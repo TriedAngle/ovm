@@ -1,0 +1,9 @@
+[package]
+name = "ovm"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+vm = { path = "../vm" }
+bytecode = { path = "../bytecode" }
+dummy_heap = { path = "../collectors/dummy_heap" }

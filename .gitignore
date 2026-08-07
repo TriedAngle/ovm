@@ -1,0 +1,5 @@
+# Rust build output, at any depth
+target/
+
+# Lockfile, at any depth
+Cargo.lock

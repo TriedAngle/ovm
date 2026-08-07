@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["bytecode", "collectors/dummy_heap", "ovm", "parser", "vm"]
+
+[workspace.package]
+edition = "2024"
+
