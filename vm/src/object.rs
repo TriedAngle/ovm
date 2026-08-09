@@ -1,8 +1,7 @@
 use core::{alloc::Layout, cell::UnsafeCell};
 
 use crate::{
-    EdgeVisitable, GcSlot, LocalHeap, RootVisitor, Smi, Value, Word,
-    value::{STRONG_PTR, WEAK_PTR},
+    EdgeVisitable, GcSlot, LocalHeap, RootVisitor, Smi, Tagged, Value, Word, value::{STRONG_PTR, WEAK_PTR}
 };
 
 pub trait HeapObject: 'static {
@@ -32,10 +31,15 @@ pub struct Header {
     map: GcSlot,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ObjectKind {
     Map,
     Array,
-    Slots,
+    ByteArray,
+    String,
+    Symbol,
+    SlotsObject,
+    CallableObject,
 }
 
 #[repr(C)]
@@ -62,7 +66,7 @@ impl Array {
     }
 
     pub fn len(&self) -> usize {
-        self.size.get().value() as usize
+        self.size.get().to_smi().expect("size").value() as usize
     }
 
     pub fn data_ptr(&self) -> *mut GcSlot {
@@ -79,11 +83,11 @@ impl Array {
     }
 
     pub fn at(&self, i: usize) -> Value {
-        self.element_slot(i).get()
+        self.element_slot(i).get().erase()
     }
 
     pub fn set(&self, heap: &impl LocalHeap, i: usize, v: Value) {
-        self.element_slot(i).set(heap, self.erase(), v);
+        self.element_slot(i).set(heap, self.erase(), Tagged::from_value(v));
     }
 }
 
@@ -100,7 +104,7 @@ impl HeapObject for Array {
 impl EdgeVisitable for Array {
     fn visit_edges(&self, visitor: &mut impl RootVisitor) {
         visitor.visit_slot(&self.header.map);
-        let size = self.size.get().value() as usize;
+        let size = self.size.get().to_smi().expect("size").value() as usize;
         for i in 0..size {
             visitor.visit_slot(self.element_slot(i));
         }
@@ -124,7 +128,7 @@ impl ByteArray {
     }
 
     pub fn len(&self) -> usize {
-        self.size.get().value() as usize
+        self.size.get().to_smi().expect("size").value() as usize
     }
 
     fn data_ptr(&self) -> *mut u8 {
@@ -164,3 +168,151 @@ impl EdgeVisitable for ByteArray {
         visitor.visit_slot(&self.header.map);
     }
 }
+
+#[repr(C)]
+pub struct VMString { 
+    pub header: Header,
+    pub backing: GcSlot<ByteArray>,
+    pub hash: GcSlot<Smi>
+}
+
+impl VMString {
+    pub fn backing(&self) -> &ByteArray {
+        let ptr = self.backing.get().as_ptr().expect("string backing");
+        unsafe { ptr.as_ref() }
+    }
+
+    pub fn hash(&self) -> i64 {
+        self.hash.get().to_smi().expect("hash").value()
+    }
+
+    pub fn len(&self) -> usize {
+        self.backing().len()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.backing().as_slice()
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(self.as_slice()).ok()
+    }
+}
+
+impl HeapObject for VMString {
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::new::<Self>()
+    }
+}
+
+impl EdgeVisitable for VMString {
+    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+        visitor.visit_slot(&self.header.map);
+        visitor.visit_slot(self.backing.ereased());
+    }
+}
+
+#[repr(C)]
+pub struct InternedString(VMString);
+
+impl InternedString {
+    pub fn string(&self) -> &VMString {
+        &self.0
+    }
+}
+
+impl HeapObject for InternedString {
+    fn header(&self) -> &Header {
+        self.0.header()
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::new::<Self>()
+    }
+}
+
+impl EdgeVisitable for InternedString {
+    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+        self.0.visit_edges(visitor);
+    }
+}
+
+#[repr(C)]
+pub struct Symbol {
+    pub header: Header,
+    pub backing: GcSlot<ByteArray>,
+}
+
+impl Symbol {
+    pub fn backing(&self) -> &ByteArray {
+        let ptr = self.backing.get().as_ptr().expect("symbol backing");
+        unsafe { ptr.as_ref() }
+    }
+
+    pub fn len(&self) -> usize {
+        self.backing().len()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        self.backing().as_slice()
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(self.as_slice()).ok()
+    }
+}
+
+impl HeapObject for Symbol {
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::new::<Self>()
+    }
+}
+
+impl EdgeVisitable for Symbol {
+    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+        visitor.visit_slot(&self.header.map);
+        visitor.visit_slot(self.backing.ereased());
+    }
+}
+
+#[repr(C)]
+pub union SlotName { 
+    pub string: Tagged<VMString>,
+    pub symbol: Tagged<Symbol>,
+    pub smi: Tagged<Smi>,
+}
+
+impl From<Tagged<VMString>> for SlotName {
+    fn from(string: Tagged<VMString>) -> Self {
+        Self { string }
+    }
+}
+
+impl From<Tagged<Symbol>> for SlotName {
+    fn from(symbol: Tagged<Symbol>) -> Self {
+        Self { symbol }
+    }
+}
+
+impl From<Tagged<Smi>> for SlotName {
+    fn from(smi: Tagged<Smi>) -> Self {
+        Self { smi }
+    }
+}
+
+impl PartialEq for SlotName {
+    fn eq(&self, other: &Self) -> bool {
+        // all variants are one word; compare the raw tagged bits
+        unsafe { self.smi.erase() == other.smi.erase() }
+    }
+}
+
+impl Eq for SlotName {}

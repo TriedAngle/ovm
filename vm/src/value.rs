@@ -49,10 +49,6 @@ impl Value {
     pub const fn is_weak_ptr(self) -> bool {
         self.0 & TAG_MASK == WEAK_PTR
     }
-
-    pub fn try_as<T: FromValue>(self) -> Option<T> {
-        T::from_value(self)
-    }
 }
 
 impl core::fmt::Debug for Value {
@@ -169,107 +165,13 @@ impl<T: HeapObject> HeapPtr<T> {
     }
 }
 
+pub trait PointerStrength {}
+
 pub struct Strong;
 pub struct Weak;
 
-/// Indirect Pointer to the Heap
-/// Will be updated when the GC is moving
-#[repr(transparent)]
-pub struct Handle<'scope, T, R = Strong> {
-    slot: NonNull<Value>,
-    _phantom: PhantomData<(&'scope (), T, R)>,
-}
-
-impl<'s, T, R> Clone for Handle<'s, T, R> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<'s, T, R> Copy for Handle<'s, T, R> {}
-
-impl<'s, T, R> core::fmt::Debug for Handle<'s, T, R> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Handle")
-            .field("kind", &core::any::type_name::<R>())
-            .field("value", &self.value())
-            .finish()
-    }
-}
-
-impl<'s, T, R> Handle<'s, T, R> {
-    pub fn value(self) -> Value {
-        unsafe { *self.slot.as_ptr() }
-    }
-
-    pub fn erase(self) -> Handle<'s, Value, R> {
-        Handle {
-            slot: self.slot,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<'s, T: HeapObject> Handle<'s, T, Strong> {
-    pub fn get(self) -> HeapPtr<T> {
-        HeapPtr::decode_strong(self.value()).expect("strong local slot must contain strong pointer")
-    }
-}
-
-impl<'s, T: HeapObject> Handle<'s, T, Weak> {}
-
-pub trait FromValue: Sized {
-    fn from_value(v: Value) -> Option<Self>;
-}
-
-pub trait IntoValue {
-    fn into_value(self) -> Value;
-}
-
-impl FromValue for Value {
-    fn from_value(v: Value) -> Option<Self> {
-        Some(v)
-    }
-}
-
-impl IntoValue for Value {
-    fn into_value(self) -> Value {
-        self
-    }
-}
-
-impl FromValue for Smi {
-    fn from_value(v: Value) -> Option<Self> {
-        Smi::decode(v)
-    }
-}
-
-impl IntoValue for Smi {
-    fn into_value(self) -> Value {
-        self.encode()
-    }
-}
-
-impl<T: HeapObject> FromValue for HeapPtr<T> {
-    fn from_value(v: Value) -> Option<Self> {
-        HeapPtr::decode_strong(v)
-    }
-}
-
-impl<T: HeapObject> IntoValue for Tagged<T> {
-    fn into_value(self) -> Value {
-        self.erase()
-    }
-}
-
-impl<T: HeapObject> FromValue for Tagged<T> {
-    fn from_value(v: Value) -> Option<Self> {
-        if v.is_ptr() {
-            Some(unsafe { Tagged::from_value_unchecked(v) })
-        } else {
-            None
-        }
-    }
-}
+impl PointerStrength for Strong {}
+impl PointerStrength for Weak {}
 
 /// Tagged is a typed Value
 #[repr(transparent)]
@@ -293,6 +195,15 @@ impl<T> core::fmt::Debug for Tagged<T> {
     }
 }
 
+impl Tagged<Value> {
+    pub fn from_ereased(value: Value) -> Self { 
+        Self { 
+            raw: value,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<T> Tagged<T> {
     pub unsafe fn from_value_unchecked(value: Value) -> Self {
         Self {
@@ -306,7 +217,7 @@ impl<T> Tagged<T> {
     }
 
     pub fn erase_tagged(self) -> Tagged<Value> {
-        unsafe { Tagged::from_value_unchecked(self.raw) }
+        Tagged::<Value>::from_ereased(self.raw)
     }
 
     pub unsafe fn cast_unchecked<U>(self) -> Tagged<U> {
@@ -334,6 +245,12 @@ impl<T> Tagged<T> {
     }
 }
 
+impl Tagged<Value> {
+    pub fn from_value(v: Value) -> Self {
+        unsafe { Self::from_value_unchecked(v) }
+    }
+}
+
 impl Tagged<Smi> {
     pub fn from_smi(smi: Smi) -> Self {
         unsafe { Self::from_value_unchecked(smi.encode()) }
@@ -348,6 +265,12 @@ impl Tagged<Smi> {
     }
 }
 
+impl From<Smi> for Tagged<Smi> {
+    fn from(smi: Smi) -> Self {
+        Self::from_smi(smi)
+    }
+}
+
 impl<T: HeapObject> Tagged<T> {
     pub fn from_ptr(ptr: HeapPtr<T>) -> Self {
         unsafe { Self::from_value_unchecked(ptr.encode_strong()) }
@@ -355,5 +278,11 @@ impl<T: HeapObject> Tagged<T> {
 
     pub fn as_ptr(self) -> Option<HeapPtr<T>> {
         HeapPtr::decode_strong(self.raw)
+    }
+}
+
+impl<T: HeapObject> From<Tagged<T>> for HeapPtr<T> {
+    fn from(v: Tagged<T>) -> Self {
+        unsafe { HeapPtr::new_unchecked(v.erase().raw_addr() as *mut T) }
     }
 }

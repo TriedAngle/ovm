@@ -30,7 +30,6 @@ unsafe impl Sync for DummyHeap {}
 
 impl DummyHeap {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        // Heap pointers must stay at least 4-aligned for the tag bits.
         let align = layout.align().max(4);
         let mut offset = self.offset.load(Ordering::Relaxed);
         loop {
@@ -86,7 +85,6 @@ impl SharedHeap for DummyHeap {
     }
 
     fn collect(&mut self, _roots: &mut dyn RootVisitor) {
-        // Never reclaims memory.
     }
 
     fn should_collect(&self) -> bool {
@@ -140,10 +138,6 @@ impl LocalHeap for DummyLocalHeap {
     fn gc_in_progress(&self) -> bool {
         false
     }
-
-    fn safepoint_enter(&self) {}
-
-    fn safepoint_exit(&self) {}
 }
 
 #[cfg(test)]

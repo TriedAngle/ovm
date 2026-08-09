@@ -1,6 +1,6 @@
 use core::alloc::Layout;
 
-use vm::{Header, HeapObject, HeapPtr, IntoValue, Smi, Tagged, Value};
+use vm::{Header, HeapObject, HeapPtr, Smi, Tagged, Value};
 
 /// Stand-in heap object, aligned like a real heap allocation.
 #[repr(align(8))]
@@ -52,12 +52,6 @@ mod value {
         assert!(!v.is_strong_ptr());
         assert!(!v.is_weak_ptr());
     }
-
-    #[test]
-    fn try_as_value_always_succeeds() {
-        let v = Value::from_bits(0x1234);
-        assert_eq!(v.try_as::<Value>().unwrap().to_bits(), 0x1234);
-    }
 }
 
 mod smi {
@@ -93,15 +87,6 @@ mod smi {
         let weak = Value::from_bits(0x1000 | vm::value::WEAK_PTR);
         assert_eq!(Smi::decode(strong), None);
         assert_eq!(Smi::decode(weak), None);
-    }
-
-    #[test]
-    fn try_as_smi() {
-        let v = Smi::new_unchecked(-7).encode();
-        assert_eq!(v.try_as::<Smi>().unwrap().value(), -7);
-
-        let ptr = Value::from_bits(0x1000 | vm::value::STRONG_PTR);
-        assert_eq!(ptr.try_as::<Smi>(), None);
     }
 }
 
@@ -152,21 +137,6 @@ mod heap_ptr {
         let v = Smi::new_unchecked(1).encode();
         assert!(HeapPtr::<TestObj>::decode(v).is_none());
         assert!(HeapPtr::<TestObj>::decode_strong(v).is_none());
-    }
-
-    #[test]
-    fn try_as_heap_ptr_requires_strong() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::new_unchecked(raw) };
-
-        assert!(ptr.encode_strong().try_as::<HeapPtr<TestObj>>().is_some());
-        assert!(ptr.encode_weak().try_as::<HeapPtr<TestObj>>().is_none());
-        assert!(Smi::new_unchecked(0)
-            .encode()
-            .try_as::<HeapPtr<TestObj>>()
-            .is_none());
-
-        unsafe { free_test_obj(raw) };
     }
 
     #[test]
@@ -322,38 +292,6 @@ mod tagged {
 
         assert!(a.ptr_eq(b));
         assert!(!a.ptr_eq(c));
-    }
-
-    #[test]
-    fn from_value_accepts_any_pointer_tag() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new_unchecked(raw) };
-
-        // Unlike HeapPtr::from_value, weak pointers are accepted here.
-        let weak = ptr.encode_weak();
-        let tagged: Tagged<TestObj> = weak.try_as().unwrap();
-        assert_eq!(tagged.erase().to_bits(), weak.to_bits());
-
-        let smi = Smi::new_unchecked(1).encode();
-        assert_eq!(smi.try_as::<Tagged<TestObj>>().map(|t| t.erase()), None);
-
-        unsafe { free_test_obj(raw) };
-    }
-
-    #[test]
-    fn into_value_impls() {
-        let v = Value::from_bits(0x10);
-        assert_eq!(v.into_value().to_bits(), 0x10);
-
-        let smi = Smi::new_unchecked(5);
-        assert_eq!(smi.into_value(), smi.encode());
-
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new_unchecked(raw) };
-        let tagged = Tagged::from_ptr(ptr);
-        assert_eq!(tagged.into_value(), ptr.encode_strong());
-
-        unsafe { free_test_obj(raw) };
     }
 
     #[test]
