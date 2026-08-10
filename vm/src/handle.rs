@@ -4,7 +4,7 @@ use crate::{GcSlot, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, PointerStrength, Roo
 
 pub struct Handle<'scope, T, R: PointerStrength = Strong> {
     location: NonNull<Value>,
-    _phantom: PhantomData<(&'scope (), T, R)>,
+    _phantom: PhantomData<(fn(&'scope ()) -> &'scope (), T, R)>,
 }
 
 impl<'s, T, R: PointerStrength> Clone for Handle<'s, T, R> {
@@ -143,7 +143,7 @@ pub struct HandleScope<'d> {
     prev_next: *mut Value,
     prev_limit: *mut Value,
     prev_block_count: usize,
-    _phantom: PhantomData<&'d HandleData>,
+    _phantom: PhantomData<fn(&'d ()) -> &'d ()>,
 }
 
 impl<'d> HandleScope<'d> {

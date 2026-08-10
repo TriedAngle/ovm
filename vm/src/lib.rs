@@ -4,7 +4,7 @@ pub mod value;
 pub mod handle;
 
 pub use heap::{
-    AllocError, EdgeVisitable, Fresh, GcSlot, HeapRef, LocalHeap, NoGc, RootVisitor, SharedHeap,
+    AllocError, EdgeVisitable, Fresh, GcSlot, HeapRef, LocalHeap, NoGc, RootVisitor, Heap,
     WordType,
 };
 pub use object::{Array, Header, HeapObject, Map, ObjectKind, SlotName, VMString, InternedString};

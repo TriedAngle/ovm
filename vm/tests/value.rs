@@ -16,12 +16,10 @@ impl HeapObject for TestObj {
     }
 }
 
-/// Allocate a `TestObj` on the heap and return its raw pointer.
 fn alloc_test_obj() -> *mut TestObj {
     Box::into_raw(Box::new(TestObj(0xDEAD_BEEF)))
 }
 
-/// Reclaim a pointer produced by [`alloc_test_obj`].
 unsafe fn free_test_obj(ptr: *mut TestObj) {
     drop(unsafe { Box::from_raw(ptr) });
 }
@@ -123,9 +121,7 @@ mod heap_ptr {
         assert!(!v.is_strong_ptr());
         assert_eq!(v.raw_addr(), raw as u64);
 
-        // A weak pointer is not accepted where a strong one is required...
         assert!(HeapPtr::<TestObj>::decode_strong(v).is_none());
-        // ...but the untyped decode accepts both.
         let decoded = HeapPtr::<TestObj>::decode(v).unwrap();
         assert_eq!(decoded.as_ptr(), raw);
 

@@ -22,15 +22,18 @@ impl core::fmt::Display for AllocError {
 
 impl std::error::Error for AllocError {}
 
-/// Trait the Core Heap must implement
-/// this VM is designed to be multithreaded
-/// so a each thread must have its LocalHeap and a Global/SharedHeap must exist.
-pub trait SharedHeap: Sized + Send + Sync {
+pub trait Heap: Sized + Send + Sync {
     type Config;
+    type Local: LocalHeap;
 
     fn new(config: Self::Config) -> Result<Self, AllocError>;
 
-    fn collect(&mut self, roots: &mut dyn RootVisitor);
+    fn new_local(&self) -> Self::Local;
+
+    fn iterate_roots(&self, roots: &mut dyn RootVisitor);
+
+    fn collect(&self);
+
     fn should_collect(&self) -> bool;
     fn gc_in_progress(&self) -> bool;
 
@@ -38,15 +41,25 @@ pub trait SharedHeap: Sized + Send + Sync {
     fn is_young(&self, _value: Value) -> bool;
 }
 
-pub trait LocalHeap: Sized {
+pub trait LocalHeap: Sized + Send {
     fn allocate_raw(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
 
-    fn allocate<T: HeapObject>(&mut self, layout: Layout) -> Result<Fresh<'_, T>, AllocError> {
-        let ptr = self.allocate_raw(layout)?;
-        Ok(Fresh {
+    fn allocate<T: HeapObject>(&mut self, layout: Layout) -> Fresh<'_, T> {
+        let ptr = self.allocate_raw(layout);
+        debug_assert!(ptr.is_ok(), "allocation must not fail");
+        let ptr = unsafe { ptr.unwrap_unchecked() };
+        Fresh {
             ptr: ptr.cast::<T>(),
             _phantom: PhantomData,
-        })
+        }
+    }
+
+    fn allocate_handle<'s, T: HeapObject>(
+        &mut self,
+        layout: Layout,
+        scope: &'s HandleScope<'_>,
+    ) -> Handle<'s, T> {
+        self.allocate(layout).into_handle(scope)
     }
 
     fn write_barrier(&self, host: Value, slot: &GcSlot, value: Value);

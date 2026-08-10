@@ -1,14 +1,22 @@
 use bytecode::{Opcode, Operand, Scale};
-use dummy_heap::{DummyHeap, DummyHeapConfig, DummyLocalHeap};
-use vm::SharedHeap;
+use dummy_heap::{DummyHeap, DummyHeapConfig};
+use ovm::VM;
+use vm::{Array, LocalHeap};
 
 fn main() {
-    let heap = DummyHeap::new(DummyHeapConfig::default()).expect("failed to create heap");
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).expect("failed to create heap");
+    let mut ctx = vm.attach();
+
+    ctx.handle_scope(|ctx, scope| {
+        let _handle = ctx
+            .heap()
+            .allocate_handle::<Array>(Array::layout_for(3), &scope);
+    });
     println!(
-        "heap initialized: {} bytes",
-        heap.capacity(),
+        "heap initialized: {} bytes ({} used)",
+        vm.heap().capacity(),
+        vm.heap().used()
     );
-    let _local = DummyLocalHeap::new(heap);
 
     // demo program: acc = 6 + 7
     let mut program = Vec::new();
