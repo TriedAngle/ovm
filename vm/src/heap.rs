@@ -1,6 +1,6 @@
 use core::{alloc::Layout, cell::UnsafeCell, marker::PhantomData, ops::FnOnce, ptr::NonNull};
 
-use crate::{Handle, HeapObject, HeapPtr, Smi, Tagged, Value, Word};
+use crate::{Handle, HandleScope, HeapObject, HeapPtr, Smi, Tagged, Value, Word};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocError {
@@ -134,11 +134,9 @@ impl<'scope, T: HeapObject> Fresh<'scope, T> {
         unsafe { HeapPtr::new_unchecked(self.ptr.as_ptr()) }
     }
 
-    pub fn into_handle(self) -> Handle<'scope, T> {
-        // TODO: back handles by a per-thread handle-scope table instead of
-        // leaking one word per promotion.
+    pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
         let value = Value::from_bits(self.ptr.as_ptr() as Word | crate::value::STRONG_PTR);
-        Handle::from_slot(NonNull::from(Box::leak(Box::new(value))))
+        scope.create_handle(unsafe { Tagged::from_value_unchecked(value) })
     }
 
     /// Promote to a direct reference within a no-GC scope.
