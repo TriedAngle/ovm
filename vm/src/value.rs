@@ -106,6 +106,12 @@ impl Smi {
 /// because the GC may be moving this is NOT safe to dereference acroess GC safepoints.
 pub struct HeapPtr<T>(NonNull<T>);
 
+// A HeapPtr is just an address into the shared heap; moving or sharing it
+// across threads is fine. Dereferencing is the unsafe part and is governed
+// separately (no-GC scopes / unsafe).
+unsafe impl<T: HeapObject> Send for HeapPtr<T> {}
+unsafe impl<T: HeapObject> Sync for HeapPtr<T> {}
+
 impl<T> Clone for HeapPtr<T> {
     fn clone(&self) -> Self {
         *self

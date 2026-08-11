@@ -11,6 +11,16 @@ fn main() {
         let _handle = ctx
             .heap()
             .allocate_handle::<Array>(Array::layout_for(3), &scope);
+
+        let interned = ctx.intern(&scope, "hello, ovm");
+        let again = ctx.intern(&scope, "hello, ovm");
+        let s = unsafe { interned.get().as_ref() };
+        println!(
+            "interned: {:?} (hash {}, deduped: {})",
+            s.string().as_str().expect("utf8"),
+            s.string().hash(),
+            interned.value().to_bits() == again.value().to_bits()
+        );
     });
     println!(
         "heap initialized: {} bytes ({} used)",

@@ -2,11 +2,16 @@ use std::sync::{Arc, Mutex, Weak};
 
 use core::ptr::NonNull;
 
-use vm::{AllocError, HandleData, HandleScope, Heap};
+use vm::{AllocError, Handle, HandleData, HandleScope, Heap, InternedString};
+
+pub mod interner;
+
+pub use interner::StringInterner;
 
 pub struct SharedVM<H: Heap> {
     heap: H,
     threads: Mutex<Vec<Weak<ContextState>>>,
+    interner: StringInterner,
 }
 
 pub struct VM<H: Heap> {
@@ -40,12 +45,17 @@ impl<H: Heap> VM<H> {
             shared: Arc::new(SharedVM {
                 heap: H::new(config)?,
                 threads: Mutex::new(Vec::new()),
+                interner: StringInterner::new(),
             }),
         })
     }
 
     pub fn heap(&self) -> &H {
         &self.shared.heap
+    }
+
+    pub fn interner(&self) -> &StringInterner {
+        &self.shared.interner
     }
 
     pub fn attach(&self) -> Context<H> {
@@ -83,6 +93,14 @@ impl<H: Heap> Context<H> {
 
     pub fn heap(&mut self) -> &mut H::Local {
         &mut self.heap
+    }
+
+    pub fn intern<'s>(
+        &mut self,
+        scope: &'s HandleScope<'_>,
+        s: impl AsRef<str>,
+    ) -> Handle<'s, InternedString> {
+        self.vm.interner().intern(&mut self.heap, scope, s)
     }
 
     pub fn handle_scope<R>(

@@ -146,6 +146,39 @@ pub struct HeapRef<'scope, T: HeapObject> {
     _phantom: PhantomData<&'scope T>,
 }
 
+impl<T: HeapObject> Clone for HeapRef<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: HeapObject> Copy for HeapRef<'_, T> {}
+
+impl<'scope, T: HeapObject> HeapRef<'scope, T> {
+    /// Wrap an existing reference. Sound: `&'scope T` is the stronger
+    /// proof — it already vouches validity for the whole scope.
+    pub fn from_ref(r: &'scope T) -> Self {
+        HeapRef {
+            ptr: unsafe { HeapPtr::new_unchecked(r as *const T as *mut T) },
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Borrow the pointee for the whole no-GC scope.
+    pub fn as_ref(&self) -> &'scope T {
+        unsafe { self.ptr.as_ref() }
+    }
+
+    /// Demote to a raw heap pointer.
+    pub fn into_ptr(self) -> HeapPtr<T> {
+        self.ptr
+    }
+
+    /// Promote to a tagged strong pointer.
+    pub fn into_tagged(self) -> Tagged<T> {
+        Tagged::from_ptr(self.ptr)
+    }
+}
+
 impl<T: HeapObject> core::ops::Deref for HeapRef<'_, T> {
     type Target = T;
 
@@ -283,6 +316,11 @@ impl<T> GcSlot<T> {
         unsafe { Tagged::from_value_unchecked(*self.raw.get()) }
     }
 
+    /// Read the raw tagged word directly, without rewrapping.
+    pub fn inner(&self) -> Value {
+        unsafe { *self.raw.get() }
+    }
+
     pub fn set(&self, heap: &impl LocalHeap, host: Value, value: impl Into<Tagged<T>>) {
         let v = value.into().erase();
         if v.is_ptr() {
@@ -297,6 +335,13 @@ impl<T> GcSlot<T> {
 
     pub const fn raw_get(this: *const Self) -> *mut T {
         this as *const T as *mut T
+    }
+}
+
+impl GcSlot<Smi> {
+    /// Read the smi directly; the slot invariant guarantees a smi.
+    pub fn to_smi(&self) -> Smi {
+        Smi::decode(self.inner()).expect("GcSlot invariant violated")
     }
 }
 

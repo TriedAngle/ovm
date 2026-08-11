@@ -165,6 +165,11 @@ impl<'d> HandleScope<'d> {
         Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
     }
 
+    /// Create a strong handle for a heap pointer.
+    pub fn create_handle_from_ptr<T: HeapObject>(&self, ptr: HeapPtr<T>) -> Handle<'_, T> {
+        self.create_handle(Tagged::from_ptr(ptr))
+    }
+
     pub fn escapable_scope<'a>(&'a mut self) -> EscapableHandleScope<'a, 'd> {
         let data = unsafe { &*self.data.as_ptr() };
         let escape_slot = data.inner().allocate_slot();
