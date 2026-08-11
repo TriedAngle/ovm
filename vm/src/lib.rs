@@ -4,10 +4,10 @@ pub mod value;
 pub mod handle;
 
 pub use heap::{
-    AllocError, EdgeVisitable, Fresh, GcSlot, HeapRef, LocalHeap, NoGc, RootVisitor, Heap,
+    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, HeapRef, LocalHeap, NoGc, RootVisitor, Heap,
     WordType,
 };
-pub use object::{Array, Header, HeapObject, Map, ObjectKind, SlotName, VMString, InternedString};
+pub use object::{Array, ByteArray, Header, HeapObject, Map, ObjectKind, SlotName, VMString, InternedString};
 pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope};
 pub use value::{HeapPtr, PointerStrength, Smi, Strong, Tagged, Value, Weak, Word};
 

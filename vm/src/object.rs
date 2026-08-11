@@ -31,6 +31,7 @@ pub struct Header {
     map: GcSlot,
 }
 
+#[repr(u16)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ObjectKind {
     Map,

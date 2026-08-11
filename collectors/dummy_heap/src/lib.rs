@@ -212,4 +212,130 @@ mod tests {
         assert_eq!(heap.shared().used(), 4 * 1000 * size_of::<u64>());
         heap.allocate_raw(Layout::new::<u64>()).unwrap();
     }
+
+    use vm::{Array, ByteArray, HandleData, HandleScope, HeapObject, Smi};
+
+    fn scope(data: &HandleData) -> HandleScope<'_> {
+        unsafe { HandleScope::from_raw(NonNull::from(data)) }
+    }
+
+    #[test]
+    fn token_bulk_allocates_and_tracks_remaining() {
+        let mut heap = local(1 << 16);
+        let la = Array::layout_for(2);
+        let lb = ByteArray::layout_for(8);
+        let total = Layout::from_size_align(la.size() + lb.size(), 16).unwrap();
+        let before = heap.shared().used();
+        {
+            let tok = heap.allocate_token(total);
+            assert_eq!(tok.remaining(), la.size() + lb.size());
+            let a = tok.allocate::<Array>(la);
+            let b = tok.allocate::<ByteArray>(lb);
+            assert_ne!(a.as_ptr() as *mut u8, b.as_ptr() as *mut u8);
+            assert_eq!(tok.remaining(), 0);
+        }
+        assert_eq!(heap.shared().used(), before + la.size() + lb.size());
+    }
+
+    #[test]
+    fn token_handles_outlive_the_token() {
+        let mut heap = local(1 << 16);
+        let data = HandleData::new();
+        let scope = scope(&data);
+        let la = Array::layout_for(2);
+        let lb = ByteArray::layout_for(8);
+        let total = Layout::from_size_align(la.size() + lb.size(), 16).unwrap();
+
+        let (ha, hb) = {
+            let tok = heap.allocate_token(total);
+            let ha = tok.allocate::<Array>(la).into_handle(&scope);
+            let hb = tok.allocate::<ByteArray>(lb).into_handle(&scope);
+            (ha, hb)
+        }; // token dropped here (full use verified)
+
+        // the handles stay rooted and point into the heap
+        assert_ne!(ha.value().to_bits(), hb.value().to_bits());
+        assert!(heap.shared().contains(ha.value().raw_addr()));
+        assert!(heap.shared().contains(hb.value().raw_addr()));
+    }
+
+    #[test]
+    fn token_fresh_allocations_coexist_and_promote() {
+        let mut heap = local(1 << 16);
+        let data = HandleData::new();
+        let scope = scope(&data);
+        let la = Array::layout_for(1);
+        let total = Layout::from_size_align(2 * la.size(), 16).unwrap();
+
+        let tok = heap.allocate_token(total);
+        // multiple Fresh alive at once (shared borrows of the token)
+        let a = tok.allocate::<Array>(la);
+        let b = tok.allocate::<Array>(la);
+        let ha = a.into_handle(&scope);
+        let hb = b.into_handle(&scope);
+        assert_ne!(ha.value().to_bits(), hb.value().to_bits());
+    }
+
+    #[test]
+    fn token_enter_no_gc_allocates_refs() {
+        let mut heap = local(1 << 16);
+        let lb = ByteArray::layout_for(8);
+        let total = Layout::from_size_align(2 * lb.size(), 16).unwrap();
+
+        let tok = heap.allocate_token(total);
+        tok.enter_no_gc(|nogc, heap| {
+            let a = tok.allocate_ref::<ByteArray>(lb, nogc);
+            let b = tok.allocate_ref::<ByteArray>(lb, nogc);
+            a.size.set(heap, a.erase(), Smi::new_unchecked(8));
+            b.size.set(heap, b.erase(), Smi::new_unchecked(8));
+            b.set(0, 42);
+            b.set(1, 7);
+            assert_eq!(a.get(0), 0);
+            assert_eq!(b.get(0), 42);
+            assert_eq!(b.get(1), 7);
+        });
+    }
+
+    #[test]
+    fn allocate_token_enter_no_gc_combines_both() {
+        let mut heap = local(1 << 16);
+        let lb = ByteArray::layout_for(4);
+        let total = Layout::from_size_align(lb.size(), 16).unwrap();
+        heap.allocate_token_enter_nogc(total, |tok, nogc, heap| {
+            let a = tok.allocate_ref::<ByteArray>(lb, nogc);
+            a.size.set(heap, a.erase(), Smi::new_unchecked(4));
+            a.set(0, 1);
+            assert_eq!(a.get(0), 1);
+        });
+    }
+
+    #[test]
+    fn allocate_enter_no_gc_gives_ref_instantly() {
+        let mut heap = local(1 << 16);
+        heap.allocate_enter_nogc::<ByteArray, _>(ByteArray::layout_for(4), |bytes, _nogc, heap| {
+            bytes.size.set(heap, bytes.erase(), Smi::new_unchecked(4));
+            bytes.set(0, 1);
+            bytes.set(1, 2);
+            assert_eq!(bytes.as_slice(), &[1, 2, 0, 0]);
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "allocation token dropped")]
+    fn token_drop_requires_full_use() {
+        let mut heap = local(1 << 16);
+        let total = Layout::from_size_align(4096, 16).unwrap();
+        let tok = heap.allocate_token(total);
+        tok.allocate::<ByteArray>(ByteArray::layout_for(4));
+        // dropped with most of the reservation unused
+    }
+
+    #[test]
+    #[should_panic(expected = "allocation token exhausted")]
+    fn token_allocate_checks_capacity() {
+        let mut heap = local(1 << 16);
+        let total = Layout::from_size_align(64, 16).unwrap();
+        let tok = heap.allocate_token(total);
+        tok.allocate::<ByteArray>(ByteArray::layout_for(4096));
+    }
 }

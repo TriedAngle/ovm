@@ -1,4 +1,4 @@
-use core::{alloc::Layout, cell::UnsafeCell, marker::PhantomData, ops::FnOnce, ptr::NonNull};
+use core::{alloc::Layout, cell::{Cell, UnsafeCell}, marker::PhantomData, ops::FnOnce, ptr::NonNull};
 
 use crate::{Handle, HandleScope, HeapObject, HeapPtr, Smi, Tagged, Value, Word};
 
@@ -60,6 +60,43 @@ pub trait LocalHeap: Sized + Send {
         scope: &'s HandleScope<'_>,
     ) -> Handle<'s, T> {
         self.allocate(layout).into_handle(scope)
+    }
+
+    fn allocate_token(&mut self, total: Layout) -> AllocToken<'_, Self> {
+        let raw = self.allocate_raw(total);
+        debug_assert!(raw.is_ok(), "allocation must not fail");
+        let raw = unsafe { raw.unwrap_unchecked() };
+        AllocToken {
+            heap: self,
+            next: Cell::new(raw.as_ptr()),
+            end: unsafe { raw.as_ptr().add(total.size()) },
+        }
+    }
+
+    fn allocate_token_enter_nogc<R>(
+        &mut self,
+        total: Layout,
+        f: impl for<'a> FnOnce(&AllocToken<'_, Self>, &'a mut NoGc<'a>, &Self) -> R,
+    ) -> R {
+        let token = self.allocate_token(total);
+        token.enter_no_gc(|nogc, heap| f(&token, nogc, heap))
+    }
+
+    fn allocate_enter_nogc<T: HeapObject, R>(
+        &mut self,
+        layout: Layout,
+        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a mut NoGc<'a>, &'a Self) -> R,
+    ) -> R {
+        let raw = self.allocate_raw(layout);
+        debug_assert!(raw.is_ok(), "allocation must not fail");
+        let raw = unsafe { raw.unwrap_unchecked() };
+        self.no_gc(move |nogc, heap| {
+            let r = HeapRef {
+                ptr: unsafe { HeapPtr::new_unchecked(raw.cast::<T>().as_ptr()) },
+                _phantom: PhantomData,
+            };
+            f(r, nogc, heap)
+        })
     }
 
     fn write_barrier(&self, host: Value, slot: &GcSlot, value: Value);
@@ -142,7 +179,6 @@ impl<'scope, T> Fresh<'scope, T> {
 }
 
 impl<'scope, T: HeapObject> Fresh<'scope, T> {
-    /// Demote to a raw heap pointer.
     pub fn into_ptr(self) -> HeapPtr<T> {
         unsafe { HeapPtr::new_unchecked(self.ptr.as_ptr()) }
     }
@@ -152,11 +188,68 @@ impl<'scope, T: HeapObject> Fresh<'scope, T> {
         scope.create_handle(unsafe { Tagged::from_value_unchecked(value) })
     }
 
-    /// Promote to a direct reference within a no-GC scope.
     pub fn heap_ref<'a>(self, _guard: &'a NoGc<'a>) -> HeapRef<'a, T> {
         HeapRef {
             ptr: self.into_ptr(),
             _phantom: PhantomData,
+        }
+    }
+}
+
+pub struct AllocToken<'heap, H: LocalHeap> {
+    heap: &'heap mut H,
+    next: Cell<*mut u8>,
+    end: *mut u8,
+}
+
+impl<'heap, H: LocalHeap> AllocToken<'heap, H> {
+    pub fn allocate<T: HeapObject>(&self, layout: Layout) -> Fresh<'_, T> {
+        Fresh {
+            ptr: self.bump(layout).cast::<T>(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn allocate_ref<'g, T: HeapObject>(
+        &self,
+        layout: Layout,
+        _guard: &'g NoGc<'g>,
+    ) -> HeapRef<'g, T> {
+        HeapRef {
+            ptr: unsafe { HeapPtr::new_unchecked(self.bump(layout).cast::<T>().as_ptr()) },
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn enter_no_gc<R>(&self, f: impl for<'a> FnOnce(&'a mut NoGc<'a>, &'a H) -> R) -> R {
+        let mut guard = NoGc {
+            _phantom: PhantomData,
+        };
+        f(&mut guard, &*self.heap)
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.end as usize - self.next.get() as usize
+    }
+
+    pub fn heap(&self) -> &H {
+        &*self.heap
+    }
+
+    fn bump(&self, layout: Layout) -> NonNull<u8> {
+        let aligned = (self.next.get() as usize).next_multiple_of(layout.align().max(4));
+        let end = aligned + layout.size();
+        assert!(end <= self.end as usize, "allocation token exhausted");
+        self.next.set(end as *mut u8);
+        unsafe { NonNull::new_unchecked(aligned as *mut u8) }
+    }
+}
+
+impl<H: LocalHeap> Drop for AllocToken<'_, H> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            let remaining = self.remaining();
+            assert_eq!(remaining, 0, "allocation token dropped with {remaining} bytes unused");
         }
     }
 }
