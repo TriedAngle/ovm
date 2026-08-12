@@ -25,12 +25,12 @@ pub enum Opcode {
     // for methods the `self` is the first element in the reglist
     Call,           // reg (caller) reglist (base) regcount (count) idx (feedback) -> acc
     CallNoFeedback, // reg (caller) reglist (base) regcount (count) -> acc
-    CallPrimitive,  // idx (primitive index) reg (caller) reglist (base) regcount (count) -> acc
+    CallNative,     // idx (native index) reg (caller) reglist (base) regcount (count) -> acc
 
     CreateObjectFromMap, // idx (constant pool map) reglist regcount (slots) -> acc
     CreateArrayLiteral,  // reglist regcount -> acc
 
-    // here to see if it makes a different over CallPrimitive with Add
+    // here to see if it makes a different over CallNative with Add
     Add, // reg1 reg2 -> acc
 }
 
@@ -71,7 +71,7 @@ impl Opcode {
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
-            b if b == CallPrimitive as u8 => CallPrimitive,
+            b if b == CallNative as u8 => CallNative,
             b if b == CreateObjectFromMap as u8 => CreateObjectFromMap,
             b if b == CreateArrayLiteral as u8 => CreateArrayLiteral,
             b if b == Add as u8 => Add,
@@ -100,7 +100,7 @@ impl Opcode {
 
             Self::Call => &[Register, RegisterList, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterList, RegisterCount],
-            Self::CallPrimitive => &[Index, Register, RegisterList, RegisterCount],
+            Self::CallNative => &[Index, Register, RegisterList, RegisterCount],
 
             Self::CreateObjectFromMap => &[Index, RegisterList, RegisterCount],
             Self::CreateArrayLiteral => &[RegisterList, RegisterCount],

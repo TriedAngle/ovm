@@ -1,4 +1,10 @@
-use core::{alloc::Layout, cell::{Cell, UnsafeCell}, marker::PhantomData, ops::FnOnce, ptr::NonNull};
+use core::{
+    alloc::Layout,
+    cell::{Cell, UnsafeCell},
+    marker::PhantomData,
+    ops::FnOnce,
+    ptr::NonNull,
+};
 
 use crate::{Handle, HandleScope, HeapObject, HeapPtr, Smi, Tagged, Value, Word};
 
@@ -139,8 +145,6 @@ impl<'a> NoGc<'a> {
 }
 
 /// Direct reference to a heap object, valid only within a no-GC scope.
-/// Carries no strong/weak semantics. Mutation of GC-pointer fields should
-/// go through `GcSlot::set` to preserve the write barrier.
 pub struct HeapRef<'scope, T: HeapObject> {
     ptr: HeapPtr<T>,
     _phantom: PhantomData<&'scope T>,
@@ -154,8 +158,6 @@ impl<T: HeapObject> Clone for HeapRef<'_, T> {
 impl<T: HeapObject> Copy for HeapRef<'_, T> {}
 
 impl<'scope, T: HeapObject> HeapRef<'scope, T> {
-    /// Wrap an existing reference. Sound: `&'scope T` is the stronger
-    /// proof — it already vouches validity for the whole scope.
     pub fn from_ref(r: &'scope T) -> Self {
         HeapRef {
             ptr: unsafe { HeapPtr::new_unchecked(r as *const T as *mut T) },
@@ -163,19 +165,20 @@ impl<'scope, T: HeapObject> HeapRef<'scope, T> {
         }
     }
 
-    /// Borrow the pointee for the whole no-GC scope.
     pub fn as_ref(&self) -> &'scope T {
         unsafe { self.ptr.as_ref() }
     }
 
-    /// Demote to a raw heap pointer.
     pub fn into_ptr(self) -> HeapPtr<T> {
         self.ptr
     }
 
-    /// Promote to a tagged strong pointer.
     pub fn into_tagged(self) -> Tagged<T> {
         Tagged::from_ptr(self.ptr)
+    }
+
+    pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
+        unsafe { scope.create_handle_unchecked(self.into_tagged()) }
     }
 }
 
@@ -218,7 +221,9 @@ impl<'scope, T: HeapObject> Fresh<'scope, T> {
 
     pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
         let value = Value::from_bits(self.ptr.as_ptr() as Word | crate::value::STRONG_PTR);
-        scope.create_handle(unsafe { Tagged::from_value_unchecked(value) })
+        // Safety: a Fresh points to a live, uncollected object (the heap
+        // was frozen since allocation) and the encoding is strong.
+        unsafe { scope.create_handle_unchecked(Tagged::from_value_unchecked(value)) }
     }
 
     pub fn heap_ref<'a>(self, _guard: &'a NoGc<'a>) -> HeapRef<'a, T> {
@@ -282,8 +287,41 @@ impl<H: LocalHeap> Drop for AllocToken<'_, H> {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             let remaining = self.remaining();
-            assert_eq!(remaining, 0, "allocation token dropped with {remaining} bytes unused");
+            assert_eq!(
+                remaining, 0,
+                "allocation token dropped with {remaining} bytes unused"
+            );
         }
+    }
+}
+
+pub struct WeakGcCell<T: HeapObject> {
+    raw: UnsafeCell<Value>,
+    _phantom: PhantomData<T>,
+}
+
+unsafe impl<T: HeapObject> Send for WeakGcCell<T> {}
+unsafe impl<T: HeapObject> Sync for WeakGcCell<T> {}
+
+impl<T: HeapObject> WeakGcCell<T> {
+    pub fn new(ptr: HeapPtr<T>) -> Self {
+        Self {
+            raw: UnsafeCell::new(ptr.encode_weak()),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn is_cleared(&self) -> bool {
+        unsafe { *self.raw.get() }.is_cleared()
+    }
+
+    pub fn upgrade<'a>(&self, guard: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
+        let word = unsafe { *self.raw.get() };
+        if word.is_cleared() {
+            return None;
+        }
+        let strong = Value::from_bits(word.raw_addr() | crate::value::STRONG_PTR);
+        Some(unsafe { guard.get_unchecked(Tagged::from_value_unchecked(strong)) })
     }
 }
 
@@ -339,7 +377,6 @@ impl<T> GcSlot<T> {
 }
 
 impl GcSlot<Smi> {
-    /// Read the smi directly; the slot invariant guarantees a smi.
     pub fn to_smi(&self) -> Smi {
         Smi::decode(self.inner()).expect("GcSlot invariant violated")
     }

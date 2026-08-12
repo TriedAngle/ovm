@@ -1,17 +1,21 @@
 use std::sync::{Arc, Mutex, Weak};
 
+use core::cell::Cell;
 use core::ptr::NonNull;
 
 use vm::{AllocError, Handle, HandleData, HandleScope, Heap, InternedString};
 
 pub mod interner;
+pub mod natives;
 
 pub use interner::StringInterner;
+pub use natives::{EXCEPTION_SENTINEL, NativeFn, NativeIndex, NativeRegistry, VmError};
 
 pub struct SharedVM<H: Heap> {
     heap: H,
     threads: Mutex<Vec<Weak<ContextState>>>,
     interner: StringInterner,
+    natives: NativeRegistry<H>,
 }
 
 pub struct VM<H: Heap> {
@@ -26,6 +30,7 @@ pub struct Context<H: Heap> {
     vm: VM<H>,
     heap: H::Local,
     state: Arc<ContextState>,
+    pending_exception: Cell<Option<VmError>>,
 }
 
 unsafe impl Send for ContextState {}
@@ -46,6 +51,7 @@ impl<H: Heap> VM<H> {
                 heap: H::new(config)?,
                 threads: Mutex::new(Vec::new()),
                 interner: StringInterner::new(),
+                natives: NativeRegistry::new(),
             }),
         })
     }
@@ -56,6 +62,24 @@ impl<H: Heap> VM<H> {
 
     pub fn interner(&self) -> &StringInterner {
         &self.shared.interner
+    }
+
+    pub fn natives(&self) -> &NativeRegistry<H> {
+        &self.shared.natives
+    }
+
+    pub fn native(&self, index: NativeIndex) -> NativeFn<H> {
+        self.shared
+            .natives
+            .get(index)
+            .expect("unknown native index")
+    }
+
+    pub fn register_native(&mut self, f: NativeFn<H>) -> NativeIndex {
+        Arc::get_mut(&mut self.shared)
+            .expect("cannot register natives on a shared VM")
+            .natives
+            .insert(f)
     }
 
     pub fn attach(&self) -> Context<H> {
@@ -69,6 +93,7 @@ impl<H: Heap> VM<H> {
             vm: self.clone(),
             heap: self.shared.heap.new_local(),
             state,
+            pending_exception: Cell::new(None),
         }
     }
 
@@ -101,6 +126,20 @@ impl<H: Heap> Context<H> {
         s: impl AsRef<str>,
     ) -> Handle<'s, InternedString> {
         self.vm.interner().intern(&mut self.heap, scope, s)
+    }
+
+    /// Record a pending exception (set by failing natives; consumed by
+    /// the interpreter's exception path).
+    pub fn set_pending_exception(&self, err: VmError) {
+        self.pending_exception.set(Some(err));
+    }
+
+    pub fn take_pending_exception(&self) -> Option<VmError> {
+        self.pending_exception.take()
+    }
+
+    pub fn has_pending_exception(&self) -> bool {
+        self.pending_exception.get().is_some()
     }
 
     pub fn handle_scope<R>(

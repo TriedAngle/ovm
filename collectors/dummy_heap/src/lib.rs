@@ -3,7 +3,7 @@ use core::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use vm::{AllocError, GcSlot, LocalHeap, RootVisitor, Heap, Value, Word};
+use vm::{AllocError, GcSlot, Heap, LocalHeap, RootVisitor, Value, Word};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DummyHeapConfig {
@@ -213,11 +213,11 @@ mod tests {
         heap.allocate_raw(Layout::new::<u64>()).unwrap();
     }
 
-    use vm::{Array, ByteArray, HandleData, HandleScope, HeapObject, Smi};
     use vm::{
         AccessorPair, HeapPtr, Lookup, Map, ObjectKind, SlotFlags, SlotName, SlotsObject, Tagged,
         Value,
     };
+    use vm::{Array, ByteArray, HandleData, HandleScope, HeapObject, Smi};
 
     fn scope(data: &HandleData) -> HandleScope<'_> {
         unsafe { HandleScope::from_raw(NonNull::from(data)) }
@@ -230,7 +230,9 @@ mod tests {
         value_slots: usize,
         descs: &[(i64, SlotFlags, Value)],
     ) -> Tagged<Map> {
-        let ptr = heap.allocate::<Map>(Map::layout_for(descs.len())).into_ptr();
+        let ptr = heap
+            .allocate::<Map>(Map::layout_for(descs.len()))
+            .into_ptr();
         let map = unsafe { ptr.as_ref() };
         map.kind.set(heap, map.erase(), kind.to_smi());
         map.value_slot_count
@@ -240,19 +242,25 @@ mod tests {
         for (i, (name, flags, value)) in descs.iter().enumerate() {
             let d = map.descriptor(i);
             d.name.set(heap, map.erase(), smi_name(*name).tagged());
-            d.flags.set(heap, map.erase(), Smi::new_unchecked(flags.bits() as i64));
+            d.flags
+                .set(heap, map.erase(), Smi::new_unchecked(flags.bits() as i64));
             d.value.set(heap, map.erase(), Tagged::from_value(*value));
         }
         Tagged::from_ptr(ptr)
     }
 
-    fn alloc_slots_obj(heap: &mut DummyLocalHeap, map: Tagged<Map>, values: &[Value]) -> HeapPtr<SlotsObject> {
+    fn alloc_slots_obj(
+        heap: &mut DummyLocalHeap,
+        map: Tagged<Map>,
+        values: &[Value],
+    ) -> HeapPtr<SlotsObject> {
         let ptr = heap
             .allocate::<SlotsObject>(SlotsObject::layout_for(values.len()))
             .into_ptr();
         let obj = unsafe { ptr.as_ref() };
         obj.header.map.set(heap, obj.erase(), map);
-        obj.size.set(heap, obj.erase(), Smi::new_unchecked(values.len() as i64));
+        obj.size
+            .set(heap, obj.erase(), Smi::new_unchecked(values.len() as i64));
         for (i, v) in values.iter().enumerate() {
             obj.slot(i).set(heap, obj.erase(), Tagged::from_value(*v));
         }
@@ -277,21 +285,38 @@ mod tests {
         let mut heap = local(1 << 16);
 
         // parent: smi(3) = const 99
-        let parent_map = alloc_map(&mut heap, ObjectKind::SlotsObject, 0, &[
-            (3, SlotFlags::CONST, Smi::new_unchecked(99).encode()),
-        ]);
+        let parent_map = alloc_map(
+            &mut heap,
+            ObjectKind::SlotsObject,
+            0,
+            &[(3, SlotFlags::CONST, Smi::new_unchecked(99).encode())],
+        );
         let parent = alloc_slots_obj(&mut heap, parent_map, &[]);
 
         // child: smi(1) = value slot 0, smi(2) = const 42, parent at value slot 1
-        let child_map = alloc_map(&mut heap, ObjectKind::SlotsObject, 2, &[
-            (1, SlotFlags::VALUE.union(SlotFlags::WRITABLE), Smi::new_unchecked(0).encode()),
-            (2, SlotFlags::CONST, Smi::new_unchecked(42).encode()),
-            (999, SlotFlags::VALUE.union(SlotFlags::PARENT), Smi::new_unchecked(1).encode()),
-        ]);
-        let child = alloc_slots_obj(&mut heap, child_map, &[
-            Smi::new_unchecked(7).encode(),
-            parent.encode_strong(),
-        ]);
+        let child_map = alloc_map(
+            &mut heap,
+            ObjectKind::SlotsObject,
+            2,
+            &[
+                (
+                    1,
+                    SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                    Smi::new_unchecked(0).encode(),
+                ),
+                (2, SlotFlags::CONST, Smi::new_unchecked(42).encode()),
+                (
+                    999,
+                    SlotFlags::VALUE.union(SlotFlags::PARENT),
+                    Smi::new_unchecked(1).encode(),
+                ),
+            ],
+        );
+        let child = alloc_slots_obj(
+            &mut heap,
+            child_map,
+            &[Smi::new_unchecked(7).encode(), parent.encode_strong()],
+        );
         let child = unsafe { child.as_ref() };
 
         heap.no_gc(|nogc, _| {
@@ -307,25 +332,48 @@ mod tests {
         let mut heap = local(1 << 16);
 
         // parent A: smi(3) = const 10; parent B: smi(3) = const 20
-        let map_a = alloc_map(&mut heap, ObjectKind::SlotsObject, 0, &[
-            (3, SlotFlags::CONST, Smi::new_unchecked(10).encode()),
-        ]);
+        let map_a = alloc_map(
+            &mut heap,
+            ObjectKind::SlotsObject,
+            0,
+            &[(3, SlotFlags::CONST, Smi::new_unchecked(10).encode())],
+        );
         let parent_a = alloc_slots_obj(&mut heap, map_a, &[]);
-        let map_b = alloc_map(&mut heap, ObjectKind::SlotsObject, 0, &[
-            (3, SlotFlags::CONST, Smi::new_unchecked(20).encode()),
-        ]);
+        let map_b = alloc_map(
+            &mut heap,
+            ObjectKind::SlotsObject,
+            0,
+            &[(3, SlotFlags::CONST, Smi::new_unchecked(20).encode())],
+        );
         let parent_b = alloc_slots_obj(&mut heap, map_b, &[]);
 
         // child: two named parents at slots 1 and 2
-        let child_map = alloc_map(&mut heap, ObjectKind::SlotsObject, 3, &[
-            (100, SlotFlags::VALUE.union(SlotFlags::PARENT), Smi::new_unchecked(1).encode()),
-            (101, SlotFlags::VALUE.union(SlotFlags::PARENT), Smi::new_unchecked(2).encode()),
-        ]);
-        let child = alloc_slots_obj(&mut heap, child_map, &[
-            Smi::new_unchecked(0).encode(),
-            parent_a.encode_strong(),
-            parent_b.encode_strong(),
-        ]);
+        let child_map = alloc_map(
+            &mut heap,
+            ObjectKind::SlotsObject,
+            3,
+            &[
+                (
+                    100,
+                    SlotFlags::VALUE.union(SlotFlags::PARENT),
+                    Smi::new_unchecked(1).encode(),
+                ),
+                (
+                    101,
+                    SlotFlags::VALUE.union(SlotFlags::PARENT),
+                    Smi::new_unchecked(2).encode(),
+                ),
+            ],
+        );
+        let child = alloc_slots_obj(
+            &mut heap,
+            child_map,
+            &[
+                Smi::new_unchecked(0).encode(),
+                parent_a.encode_strong(),
+                parent_b.encode_strong(),
+            ],
+        );
         let child = unsafe { child.as_ref() };
 
         heap.no_gc(|nogc, _| {
@@ -342,23 +390,32 @@ mod tests {
             .allocate::<AccessorPair>(Layout::new::<AccessorPair>())
             .into_ptr();
         let pair = unsafe { pair_ptr.as_ref() };
-        pair.get.set(&heap, pair.erase(), Tagged::from_value(Smi::new_unchecked(111).encode()));
-        pair.set.set(&heap, pair.erase(), Tagged::from_value(Smi::new_unchecked(222).encode()));
+        pair.get.set(
+            &heap,
+            pair.erase(),
+            Tagged::from_value(Smi::new_unchecked(111).encode()),
+        );
+        pair.set.set(
+            &heap,
+            pair.erase(),
+            Tagged::from_value(Smi::new_unchecked(222).encode()),
+        );
 
-        let map = alloc_map(&mut heap, ObjectKind::SlotsObject, 0, &[
-            (5, SlotFlags::ACCESSOR, pair_ptr.encode_strong()),
-        ]);
+        let map = alloc_map(
+            &mut heap,
+            ObjectKind::SlotsObject,
+            0,
+            &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
+        );
         let obj = alloc_slots_obj(&mut heap, map, &[]);
         let obj = unsafe { obj.as_ref() };
 
-        heap.no_gc(|nogc, _| {
-            match obj.lookup(nogc, smi_name(5)) {
-                Lookup::Accessor { pair, .. } => {
-                    assert_eq!(Smi::decode(pair.get.get().erase()).unwrap().value(), 111);
-                    assert_eq!(Smi::decode(pair.set.get().erase()).unwrap().value(), 222);
-                }
-                _ => panic!("expected accessor lookup result"),
+        heap.no_gc(|nogc, _| match obj.lookup(nogc, smi_name(5)) {
+            Lookup::Accessor { pair, .. } => {
+                assert_eq!(Smi::decode(pair.get.get().erase()).unwrap().value(), 111);
+                assert_eq!(Smi::decode(pair.set.get().erase()).unwrap().value(), 222);
             }
+            _ => panic!("expected accessor lookup result"),
         });
     }
 

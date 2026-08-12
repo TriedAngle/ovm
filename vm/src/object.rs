@@ -1,8 +1,11 @@
-use core::{alloc::Layout, cell::UnsafeCell};
+use core::{
+    alloc::Layout,
+    cell::{Cell, UnsafeCell},
+};
 
 use crate::{
     EdgeVisitable, GcSlot, HeapRef, LocalHeap, NoGc, RootVisitor, Smi, Tagged, Value, Word,
-    value::{STRONG_PTR, WEAK_PTR}
+    value::{STRONG_PTR, WEAK_PTR},
 };
 
 pub trait HeapObject: 'static {
@@ -49,6 +52,7 @@ pub enum ObjectKind {
     SlotsObject,
     CallableObject,
     AccessorPair,
+    Float,
 }
 
 impl ObjectKind {
@@ -62,6 +66,7 @@ impl ObjectKind {
             5 => Self::SlotsObject,
             6 => Self::CallableObject,
             7 => Self::AccessorPair,
+            8 => Self::Float,
             _ => return None,
         })
     }
@@ -75,7 +80,7 @@ impl ObjectKind {
 pub struct Map {
     pub header: Header,
     /// ObjectKind
-    pub kind: GcSlot<Smi>,           
+    pub kind: GcSlot<Smi>,
     pub value_slot_count: GcSlot<Smi>,
     pub descriptor_count: GcSlot<Smi>,
     pub descriptors: [SlotDescriptor; 0],
@@ -83,8 +88,8 @@ pub struct Map {
 
 impl Map {
     pub fn layout_for(descriptor_count: usize) -> Layout {
-        let descriptors_layout = Layout::array::<SlotDescriptor>(descriptor_count)
-            .expect("descriptors layout");
+        let descriptors_layout =
+            Layout::array::<SlotDescriptor>(descriptor_count).expect("descriptors layout");
         Layout::new::<Self>()
             .extend(descriptors_layout)
             .expect("map layout")
@@ -116,7 +121,12 @@ impl Map {
         unsafe { &*self.data_ptr().add(i) }
     }
 
-    pub fn lookup<'a>(&'a self, guard: &'a NoGc<'a>, obj: HeapRef<'a, SlotsObject>, name: SlotName) -> Lookup<'a> {
+    pub fn lookup<'a>(
+        &'a self,
+        guard: &'a NoGc<'a>,
+        obj: HeapRef<'a, SlotsObject>,
+        name: SlotName,
+    ) -> Lookup<'a> {
         for (index, d) in self.descriptors().iter().enumerate() {
             if !d.flags().is_parent() && d.name() == name {
                 return match d.flags().kind() {
@@ -126,7 +136,11 @@ impl Map {
                         holder_index: d.offset(),
                         value: d.read(obj.as_ref()),
                     },
-                    SlotKind::Const => Lookup::Const { holder: obj, map_index: index, value: d.read(obj.as_ref()) },
+                    SlotKind::Const => Lookup::Const {
+                        holder: obj,
+                        map_index: index,
+                        value: d.read(obj.as_ref()),
+                    },
                     SlotKind::Accessor => Lookup::Accessor {
                         holder: obj,
                         map_index: index,
@@ -138,7 +152,9 @@ impl Map {
 
         for d in self.descriptors() {
             if d.flags().is_parent() {
-                let parent = unsafe { guard.get_unchecked::<SlotsObject>(d.slot(obj.as_ref()).get().cast_unchecked()) };
+                let parent = unsafe {
+                    guard.get_unchecked::<SlotsObject>(d.slot(obj.as_ref()).get().cast_unchecked())
+                };
                 let result = parent.as_ref().lookup(guard, name);
                 if !matches!(result, Lookup::NotFound) {
                     return result;
@@ -149,10 +165,18 @@ impl Map {
         Lookup::NotFound
     }
 
-    pub fn lookup_parent<'a>(&'a self, guard: &'a NoGc<'a>, obj: HeapRef<'a, SlotsObject>, name: SlotName, parent: SlotName) -> Lookup<'a> {
+    pub fn lookup_parent<'a>(
+        &'a self,
+        guard: &'a NoGc<'a>,
+        obj: HeapRef<'a, SlotsObject>,
+        name: SlotName,
+        parent: SlotName,
+    ) -> Lookup<'a> {
         match self.find_parent(parent) {
             Some(d) => {
-                let parent = unsafe { guard.get_unchecked::<SlotsObject>(d.slot(obj.as_ref()).get().cast_unchecked()) };
+                let parent = unsafe {
+                    guard.get_unchecked::<SlotsObject>(d.slot(obj.as_ref()).get().cast_unchecked())
+                };
                 parent.as_ref().lookup(guard, name)
             }
             None => Lookup::NotFound,
@@ -266,7 +290,9 @@ impl SlotDescriptor {
     }
 
     pub fn offset(&self) -> usize {
-        Smi::decode(self.value.inner()).expect("slot offset").value() as usize
+        Smi::decode(self.value.inner())
+            .expect("slot offset")
+            .value() as usize
     }
 
     pub fn slot<'s>(&'s self, obj: &'s SlotsObject) -> &'s GcSlot {
@@ -319,7 +345,8 @@ impl Array {
     }
 
     pub fn set(&self, heap: &impl LocalHeap, i: usize, v: Value) {
-        self.element_slot(i).set(heap, self.erase(), Tagged::from_value(v));
+        self.element_slot(i)
+            .set(heap, self.erase(), Tagged::from_value(v));
     }
 }
 
@@ -384,10 +411,9 @@ impl ByteArray {
         unsafe { core::slice::from_raw_parts_mut(self.data_ptr(), self.len()) }
     }
 
-    /// Initialize a freshly allocated bytearray: set its length and copy
-    /// `bytes` into it. Must be allocated with `layout_for(bytes.len())`.
     pub fn init(&self, heap: &impl LocalHeap, bytes: &[u8]) {
-        self.size.set(heap, self.erase(), Smi::new_unchecked(bytes.len() as i64));
+        self.size
+            .set(heap, self.erase(), Smi::new_unchecked(bytes.len() as i64));
         unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data_ptr(), bytes.len()) };
     }
 }
@@ -409,10 +435,10 @@ impl EdgeVisitable for ByteArray {
 }
 
 #[repr(C)]
-pub struct VMString { 
+pub struct VMString {
     pub header: Header,
     pub backing: GcSlot<ByteArray>,
-    pub hash: GcSlot<Smi>
+    pub hash: GcSlot<Smi>,
 }
 
 impl VMString {
@@ -614,18 +640,44 @@ impl SlotsObject {
     }
 
     pub fn lookup<'a>(&'a self, guard: &'a NoGc<'a>, name: SlotName) -> Lookup<'a> {
-        guard.get(&self.header.map).as_ref().lookup(guard, HeapRef::from_ref(self), name)
+        guard
+            .get(&self.header.map)
+            .as_ref()
+            .lookup(guard, HeapRef::from_ref(self), name)
     }
 
-    pub fn lookup_parent<'a>(&'a self, guard: &'a NoGc<'a>, name: SlotName, parent: SlotName) -> Lookup<'a> {
-        guard.get(&self.header.map).as_ref().lookup_parent(guard, HeapRef::from_ref(self), name, parent)
+    pub fn lookup_parent<'a>(
+        &'a self,
+        guard: &'a NoGc<'a>,
+        name: SlotName,
+        parent: SlotName,
+    ) -> Lookup<'a> {
+        guard.get(&self.header.map).as_ref().lookup_parent(
+            guard,
+            HeapRef::from_ref(self),
+            name,
+            parent,
+        )
     }
 }
 
 pub enum Lookup<'a> {
-    Data { holder: HeapRef<'a, SlotsObject>, map_index: usize, holder_index: usize, value: Value },
-    Const { holder: HeapRef<'a, SlotsObject>, map_index: usize, value: Value },
-    Accessor { holder: HeapRef<'a, SlotsObject>, map_index: usize, pair: HeapRef<'a, AccessorPair> },
+    Data {
+        holder: HeapRef<'a, SlotsObject>,
+        map_index: usize,
+        holder_index: usize,
+        value: Value,
+    },
+    Const {
+        holder: HeapRef<'a, SlotsObject>,
+        map_index: usize,
+        value: Value,
+    },
+    Accessor {
+        holder: HeapRef<'a, SlotsObject>,
+        map_index: usize,
+        pair: HeapRef<'a, AccessorPair>,
+    },
     NotFound,
 }
 
@@ -712,5 +764,28 @@ impl AsRef<str> for InternedString {
 impl AsRef<str> for Symbol {
     fn as_ref(&self) -> &str {
         self.as_str().expect("symbol must be valid utf8")
+    }
+}
+
+/// A boxed f64.
+#[repr(C)]
+pub struct Float {
+    pub header: Header,
+    pub value: Cell<f64>,
+}
+
+impl HeapObject for Float {
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::new::<Self>()
+    }
+}
+
+impl EdgeVisitable for Float {
+    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+        visitor.visit_slot(self.header.map.ereased());
     }
 }

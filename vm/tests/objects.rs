@@ -6,13 +6,17 @@ fn slot_flags_kind_decoding() {
     assert_eq!(SlotFlags::CONST.kind(), SlotKind::Const);
     assert_eq!(SlotFlags::ACCESSOR.kind(), SlotKind::Accessor);
     // attribute bits don't disturb the kind
-    let f = SlotFlags::CONST.union(SlotFlags::WRITABLE).union(SlotFlags::ENUMERABLE);
+    let f = SlotFlags::CONST
+        .union(SlotFlags::WRITABLE)
+        .union(SlotFlags::ENUMERABLE);
     assert_eq!(f.kind(), SlotKind::Const);
 }
 
 #[test]
 fn slot_flags_attributes() {
-    let f = SlotFlags::VALUE.union(SlotFlags::WRITABLE).union(SlotFlags::ENUMERABLE);
+    let f = SlotFlags::VALUE
+        .union(SlotFlags::WRITABLE)
+        .union(SlotFlags::ENUMERABLE);
     assert!(!f.is_parent());
     assert!(f.is_writable());
     assert!(f.is_enumerable());

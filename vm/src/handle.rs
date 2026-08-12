@@ -1,6 +1,13 @@
-use core::{cell::{Cell, UnsafeCell}, marker::PhantomData,  ptr::NonNull};
+use core::{
+    cell::{Cell, UnsafeCell},
+    marker::PhantomData,
+    ptr::NonNull,
+};
 
-use crate::{GcSlot, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, PointerStrength, RootVisitor, Strong, Tagged, Value, Weak};
+use crate::{
+    GcSlot, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, PointerStrength, RootVisitor, Strong, Tagged,
+    Value, Weak,
+};
 
 pub struct Handle<'scope, T, R: PointerStrength = Strong> {
     location: NonNull<Value>,
@@ -159,15 +166,17 @@ impl<'d> HandleScope<'d> {
         }
     }
 
-    pub fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+    pub fn create_handle<T>(&self, value: Tagged<T>) -> Option<Handle<'_, T>> {
+        if value.is_weak_ptr() {
+            return None;
+        }
+        Some(unsafe { self.create_handle_unchecked(value) })
+    }
+
+    pub unsafe fn create_handle_unchecked<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
         let slot = unsafe { &*self.data.as_ptr() }.inner().allocate_slot();
         unsafe { *slot = value.erase() };
         Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
-    }
-
-    /// Create a strong handle for a heap pointer.
-    pub fn create_handle_from_ptr<T: HeapObject>(&self, ptr: HeapPtr<T>) -> Handle<'_, T> {
-        self.create_handle(Tagged::from_ptr(ptr))
     }
 
     pub fn escapable_scope<'a>(&'a mut self) -> EscapableHandleScope<'a, 'd> {

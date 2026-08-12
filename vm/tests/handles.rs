@@ -21,7 +21,7 @@ fn handle_scope(data: &HandleData) -> HandleScope<'_> {
 }
 
 fn smi_handle(scope: &HandleScope<'_>, v: i64) -> i64 {
-    let handle = scope.create_handle(Tagged::smi(v).unwrap());
+    let handle = scope.create_handle(Tagged::smi(v).unwrap()).unwrap();
     Smi::decode(handle.value()).unwrap().value()
 }
 
@@ -30,8 +30,8 @@ fn handles_read_back_their_values() {
     let data = HandleData::new();
     let scope = handle_scope(&data);
 
-    let a = scope.create_handle(Tagged::smi(42).unwrap());
-    let b = scope.create_handle(Tagged::smi(-7).unwrap());
+    let a = scope.create_handle(Tagged::smi(42).unwrap()).unwrap();
+    let b = scope.create_handle(Tagged::smi(-7).unwrap()).unwrap();
 
     assert_eq!(Smi::decode(a.value()).unwrap().value(), 42);
     assert_eq!(Smi::decode(b.value()).unwrap().value(), -7);
@@ -57,7 +57,7 @@ fn scope_tracks_nesting_level() {
 fn closed_scope_unroots_its_handles() {
     let data = HandleData::new();
     let outer = handle_scope(&data);
-    let keep = outer.create_handle(Tagged::smi(1).unwrap());
+    let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
 
     {
         let inner = handle_scope(&data);
@@ -88,7 +88,7 @@ fn reclaimed_slots_are_reused() {
         smi_handle(&scope, i * 100);
     }
     assert_eq!(root_count(&data), 5);
-    let fourth = scope.create_handle(Tagged::smi(400).unwrap());
+    let fourth = scope.create_handle(Tagged::smi(400).unwrap()).unwrap();
     assert_eq!(Smi::decode(fourth.value()).unwrap().value(), 400);
 }
 
@@ -99,7 +99,7 @@ fn blocks_extend_when_full() {
 
     let mut handles = Vec::new();
     for i in 0..1030 {
-        handles.push(scope.create_handle(Tagged::smi(i).unwrap()));
+        handles.push(scope.create_handle(Tagged::smi(i).unwrap()).unwrap());
     }
 
     assert_eq!(root_count(&data), 1030);
@@ -112,13 +112,13 @@ fn blocks_extend_when_full() {
 fn escaped_handle_survives_inner_scope() {
     let data = HandleData::new();
     let mut outer = handle_scope(&data);
-    let keep = outer.create_handle(Tagged::smi(1).unwrap());
+    let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
     assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
 
     let escaped = {
         let escapable = outer.escapable_scope();
-        let h = escapable.create_handle(Tagged::smi(2).unwrap());
-        escapable.create_handle(Tagged::smi(3).unwrap());
+        let h = escapable.create_handle(Tagged::smi(2).unwrap()).unwrap();
+        escapable.create_handle(Tagged::smi(3).unwrap()).unwrap();
         escapable.escape(h)
     };
 
@@ -130,13 +130,30 @@ fn escaped_handle_survives_inner_scope() {
 fn escapable_scope_closed_without_escape_reclaims() {
     let data = HandleData::new();
     let mut outer = handle_scope(&data);
-    let keep = outer.create_handle(Tagged::smi(1).unwrap());
+    let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
     assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
 
     {
         let escapable = outer.escapable_scope();
-        escapable.create_handle(Tagged::smi(2).unwrap());
+        escapable.create_handle(Tagged::smi(2).unwrap()).unwrap();
     }
 
     assert_eq!(root_count(&data), 2);
+}
+
+#[test]
+fn weak_pointers_cannot_be_handle_rooted() {
+    use vm::{Tagged, Value};
+    use vm::value::{STRONG_PTR, WEAK_PTR};
+
+    let data = HandleData::new();
+    let scope = handle_scope(&data);
+
+    // a weak-tagged pointer must not become a strong root
+    let weak = unsafe { Tagged::<Smi>::from_value_unchecked(Value::from_bits(0x1000 | WEAK_PTR)) };
+    assert!(scope.create_handle(weak).is_none());
+
+    // strong pointers and smis are fine
+    let strong = unsafe { Tagged::<Smi>::from_value_unchecked(Value::from_bits(0x1000 | STRONG_PTR)) };
+    assert!(scope.create_handle(strong).is_some());
 }

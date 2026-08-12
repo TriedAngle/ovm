@@ -1,17 +1,18 @@
+pub mod handle;
 pub mod heap;
 pub mod object;
 pub mod value;
-pub mod handle;
 
+pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope};
 pub use heap::{
-    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, HeapRef, LocalHeap, NoGc, RootVisitor, Heap,
-    WordType,
+    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, Heap, HeapRef, LocalHeap, NoGc,
+    RootVisitor, WeakGcCell, WordType,
 };
 pub use object::{
-    AccessorPair, Array, ByteArray, CallableObject, Header, HeapObject, Lookup, Map, ObjectKind,
-    SlotDescriptor, SlotFlags, SlotKind, SlotName, SlotsObject, Symbol, VMString, InternedString,
+    AccessorPair, Array, ByteArray, CallableObject, Float, Header, HeapObject, InternedString,
+    Lookup, Map, ObjectKind, SlotDescriptor, SlotFlags, SlotKind, SlotName, SlotsObject, Symbol,
+    VMString,
 };
-pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope};
 pub use value::{HeapPtr, PointerStrength, Smi, Strong, Tagged, Value, Weak, Word};
 
 pub type Local<'scope, T> = Handle<'scope, T, Strong>;

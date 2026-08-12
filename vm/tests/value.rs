@@ -191,10 +191,7 @@ mod debug {
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::<TestObj>::new_unchecked(raw) };
 
-        assert_eq!(
-            format!("{:?}", ptr),
-            format!("HeapPtr({:#x})", raw as u64)
-        );
+        assert_eq!(format!("{:?}", ptr), format!("HeapPtr({:#x})", raw as u64));
 
         unsafe { free_test_obj(raw) };
     }
@@ -247,7 +244,8 @@ mod tagged {
 
     #[test]
     fn as_ptr_rejects_smi_and_weak() {
-        let smi = unsafe { Tagged::<TestObj>::from_value_unchecked(Smi::new_unchecked(1).encode()) };
+        let smi =
+            unsafe { Tagged::<TestObj>::from_value_unchecked(Smi::new_unchecked(1).encode()) };
         assert!(smi.as_ptr().is_none());
 
         let raw = alloc_test_obj();

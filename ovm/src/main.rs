@@ -1,7 +1,10 @@
+use std::alloc::Layout;
+
 use bytecode::{Opcode, Operand, Scale};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
-use vm::{Array, LocalHeap};
+use ovm::natives::NativeIndex;
+use vm::{Array, Float, HeapObject, LocalHeap, Map, ObjectKind, Smi, Tagged, Value};
 
 fn main() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).expect("failed to create heap");
@@ -28,7 +31,40 @@ fn main() {
         vm.heap().used()
     );
 
-    // demo program: acc = 6 + 7
+    // natives demo
+    let float_map = {
+        let fresh = ctx.heap().allocate::<Map>(Map::layout_for(0));
+        let ptr = fresh.into_ptr();
+        let map = unsafe { ptr.as_ref() };
+        map.kind
+            .set(ctx.heap(), map.erase(), ObjectKind::Float.to_smi());
+        map.value_slot_count
+            .set(ctx.heap(), map.erase(), Smi::new_unchecked(0));
+        map.descriptor_count
+            .set(ctx.heap(), map.erase(), Smi::new_unchecked(0));
+        Tagged::from_ptr(ptr)
+    };
+
+    let receiver = Smi::new_unchecked(0).encode();
+    let result = vm.native(NativeIndex::SMI_ADD)(
+        &mut ctx,
+        &[
+            receiver,
+            Smi::new_unchecked(6).encode(),
+            Smi::new_unchecked(7).encode(),
+        ],
+    )
+    .expect("smi_add failed");
+    println!("smi_add(6, 7) = {}", Smi::decode(result).unwrap().value());
+
+    let fa = make_float(&mut ctx, float_map, 1.5);
+    let fb = make_float(&mut ctx, float_map, 2.25);
+    let result = vm.native(NativeIndex::FLOAT_ADD)(&mut ctx, &[receiver, fa, fb])
+        .expect("float_add failed");
+    let out = unsafe { vm::HeapPtr::<Float>::decode(result).unwrap().as_ref() };
+    println!("float_add(1.5, 2.25) = {}", out.value.get());
+
+    // return 6 + 7
     let mut program = Vec::new();
     emit(&mut program, Opcode::LoadSmi, &[6]);
     emit(&mut program, Opcode::Store, &[0]);
@@ -44,6 +80,15 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+fn make_float(ctx: &mut ovm::Context<DummyHeap>, map: Tagged<Map>, v: f64) -> Value {
+    let fresh = ctx.heap().allocate::<Float>(Layout::new::<Float>());
+    let ptr = fresh.into_ptr();
+    let fl = unsafe { ptr.as_ref() };
+    fl.header.map.set(ctx.heap(), fl.erase(), map);
+    fl.value.set(v);
+    ptr.encode_strong()
 }
 
 fn emit(code: &mut Vec<u8>, op: Opcode, operands: &[u32]) {

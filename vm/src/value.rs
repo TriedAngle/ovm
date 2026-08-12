@@ -49,6 +49,12 @@ impl Value {
     pub const fn is_weak_ptr(self) -> bool {
         self.0 & TAG_MASK == WEAK_PTR
     }
+
+    pub const CLEARED: Value = Value::from_bits(WEAK_PTR);
+
+    pub const fn is_cleared(self) -> bool {
+        self.0 == WEAK_PTR
+    }
 }
 
 impl core::fmt::Debug for Value {
@@ -106,9 +112,6 @@ impl Smi {
 /// because the GC may be moving this is NOT safe to dereference acroess GC safepoints.
 pub struct HeapPtr<T>(NonNull<T>);
 
-// A HeapPtr is just an address into the shared heap; moving or sharing it
-// across threads is fine. Dereferencing is the unsafe part and is governed
-// separately (no-GC scopes / unsafe).
 unsafe impl<T: HeapObject> Send for HeapPtr<T> {}
 unsafe impl<T: HeapObject> Sync for HeapPtr<T> {}
 
@@ -202,8 +205,8 @@ impl<T> core::fmt::Debug for Tagged<T> {
 }
 
 impl Tagged<Value> {
-    pub fn from_ereased(value: Value) -> Self { 
-        Self { 
+    pub fn from_ereased(value: Value) -> Self {
+        Self {
             raw: value,
             _phantom: PhantomData,
         }
