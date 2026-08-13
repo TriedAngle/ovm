@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::HeapObject;
+use crate::{HeapObject, HeapRef, SlotsObject};
 
 /// Word Size inside the heap
 /// if we add compressed pointers we may need to duplicate this
@@ -175,7 +175,6 @@ impl<T: HeapObject> HeapPtr<T> {
 }
 
 pub trait PointerStrength {}
-
 pub struct Strong;
 pub struct Weak;
 
@@ -294,4 +293,9 @@ impl<T: HeapObject> From<Tagged<T>> for HeapPtr<T> {
     fn from(v: Tagged<T>) -> Self {
         unsafe { HeapPtr::new_unchecked(v.erase().raw_addr() as *mut T) }
     }
+}
+
+pub enum ValueRef<'a> {
+    Smi(Smi),
+    Object(HeapRef<'a, SlotsObject>),
 }

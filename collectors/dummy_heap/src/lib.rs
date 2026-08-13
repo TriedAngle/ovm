@@ -1,9 +1,9 @@
 use core::alloc::Layout;
 use core::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use vm::{AllocError, GcSlot, Heap, LocalHeap, RootVisitor, Value, Word};
+use vm::{AllocError, GcSlot, Heap, LocalHeap, RootVisitor, Value, WellKnown, Word};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DummyHeapConfig {
@@ -22,6 +22,7 @@ pub struct DummyHeapState {
     start: NonNull<u8>,
     layout: Layout,
     offset: AtomicUsize,
+    known: OnceLock<WellKnown>,
 }
 
 unsafe impl Send for DummyHeapState {}
@@ -101,6 +102,7 @@ impl Heap for DummyHeap {
                 start,
                 layout,
                 offset: AtomicUsize::new(0),
+                known: OnceLock::new(),
             }),
         })
     }
@@ -109,6 +111,13 @@ impl Heap for DummyHeap {
         DummyLocalHeap {
             shared: Arc::clone(&self.inner),
         }
+    }
+
+    fn set_known(&self, known: WellKnown) {
+        assert!(
+            self.inner.known.set(known).is_ok(),
+            "well-known maps already installed"
+        );
     }
 
     fn iterate_roots(&self, _roots: &mut dyn RootVisitor) {
@@ -152,6 +161,13 @@ impl LocalHeap for DummyLocalHeap {
         self.shared.allocate(layout)
     }
 
+    fn known(&self) -> &WellKnown {
+        self.shared
+            .known
+            .get()
+            .expect("well-known maps not installed")
+    }
+
     fn write_barrier(&self, _host: Value, _slot: &GcSlot, _value: Value) {}
 
     fn collection_requested(&self) -> bool {
@@ -173,6 +189,14 @@ mod tests {
         DummyHeap::new(DummyHeapConfig { heap_size: size })
             .unwrap()
             .new_local()
+    }
+
+    /// A local heap with the well-known maps installed — required for
+    /// allocating object kinds whose map comes from `known()`.
+    fn local_with_maps(size: usize) -> DummyLocalHeap {
+        let heap = DummyHeap::new(DummyHeapConfig { heap_size: size }).unwrap();
+        heap.install_well_known_maps();
+        heap.new_local()
     }
 
     #[test]
@@ -214,39 +238,32 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, HeapPtr, Lookup, Map, ObjectKind, SlotFlags, SlotName, SlotsObject, Tagged,
-        Value,
+        AccessorPair, HeapPtr, Lookup, Map, MapInit, SlotFlags, SlotName, SlotsObject,
+        SlotsObjectInit, Tagged, Value,
     };
-    use vm::{Array, ByteArray, HandleData, HandleScope, HeapObject, Smi};
+    use vm::{Array, ByteArray, GcSlot, HandleData, HandleScope, Smi};
 
     fn scope(data: &HandleData) -> HandleScope<'_> {
         unsafe { HandleScope::from_raw(NonNull::from(data)) }
     }
 
     /// Allocate a map with descriptors given as (name smi, flags, payload).
+    /// The map's own map self-references; nothing in these tests reads it.
     fn alloc_map(
         heap: &mut DummyLocalHeap,
-        kind: ObjectKind,
         value_slots: usize,
         descs: &[(i64, SlotFlags, Value)],
     ) -> Tagged<Map> {
-        let ptr = heap
-            .allocate::<Map>(Map::layout_for(descs.len()))
-            .into_ptr();
-        let map = unsafe { ptr.as_ref() };
-        map.kind.set(heap, map.erase(), kind.to_smi());
-        map.value_slot_count
-            .set(heap, map.erase(), Smi::new_unchecked(value_slots as i64));
-        map.descriptor_count
-            .set(heap, map.erase(), Smi::new_unchecked(descs.len() as i64));
-        for (i, (name, flags, value)) in descs.iter().enumerate() {
-            let d = map.descriptor(i);
-            d.name.set(heap, map.erase(), smi_name(*name).tagged());
-            d.flags
-                .set(heap, map.erase(), Smi::new_unchecked(flags.bits() as i64));
-            d.value.set(heap, map.erase(), Tagged::from_value(*value));
-        }
-        Tagged::from_ptr(ptr)
+        let descriptors: Vec<(SlotName, SlotFlags, Value)> = descs
+            .iter()
+            .map(|(name, flags, value)| (smi_name(*name), *flags, *value))
+            .collect();
+        heap.allocate::<Map>(MapInit {
+            meta_map: None,
+            value_slot_count: value_slots,
+            descriptors: &descriptors,
+        })
+        .into_tagged()
     }
 
     fn alloc_slots_obj(
@@ -254,17 +271,8 @@ mod tests {
         map: Tagged<Map>,
         values: &[Value],
     ) -> HeapPtr<SlotsObject> {
-        let ptr = heap
-            .allocate::<SlotsObject>(SlotsObject::layout_for(values.len()))
-            .into_ptr();
-        let obj = unsafe { ptr.as_ref() };
-        obj.header.map.set(heap, obj.erase(), map);
-        obj.size
-            .set(heap, obj.erase(), Smi::new_unchecked(values.len() as i64));
-        for (i, v) in values.iter().enumerate() {
-            obj.slot(i).set(heap, obj.erase(), Tagged::from_value(*v));
-        }
-        ptr
+        heap.allocate::<SlotsObject>(SlotsObjectInit { map, values })
+            .into_ptr()
     }
 
     fn smi_name(n: i64) -> SlotName {
@@ -273,8 +281,8 @@ mod tests {
 
     fn expect_data(lookup: Lookup<'_>, expected: i64) {
         match lookup {
-            Lookup::Data { value, .. } | Lookup::Const { value, .. } => {
-                assert_eq!(Smi::decode(value).unwrap().value(), expected)
+            Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => {
+                assert_eq!(Smi::decode(slot.inner()).unwrap().value(), expected)
             }
             _ => panic!("expected data lookup result"),
         }
@@ -287,17 +295,15 @@ mod tests {
         // parent: smi(3) = const 99
         let parent_map = alloc_map(
             &mut heap,
-            ObjectKind::SlotsObject,
             0,
             &[(3, SlotFlags::CONST, Smi::new_unchecked(99).encode())],
         );
         let parent = alloc_slots_obj(&mut heap, parent_map, &[]);
 
-        // child: smi(1) = value slot 0, smi(2) = const 42, parent at value slot 1
+        // child: smi(1) = value slot 0, smi(2) = const 42, parent stored in the map
         let child_map = alloc_map(
             &mut heap,
-            ObjectKind::SlotsObject,
-            2,
+            1,
             &[
                 (
                     1,
@@ -307,23 +313,52 @@ mod tests {
                 (2, SlotFlags::CONST, Smi::new_unchecked(42).encode()),
                 (
                     999,
-                    SlotFlags::VALUE.union(SlotFlags::PARENT),
-                    Smi::new_unchecked(1).encode(),
+                    SlotFlags::CONST.union(SlotFlags::PARENT),
+                    parent.encode_strong(),
                 ),
             ],
         );
-        let child = alloc_slots_obj(
-            &mut heap,
-            child_map,
-            &[Smi::new_unchecked(7).encode(), parent.encode_strong()],
-        );
+        let child = alloc_slots_obj(&mut heap, child_map, &[Smi::new_unchecked(7).encode()]);
         let child = unsafe { child.as_ref() };
 
-        heap.no_gc(|nogc, _| {
-            expect_data(child.lookup(nogc, smi_name(1)), 7); // own inline slot
-            expect_data(child.lookup(nogc, smi_name(2)), 42); // const in map
-            expect_data(child.lookup(nogc, smi_name(3)), 99); // inherited via parent
-            assert!(matches!(child.lookup(nogc, smi_name(4)), Lookup::NotFound));
+        heap.no_gc(|nogc, heap| {
+            expect_data(child.lookup(nogc, heap, smi_name(1)), 7); // own inline slot
+            expect_data(child.lookup(nogc, heap, smi_name(2)), 42); // const in map
+            expect_data(child.lookup(nogc, heap, smi_name(3)), 99); // inherited via parent
+            assert!(matches!(
+                child.lookup(nogc, heap, smi_name(4)),
+                Lookup::NotFound
+            ));
+        });
+    }
+
+    #[test]
+    fn slot_lookup_dispatches_smi_and_object() {
+        let mut heap = local_with_maps(1 << 16);
+
+        let map = alloc_map(
+            &mut heap,
+            1,
+            &[(
+                1,
+                SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                Smi::new_unchecked(0).encode(),
+            )],
+        );
+        let obj = alloc_slots_obj(&mut heap, map, &[Smi::new_unchecked(7).encode()]);
+
+        heap.no_gc(|nogc, heap| {
+            // smi receiver: looks up in the (descriptor-less) smi map
+            // Safety: scratch stack slots, only read inside this no-GC scope.
+            let smi = unsafe { GcSlot::from_value(Smi::new_unchecked(42).encode()) };
+            assert!(matches!(
+                smi.lookup(nogc, heap, smi_name(1)),
+                Lookup::NotFound
+            ));
+            // object receiver: same result as the typed entry point
+            // Safety: scratch stack slot, only read inside this no-GC scope.
+            let obj_slot = unsafe { GcSlot::from_value(obj.encode_strong()) };
+            expect_data(obj_slot.lookup(nogc, heap, smi_name(1)), 7);
         });
     }
 
@@ -334,83 +369,63 @@ mod tests {
         // parent A: smi(3) = const 10; parent B: smi(3) = const 20
         let map_a = alloc_map(
             &mut heap,
-            ObjectKind::SlotsObject,
             0,
             &[(3, SlotFlags::CONST, Smi::new_unchecked(10).encode())],
         );
         let parent_a = alloc_slots_obj(&mut heap, map_a, &[]);
         let map_b = alloc_map(
             &mut heap,
-            ObjectKind::SlotsObject,
             0,
             &[(3, SlotFlags::CONST, Smi::new_unchecked(20).encode())],
         );
         let parent_b = alloc_slots_obj(&mut heap, map_b, &[]);
 
-        // child: two named parents at slots 1 and 2
+        // child: two named parents, both stored in the map
         let child_map = alloc_map(
             &mut heap,
-            ObjectKind::SlotsObject,
-            3,
+            0,
             &[
                 (
                     100,
-                    SlotFlags::VALUE.union(SlotFlags::PARENT),
-                    Smi::new_unchecked(1).encode(),
+                    SlotFlags::CONST.union(SlotFlags::PARENT),
+                    parent_a.encode_strong(),
                 ),
                 (
                     101,
-                    SlotFlags::VALUE.union(SlotFlags::PARENT),
-                    Smi::new_unchecked(2).encode(),
+                    SlotFlags::CONST.union(SlotFlags::PARENT),
+                    parent_b.encode_strong(),
                 ),
             ],
         );
-        let child = alloc_slots_obj(
-            &mut heap,
-            child_map,
-            &[
-                Smi::new_unchecked(0).encode(),
-                parent_a.encode_strong(),
-                parent_b.encode_strong(),
-            ],
-        );
+        let child = alloc_slots_obj(&mut heap, child_map, &[]);
         let child = unsafe { child.as_ref() };
 
-        heap.no_gc(|nogc, _| {
-            expect_data(child.lookup(nogc, smi_name(3)), 10); // default: first parent
-            expect_data(child.lookup_parent(nogc, smi_name(3), smi_name(101)), 20); // directed
+        heap.no_gc(|nogc, heap| {
+            expect_data(child.lookup(nogc, heap, smi_name(3)), 10); // default: first parent
+            expect_data(child.lookup_parent(nogc, heap, smi_name(3), smi_name(101)), 20); // directed
         });
     }
 
     #[test]
     fn lookup_returns_accessor_pair() {
-        let mut heap = local(1 << 16);
+        let mut heap = local_with_maps(1 << 16);
 
         let pair_ptr = heap
-            .allocate::<AccessorPair>(Layout::new::<AccessorPair>())
+            .allocate::<AccessorPair>((
+                Smi::new_unchecked(111).encode(),
+                Smi::new_unchecked(222).encode(),
+            ))
             .into_ptr();
-        let pair = unsafe { pair_ptr.as_ref() };
-        pair.get.set(
-            &heap,
-            pair.erase(),
-            Tagged::from_value(Smi::new_unchecked(111).encode()),
-        );
-        pair.set.set(
-            &heap,
-            pair.erase(),
-            Tagged::from_value(Smi::new_unchecked(222).encode()),
-        );
 
         let map = alloc_map(
             &mut heap,
-            ObjectKind::SlotsObject,
             0,
             &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
         );
         let obj = alloc_slots_obj(&mut heap, map, &[]);
         let obj = unsafe { obj.as_ref() };
 
-        heap.no_gc(|nogc, _| match obj.lookup(nogc, smi_name(5)) {
+        heap.no_gc(|nogc, heap| match obj.lookup(nogc, heap, smi_name(5)) {
             Lookup::Accessor { pair, .. } => {
                 assert_eq!(Smi::decode(pair.get.get().erase()).unwrap().value(), 111);
                 assert_eq!(Smi::decode(pair.set.get().erase()).unwrap().value(), 222);
@@ -421,7 +436,7 @@ mod tests {
 
     #[test]
     fn token_bulk_allocates_and_tracks_remaining() {
-        let mut heap = local(1 << 16);
+        let mut heap = local_with_maps(1 << 16);
         let la = Array::layout_for(2);
         let lb = ByteArray::layout_for(8);
         let total = Layout::from_size_align(la.size() + lb.size(), 16).unwrap();
@@ -429,18 +444,20 @@ mod tests {
         {
             let tok = heap.allocate_token(total);
             assert_eq!(tok.remaining(), la.size() + lb.size());
-            let a = tok.allocate::<Array>(la);
-            let b = tok.allocate::<ByteArray>(lb);
+            let a = tok.allocate::<Array>(&[Value::from_bits(0); 2]);
+            let b = tok.allocate::<ByteArray>(&[0u8; 8]);
             assert_ne!(a.as_ptr() as *mut u8, b.as_ptr() as *mut u8);
             assert_eq!(tok.remaining(), 0);
         }
-        assert_eq!(heap.shared().used(), before + la.size() + lb.size());
+        // the token region starts 16-aligned, so account for the padding
+        let start = before.next_multiple_of(16);
+        assert_eq!(heap.shared().used(), start + la.size() + lb.size());
     }
 
     #[test]
     fn token_handles_outlive_the_token() {
-        let mut heap = local(1 << 16);
-        let data = HandleData::new();
+        let mut heap = local_with_maps(1 << 16);
+        let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let la = Array::layout_for(2);
         let lb = ByteArray::layout_for(8);
@@ -448,8 +465,8 @@ mod tests {
 
         let (ha, hb) = {
             let tok = heap.allocate_token(total);
-            let ha = tok.allocate::<Array>(la).into_handle(&scope);
-            let hb = tok.allocate::<ByteArray>(lb).into_handle(&scope);
+            let ha = tok.allocate::<Array>(&[Value::from_bits(0); 2]).into_handle(&scope);
+            let hb = tok.allocate::<ByteArray>(&[0u8; 8]).into_handle(&scope);
             (ha, hb)
         }; // token dropped here (full use verified)
 
@@ -461,16 +478,16 @@ mod tests {
 
     #[test]
     fn token_fresh_allocations_coexist_and_promote() {
-        let mut heap = local(1 << 16);
-        let data = HandleData::new();
+        let mut heap = local_with_maps(1 << 16);
+        let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let la = Array::layout_for(1);
         let total = Layout::from_size_align(2 * la.size(), 16).unwrap();
 
         let tok = heap.allocate_token(total);
         // multiple Fresh alive at once (shared borrows of the token)
-        let a = tok.allocate::<Array>(la);
-        let b = tok.allocate::<Array>(la);
+        let a = tok.allocate::<Array>(&[Value::from_bits(0)]);
+        let b = tok.allocate::<Array>(&[Value::from_bits(0)]);
         let ha = a.into_handle(&scope);
         let hb = b.into_handle(&scope);
         assert_ne!(ha.value().to_bits(), hb.value().to_bits());
@@ -478,16 +495,14 @@ mod tests {
 
     #[test]
     fn token_enter_no_gc_allocates_refs() {
-        let mut heap = local(1 << 16);
+        let mut heap = local_with_maps(1 << 16);
         let lb = ByteArray::layout_for(8);
         let total = Layout::from_size_align(2 * lb.size(), 16).unwrap();
 
         let tok = heap.allocate_token(total);
-        tok.enter_no_gc(|nogc, heap| {
-            let a = tok.allocate_ref::<ByteArray>(lb, nogc);
-            let b = tok.allocate_ref::<ByteArray>(lb, nogc);
-            a.size.set(heap, a.erase(), Smi::new_unchecked(8));
-            b.size.set(heap, b.erase(), Smi::new_unchecked(8));
+        tok.enter_no_gc(|nogc, _heap| {
+            let a = tok.allocate_ref::<ByteArray>(&[0u8; 8], nogc);
+            let b = tok.allocate_ref::<ByteArray>(&[0u8; 8], nogc);
             a.set(0, 1);
             b.set(0, 42);
             b.set(1, 7);
@@ -499,12 +514,11 @@ mod tests {
 
     #[test]
     fn allocate_token_enter_no_gc_combines_both() {
-        let mut heap = local(1 << 16);
+        let mut heap = local_with_maps(1 << 16);
         let lb = ByteArray::layout_for(4);
         let total = Layout::from_size_align(lb.size(), 16).unwrap();
-        heap.allocate_token_enter_nogc(total, |tok, nogc, heap| {
-            let a = tok.allocate_ref::<ByteArray>(lb, nogc);
-            a.size.set(heap, a.erase(), Smi::new_unchecked(4));
+        heap.allocate_token_enter_nogc(total, |tok, nogc, _heap| {
+            let a = tok.allocate_ref::<ByteArray>(&[0u8; 4], nogc);
             a.set(0, 1);
             assert_eq!(a.get(0), 1);
         });
@@ -512,13 +526,8 @@ mod tests {
 
     #[test]
     fn allocate_enter_no_gc_gives_ref_instantly() {
-        let mut heap = local(1 << 16);
-        heap.allocate_enter_nogc::<ByteArray, _>(ByteArray::layout_for(4), |bytes, _nogc, heap| {
-            bytes.size.set(heap, bytes.erase(), Smi::new_unchecked(4));
-            bytes.set(0, 1);
-            bytes.set(1, 2);
-            bytes.set(2, 3);
-            bytes.set(3, 4);
+        let mut heap = local_with_maps(1 << 16);
+        heap.allocate_enter_nogc::<ByteArray, _>(&[1u8, 2, 3, 4], |bytes, _nogc, _heap| {
             assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
         });
     }
@@ -526,19 +535,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "allocation token dropped")]
     fn token_drop_requires_full_use() {
-        let mut heap = local(1 << 16);
+        let mut heap = local_with_maps(1 << 16);
         let total = Layout::from_size_align(4096, 16).unwrap();
         let tok = heap.allocate_token(total);
-        tok.allocate::<ByteArray>(ByteArray::layout_for(4));
+        let _ = tok.allocate::<ByteArray>(&[0u8; 4]);
         // dropped with most of the reservation unused
     }
 
     #[test]
     #[should_panic(expected = "allocation token exhausted")]
     fn token_allocate_checks_capacity() {
-        let mut heap = local(1 << 16);
+        let mut heap = local_with_maps(1 << 16);
         let total = Layout::from_size_align(64, 16).unwrap();
         let tok = heap.allocate_token(total);
-        tok.allocate::<ByteArray>(ByteArray::layout_for(4096));
+        let _ = tok.allocate::<ByteArray>(&[0u8; 4096]);
     }
 }

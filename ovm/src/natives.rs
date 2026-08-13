@@ -1,6 +1,4 @@
-use core::alloc::Layout;
-
-use vm::{Float, HeapRef, LocalHeap, NoGc, ObjectKind, Smi, Tagged, Value};
+use vm::{Float, LocalHeap, Smi, Value};
 
 use crate::{Context, Heap};
 
@@ -96,23 +94,11 @@ fn float_add<H: Heap>(ctx: &mut Context<H>, args: &[Value]) -> Result<Value, VmE
         [_, a, b] => (*a, *b),
         _ => return Err(VmError::Arity),
     };
-    ctx.heap()
-        .allocate_enter_nogc::<Float, _>(Layout::new::<Float>(), |out, nogc, _| {
-            let fa = float_ref(nogc, a)?;
-            let fb = float_ref(nogc, b)?;
-            out.value.set(fa.value.get() + fb.value.get());
-            Ok(out.into_tagged().erase())
-        })
-}
-
-fn float_ref<'a>(nogc: &'a NoGc<'a>, v: Value) -> Result<HeapRef<'a, Float>, VmError> {
-    if !v.is_ptr() {
-        return Err(VmError::Type);
-    }
-    let r = unsafe { nogc.get_unchecked::<Float>(Tagged::from_value_unchecked(v)) };
-    let map = nogc.get(&r.as_ref().header.map);
-    if map.as_ref().object_kind() != ObjectKind::Float {
-        return Err(VmError::Type);
-    }
-    Ok(r)
+    let sum = ctx.heap().no_gc(|nogc, heap| {
+        let float_map = heap.known().float_map;
+        let fa = nogc.get_as::<Float>(a, float_map).ok_or(VmError::Type)?;
+        let fb = nogc.get_as::<Float>(b, float_map).ok_or(VmError::Type)?;
+        Ok(fa.value.get() + fb.value.get())
+    })?;
+    Ok(ctx.heap().allocate::<Float>(sum).erase())
 }

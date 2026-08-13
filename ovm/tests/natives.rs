@@ -1,31 +1,10 @@
-use core::alloc::Layout;
-
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::natives::{EXCEPTION_SENTINEL, NativeIndex, native_trampoline};
 use ovm::{Context, VM, VmError};
-use vm::{Float, HeapObject, HeapPtr, LocalHeap, Map, ObjectKind, Smi, Tagged, Value};
+use vm::{Float, LocalHeap, Smi, Value};
 
-fn make_float_map(ctx: &mut Context<DummyHeap>) -> Tagged<Map> {
-    let ptr = ctx.heap().allocate::<Map>(Map::layout_for(0)).into_ptr();
-    let map = unsafe { ptr.as_ref() };
-    map.kind
-        .set(ctx.heap(), map.erase(), ObjectKind::Float.to_smi());
-    map.value_slot_count
-        .set(ctx.heap(), map.erase(), Smi::new_unchecked(0));
-    map.descriptor_count
-        .set(ctx.heap(), map.erase(), Smi::new_unchecked(0));
-    Tagged::from_ptr(ptr)
-}
-
-fn make_float(ctx: &mut Context<DummyHeap>, map: Tagged<Map>, v: f64) -> Value {
-    let ptr = ctx
-        .heap()
-        .allocate::<Float>(Layout::new::<Float>())
-        .into_ptr();
-    let fl = unsafe { ptr.as_ref() };
-    fl.header.map.set(ctx.heap(), fl.erase(), map);
-    fl.value.set(v);
-    ptr.encode_strong()
+fn float(ctx: &mut Context<DummyHeap>, v: f64) -> Value {
+    ctx.heap().allocate::<Float>(v).erase()
 }
 
 fn smi(v: i64) -> Value {
@@ -43,8 +22,7 @@ fn smi_add_adds_and_checks_types() {
 
     assert_eq!(add(&mut ctx, &[smi(0), smi(1)]), Err(VmError::Arity));
 
-    let map = make_float_map(&mut ctx);
-    let f = make_float(&mut ctx, map, 1.0);
+    let f = float(&mut ctx, 1.0);
     assert_eq!(add(&mut ctx, &[smi(0), f, smi(1)]), Err(VmError::Type));
 }
 
@@ -52,14 +30,18 @@ fn smi_add_adds_and_checks_types() {
 fn float_add_adds_and_boxes_result() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
     let mut ctx = vm.attach();
-    let map = make_float_map(&mut ctx);
     let add = vm.native(NativeIndex::FLOAT_ADD);
 
-    let fa = make_float(&mut ctx, map, 1.5);
-    let fb = make_float(&mut ctx, map, 2.25);
+    let fa = float(&mut ctx, 1.5);
+    let fb = float(&mut ctx, 2.25);
     let r = add(&mut ctx, &[smi(0), fa, fb]).unwrap();
-    let out = unsafe { HeapPtr::<Float>::decode(r).unwrap().as_ref() };
-    assert_eq!(out.value.get(), 3.75);
+    let out = ctx.heap().no_gc(|nogc, heap| {
+        nogc.get_as::<Float>(r, heap.known().float_map)
+            .unwrap()
+            .value
+            .get()
+    });
+    assert_eq!(out, 3.75);
 
     assert_eq!(add(&mut ctx, &[smi(0), smi(1), smi(2)]), Err(VmError::Type));
 }

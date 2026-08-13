@@ -7,6 +7,16 @@ use vm::{Header, HeapObject, HeapPtr, Smi, Tagged, Value};
 struct TestObj(u64);
 
 impl HeapObject for TestObj {
+    type Init<'a> = ();
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, _heap: &impl vm::LocalHeap, _config: &Self::Init<'_>) {
+        unimplemented!("TestObj is boxed, never heap-allocated by these tests")
+    }
+
     fn header(&self) -> &Header {
         unimplemented!("TestObj carries no header; never called by these tests")
     }

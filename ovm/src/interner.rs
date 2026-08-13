@@ -4,7 +4,7 @@ use std::sync::Mutex;
 
 use core::alloc::Layout;
 
-use vm::{ByteArray, Handle, HandleScope, HeapObject, InternedString, LocalHeap, Smi, WeakGcCell};
+use vm::{ByteArray, Handle, HandleScope, InternedString, LocalHeap, WeakGcCell};
 
 /// Content hash for interned strings (FNV-1a, masked into smi range).
 /// TODO: decide on a hash algorithm
@@ -53,20 +53,11 @@ impl StringInterner {
         let ls = Layout::new::<InternedString>();
         let (total, _) = lb.extend(ls).expect("string layout");
 
-        let handle = heap.allocate_token_enter_nogc(total, |token, nogc, heap| {
-            let backing = token.allocate_ref::<ByteArray>(lb, nogc);
-            backing.init(heap, s.as_bytes());
-
-            let interned = token.allocate_ref::<InternedString>(ls, nogc);
-            let inner = interned.string();
-            inner
-                .backing
-                .set(heap, inner.erase(), backing.into_tagged());
-            inner.hash.set(
-                heap,
-                inner.erase(),
-                Smi::new_unchecked(hash_bytes(s.as_bytes())),
-            );
+        let handle = heap.allocate_token_enter_nogc(total, |token, nogc, _heap| {
+            let backing = token.allocate_ref::<ByteArray>(s.as_bytes(), nogc);
+            let hash = hash_bytes(s.as_bytes());
+            let interned =
+                token.allocate_ref::<InternedString>((backing.into_tagged(), hash), nogc);
             interned.into_handle(scope)
         });
 

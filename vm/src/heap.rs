@@ -6,7 +6,10 @@ use core::{
     ptr::NonNull,
 };
 
-use crate::{Handle, HandleScope, HeapObject, HeapPtr, Smi, Tagged, Value, Word};
+use crate::{
+    Global, Handle, HandleScope, HeapObject, HeapPtr, Map, MapInit, RootHandles, SlotsObject,
+    SlotsObjectInit, Smi, Tagged, Value, Word,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocError {
@@ -28,6 +31,20 @@ impl core::fmt::Display for AllocError {
 
 impl std::error::Error for AllocError {}
 
+pub struct WellKnown {
+    pub roots: RootHandles,
+    pub meta_map: Global<Map>,
+    /// The hole: fill for not-yet-written slots
+    pub void: Global<SlotsObject>,
+    pub smi_map: Global<Map>,
+    pub float_map: Global<Map>,
+    pub array_map: Global<Map>,
+    pub byte_array_map: Global<Map>,
+    pub string_map: Global<Map>,
+    pub symbol_map: Global<Map>,
+    pub accessor_pair_map: Global<Map>,
+}
+
 pub trait Heap: Sized + Send + Sync {
     type Config;
     type Local: LocalHeap;
@@ -35,6 +52,60 @@ pub trait Heap: Sized + Send + Sync {
     fn new(config: Self::Config) -> Result<Self, AllocError>;
 
     fn new_local(&self) -> Self::Local;
+
+    fn set_known(&self, known: WellKnown);
+
+    fn install_well_known_maps(&self) {
+        let mut local = self.new_local();
+
+        let meta_map = local
+            .allocate::<Map>(MapInit {
+                meta_map: None,
+                value_slot_count: 0,
+                descriptors: &[],
+            })
+            .into_tagged();
+        let void_map = local
+            .allocate::<Map>(MapInit {
+                meta_map: Some(meta_map),
+                value_slot_count: 0,
+                descriptors: &[],
+            })
+            .into_tagged();
+        let void = local
+            .allocate::<SlotsObject>(SlotsObjectInit {
+                map: void_map,
+                values: &[],
+            })
+            .into_tagged();
+
+        let roots = unsafe { RootHandles::new(9, void.erase()) };
+
+        let mut new_map = |meta_map: Option<Tagged<Map>>| {
+            let fresh = local.allocate::<Map>(MapInit {
+                meta_map,
+                value_slot_count: 0,
+                descriptors: &[],
+            });
+            roots.create_handle(fresh.into_tagged())
+        };
+
+        let meta_map = roots.create_handle(meta_map);
+        let meta = meta_map.as_tagged();
+        let known = WellKnown {
+            meta_map,
+            void: roots.create_handle(void),
+            smi_map: new_map(Some(meta)),
+            float_map: new_map(Some(meta)),
+            array_map: new_map(Some(meta)),
+            byte_array_map: new_map(Some(meta)),
+            string_map: new_map(Some(meta)),
+            symbol_map: new_map(Some(meta)),
+            accessor_pair_map: new_map(Some(meta)),
+            roots,
+        };
+        self.set_known(known);
+    }
 
     fn iterate_roots(&self, roots: &mut dyn RootVisitor);
 
@@ -50,22 +121,41 @@ pub trait Heap: Sized + Send + Sync {
 pub trait LocalHeap: Sized + Send {
     fn allocate_raw(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
 
-    fn allocate<T: HeapObject>(&mut self, layout: Layout) -> Fresh<'_, T> {
-        let ptr = self.allocate_raw(layout);
-        debug_assert!(ptr.is_ok(), "allocation must not fail");
-        let ptr = unsafe { ptr.unwrap_unchecked() };
+    fn known(&self) -> &WellKnown;
+
+    fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
+        let raw = self.allocate_raw(T::layout_for(&config));
+        debug_assert!(raw.is_ok(), "allocation must not fail");
+        let raw = unsafe { raw.unwrap_unchecked() };
+        let mut ptr = raw.cast::<T>();
+        unsafe { ptr.as_mut() }.init(self, &config);
         Fresh {
-            ptr: ptr.cast::<T>(),
+            ptr,
             _phantom: PhantomData,
         }
     }
 
     fn allocate_handle<'s, T: HeapObject>(
         &mut self,
-        layout: Layout,
+        config: T::Init<'_>,
         scope: &'s HandleScope<'_>,
     ) -> Handle<'s, T> {
-        self.allocate(layout).into_handle(scope)
+        self.allocate(config).into_handle(scope)
+    }
+
+    fn allocate_enter_nogc<T: HeapObject, R>(
+        &mut self,
+        config: T::Init<'_>,
+        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a mut NoGc<'a>, &'a Self) -> R,
+    ) -> R {
+        let ptr = self.allocate(config).into_ptr();
+        self.no_gc(move |nogc, heap| {
+            let r = HeapRef {
+                ptr,
+                _phantom: PhantomData,
+            };
+            f(r, nogc, heap)
+        })
     }
 
     fn allocate_token(&mut self, total: Layout) -> AllocToken<'_, Self> {
@@ -86,23 +176,6 @@ pub trait LocalHeap: Sized + Send {
     ) -> R {
         let token = self.allocate_token(total);
         token.enter_no_gc(|nogc, heap| f(&token, nogc, heap))
-    }
-
-    fn allocate_enter_nogc<T: HeapObject, R>(
-        &mut self,
-        layout: Layout,
-        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a mut NoGc<'a>, &'a Self) -> R,
-    ) -> R {
-        let raw = self.allocate_raw(layout);
-        debug_assert!(raw.is_ok(), "allocation must not fail");
-        let raw = unsafe { raw.unwrap_unchecked() };
-        self.no_gc(move |nogc, heap| {
-            let r = HeapRef {
-                ptr: unsafe { HeapPtr::new_unchecked(raw.cast::<T>().as_ptr()) },
-                _phantom: PhantomData,
-            };
-            f(r, nogc, heap)
-        })
     }
 
     fn write_barrier(&self, host: Value, slot: &GcSlot, value: Value);
@@ -136,6 +209,19 @@ impl<'a> NoGc<'a> {
         unsafe { self.get_unchecked(slot.get()) }
     }
 
+    pub fn get_as<T: HeapObject>(
+        &'a self,
+        v: Value,
+        expected: Global<Map>,
+    ) -> Option<HeapRef<'a, T>> {
+        let ptr = HeapPtr::<T>::decode_strong(v)?;
+        let map = unsafe { ptr.as_ref() }.header().map.get();
+        if !map.ptr_eq(expected.as_tagged()) {
+            return None;
+        }
+        Some(unsafe { HeapRef::from_ptr(ptr) })
+    }
+
     pub unsafe fn get_unchecked<T: HeapObject>(&'a self, v: Tagged<T>) -> HeapRef<'a, T> {
         HeapRef {
             ptr: v.into(),
@@ -152,15 +238,24 @@ pub struct HeapRef<'scope, T: HeapObject> {
 
 impl<T: HeapObject> Clone for HeapRef<'_, T> {
     fn clone(&self) -> Self {
-        *self
+        HeapRef {
+            ptr: self.ptr,
+            _phantom: PhantomData,
+        }
     }
 }
-impl<T: HeapObject> Copy for HeapRef<'_, T> {}
 
 impl<'scope, T: HeapObject> HeapRef<'scope, T> {
     pub fn from_ref(r: &'scope T) -> Self {
         HeapRef {
             ptr: unsafe { HeapPtr::new_unchecked(r as *const T as *mut T) },
+            _phantom: PhantomData,
+        }
+    }
+
+    pub unsafe fn from_ptr(ptr: HeapPtr<T>) -> Self {
+        HeapRef {
+            ptr,
             _phantom: PhantomData,
         }
     }
@@ -219,11 +314,16 @@ impl<'scope, T: HeapObject> Fresh<'scope, T> {
         unsafe { HeapPtr::new_unchecked(self.ptr.as_ptr()) }
     }
 
+    pub fn into_tagged(self) -> Tagged<T> {
+        Tagged::from_ptr(self.into_ptr())
+    }
+
+    pub fn erase(self) -> Value {
+        self.into_tagged().erase()
+    }
+
     pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
-        let value = Value::from_bits(self.ptr.as_ptr() as Word | crate::value::STRONG_PTR);
-        // Safety: a Fresh points to a live, uncollected object (the heap
-        // was frozen since allocation) and the encoding is strong.
-        unsafe { scope.create_handle_unchecked(Tagged::from_value_unchecked(value)) }
+        unsafe { scope.create_handle_unchecked(self.into_tagged()) }
     }
 
     pub fn heap_ref<'a>(self, _guard: &'a NoGc<'a>) -> HeapRef<'a, T> {
@@ -241,20 +341,22 @@ pub struct AllocToken<'heap, H: LocalHeap> {
 }
 
 impl<'heap, H: LocalHeap> AllocToken<'heap, H> {
-    pub fn allocate<T: HeapObject>(&self, layout: Layout) -> Fresh<'_, T> {
+    pub fn allocate<T: HeapObject>(&self, config: T::Init<'_>) -> Fresh<'_, T> {
+        let mut ptr = self.bump(T::layout_for(&config)).cast::<T>();
+        unsafe { ptr.as_mut() }.init(&*self.heap, &config);
         Fresh {
-            ptr: self.bump(layout).cast::<T>(),
+            ptr,
             _phantom: PhantomData,
         }
     }
 
     pub fn allocate_ref<'g, T: HeapObject>(
         &self,
-        layout: Layout,
+        config: T::Init<'_>,
         _guard: &'g NoGc<'g>,
     ) -> HeapRef<'g, T> {
         HeapRef {
-            ptr: unsafe { HeapPtr::new_unchecked(self.bump(layout).cast::<T>().as_ptr()) },
+            ptr: self.allocate(config).into_ptr(),
             _phantom: PhantomData,
         }
     }
@@ -348,19 +450,26 @@ pub struct GcSlot<T = Value> {
 }
 
 /// A GC-tracked slot holding a tagged word with a type hint.
-/// Values flow in and out as `Tagged<T>`; the slot never decodes.
+/// Values flow in and out as `Tagged<T>`
 impl<T> GcSlot<T> {
+    pub unsafe fn from_value(v: Value) -> Self {
+        Self {
+            raw: UnsafeCell::new(v),
+            _phantom: PhantomData,
+        }
+    }
+
     pub fn get(&self) -> Tagged<T> {
         unsafe { Tagged::from_value_unchecked(*self.raw.get()) }
     }
 
-    /// Read the raw tagged word directly, without rewrapping.
     pub fn inner(&self) -> Value {
         unsafe { *self.raw.get() }
     }
 
     pub fn set(&self, heap: &impl LocalHeap, host: Value, value: impl Into<Tagged<T>>) {
         let v = value.into().erase();
+        debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         if v.is_ptr() {
             heap.write_barrier(host, self.ereased(), v);
         }

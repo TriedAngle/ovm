@@ -4,11 +4,17 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, HeapRef, LocalHeap, NoGc, RootVisitor, Smi, Tagged, Value, Word,
+    EdgeVisitable, GcSlot, LocalHeap, RootVisitor, Smi, Tagged, Value, Word,
     value::{STRONG_PTR, WEAK_PTR},
 };
 
 pub trait HeapObject: 'static {
+    type Init<'a>;
+
+    fn layout_for(config: &Self::Init<'_>) -> Layout;
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>);
+
     fn header(&self) -> &Header;
 
     fn layout(&self) -> Layout;
@@ -41,46 +47,9 @@ impl Header {
     }
 }
 
-#[repr(u16)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum ObjectKind {
-    Map,
-    Array,
-    ByteArray,
-    String,
-    Symbol,
-    SlotsObject,
-    CallableObject,
-    AccessorPair,
-    Float,
-}
-
-impl ObjectKind {
-    pub fn from_smi(smi: Smi) -> Option<Self> {
-        Some(match smi.value() as u16 {
-            0 => Self::Map,
-            1 => Self::Array,
-            2 => Self::ByteArray,
-            3 => Self::String,
-            4 => Self::Symbol,
-            5 => Self::SlotsObject,
-            6 => Self::CallableObject,
-            7 => Self::AccessorPair,
-            8 => Self::Float,
-            _ => return None,
-        })
-    }
-
-    pub fn to_smi(self) -> Smi {
-        Smi::new_unchecked(self as i64)
-    }
-}
-
 #[repr(C)]
 pub struct Map {
     pub header: Header,
-    /// ObjectKind
-    pub kind: GcSlot<Smi>,
     pub value_slot_count: GcSlot<Smi>,
     pub descriptor_count: GcSlot<Smi>,
     pub descriptors: [SlotDescriptor; 0],
@@ -94,10 +63,6 @@ impl Map {
             .extend(descriptors_layout)
             .expect("map layout")
             .0
-    }
-
-    pub fn object_kind(&self) -> ObjectKind {
-        ObjectKind::from_smi(self.kind.to_smi()).expect("invalid object kind")
     }
 
     pub fn value_slot_count(&self) -> usize {
@@ -120,77 +85,47 @@ impl Map {
         debug_assert!(i < self.descriptor_count());
         unsafe { &*self.data_ptr().add(i) }
     }
+}
 
-    pub fn lookup<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-        obj: HeapRef<'a, SlotsObject>,
-        name: SlotName,
-    ) -> Lookup<'a> {
-        for (index, d) in self.descriptors().iter().enumerate() {
-            if !d.flags().is_parent() && d.name() == name {
-                return match d.flags().kind() {
-                    SlotKind::Value => Lookup::Data {
-                        holder: obj,
-                        map_index: index,
-                        holder_index: d.offset(),
-                        value: d.read(obj.as_ref()),
-                    },
-                    SlotKind::Const => Lookup::Const {
-                        holder: obj,
-                        map_index: index,
-                        value: d.read(obj.as_ref()),
-                    },
-                    SlotKind::Accessor => Lookup::Accessor {
-                        holder: obj,
-                        map_index: index,
-                        pair: unsafe { guard.get_unchecked(d.value.get().cast_unchecked()) },
-                    },
-                };
-            }
-        }
-
-        for d in self.descriptors() {
-            if d.flags().is_parent() {
-                let parent = unsafe {
-                    guard.get_unchecked::<SlotsObject>(d.slot(obj.as_ref()).get().cast_unchecked())
-                };
-                let result = parent.as_ref().lookup(guard, name);
-                if !matches!(result, Lookup::NotFound) {
-                    return result;
-                }
-            }
-        }
-
-        Lookup::NotFound
-    }
-
-    pub fn lookup_parent<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-        obj: HeapRef<'a, SlotsObject>,
-        name: SlotName,
-        parent: SlotName,
-    ) -> Lookup<'a> {
-        match self.find_parent(parent) {
-            Some(d) => {
-                let parent = unsafe {
-                    guard.get_unchecked::<SlotsObject>(d.slot(obj.as_ref()).get().cast_unchecked())
-                };
-                parent.as_ref().lookup(guard, name)
-            }
-            None => Lookup::NotFound,
-        }
-    }
-
-    pub fn find_parent(&self, name: SlotName) -> Option<&SlotDescriptor> {
-        self.descriptors()
-            .iter()
-            .find(|d| d.flags().is_parent() && d.name() == name)
-    }
+pub struct MapInit<'a> {
+    pub meta_map: Option<Tagged<Map>>,
+    pub value_slot_count: usize,
+    pub descriptors: &'a [(SlotName, SlotFlags, Value)],
 }
 
 impl HeapObject for Map {
+    type Init<'a> = MapInit<'a>;
+
+    fn layout_for(config: &Self::Init<'_>) -> Layout {
+        Self::layout_for(config.descriptors.len())
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        let meta = match config.meta_map {
+            Some(m) => m,
+            None => unsafe { Tagged::from_value_unchecked(host) },
+        };
+        self.header.map.set(heap, host, meta);
+        self.value_slot_count.set(
+            heap,
+            host,
+            Smi::new_unchecked(config.value_slot_count as i64),
+        );
+        self.descriptor_count.set(
+            heap,
+            host,
+            Smi::new_unchecked(config.descriptors.len() as i64),
+        );
+        for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
+            let d = self.descriptor(i);
+            d.name.set(heap, host, name.tagged());
+            d.flags
+                .set(heap, host, Smi::new_unchecked(flags.bits() as i64));
+            d.value.set(heap, host, Tagged::from_value(*value));
+        }
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -294,17 +229,6 @@ impl SlotDescriptor {
             .expect("slot offset")
             .value() as usize
     }
-
-    pub fn slot<'s>(&'s self, obj: &'s SlotsObject) -> &'s GcSlot {
-        match self.flags().kind() {
-            SlotKind::Const | SlotKind::Accessor => &self.value,
-            SlotKind::Value => obj.slot(self.offset()),
-        }
-    }
-
-    pub fn read(&self, obj: &SlotsObject) -> Value {
-        self.slot(obj).get().erase()
-    }
 }
 
 #[repr(C)]
@@ -351,6 +275,24 @@ impl Array {
 }
 
 impl HeapObject for Array {
+    type Init<'a> = &'a [Value];
+
+    fn layout_for(config: &Self::Init<'_>) -> Layout {
+        Self::layout_for(config.len())
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(heap, host, heap.known().array_map.as_tagged());
+        self.size
+            .set(heap, host, Smi::new_unchecked(config.len() as i64));
+        for (i, v) in config.iter().enumerate() {
+            self.element_slot(i).set(heap, host, Tagged::from_value(*v));
+        }
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -410,15 +352,27 @@ impl ByteArray {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { core::slice::from_raw_parts_mut(self.data_ptr(), self.len()) }
     }
-
-    pub fn init(&self, heap: &impl LocalHeap, bytes: &[u8]) {
-        self.size
-            .set(heap, self.erase(), Smi::new_unchecked(bytes.len() as i64));
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data_ptr(), bytes.len()) };
-    }
 }
 
 impl HeapObject for ByteArray {
+    type Init<'a> = &'a [u8];
+
+    fn layout_for(config: &Self::Init<'_>) -> Layout {
+        Self::layout_for(config.len())
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(heap, host, heap.known().byte_array_map.as_tagged());
+        self.size
+            .set(heap, host, Smi::new_unchecked(config.len() as i64));
+        for (i, b) in config.iter().enumerate() {
+            self.set(i, *b);
+        }
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -465,6 +419,21 @@ impl VMString {
 }
 
 impl HeapObject for VMString {
+    type Init<'a> = (Tagged<ByteArray>, i64);
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(heap, host, heap.known().string_map.as_tagged());
+        self.backing.set(heap, host, config.0);
+        self.hash.set(heap, host, Smi::new_unchecked(config.1));
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -491,6 +460,16 @@ impl InternedString {
 }
 
 impl HeapObject for InternedString {
+    type Init<'a> = (Tagged<ByteArray>, i64);
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        self.0.init(heap, config);
+    }
+
     fn header(&self) -> &Header {
         self.0.header()
     }
@@ -532,6 +511,20 @@ impl Symbol {
 }
 
 impl HeapObject for Symbol {
+    type Init<'a> = Tagged<ByteArray>;
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(heap, host, heap.known().symbol_map.as_tagged());
+        self.backing.set(heap, host, *config);
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -597,6 +590,21 @@ pub struct AccessorPair {
 }
 
 impl HeapObject for AccessorPair {
+    type Init<'a> = (Value, Value);
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(heap, host, heap.known().accessor_pair_map.as_tagged());
+        self.get.set(heap, host, Tagged::from_value(config.0));
+        self.set.set(heap, host, Tagged::from_value(config.1));
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -638,50 +646,30 @@ impl SlotsObject {
         debug_assert!(i < self.len());
         unsafe { &*self.slots.as_ptr().add(i) }
     }
-
-    pub fn lookup<'a>(&'a self, guard: &'a NoGc<'a>, name: SlotName) -> Lookup<'a> {
-        guard
-            .get(&self.header.map)
-            .as_ref()
-            .lookup(guard, HeapRef::from_ref(self), name)
-    }
-
-    pub fn lookup_parent<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-        name: SlotName,
-        parent: SlotName,
-    ) -> Lookup<'a> {
-        guard.get(&self.header.map).as_ref().lookup_parent(
-            guard,
-            HeapRef::from_ref(self),
-            name,
-            parent,
-        )
-    }
 }
 
-pub enum Lookup<'a> {
-    Data {
-        holder: HeapRef<'a, SlotsObject>,
-        map_index: usize,
-        holder_index: usize,
-        value: Value,
-    },
-    Const {
-        holder: HeapRef<'a, SlotsObject>,
-        map_index: usize,
-        value: Value,
-    },
-    Accessor {
-        holder: HeapRef<'a, SlotsObject>,
-        map_index: usize,
-        pair: HeapRef<'a, AccessorPair>,
-    },
-    NotFound,
+pub struct SlotsObjectInit<'a> {
+    pub map: Tagged<Map>,
+    pub values: &'a [Value],
 }
 
 impl HeapObject for SlotsObject {
+    type Init<'a> = SlotsObjectInit<'a>;
+
+    fn layout_for(config: &Self::Init<'_>) -> Layout {
+        Self::layout_for(config.values.len())
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header.map.set(heap, host, config.map);
+        self.size
+            .set(heap, host, Smi::new_unchecked(config.values.len() as i64));
+        for (i, v) in config.values.iter().enumerate() {
+            self.slot(i).set(heap, host, Tagged::from_value(*v));
+        }
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -728,7 +716,34 @@ impl CallableObject {
     }
 }
 
+pub struct CallableInit<'a> {
+    pub map: Tagged<Map>,
+    pub callable_info: Value,
+    pub context: Value,
+    pub slots: &'a [Value],
+}
+
 impl HeapObject for CallableObject {
+    type Init<'a> = CallableInit<'a>;
+
+    fn layout_for(config: &Self::Init<'_>) -> Layout {
+        Self::layout_for(config.slots.len())
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header.map.set(heap, host, config.map);
+        self.callable_info
+            .set(heap, host, Tagged::from_value(config.callable_info));
+        self.context
+            .set(heap, host, Tagged::from_value(config.context));
+        self.size
+            .set(heap, host, Smi::new_unchecked(config.slots.len() as i64));
+        for (i, v) in config.slots.iter().enumerate() {
+            self.slot(i).set(heap, host, Tagged::from_value(*v));
+        }
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }
@@ -767,7 +782,6 @@ impl AsRef<str> for Symbol {
     }
 }
 
-/// A boxed f64.
 #[repr(C)]
 pub struct Float {
     pub header: Header,
@@ -775,6 +789,20 @@ pub struct Float {
 }
 
 impl HeapObject for Float {
+    type Init<'a> = f64;
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(heap, host, heap.known().float_map.as_tagged());
+        self.value.set(*config);
+    }
+
     fn header(&self) -> &Header {
         &self.header
     }

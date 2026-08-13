@@ -27,7 +27,7 @@ fn smi_handle(scope: &HandleScope<'_>, v: i64) -> i64 {
 
 #[test]
 fn handles_read_back_their_values() {
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     let scope = handle_scope(&data);
 
     let a = scope.create_handle(Tagged::smi(42).unwrap()).unwrap();
@@ -40,7 +40,7 @@ fn handles_read_back_their_values() {
 
 #[test]
 fn scope_tracks_nesting_level() {
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     assert_eq!(data.level(), 0);
     let outer = handle_scope(&data);
     assert_eq!(data.level(), 1);
@@ -55,7 +55,7 @@ fn scope_tracks_nesting_level() {
 
 #[test]
 fn closed_scope_unroots_its_handles() {
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     let outer = handle_scope(&data);
     let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
 
@@ -73,7 +73,7 @@ fn closed_scope_unroots_its_handles() {
 
 #[test]
 fn reclaimed_slots_are_reused() {
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     {
         let scope = handle_scope(&data);
         for i in 0..10 {
@@ -94,7 +94,7 @@ fn reclaimed_slots_are_reused() {
 
 #[test]
 fn blocks_extend_when_full() {
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     let scope = handle_scope(&data);
 
     let mut handles = Vec::new();
@@ -110,7 +110,7 @@ fn blocks_extend_when_full() {
 
 #[test]
 fn escaped_handle_survives_inner_scope() {
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     let mut outer = handle_scope(&data);
     let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
     assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
@@ -128,7 +128,7 @@ fn escaped_handle_survives_inner_scope() {
 
 #[test]
 fn escapable_scope_closed_without_escape_reclaims() {
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     let mut outer = handle_scope(&data);
     let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
     assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
@@ -146,7 +146,7 @@ fn weak_pointers_cannot_be_handle_rooted() {
     use vm::{Tagged, Value};
     use vm::value::{STRONG_PTR, WEAK_PTR};
 
-    let data = HandleData::new();
+    let data = HandleData::new(Smi::new_unchecked(0).encode());
     let scope = handle_scope(&data);
 
     // a weak-tagged pointer must not become a strong root

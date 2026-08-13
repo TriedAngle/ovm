@@ -1,49 +1,36 @@
-use std::alloc::Layout;
-
 use bytecode::{Opcode, Operand, Scale};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
 use ovm::natives::NativeIndex;
-use vm::{Array, Float, HeapObject, LocalHeap, Map, ObjectKind, Smi, Tagged, Value};
+use vm::{Array, Float, LocalHeap, Smi};
 
 fn main() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).expect("failed to create heap");
     let mut ctx = vm.attach();
 
     ctx.handle_scope(|ctx, scope| {
+        let zero = Smi::new_unchecked(0).encode();
         let _handle = ctx
             .heap()
-            .allocate_handle::<Array>(Array::layout_for(3), &scope);
+            .allocate_handle::<Array>(&[zero, zero, zero], &scope);
 
         let interned = ctx.intern(&scope, "hello, ovm");
         let again = ctx.intern(&scope, "hello, ovm");
-        let s = unsafe { interned.get().as_ref() };
-        println!(
-            "interned: {:?} (hash {}, deduped: {})",
-            s.string().as_str().expect("utf8"),
-            s.string().hash(),
-            interned.value().to_bits() == again.value().to_bits()
-        );
+        ctx.heap().no_gc(|nogc, _| {
+            let s = interned.heap_ref(nogc);
+            println!(
+                "interned: {:?} (hash {}, deduped: {})",
+                s.string().as_str().expect("utf8"),
+                s.string().hash(),
+                interned.value().to_bits() == again.value().to_bits()
+            );
+        });
     });
     println!(
         "heap initialized: {} bytes ({} used)",
         vm.heap().capacity(),
         vm.heap().used()
     );
-
-    // natives demo
-    let float_map = {
-        let fresh = ctx.heap().allocate::<Map>(Map::layout_for(0));
-        let ptr = fresh.into_ptr();
-        let map = unsafe { ptr.as_ref() };
-        map.kind
-            .set(ctx.heap(), map.erase(), ObjectKind::Float.to_smi());
-        map.value_slot_count
-            .set(ctx.heap(), map.erase(), Smi::new_unchecked(0));
-        map.descriptor_count
-            .set(ctx.heap(), map.erase(), Smi::new_unchecked(0));
-        Tagged::from_ptr(ptr)
-    };
 
     let receiver = Smi::new_unchecked(0).encode();
     let result = vm.native(NativeIndex::SMI_ADD)(
@@ -57,12 +44,17 @@ fn main() {
     .expect("smi_add failed");
     println!("smi_add(6, 7) = {}", Smi::decode(result).unwrap().value());
 
-    let fa = make_float(&mut ctx, float_map, 1.5);
-    let fb = make_float(&mut ctx, float_map, 2.25);
+    let fa = ctx.heap().allocate::<Float>(1.5).erase();
+    let fb = ctx.heap().allocate::<Float>(2.25).erase();
     let result = vm.native(NativeIndex::FLOAT_ADD)(&mut ctx, &[receiver, fa, fb])
         .expect("float_add failed");
-    let out = unsafe { vm::HeapPtr::<Float>::decode(result).unwrap().as_ref() };
-    println!("float_add(1.5, 2.25) = {}", out.value.get());
+    let out = ctx.heap().no_gc(|nogc, heap| {
+        nogc.get_as::<Float>(result, heap.known().float_map)
+            .expect("float_add returned a float")
+            .value
+            .get()
+    });
+    println!("float_add(1.5, 2.25) = {}", out);
 
     // return 6 + 7
     let mut program = Vec::new();
@@ -80,15 +72,6 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-fn make_float(ctx: &mut ovm::Context<DummyHeap>, map: Tagged<Map>, v: f64) -> Value {
-    let fresh = ctx.heap().allocate::<Float>(Layout::new::<Float>());
-    let ptr = fresh.into_ptr();
-    let fl = unsafe { ptr.as_ref() };
-    fl.header.map.set(ctx.heap(), fl.erase(), map);
-    fl.value.set(v);
-    ptr.encode_strong()
 }
 
 fn emit(code: &mut Vec<u8>, op: Opcode, operands: &[u32]) {

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, Weak};
 use core::cell::Cell;
 use core::ptr::NonNull;
 
-use vm::{AllocError, Handle, HandleData, HandleScope, Heap, InternedString};
+use vm::{AllocError, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap};
 
 pub mod interner;
 pub mod natives;
@@ -46,9 +46,11 @@ impl<H: Heap> Clone for VM<H> {
 
 impl<H: Heap> VM<H> {
     pub fn new(config: H::Config) -> Result<Self, AllocError> {
+        let heap = H::new(config)?;
+        heap.install_well_known_maps();
         Ok(Self {
             shared: Arc::new(SharedVM {
-                heap: H::new(config)?,
+                heap,
                 threads: Mutex::new(Vec::new()),
                 interner: StringInterner::new(),
                 natives: NativeRegistry::new(),
@@ -83,15 +85,16 @@ impl<H: Heap> VM<H> {
     }
 
     pub fn attach(&self) -> Context<H> {
+        let heap = self.shared.heap.new_local();
         let state = Arc::new(ContextState {
-            handles: HandleData::new(),
+            handles: HandleData::new(heap.known().void.value()),
         });
         let mut threads = self.shared.threads.lock().unwrap();
         threads.retain(|t| t.strong_count() > 0);
         threads.push(Arc::downgrade(&state));
         Context {
             vm: self.clone(),
-            heap: self.shared.heap.new_local(),
+            heap,
             state,
             pending_exception: Cell::new(None),
         }

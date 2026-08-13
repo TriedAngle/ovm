@@ -2,11 +2,12 @@ use core::{
     cell::{Cell, UnsafeCell},
     marker::PhantomData,
     ptr::NonNull,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use crate::{
-    GcSlot, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, PointerStrength, RootVisitor, Strong, Tagged,
-    Value, Weak,
+    GcSlot, Global, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, HeapRef, NoGc, PointerStrength,
+    RootVisitor, Strong, Tagged, Value, Weak,
 };
 
 pub struct Handle<'scope, T, R: PointerStrength = Strong> {
@@ -54,6 +55,14 @@ impl<'s, T: HeapObject> Handle<'s, T, Strong> {
     pub fn get(self) -> HeapPtr<T> {
         HeapPtr::decode_strong(self.value()).expect("strong local slot must contain strong pointer")
     }
+
+    pub fn as_tagged(self) -> Tagged<T> {
+        self.into()
+    }
+
+    pub fn heap_ref<'a>(self, _guard: &'a NoGc<'a>) -> HeapRef<'a, T> {
+        unsafe { HeapRef::from_ptr(self.get()) }
+    }
 }
 
 impl<'s, T: HeapObject> Handle<'s, T, Weak> {}
@@ -75,6 +84,7 @@ struct HandleDataImpl {
     next: *mut Value,
     limit: *mut Value,
     level: usize,
+    fill: Value,
 }
 
 impl HandleDataImpl {
@@ -88,7 +98,7 @@ impl HandleDataImpl {
     }
 
     fn extend(&mut self) {
-        let block = vec![Value::from_bits(0); HANDLE_BLOCK_SIZE].into_boxed_slice();
+        let block = vec![self.fill; HANDLE_BLOCK_SIZE].into_boxed_slice();
         self.next = block.as_ptr() as *mut Value;
         self.limit = unsafe { self.next.add(block.len()) };
         self.blocks.push(block);
@@ -113,12 +123,15 @@ impl HandleDataImpl {
 }
 
 impl HandleData {
-    pub fn new() -> Self {
+    /// `fill` is the value for not-yet-handed-out slots — the void object
+    /// in practice (`heap.known().void`).
+    pub fn new(fill: Value) -> Self {
         let mut inner = HandleDataImpl {
             blocks: Vec::new(),
             next: std::ptr::null_mut(),
             limit: std::ptr::null_mut(),
             level: 0,
+            fill,
         };
         inner.extend();
         Self {
@@ -136,12 +149,6 @@ impl HandleData {
 
     pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
         self.inner().visit_roots(visitor)
-    }
-}
-
-impl Default for HandleData {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -214,7 +221,6 @@ pub struct EscapableHandleScope<'i, 'o> {
     prev_block_count: usize,
     escaped: Cell<bool>,
 }
-
 impl<'d> core::ops::Deref for EscapableHandleScope<'_, 'd> {
     type Target = HandleScope<'d>;
 
@@ -243,5 +249,35 @@ impl Drop for EscapableHandleScope<'_, '_> {
         inner.next = self.prev_next;
         inner.limit = self.prev_limit;
         inner.blocks.truncate(self.prev_block_count);
+    }
+}
+
+pub struct RootHandles {
+    slots: Box<[GcSlot]>,
+    next: AtomicUsize,
+}
+
+impl RootHandles {
+    pub unsafe fn new(capacity: usize, fill: Value) -> Self {
+        Self {
+            slots: (0..capacity)
+                .map(|_| unsafe { GcSlot::from_value(fill) })
+                .collect(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn create_handle<T>(&self, value: Tagged<T>) -> Global<T> {
+        let i = self.next.fetch_add(1, Ordering::Relaxed);
+        assert!(i < self.slots.len(), "root handle table exhausted");
+        let slot = GcSlot::raw_get(&self.slots[i]);
+        unsafe { *slot = value.erase() };
+        Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
+    }
+
+    pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
+        for slot in &self.slots[..self.next.load(Ordering::Relaxed)] {
+            visitor.visit_slot(slot);
+        }
     }
 }
