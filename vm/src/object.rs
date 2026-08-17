@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, LocalHeap, RootVisitor, Smi, Tagged, Value, Word,
+    EdgeVisitable, GcSlot, LocalHeap, Smi, Tagged, Value, Visitor, Word,
     value::{STRONG_PTR, WEAK_PTR},
 };
 
@@ -24,7 +24,7 @@ pub trait HeapObject: 'static {
         Self: Sized,
     {
         let addr = self as *const Self as *const Word as Word;
-        Value::from_bits(addr | STRONG_PTR)
+        unsafe { Value::from_bits(addr | STRONG_PTR) }
     }
 
     fn erase_weak(&self) -> Value
@@ -32,7 +32,7 @@ pub trait HeapObject: 'static {
         Self: Sized,
     {
         let addr = self as *const Self as *const Word as Word;
-        Value::from_bits(addr | WEAK_PTR)
+        unsafe { Value::from_bits(addr | WEAK_PTR) }
     }
 }
 
@@ -88,7 +88,7 @@ impl Map {
 }
 
 pub struct MapInit<'a> {
-    pub meta_map: Option<Tagged<Map>>,
+    pub map_map: Tagged<Map>,
     pub value_slot_count: usize,
     pub descriptors: &'a [(SlotName, SlotFlags, Value)],
 }
@@ -102,26 +102,15 @@ impl HeapObject for Map {
 
     fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
         let host = self.erase();
-        let meta = match config.meta_map {
-            Some(m) => m,
-            None => unsafe { Tagged::from_value_unchecked(host) },
-        };
-        self.header.map.set(heap, host, meta);
-        self.value_slot_count.set(
-            heap,
-            host,
-            Smi::new_unchecked(config.value_slot_count as i64),
-        );
-        self.descriptor_count.set(
-            heap,
-            host,
-            Smi::new_unchecked(config.descriptors.len() as i64),
-        );
+        self.header.map.set(heap, host, config.map_map);
+        self.value_slot_count
+            .set(heap, host, Smi::new(config.value_slot_count as i64));
+        self.descriptor_count
+            .set(heap, host, Smi::new(config.descriptors.len() as i64));
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
             d.name.set(heap, host, name.tagged());
-            d.flags
-                .set(heap, host, Smi::new_unchecked(flags.bits() as i64));
+            d.flags.set(heap, host, Smi::new(flags.bits() as i64));
             d.value.set(heap, host, Tagged::from_value(*value));
         }
     }
@@ -136,7 +125,7 @@ impl HeapObject for Map {
 }
 
 impl EdgeVisitable for Map {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         for d in self.descriptors() {
             visitor.visit_slot(d.name.ereased());
@@ -286,8 +275,7 @@ impl HeapObject for Array {
         self.header
             .map
             .set(heap, host, heap.known().array_map.as_tagged());
-        self.size
-            .set(heap, host, Smi::new_unchecked(config.len() as i64));
+        self.size.set(heap, host, Smi::new(config.len() as i64));
         for (i, v) in config.iter().enumerate() {
             self.element_slot(i).set(heap, host, Tagged::from_value(*v));
         }
@@ -303,7 +291,7 @@ impl HeapObject for Array {
 }
 
 impl EdgeVisitable for Array {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         let size = self.size.to_smi().value() as usize;
         for i in 0..size {
@@ -366,8 +354,7 @@ impl HeapObject for ByteArray {
         self.header
             .map
             .set(heap, host, heap.known().byte_array_map.as_tagged());
-        self.size
-            .set(heap, host, Smi::new_unchecked(config.len() as i64));
+        self.size.set(heap, host, Smi::new(config.len() as i64));
         for (i, b) in config.iter().enumerate() {
             self.set(i, *b);
         }
@@ -383,7 +370,7 @@ impl HeapObject for ByteArray {
 }
 
 impl EdgeVisitable for ByteArray {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
     }
 }
@@ -431,7 +418,7 @@ impl HeapObject for VMString {
             .map
             .set(heap, host, heap.known().string_map.as_tagged());
         self.backing.set(heap, host, config.0);
-        self.hash.set(heap, host, Smi::new_unchecked(config.1));
+        self.hash.set(heap, host, Smi::new(config.1));
     }
 
     fn header(&self) -> &Header {
@@ -444,7 +431,7 @@ impl HeapObject for VMString {
 }
 
 impl EdgeVisitable for VMString {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         visitor.visit_slot(self.backing.ereased());
     }
@@ -480,7 +467,7 @@ impl HeapObject for InternedString {
 }
 
 impl EdgeVisitable for InternedString {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         self.0.visit_edges(visitor);
     }
 }
@@ -535,7 +522,7 @@ impl HeapObject for Symbol {
 }
 
 impl EdgeVisitable for Symbol {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         visitor.visit_slot(self.backing.ereased());
     }
@@ -565,6 +552,12 @@ impl From<Tagged<VMString>> for SlotName {
 impl From<Tagged<Symbol>> for SlotName {
     fn from(symbol: Tagged<Symbol>) -> Self {
         Self(symbol.erase())
+    }
+}
+
+impl From<Tagged<InternedString>> for SlotName {
+    fn from(string: Tagged<InternedString>) -> Self {
+        Self(string.erase())
     }
 }
 
@@ -615,7 +608,7 @@ impl HeapObject for AccessorPair {
 }
 
 impl EdgeVisitable for AccessorPair {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         visitor.visit_slot(self.get.ereased());
         visitor.visit_slot(self.set.ereased());
@@ -664,7 +657,7 @@ impl HeapObject for SlotsObject {
         let host = self.erase();
         self.header.map.set(heap, host, config.map);
         self.size
-            .set(heap, host, Smi::new_unchecked(config.values.len() as i64));
+            .set(heap, host, Smi::new(config.values.len() as i64));
         for (i, v) in config.values.iter().enumerate() {
             self.slot(i).set(heap, host, Tagged::from_value(*v));
         }
@@ -680,7 +673,7 @@ impl HeapObject for SlotsObject {
 }
 
 impl EdgeVisitable for SlotsObject {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         for i in 0..self.len() {
             visitor.visit_slot(self.slot(i));
@@ -691,57 +684,37 @@ impl EdgeVisitable for SlotsObject {
 #[repr(C)]
 pub struct CallableObject {
     pub header: Header,
-    pub callable_info: GcSlot,
+    pub bytecode: GcSlot<ByteArray>,
+    pub constants: GcSlot<Array>,
+    pub register_count: GcSlot<Smi>,
     pub context: GcSlot,
-    pub size: GcSlot<Smi>,
-    pub slots: [GcSlot; 0],
 }
 
-impl CallableObject {
-    pub fn layout_for(len: usize) -> Layout {
-        let slots_layout = Layout::array::<GcSlot>(len).expect("slots layout");
-        Layout::new::<Self>()
-            .extend(slots_layout)
-            .expect("callable object layout")
-            .0
-    }
-
-    pub fn len(&self) -> usize {
-        self.size.to_smi().value() as usize
-    }
-
-    pub fn slot(&self, i: usize) -> &GcSlot {
-        debug_assert!(i < self.len());
-        unsafe { &*self.slots.as_ptr().add(i) }
-    }
-}
-
-pub struct CallableInit<'a> {
-    pub map: Tagged<Map>,
-    pub callable_info: Value,
+pub struct CallableInit {
+    pub bytecode: Tagged<ByteArray>,
+    pub constants: Tagged<Array>,
+    pub register_count: usize,
     pub context: Value,
-    pub slots: &'a [Value],
 }
 
 impl HeapObject for CallableObject {
-    type Init<'a> = CallableInit<'a>;
+    type Init<'a> = CallableInit;
 
-    fn layout_for(config: &Self::Init<'_>) -> Layout {
-        Self::layout_for(config.slots.len())
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
     }
 
     fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
         let host = self.erase();
-        self.header.map.set(heap, host, config.map);
-        self.callable_info
-            .set(heap, host, Tagged::from_value(config.callable_info));
+        self.header
+            .map
+            .set(heap, host, heap.known().callable_map.as_tagged());
+        self.bytecode.set(heap, host, config.bytecode);
+        self.constants.set(heap, host, config.constants);
+        self.register_count
+            .set(heap, host, Smi::new(config.register_count as i64));
         self.context
             .set(heap, host, Tagged::from_value(config.context));
-        self.size
-            .set(heap, host, Smi::new_unchecked(config.slots.len() as i64));
-        for (i, v) in config.slots.iter().enumerate() {
-            self.slot(i).set(heap, host, Tagged::from_value(*v));
-        }
     }
 
     fn header(&self) -> &Header {
@@ -749,18 +722,16 @@ impl HeapObject for CallableObject {
     }
 
     fn layout(&self) -> Layout {
-        Self::layout_for(self.len())
+        Layout::new::<Self>()
     }
 }
 
 impl EdgeVisitable for CallableObject {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
-        visitor.visit_slot(self.callable_info.ereased());
+        visitor.visit_slot(self.bytecode.ereased());
+        visitor.visit_slot(self.constants.ereased());
         visitor.visit_slot(self.context.ereased());
-        for i in 0..self.len() {
-            visitor.visit_slot(self.slot(i));
-        }
     }
 }
 
@@ -813,7 +784,7 @@ impl HeapObject for Float {
 }
 
 impl EdgeVisitable for Float {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
     }
 }

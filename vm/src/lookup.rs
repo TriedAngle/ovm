@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, SlotDescriptor, SlotKind,
-    SlotName, SlotsObject, Smi, ValueRef,
+    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Register, SlotDescriptor,
+    SlotKind, SlotName, SlotsObject, Smi, Value, ValueRef,
 };
 
 pub enum Lookup<'a> {
@@ -24,14 +24,8 @@ pub enum Lookup<'a> {
 }
 
 impl GcSlot {
-    pub fn value_ref<'a>(&self, _guard: &'a NoGc<'a>) -> ValueRef<'a> {
-        let v = self.inner();
-        if let Some(smi) = Smi::decode(v) {
-            return ValueRef::Smi(smi);
-        }
-        let ptr = HeapPtr::<SlotsObject>::decode_strong(v)
-            .expect("value-flow slots hold only smi or strong values");
-        ValueRef::Object(unsafe { HeapRef::from_ptr(ptr) })
+    pub fn value_ref<'a>(&self, guard: &'a NoGc<'a>) -> ValueRef<'a> {
+        value_ref(self.inner(), guard)
     }
 
     pub fn lookup<'a>(
@@ -40,13 +34,45 @@ impl GcSlot {
         heap: &impl LocalHeap,
         name: SlotName,
     ) -> Lookup<'a> {
-        let receiver = self.value_ref(guard);
-        let map = match &receiver {
-            ValueRef::Smi(_) => heap.known().smi_map.heap_ref(guard),
-            ValueRef::Object(obj) => guard.get(&obj.as_ref().header.map),
-        };
-        map.as_ref().lookup(guard, heap, receiver, name)
+        lookup_value(self.inner(), guard, heap, name)
     }
+}
+
+impl Register {
+    pub fn value_ref<'a>(&self, guard: &'a NoGc<'a>) -> ValueRef<'a> {
+        value_ref(self.inner(), guard)
+    }
+
+    pub fn lookup<'a>(
+        &self,
+        guard: &'a NoGc<'a>,
+        heap: &impl LocalHeap,
+        name: SlotName,
+    ) -> Lookup<'a> {
+        lookup_value(self.inner(), guard, heap, name)
+    }
+}
+
+fn value_ref<'a>(v: Value, _guard: &'a NoGc<'a>) -> ValueRef<'a> {
+    if let Some(smi) = Smi::decode(v) {
+        return ValueRef::Smi(smi);
+    }
+    let ptr = HeapPtr::decode_strong(v).expect("slots hold only smi or strong values");
+    ValueRef::Object(unsafe { HeapRef::from_ptr(ptr.cast()) })
+}
+
+fn lookup_value<'a>(
+    receiver: Value,
+    guard: &'a NoGc<'a>,
+    heap: &impl LocalHeap,
+    name: SlotName,
+) -> Lookup<'a> {
+    let receiver = value_ref(receiver, guard);
+    let map = match &receiver {
+        ValueRef::Smi(_) => heap.known().smi_map.heap_ref(guard),
+        ValueRef::Object(obj) => guard.get(&obj.as_ref().header.map),
+    };
+    map.as_ref().lookup(guard, heap, receiver, name)
 }
 
 impl Map {
@@ -81,7 +107,7 @@ impl Map {
                     SlotKind::Accessor => Lookup::Accessor {
                         holder: receiver,
                         map_index: index,
-                        pair: unsafe { guard.get_unchecked(d.value.get().cast_unchecked()) },
+                        pair: unsafe { guard.get_unchecked(d.value.get().cast()) },
                     },
                 };
             }

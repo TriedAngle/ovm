@@ -7,7 +7,7 @@ pub enum Opcode {
     Load,  // reg -> acc
     Store, // acc -> reg
 
-    LoadSmi,      // reg -> acc
+    LoadSmi,      // imm -> acc
     LoadConstant, // idx -> acc
 
     Move, // reg -> reg
@@ -23,9 +23,9 @@ pub enum Opcode {
 
     // reglist is the first register (index) we dont have literally the whole list there.
     // for methods the `self` is the first element in the reglist
-    Call,           // reg (caller) reglist (base) regcount (count) idx (feedback) -> acc
-    CallNoFeedback, // reg (caller) reglist (base) regcount (count) -> acc
-    CallNative,     // idx (native index) reg (caller) reglist (base) regcount (count) -> acc
+    Call,           // reg (callee) reglist (base) regcount (count) idx (feedback) -> acc
+    CallNoFeedback, // reg (callee) reglist (base) regcount (count) -> acc
+    CallNative, // idx (native index) reglist (base, first element is the receiver) regcount (count) -> acc
 
     CreateObjectFromMap, // idx (constant pool map) reglist regcount (slots) -> acc
     CreateArrayLiteral,  // reglist regcount -> acc
@@ -36,12 +36,12 @@ pub enum Opcode {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Operand {
-    Register,      // scalable
-    RegisterList,  // scalable
-    RegisterCount, // Uimmediate but not scalable
-    Immediate,     // scalable
-    UImmediate,    // scalable
-    Index,         // scalable
+    Register,          // scalable, signed (negative indices are parameters)
+    RegisterListStart, // first register of a start+count range; scalable, signed
+    RegisterCount,     // UImmediate but not scalable
+    Immediate,         // scalable, signed
+    UImmediate,        // scalable
+    Index,             // scalable
 }
 
 impl Operand {
@@ -49,12 +49,18 @@ impl Operand {
         use Operand::*;
         match self {
             RegisterCount => 1, // ALWAYS 1 byte
-            Register | RegisterList | Immediate | UImmediate | Index => scale as usize,
+            Register | RegisterListStart | Immediate | UImmediate | Index => scale as usize,
         }
+    }
+
+    pub const fn is_signed(self) -> bool {
+        use Operand::*;
+        matches!(self, Register | RegisterListStart | Immediate)
     }
 }
 
 impl Opcode {
+    // TODO: we should probably use transmute unsafe here
     pub const fn from_byte(byte: u8) -> Option<Self> {
         use Opcode::*;
         Some(match byte {
@@ -98,12 +104,12 @@ impl Opcode {
             Self::LoadNamedProperty => &[Register, Index, Index],
             Self::StoreNamedProperty => &[Register, Index, Index],
 
-            Self::Call => &[Register, RegisterList, RegisterCount, Index],
-            Self::CallNoFeedback => &[Register, RegisterList, RegisterCount],
-            Self::CallNative => &[Index, Register, RegisterList, RegisterCount],
+            Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
+            Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
+            Self::CallNative => &[Index, RegisterListStart, RegisterCount],
 
-            Self::CreateObjectFromMap => &[Index, RegisterList, RegisterCount],
-            Self::CreateArrayLiteral => &[RegisterList, RegisterCount],
+            Self::CreateObjectFromMap => &[Index, RegisterListStart, RegisterCount],
+            Self::CreateArrayLiteral => &[RegisterListStart, RegisterCount],
 
             Self::Add => &[Register, Register],
         }
@@ -126,4 +132,42 @@ impl Opcode {
 pub enum Scale {
     Byte1 = 1, // default
     Byte2 = 2, // wide
+}
+
+pub fn emit(code: &mut Vec<u8>, op: Opcode, operands: &[u32]) {
+    let kinds = op.operands();
+    assert_eq!(kinds.len(), operands.len(), "operand count mismatch");
+
+    let wide = kinds.iter().zip(operands).any(|(kind, value)| {
+        if *kind == Operand::RegisterCount {
+            return false;
+        }
+        if kind.is_signed() {
+            let v = *value as i32;
+            v < i8::MIN as i32 || v > i8::MAX as i32
+        } else {
+            *value > u8::MAX as u32
+        }
+    });
+    let scale = if wide { Scale::Byte2 } else { Scale::Byte1 };
+    if wide {
+        code.push(Opcode::Wide as u8);
+    }
+    code.push(op as u8);
+
+    for (kind, value) in kinds.iter().zip(operands) {
+        let size = kind.size_in_stream(scale);
+        let fits = if kind.is_signed() {
+            let v = *value as i32;
+            match size {
+                1 => v >= i8::MIN as i32 && v <= i8::MAX as i32,
+                2 => v >= i16::MIN as i32 && v <= i16::MAX as i32,
+                _ => unreachable!("signed operands are at most 2 bytes"),
+            }
+        } else {
+            (*value as u64) < (1u64 << (size * 8))
+        };
+        assert!(fits, "operand {value} does not fit in {size} byte(s)");
+        code.extend_from_slice(&value.to_le_bytes()[..size]);
+    }
 }

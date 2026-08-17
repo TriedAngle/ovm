@@ -6,8 +6,8 @@ pub mod value;
 
 pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, RootHandles};
 pub use heap::{
-    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, Heap, HeapRef, LocalHeap, NoGc,
-    RootVisitor, WeakGcCell, WellKnown, WordType,
+    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, Heap, HeapRef, LocalHeap, NoGc, Register,
+    RootVisitor, Visitor, WeakGcCell, WellKnown, WordType,
 };
 pub use lookup::Lookup;
 pub use object::{
@@ -32,5 +32,6 @@ const _: () = {
     assert!(size_of::<GcSlot>() == size_of::<Word>());
     assert!(size_of::<GcSlot<Smi>>() == size_of::<Word>());
     assert!(size_of::<GcSlot<VMString>>() == size_of::<Word>());
+    assert!(size_of::<Register>() == size_of::<Word>());
     assert!(size_of::<SlotName>() == size_of::<Word>());
 };

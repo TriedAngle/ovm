@@ -7,8 +7,8 @@ use core::{
 };
 
 use crate::{
-    Global, Handle, HandleScope, HeapObject, HeapPtr, Map, MapInit, RootHandles, SlotsObject,
-    SlotsObjectInit, Smi, Tagged, Value, Word,
+    Global, Handle, HandleScope, Header, HeapObject, HeapPtr, Map, MapInit, RootHandles,
+    SlotsObject, SlotsObjectInit, Smi, Tagged, Value, Word,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,8 +33,9 @@ impl std::error::Error for AllocError {}
 
 pub struct WellKnown {
     pub roots: RootHandles,
-    pub meta_map: Global<Map>,
+    pub map_map: Global<Map>,
     /// The hole: fill for not-yet-written slots
+    /// TODO: consider having sepearte thing for this, or keep it as void
     pub void: Global<SlotsObject>,
     pub smi_map: Global<Map>,
     pub float_map: Global<Map>,
@@ -43,6 +44,7 @@ pub struct WellKnown {
     pub string_map: Global<Map>,
     pub symbol_map: Global<Map>,
     pub accessor_pair_map: Global<Map>,
+    pub callable_map: Global<Map>,
 }
 
 pub trait Heap: Sized + Send + Sync {
@@ -57,57 +59,67 @@ pub trait Heap: Sized + Send + Sync {
 
     fn install_well_known_maps(&self) {
         let mut local = self.new_local();
+        let roots = unsafe { RootHandles::new(32, Smi::new(0).encode()) };
 
-        let meta_map = local
-            .allocate::<Map>(MapInit {
-                meta_map: None,
+        let map_map = {
+            let raw = local
+                .allocate_raw(Map::layout_for(0))
+                .expect("bootstrap map map allocation");
+            let ptr = unsafe { HeapPtr::<Map>::new(raw.as_ptr().cast()) };
+            let map_map = Tagged::from_ptr(ptr);
+            let init = MapInit {
+                map_map,
                 value_slot_count: 0,
                 descriptors: &[],
-            })
-            .into_tagged();
+            };
+            unsafe { ptr.as_mut() }.init(&local, &init);
+            map_map
+        };
+        let map_map = roots.create_handle(map_map);
+        let meta = map_map.as_tagged();
+
         let void_map = local
             .allocate::<Map>(MapInit {
-                meta_map: Some(meta_map),
+                map_map: meta,
                 value_slot_count: 0,
                 descriptors: &[],
             })
-            .into_tagged();
+            .into_global(&roots);
+
         let void = local
             .allocate::<SlotsObject>(SlotsObjectInit {
-                map: void_map,
+                map: void_map.as_tagged(),
                 values: &[],
             })
-            .into_tagged();
+            .into_global(&roots);
 
-        let roots = unsafe { RootHandles::new(9, void.erase()) };
-
-        let mut new_map = |meta_map: Option<Tagged<Map>>| {
-            let fresh = local.allocate::<Map>(MapInit {
-                meta_map,
-                value_slot_count: 0,
-                descriptors: &[],
-            });
-            roots.create_handle(fresh.into_tagged())
+        let mut new_map = |map_map: Tagged<Map>| {
+            local
+                .allocate::<Map>(MapInit {
+                    map_map,
+                    value_slot_count: 0,
+                    descriptors: &[],
+                })
+                .into_global(&roots)
         };
 
-        let meta_map = roots.create_handle(meta_map);
-        let meta = meta_map.as_tagged();
         let known = WellKnown {
-            meta_map,
-            void: roots.create_handle(void),
-            smi_map: new_map(Some(meta)),
-            float_map: new_map(Some(meta)),
-            array_map: new_map(Some(meta)),
-            byte_array_map: new_map(Some(meta)),
-            string_map: new_map(Some(meta)),
-            symbol_map: new_map(Some(meta)),
-            accessor_pair_map: new_map(Some(meta)),
+            map_map,
+            void,
+            smi_map: new_map(meta),
+            float_map: new_map(meta),
+            array_map: new_map(meta),
+            byte_array_map: new_map(meta),
+            string_map: new_map(meta),
+            symbol_map: new_map(meta),
+            accessor_pair_map: new_map(meta),
+            callable_map: new_map(meta),
             roots,
         };
         self.set_known(known);
     }
 
-    fn iterate_roots(&self, roots: &mut dyn RootVisitor);
+    fn iterate_roots(&self, roots: &mut impl RootVisitor);
 
     fn collect(&self);
 
@@ -214,12 +226,12 @@ impl<'a> NoGc<'a> {
         v: Value,
         expected: Global<Map>,
     ) -> Option<HeapRef<'a, T>> {
-        let ptr = HeapPtr::<T>::decode_strong(v)?;
-        let map = unsafe { ptr.as_ref() }.header().map.get();
+        let ptr = HeapPtr::decode_strong(v)?;
+        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.get();
         if !map.ptr_eq(expected.as_tagged()) {
             return None;
         }
-        Some(unsafe { HeapRef::from_ptr(ptr) })
+        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
     }
 
     pub unsafe fn get_unchecked<T: HeapObject>(&'a self, v: Tagged<T>) -> HeapRef<'a, T> {
@@ -248,7 +260,7 @@ impl<T: HeapObject> Clone for HeapRef<'_, T> {
 impl<'scope, T: HeapObject> HeapRef<'scope, T> {
     pub fn from_ref(r: &'scope T) -> Self {
         HeapRef {
-            ptr: unsafe { HeapPtr::new_unchecked(r as *const T as *mut T) },
+            ptr: unsafe { HeapPtr::new(r as *const T as *mut T) },
             _phantom: PhantomData,
         }
     }
@@ -311,7 +323,7 @@ impl<'scope, T> Fresh<'scope, T> {
 
 impl<'scope, T: HeapObject> Fresh<'scope, T> {
     pub fn into_ptr(self) -> HeapPtr<T> {
-        unsafe { HeapPtr::new_unchecked(self.ptr.as_ptr()) }
+        unsafe { HeapPtr::new(self.ptr.as_ptr()) }
     }
 
     pub fn into_tagged(self) -> Tagged<T> {
@@ -324,6 +336,10 @@ impl<'scope, T: HeapObject> Fresh<'scope, T> {
 
     pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
         unsafe { scope.create_handle_unchecked(self.into_tagged()) }
+    }
+
+    pub fn into_global(self, roots: &RootHandles) -> Global<T> {
+        roots.create_handle(self.into_tagged())
     }
 
     pub fn heap_ref<'a>(self, _guard: &'a NoGc<'a>) -> HeapRef<'a, T> {
@@ -417,12 +433,22 @@ impl<T: HeapObject> WeakGcCell<T> {
         unsafe { *self.raw.get() }.is_cleared()
     }
 
+    pub fn word(&self) -> Value {
+        unsafe { *self.raw.get() }
+    }
+
+    pub fn set_word(&self, v: Value) {
+        unsafe { *self.raw.get() = v };
+    }
+
     pub fn upgrade<'a>(&self, guard: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
         let word = unsafe { *self.raw.get() };
         if word.is_cleared() {
             return None;
         }
-        let strong = Value::from_bits(word.raw_addr() | crate::value::STRONG_PTR);
+        // Safety: re-tags the word of a live (not cleared) weak cell as
+        // strong; the address is unchanged.
+        let strong = unsafe { Value::from_bits(word.raw_addr() | crate::value::STRONG_PTR) };
         Some(unsafe { guard.get_unchecked(Tagged::from_value_unchecked(strong)) })
     }
 }
@@ -491,14 +517,50 @@ impl GcSlot<Smi> {
     }
 }
 
-pub trait RootVisitor {
-    fn visit_slot(&mut self, slot: &GcSlot);
+#[repr(transparent)]
+pub struct Register(UnsafeCell<Value>);
 
-    fn visit_weak_slot(&mut self, slot: &GcSlot) {
-        self.visit_slot(slot);
+impl Register {
+    pub unsafe fn from_value(v: Value) -> Self {
+        Self(UnsafeCell::new(v))
+    }
+
+    pub fn inner(&self) -> Value {
+        unsafe { *self.0.get() }
+    }
+
+    pub fn store(&self, v: Value) {
+        debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
+        unsafe { *self.0.get() = v };
     }
 }
 
+pub trait Visitor {
+    fn visit_slot(&mut self, slot: &GcSlot);
+
+    fn visit_register(&mut self, reg: &Register);
+
+    fn visit_weak_slot<T: HeapObject>(&mut self, cell: &WeakGcCell<T>);
+}
+
+impl<V: Visitor + ?Sized> Visitor for &mut V {
+    fn visit_slot(&mut self, slot: &GcSlot) {
+        (**self).visit_slot(slot)
+    }
+
+    fn visit_register(&mut self, reg: &Register) {
+        (**self).visit_register(reg)
+    }
+
+    fn visit_weak_slot<T: HeapObject>(&mut self, cell: &WeakGcCell<T>) {
+        (**self).visit_weak_slot(cell)
+    }
+}
+
+pub trait RootVisitor: Visitor {}
+
+impl<R: RootVisitor + ?Sized> RootVisitor for &mut R {}
+
 pub trait EdgeVisitable {
-    fn visit_edges(&self, visitor: &mut impl RootVisitor);
+    fn visit_edges(&self, visitor: &mut impl Visitor);
 }

@@ -4,7 +4,9 @@ use std::sync::Mutex;
 
 use core::alloc::Layout;
 
-use vm::{ByteArray, Handle, HandleScope, InternedString, LocalHeap, WeakGcCell};
+use vm::{
+    ByteArray, EdgeVisitable, Handle, HandleScope, InternedString, LocalHeap, Visitor, WeakGcCell,
+};
 
 /// Content hash for interned strings (FNV-1a, masked into smi range).
 /// TODO: decide on a hash algorithm
@@ -79,13 +81,20 @@ impl StringInterner {
     }
 }
 
-/// Upgrade a table entry to a rooted handle; `None` if the GC cleared it.
 fn handle_from_entry<'s, L: LocalHeap>(
     heap: &mut L,
     scope: &'s HandleScope<'_>,
     entry: &WeakGcCell<InternedString>,
 ) -> Option<Handle<'s, InternedString>> {
     heap.no_gc(|nogc, _| entry.upgrade(nogc).map(|r| r.into_handle(scope)))
+}
+
+impl EdgeVisitable for StringInterner {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
+        for cell in self.table.lock().unwrap().values() {
+            visitor.visit_weak_slot(cell);
+        }
+    }
 }
 
 impl Default for StringInterner {

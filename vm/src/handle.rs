@@ -6,8 +6,8 @@ use core::{
 };
 
 use crate::{
-    GcSlot, Global, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, HeapRef, NoGc, PointerStrength,
-    RootVisitor, Strong, Tagged, Value, Weak,
+    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, HeapRef, NoGc,
+    PointerStrength, Strong, Tagged, Value, Visitor, Weak,
 };
 
 pub struct Handle<'scope, T, R: PointerStrength = Strong> {
@@ -53,7 +53,9 @@ impl<'s, T, R: PointerStrength> Handle<'s, T, R> {
 
 impl<'s, T: HeapObject> Handle<'s, T, Strong> {
     pub fn get(self) -> HeapPtr<T> {
-        HeapPtr::decode_strong(self.value()).expect("strong local slot must contain strong pointer")
+        self.as_tagged()
+            .as_ptr()
+            .expect("strong local slot must contain strong pointer")
     }
 
     pub fn as_tagged(self) -> Tagged<T> {
@@ -104,7 +106,7 @@ impl HandleDataImpl {
         self.blocks.push(block);
     }
 
-    fn visit_roots(&self, visitor: &mut impl RootVisitor) {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         for block in &self.blocks {
             let start = block.as_ptr() as *mut Value;
             let end = unsafe { start.add(block.len()) };
@@ -123,8 +125,6 @@ impl HandleDataImpl {
 }
 
 impl HandleData {
-    /// `fill` is the value for not-yet-handed-out slots — the void object
-    /// in practice (`heap.known().void`).
     pub fn new(fill: Value) -> Self {
         let mut inner = HandleDataImpl {
             blocks: Vec::new(),
@@ -146,9 +146,11 @@ impl HandleData {
     pub fn level(&self) -> usize {
         self.inner().level
     }
+}
 
-    pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
-        self.inner().visit_roots(visitor)
+impl EdgeVisitable for HandleData {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
+        self.inner().visit_edges(visitor)
     }
 }
 
@@ -274,8 +276,10 @@ impl RootHandles {
         unsafe { *slot = value.erase() };
         Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
     }
+}
 
-    pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
+impl EdgeVisitable for RootHandles {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
         for slot in &self.slots[..self.next.load(Ordering::Relaxed)] {
             visitor.visit_slot(slot);
         }

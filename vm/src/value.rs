@@ -22,7 +22,7 @@ pub const WEAK_PTR: Word = 0b11;
 pub struct Value(Word);
 
 impl Value {
-    pub const fn from_bits(bits: Word) -> Self {
+    pub const unsafe fn from_bits(bits: Word) -> Self {
         Self(bits)
     }
 
@@ -50,7 +50,7 @@ impl Value {
         self.0 & TAG_MASK == WEAK_PTR
     }
 
-    pub const CLEARED: Value = Value::from_bits(WEAK_PTR);
+    pub const CLEARED: Value = Value(WEAK_PTR);
 
     pub const fn is_cleared(self) -> bool {
         self.0 == WEAK_PTR
@@ -78,16 +78,12 @@ impl Smi {
     pub const MAX: i64 = i64::MAX >> 1;
     pub const MIN: i64 = !Self::MAX;
 
-    pub const fn new(val: i64) -> Option<Self> {
-        if Self::MIN <= val && val <= Self::MAX {
-            Some(Self(val))
-        } else {
-            None
-        }
+    pub const fn in_range(val: i64) -> bool {
+        Self::MIN <= val && val <= Self::MAX
     }
 
-    pub const fn new_unchecked(val: i64) -> Self {
-        debug_assert!(Self::MIN <= val && val <= Self::MAX);
+    pub const fn new(val: i64) -> Self {
+        debug_assert!(Self::in_range(val));
         Self(val)
     }
 
@@ -96,7 +92,7 @@ impl Smi {
     }
 
     pub const fn encode(self) -> Value {
-        Value::from_bits((self.0 as Word) << 1)
+        Value((self.0 as Word) << 1)
     }
 
     pub const fn decode(v: Value) -> Option<Smi> {
@@ -128,12 +124,8 @@ impl<T> core::fmt::Debug for HeapPtr<T> {
     }
 }
 
-impl<T: HeapObject> HeapPtr<T> {
-    pub unsafe fn new_unchecked(ptr: *mut T) -> Self {
-        debug_assert!(
-            ptr as Word & TAG_MASK == 0,
-            "heap objects must be >=4-aligned"
-        );
+impl<T> HeapPtr<T> {
+    pub unsafe fn new(ptr: *mut T) -> Self {
         unsafe { Self(NonNull::new_unchecked(ptr)) }
     }
 
@@ -141,6 +133,30 @@ impl<T: HeapObject> HeapPtr<T> {
         self.0.as_ptr()
     }
 
+    pub unsafe fn cast<U>(self) -> HeapPtr<U> {
+        unsafe { HeapPtr::new(self.as_ptr() as *mut U) }
+    }
+}
+
+impl HeapPtr<Value> {
+    pub fn decode_strong(v: Value) -> Option<Self> {
+        if v.is_strong_ptr() {
+            Some(unsafe { Self::new(v.raw_addr() as *mut Value) })
+        } else {
+            None
+        }
+    }
+
+    pub fn decode(v: Value) -> Option<Self> {
+        if v.is_ptr() {
+            Some(unsafe { Self::new(v.raw_addr() as *mut Value) })
+        } else {
+            None
+        }
+    }
+}
+
+impl<T: HeapObject> HeapPtr<T> {
     pub unsafe fn as_ref<'a>(self) -> &'a T {
         unsafe { &*self.0.as_ptr() }
     }
@@ -150,27 +166,11 @@ impl<T: HeapObject> HeapPtr<T> {
     }
 
     pub fn encode_strong(self) -> Value {
-        Value::from_bits(self.as_ptr() as Word | STRONG_PTR)
+        Value(self.as_ptr() as Word | STRONG_PTR)
     }
 
     pub fn encode_weak(self) -> Value {
-        Value::from_bits(self.as_ptr() as Word | WEAK_PTR)
-    }
-
-    pub fn decode_strong(v: Value) -> Option<Self> {
-        if v.is_strong_ptr() {
-            Some(unsafe { Self::new_unchecked(v.raw_addr() as *mut T) })
-        } else {
-            None
-        }
-    }
-
-    pub fn decode(v: Value) -> Option<Self> {
-        if v.is_ptr() {
-            Some(unsafe { Self::new_unchecked(v.raw_addr() as *mut T) })
-        } else {
-            None
-        }
+        Value(self.as_ptr() as Word | WEAK_PTR)
     }
 }
 
@@ -228,7 +228,7 @@ impl<T> Tagged<T> {
         Tagged::<Value>::from_ereased(self.raw)
     }
 
-    pub unsafe fn cast_unchecked<U>(self) -> Tagged<U> {
+    pub unsafe fn cast<U>(self) -> Tagged<U> {
         unsafe { Tagged::from_value_unchecked(self.raw) }
     }
 
@@ -265,7 +265,11 @@ impl Tagged<Smi> {
     }
 
     pub fn smi(v: i64) -> Option<Self> {
-        Smi::new(v).map(Self::from_smi)
+        if Smi::in_range(v) {
+            Some(Self::from_smi(Smi::new(v)))
+        } else {
+            None
+        }
     }
 
     pub fn to_smi(self) -> Option<Smi> {
@@ -285,13 +289,17 @@ impl<T: HeapObject> Tagged<T> {
     }
 
     pub fn as_ptr(self) -> Option<HeapPtr<T>> {
-        HeapPtr::decode_strong(self.raw)
+        if self.raw.is_strong_ptr() {
+            Some(unsafe { HeapPtr::new(self.raw.raw_addr() as *mut T) })
+        } else {
+            None
+        }
     }
 }
 
 impl<T: HeapObject> From<Tagged<T>> for HeapPtr<T> {
     fn from(v: Tagged<T>) -> Self {
-        unsafe { HeapPtr::new_unchecked(v.erase().raw_addr() as *mut T) }
+        unsafe { HeapPtr::new(v.erase().raw_addr() as *mut T) }
     }
 }
 

@@ -3,13 +3,25 @@ use std::sync::{Arc, Mutex, Weak};
 use core::cell::Cell;
 use core::ptr::NonNull;
 
-use vm::{AllocError, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap};
+use vm::{
+    AllocError, CallableObject, EdgeVisitable, Handle, HandleData, HandleScope, Heap,
+    InternedString, LocalHeap, RootVisitor, Value, Visitor,
+};
 
+pub mod cache;
 pub mod interner;
+pub mod interpreter;
 pub mod natives;
+pub mod stack;
+
+pub use stack::{STACK_SLOTS, Stack, FrameMeta};
+
+pub use cache::StackCache;
 
 pub use interner::StringInterner;
-pub use natives::{EXCEPTION_SENTINEL, NativeFn, NativeIndex, NativeRegistry, VmError};
+pub use natives::{
+    EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry, VmError,
+};
 
 pub struct SharedVM<H: Heap> {
     heap: H,
@@ -22,19 +34,107 @@ pub struct VM<H: Heap> {
     shared: Arc<SharedVM<H>>,
 }
 
-struct ContextState {
+pub struct ContextState {
     handles: HandleData,
+    stack: Stack,
+    cache: StackCache,
+    pending_exception: Cell<Option<VmError>>,
 }
 
-pub struct Context<H: Heap> {
-    vm: VM<H>,
-    heap: H::Local,
-    state: Arc<ContextState>,
-    pending_exception: Cell<Option<VmError>>,
+impl ContextState {
+    pub fn stack(&self) -> &Stack {
+        &self.stack
+    }
+
+    pub fn set_pending_exception(&self, err: VmError) {
+        self.pending_exception.set(Some(err));
+    }
+
+    pub fn take_pending_exception(&self) -> Option<VmError> {
+        self.pending_exception.take()
+    }
+
+    pub fn has_pending_exception(&self) -> bool {
+        self.pending_exception.get().is_some()
+    }
+
+    pub fn handle_scope<R>(&self, f: impl for<'s> FnOnce(HandleScope<'s>) -> R) -> R {
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.handles)) };
+        f(scope)
+    }
 }
 
 unsafe impl Send for ContextState {}
 unsafe impl Sync for ContextState {}
+
+impl EdgeVisitable for ContextState {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
+        self.handles.visit_edges(visitor);
+        self.stack.visit_edges(visitor);
+        self.cache.visit_edges(visitor);
+    }
+}
+
+pub struct Thread<H: Heap> {
+    vm: VM<H>,
+    heap: H::Local,
+    state: Arc<ContextState>,
+}
+
+impl<H: Heap> Thread<H> {
+    pub fn vm(&self) -> &VM<H> {
+        &self.vm
+    }
+
+    pub fn heap(&mut self) -> &mut H::Local {
+        &mut self.heap
+    }
+
+    pub fn state(&self) -> &ContextState {
+        &self.state
+    }
+
+    pub fn intern<'s>(
+        &mut self,
+        scope: &'s HandleScope<'_>,
+        s: impl AsRef<str>,
+    ) -> Handle<'s, InternedString> {
+        self.vm.interner().intern(&mut self.heap, scope, s)
+    }
+
+    pub fn set_pending_exception(&self, err: VmError) {
+        self.state.set_pending_exception(err);
+    }
+
+    pub fn take_pending_exception(&self) -> Option<VmError> {
+        self.state.take_pending_exception()
+    }
+
+    pub fn has_pending_exception(&self) -> bool {
+        self.state.has_pending_exception()
+    }
+
+    pub fn handle_scope<R>(
+        &mut self,
+        f: impl for<'s> FnOnce(&mut Self, HandleScope<'s>) -> R,
+    ) -> R {
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
+        f(self, scope)
+    }
+
+    pub fn run(
+        &mut self,
+        callable: vm::Tagged<CallableObject>,
+        args: &[vm::Value],
+    ) -> Result<vm::Value, VmError> {
+        interpreter::run(&self.vm, &mut self.heap, &self.state, callable, args)
+    }
+
+    pub fn run_native(&mut self, f: NativeFn<H>, args: &[vm::Value]) -> Result<Value, VmError> {
+        let mut nctx = NativeContext::new(&self.vm, &mut self.heap, &self.state);
+        f(&mut nctx, args)
+    }
+}
 
 impl<H: Heap> Clone for VM<H> {
     fn clone(&self) -> Self {
@@ -84,72 +184,43 @@ impl<H: Heap> VM<H> {
             .insert(f)
     }
 
-    pub fn attach(&self) -> Context<H> {
+    pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
+        self.shared.interner.visit_edges(visitor);
+        let threads = self.shared.threads.lock().unwrap();
+        for state in threads.iter().filter_map(Weak::upgrade) {
+            state.visit_edges(visitor);
+        }
+    }
+
+    pub fn attach(&self) -> Thread<H> {
         let heap = self.shared.heap.new_local();
+        let void = heap.known().void.value();
         let state = Arc::new(ContextState {
-            handles: HandleData::new(heap.known().void.value()),
+            handles: HandleData::new(void),
+            stack: Stack::new(STACK_SLOTS, void),
+            cache: StackCache::new(void),
+            pending_exception: Cell::new(None),
         });
         let mut threads = self.shared.threads.lock().unwrap();
         threads.retain(|t| t.strong_count() > 0);
         threads.push(Arc::downgrade(&state));
-        Context {
+        Thread {
             vm: self.clone(),
             heap,
             state,
-            pending_exception: Cell::new(None),
         }
     }
 
     pub fn spawn<F, R>(&self, f: F) -> std::thread::JoinHandle<R>
     where
-        F: FnOnce(&mut Context<H>) -> R + Send + 'static,
+        F: FnOnce(&mut Thread<H>) -> R + Send + 'static,
         R: Send + 'static,
         H: 'static,
     {
         let vm = self.clone();
         std::thread::spawn(move || {
-            let mut ctx = vm.attach();
-            f(&mut ctx)
+            let mut thread = vm.attach();
+            f(&mut thread)
         })
-    }
-}
-
-impl<H: Heap> Context<H> {
-    pub fn vm(&self) -> &VM<H> {
-        &self.vm
-    }
-
-    pub fn heap(&mut self) -> &mut H::Local {
-        &mut self.heap
-    }
-
-    pub fn intern<'s>(
-        &mut self,
-        scope: &'s HandleScope<'_>,
-        s: impl AsRef<str>,
-    ) -> Handle<'s, InternedString> {
-        self.vm.interner().intern(&mut self.heap, scope, s)
-    }
-
-    /// Record a pending exception (set by failing natives; consumed by
-    /// the interpreter's exception path).
-    pub fn set_pending_exception(&self, err: VmError) {
-        self.pending_exception.set(Some(err));
-    }
-
-    pub fn take_pending_exception(&self) -> Option<VmError> {
-        self.pending_exception.take()
-    }
-
-    pub fn has_pending_exception(&self) -> bool {
-        self.pending_exception.get().is_some()
-    }
-
-    pub fn handle_scope<R>(
-        &mut self,
-        f: impl for<'s> FnOnce(&mut Self, HandleScope<'s>) -> R,
-    ) -> R {
-        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
-        f(self, scope)
     }
 }
