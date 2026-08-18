@@ -241,10 +241,10 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, HeapPtr, Lookup, Map, MapInit, SlotFlags, SlotName, SlotsObject,
+        AccessorPair, HeapPtr, Lookup, Map, MapInit, MapKind, SlotFlags, SlotName, SlotsObject,
         SlotsObjectInit, Tagged, Value,
     };
-    use vm::{Array, ByteArray, HandleData, HandleScope, Register, Smi};
+    use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Register, Smi};
 
     fn scope(data: &HandleData) -> HandleScope<'_> {
         unsafe { HandleScope::from_raw(NonNull::from(data)) }
@@ -264,6 +264,7 @@ mod tests {
         let map_map = heap.known().map_map.as_tagged();
         heap.allocate::<Map>(MapInit {
             map_map,
+            kind: MapKind::OBJECT,
             value_slot_count: value_slots,
             descriptors: &descriptors,
         })
@@ -441,15 +442,15 @@ mod tests {
     #[test]
     fn token_bulk_allocates_and_tracks_remaining() {
         let mut heap = local_with_maps(1 << 16);
-        let la = Array::layout_for(2);
-        let lb = ByteArray::layout_for(8);
+        let la = FixedArray::layout_for(2);
+        let lb = FixedByteArray::layout_for(8);
         let total = Layout::from_size_align(la.size() + lb.size(), 16).unwrap();
         let before = heap.shared().used();
         {
             let tok = heap.allocate_token(total);
             assert_eq!(tok.remaining(), la.size() + lb.size());
-            let a = tok.allocate::<Array>(&[Smi::new(0).encode(); 2]);
-            let b = tok.allocate::<ByteArray>(&[0u8; 8]);
+            let a = tok.allocate::<FixedArray>(&[Smi::new(0).encode(); 2]);
+            let b = tok.allocate::<FixedByteArray>(&[0u8; 8]);
             assert_ne!(a.as_ptr() as *mut u8, b.as_ptr() as *mut u8);
             assert_eq!(tok.remaining(), 0);
         }
@@ -463,16 +464,18 @@ mod tests {
         let mut heap = local_with_maps(1 << 16);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let la = Array::layout_for(2);
-        let lb = ByteArray::layout_for(8);
+        let la = FixedArray::layout_for(2);
+        let lb = FixedByteArray::layout_for(8);
         let total = Layout::from_size_align(la.size() + lb.size(), 16).unwrap();
 
         let (ha, hb) = {
             let tok = heap.allocate_token(total);
             let ha = tok
-                .allocate::<Array>(&[Smi::new(0).encode(); 2])
+                .allocate::<FixedArray>(&[Smi::new(0).encode(); 2])
                 .into_handle(&scope);
-            let hb = tok.allocate::<ByteArray>(&[0u8; 8]).into_handle(&scope);
+            let hb = tok
+                .allocate::<FixedByteArray>(&[0u8; 8])
+                .into_handle(&scope);
             (ha, hb)
         }; // token dropped here (full use verified)
 
@@ -487,13 +490,13 @@ mod tests {
         let mut heap = local_with_maps(1 << 16);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let la = Array::layout_for(1);
+        let la = FixedArray::layout_for(1);
         let total = Layout::from_size_align(2 * la.size(), 16).unwrap();
 
         let tok = heap.allocate_token(total);
         // multiple Fresh alive at once (shared borrows of the token)
-        let a = tok.allocate::<Array>(&[Smi::new(0).encode()]);
-        let b = tok.allocate::<Array>(&[Smi::new(0).encode()]);
+        let a = tok.allocate::<FixedArray>(&[Smi::new(0).encode()]);
+        let b = tok.allocate::<FixedArray>(&[Smi::new(0).encode()]);
         let ha = a.into_handle(&scope);
         let hb = b.into_handle(&scope);
         assert_ne!(ha.value().to_bits(), hb.value().to_bits());
@@ -502,13 +505,13 @@ mod tests {
     #[test]
     fn token_enter_no_gc_allocates_refs() {
         let mut heap = local_with_maps(1 << 16);
-        let lb = ByteArray::layout_for(8);
+        let lb = FixedByteArray::layout_for(8);
         let total = Layout::from_size_align(2 * lb.size(), 16).unwrap();
 
         let tok = heap.allocate_token(total);
         tok.enter_no_gc(|nogc, _heap| {
-            let a = tok.allocate_ref::<ByteArray>(&[0u8; 8], nogc);
-            let b = tok.allocate_ref::<ByteArray>(&[0u8; 8], nogc);
+            let a = tok.allocate_ref::<FixedByteArray>(&[0u8; 8], nogc);
+            let b = tok.allocate_ref::<FixedByteArray>(&[0u8; 8], nogc);
             a.set(0, 1);
             b.set(0, 42);
             b.set(1, 7);
@@ -521,10 +524,10 @@ mod tests {
     #[test]
     fn allocate_token_enter_no_gc_combines_both() {
         let mut heap = local_with_maps(1 << 16);
-        let lb = ByteArray::layout_for(4);
+        let lb = FixedByteArray::layout_for(4);
         let total = Layout::from_size_align(lb.size(), 16).unwrap();
         heap.allocate_token_enter_nogc(total, |tok, nogc, _heap| {
-            let a = tok.allocate_ref::<ByteArray>(&[0u8; 4], nogc);
+            let a = tok.allocate_ref::<FixedByteArray>(&[0u8; 4], nogc);
             a.set(0, 1);
             assert_eq!(a.get(0), 1);
         });
@@ -533,7 +536,7 @@ mod tests {
     #[test]
     fn allocate_enter_no_gc_gives_ref_instantly() {
         let mut heap = local_with_maps(1 << 16);
-        heap.allocate_enter_nogc::<ByteArray, _>(&[1u8, 2, 3, 4], |bytes, _nogc, _heap| {
+        heap.allocate_enter_nogc::<FixedByteArray, _>(&[1u8, 2, 3, 4], |bytes, _nogc, _heap| {
             assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
         });
     }
@@ -544,7 +547,7 @@ mod tests {
         let mut heap = local_with_maps(1 << 16);
         let total = Layout::from_size_align(4096, 16).unwrap();
         let tok = heap.allocate_token(total);
-        let _ = tok.allocate::<ByteArray>(&[0u8; 4]);
+        let _ = tok.allocate::<FixedByteArray>(&[0u8; 4]);
         // dropped with most of the reservation unused
     }
 
@@ -554,6 +557,6 @@ mod tests {
         let mut heap = local_with_maps(1 << 16);
         let total = Layout::from_size_align(64, 16).unwrap();
         let tok = heap.allocate_token(total);
-        let _ = tok.allocate::<ByteArray>(&[0u8; 4096]);
+        let _ = tok.allocate::<FixedByteArray>(&[0u8; 4096]);
     }
 }

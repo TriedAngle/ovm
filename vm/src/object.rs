@@ -52,6 +52,8 @@ pub struct Map {
     pub header: Header,
     pub value_slot_count: GcSlot<Smi>,
     pub descriptor_count: GcSlot<Smi>,
+    /// Object kind tag (low byte) and capability flags (second byte).
+    pub kind: GcSlot<Smi>,
     pub descriptors: [SlotDescriptor; 0],
 }
 
@@ -73,6 +75,10 @@ impl Map {
         self.descriptor_count.to_smi().value() as usize
     }
 
+    pub fn kind(&self) -> MapKind {
+        MapKind::new(self.kind.to_smi().value() as u64)
+    }
+
     fn data_ptr(&self) -> *mut SlotDescriptor {
         self.descriptors.as_ptr() as *mut SlotDescriptor
     }
@@ -89,6 +95,7 @@ impl Map {
 
 pub struct MapInit<'a> {
     pub map_map: Tagged<Map>,
+    pub kind: MapKind,
     pub value_slot_count: usize,
     pub descriptors: &'a [(SlotName, SlotFlags, Value)],
 }
@@ -107,6 +114,8 @@ impl HeapObject for Map {
             .set(heap, host, Smi::new(config.value_slot_count as i64));
         self.descriptor_count
             .set(heap, host, Smi::new(config.descriptors.len() as i64));
+        self.kind
+            .set(heap, host, Smi::new(config.kind.bits() as i64));
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
             d.name.set(heap, host, name.tagged());
@@ -131,6 +140,108 @@ impl EdgeVisitable for Map {
             visitor.visit_slot(d.name.ereased());
             visitor.visit_slot(d.value.ereased());
         }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u64)]
+pub enum ObjectKind {
+    BuiltinStart = 0,
+    Map = 1,
+    FixedArray = 2,
+    FixedByteArray = 3,
+    VMString = 4,
+    AccessorPair = 5,
+    CallableInfo = 6,
+    Float = 7,
+    Symbol = 8,
+    BuiltinEnd = 9,
+
+    /// elements and len empty
+    Object = 10,
+    /// `elements` points to a `FixedArray`.
+    Array = 11,
+    /// `elements` points to a `FixedByteArray`.
+    ByteArray = 12,
+    /// `elements` points to a `VMString`.
+    String = 13,
+}
+
+impl ObjectKind {
+    pub const BUILTIN_START: u64 = ObjectKind::BuiltinStart as u64;
+    pub const BUILTIN_END: u64 = ObjectKind::BuiltinEnd as u64;
+}
+
+/// Low byte: the `ObjectKind`. Second byte: capability flags
+/// (extendable, callable, constructor). Constructor implies callable.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct MapKind(u64);
+
+impl MapKind {
+    const KIND_MASK: u64 = 0xff;
+
+    pub const EXTENDABLE: MapKind = MapKind(1 << 8);
+    pub const CALLABLE: MapKind = MapKind(1 << 9);
+    pub const CONSTRUCTOR: MapKind = MapKind(1 << 10);
+
+    pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
+    pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
+    pub const FIXED_BYTE_ARRAY: MapKind = MapKind(ObjectKind::FixedByteArray as u64);
+    pub const VM_STRING: MapKind = MapKind(ObjectKind::VMString as u64);
+    pub const ACCESSOR_PAIR: MapKind = MapKind(ObjectKind::AccessorPair as u64);
+    pub const CALLABLE_INFO: MapKind = MapKind(ObjectKind::CallableInfo as u64);
+    pub const FLOAT: MapKind = MapKind(ObjectKind::Float as u64);
+    pub const SYMBOL: MapKind = MapKind(ObjectKind::Symbol as u64);
+    pub const OBJECT: MapKind = MapKind(ObjectKind::Object as u64);
+    pub const ARRAY: MapKind = MapKind(ObjectKind::Array as u64);
+    pub const BYTE_ARRAY: MapKind = MapKind(ObjectKind::ByteArray as u64);
+    pub const STRING: MapKind = MapKind(ObjectKind::String as u64);
+
+    pub const fn new(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn kind(self) -> ObjectKind {
+        match Self(self.0 & Self::KIND_MASK) {
+            Self::MAP => ObjectKind::Map,
+            Self::FIXED_ARRAY => ObjectKind::FixedArray,
+            Self::FIXED_BYTE_ARRAY => ObjectKind::FixedByteArray,
+            Self::VM_STRING => ObjectKind::VMString,
+            Self::ACCESSOR_PAIR => ObjectKind::AccessorPair,
+            Self::CALLABLE_INFO => ObjectKind::CallableInfo,
+            Self::FLOAT => ObjectKind::Float,
+            Self::SYMBOL => ObjectKind::Symbol,
+            Self::OBJECT => ObjectKind::Object,
+            Self::ARRAY => ObjectKind::Array,
+            Self::BYTE_ARRAY => ObjectKind::ByteArray,
+            Self::STRING => ObjectKind::String,
+            _ => panic!("invalid object kind"),
+        }
+    }
+
+    pub const fn is_builtin(self) -> bool {
+        let kind = self.0 & Self::KIND_MASK;
+        kind > ObjectKind::BUILTIN_START && kind < ObjectKind::BUILTIN_END
+    }
+
+    pub const fn is_extendable(self) -> bool {
+        self.0 & Self::EXTENDABLE.0 != 0
+    }
+
+    pub const fn is_callable(self) -> bool {
+        self.0 & Self::CALLABLE.0 != 0
+    }
+
+    pub const fn is_constructor(self) -> bool {
+        self.0 & Self::CONSTRUCTOR.0 != 0
     }
 }
 

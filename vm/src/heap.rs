@@ -7,7 +7,7 @@ use core::{
 };
 
 use crate::{
-    Global, Handle, HandleScope, Header, HeapObject, HeapPtr, Map, MapInit, RootHandles,
+    Global, Handle, HandleScope, Header, HeapObject, HeapPtr, Map, MapInit, MapKind, RootHandles,
     SlotsObject, SlotsObjectInit, Smi, Tagged, Value, Word,
 };
 
@@ -69,6 +69,7 @@ pub trait Heap: Sized + Send + Sync {
             let map_map = Tagged::from_ptr(ptr);
             let init = MapInit {
                 map_map,
+                kind: MapKind::MAP,
                 value_slot_count: 0,
                 descriptors: &[],
             };
@@ -81,6 +82,7 @@ pub trait Heap: Sized + Send + Sync {
         let void_map = local
             .allocate::<Map>(MapInit {
                 map_map: meta,
+                kind: MapKind::OBJECT,
                 value_slot_count: 0,
                 descriptors: &[],
             })
@@ -93,10 +95,11 @@ pub trait Heap: Sized + Send + Sync {
             })
             .into_global(&roots);
 
-        let mut new_map = |map_map: Tagged<Map>| {
+        let mut new_map = |map_map: Tagged<Map>, kind: MapKind| {
             local
                 .allocate::<Map>(MapInit {
                     map_map,
+                    kind,
                     value_slot_count: 0,
                     descriptors: &[],
                 })
@@ -106,14 +109,14 @@ pub trait Heap: Sized + Send + Sync {
         let known = WellKnown {
             map_map,
             void,
-            smi_map: new_map(meta),
-            float_map: new_map(meta),
-            array_map: new_map(meta),
-            byte_array_map: new_map(meta),
-            string_map: new_map(meta),
-            symbol_map: new_map(meta),
-            accessor_pair_map: new_map(meta),
-            callable_map: new_map(meta),
+            smi_map: new_map(meta, MapKind::OBJECT),
+            float_map: new_map(meta, MapKind::FLOAT),
+            array_map: new_map(meta, MapKind::FIXED_ARRAY),
+            byte_array_map: new_map(meta, MapKind::FIXED_BYTE_ARRAY),
+            string_map: new_map(meta, MapKind::VM_STRING),
+            symbol_map: new_map(meta, MapKind::SYMBOL),
+            accessor_pair_map: new_map(meta, MapKind::ACCESSOR_PAIR),
+            callable_map: new_map(meta, MapKind::CALLABLE_INFO),
             roots,
         };
         self.set_known(known);

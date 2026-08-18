@@ -2,8 +2,8 @@ use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeIndex, VM, VmError};
 use vm::{
-    Array, ByteArray, CallableInit, CallableObject, HeapPtr, LocalHeap, Map, MapInit, SlotFlags,
-    SlotName, SlotsObject, SlotsObjectInit, Smi,
+    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HeapPtr, LocalHeap, Map,
+    MapInit, MapKind, SlotFlags, SlotName, SlotsObject, SlotsObjectInit, Smi,
 };
 
 fn smi(v: i64) -> vm::Value {
@@ -18,10 +18,12 @@ fn run_program(
 ) -> Result<vm::Value, ovm::VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
-        let bytecode = thread.heap().allocate_handle::<ByteArray>(&program, &scope);
-        let constants = thread.heap().allocate_handle::<Array>(&[], &scope);
-        let callable = thread.heap().allocate_handle::<CallableObject>(
-            CallableInit {
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
                 bytecode: bytecode.as_tagged(),
                 constants: constants.as_tagged(),
                 register_count,
@@ -139,10 +141,10 @@ fn call_resolves_target_lookup_and_pushes_frames() {
         emit(&mut callee_program, Opcode::Return, &[]);
         let callee_bytecode = thread
             .heap()
-            .allocate_handle::<ByteArray>(&callee_program, &scope);
-        let callee_constants = thread.heap().allocate_handle::<Array>(&[], &scope);
-        let callee = thread.heap().allocate_handle::<CallableObject>(
-            CallableInit {
+            .allocate_handle::<FixedByteArray>(&callee_program, &scope);
+        let callee_constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
                 bytecode: callee_bytecode.as_tagged(),
                 constants: callee_constants.as_tagged(),
                 register_count: 2,
@@ -157,6 +159,7 @@ fn call_resolves_target_lookup_and_pushes_frames() {
         let map = thread.heap().allocate_handle::<Map>(
             MapInit {
                 map_map,
+                kind: MapKind::OBJECT,
                 value_slot_count: 1,
                 descriptors: &[(
                     SlotName::from(call_name.as_tagged()),
@@ -177,15 +180,17 @@ fn call_resolves_target_lookup_and_pushes_frames() {
         // caller: r0 = receiver; CallNoFeedback r0, r0, 1 -> acc
         let receiver_consts = thread
             .heap()
-            .allocate_handle::<Array>(&[receiver.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[receiver.as_tagged().erase()], &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
         emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
         emit(&mut program, Opcode::Return, &[]);
-        let bytecode = thread.heap().allocate_handle::<ByteArray>(&program, &scope);
-        let caller = thread.heap().allocate_handle::<CallableObject>(
-            CallableInit {
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let caller = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
                 bytecode: bytecode.as_tagged(),
                 constants: receiver_consts.as_tagged(),
                 register_count: 2,
@@ -219,7 +224,7 @@ fn create_array_literal_fills_from_registers() {
     let array = result.unwrap();
     thread.heap().no_gc(|nogc, heap| {
         let a = nogc
-            .get_as::<Array>(array, heap.known().array_map)
+            .get_as::<FixedArray>(array, heap.known().array_map)
             .expect("array literal result");
         assert_eq!(Smi::decode(a.at(0)).unwrap().value(), 1);
         assert_eq!(Smi::decode(a.at(1)).unwrap().value(), 2);
@@ -242,6 +247,7 @@ fn create_object_from_map_fills_from_registers() {
         let map = thread.heap().allocate_handle::<Map>(
             MapInit {
                 map_map,
+                kind: MapKind::OBJECT,
                 value_slot_count: 2,
                 descriptors: &[
                     (
@@ -262,7 +268,7 @@ fn create_object_from_map_fills_from_registers() {
         // constants[0] = the map
         let consts = thread
             .heap()
-            .allocate_handle::<Array>(&[map.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[map.as_tagged().erase()], &scope);
 
         // r0 = 7, r1 = 9; CreateObjectFromMap 0 (map constant) r0 2
         let mut program = Vec::new();
@@ -273,9 +279,11 @@ fn create_object_from_map_fills_from_registers() {
         emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 2]);
         emit(&mut program, Opcode::Return, &[]);
 
-        let bytecode = thread.heap().allocate_handle::<ByteArray>(&program, &scope);
-        let callable = thread.heap().allocate_handle::<CallableObject>(
-            CallableInit {
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
                 bytecode: bytecode.as_tagged(),
                 constants: consts.as_tagged(),
                 register_count: 2,
