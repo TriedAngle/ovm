@@ -1,8 +1,8 @@
 use core::cell::UnsafeCell;
 
 use vm::{
-    Array, ByteArray, CallableObject, EdgeVisitable, HeapPtr, HeapRef, NoGc, Register, Tagged,
-    Value, Visitor,
+    CallableInfoObject, EdgeVisitable, FixedArray, FixedByteArray, HeapPtr, HeapRef, NoGc,
+    Register, Tagged, Value, Visitor,
 };
 
 use crate::{FrameMeta, Stack};
@@ -53,7 +53,7 @@ impl StackCache {
     pub fn load(&self, stack: &Stack, frame: FrameMeta) {
         let callable = stack.callable(&frame);
         let ptr = HeapPtr::decode_strong(callable).expect("callable must be strong");
-        let obj = unsafe { ptr.cast::<CallableObject>().as_ref() };
+        let obj = unsafe { ptr.cast::<CallableInfoObject>().as_ref() };
         let cache = self.get();
         cache.code.store(obj.bytecode.get().erase());
         cache.constants.store(obj.constants.get().erase());
@@ -93,7 +93,7 @@ impl StackCache {
         self.get().code.inner()
     }
 
-    pub fn code_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, ByteArray> {
+    pub fn code_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
         debug_assert!(self.is_active(), "bytecode read from inactive cache");
         unsafe { nogc.get_unchecked(Tagged::from_value_unchecked(self.code())) }
     }
@@ -102,7 +102,7 @@ impl StackCache {
         self.get().constants.inner()
     }
 
-    pub fn constants_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, Array> {
+    pub fn constants_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedArray> {
         debug_assert!(self.is_active(), "constants read from inactive cache");
         unsafe { nogc.get_unchecked(Tagged::from_value_unchecked(self.constants())) }
     }

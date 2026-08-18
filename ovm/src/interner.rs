@@ -5,7 +5,8 @@ use std::sync::Mutex;
 use core::alloc::Layout;
 
 use vm::{
-    ByteArray, EdgeVisitable, Handle, HandleScope, InternedString, LocalHeap, Visitor, WeakGcCell,
+    EdgeVisitable, FixedByteArray, Handle, HandleScope, InternedString, LocalHeap, Visitor,
+    WeakGcCell,
 };
 
 /// Content hash for interned strings (FNV-1a, masked into smi range).
@@ -51,12 +52,12 @@ impl StringInterner {
             }
         }
 
-        let lb = ByteArray::layout_for(s.len());
+        let lb = FixedByteArray::layout_for(s.len());
         let ls = Layout::new::<InternedString>();
         let (total, _) = lb.extend(ls).expect("string layout");
 
         let handle = heap.allocate_token_enter_nogc(total, |token, nogc, _heap| {
-            let backing = token.allocate_ref::<ByteArray>(s.as_bytes(), nogc);
+            let backing = token.allocate_ref::<FixedByteArray>(s.as_bytes(), nogc);
             let hash = hash_bytes(s.as_bytes());
             let interned =
                 token.allocate_ref::<InternedString>((backing.into_tagged(), hash), nogc);

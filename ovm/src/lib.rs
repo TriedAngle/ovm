@@ -4,7 +4,7 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use vm::{
-    AllocError, CallableObject, EdgeVisitable, Handle, HandleData, HandleScope, Heap,
+    AllocError, CallableInfoObject, EdgeVisitable, Handle, HandleData, HandleScope, Heap,
     InternedString, LocalHeap, RootVisitor, Value, Visitor,
 };
 
@@ -14,7 +14,7 @@ pub mod interpreter;
 pub mod natives;
 pub mod stack;
 
-pub use stack::{STACK_SLOTS, Stack, FrameMeta};
+pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 
 pub use cache::StackCache;
 
@@ -124,7 +124,7 @@ impl<H: Heap> Thread<H> {
 
     pub fn run(
         &mut self,
-        callable: vm::Tagged<CallableObject>,
+        callable: vm::Tagged<CallableInfoObject>,
         args: &[vm::Value],
     ) -> Result<vm::Value, VmError> {
         interpreter::run(&self.vm, &mut self.heap, &self.state, callable, args)

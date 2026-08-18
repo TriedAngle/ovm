@@ -11,9 +11,9 @@ pub use heap::{
 };
 pub use lookup::Lookup;
 pub use object::{
-    AccessorPair, Array, ByteArray, CallableInit, CallableObject, Float, Header, HeapObject,
-    InternedString, Map, MapInit, SlotDescriptor, SlotFlags, SlotKind, SlotName, SlotsObject,
-    SlotsObjectInit, Symbol, VMString,
+    AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Header,
+    HeapObject, InternedString, Map, MapInit, SlotDescriptor, SlotFlags, SlotKind, SlotName,
+    SlotsObject, SlotsObjectInit, Symbol, VMString,
 };
 pub use value::{HeapPtr, PointerStrength, Smi, Strong, Tagged, Value, ValueRef, Weak, Word};
 

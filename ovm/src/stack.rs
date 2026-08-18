@@ -1,6 +1,6 @@
 use core::cell::{Cell, RefCell};
 
-use vm::{CallableObject, EdgeVisitable, Register, Smi, Tagged, Value, Visitor};
+use vm::{CallableInfoObject, EdgeVisitable, Register, Smi, Tagged, Value, Visitor};
 
 use crate::VmError;
 
@@ -89,7 +89,7 @@ impl Stack {
 
     pub fn push_initial_frame(
         &self,
-        callable: Tagged<CallableObject>,
+        callable: Tagged<CallableInfoObject>,
         args: &[Value],
     ) -> Result<FrameMeta, VmError> {
         let ptr = callable.as_ptr().ok_or(VmError::Type)?;
@@ -110,7 +110,7 @@ impl Stack {
     pub fn push_frame(
         &self,
         caller: FrameMeta,
-        callable: Tagged<CallableObject>,
+        callable: Tagged<CallableInfoObject>,
         src_reg_base: i32,
         count: usize,
     ) -> Result<FrameMeta, VmError> {
@@ -159,7 +159,7 @@ impl Stack {
         &self,
         base: usize,
         register_count: usize,
-        callable: Tagged<CallableObject>,
+        callable: Tagged<CallableInfoObject>,
         argc: usize,
     ) -> FrameMeta {
         self.slot_unchecked(base + register_count + CALLABLE_OFFSET)

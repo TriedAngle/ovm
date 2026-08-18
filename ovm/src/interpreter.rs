@@ -1,8 +1,8 @@
 use bytecode::{Opcode, Operand, Scale};
 
 use vm::{
-    Array, CallableObject, HeapObject, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc,
-    SlotName, SlotsObject, SlotsObjectInit, Smi, Tagged, Value, ValueRef,
+    CallableInfoObject, FixedArray, HeapObject, HeapRef, InternedString, LocalHeap, Lookup, Map,
+    NoGc, SlotName, SlotsObject, SlotsObjectInit, Smi, Tagged, Value, ValueRef,
 };
 
 use crate::{ContextState, Heap, NativeContext, NativeIndex, VM, VmError};
@@ -11,7 +11,7 @@ pub fn run<H: Heap>(
     vm: &VM<H>,
     heap: &mut H::Local,
     state: &ContextState,
-    callable: Tagged<CallableObject>,
+    callable: Tagged<CallableInfoObject>,
     args: &[Value],
 ) -> Result<Value, VmError> {
     let call_name = state.handle_scope(|scope| {
@@ -38,15 +38,15 @@ fn code_ref<'a, L: LocalHeap>(
     nogc: &'a NoGc<'a>,
     heap: &'a L,
     callable: Value,
-) -> HeapRef<'a, CallableObject> {
-    nogc.get_as::<CallableObject>(callable, heap.known().callable_map)
+) -> HeapRef<'a, CallableInfoObject> {
+    nogc.get_as::<CallableInfoObject>(callable, heap.known().callable_map)
         .expect("frame code must be a callable object")
 }
 
 fn property_name<'a, L: LocalHeap>(
     nogc: &'a NoGc<'a>,
     heap: &'a L,
-    constants: HeapRef<'a, Array>,
+    constants: HeapRef<'a, FixedArray>,
     idx: usize,
 ) -> SlotName {
     let v = constants.at(idx);
@@ -119,7 +119,7 @@ fn dispatch<H: Heap>(
                         .lookup(nogc, heap, call_name)
                     {
                         Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => nogc
-                            .get_as::<CallableObject>(slot.inner(), heap.known().callable_map)
+                            .get_as::<CallableInfoObject>(slot.inner(), heap.known().callable_map)
                             .map(|r| r.into_tagged()),
                         _ => None,
                     }
@@ -184,9 +184,10 @@ fn dispatch<H: Heap>(
                 let count = operands[1] as usize;
                 cache.spill_acc(acc);
                 let args = stack.args(&meta, operands[0] as i32, count);
-                let array = heap.allocate_enter_nogc(args, |dst: HeapRef<'_, Array>, _nogc, _| {
-                    dst.into_tagged().erase()
-                });
+                let array = heap
+                    .allocate_enter_nogc(args, |dst: HeapRef<'_, FixedArray>, _nogc, _| {
+                        dst.into_tagged().erase()
+                    });
                 let _ = cache.take_acc();
                 acc = array;
             }

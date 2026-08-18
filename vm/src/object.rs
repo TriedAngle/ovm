@@ -221,13 +221,21 @@ impl SlotDescriptor {
 }
 
 #[repr(C)]
-pub struct Array {
+pub struct Object {
+    header: Header,
+    slots: GcSlot<FixedArray>,
+    elements: GcSlot,
+    length: GcSlot<Smi>,
+}
+
+#[repr(C)]
+pub struct FixedArray {
     pub header: Header,
     pub size: GcSlot<Smi>,
     pub values: [GcSlot; 0],
 }
 
-impl Array {
+impl FixedArray {
     pub fn layout_for(len: usize) -> Layout {
         let values_layout = Layout::array::<GcSlot>(len).expect("values layout");
         Layout::new::<Self>()
@@ -263,7 +271,7 @@ impl Array {
     }
 }
 
-impl HeapObject for Array {
+impl HeapObject for FixedArray {
     type Init<'a> = &'a [Value];
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
@@ -290,7 +298,7 @@ impl HeapObject for Array {
     }
 }
 
-impl EdgeVisitable for Array {
+impl EdgeVisitable for FixedArray {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         let size = self.size.to_smi().value() as usize;
@@ -301,13 +309,13 @@ impl EdgeVisitable for Array {
 }
 
 #[repr(C)]
-pub struct ByteArray {
+pub struct FixedByteArray {
     pub header: Header,
     pub size: GcSlot<Smi>,
     pub values: [UnsafeCell<u8>; 0],
 }
 
-impl ByteArray {
+impl FixedByteArray {
     pub fn layout_for(len: usize) -> Layout {
         let values_layout = Layout::array::<u8>(len).expect("values layout");
         Layout::new::<Self>()
@@ -342,7 +350,7 @@ impl ByteArray {
     }
 }
 
-impl HeapObject for ByteArray {
+impl HeapObject for FixedByteArray {
     type Init<'a> = &'a [u8];
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
@@ -369,7 +377,7 @@ impl HeapObject for ByteArray {
     }
 }
 
-impl EdgeVisitable for ByteArray {
+impl EdgeVisitable for FixedByteArray {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
     }
@@ -378,12 +386,12 @@ impl EdgeVisitable for ByteArray {
 #[repr(C)]
 pub struct VMString {
     pub header: Header,
-    pub backing: GcSlot<ByteArray>,
+    pub backing: GcSlot<FixedByteArray>,
     pub hash: GcSlot<Smi>,
 }
 
 impl VMString {
-    pub fn backing(&self) -> &ByteArray {
+    pub fn backing(&self) -> &FixedByteArray {
         let ptr = self.backing.get().as_ptr().expect("string backing");
         unsafe { ptr.as_ref() }
     }
@@ -406,7 +414,7 @@ impl VMString {
 }
 
 impl HeapObject for VMString {
-    type Init<'a> = (Tagged<ByteArray>, i64);
+    type Init<'a> = (Tagged<FixedByteArray>, i64);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -447,7 +455,7 @@ impl InternedString {
 }
 
 impl HeapObject for InternedString {
-    type Init<'a> = (Tagged<ByteArray>, i64);
+    type Init<'a> = (Tagged<FixedByteArray>, i64);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -475,11 +483,11 @@ impl EdgeVisitable for InternedString {
 #[repr(C)]
 pub struct Symbol {
     pub header: Header,
-    pub backing: GcSlot<ByteArray>,
+    pub backing: GcSlot<FixedByteArray>,
 }
 
 impl Symbol {
-    pub fn backing(&self) -> &ByteArray {
+    pub fn backing(&self) -> &FixedByteArray {
         let ptr = self.backing.get().as_ptr().expect("symbol backing");
         unsafe { ptr.as_ref() }
     }
@@ -498,7 +506,7 @@ impl Symbol {
 }
 
 impl HeapObject for Symbol {
-    type Init<'a> = Tagged<ByteArray>;
+    type Init<'a> = Tagged<FixedByteArray>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -682,23 +690,23 @@ impl EdgeVisitable for SlotsObject {
 }
 
 #[repr(C)]
-pub struct CallableObject {
+pub struct CallableInfoObject {
     pub header: Header,
-    pub bytecode: GcSlot<ByteArray>,
-    pub constants: GcSlot<Array>,
+    pub bytecode: GcSlot<FixedByteArray>,
+    pub constants: GcSlot<FixedArray>,
     pub register_count: GcSlot<Smi>,
     pub context: GcSlot,
 }
 
-pub struct CallableInit {
-    pub bytecode: Tagged<ByteArray>,
-    pub constants: Tagged<Array>,
+pub struct CallableInfoInit {
+    pub bytecode: Tagged<FixedByteArray>,
+    pub constants: Tagged<FixedArray>,
     pub register_count: usize,
     pub context: Value,
 }
 
-impl HeapObject for CallableObject {
-    type Init<'a> = CallableInit;
+impl HeapObject for CallableInfoObject {
+    type Init<'a> = CallableInfoInit;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -726,7 +734,7 @@ impl HeapObject for CallableObject {
     }
 }
 
-impl EdgeVisitable for CallableObject {
+impl EdgeVisitable for CallableInfoObject {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit_slot(self.header.map.ereased());
         visitor.visit_slot(self.bytecode.ereased());

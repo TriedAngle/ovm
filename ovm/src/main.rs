@@ -2,7 +2,7 @@ use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
 use ovm::natives::NativeIndex;
-use vm::{Array, ByteArray, CallableInit, CallableObject, Float, LocalHeap, Smi};
+use vm::{CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, LocalHeap, Smi};
 
 fn main() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).expect("failed to create heap");
@@ -12,7 +12,7 @@ fn main() {
         let zero = Smi::new(0).encode();
         let _handle = thread
             .heap()
-            .allocate_handle::<Array>(&[zero, zero, zero], &scope);
+            .allocate_handle::<FixedArray>(&[zero, zero, zero], &scope);
 
         let interned = thread.intern(&scope, "hello, ovm");
         let again = thread.intern(&scope, "hello, ovm");
@@ -67,10 +67,10 @@ fn main() {
         let void = thread.heap().known().void.value();
         let bytecode = thread
             .heap()
-            .allocate_handle::<ByteArray>(program.as_slice(), &scope);
-        let constants = thread.heap().allocate_handle::<Array>(&[], &scope);
-        let callable = thread.heap().allocate_handle::<CallableObject>(
-            CallableInit {
+            .allocate_handle::<FixedByteArray>(program.as_slice(), &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
                 bytecode: bytecode.as_tagged(),
                 constants: constants.as_tagged(),
                 register_count: 2,
