@@ -1,6 +1,6 @@
 use core::cell::{Cell, RefCell};
 
-use vm::{CallableInfoObject, EdgeVisitable, Register, Smi, Tagged, Value, Visitor};
+use vm::{EdgeVisitable, Object, Register, Smi, Tagged, Value, Visitor};
 
 use crate::VmError;
 
@@ -58,9 +58,8 @@ impl Stack {
         unsafe { core::slice::from_raw_parts(slots.as_ptr() as *const Value, count) }
     }
 
-    pub fn callable(&self, meta: &FrameMeta) -> Value {
+    pub fn callable_slot(&self, meta: &FrameMeta) -> &Register {
         self.slot_unchecked(meta.base + meta.register_count + CALLABLE_OFFSET)
-            .inner()
     }
 
     fn reg_index(meta: &FrameMeta, i: i32) -> usize {
@@ -87,13 +86,13 @@ impl Stack {
         self.value_slice(Self::reg_index(meta, reg_base), count)
     }
 
+    /// `callable` slots[0] is the CallableInfoObject
     pub fn push_initial_frame(
         &self,
-        callable: Tagged<CallableInfoObject>,
+        callable: Tagged<Object>,
+        register_count: usize,
         args: &[Value],
     ) -> Result<FrameMeta, VmError> {
-        let ptr = callable.as_ptr().ok_or(VmError::Type)?;
-        let register_count = unsafe { ptr.as_ref() }.register_count.to_smi().value() as usize;
         let base = self.reserve(register_count, args.len())?;
         let dst = base + register_count + HEADER_SLOTS;
         debug_assert!(args.iter().all(|v| !v.is_weak_ptr()));
@@ -104,18 +103,17 @@ impl Stack {
                 args.len(),
             )
         }
-        Ok(self.finish_frame(base, register_count, callable, args.len()))
+        Ok(self.init_frame_header(base, register_count, callable, args.len()))
     }
 
     pub fn push_frame(
         &self,
         caller: FrameMeta,
-        callable: Tagged<CallableInfoObject>,
+        callable: Tagged<Object>,
+        register_count: usize,
         src_reg_base: i32,
         count: usize,
     ) -> Result<FrameMeta, VmError> {
-        let ptr = callable.as_ptr().ok_or(VmError::Type)?;
-        let register_count = unsafe { ptr.as_ref() }.register_count.to_smi().value() as usize;
         let base = self.reserve(register_count, count)?;
         let src = Self::reg_index(&caller, src_reg_base);
         let dst = base + register_count + HEADER_SLOTS;
@@ -131,7 +129,7 @@ impl Stack {
                 count,
             )
         }
-        let callee = self.finish_frame(base, register_count, callable, count);
+        let callee = self.init_frame_header(base, register_count, callable, count);
         self.frames.borrow_mut().push(caller);
         Ok(callee)
     }
@@ -155,11 +153,11 @@ impl Stack {
         Ok(base)
     }
 
-    fn finish_frame(
+    fn init_frame_header(
         &self,
         base: usize,
         register_count: usize,
-        callable: Tagged<CallableInfoObject>,
+        callable: Tagged<Object>,
         argc: usize,
     ) -> FrameMeta {
         self.slot_unchecked(base + register_count + CALLABLE_OFFSET)

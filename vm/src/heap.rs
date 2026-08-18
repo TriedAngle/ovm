@@ -7,8 +7,8 @@ use core::{
 };
 
 use crate::{
-    Global, Handle, HandleScope, Header, HeapObject, HeapPtr, Map, MapInit, MapKind, RootHandles,
-    SlotsObject, SlotsObjectInit, Smi, Tagged, Value, Word,
+    FixedArray, Global, Handle, HandleScope, Header, HeapObject, HeapPtr, Map, MapInit, MapKind,
+    Object, ObjectInit, ObjectSlotsInit, RootHandles, Smi, Tagged, Value, Word,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,7 +36,7 @@ pub struct WellKnown {
     pub map_map: Global<Map>,
     /// The hole: fill for not-yet-written slots
     /// TODO: consider having sepearte thing for this, or keep it as void
-    pub void: Global<SlotsObject>,
+    pub void: Global<Object>,
     pub smi_map: Global<Map>,
     pub float_map: Global<Map>,
     pub array_map: Global<Map>,
@@ -88,12 +88,22 @@ pub trait Heap: Sized + Send + Sync {
             })
             .into_global(&roots);
 
-        let void = local
-            .allocate::<SlotsObject>(SlotsObjectInit {
+        let void_tagged = local
+            .allocate::<Object>(ObjectInit {
                 map: void_map.as_tagged(),
-                values: &[],
+                slots: unsafe { Tagged::from_value_unchecked(Smi::new(0).encode()) },
+                elements: Smi::new(0).encode(),
+                length: 0,
             })
-            .into_global(&roots);
+            .into_tagged();
+        {
+            let ptr: HeapPtr<Object> = void_tagged.into();
+            let obj = unsafe { ptr.as_mut() };
+            let host = obj.erase();
+            obj.slots.set(&local, host, unsafe { void_tagged.cast() });
+            obj.elements.set(&local, host, void_tagged.erase_tagged());
+        }
+        let void = roots.create_handle(void_tagged);
 
         let mut new_map = |map_map: Tagged<Map>, kind: MapKind| {
             local
@@ -156,6 +166,22 @@ pub trait LocalHeap: Sized + Send {
         scope: &'s HandleScope<'_>,
     ) -> Handle<'s, T> {
         self.allocate(config).into_handle(scope)
+    }
+
+    fn allocate_object(&mut self, config: ObjectSlotsInit<'_>) -> Fresh<'_, Object> {
+        let total = Layout::new::<Object>()
+            .extend(FixedArray::layout_for(config.values.len()))
+            .expect("object with slots layout")
+            .0;
+
+        let token = self.allocate_token(total);
+        let slots = token.allocate::<FixedArray>(config.values);
+        token.allocate::<Object>(ObjectInit {
+            map: config.map,
+            slots: slots.into_tagged(),
+            elements: config.elements,
+            length: config.length,
+        })
     }
 
     fn allocate_enter_nogc<T: HeapObject, R>(
@@ -360,7 +386,7 @@ pub struct AllocToken<'heap, H: LocalHeap> {
 }
 
 impl<'heap, H: LocalHeap> AllocToken<'heap, H> {
-    pub fn allocate<T: HeapObject>(&self, config: T::Init<'_>) -> Fresh<'_, T> {
+    pub fn allocate<T: HeapObject>(&self, config: T::Init<'_>) -> Fresh<'heap, T> {
         let mut ptr = self.bump(T::layout_for(&config)).cast::<T>();
         unsafe { ptr.as_mut() }.init(&*self.heap, &config);
         Fresh {

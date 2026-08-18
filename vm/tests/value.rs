@@ -1,6 +1,6 @@
 use core::alloc::Layout;
 
-use vm::{Header, HeapObject, HeapPtr, Smi, Tagged, Value};
+use vm::{Header, HeapObject, HeapPtr, LocalHeap, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
 
 /// Stand-in heap object, aligned like a real heap allocation.
 #[repr(align(8))]
@@ -13,7 +13,7 @@ impl HeapObject for TestObj {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, _heap: &impl vm::LocalHeap, _config: &Self::Init<'_>) {
+    fn init(&mut self, _heap: &impl LocalHeap, _config: &Self::Init<'_>) {
         unimplemented!("TestObj is boxed, never heap-allocated by these tests")
     }
 
@@ -98,8 +98,8 @@ mod smi {
         // Safety: bit-level test; the values are never dereferenced.
         let (strong, weak) = unsafe {
             (
-                Value::from_bits(0x1000 | vm::value::STRONG_PTR),
-                Value::from_bits(0x1000 | vm::value::WEAK_PTR),
+                Value::from_bits(0x1000 | STRONG_PTR),
+                Value::from_bits(0x1000 | WEAK_PTR),
             )
         };
         assert_eq!(Smi::decode(strong), None);
@@ -191,8 +191,8 @@ mod debug {
         // Safety: bit-level test; the values are never dereferenced.
         let (strong, weak) = unsafe {
             (
-                Value::from_bits(0x1000 | vm::value::STRONG_PTR),
-                Value::from_bits(0x1000 | vm::value::WEAK_PTR),
+                Value::from_bits(0x1000 | STRONG_PTR),
+                Value::from_bits(0x1000 | WEAK_PTR),
             )
         };
         assert_eq!(format!("{:?}", strong), "Value(Strong(0x1000))");

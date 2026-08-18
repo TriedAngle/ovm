@@ -90,8 +90,8 @@ impl<H: Heap> NativeRegistry<H> {
         let mut registry = Self {
             entries: Vec::new(),
         };
-        debug_assert_eq!(registry.insert(smi_add), NativeIndex::SMI_ADD);
-        debug_assert_eq!(registry.insert(float_add), NativeIndex::FLOAT_ADD);
+        registry.insert(smi_add);
+        registry.insert(float_add);
         registry
     }
 

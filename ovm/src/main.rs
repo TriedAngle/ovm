@@ -2,7 +2,10 @@ use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
 use ovm::natives::NativeIndex;
-use vm::{CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, LocalHeap, Smi};
+use vm::{
+    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, LocalHeap, Map,
+    MapInit, MapKind, ObjectSlotsInit, Smi,
+};
 
 fn main() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).expect("failed to create heap");
@@ -78,7 +81,27 @@ fn main() {
             },
             &scope,
         );
-        thread.run(callable.as_tagged(), &[])
+        // wrap the callable info in a normal object with a callable map
+        let map_map = thread.heap().known().map_map.as_tagged();
+        let callable_map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                map_map,
+                kind: MapKind::OBJECT.union(MapKind::CALLABLE),
+                value_slot_count: 1,
+                descriptors: &[],
+            },
+            &scope,
+        );
+        let callable_obj = thread
+            .heap()
+            .allocate_object(ObjectSlotsInit {
+                map: callable_map.as_tagged(),
+                values: &[callable.as_tagged().erase()],
+                elements: void,
+                length: 0,
+            })
+            .into_handle(&scope);
+        thread.run(callable_obj.as_tagged(), &[])
     });
 
     match result {

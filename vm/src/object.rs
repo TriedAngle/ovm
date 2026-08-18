@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, LocalHeap, Smi, Tagged, Value, Visitor, Word,
+    EdgeVisitable, GcSlot, HeapRef, LocalHeap, NoGc, Smi, Tagged, Value, Visitor, Word,
     value::{STRONG_PTR, WEAK_PTR},
 };
 
@@ -333,10 +333,75 @@ impl SlotDescriptor {
 
 #[repr(C)]
 pub struct Object {
-    header: Header,
-    slots: GcSlot<FixedArray>,
-    elements: GcSlot,
-    length: GcSlot<Smi>,
+    pub header: Header,
+    pub slots: GcSlot<FixedArray>,
+    pub elements: GcSlot,
+    pub length: GcSlot<Smi>,
+}
+
+impl Object {
+    pub fn layout_for() -> Layout {
+        Layout::new::<Self>()
+    }
+
+    pub fn callable_info<'a>(
+        &'a self,
+        guard: &'a NoGc<'a>,
+        heap: &impl LocalHeap,
+    ) -> Option<HeapRef<'a, CallableInfoObject>> {
+        if !guard.get(&self.header.map).kind().is_callable() {
+            return None;
+        }
+        let info = guard.get(&self.slots).at(0);
+        guard.get_as::<CallableInfoObject>(info, heap.known().callable_map)
+    }
+}
+
+pub struct ObjectInit {
+    pub map: Tagged<Map>,
+    pub slots: Tagged<FixedArray>,
+    pub elements: Value,
+    pub length: usize,
+}
+
+pub struct ObjectSlotsInit<'a> {
+    pub map: Tagged<Map>,
+    pub values: &'a [Value],
+    pub elements: Value,
+    pub length: usize,
+}
+
+impl HeapObject for Object {
+    type Init<'a> = ObjectInit;
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Self::layout_for()
+    }
+
+    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header.map.set(heap, host, config.map);
+        self.slots.set(heap, host, config.slots);
+        self.elements
+            .set(heap, host, Tagged::from_value(config.elements));
+        self.length.set(heap, host, Smi::new(config.length as i64));
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Self::layout_for()
+    }
+}
+
+impl EdgeVisitable for Object {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
+        visitor.visit_slot(self.header.map.ereased());
+        visitor.visit_slot(self.slots.ereased());
+        visitor.visit_slot(self.elements.ereased());
+    }
 }
 
 #[repr(C)]
@@ -731,72 +796,6 @@ impl EdgeVisitable for AccessorPair {
         visitor.visit_slot(self.header.map.ereased());
         visitor.visit_slot(self.get.ereased());
         visitor.visit_slot(self.set.ereased());
-    }
-}
-
-#[repr(C)]
-pub struct SlotsObject {
-    pub header: Header,
-    pub size: GcSlot<Smi>,
-    pub slots: [GcSlot; 0],
-}
-
-impl SlotsObject {
-    pub fn layout_for(len: usize) -> Layout {
-        let slots_layout = Layout::array::<GcSlot>(len).expect("slots layout");
-        Layout::new::<Self>()
-            .extend(slots_layout)
-            .expect("slots object layout")
-            .0
-    }
-
-    pub fn len(&self) -> usize {
-        self.size.to_smi().value() as usize
-    }
-
-    pub fn slot(&self, i: usize) -> &GcSlot {
-        debug_assert!(i < self.len());
-        unsafe { &*self.slots.as_ptr().add(i) }
-    }
-}
-
-pub struct SlotsObjectInit<'a> {
-    pub map: Tagged<Map>,
-    pub values: &'a [Value],
-}
-
-impl HeapObject for SlotsObject {
-    type Init<'a> = SlotsObjectInit<'a>;
-
-    fn layout_for(config: &Self::Init<'_>) -> Layout {
-        Self::layout_for(config.values.len())
-    }
-
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
-        let host = self.erase();
-        self.header.map.set(heap, host, config.map);
-        self.size
-            .set(heap, host, Smi::new(config.values.len() as i64));
-        for (i, v) in config.values.iter().enumerate() {
-            self.slot(i).set(heap, host, Tagged::from_value(*v));
-        }
-    }
-
-    fn header(&self) -> &Header {
-        &self.header
-    }
-
-    fn layout(&self) -> Layout {
-        Self::layout_for(self.len())
-    }
-}
-
-impl EdgeVisitable for SlotsObject {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
-        for i in 0..self.len() {
-            visitor.visit_slot(self.slot(i));
-        }
     }
 }
 

@@ -12,10 +12,13 @@ pub use heap::{
 pub use lookup::Lookup;
 pub use object::{
     AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Header,
-    HeapObject, InternedString, Map, MapInit, MapKind, ObjectKind, SlotDescriptor, SlotFlags,
-    SlotKind, SlotName, SlotsObject, SlotsObjectInit, Symbol, VMString,
+    HeapObject, InternedString, Map, MapInit, MapKind, Object, ObjectInit, ObjectKind,
+    ObjectSlotsInit, SlotDescriptor, SlotFlags, SlotKind, SlotName, Symbol, VMString,
 };
-pub use value::{HeapPtr, PointerStrength, Smi, Strong, Tagged, Value, ValueRef, Weak, Word};
+pub use value::{
+    HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,
+    Word,
+};
 
 pub type Local<'scope, T> = Handle<'scope, T, Strong>;
 // pseudo-static

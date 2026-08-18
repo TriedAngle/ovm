@@ -4,8 +4,7 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use vm::{
-    AllocError, CallableInfoObject, EdgeVisitable, Handle, HandleData, HandleScope, Heap,
-    InternedString, LocalHeap, RootVisitor, Value, Visitor,
+    AllocError, EdgeVisitable, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap, Object, RootVisitor, Tagged, Value, Visitor,
 };
 
 pub mod cache;
@@ -124,13 +123,13 @@ impl<H: Heap> Thread<H> {
 
     pub fn run(
         &mut self,
-        callable: vm::Tagged<CallableInfoObject>,
-        args: &[vm::Value],
-    ) -> Result<vm::Value, VmError> {
+        callable: Tagged<Object>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
         interpreter::run(&self.vm, &mut self.heap, &self.state, callable, args)
     }
 
-    pub fn run_native(&mut self, f: NativeFn<H>, args: &[vm::Value]) -> Result<Value, VmError> {
+    pub fn run_native(&mut self, f: NativeFn<H>, args: &[Value]) -> Result<Value, VmError> {
         let mut nctx = NativeContext::new(&self.vm, &mut self.heap, &self.state);
         f(&mut nctx, args)
     }

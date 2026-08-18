@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Register, SlotDescriptor,
-    SlotKind, SlotName, SlotsObject, Smi, Value, ValueRef,
+    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Object, Register, SlotDescriptor,
+    SlotKind, SlotName, Smi, Value, ValueRef,
 };
 
 pub enum Lookup<'a> {
@@ -95,7 +95,7 @@ impl Map {
                         Lookup::Data {
                             map_index: index,
                             holder_index: d.offset(),
-                            slot: obj.as_ref().slot(d.offset()),
+                            slot: guard.get(&obj.as_ref().slots).as_ref().element_slot(d.offset()),
                             holder: receiver,
                         }
                     }
@@ -145,7 +145,7 @@ impl Map {
     }
 }
 
-impl SlotsObject {
+impl Object {
     pub fn lookup<'a>(
         &'a self,
         guard: &'a NoGc<'a>,

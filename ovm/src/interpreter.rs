@@ -1,8 +1,8 @@
 use bytecode::{Opcode, Operand, Scale};
 
 use vm::{
-    CallableInfoObject, FixedArray, HeapObject, HeapRef, InternedString, LocalHeap, Lookup, Map,
-    NoGc, SlotName, SlotsObject, SlotsObjectInit, Smi, Tagged, Value, ValueRef,
+    FixedArray, HeapObject, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
+    ObjectSlotsInit, SlotName, Smi, Tagged, Value, ValueRef,
 };
 
 use crate::{ContextState, Heap, NativeContext, NativeIndex, VM, VmError};
@@ -11,36 +11,36 @@ pub fn run<H: Heap>(
     vm: &VM<H>,
     heap: &mut H::Local,
     state: &ContextState,
-    callable: Tagged<CallableInfoObject>,
+    callable: Tagged<Object>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    let call_name = state.handle_scope(|scope| {
-        SlotName::from(vm.interner().intern(heap, &scope, "call").as_tagged())
-    });
+    let register_count = heap
+        .no_gc(|nogc, heap| {
+            // Safety: the caller roots the callable (handle or well-known
+            // root) for the whole run.
+            let obj = unsafe { nogc.get_unchecked(callable) };
+            obj.as_ref()
+                .callable_info(nogc, heap)
+                .map(|info| info.register_count.to_smi().value() as usize)
+        })
+        .ok_or(VmError::Type)?;
 
     let stack = &state.stack;
     let cache = &state.cache;
 
-    let result = stack.push_initial_frame(callable, args).and_then(|frame| {
-        cache.enter(stack, frame);
-        let result = dispatch(vm, heap, state, call_name);
-        cache.deactivate();
-        result
-    });
+    let result = stack
+        .push_initial_frame(callable, register_count, args)
+        .and_then(|frame| {
+            cache.enter(stack, frame, heap);
+            let result = dispatch(vm, heap, state);
+            cache.deactivate();
+            result
+        });
 
     stack.set_top(0);
     stack.clear_frames();
 
     result
-}
-
-fn code_ref<'a, L: LocalHeap>(
-    nogc: &'a NoGc<'a>,
-    heap: &'a L,
-    callable: Value,
-) -> HeapRef<'a, CallableInfoObject> {
-    nogc.get_as::<CallableInfoObject>(callable, heap.known().callable_map)
-        .expect("frame code must be a callable object")
 }
 
 fn property_name<'a, L: LocalHeap>(
@@ -56,12 +56,7 @@ fn property_name<'a, L: LocalHeap>(
     SlotName::from(name.into_tagged())
 }
 
-fn dispatch<H: Heap>(
-    vm: &VM<H>,
-    heap: &mut H::Local,
-    state: &ContextState,
-    call_name: SlotName,
-) -> Result<Value, VmError> {
+fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> Result<Value, VmError> {
     let stack = &state.stack;
     let cache = &state.cache;
     let mut acc = heap.known().void.value();
@@ -73,7 +68,7 @@ fn dispatch<H: Heap>(
 
         match op {
             Opcode::Return => match stack.pop_frame(meta.base) {
-                Some(caller) => cache.load(stack, caller),
+                Some(caller) => cache.load(stack, caller, heap),
                 None => return Ok(acc),
             },
             Opcode::Load => {
@@ -114,21 +109,26 @@ fn dispatch<H: Heap>(
             Opcode::Call | Opcode::CallNoFeedback => {
                 let count = operands[2] as usize;
                 let target = heap.no_gc(|nogc, heap| {
-                    match stack
-                        .reg_slot(&meta, operands[0] as i32)
-                        .lookup(nogc, heap, call_name)
-                    {
-                        Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => nogc
-                            .get_as::<CallableInfoObject>(slot.inner(), heap.known().callable_map)
-                            .map(|r| r.into_tagged()),
-                        _ => None,
-                    }
+                    let ValueRef::Object(obj) =
+                        stack.reg_slot(&meta, operands[0] as i32).value_ref(nogc)
+                    else {
+                        return None;
+                    };
+                    let info = obj.as_ref().callable_info(nogc, heap)?;
+                    let register_count = info.register_count.to_smi().value() as usize;
+                    Some((obj.into_tagged(), register_count))
                 });
-                let Some(target) = target else {
-                    return Err(VmError::Type); // not callable
+                let Some((target, register_count)) = target else {
+                    return Err(VmError::Type);
                 };
-                let callee = stack.push_frame(meta, target, operands[1] as i32, count)?;
-                cache.load(stack, callee);
+                let callee = stack.push_frame(
+                    meta,
+                    target,
+                    register_count,
+                    operands[1] as i32,
+                    count,
+                )?;
+                cache.load(stack, callee, heap);
             }
             Opcode::LoadNamedProperty => {
                 let v = heap.no_gc(|nogc, heap| {
@@ -173,12 +173,14 @@ fn dispatch<H: Heap>(
                 let count = operands[2] as usize;
                 cache.spill_acc(acc);
                 let args = stack.args(&meta, operands[1] as i32, count);
-                let obj = heap.allocate_enter_nogc(
-                    SlotsObjectInit { map, values: args },
-                    |dst: HeapRef<'_, SlotsObject>, _nogc, _| dst.into_tagged().erase(),
-                );
+                let obj = heap.allocate_object(ObjectSlotsInit {
+                    map,
+                    values: args,
+                    elements: heap.known().void.value(),
+                    length: 0,
+                });
                 let _ = cache.take_acc();
-                acc = obj;
+                acc = obj.erase();
             }
             Opcode::CreateArrayLiteral => {
                 let count = operands[1] as usize;
@@ -192,29 +194,42 @@ fn dispatch<H: Heap>(
                 acc = array;
             }
             Opcode::LoadContextSlot => {
-                let callable_value = stack.callable(&meta);
                 let v = heap.no_gc(|nogc, heap| {
-                    let code = code_ref(nogc, heap, callable_value);
-                    let ValueRef::Object(context) = code.as_ref().context.value_ref(nogc) else {
+                    let ValueRef::Object(obj) = stack.callable_slot(&meta).value_ref(nogc) else {
                         return Err(VmError::Type);
                     };
-                    Ok(context.as_ref().slot(operands[0] as usize).inner())
+                    let info = obj
+                        .as_ref()
+                        .callable_info(nogc, heap)
+                        .ok_or(VmError::Type)?;
+                    let ValueRef::Object(context) = info.context.value_ref(nogc) else {
+                        return Err(VmError::Type);
+                    };
+                    Ok(nogc
+                        .get(&context.as_ref().slots)
+                        .as_ref()
+                        .element_slot(operands[0] as usize)
+                        .inner())
                 })?;
                 acc = v;
             }
             Opcode::StoreContextSlot => {
-                let callable_value = stack.callable(&meta);
                 heap.no_gc(|nogc, heap| {
-                    let code = code_ref(nogc, heap, callable_value);
-                    let host = code.as_ref().context.inner();
-                    let ValueRef::Object(context) = code.as_ref().context.value_ref(nogc) else {
+                    let ValueRef::Object(obj) = stack.callable_slot(&meta).value_ref(nogc) else {
                         return Err(VmError::Type);
                     };
-                    context.as_ref().slot(operands[0] as usize).set(
-                        heap,
-                        host,
-                        Tagged::from_value(acc),
-                    );
+                    let info = obj
+                        .as_ref()
+                        .callable_info(nogc, heap)
+                        .ok_or(VmError::Type)?;
+                    let host = info.context.inner();
+                    let ValueRef::Object(context) = info.context.value_ref(nogc) else {
+                        return Err(VmError::Type);
+                    };
+                    nogc.get(&context.as_ref().slots)
+                        .as_ref()
+                        .element_slot(operands[0] as usize)
+                        .set(heap, host, Tagged::from_value(acc));
                     Ok(())
                 })?;
             }

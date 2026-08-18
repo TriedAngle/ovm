@@ -241,8 +241,8 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, HeapPtr, Lookup, Map, MapInit, MapKind, SlotFlags, SlotName, SlotsObject,
-        SlotsObjectInit, Tagged, Value,
+        AccessorPair, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
+        SlotName, Tagged, Value,
     };
     use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Register, Smi};
 
@@ -271,13 +271,19 @@ mod tests {
         .into_tagged()
     }
 
-    fn alloc_slots_obj(
+    fn alloc_object(
         heap: &mut DummyLocalHeap,
         map: Tagged<Map>,
         values: &[Value],
-    ) -> HeapPtr<SlotsObject> {
-        heap.allocate::<SlotsObject>(SlotsObjectInit { map, values })
-            .into_ptr()
+    ) -> HeapPtr<Object> {
+        let elements = heap.known().void.value();
+        heap.allocate_object(ObjectSlotsInit {
+            map,
+            values,
+            elements,
+            length: 0,
+        })
+        .into_ptr()
     }
 
     fn smi_name(n: i64) -> SlotName {
@@ -303,7 +309,7 @@ mod tests {
             0,
             &[(3, SlotFlags::CONST, Smi::new(99).encode())],
         );
-        let parent = alloc_slots_obj(&mut heap, parent_map, &[]);
+        let parent = alloc_object(&mut heap, parent_map, &[]);
 
         // child: smi(1) = value slot 0, smi(2) = const 42, parent stored in the map
         let child_map = alloc_map(
@@ -323,7 +329,7 @@ mod tests {
                 ),
             ],
         );
-        let child = alloc_slots_obj(&mut heap, child_map, &[Smi::new(7).encode()]);
+        let child = alloc_object(&mut heap, child_map, &[Smi::new(7).encode()]);
         let child = unsafe { child.as_ref() };
 
         heap.no_gc(|nogc, heap| {
@@ -350,7 +356,7 @@ mod tests {
                 Smi::new(0).encode(),
             )],
         );
-        let obj = alloc_slots_obj(&mut heap, map, &[Smi::new(7).encode()]);
+        let obj = alloc_object(&mut heap, map, &[Smi::new(7).encode()]);
 
         heap.no_gc(|nogc, heap| {
             // smi receiver: looks up in the (descriptor-less) smi map
@@ -377,13 +383,13 @@ mod tests {
             0,
             &[(3, SlotFlags::CONST, Smi::new(10).encode())],
         );
-        let parent_a = alloc_slots_obj(&mut heap, map_a, &[]);
+        let parent_a = alloc_object(&mut heap, map_a, &[]);
         let map_b = alloc_map(
             &mut heap,
             0,
             &[(3, SlotFlags::CONST, Smi::new(20).encode())],
         );
-        let parent_b = alloc_slots_obj(&mut heap, map_b, &[]);
+        let parent_b = alloc_object(&mut heap, map_b, &[]);
 
         // child: two named parents, both stored in the map
         let child_map = alloc_map(
@@ -402,7 +408,7 @@ mod tests {
                 ),
             ],
         );
-        let child = alloc_slots_obj(&mut heap, child_map, &[]);
+        let child = alloc_object(&mut heap, child_map, &[]);
         let child = unsafe { child.as_ref() };
 
         heap.no_gc(|nogc, heap| {
@@ -427,7 +433,7 @@ mod tests {
             0,
             &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
         );
-        let obj = alloc_slots_obj(&mut heap, map, &[]);
+        let obj = alloc_object(&mut heap, map, &[]);
         let obj = unsafe { obj.as_ref() };
 
         heap.no_gc(|nogc, heap| match obj.lookup(nogc, heap, smi_name(5)) {

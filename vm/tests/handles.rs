@@ -154,8 +154,7 @@ fn escapable_scope_closed_without_escape_reclaims() {
 
 #[test]
 fn weak_pointers_cannot_be_handle_rooted() {
-    use vm::value::{STRONG_PTR, WEAK_PTR};
-    use vm::{Tagged, Value};
+    use vm::{STRONG_PTR, Tagged, Value, WEAK_PTR};
 
     let data = HandleData::new(Smi::new(0).encode());
     let scope = handle_scope(&data);

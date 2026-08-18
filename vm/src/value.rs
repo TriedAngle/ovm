@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{HeapObject, HeapRef, SlotsObject};
+use crate::{HeapObject, HeapRef, Object};
 
 /// Word Size inside the heap
 /// if we add compressed pointers we may need to duplicate this
@@ -305,5 +305,5 @@ impl<T: HeapObject> From<Tagged<T>> for HeapPtr<T> {
 
 pub enum ValueRef<'a> {
     Smi(Smi),
-    Object(HeapRef<'a, SlotsObject>),
+    Object(HeapRef<'a, Object>),
 }

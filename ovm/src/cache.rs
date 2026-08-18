@@ -1,8 +1,8 @@
 use core::cell::UnsafeCell;
 
 use vm::{
-    CallableInfoObject, EdgeVisitable, FixedArray, FixedByteArray, HeapPtr, HeapRef, NoGc,
-    Register, Tagged, Value, Visitor,
+    EdgeVisitable, FixedArray, FixedByteArray, HeapRef, LocalHeap, NoGc, Register, Tagged, Value,
+    ValueRef, Visitor,
 };
 
 use crate::{FrameMeta, Stack};
@@ -44,22 +44,28 @@ impl StackCache {
         self.get().active
     }
 
-    pub fn enter(&self, stack: &Stack, frame: FrameMeta) {
+    pub fn enter(&self, stack: &Stack, frame: FrameMeta, heap: &mut impl LocalHeap) {
         debug_assert!(!self.is_active(), "re-entrant interpreter run");
-        self.load(stack, frame);
+        self.load(stack, frame, heap);
         self.get().active = true;
     }
 
-    pub fn load(&self, stack: &Stack, frame: FrameMeta) {
-        let callable = stack.callable(&frame);
-        let ptr = HeapPtr::decode_strong(callable).expect("callable must be strong");
-        let obj = unsafe { ptr.cast::<CallableInfoObject>().as_ref() };
-        let cache = self.get();
-        cache.code.store(obj.bytecode.get().erase());
-        cache.constants.store(obj.constants.get().erase());
-        cache.pc = frame.pc;
-        cache.base = frame.base;
-        cache.register_count = frame.register_count;
+    pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut impl LocalHeap) {
+        heap.no_gc(|nogc, heap| {
+            let ValueRef::Object(obj) = stack.callable_slot(&frame).value_ref(nogc) else {
+                panic!("frame callable must be an object");
+            };
+            let info = obj
+                .as_ref()
+                .callable_info(nogc, heap)
+                .expect("frame callable must have a callable info");
+            let cache = self.get();
+            cache.code.store(info.bytecode.get().erase());
+            cache.constants.store(info.constants.get().erase());
+            cache.pc = frame.pc;
+            cache.base = frame.base;
+            cache.register_count = frame.register_count;
+        });
     }
 
     pub fn deactivate(&self) {

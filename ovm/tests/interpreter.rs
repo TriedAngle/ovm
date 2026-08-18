@@ -1,21 +1,52 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{NativeIndex, VM, VmError};
+use ovm::{NativeIndex, Thread, VM, VmError};
 use vm::{
-    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HeapPtr, LocalHeap, Map,
-    MapInit, MapKind, SlotFlags, SlotName, SlotsObject, SlotsObjectInit, Smi,
+    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandleScope, HeapPtr,
+    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi, Tagged,
+    Value,
 };
 
-fn smi(v: i64) -> vm::Value {
+fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
+/// Wrap a callable info in a normal object with a callable map
+/// (kind convention: CALLABLE flag => slots[0] is the callable info).
+fn callable_object(
+    thread: &mut Thread<DummyHeap>,
+    scope: &HandleScope<'_>,
+    info: Tagged<CallableInfoObject>,
+) -> Tagged<Object> {
+    let map_map = thread.heap().known().map_map.as_tagged();
+    let void = thread.heap().known().void.value();
+    let map = thread.heap().allocate_handle::<Map>(
+        MapInit {
+            map_map,
+            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
+            value_slot_count: 1,
+            descriptors: &[],
+        },
+        scope,
+    );
+    thread
+        .heap()
+        .allocate_object(ObjectSlotsInit {
+            map: map.as_tagged(),
+            values: &[info.erase()],
+            elements: void,
+            length: 0,
+        })
+        .into_handle(scope)
+        .as_tagged()
+}
+
 fn run_program(
-    thread: &mut ovm::Thread<DummyHeap>,
+    thread: &mut Thread<DummyHeap>,
     program: Vec<u8>,
     register_count: usize,
-    args: &[vm::Value],
-) -> Result<vm::Value, ovm::VmError> {
+    args: &[Value],
+) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
         let bytecode = thread
@@ -31,7 +62,8 @@ fn run_program(
             },
             &scope,
         );
-        thread.run(callable.as_tagged(), args)
+        let callable = callable_object(thread, &scope, callable.as_tagged());
+        thread.run(callable, args)
     })
 }
 
@@ -128,7 +160,7 @@ fn wide_parameter_operand_uses_two_bytes() {
 }
 
 #[test]
-fn call_resolves_target_lookup_and_pushes_frames() {
+fn call_resolves_callable_object_and_pushes_frames() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
@@ -152,35 +184,12 @@ fn call_resolves_target_lookup_and_pushes_frames() {
             },
             &scope,
         );
+        let callee_obj = callable_object(thread, &scope, callee.as_tagged());
 
-        // receiver with a "call" slot pointing at the callee
-        let call_name = thread.intern(&scope, "call");
-        let map_map = thread.heap().known().map_map.as_tagged();
-        let map = thread.heap().allocate_handle::<Map>(
-            MapInit {
-                map_map,
-                kind: MapKind::OBJECT,
-                value_slot_count: 1,
-                descriptors: &[(
-                    SlotName::from(call_name.as_tagged()),
-                    SlotFlags::VALUE.union(SlotFlags::WRITABLE),
-                    Smi::new(0).encode(), // slot offset of the value slot
-                )],
-            },
-            &scope,
-        );
-        let receiver = thread.heap().allocate_handle::<SlotsObject>(
-            SlotsObjectInit {
-                map: map.as_tagged(),
-                values: &[callee.as_tagged().erase()],
-            },
-            &scope,
-        );
-
-        // caller: r0 = receiver; CallNoFeedback r0, r0, 1 -> acc
+        // caller: r0 = callee object; CallNoFeedback r0, r0, 1 -> acc
         let receiver_consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[receiver.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[callee_obj.erase()], &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -198,8 +207,9 @@ fn call_resolves_target_lookup_and_pushes_frames() {
             },
             &scope,
         );
+        let caller_obj = callable_object(thread, &scope, caller.as_tagged());
 
-        thread.run(caller.as_tagged(), &[])
+        thread.run(caller_obj, &[])
     });
 
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 99);
@@ -291,7 +301,8 @@ fn create_object_from_map_fills_from_registers() {
             },
             &scope,
         );
-        thread.run(callable.as_tagged(), &[])
+        let callable = callable_object(thread, &scope, callable.as_tagged());
+        thread.run(callable, &[])
     });
 
     let obj = result.unwrap();
@@ -300,8 +311,9 @@ fn create_object_from_map_fills_from_registers() {
         // Safety: `obj` is a strong, live reference to the object
         // literal returned by `run`, and no collection can happen
         // inside the no-GC scope.
-        let o = unsafe { ptr.cast::<SlotsObject>().as_ref() };
-        assert_eq!(Smi::decode(o.slot(0).inner()).unwrap().value(), 7);
-        assert_eq!(Smi::decode(o.slot(1).inner()).unwrap().value(), 9);
+        let o = unsafe { ptr.cast::<Object>().as_ref() };
+        let slots = unsafe { o.slots.get().as_ptr().unwrap().as_ref() };
+        assert_eq!(Smi::decode(slots.at(0)).unwrap().value(), 7);
+        assert_eq!(Smi::decode(slots.at(1)).unwrap().value(), 9);
     });
 }
