@@ -1,5 +1,6 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
+use vm::LocalHeap;
 
 #[test]
 fn interning_deduplicates_and_preserves_content() {
@@ -16,15 +17,18 @@ fn interning_deduplicates_and_preserves_content() {
         assert_ne!(a.value().to_bits(), c.value().to_bits());
 
         // content round trip
-        let istr = unsafe { a.get().as_ref() };
-        assert_eq!(istr.string().as_str(), Some("hello"));
-        assert_eq!(istr.string().hash(), {
-            let b = ctx.intern(&scope, "hello");
-            unsafe { b.get().as_ref() }.string().hash()
+        let (text, hash_a, hash_b) = ctx.heap().no_gc(|nogc, _| {
+            (
+                a.heap_ref(nogc).string().as_str(nogc).unwrap().to_owned(),
+                a.heap_ref(nogc).string().hash(),
+                b.heap_ref(nogc).string().hash(),
+            )
         });
+        assert_eq!(text, "hello");
+        assert_eq!(hash_a, hash_b);
 
         // re-interning an interned string forwards to the same entry
-        let d = ctx.intern(&scope, istr.string());
+        let d = ctx.intern(&scope, &text);
         assert_eq!(a.value().to_bits(), d.value().to_bits());
     });
 }

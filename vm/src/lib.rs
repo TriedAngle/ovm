@@ -4,10 +4,10 @@ pub mod lookup;
 pub mod object;
 pub mod value;
 
-pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, RootHandles};
+pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, RootHandles};
 pub use heap::{
-    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, Heap, HeapRef, LocalHeap, NoGc, Register,
-    RootVisitor, Visitor, WeakGcCell, WellKnown, WordType,
+    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, Heap, HeapRef, LocalHeap, NoGc, RawCell,
+    Register, RootVisitor, Visitor, WeakGcCell, WellKnown, WordType,
 };
 pub use lookup::Lookup;
 pub use object::{

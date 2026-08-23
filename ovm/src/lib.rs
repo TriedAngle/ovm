@@ -4,7 +4,7 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use vm::{
-    AllocError, EdgeVisitable, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap, Object, RootVisitor, Tagged, Value, Visitor,
+    AllocError, EdgeVisitable, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap, Object, RootVisitor, Value, Visitor,
 };
 
 pub mod cache;
@@ -22,8 +22,14 @@ pub use natives::{
     EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry, VmError,
 };
 
+// TODO: get rid of the generic heap, instead make only init generic.
+// in runtime we only want a Generic interface with vtable pointers probably
+// this is especially problematic with C/native interaces which dont support generics
+// also these generics have not shown any benifit really.
+// additionnaly without generics we can do runtime GC swapping (whatever the usecase may be)
 pub struct SharedVM<H: Heap> {
     heap: H,
+    // TODO: investiage if Mutex is fine, maybe a lock-free mechanism exists
     threads: Mutex<Vec<Weak<ContextState>>>,
     interner: StringInterner,
     natives: NativeRegistry<H>,
@@ -33,6 +39,7 @@ pub struct VM<H: Heap> {
     shared: Arc<SharedVM<H>>,
 }
 
+// TODO: implement real exception and handler stack
 pub struct ContextState {
     handles: HandleData,
     stack: Stack,
@@ -64,6 +71,9 @@ impl ContextState {
 }
 
 unsafe impl Send for ContextState {}
+// TODO: can we get rid of this somehow? 
+// in practice we seem to need Sync because Heap needs access,
+// in theory full isolation (and passing?) should be possible
 unsafe impl Sync for ContextState {}
 
 impl EdgeVisitable for ContextState {
@@ -123,7 +133,7 @@ impl<H: Heap> Thread<H> {
 
     pub fn run(
         &mut self,
-        callable: Tagged<Object>,
+        callable: Handle<'_, Object>,
         args: &[Value],
     ) -> Result<Value, VmError> {
         interpreter::run(&self.vm, &mut self.heap, &self.state, callable, args)
@@ -201,6 +211,7 @@ impl<H: Heap> VM<H> {
             pending_exception: Cell::new(None),
         });
         let mut threads = self.shared.threads.lock().unwrap();
+        // TODO: should we really call this every attach() ?
         threads.retain(|t| t.strong_count() > 0);
         threads.push(Arc::downgrade(&state));
         Thread {

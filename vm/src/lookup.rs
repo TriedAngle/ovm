@@ -23,6 +23,7 @@ pub enum Lookup<'a> {
     NotFound,
 }
 
+// TODO: consider removing this and just use value?
 impl GcSlot {
     pub fn value_ref<'a>(&self, guard: &'a NoGc<'a>) -> ValueRef<'a> {
         value_ref(self.inner(), guard)
@@ -38,6 +39,7 @@ impl GcSlot {
     }
 }
 
+// TODO: consider removing this and just use value?
 impl Register {
     pub fn value_ref<'a>(&self, guard: &'a NoGc<'a>) -> ValueRef<'a> {
         value_ref(self.inner(), guard)
@@ -70,7 +72,7 @@ fn lookup_value<'a>(
     let receiver = value_ref(receiver, guard);
     let map = match &receiver {
         ValueRef::Smi(_) => heap.known().smi_map.heap_ref(guard),
-        ValueRef::Object(obj) => guard.get(&obj.as_ref().header.map),
+        ValueRef::Object(obj) => obj.as_ref().header.map.heap_ref(guard),
     };
     map.as_ref().lookup(guard, heap, receiver, name)
 }
@@ -87,15 +89,21 @@ impl Map {
             if !d.flags().is_parent() && d.name() == name {
                 return match d.flags().kind() {
                     SlotKind::Value => {
-                        // smis have no slots
-                        // not sure if we actually need to protect from this?
+                        // TODO: smis have no value slots not sure if we need to protect from this?
+                        // the same should be true for floats too !
+                        // find case where this happens or remove this
                         let ValueRef::Object(obj) = &receiver else {
                             panic!("value slot on the smi map")
                         };
                         Lookup::Data {
                             map_index: index,
                             holder_index: d.offset(),
-                            slot: guard.get(&obj.as_ref().slots).as_ref().element_slot(d.offset()),
+                            slot: obj
+                                .as_ref()
+                                .slots
+                                .heap_ref(guard)
+                                .as_ref()
+                                .element_slot(d.offset()),
                             holder: receiver,
                         }
                     }
@@ -107,7 +115,7 @@ impl Map {
                     SlotKind::Accessor => Lookup::Accessor {
                         holder: receiver,
                         map_index: index,
-                        pair: unsafe { guard.get_unchecked(d.value.get().cast()) },
+                        pair: unsafe { HeapRef::from_ptr(d.value.get().cast().into()) },
                     },
                 };
             }
@@ -152,7 +160,7 @@ impl Object {
         heap: &impl LocalHeap,
         name: SlotName,
     ) -> Lookup<'a> {
-        guard.get(&self.header.map).as_ref().lookup(
+        self.header.map.heap_ref(guard).as_ref().lookup(
             guard,
             heap,
             ValueRef::Object(HeapRef::from_ref(self)),
@@ -167,8 +175,9 @@ impl Object {
         name: SlotName,
         parent: SlotName,
     ) -> Lookup<'a> {
-        guard
-            .get(&self.header.map)
+        self.header
+            .map
+            .heap_ref(guard)
             .as_ref()
             .lookup_parent(guard, heap, name, parent)
     }

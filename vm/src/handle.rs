@@ -7,12 +7,12 @@ use core::{
 
 use crate::{
     EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, HeapRef, NoGc,
-    PointerStrength, Strong, Tagged, Value, Visitor, Weak,
+    PointerStrength, RawCell, Strong, Tagged, Value, Visitor, Weak,
 };
 
 pub struct Handle<'scope, T, R: PointerStrength = Strong> {
     location: NonNull<Value>,
-    _phantom: PhantomData<(fn(&'scope ()) -> &'scope (), T, R)>,
+    _phantom: PhantomData<(&'scope (), T, R)>,
 }
 
 impl<'s, T, R: PointerStrength> Clone for Handle<'s, T, R> {
@@ -117,7 +117,7 @@ impl HandleDataImpl {
             };
             let mut slot = start;
             while slot < used_end {
-                visitor.visit_slot(unsafe { &*(slot as *const GcSlot) });
+                visitor.visit(unsafe { &*(slot as *const RawCell) });
                 slot = unsafe { slot.add(1) };
             }
         }
@@ -281,7 +281,18 @@ impl RootHandles {
 impl EdgeVisitable for RootHandles {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         for slot in &self.slots[..self.next.load(Ordering::Relaxed)] {
-            visitor.visit_slot(slot);
+            visitor.visit(slot.as_raw());
         }
+    }
+}
+
+pub trait HandleSet {
+    fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T>;
+}
+
+impl HandleSet for HandleScope<'_> {
+    fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+        self.create_handle(value)
+            .expect("weak value cannot be rooted in a handle")
     }
 }

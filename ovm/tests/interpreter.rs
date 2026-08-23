@@ -2,8 +2,8 @@ use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeIndex, Thread, VM, VmError};
 use vm::{
-    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandleScope, HeapPtr,
-    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi, Tagged,
+    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Handle, HandleScope, HeapPtr,
+    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi,
     Value,
 };
 
@@ -13,16 +13,14 @@ fn smi(v: i64) -> Value {
 
 /// Wrap a callable info in a normal object with a callable map
 /// (kind convention: CALLABLE flag => slots[0] is the callable info).
-fn callable_object(
+fn callable_object<'s>(
     thread: &mut Thread<DummyHeap>,
-    scope: &HandleScope<'_>,
-    info: Tagged<CallableInfoObject>,
-) -> Tagged<Object> {
-    let map_map = thread.heap().known().map_map.as_tagged();
+    scope: &'s HandleScope<'_>,
+    info: Handle<'_, CallableInfoObject>,
+) -> Handle<'s, Object> {
     let void = thread.heap().known().void.value();
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
-            map_map,
             kind: MapKind::OBJECT.union(MapKind::CALLABLE),
             value_slot_count: 1,
             descriptors: &[],
@@ -31,14 +29,16 @@ fn callable_object(
     );
     thread
         .heap()
-        .allocate_object(ObjectSlotsInit {
-            map: map.as_tagged(),
-            values: &[info.erase()],
-            elements: void,
-            length: 0,
-        })
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map,
+                values: &[info.as_tagged().erase()],
+                elements: void,
+                length: 0,
+            },
+        )
         .into_handle(scope)
-        .as_tagged()
 }
 
 fn run_program(
@@ -55,14 +55,14 @@ fn run_program(
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
-                bytecode: bytecode.as_tagged(),
-                constants: constants.as_tagged(),
+                bytecode,
+                constants,
                 register_count,
                 context: void,
             },
             &scope,
         );
-        let callable = callable_object(thread, &scope, callable.as_tagged());
+        let callable = callable_object(thread, &scope, callable);
         thread.run(callable, args)
     })
 }
@@ -177,19 +177,19 @@ fn call_resolves_callable_object_and_pushes_frames() {
         let callee_constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
         let callee = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
-                bytecode: callee_bytecode.as_tagged(),
-                constants: callee_constants.as_tagged(),
+                bytecode: callee_bytecode,
+                constants: callee_constants,
                 register_count: 2,
                 context: void,
             },
             &scope,
         );
-        let callee_obj = callable_object(thread, &scope, callee.as_tagged());
+        let callee_obj = callable_object(thread, &scope, callee);
 
         // caller: r0 = callee object; CallNoFeedback r0, r0, 1 -> acc
         let receiver_consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[callee_obj.erase()], &scope);
+            .allocate_handle::<FixedArray>(&[callee_obj.as_tagged().erase()], &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -200,14 +200,14 @@ fn call_resolves_callable_object_and_pushes_frames() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let caller = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
-                bytecode: bytecode.as_tagged(),
-                constants: receiver_consts.as_tagged(),
+                bytecode,
+                constants: receiver_consts,
                 register_count: 2,
                 context: void,
             },
             &scope,
         );
-        let caller_obj = callable_object(thread, &scope, caller.as_tagged());
+        let caller_obj = callable_object(thread, &scope, caller);
 
         thread.run(caller_obj, &[])
     });
@@ -233,8 +233,8 @@ fn create_array_literal_fills_from_registers() {
     let result = run_program(&mut thread, program, 3, &[]);
     let array = result.unwrap();
     thread.heap().no_gc(|nogc, heap| {
-        let a = nogc
-            .get_as::<FixedArray>(array, heap.known().array_map)
+        let a = array
+            .get_as::<FixedArray>(nogc, heap.known().array_map)
             .expect("array literal result");
         assert_eq!(Smi::decode(a.at(0)).unwrap().value(), 1);
         assert_eq!(Smi::decode(a.at(1)).unwrap().value(), 2);
@@ -247,16 +247,14 @@ fn create_object_from_map_fills_from_registers() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    let result = thread.handle_scope(|thread, scope| {
+    let (result, map_v) = thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
 
         // map with two writable value slots (offsets 0 and 1)
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
-        let map_map = thread.heap().known().map_map.as_tagged();
         let map = thread.heap().allocate_handle::<Map>(
             MapInit {
-                map_map,
                 kind: MapKind::OBJECT,
                 value_slot_count: 2,
                 descriptors: &[
@@ -294,15 +292,15 @@ fn create_object_from_map_fills_from_registers() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
-                bytecode: bytecode.as_tagged(),
-                constants: consts.as_tagged(),
+                bytecode,
+                constants: consts,
                 register_count: 2,
                 context: void,
             },
             &scope,
         );
-        let callable = callable_object(thread, &scope, callable.as_tagged());
-        thread.run(callable, &[])
+        let callable = callable_object(thread, &scope, callable);
+        (thread.run(callable, &[]), map.as_tagged().erase())
     });
 
     let obj = result.unwrap();
@@ -315,5 +313,7 @@ fn create_object_from_map_fills_from_registers() {
         let slots = unsafe { o.slots.get().as_ptr().unwrap().as_ref() };
         assert_eq!(Smi::decode(slots.at(0)).unwrap().value(), 7);
         assert_eq!(Smi::decode(slots.at(1)).unwrap().value(), 9);
+        // the object's map must be the map from the constants table
+        assert_eq!(o.header.map.get().erase(), map_v);
     });
 }

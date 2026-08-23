@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{HeapObject, HeapRef, Object};
+use crate::{Global, Header, HeapObject, HeapRef, Map, NoGc, Object};
 
 /// Word Size inside the heap
 /// if we add compressed pointers we may need to duplicate this
@@ -55,6 +55,23 @@ impl Value {
     pub const fn is_cleared(self) -> bool {
         self.0 == WEAK_PTR
     }
+
+    /// If this is a strong pointer to an object whose map is `expected`,
+    /// returns it as a heap reference valid for the no-GC scope.
+    /// TODO: this function is kinda ugly, and is also unsafe with its type cast
+    pub fn get_as<'a, T: HeapObject>(
+        &self,
+        _nogc: &'a NoGc<'a>,
+        expected: Global<Map>,
+    ) -> Option<HeapRef<'a, T>> {
+        let ptr = HeapPtr::decode_strong(*self)?;
+        // TODO: make better api for getting object's map
+        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.get();
+        if !map.ptr_eq(expected.as_tagged()) {
+            return None;
+        }
+        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
+    }
 }
 
 impl core::fmt::Debug for Value {
@@ -95,6 +112,7 @@ impl Smi {
         Value((self.0 as Word) << 1)
     }
 
+    // TODO: have unsafe veresion of this with debug check
     pub const fn decode(v: Value) -> Option<Smi> {
         if v.is_smi() {
             Some(Self((v.to_bits() as i64) >> 1))
@@ -124,6 +142,8 @@ impl<T> core::fmt::Debug for HeapPtr<T> {
     }
 }
 
+// TODO: consider swapping the interface safety
+// creation should be safe and encoding to value unsafe?
 impl<T> HeapPtr<T> {
     pub unsafe fn new(ptr: *mut T) -> Self {
         unsafe { Self(NonNull::new_unchecked(ptr)) }

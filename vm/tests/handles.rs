@@ -1,22 +1,13 @@
 use core::ptr::NonNull;
 
-use vm::{
-    EdgeVisitable, GcSlot, HandleData, HandleScope, HeapObject, Register, RootVisitor, Smi, Tagged,
-    Visitor, WeakGcCell,
-};
+use vm::{EdgeVisitable, HandleData, HandleScope, RawCell, RootVisitor, Smi, Tagged, Visitor};
 
 struct Counter(usize);
 
 impl Visitor for Counter {
-    fn visit_slot(&mut self, _slot: &GcSlot) {
+    fn visit(&mut self, _cell: &RawCell) {
         self.0 += 1;
     }
-
-    fn visit_register(&mut self, _reg: &Register) {
-        self.0 += 1;
-    }
-
-    fn visit_weak_slot<T: HeapObject>(&mut self, _cell: &WeakGcCell<T>) {}
 }
 
 impl RootVisitor for Counter {}

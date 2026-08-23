@@ -1,12 +1,16 @@
 use core::cell::UnsafeCell;
 
 use vm::{
-    EdgeVisitable, FixedArray, FixedByteArray, HeapRef, LocalHeap, NoGc, Register, Tagged, Value,
-    ValueRef, Visitor,
+    EdgeVisitable, FixedArray, FixedByteArray, HeapRef, LocalHeap, NoGc, Register, Value, ValueRef,
+    Visitor,
 };
 
 use crate::{FrameMeta, Stack};
 
+// TODO: consider finding a way to not need this.
+// the reason this needs an UnsafeCell is because the GC needs to be aware of this
+// to give the awareness this is attached to a SharedVMInstance and to access it mutably
+// we need exclusive borrow
 pub struct StackCache(UnsafeCell<StackCacheImpl>);
 
 struct StackCacheImpl {
@@ -95,22 +99,14 @@ impl StackCache {
         self.get().pc = pc;
     }
 
-    fn code(&self) -> Value {
-        self.get().code.inner()
-    }
-
     pub fn code_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
         debug_assert!(self.is_active(), "bytecode read from inactive cache");
-        unsafe { nogc.get_unchecked(Tagged::from_value_unchecked(self.code())) }
-    }
-
-    fn constants(&self) -> Value {
-        self.get().constants.inner()
+        self.get().code.heap_ref(nogc)
     }
 
     pub fn constants_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedArray> {
         debug_assert!(self.is_active(), "constants read from inactive cache");
-        unsafe { nogc.get_unchecked(Tagged::from_value_unchecked(self.constants())) }
+        self.get().constants.heap_ref(nogc)
     }
 
     pub fn spill_acc(&self, acc: Value) {
@@ -136,9 +132,9 @@ impl EdgeVisitable for StackCache {
             "GC visited an active cache with an unspilled accumulator"
         );
         if cache.acc_spilled {
-            visitor.visit_register(&cache.acc);
+            visitor.visit(cache.acc.as_raw());
         }
-        visitor.visit_register(&cache.code);
-        visitor.visit_register(&cache.constants);
+        visitor.visit(cache.code.as_raw());
+        visitor.visit(cache.constants.as_raw());
     }
 }

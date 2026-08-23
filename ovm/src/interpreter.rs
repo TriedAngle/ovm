@@ -1,7 +1,7 @@
 use bytecode::{Opcode, Operand, Scale};
 
 use vm::{
-    FixedArray, HeapObject, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
+    FixedArray, Handle, HeapObject, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
     ObjectSlotsInit, SlotName, Smi, Tagged, Value, ValueRef,
 };
 
@@ -11,15 +11,15 @@ pub fn run<H: Heap>(
     vm: &VM<H>,
     heap: &mut H::Local,
     state: &ContextState,
-    callable: Tagged<Object>,
+    callable: Handle<'_, Object>,
     args: &[Value],
 ) -> Result<Value, VmError> {
+    // TODO: merge getting the register count into the frame allocation function (I think)
     let register_count = heap
         .no_gc(|nogc, heap| {
-            // Safety: the caller roots the callable (handle or well-known
-            // root) for the whole run.
-            let obj = unsafe { nogc.get_unchecked(callable) };
-            obj.as_ref()
+            callable
+                .heap_ref(nogc)
+                .as_ref()
                 .callable_info(nogc, heap)
                 .map(|info| info.register_count.to_smi().value() as usize)
         })
@@ -28,8 +28,9 @@ pub fn run<H: Heap>(
     let stack = &state.stack;
     let cache = &state.cache;
 
+    // TODO: consider having a frame scope?
     let result = stack
-        .push_initial_frame(callable, register_count, args)
+        .push_initial_frame(callable.as_tagged(), register_count, args)
         .and_then(|frame| {
             cache.enter(stack, frame, heap);
             let result = dispatch(vm, heap, state);
@@ -49,13 +50,15 @@ fn property_name<'a, L: LocalHeap>(
     constants: HeapRef<'a, FixedArray>,
     idx: usize,
 ) -> SlotName {
+    // TODO: this function must handle also non constants and non interned strings and symbols
     let v = constants.at(idx);
-    let name = nogc
-        .get_as::<InternedString>(v, heap.known().string_map)
+    let name = v
+        .get_as::<InternedString>(nogc, heap.known().string_map)
         .expect("property name constant must be an interned string");
     SlotName::from(name.into_tagged())
 }
 
+// TODO: pass stack and cache directly, could be benificial for threading dispatch later
 fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> Result<Value, VmError> {
     let stack = &state.stack;
     let cache = &state.cache;
@@ -66,7 +69,10 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
+        // TODO: nicer api for the operator casts
+        // TODO: actually handle `Result` instead of just `?`
         match op {
+            // TODO0: why return from value within cache/frame, shouldn't it always be in acc? 
             Opcode::Return => match stack.pop_frame(meta.base) {
                 Some(caller) => cache.load(stack, caller, heap),
                 None => return Ok(acc),
@@ -89,6 +95,7 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
                 acc = v;
             }
             Opcode::Add => {
+                // TODO: JS semantics
                 let a = Smi::decode(stack.reg(&meta, operands[0] as i32)).ok_or(VmError::Type)?;
                 let b = Smi::decode(stack.reg(&meta, operands[1] as i32)).ok_or(VmError::Type)?;
                 let r = a.value().checked_add(b.value()).ok_or(VmError::Overflow)?;
@@ -106,6 +113,7 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
                 let _ = cache.take_acc();
                 acc = result?;
             }
+            // TODO: feedback vectors and separation once they are there
             Opcode::Call | Opcode::CallNoFeedback => {
                 let count = operands[2] as usize;
                 let target = heap.no_gc(|nogc, heap| {
@@ -130,6 +138,9 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
                 )?;
                 cache.load(stack, callee, heap);
             }
+            // TODO: property lookup shoudln't solely depend on constant pool
+            // runtime values and symbols must also be supported
+            // probably separate bytecode of split load and lookup
             Opcode::LoadNamedProperty => {
                 let v = heap.no_gc(|nogc, heap| {
                     let name =
@@ -166,22 +177,33 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
             Opcode::CreateObjectFromMap => {
                 let map = heap.no_gc(|nogc, heap| {
                     let v = cache.constants_ref(nogc).at(operands[0] as usize);
-                    nogc.get_as::<Map>(v, heap.known().map_map)
+                    v.get_as::<Map>(nogc, heap.known().map_map)
                         .map(|r| r.into_tagged())
                         .ok_or(VmError::Type)
                 })?;
                 let count = operands[2] as usize;
                 cache.spill_acc(acc);
                 let args = stack.args(&meta, operands[1] as i32, count);
-                let obj = heap.allocate_object(ObjectSlotsInit {
-                    map,
-                    values: args,
-                    elements: heap.known().void.value(),
-                    length: 0,
+
+                // TODO: maybe have a handlescope always accessible or a quickspill cache
+                let obj = state.handle_scope(|scope| {
+                    let map = scope
+                        .create_handle(map)
+                        .expect("map is a strong pointer");
+                    heap.allocate_object(
+                        &scope,
+                        ObjectSlotsInit {
+                            map,
+                            values: args,
+                            elements: heap.known().void.value(),
+                            length: 0,
+                        },
+                    )
                 });
                 let _ = cache.take_acc();
                 acc = obj.erase();
             }
+            // TODO: create more array creation operations, this one is only for &[Value]
             Opcode::CreateArrayLiteral => {
                 let count = operands[1] as usize;
                 cache.spill_acc(acc);
@@ -205,8 +227,10 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
                     let ValueRef::Object(context) = info.context.value_ref(nogc) else {
                         return Err(VmError::Type);
                     };
-                    Ok(nogc
-                        .get(&context.as_ref().slots)
+                    Ok(context
+                        .as_ref()
+                        .slots
+                        .heap_ref(nogc)
                         .as_ref()
                         .element_slot(operands[0] as usize)
                         .inner())
@@ -226,8 +250,10 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
                     let ValueRef::Object(context) = info.context.value_ref(nogc) else {
                         return Err(VmError::Type);
                     };
-                    nogc.get(&context.as_ref().slots)
+                    context
                         .as_ref()
+                        .slots
+                        .heap_ref(nogc)
                         .element_slot(operands[0] as usize)
                         .set(heap, host, Tagged::from_value(acc));
                     Ok(())
@@ -238,6 +264,8 @@ fn dispatch<H: Heap>(vm: &VM<H>, heap: &mut H::Local, state: &ContextState) -> R
     }
 }
 
+// TODO: this decode function looks quite complex, I believe this can be simplified
+// TODO: get rid of this much branching and .expect(), use `debug_assert!` instead
 fn decode(code: &[u8], mut pc: usize) -> (Opcode, [u32; 4], usize) {
     let mut op = read_opcode(code, &mut pc);
     let mut scale = Scale::Byte1;
@@ -269,6 +297,7 @@ fn decode(code: &[u8], mut pc: usize) -> (Opcode, [u32; 4], usize) {
     (op, operands, pc)
 }
 
+// TODO: see if force inlining matters
 fn read_opcode(code: &[u8], pc: &mut usize) -> Opcode {
     let byte = *code.get(*pc).expect("program counter out of bounds");
     *pc += 1;

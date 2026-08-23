@@ -7,7 +7,7 @@ use core::{
 };
 
 use crate::{
-    FixedArray, Global, Handle, HandleScope, Header, HeapObject, HeapPtr, Map, MapInit, MapKind,
+    FixedArray, Global, Handle, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapKind,
     Object, ObjectInit, ObjectSlotsInit, RootHandles, Smi, Tagged, Value, Word,
 };
 
@@ -34,8 +34,7 @@ impl std::error::Error for AllocError {}
 pub struct WellKnown {
     pub roots: RootHandles,
     pub map_map: Global<Map>,
-    /// The hole: fill for not-yet-written slots
-    /// TODO: consider having sepearte thing for this, or keep it as void
+    /// "hole"
     pub void: Global<Object>,
     pub smi_map: Global<Map>,
     pub float_map: Global<Map>,
@@ -59,74 +58,70 @@ pub trait Heap: Sized + Send + Sync {
 
     fn install_well_known_maps(&self) {
         let mut local = self.new_local();
-        let roots = unsafe { RootHandles::new(32, Smi::new(0).encode()) };
+        let roots = unsafe { RootHandles::new(64, Smi::new(0).encode()) };
+
+        fn bootstrap_map(
+            local: &mut impl LocalHeap,
+            roots: &RootHandles,
+            map_map: Global<Map>,
+            kind: MapKind,
+        ) -> Global<Map> {
+            let raw = local
+                .allocate_raw(Map::layout_for(0))
+                .expect("bootstrap map allocation");
+            let ptr = unsafe { HeapPtr::<Map>::new(raw.as_ptr().cast()) };
+            let global = roots.create_handle(Tagged::from_ptr(ptr));
+            let map = unsafe { global.get().as_mut() };
+            let host = map.erase();
+            map.header.map.set(local, host, map_map.as_tagged());
+            map.value_slot_count.set(local, host, Smi::new(0));
+            map.descriptor_count.set(local, host, Smi::new(0));
+            map.kind.set(local, host, Smi::new(kind.bits() as i64));
+            global
+        }
 
         let map_map = {
             let raw = local
                 .allocate_raw(Map::layout_for(0))
                 .expect("bootstrap map map allocation");
             let ptr = unsafe { HeapPtr::<Map>::new(raw.as_ptr().cast()) };
-            let map_map = Tagged::from_ptr(ptr);
-            let init = MapInit {
-                map_map,
-                kind: MapKind::MAP,
-                value_slot_count: 0,
-                descriptors: &[],
-            };
-            unsafe { ptr.as_mut() }.init(&local, &init);
-            map_map
+            let tagged = Tagged::from_ptr(ptr);
+            let map = unsafe { ptr.as_mut() };
+            let host = map.erase();
+            map.header.map.set(&local, host, tagged);
+            map.value_slot_count.set(&local, host, Smi::new(0));
+            map.descriptor_count.set(&local, host, Smi::new(0));
+            map.kind.set(&local, host, Smi::new(MapKind::MAP.bits() as i64));
+            roots.create_handle(tagged)
         };
-        let map_map = roots.create_handle(map_map);
-        let meta = map_map.as_tagged();
+        let void_map = bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT);
 
-        let void_map = local
-            .allocate::<Map>(MapInit {
-                map_map: meta,
-                kind: MapKind::OBJECT,
-                value_slot_count: 0,
-                descriptors: &[],
-            })
-            .into_global(&roots);
-
-        let void_tagged = local
-            .allocate::<Object>(ObjectInit {
-                map: void_map.as_tagged(),
-                slots: unsafe { Tagged::from_value_unchecked(Smi::new(0).encode()) },
-                elements: Smi::new(0).encode(),
-                length: 0,
-            })
-            .into_tagged();
-        {
-            let ptr: HeapPtr<Object> = void_tagged.into();
+        let void = {
+            let raw = local
+                .allocate_raw(Object::layout_for())
+                .expect("bootstrap void allocation");
+            let ptr = unsafe { HeapPtr::<Object>::new(raw.as_ptr().cast()) };
+            let tagged = Tagged::from_ptr(ptr);
             let obj = unsafe { ptr.as_mut() };
             let host = obj.erase();
-            obj.slots.set(&local, host, unsafe { void_tagged.cast() });
-            obj.elements.set(&local, host, void_tagged.erase_tagged());
-        }
-        let void = roots.create_handle(void_tagged);
-
-        let mut new_map = |map_map: Tagged<Map>, kind: MapKind| {
-            local
-                .allocate::<Map>(MapInit {
-                    map_map,
-                    kind,
-                    value_slot_count: 0,
-                    descriptors: &[],
-                })
-                .into_global(&roots)
+            obj.header.map.set(&local, host, void_map.as_tagged());
+            obj.slots.set(&local, host, unsafe { tagged.cast() });
+            obj.elements.set(&local, host, tagged.erase_tagged());
+            obj.length.set(&local, host, Smi::new(0));
+            roots.create_handle(tagged)
         };
 
         let known = WellKnown {
             map_map,
             void,
-            smi_map: new_map(meta, MapKind::OBJECT),
-            float_map: new_map(meta, MapKind::FLOAT),
-            array_map: new_map(meta, MapKind::FIXED_ARRAY),
-            byte_array_map: new_map(meta, MapKind::FIXED_BYTE_ARRAY),
-            string_map: new_map(meta, MapKind::VM_STRING),
-            symbol_map: new_map(meta, MapKind::SYMBOL),
-            accessor_pair_map: new_map(meta, MapKind::ACCESSOR_PAIR),
-            callable_map: new_map(meta, MapKind::CALLABLE_INFO),
+            smi_map: bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT),
+            float_map: bootstrap_map(&mut local, &roots, map_map, MapKind::FLOAT),
+            array_map: bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_ARRAY),
+            byte_array_map: bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_BYTE_ARRAY),
+            string_map: bootstrap_map(&mut local, &roots, map_map, MapKind::VM_STRING),
+            symbol_map: bootstrap_map(&mut local, &roots, map_map, MapKind::SYMBOL),
+            accessor_pair_map: bootstrap_map(&mut local, &roots, map_map, MapKind::ACCESSOR_PAIR),
+            callable_map: bootstrap_map(&mut local, &roots, map_map, MapKind::CALLABLE_INFO),
             roots,
         };
         self.set_known(known);
@@ -168,17 +163,17 @@ pub trait LocalHeap: Sized + Send {
         self.allocate(config).into_handle(scope)
     }
 
-    fn allocate_object(&mut self, config: ObjectSlotsInit<'_>) -> Fresh<'_, Object> {
-        let total = Layout::new::<Object>()
-            .extend(FixedArray::layout_for(config.values.len()))
-            .expect("object with slots layout")
-            .0;
 
-        let token = self.allocate_token(total);
-        let slots = token.allocate::<FixedArray>(config.values);
-        token.allocate::<Object>(ObjectInit {
+    // TODO: potentially remove this in favor of a better allocate function
+    fn allocate_object<'a>(
+        &mut self,
+        handles: &'a impl HandleSet,
+        config: ObjectSlotsInit<'a, '_>,
+    ) -> Fresh<'_, Object> {
+        let slots = handles.create_handle(self.allocate::<FixedArray>(config.values).into_tagged());
+        self.allocate::<Object>(ObjectInit {
             map: config.map,
-            slots: slots.into_tagged(),
+            slots,
             elements: config.elements,
             length: config.length,
         })
@@ -219,7 +214,7 @@ pub trait LocalHeap: Sized + Send {
         token.enter_no_gc(|nogc, heap| f(&token, nogc, heap))
     }
 
-    fn write_barrier(&self, host: Value, slot: &GcSlot, value: Value);
+    fn write_barrier(&self, host: Value, slot: &RawCell, value: Value);
 
     fn collection_requested(&self) -> bool;
     fn park_for_collection(&self);
@@ -243,32 +238,6 @@ pub trait LocalHeap: Sized + Send {
 
 pub struct NoGc<'a> {
     _phantom: PhantomData<&'a mut &'a ()>,
-}
-
-impl<'a> NoGc<'a> {
-    pub fn get<T: HeapObject>(&'a self, slot: &'a GcSlot<T>) -> HeapRef<'a, T> {
-        unsafe { self.get_unchecked(slot.get()) }
-    }
-
-    pub fn get_as<T: HeapObject>(
-        &'a self,
-        v: Value,
-        expected: Global<Map>,
-    ) -> Option<HeapRef<'a, T>> {
-        let ptr = HeapPtr::decode_strong(v)?;
-        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.get();
-        if !map.ptr_eq(expected.as_tagged()) {
-            return None;
-        }
-        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
-    }
-
-    pub unsafe fn get_unchecked<T: HeapObject>(&'a self, v: Tagged<T>) -> HeapRef<'a, T> {
-        HeapRef {
-            ptr: v.into(),
-            _phantom: PhantomData,
-        }
-    }
 }
 
 /// Direct reference to a heap object, valid only within a no-GC scope.
@@ -442,8 +411,38 @@ impl<H: LocalHeap> Drop for AllocToken<'_, H> {
     }
 }
 
-pub struct WeakGcCell<T: HeapObject> {
+#[repr(transparent)]
+pub struct RawCell {
     raw: UnsafeCell<Value>,
+}
+
+impl RawCell {
+    pub unsafe fn from_value(v: Value) -> Self {
+        Self {
+            raw: UnsafeCell::new(v),
+        }
+    }
+
+    pub fn load(&self) -> Value {
+        unsafe { *self.raw.get() }
+    }
+
+    pub fn store_raw(&self, v: Value) {
+        unsafe { *self.raw.get() = v };
+    }
+
+    pub fn heap_ref<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
+        unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(self.load()).into()) }
+    }
+}
+
+/// A strong cell holding a weak reference: does not keep the target
+/// alive and is cleared by the GC once the target dies.
+/// TODO: potentially remove this in favor of weak collections (vm intern table)
+/// and having "MaybeWeakGcCell" for VM objects that have weak semantics
+#[repr(transparent)]
+pub struct WeakGcCell<T: HeapObject> {
+    cell: RawCell,
     _phantom: PhantomData<T>,
 }
 
@@ -453,32 +452,28 @@ unsafe impl<T: HeapObject> Sync for WeakGcCell<T> {}
 impl<T: HeapObject> WeakGcCell<T> {
     pub fn new(ptr: HeapPtr<T>) -> Self {
         Self {
-            raw: UnsafeCell::new(ptr.encode_weak()),
+            cell: unsafe { RawCell::from_value(ptr.encode_weak()) },
             _phantom: PhantomData,
         }
     }
 
+    pub fn as_raw(&self) -> &RawCell {
+        &self.cell
+    }
+
     pub fn is_cleared(&self) -> bool {
-        unsafe { *self.raw.get() }.is_cleared()
+        self.cell.load().is_cleared()
     }
 
-    pub fn word(&self) -> Value {
-        unsafe { *self.raw.get() }
-    }
-
-    pub fn set_word(&self, v: Value) {
-        unsafe { *self.raw.get() = v };
-    }
-
-    pub fn upgrade<'a>(&self, guard: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
-        let word = unsafe { *self.raw.get() };
+    // TODO: this maybe doens't make much sense
+    // if a WeakGcCell is always weak, then upgrading it doesn't actually upgrade but only pretend
+    pub fn upgrade<'a>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
+        let word = self.cell.load();
         if word.is_cleared() {
             return None;
         }
-        // Safety: re-tags the word of a live (not cleared) weak cell as
-        // strong; the address is unchanged.
         let strong = unsafe { Value::from_bits(word.raw_addr() | crate::value::STRONG_PTR) };
-        Some(unsafe { guard.get_unchecked(Tagged::from_value_unchecked(strong)) })
+        Some(unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(strong).into()) })
     }
 }
 
@@ -500,39 +495,37 @@ impl<T: HeapObject + 'static> WordType for Tagged<T> {
 
 #[repr(transparent)]
 pub struct GcSlot<T = Value> {
-    raw: UnsafeCell<Value>,
+    cell: RawCell,
     _phantom: PhantomData<T>,
 }
 
-/// A GC-tracked slot holding a tagged word with a type hint.
-/// Values flow in and out as `Tagged<T>`
 impl<T> GcSlot<T> {
     pub unsafe fn from_value(v: Value) -> Self {
         Self {
-            raw: UnsafeCell::new(v),
+            cell: unsafe { RawCell::from_value(v) },
             _phantom: PhantomData,
         }
     }
 
     pub fn get(&self) -> Tagged<T> {
-        unsafe { Tagged::from_value_unchecked(*self.raw.get()) }
+        unsafe { Tagged::from_value_unchecked(self.cell.load()) }
     }
 
     pub fn inner(&self) -> Value {
-        unsafe { *self.raw.get() }
+        self.cell.load()
     }
 
     pub fn set(&self, heap: &impl LocalHeap, host: Value, value: impl Into<Tagged<T>>) {
         let v = value.into().erase();
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         if v.is_ptr() {
-            heap.write_barrier(host, self.ereased(), v);
+            heap.write_barrier(host, self.as_raw(), v);
         }
-        unsafe { *self.raw.get() = v };
+        self.cell.store_raw(v);
     }
 
-    pub fn ereased(&self) -> &GcSlot {
-        unsafe { &*(self as *const GcSlot<T> as *const GcSlot) }
+    pub fn as_raw(&self) -> &RawCell {
+        &self.cell
     }
 
     pub const fn raw_get(this: *const Self) -> *mut T {
@@ -546,43 +539,47 @@ impl GcSlot<Smi> {
     }
 }
 
+impl<T: HeapObject> GcSlot<T> {
+    /// Reads the slot as a heap reference valid for the no-GC scope.
+    pub fn heap_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
+        self.cell.heap_ref(nogc)
+    }
+}
+
 #[repr(transparent)]
-pub struct Register(UnsafeCell<Value>);
+pub struct Register(RawCell);
 
 impl Register {
     pub unsafe fn from_value(v: Value) -> Self {
-        Self(UnsafeCell::new(v))
+        Self(unsafe { RawCell::from_value(v) })
     }
 
     pub fn inner(&self) -> Value {
-        unsafe { *self.0.get() }
+        self.0.load()
     }
 
     pub fn store(&self, v: Value) {
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
-        unsafe { *self.0.get() = v };
+        self.0.store_raw(v);
+    }
+
+    /// Typed read with the element type known from context.
+    pub fn heap_ref<'a, T: HeapObject>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
+        self.0.heap_ref(nogc)
+    }
+
+    pub fn as_raw(&self) -> &RawCell {
+        &self.0
     }
 }
 
 pub trait Visitor {
-    fn visit_slot(&mut self, slot: &GcSlot);
-
-    fn visit_register(&mut self, reg: &Register);
-
-    fn visit_weak_slot<T: HeapObject>(&mut self, cell: &WeakGcCell<T>);
+    fn visit(&mut self, cell: &RawCell);
 }
 
 impl<V: Visitor + ?Sized> Visitor for &mut V {
-    fn visit_slot(&mut self, slot: &GcSlot) {
-        (**self).visit_slot(slot)
-    }
-
-    fn visit_register(&mut self, reg: &Register) {
-        (**self).visit_register(reg)
-    }
-
-    fn visit_weak_slot<T: HeapObject>(&mut self, cell: &WeakGcCell<T>) {
-        (**self).visit_weak_slot(cell)
+    fn visit(&mut self, cell: &RawCell) {
+        (**self).visit(cell)
     }
 }
 

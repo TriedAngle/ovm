@@ -3,7 +3,7 @@ use core::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use vm::{AllocError, EdgeVisitable, GcSlot, Heap, LocalHeap, RootVisitor, Value, WellKnown, Word};
+use vm::{AllocError, EdgeVisitable, Heap, LocalHeap, RawCell, RootVisitor, Value, WellKnown, Word};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DummyHeapConfig {
@@ -171,7 +171,7 @@ impl LocalHeap for DummyLocalHeap {
             .expect("well-known maps not installed")
     }
 
-    fn write_barrier(&self, _host: Value, _slot: &GcSlot, _value: Value) {}
+    fn write_barrier(&self, _host: Value, _slot: &RawCell, _value: Value) {}
 
     fn collection_requested(&self) -> bool {
         false
@@ -241,8 +241,8 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
-        SlotName, Tagged, Value,
+        AccessorPair, Global, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit,
+        SlotFlags, SlotName, Tagged, Value,
     };
     use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Register, Smi};
 
@@ -256,33 +256,38 @@ mod tests {
         heap: &mut DummyLocalHeap,
         value_slots: usize,
         descs: &[(i64, SlotFlags, Value)],
-    ) -> Tagged<Map> {
+    ) -> Global<Map> {
         let descriptors: Vec<(SlotName, SlotFlags, Value)> = descs
             .iter()
             .map(|(name, flags, value)| (smi_name(*name), *flags, *value))
             .collect();
-        let map_map = heap.known().map_map.as_tagged();
-        heap.allocate::<Map>(MapInit {
-            map_map,
-            kind: MapKind::OBJECT,
-            value_slot_count: value_slots,
-            descriptors: &descriptors,
-        })
-        .into_tagged()
+        let map = heap
+            .allocate::<Map>(MapInit {
+                kind: MapKind::OBJECT,
+                value_slot_count: value_slots,
+                descriptors: &descriptors,
+            })
+            .into_tagged();
+        heap.known().roots.create_handle(map)
     }
 
     fn alloc_object(
         heap: &mut DummyLocalHeap,
-        map: Tagged<Map>,
+        map: Global<Map>,
         values: &[Value],
     ) -> HeapPtr<Object> {
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
         let elements = heap.known().void.value();
-        heap.allocate_object(ObjectSlotsInit {
-            map,
-            values,
-            elements,
-            length: 0,
-        })
+        heap.allocate_object(
+            &scope,
+            ObjectSlotsInit {
+                map,
+                values,
+                elements,
+                length: 0,
+            },
+        )
         .into_ptr()
     }
 

@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, HeapRef, LocalHeap, NoGc, Smi, Tagged, Value, Visitor, Word,
+    EdgeVisitable, GcSlot, Handle, HeapRef, LocalHeap, NoGc, Smi, Tagged, Value, Visitor, Word,
     value::{STRONG_PTR, WEAK_PTR},
 };
 
@@ -94,7 +94,6 @@ impl Map {
 }
 
 pub struct MapInit<'a> {
-    pub map_map: Tagged<Map>,
     pub kind: MapKind,
     pub value_slot_count: usize,
     pub descriptors: &'a [(SlotName, SlotFlags, Value)],
@@ -109,7 +108,9 @@ impl HeapObject for Map {
 
     fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
         let host = self.erase();
-        self.header.map.set(heap, host, config.map_map);
+        self.header
+            .map
+            .set(heap, host, heap.known().map_map.as_tagged());
         self.value_slot_count
             .set(heap, host, Smi::new(config.value_slot_count as i64));
         self.descriptor_count
@@ -135,10 +136,10 @@ impl HeapObject for Map {
 
 impl EdgeVisitable for Map {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
+        visitor.visit(self.header.map.as_raw());
         for d in self.descriptors() {
-            visitor.visit_slot(d.name.ereased());
-            visitor.visit_slot(d.value.ereased());
+            visitor.visit(d.name.as_raw());
+            visitor.visit(d.value.as_raw());
         }
     }
 }
@@ -209,6 +210,7 @@ impl MapKind {
         Self(self.0 | other.0)
     }
 
+    // TODO: consider transmute with debug assert
     pub const fn kind(self) -> ObjectKind {
         match Self(self.0 & Self::KIND_MASK) {
             Self::MAP => ObjectKind::Map,
@@ -349,30 +351,30 @@ impl Object {
         guard: &'a NoGc<'a>,
         heap: &impl LocalHeap,
     ) -> Option<HeapRef<'a, CallableInfoObject>> {
-        if !guard.get(&self.header.map).kind().is_callable() {
+        if !self.header.map.heap_ref(guard).kind().is_callable() {
             return None;
         }
-        let info = guard.get(&self.slots).at(0);
-        guard.get_as::<CallableInfoObject>(info, heap.known().callable_map)
+        let info = self.slots.heap_ref(guard).at(0);
+        info.get_as(guard, heap.known().callable_map)
     }
 }
 
-pub struct ObjectInit {
-    pub map: Tagged<Map>,
-    pub slots: Tagged<FixedArray>,
+pub struct ObjectInit<'a> {
+    pub map: Handle<'a, Map>,
+    pub slots: Handle<'a, FixedArray>,
     pub elements: Value,
     pub length: usize,
 }
 
-pub struct ObjectSlotsInit<'a> {
-    pub map: Tagged<Map>,
-    pub values: &'a [Value],
+pub struct ObjectSlotsInit<'m, 'v> {
+    pub map: Handle<'m, Map>,
+    pub values: &'v [Value],
     pub elements: Value,
     pub length: usize,
 }
 
 impl HeapObject for Object {
-    type Init<'a> = ObjectInit;
+    type Init<'a> = ObjectInit<'a>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Self::layout_for()
@@ -380,8 +382,8 @@ impl HeapObject for Object {
 
     fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
         let host = self.erase();
-        self.header.map.set(heap, host, config.map);
-        self.slots.set(heap, host, config.slots);
+        self.header.map.set(heap, host, config.map.as_tagged());
+        self.slots.set(heap, host, config.slots.as_tagged());
         self.elements
             .set(heap, host, Tagged::from_value(config.elements));
         self.length.set(heap, host, Smi::new(config.length as i64));
@@ -398,9 +400,9 @@ impl HeapObject for Object {
 
 impl EdgeVisitable for Object {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
-        visitor.visit_slot(self.slots.ereased());
-        visitor.visit_slot(self.elements.ereased());
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.slots.as_raw());
+        visitor.visit(self.elements.as_raw());
     }
 }
 
@@ -476,10 +478,10 @@ impl HeapObject for FixedArray {
 
 impl EdgeVisitable for FixedArray {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
+        visitor.visit(self.header.map.as_raw());
         let size = self.size.to_smi().value() as usize;
         for i in 0..size {
-            visitor.visit_slot(self.element_slot(i));
+            visitor.visit(self.element_slot(i).as_raw());
         }
     }
 }
@@ -555,7 +557,7 @@ impl HeapObject for FixedByteArray {
 
 impl EdgeVisitable for FixedByteArray {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
+        visitor.visit(self.header.map.as_raw());
     }
 }
 
@@ -567,30 +569,29 @@ pub struct VMString {
 }
 
 impl VMString {
-    pub fn backing(&self) -> &FixedByteArray {
-        let ptr = self.backing.get().as_ptr().expect("string backing");
-        unsafe { ptr.as_ref() }
+    pub fn backing<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
+        self.backing.heap_ref(nogc)
     }
 
     pub fn hash(&self) -> i64 {
         self.hash.to_smi().value()
     }
 
-    pub fn len(&self) -> usize {
-        self.backing().len()
+    pub fn len<'a>(&self, nogc: &'a NoGc<'a>) -> usize {
+        self.backing(nogc).len()
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        self.backing().as_slice()
+    pub fn as_slice<'a>(&self, nogc: &'a NoGc<'a>) -> &'a [u8] {
+        self.backing(nogc).as_ref().as_slice()
     }
 
-    pub fn as_str(&self) -> Option<&str> {
-        core::str::from_utf8(self.as_slice()).ok()
+    pub fn as_str<'a>(&self, nogc: &'a NoGc<'a>) -> Option<&'a str> {
+        core::str::from_utf8(self.as_slice(nogc)).ok()
     }
 }
 
 impl HeapObject for VMString {
-    type Init<'a> = (Tagged<FixedByteArray>, i64);
+    type Init<'a> = (Handle<'a, FixedByteArray>, i64);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -601,7 +602,7 @@ impl HeapObject for VMString {
         self.header
             .map
             .set(heap, host, heap.known().string_map.as_tagged());
-        self.backing.set(heap, host, config.0);
+        self.backing.set(heap, host, config.0.as_tagged());
         self.hash.set(heap, host, Smi::new(config.1));
     }
 
@@ -616,8 +617,8 @@ impl HeapObject for VMString {
 
 impl EdgeVisitable for VMString {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
-        visitor.visit_slot(self.backing.ereased());
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.backing.as_raw());
     }
 }
 
@@ -631,7 +632,7 @@ impl InternedString {
 }
 
 impl HeapObject for InternedString {
-    type Init<'a> = (Tagged<FixedByteArray>, i64);
+    type Init<'a> = (Handle<'a, FixedByteArray>, i64);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -663,26 +664,25 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    pub fn backing(&self) -> &FixedByteArray {
-        let ptr = self.backing.get().as_ptr().expect("symbol backing");
-        unsafe { ptr.as_ref() }
+    pub fn backing<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
+        self.backing.heap_ref(nogc)
     }
 
-    pub fn len(&self) -> usize {
-        self.backing().len()
+    pub fn len<'a>(&self, nogc: &'a NoGc<'a>) -> usize {
+        self.backing(nogc).len()
     }
 
-    pub fn as_slice(&self) -> &[u8] {
-        self.backing().as_slice()
+    pub fn as_slice<'a>(&self, nogc: &'a NoGc<'a>) -> &'a [u8] {
+        self.backing(nogc).as_ref().as_slice()
     }
 
-    pub fn as_str(&self) -> Option<&str> {
-        core::str::from_utf8(self.as_slice()).ok()
+    pub fn as_str<'a>(&self, nogc: &'a NoGc<'a>) -> Option<&'a str> {
+        core::str::from_utf8(self.as_slice(nogc)).ok()
     }
 }
 
 impl HeapObject for Symbol {
-    type Init<'a> = Tagged<FixedByteArray>;
+    type Init<'a> = Handle<'a, FixedByteArray>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -693,7 +693,7 @@ impl HeapObject for Symbol {
         self.header
             .map
             .set(heap, host, heap.known().symbol_map.as_tagged());
-        self.backing.set(heap, host, *config);
+        self.backing.set(heap, host, config.as_tagged());
     }
 
     fn header(&self) -> &Header {
@@ -707,8 +707,8 @@ impl HeapObject for Symbol {
 
 impl EdgeVisitable for Symbol {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
-        visitor.visit_slot(self.backing.ereased());
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.backing.as_raw());
     }
 }
 
@@ -793,9 +793,9 @@ impl HeapObject for AccessorPair {
 
 impl EdgeVisitable for AccessorPair {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
-        visitor.visit_slot(self.get.ereased());
-        visitor.visit_slot(self.set.ereased());
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.get.as_raw());
+        visitor.visit(self.set.as_raw());
     }
 }
 
@@ -808,15 +808,15 @@ pub struct CallableInfoObject {
     pub context: GcSlot,
 }
 
-pub struct CallableInfoInit {
-    pub bytecode: Tagged<FixedByteArray>,
-    pub constants: Tagged<FixedArray>,
+pub struct CallableInfoInit<'a> {
+    pub bytecode: Handle<'a, FixedByteArray>,
+    pub constants: Handle<'a, FixedArray>,
     pub register_count: usize,
     pub context: Value,
 }
 
 impl HeapObject for CallableInfoObject {
-    type Init<'a> = CallableInfoInit;
+    type Init<'a> = CallableInfoInit<'a>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -827,8 +827,9 @@ impl HeapObject for CallableInfoObject {
         self.header
             .map
             .set(heap, host, heap.known().callable_map.as_tagged());
-        self.bytecode.set(heap, host, config.bytecode);
-        self.constants.set(heap, host, config.constants);
+        self.bytecode.set(heap, host, config.bytecode.as_tagged());
+        self.constants
+            .set(heap, host, config.constants.as_tagged());
         self.register_count
             .set(heap, host, Smi::new(config.register_count as i64));
         self.context
@@ -846,28 +847,10 @@ impl HeapObject for CallableInfoObject {
 
 impl EdgeVisitable for CallableInfoObject {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
-        visitor.visit_slot(self.bytecode.ereased());
-        visitor.visit_slot(self.constants.ereased());
-        visitor.visit_slot(self.context.ereased());
-    }
-}
-
-impl AsRef<str> for VMString {
-    fn as_ref(&self) -> &str {
-        self.as_str().expect("string must be valid utf8")
-    }
-}
-
-impl AsRef<str> for InternedString {
-    fn as_ref(&self) -> &str {
-        self.string().as_ref()
-    }
-}
-
-impl AsRef<str> for Symbol {
-    fn as_ref(&self) -> &str {
-        self.as_str().expect("symbol must be valid utf8")
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.bytecode.as_raw());
+        visitor.visit(self.constants.as_raw());
+        visitor.visit(self.context.as_raw());
     }
 }
 
@@ -903,6 +886,6 @@ impl HeapObject for Float {
 
 impl EdgeVisitable for Float {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
-        visitor.visit_slot(self.header.map.ereased());
+        visitor.visit(self.header.map.as_raw());
     }
 }

@@ -141,8 +141,8 @@ fn float_add<H: Heap>(nctx: &mut NativeContext<'_, H>, args: &[Value]) -> Result
     };
     let sum = nctx.heap().no_gc(|nogc, heap| {
         let float_map = heap.known().float_map;
-        let fa = nogc.get_as::<Float>(a, float_map).ok_or(VmError::Type)?;
-        let fb = nogc.get_as::<Float>(b, float_map).ok_or(VmError::Type)?;
+        let fa = a.get_as::<Float>(nogc, float_map).ok_or(VmError::Type)?;
+        let fb = b.get_as::<Float>(nogc, float_map).ok_or(VmError::Type)?;
         Ok(fa.value.get() + fb.value.get())
     })?;
     Ok(nctx.heap().allocate::<Float>(sum).erase())

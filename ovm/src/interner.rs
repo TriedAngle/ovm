@@ -2,8 +2,6 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
-use core::alloc::Layout;
-
 use vm::{
     EdgeVisitable, FixedByteArray, Handle, HandleScope, InternedString, LocalHeap, Visitor,
     WeakGcCell,
@@ -20,6 +18,7 @@ fn hash_bytes(bytes: &[u8]) -> i64 {
     (h & ((1 << 62) - 1)) as i64
 }
 
+// TODO: weak GC cell is fake kinda, make this better
 pub struct StringInterner {
     table: Mutex<HashMap<Box<str>, WeakGcCell<InternedString>>>,
 }
@@ -52,17 +51,13 @@ impl StringInterner {
             }
         }
 
-        let lb = FixedByteArray::layout_for(s.len());
-        let ls = Layout::new::<InternedString>();
-        let (total, _) = lb.extend(ls).expect("string layout");
-
-        let handle = heap.allocate_token_enter_nogc(total, |token, nogc, _heap| {
-            let backing = token.allocate_ref::<FixedByteArray>(s.as_bytes(), nogc);
-            let hash = hash_bytes(s.as_bytes());
-            let interned =
-                token.allocate_ref::<InternedString>((backing.into_tagged(), hash), nogc);
-            interned.into_handle(scope)
-        });
+        let backing = heap
+            .allocate::<FixedByteArray>(s.as_bytes())
+            .into_handle(scope);
+        let hash = hash_bytes(s.as_bytes());
+        let handle = heap
+            .allocate::<InternedString>((backing, hash))
+            .into_handle(scope);
 
         let mut table = self.table.lock().unwrap();
         match table.entry(s.into()) {
@@ -93,7 +88,7 @@ fn handle_from_entry<'s, L: LocalHeap>(
 impl EdgeVisitable for StringInterner {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         for cell in self.table.lock().unwrap().values() {
-            visitor.visit_weak_slot(cell);
+            visitor.visit(cell.as_raw());
         }
     }
 }

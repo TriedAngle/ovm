@@ -78,6 +78,7 @@ impl Stack {
         self.slot_unchecked(Self::reg_index(meta, i)).store(v);
     }
 
+    // TODO: I don't think this function is needed, instead just reg can be used
     pub fn reg_slot(&self, meta: &FrameMeta, i: i32) -> &Register {
         self.slot_unchecked(Self::reg_index(meta, i))
     }
@@ -175,7 +176,7 @@ impl Stack {
 impl EdgeVisitable for Stack {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         for slot in &self.slots[..self.top()] {
-            visitor.visit_register(slot);
+            visitor.visit(slot.as_raw());
         }
     }
 }
