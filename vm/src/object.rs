@@ -828,8 +828,7 @@ impl HeapObject for CallableInfoObject {
             .map
             .set(heap, host, heap.known().callable_map.as_tagged());
         self.bytecode.set(heap, host, config.bytecode.as_tagged());
-        self.constants
-            .set(heap, host, config.constants.as_tagged());
+        self.constants.set(heap, host, config.constants.as_tagged());
         self.register_count
             .set(heap, host, Smi::new(config.register_count as i64));
         self.context

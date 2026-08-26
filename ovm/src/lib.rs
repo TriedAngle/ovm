@@ -4,7 +4,8 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use vm::{
-    AllocError, EdgeVisitable, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap, Object, RootVisitor, Value, Visitor,
+    AllocError, EdgeVisitable, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap,
+    Object, RootVisitor, Value, Visitor,
 };
 
 pub mod cache;
@@ -71,7 +72,7 @@ impl ContextState {
 }
 
 unsafe impl Send for ContextState {}
-// TODO: can we get rid of this somehow? 
+// TODO: can we get rid of this somehow?
 // in practice we seem to need Sync because Heap needs access,
 // in theory full isolation (and passing?) should be possible
 unsafe impl Sync for ContextState {}
@@ -131,11 +132,7 @@ impl<H: Heap> Thread<H> {
         f(self, scope)
     }
 
-    pub fn run(
-        &mut self,
-        callable: Handle<'_, Object>,
-        args: &[Value],
-    ) -> Result<Value, VmError> {
+    pub fn run(&mut self, callable: Handle<'_, Object>, args: &[Value]) -> Result<Value, VmError> {
         interpreter::run(&self.vm, &mut self.heap, &self.state, callable, args)
     }
 

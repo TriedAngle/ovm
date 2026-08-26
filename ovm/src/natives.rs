@@ -9,6 +9,7 @@ pub enum VmError {
     Arity,
     Type,
     Overflow,
+    OutOfBounds,
     StackOverflow,
 }
 

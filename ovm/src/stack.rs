@@ -78,11 +78,6 @@ impl Stack {
         self.slot_unchecked(Self::reg_index(meta, i)).store(v);
     }
 
-    // TODO: I don't think this function is needed, instead just reg can be used
-    pub fn reg_slot(&self, meta: &FrameMeta, i: i32) -> &Register {
-        self.slot_unchecked(Self::reg_index(meta, i))
-    }
-
     pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> &[Value] {
         self.value_slice(Self::reg_index(meta, reg_base), count)
     }

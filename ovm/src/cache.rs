@@ -56,7 +56,7 @@ impl StackCache {
 
     pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut impl LocalHeap) {
         heap.no_gc(|nogc, heap| {
-            let ValueRef::Object(obj) = stack.callable_slot(&frame).value_ref(nogc) else {
+            let ValueRef::Object(obj) = stack.callable_slot(&frame).inner().value_ref(nogc) else {
                 panic!("frame callable must be an object");
             };
             let info = obj

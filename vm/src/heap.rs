@@ -7,8 +7,8 @@ use core::{
 };
 
 use crate::{
-    FixedArray, Global, Handle, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapKind,
-    Object, ObjectInit, ObjectSlotsInit, RootHandles, Smi, Tagged, Value, Word,
+    FixedArray, Global, Handle, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapKind, Object,
+    ObjectInit, ObjectSlotsInit, RootHandles, Smi, Tagged, Value, Word,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +91,8 @@ pub trait Heap: Sized + Send + Sync {
             map.header.map.set(&local, host, tagged);
             map.value_slot_count.set(&local, host, Smi::new(0));
             map.descriptor_count.set(&local, host, Smi::new(0));
-            map.kind.set(&local, host, Smi::new(MapKind::MAP.bits() as i64));
+            map.kind
+                .set(&local, host, Smi::new(MapKind::MAP.bits() as i64));
             roots.create_handle(tagged)
         };
         let void_map = bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT);
@@ -162,7 +163,6 @@ pub trait LocalHeap: Sized + Send {
     ) -> Handle<'s, T> {
         self.allocate(config).into_handle(scope)
     }
-
 
     // TODO: potentially remove this in favor of a better allocate function
     fn allocate_object<'a>(

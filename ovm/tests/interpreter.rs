@@ -3,8 +3,7 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeIndex, Thread, VM, VmError};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Handle, HandleScope, HeapPtr,
-    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi,
-    Value,
+    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi, Value,
 };
 
 fn smi(v: i64) -> Value {
@@ -316,4 +315,160 @@ fn create_object_from_map_fills_from_registers() {
         // the object's map must be the map from the constants table
         assert_eq!(o.header.map.get().erase(), map_v);
     });
+}
+
+#[test]
+fn keyed_load_reads_array_element() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r0..r2 = 10, 20, 30; r3 = [r0, r1, r2]; acc = 1; acc = r3[acc]
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[10]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::LoadSmi, &[20]);
+    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::LoadSmi, &[30]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 3]);
+    emit(&mut program, Opcode::Store, &[3]);
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[3, 0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 4, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 20);
+}
+
+#[test]
+fn keyed_store_writes_array_element() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r3 = [1]; r4 = 0 (key); acc = 99 (value); r3[r4] = acc; acc = r3[0]
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+    emit(&mut program, Opcode::Store, &[3]);
+    emit(&mut program, Opcode::LoadSmi, &[0]);
+    emit(&mut program, Opcode::Store, &[4]);
+    emit(&mut program, Opcode::LoadSmi, &[99]);
+    emit(&mut program, Opcode::StoreKeyedProperty, &[3, 4, 0]);
+    emit(&mut program, Opcode::LoadSmi, &[0]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[3, 0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 5, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 99);
+}
+
+#[test]
+fn keyed_load_out_of_bounds_errors() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    for key in [2u32, (-1i32) as u32] {
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadSmi, &[1]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::LoadSmi, &[key]);
+        emit(&mut program, Opcode::LoadKeyedProperty, &[1, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let result = run_program(&mut thread, program, 2, &[]);
+        assert_eq!(result, Err(VmError::OutOfBounds));
+    }
+}
+
+/// Build an object with map (x -> slot 0, y -> slot 1) in the constants table
+/// at index 0, and the interned name "x" at index 1.
+fn object_program(
+    thread: &mut Thread<DummyHeap>,
+    build: impl FnOnce(&mut Vec<u8>),
+) -> Result<Value, VmError> {
+    thread.handle_scope(|thread, scope| {
+        let void = thread.heap().known().void.value();
+        let x = thread.intern(&scope, "x");
+        let y = thread.intern(&scope, "y");
+        let map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                kind: MapKind::OBJECT,
+                value_slot_count: 2,
+                descriptors: &[
+                    (
+                        SlotName::from(x.as_tagged()),
+                        SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                        Smi::new(0).encode(),
+                    ),
+                    (
+                        SlotName::from(y.as_tagged()),
+                        SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                        Smi::new(1).encode()),
+                ],
+            },
+            &scope,
+        );
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[map.as_tagged().erase(), x.as_tagged().erase()],
+            &scope,
+        );
+
+        // r0 = 7, r1 = 9; r2 = object
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadSmi, &[7]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[9]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 2]);
+        emit(&mut program, Opcode::Store, &[2]);
+        build(&mut program);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 4,
+                context: void,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.run(callable, &[])
+    })
+}
+
+#[test]
+fn keyed_load_reads_named_property_via_string_key() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // acc = "x" (constants[1]); acc = r2[acc]
+    let result = object_program(&mut thread, |program| {
+        emit(program, Opcode::LoadConstant, &[1]);
+        emit(program, Opcode::LoadKeyedProperty, &[2, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+#[test]
+fn keyed_store_writes_named_property_via_string_key() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r3 = "x"; acc = 42; r2[r3] = acc; acc = r2.x
+    let result = object_program(&mut thread, |program| {
+        emit(program, Opcode::LoadConstant, &[1]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadSmi, &[42]);
+        emit(program, Opcode::StoreKeyedProperty, &[2, 3, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }

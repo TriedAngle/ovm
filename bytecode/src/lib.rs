@@ -21,6 +21,9 @@ pub enum Opcode {
     LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
     StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
 
+    LoadKeyedProperty,  // reg (obj) idx (feedback); key in acc -> acc
+    StoreKeyedProperty, // acc -> reg (obj) reg (key) idx (feedback)
+
     // reglist is the first register (index) we dont have literally the whole list there.
     // for methods the `self` is the first element in the reglist
     Call,           // reg (callee) reglist (base) regcount (count) idx (feedback) -> acc
@@ -59,6 +62,49 @@ impl Operand {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct Operands {
+    raw: [u32; 4],
+    kinds: &'static [Operand],
+}
+
+impl Operands {
+    pub const fn new(raw: [u32; 4], kinds: &'static [Operand]) -> Self {
+        Self { raw, kinds }
+    }
+
+    #[inline]
+    fn at(&self, i: usize, kind: Operand) -> u32 {
+        debug_assert_eq!(self.kinds[i], kind);
+        self.raw[i]
+    }
+
+    #[inline]
+    pub fn reg(&self, i: usize) -> i32 {
+        self.at(i, Operand::Register) as i32
+    }
+
+    #[inline]
+    pub fn reg_list(&self, i: usize) -> i32 {
+        self.at(i, Operand::RegisterListStart) as i32
+    }
+
+    #[inline]
+    pub fn reg_count(&self, i: usize) -> usize {
+        self.at(i, Operand::RegisterCount) as usize
+    }
+
+    #[inline]
+    pub fn imm(&self, i: usize) -> i32 {
+        self.at(i, Operand::Immediate) as i32
+    }
+
+    #[inline]
+    pub fn idx(&self, i: usize) -> usize {
+        self.at(i, Operand::Index) as usize
+    }
+}
+
 impl Opcode {
     // TODO: we should probably use transmute unsafe here
     pub const fn from_byte(byte: u8) -> Option<Self> {
@@ -75,6 +121,8 @@ impl Opcode {
             b if b == StoreContextSlot as u8 => StoreContextSlot,
             b if b == LoadNamedProperty as u8 => LoadNamedProperty,
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
+            b if b == LoadKeyedProperty as u8 => LoadKeyedProperty,
+            b if b == StoreKeyedProperty as u8 => StoreKeyedProperty,
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
             b if b == CallNative as u8 => CallNative,
@@ -103,6 +151,9 @@ impl Opcode {
 
             Self::LoadNamedProperty => &[Register, Index, Index],
             Self::StoreNamedProperty => &[Register, Index, Index],
+
+            Self::LoadKeyedProperty => &[Register, Index],
+            Self::StoreKeyedProperty => &[Register, Register, Index],
 
             Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
@@ -170,4 +221,41 @@ pub fn emit(code: &mut Vec<u8>, op: Opcode, operands: &[u32]) {
         assert!(fits, "operand {value} does not fit in {size} byte(s)");
         code.extend_from_slice(&value.to_le_bytes()[..size]);
     }
+}
+
+// TODO: get rid of this much branching and .expect(), use `debug_assert!` instead
+pub fn decode(code: &[u8], mut pc: usize) -> (Opcode, Operands, usize) {
+    let mut op = read_opcode(code, &mut pc);
+    let mut scale = Scale::Byte1;
+    if op == Opcode::Wide {
+        scale = Scale::Byte2;
+        op = read_opcode(code, &mut pc);
+    }
+
+    let mut raw = [0u32; 4];
+    for (i, kind) in op.operands().iter().enumerate() {
+        let size = kind.size_in_stream(scale);
+        let bytes = code
+            .get(pc..pc + size)
+            .expect("truncated instruction stream");
+        let mut buf = [0u8; 4];
+        buf[..size].copy_from_slice(bytes);
+        let value = u32::from_le_bytes(buf);
+        raw[i] = if kind.is_signed() {
+            // sign-extend
+            let shift = 32 - size * 8;
+            ((value << shift) as i32 >> shift) as u32
+        } else {
+            value
+        };
+        pc += size;
+    }
+    (op, Operands::new(raw, op.operands()), pc)
+}
+
+// TODO: see if force inlining matters
+fn read_opcode(code: &[u8], pc: &mut usize) -> Opcode {
+    let byte = *code.get(*pc).expect("program counter out of bounds");
+    *pc += 1;
+    Opcode::from_byte(byte).expect("invalid opcode")
 }

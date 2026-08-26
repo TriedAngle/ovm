@@ -3,7 +3,9 @@ use core::ptr::NonNull;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use vm::{AllocError, EdgeVisitable, Heap, LocalHeap, RawCell, RootVisitor, Value, WellKnown, Word};
+use vm::{
+    AllocError, EdgeVisitable, Heap, LocalHeap, RawCell, RootVisitor, Value, WellKnown, Word,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct DummyHeapConfig {
@@ -244,7 +246,7 @@ mod tests {
         AccessorPair, Global, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit,
         SlotFlags, SlotName, Tagged, Value,
     };
-    use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Register, Smi};
+    use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Smi};
 
     fn scope(data: &HandleData) -> HandleScope<'_> {
         unsafe { HandleScope::from_raw(NonNull::from(data)) }
@@ -365,16 +367,14 @@ mod tests {
 
         heap.no_gc(|nogc, heap| {
             // smi receiver: looks up in the (descriptor-less) smi map
-            // Safety: scratch stack registers, only read inside this no-GC scope.
-            let smi = unsafe { Register::from_value(Smi::new(42).encode()) };
+            let smi = Smi::new(42).encode();
             assert!(matches!(
                 smi.lookup(nogc, heap, smi_name(1)),
                 Lookup::NotFound
             ));
             // object receiver: same result as the typed entry point
-            // Safety: scratch stack registers, only read inside this no-GC scope.
-            let obj_slot = unsafe { Register::from_value(obj.encode_strong()) };
-            expect_data(obj_slot.lookup(nogc, heap, smi_name(1)), 7);
+            let obj_value = obj.encode_strong();
+            expect_data(obj_value.lookup(nogc, heap, smi_name(1)), 7);
         });
     }
 

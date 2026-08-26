@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Object, Register, SlotDescriptor,
-    SlotKind, SlotName, Smi, Value, ValueRef,
+    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Object, SlotDescriptor, SlotKind,
+    SlotName, Smi, Value, ValueRef,
 };
 
 pub enum Lookup<'a> {
@@ -23,10 +23,9 @@ pub enum Lookup<'a> {
     NotFound,
 }
 
-// TODO: consider removing this and just use value?
-impl GcSlot {
+impl Value {
     pub fn value_ref<'a>(&self, guard: &'a NoGc<'a>) -> ValueRef<'a> {
-        value_ref(self.inner(), guard)
+        value_ref(*self, guard)
     }
 
     pub fn lookup<'a>(
@@ -35,23 +34,7 @@ impl GcSlot {
         heap: &impl LocalHeap,
         name: SlotName,
     ) -> Lookup<'a> {
-        lookup_value(self.inner(), guard, heap, name)
-    }
-}
-
-// TODO: consider removing this and just use value?
-impl Register {
-    pub fn value_ref<'a>(&self, guard: &'a NoGc<'a>) -> ValueRef<'a> {
-        value_ref(self.inner(), guard)
-    }
-
-    pub fn lookup<'a>(
-        &self,
-        guard: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
-        name: SlotName,
-    ) -> Lookup<'a> {
-        lookup_value(self.inner(), guard, heap, name)
+        lookup_value(*self, guard, heap, name)
     }
 }
 
@@ -123,7 +106,7 @@ impl Map {
 
         for d in self.descriptors() {
             if d.flags().is_parent() {
-                let result = d.value.lookup(guard, heap, name);
+                let result = d.value.inner().lookup(guard, heap, name);
                 if !matches!(result, Lookup::NotFound) {
                     return result;
                 }
@@ -141,7 +124,7 @@ impl Map {
         parent: SlotName,
     ) -> Lookup<'a> {
         match self.find_parent(parent) {
-            Some(d) => d.value.lookup(guard, heap, name),
+            Some(d) => d.value.inner().lookup(guard, heap, name),
             None => Lookup::NotFound,
         }
     }
