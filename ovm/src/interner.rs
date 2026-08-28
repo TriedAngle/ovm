@@ -63,7 +63,7 @@ impl StringInterner {
         match table.entry(s.into()) {
             Entry::Occupied(mut e) => match handle_from_entry(heap, scope, e.get()) {
                 Some(h) => h,
-                // the canonical entry died mid-race: replace it with ours
+                // the entry died mid-race => replace it
                 None => {
                     e.insert(WeakGcCell::new(handle.get()));
                     handle

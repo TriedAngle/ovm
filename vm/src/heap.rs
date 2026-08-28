@@ -5,10 +5,9 @@ use core::{
     ops::FnOnce,
     ptr::NonNull,
 };
-
 use crate::{
     FixedArray, Global, Handle, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapKind, Object,
-    ObjectInit, ObjectSlotsInit, RootHandles, Smi, Tagged, Value, Word,
+    ObjectInit, ObjectSlotsInit, RootHandles, Smi, STRONG_PTR, Tagged, TransitionLock, Value, Word,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +76,8 @@ pub trait Heap: Sized + Send + Sync {
             map.value_slot_count.set(local, host, Smi::new(0));
             map.descriptor_count.set(local, host, Smi::new(0));
             map.kind.set(local, host, Smi::new(kind.bits() as i64));
+            // placeholder: `void` does not exist yet, fixed up below
+            map.transitions.as_raw().store_raw(Smi::new(0).encode());
             global
         }
 
@@ -93,6 +94,8 @@ pub trait Heap: Sized + Send + Sync {
             map.descriptor_count.set(&local, host, Smi::new(0));
             map.kind
                 .set(&local, host, Smi::new(MapKind::MAP.bits() as i64));
+            // placeholder: `void` does not exist yet, fixed up below
+            map.transitions.as_raw().store_raw(Smi::new(0).encode());
             roots.create_handle(tagged)
         };
         let void_map = bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT);
@@ -112,17 +115,48 @@ pub trait Heap: Sized + Send + Sync {
             roots.create_handle(tagged)
         };
 
+        let smi_map = bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT);
+        let float_map = bootstrap_map(&mut local, &roots, map_map, MapKind::FLOAT);
+        let array_map = bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_ARRAY);
+        let byte_array_map =
+            bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_BYTE_ARRAY);
+        let string_map = bootstrap_map(&mut local, &roots, map_map, MapKind::VM_STRING);
+        let symbol_map = bootstrap_map(&mut local, &roots, map_map, MapKind::SYMBOL);
+        let accessor_pair_map =
+            bootstrap_map(&mut local, &roots, map_map, MapKind::ACCESSOR_PAIR);
+        let callable_map = bootstrap_map(&mut local, &roots, map_map, MapKind::CALLABLE_INFO);
+
+        // Fix up the bootstrap maps' transition slots now that `void` exists:
+        // from here on a map's transitions are either empty (`void`) or a
+        // `FixedArray` of `[name, target_map]` pairs.
+        local.no_gc(|nogc, _| {
+            for map in [
+                &map_map,
+                &void_map,
+                &smi_map,
+                &float_map,
+                &array_map,
+                &byte_array_map,
+                &string_map,
+                &symbol_map,
+                &accessor_pair_map,
+                &callable_map,
+            ] {
+                map.heap_ref(nogc).transitions.clear(void.value());
+            }
+        });
+
         let known = WellKnown {
             map_map,
             void,
-            smi_map: bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT),
-            float_map: bootstrap_map(&mut local, &roots, map_map, MapKind::FLOAT),
-            array_map: bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_ARRAY),
-            byte_array_map: bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_BYTE_ARRAY),
-            string_map: bootstrap_map(&mut local, &roots, map_map, MapKind::VM_STRING),
-            symbol_map: bootstrap_map(&mut local, &roots, map_map, MapKind::SYMBOL),
-            accessor_pair_map: bootstrap_map(&mut local, &roots, map_map, MapKind::ACCESSOR_PAIR),
-            callable_map: bootstrap_map(&mut local, &roots, map_map, MapKind::CALLABLE_INFO),
+            smi_map,
+            float_map,
+            array_map,
+            byte_array_map,
+            string_map,
+            symbol_map,
+            accessor_pair_map,
+            callable_map,
             roots,
         };
         self.set_known(known);
@@ -143,6 +177,8 @@ pub trait LocalHeap: Sized + Send {
     fn allocate_raw(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
 
     fn known(&self) -> &WellKnown;
+
+    fn transition_lock(&self) -> TransitionLock;
 
     fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
         let raw = self.allocate_raw(T::layout_for(&config));
@@ -431,7 +467,7 @@ impl RawCell {
         unsafe { *self.raw.get() = v };
     }
 
-    pub fn heap_ref<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
+    pub unsafe fn heap_ref<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
         unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(self.load()).into()) }
     }
 }
@@ -472,7 +508,7 @@ impl<T: HeapObject> WeakGcCell<T> {
         if word.is_cleared() {
             return None;
         }
-        let strong = unsafe { Value::from_bits(word.raw_addr() | crate::value::STRONG_PTR) };
+        let strong = unsafe { Value::from_bits(word.raw_addr() | STRONG_PTR) };
         Some(unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(strong).into()) })
     }
 }
@@ -498,7 +534,6 @@ pub struct GcSlot<T = Value> {
     cell: RawCell,
     _phantom: PhantomData<T>,
 }
-
 impl<T> GcSlot<T> {
     pub unsafe fn from_value(v: Value) -> Self {
         Self {
@@ -542,7 +577,54 @@ impl GcSlot<Smi> {
 impl<T: HeapObject> GcSlot<T> {
     /// Reads the slot as a heap reference valid for the no-GC scope.
     pub fn heap_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        self.cell.heap_ref(nogc)
+        // Safe: `T` is this slot's declared type.
+        unsafe { self.cell.heap_ref(nogc) }
+    }
+}
+
+/// A slot that is either empty (`void`) or holds a strong reference to `T`.
+///
+/// Empty is encoded as the well-known `void` object, so the slot is always a
+/// valid strong value that the GC can trace.
+#[repr(transparent)]
+pub struct OptionGcSlot<T = Value> {
+    slot: GcSlot<T>,
+}
+
+impl<T> OptionGcSlot<T> {
+    pub unsafe fn from_value(v: Value) -> Self {
+        Self {
+            slot: unsafe { GcSlot::from_value(v) },
+        }
+    }
+
+    pub fn inner(&self) -> Value {
+        self.slot.inner()
+    }
+
+    pub fn as_raw(&self) -> &RawCell {
+        self.slot.as_raw()
+    }
+
+    pub fn set(&self, heap: &impl LocalHeap, host: Value, value: impl Into<Tagged<T>>) {
+        self.slot.set(heap, host, value);
+    }
+
+    pub fn clear(&self, void: Value) {
+        self.slot.cell.store_raw(void);
+    }
+}
+
+impl<T: HeapObject> OptionGcSlot<T> {
+    pub fn heap_ref<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        heap: &impl LocalHeap,
+    ) -> Option<HeapRef<'a, T>> {
+        if self.inner() == heap.known().void.value() {
+            return None;
+        }
+        Some(self.slot.heap_ref(nogc))
     }
 }
 
@@ -563,9 +645,8 @@ impl Register {
         self.0.store_raw(v);
     }
 
-    /// Typed read with the element type known from context.
     pub fn heap_ref<'a, T: HeapObject>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        self.0.heap_ref(nogc)
+        unsafe { self.0.heap_ref(nogc) }
     }
 
     pub fn as_raw(&self) -> &RawCell {

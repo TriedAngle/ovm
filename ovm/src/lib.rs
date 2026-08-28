@@ -20,8 +20,9 @@ pub use cache::StackCache;
 
 pub use interner::StringInterner;
 pub use natives::{
-    EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry, VmError,
+    EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry,
 };
+pub use vm::VmError;
 
 // TODO: get rid of the generic heap, instead make only init generic.
 // in runtime we only want a Generic interface with vtable pointers probably

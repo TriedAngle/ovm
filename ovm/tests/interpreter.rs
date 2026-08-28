@@ -3,7 +3,8 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeIndex, Thread, VM, VmError};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Handle, HandleScope, HeapPtr,
-    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi, Value,
+    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi, Tagged,
+    Value,
 };
 
 fn smi(v: i64) -> Value {
@@ -471,4 +472,268 @@ fn keyed_store_writes_named_property_via_string_key() {
         emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+}
+
+/// Build an object (x = 7) in r2 with map (x -> slot 0, attributes `x_flags`)
+/// in constants at 0, interned "x" at 1, "z" at 2 and "w" at 3.
+fn transition_object_program(
+    thread: &mut Thread<DummyHeap>,
+    kind: MapKind,
+    x_flags: SlotFlags,
+    build: impl FnOnce(&mut Vec<u8>),
+) -> Result<Value, VmError> {
+    thread.handle_scope(|thread, scope| {
+        let void = thread.heap().known().void.value();
+        let x = thread.intern(&scope, "x");
+        let z = thread.intern(&scope, "z");
+        let w = thread.intern(&scope, "w");
+        let map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                kind,
+                value_slot_count: 1,
+                descriptors: &[(
+                    SlotName::from(x.as_tagged()),
+                    x_flags,
+                    Smi::new(0).encode(),
+                )],
+            },
+            &scope,
+        );
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[
+                map.as_tagged().erase(),
+                x.as_tagged().erase(),
+                z.as_tagged().erase(),
+                w.as_tagged().erase(),
+            ],
+            &scope,
+        );
+
+        // r0 = 7; r2 = object
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadSmi, &[7]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 1]);
+        emit(&mut program, Opcode::Store, &[2]);
+        build(&mut program);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 5,
+                context: void,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.run(callable, &[])
+    })
+}
+
+const EXTENDABLE: MapKind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+const WRITABLE_VALUE: SlotFlags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+
+#[test]
+fn named_store_new_property_transitions() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r2.z = 42 (transition); acc = r2.x + r2.z
+    let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
+        emit(program, Opcode::LoadSmi, &[42]);
+        emit(program, Opcode::StoreNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+        emit(program, Opcode::Store, &[4]);
+        emit(program, Opcode::Add, &[3, 4]);
+    });
+    // existing slot preserved (7) and new slot written (42)
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 49);
+}
+
+#[test]
+fn named_store_chained_transitions() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r2.z = 42 (transition); r2.w = 1 (chained transition);
+    // acc = r2.x + r2.z + r2.w
+    let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
+        emit(program, Opcode::LoadSmi, &[42]);
+        emit(program, Opcode::StoreNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::LoadSmi, &[1]);
+        emit(program, Opcode::StoreNamedProperty, &[2, 3, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+        emit(program, Opcode::Store, &[4]);
+        emit(program, Opcode::Add, &[3, 4]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 3, 0]);
+        emit(program, Opcode::Store, &[4]);
+        emit(program, Opcode::Add, &[3, 4]);
+    });
+    // x = 7 (preserved), z = 42, w = 1
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 50);
+}
+
+#[test]
+fn keyed_store_new_property_via_string_key_transitions() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r3 = "z"; acc = 42; r2[r3] = acc (transition); acc = r2.z
+    let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
+        emit(program, Opcode::LoadConstant, &[2]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadSmi, &[42]);
+        emit(program, Opcode::StoreKeyedProperty, &[2, 3, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+}
+
+#[test]
+fn named_store_new_property_to_non_extensible_fails() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // plain OBJECT map: not extendable
+    let result = transition_object_program(
+        &mut thread,
+        MapKind::OBJECT,
+        WRITABLE_VALUE,
+        |program| {
+            emit(program, Opcode::LoadSmi, &[42]);
+            emit(program, Opcode::StoreNamedProperty, &[2, 2, 0]);
+        },
+    );
+    assert_eq!(result, Err(VmError::NotExtensible));
+}
+
+#[test]
+fn named_store_to_non_writable_fails() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // x is a non-writable value slot
+    let result =
+        transition_object_program(&mut thread, EXTENDABLE, SlotFlags::VALUE, |program| {
+            emit(program, Opcode::LoadSmi, &[42]);
+            emit(program, Opcode::StoreNamedProperty, &[2, 1, 0]);
+        });
+    assert_eq!(result, Err(VmError::Type));
+}
+
+/// Parent object (p = 1) in constants at 2, child object in r2 with a parent
+/// descriptor pointing at it; interned "p" at 1.
+fn parent_object_program(
+    thread: &mut Thread<DummyHeap>,
+    store_op: Opcode,
+) -> Result<Value, VmError> {
+    thread.handle_scope(|thread, scope| {
+        let void = thread.heap().known().void.value();
+        let p = thread.intern(&scope, "p");
+        let parent_map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                kind: MapKind::OBJECT,
+                value_slot_count: 1,
+                descriptors: &[(
+                    SlotName::from(p.as_tagged()),
+                    WRITABLE_VALUE,
+                    Smi::new(0).encode(),
+                )],
+            },
+            &scope,
+        );
+        let parent = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map: parent_map,
+                    values: &[Smi::new(1).encode()],
+                    elements: void,
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
+        // child: no own slots, parent stored in the map
+        let child_map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                kind: EXTENDABLE,
+                value_slot_count: 0,
+                descriptors: &[(
+                    SlotName::from(Tagged::smi(999).unwrap()),
+                    SlotFlags::CONST.union(SlotFlags::PARENT),
+                    parent.as_tagged().erase(),
+                )],
+            },
+            &scope,
+        );
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[
+                child_map.as_tagged().erase(),
+                p.as_tagged().erase(),
+                parent.as_tagged().erase(),
+            ],
+            &scope,
+        );
+
+        // r2 = child; r2.p = 2 (via `store_op`); acc = r2.p + parent.p
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 0]);
+        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::LoadSmi, &[2]);
+        emit(&mut program, store_op, &[2, 1, 0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+        emit(&mut program, Opcode::Store, &[3]);
+        emit(&mut program, Opcode::LoadConstant, &[2]);
+        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[4, 1, 0]);
+        emit(&mut program, Opcode::Store, &[5]);
+        emit(&mut program, Opcode::Add, &[3, 5]);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 6,
+                context: void,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.run(callable, &[])
+    })
+}
+
+#[test]
+fn self_store_writes_through_to_parent_slot() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = parent_object_program(&mut thread, Opcode::StoreNamedProperty);
+    // child.p = 2 (inherited, parent now 2) + parent.p = 2
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 4);
+}
+
+#[test]
+fn shadow_store_creates_own_slot_and_leaves_parent() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = parent_object_program(&mut thread, Opcode::StoreNamedPropertyShadow);
+    // child.p = 2 (new own slot) + parent.p = 1 (untouched)
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 3);
 }

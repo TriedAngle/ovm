@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Object, SlotDescriptor, SlotKind,
-    SlotName, Smi, Value, ValueRef,
+    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Object, SlotDescriptor,
+    SlotFlags, SlotKind, SlotName, Smi, Value, ValueRef,
 };
 
 pub enum Lookup<'a> {
@@ -9,6 +9,7 @@ pub enum Lookup<'a> {
         map_index: usize,
         holder_index: usize,
         slot: &'a GcSlot,
+        flags: SlotFlags,
     },
     Const {
         holder: ValueRef<'a>,
@@ -88,6 +89,7 @@ impl Map {
                                 .as_ref()
                                 .element_slot(d.offset()),
                             holder: receiver,
+                            flags: d.flags(),
                         }
                     }
                     SlotKind::Const => Lookup::Const {

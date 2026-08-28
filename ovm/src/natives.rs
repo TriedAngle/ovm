@@ -1,17 +1,8 @@
-use vm::{Float, Handle, HandleScope, InternedString, LocalHeap, Smi, Value};
+use vm::{Float, Handle, HandleScope, InternedString, LocalHeap, Smi, Value, VmError};
 
 use crate::{ContextState, Heap, Thread, VM};
 
 pub const EXCEPTION_SENTINEL: Value = Value::CLEARED;
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum VmError {
-    Arity,
-    Type,
-    Overflow,
-    OutOfBounds,
-    StackOverflow,
-}
 
 pub struct NativeContext<'a, H: Heap> {
     vm: &'a VM<H>,
