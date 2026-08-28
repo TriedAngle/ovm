@@ -20,9 +20,13 @@ pub enum Opcode {
 
     LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
     StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
+    // JS semantics: a writable inherited data property is shadowed with a new
+    // own property on the receiver instead of written through to the holder.
+    StoreNamedPropertyShadow, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
 
     LoadKeyedProperty,  // reg (obj) idx (feedback); key in acc -> acc
     StoreKeyedProperty, // acc -> reg (obj) reg (key) idx (feedback)
+    StoreKeyedPropertyShadow, // acc -> reg (obj) reg (key) idx (feedback)
 
     // reglist is the first register (index) we dont have literally the whole list there.
     // for methods the `self` is the first element in the reglist
@@ -121,8 +125,10 @@ impl Opcode {
             b if b == StoreContextSlot as u8 => StoreContextSlot,
             b if b == LoadNamedProperty as u8 => LoadNamedProperty,
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
+            b if b == StoreNamedPropertyShadow as u8 => StoreNamedPropertyShadow,
             b if b == LoadKeyedProperty as u8 => LoadKeyedProperty,
             b if b == StoreKeyedProperty as u8 => StoreKeyedProperty,
+            b if b == StoreKeyedPropertyShadow as u8 => StoreKeyedPropertyShadow,
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
             b if b == CallNative as u8 => CallNative,
@@ -151,9 +157,11 @@ impl Opcode {
 
             Self::LoadNamedProperty => &[Register, Index, Index],
             Self::StoreNamedProperty => &[Register, Index, Index],
+            Self::StoreNamedPropertyShadow => &[Register, Index, Index],
 
             Self::LoadKeyedProperty => &[Register, Index],
             Self::StoreKeyedProperty => &[Register, Register, Index],
+            Self::StoreKeyedPropertyShadow => &[Register, Register, Index],
 
             Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],

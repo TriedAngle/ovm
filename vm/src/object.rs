@@ -4,8 +4,8 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, HeapRef, LocalHeap, NoGc, Smi, Tagged, Value, Visitor, Word,
-    value::{STRONG_PTR, WEAK_PTR},
+    EdgeVisitable, GcSlot, Handle, HeapRef, LocalHeap, NoGc, OptionGcSlot, PointerStrength, Smi,
+    STRONG_PTR, Tagged, TransitionGuard, Value, Visitor, WEAK_PTR, Word,
 };
 
 pub trait HeapObject: 'static {
@@ -54,6 +54,9 @@ pub struct Map {
     pub descriptor_count: GcSlot<Smi>,
     /// Object kind tag (low byte) and capability flags (second byte).
     pub kind: GcSlot<Smi>,
+    /// Empty, or a `FixedArray` of flat `[name, target_map]` transition pairs.
+    // TODO: make transition targets weak (V8 does this so unused shape subtrees die)
+    pub transitions: OptionGcSlot<FixedArray>,
     pub descriptors: [SlotDescriptor; 0],
 }
 
@@ -91,6 +94,47 @@ impl Map {
         debug_assert!(i < self.descriptor_count());
         unsafe { &*self.data_ptr().add(i) }
     }
+
+    pub fn find_transition<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        heap: &impl LocalHeap,
+        name: SlotName,
+        flags: SlotFlags,
+    ) -> Option<HeapRef<'a, Map>> {
+        let lock = heap.transition_lock();
+        let guard = lock.acquire();
+        self.find_transition_locked(nogc, heap, name, flags, &guard)
+    }
+
+    pub fn find_transition_locked<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        heap: &impl LocalHeap,
+        name: SlotName,
+        flags: SlotFlags,
+        _guard: &TransitionGuard<'_>,
+    ) -> Option<HeapRef<'a, Map>> {
+        let array = self.transitions.heap_ref(nogc, heap)?;
+        let pairs = array.as_slice();
+        debug_assert!(pairs.len() % 2 == 0, "transition pairs are flat [name, map]");
+        for pair in pairs.chunks_exact(2) {
+            if pair[0].inner() != name.value() {
+                continue;
+            }
+
+            let target = pair[1]
+                .inner()
+                .get_as::<Map>(nogc, heap.known().map_map)
+                .expect("transition target must be a map");
+
+            let count = target.descriptor_count();
+            if count > 0 && target.descriptor(count - 1).flags() == flags {
+                return Some(target);
+            }
+        }
+        None
+    }
 }
 
 pub struct MapInit<'a> {
@@ -117,6 +161,7 @@ impl HeapObject for Map {
             .set(heap, host, Smi::new(config.descriptors.len() as i64));
         self.kind
             .set(heap, host, Smi::new(config.kind.bits() as i64));
+        self.transitions.clear(heap.known().void.value());
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
             d.name.set(heap, host, name.tagged());
@@ -137,6 +182,7 @@ impl HeapObject for Map {
 impl EdgeVisitable for Map {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.transitions.as_raw());
         for d in self.descriptors() {
             visitor.visit(d.name.as_raw());
             visitor.visit(d.value.as_raw());
@@ -722,6 +768,10 @@ impl SlotName {
         self.0
     }
 
+    pub fn from_value(value: Value) -> Self {
+        Self(value)
+    }
+
     pub fn tagged(self) -> Tagged<SlotName> {
         unsafe { Tagged::from_value_unchecked(self.0) }
     }
@@ -748,6 +798,12 @@ impl From<Tagged<InternedString>> for SlotName {
 impl From<Tagged<Smi>> for SlotName {
     fn from(smi: Tagged<Smi>) -> Self {
         Self(smi.erase())
+    }
+}
+
+impl<R: PointerStrength> From<Handle<'_, SlotName, R>> for SlotName {
+    fn from(name: Handle<'_, SlotName, R>) -> Self {
+        Self::from_value(name.value())
     }
 }
 

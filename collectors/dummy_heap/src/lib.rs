@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use vm::{
-    AllocError, EdgeVisitable, Heap, LocalHeap, RawCell, RootVisitor, Value, WellKnown, Word,
+    AllocError, EdgeVisitable, Heap, LocalHeap, RawCell, RootVisitor, TransitionLock, Value,
+    WellKnown, Word,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -25,6 +26,7 @@ pub struct DummyHeapState {
     layout: Layout,
     offset: AtomicUsize,
     known: OnceLock<WellKnown>,
+    transition_lock: TransitionLock,
 }
 
 unsafe impl Send for DummyHeapState {}
@@ -105,6 +107,7 @@ impl Heap for DummyHeap {
                 layout,
                 offset: AtomicUsize::new(0),
                 known: OnceLock::new(),
+                transition_lock: TransitionLock::new(),
             }),
         })
     }
@@ -171,6 +174,10 @@ impl LocalHeap for DummyLocalHeap {
             .known
             .get()
             .expect("well-known maps not installed")
+    }
+
+    fn transition_lock(&self) -> TransitionLock {
+        self.shared.transition_lock.clone()
     }
 
     fn write_barrier(&self, _host: Value, _slot: &RawCell, _value: Value) {}
@@ -244,7 +251,7 @@ mod tests {
 
     use vm::{
         AccessorPair, Global, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit,
-        SlotFlags, SlotName, Tagged, Value,
+        SlotFlags, SlotName, Tagged, Value, VmError,
     };
     use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Smi};
 
@@ -256,6 +263,7 @@ mod tests {
     /// Requires well-known maps: the map's own map is the map map.
     fn alloc_map(
         heap: &mut DummyLocalHeap,
+        kind: MapKind,
         value_slots: usize,
         descs: &[(i64, SlotFlags, Value)],
     ) -> Global<Map> {
@@ -265,7 +273,7 @@ mod tests {
             .collect();
         let map = heap
             .allocate::<Map>(MapInit {
-                kind: MapKind::OBJECT,
+                kind,
                 value_slot_count: value_slots,
                 descriptors: &descriptors,
             })
@@ -307,12 +315,296 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_maps_have_void_transitions() {
+        let mut heap = local_with_maps(1 << 16);
+        heap.no_gc(|nogc, heap| {
+            let known = heap.known();
+            let void = known.void.value();
+            for map in [
+                known.map_map,
+                known.smi_map,
+                known.float_map,
+                known.array_map,
+                known.byte_array_map,
+                known.string_map,
+                known.symbol_map,
+                known.accessor_pair_map,
+                known.callable_map,
+            ] {
+                assert_eq!(map.heap_ref(nogc).transitions.inner(), void);
+            }
+        });
+    }
+
+    #[test]
+    fn fresh_map_has_no_transitions() {
+        let mut heap = local_with_maps(1 << 16);
+        let map = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
+        heap.no_gc(|nogc, heap| {
+            let map = map.heap_ref(nogc);
+            assert_eq!(map.transitions.inner(), heap.known().void.value());
+            assert!(
+                map.find_transition(nogc, heap, smi_name(1), SlotFlags::VALUE)
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
+    fn find_transition_matches_name_and_derived_flags() {
+        let mut heap = local_with_maps(1 << 16);
+        let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+        // parent {}, child {smi(1) -> slot 0}
+        let parent = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
+        let child = alloc_map(&mut heap, MapKind::OBJECT, 1, &[(1, flags, Smi::new(0).encode())]);
+        // hand-built transition pairs [name, target]
+        let pairs = heap
+            .allocate::<FixedArray>(&[smi_name(1).value(), child.value()])
+            .into_tagged();
+
+        heap.no_gc(|nogc, heap| {
+            let parent_ref = parent.heap_ref(nogc);
+            parent_ref.transitions.set(heap, parent.value(), pairs);
+
+            let found = parent_ref
+                .find_transition(nogc, heap, smi_name(1), flags)
+                .expect("transition by name and flags");
+            assert_eq!(found.into_ptr().as_ptr(), child.get().as_ptr());
+
+            // same name but different attributes is a different transition
+            let other = flags.union(SlotFlags::ENUMERABLE);
+            assert!(
+                parent_ref
+                    .find_transition(nogc, heap, smi_name(1), other)
+                    .is_none()
+            );
+            // unknown name
+            assert!(
+                parent_ref
+                    .find_transition(nogc, heap, smi_name(2), flags)
+                    .is_none()
+            );
+        });
+    }
+
+    /// Root a freshly allocated object pointer in the scope.
+    fn root_object<'s>(scope: &'s HandleScope<'_>, ptr: HeapPtr<Object>) -> vm::Handle<'s, Object> {
+        scope
+            .create_handle(Tagged::from_ptr(ptr))
+            .expect("object pointer is strong")
+    }
+
+    /// Root a slot name in the scope.
+    fn root_name<'s>(scope: &'s HandleScope<'_>, name: SlotName) -> vm::Handle<'s, SlotName> {
+        scope.create_handle(name.tagged()).expect("name is strong")
+    }
+
+    /// Root a value in the scope.
+    fn root_value<'s>(scope: &'s HandleScope<'_>, value: Value) -> vm::Handle<'s, Value> {
+        scope
+            .create_handle(Tagged::from_value(value))
+            .expect("value is strong")
+    }
+
+    #[test]
+    fn transition_target_appends_descriptor_and_records_edge() {
+        let mut heap = local_with_maps(1 << 16);
+        let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let parent = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
+        let name = root_name(&scope, smi_name(1));
+
+        let child = Map::transition_target(&mut heap, parent, name, flags);
+        let child = scope.create_handle(child).expect("child map is strong");
+
+        heap.no_gc(|nogc, heap| {
+            let child_ref = child.heap_ref(nogc);
+            assert_eq!(child_ref.descriptor_count(), 1);
+            assert_eq!(child_ref.value_slot_count(), 1);
+            let d = child_ref.descriptor(0);
+            assert_eq!(d.name(), smi_name(1));
+            assert_eq!(d.flags(), flags);
+            assert_eq!(d.offset(), 0);
+
+            // the parent recorded the edge and finds it again
+            let found = parent
+                .heap_ref(nogc)
+                .find_transition(nogc, heap, smi_name(1), flags)
+                .expect("recorded transition");
+            assert_eq!(found.into_ptr().as_ptr(), child.get().as_ptr());
+        });
+    }
+
+    #[test]
+    fn transition_target_reuses_existing_child() {
+        let mut heap = local_with_maps(1 << 16);
+        let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let parent = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
+        let name = root_name(&scope, smi_name(1));
+
+        let a = Map::transition_target(&mut heap, parent, name, flags);
+        let b = Map::transition_target(&mut heap, parent, name, flags);
+        assert_eq!(a.erase(), b.erase());
+
+        heap.no_gc(|nogc, heap| {
+            let pairs = parent
+                .heap_ref(nogc)
+                .transitions
+                .heap_ref(nogc, heap)
+                .expect("transition array");
+            assert_eq!(pairs.len(), 2, "exactly one edge recorded");
+        });
+    }
+
+    #[test]
+    fn transition_target_grows_pairs_for_siblings_and_chains() {
+        let mut heap = local_with_maps(1 << 16);
+        let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let parent = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
+        let name1 = root_name(&scope, smi_name(1));
+        let name2 = root_name(&scope, smi_name(2));
+
+        // two different properties off the same parent: sibling edges
+        let a = scope
+            .create_handle(Map::transition_target(&mut heap, parent, name1, flags))
+            .expect("strong");
+        let b = scope
+            .create_handle(Map::transition_target(&mut heap, parent, name2, flags))
+            .expect("strong");
+        assert_ne!(a.value(), b.value());
+
+        // and a chain: transition from a child map
+        let c = scope
+            .create_handle(Map::transition_target(&mut heap, a, name2, flags))
+            .expect("strong");
+
+        heap.no_gc(|nogc, heap| {
+            let pairs = parent
+                .heap_ref(nogc)
+                .transitions
+                .heap_ref(nogc, heap)
+                .expect("transition array");
+            assert_eq!(pairs.len(), 4, "two edges recorded on the parent");
+
+            // a: {1 -> slot 0}; c: {1 -> slot 0, 2 -> slot 1}
+            let a = a.heap_ref(nogc);
+            assert_eq!(a.descriptor_count(), 1);
+            let c = c.heap_ref(nogc);
+            assert_eq!(c.descriptor_count(), 2);
+            assert_eq!(c.value_slot_count(), 2);
+            assert_eq!(c.descriptor(0).name(), smi_name(1));
+            assert_eq!(c.descriptor(1).name(), smi_name(2));
+            assert_eq!(c.descriptor(1).offset(), 1);
+        });
+    }
+
+    #[test]
+    fn store_new_data_property_grows_object_and_writes() {
+        let mut heap = local_with_maps(1 << 16);
+        let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, kind, 1, &[(1, flags, Smi::new(0).encode())]);
+        let obj = root_object(&scope, alloc_object(&mut heap, map, &[Smi::new(7).encode()]));
+
+        Object::store_new_data_property(
+            &mut heap,
+            obj,
+            root_name(&scope, smi_name(2)),
+            root_value(&scope, Smi::new(9).encode()),
+        )
+        .unwrap();
+
+        heap.no_gc(|nogc, heap| {
+            let obj = obj.heap_ref(nogc);
+            let map = obj.header.map.heap_ref(nogc);
+            assert_eq!(map.descriptor_count(), 2);
+            // old slot intact, new slot written
+            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 7);
+            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(2)), 9);
+            // appended descriptor carries the CreateDataProperty default attributes
+            let d = map.descriptor(1);
+            assert_eq!(d.name(), smi_name(2));
+            assert_eq!(d.offset(), 1);
+            assert!(d.flags().is_writable());
+            assert!(d.flags().is_enumerable());
+            assert!(d.flags().is_configurable());
+        });
+    }
+
+    #[test]
+    fn store_new_data_property_converges_maps() {
+        let mut heap = local_with_maps(1 << 16);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, kind, 0, &[]);
+        let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
+        let b = root_object(&scope, alloc_object(&mut heap, map, &[]));
+
+        Object::store_new_data_property(
+            &mut heap,
+            a,
+            root_name(&scope, smi_name(1)),
+            root_value(&scope, Smi::new(1).encode()),
+        )
+        .unwrap();
+        Object::store_new_data_property(
+            &mut heap,
+            b,
+            root_name(&scope, smi_name(1)),
+            root_value(&scope, Smi::new(2).encode()),
+        )
+        .unwrap();
+
+        heap.no_gc(|nogc, heap| {
+            let map_a = a.heap_ref(nogc).header.map.inner();
+            let map_b = b.heap_ref(nogc).header.map.inner();
+            assert_eq!(map_a, map_b, "same base shape converges to the same map");
+            expect_data(a.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)), 1);
+            expect_data(b.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)), 2);
+        });
+    }
+
+    #[test]
+    fn store_new_data_property_rejects_non_extensible() {
+        let mut heap = local_with_maps(1 << 16);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        // plain OBJECT: not extendable
+        let map = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
+        let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
+
+        let result = Object::store_new_data_property(
+            &mut heap,
+            obj,
+            root_name(&scope, smi_name(1)),
+            root_value(&scope, Smi::new(1).encode()),
+        );
+        assert_eq!(result, Err(VmError::NotExtensible));
+
+        heap.no_gc(|nogc, _| {
+            let obj = obj.heap_ref(nogc);
+            // object untouched: same map, no slots
+            assert_eq!(obj.header.map.inner(), map.value());
+            assert_eq!(obj.slots.heap_ref(nogc).len(), 0);
+        });
+    }
+
+    #[test]
     fn lookup_resolves_own_const_value_and_parent_chain() {
         let mut heap = local_with_maps(1 << 16);
 
         // parent: smi(3) = const 99
         let parent_map = alloc_map(
             &mut heap,
+            MapKind::OBJECT,
             0,
             &[(3, SlotFlags::CONST, Smi::new(99).encode())],
         );
@@ -321,6 +613,7 @@ mod tests {
         // child: smi(1) = value slot 0, smi(2) = const 42, parent stored in the map
         let child_map = alloc_map(
             &mut heap,
+            MapKind::OBJECT,
             1,
             &[
                 (
@@ -356,6 +649,7 @@ mod tests {
 
         let map = alloc_map(
             &mut heap,
+            MapKind::OBJECT,
             1,
             &[(
                 1,
@@ -385,12 +679,14 @@ mod tests {
         // parent A: smi(3) = const 10; parent B: smi(3) = const 20
         let map_a = alloc_map(
             &mut heap,
+            MapKind::OBJECT,
             0,
             &[(3, SlotFlags::CONST, Smi::new(10).encode())],
         );
         let parent_a = alloc_object(&mut heap, map_a, &[]);
         let map_b = alloc_map(
             &mut heap,
+            MapKind::OBJECT,
             0,
             &[(3, SlotFlags::CONST, Smi::new(20).encode())],
         );
@@ -399,6 +695,7 @@ mod tests {
         // child: two named parents, both stored in the map
         let child_map = alloc_map(
             &mut heap,
+            MapKind::OBJECT,
             0,
             &[
                 (
@@ -435,6 +732,7 @@ mod tests {
 
         let map = alloc_map(
             &mut heap,
+            MapKind::OBJECT,
             0,
             &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
         );
@@ -447,6 +745,49 @@ mod tests {
                 assert_eq!(Smi::decode(pair.set.get().erase()).unwrap().value(), 222);
             }
             _ => panic!("expected accessor lookup result"),
+        });
+    }
+
+    #[test]
+    fn concurrent_transition_target_converges() {
+        let heap = DummyHeap::new(DummyHeapConfig { heap_size: 1 << 20 }).unwrap();
+        heap.install_well_known_maps();
+        let mut local = heap.new_local();
+        let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+        let parent = alloc_map(&mut local, MapKind::OBJECT, 0, &[]);
+        let parent_ptr = parent.get();
+
+        // N threads race to add the same property transition to one map;
+        // all must converge to the same child map
+        let heap = &heap;
+        std::thread::scope(|s| {
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                threads.push(s.spawn(move || {
+                    let mut local = heap.new_local();
+                    let data = HandleData::new(local.known().void.value());
+                    let scope = scope(&data);
+                    let parent = scope
+                        .create_handle(Tagged::from_ptr(parent_ptr))
+                        .expect("parent is strong");
+                    let name = root_name(&scope, smi_name(1));
+                    Map::transition_target(&mut local, parent, name, flags).erase()
+                }));
+            }
+            let results: Vec<Value> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+            assert!(
+                results.windows(2).all(|w| w[0] == w[1]),
+                "all threads must converge to the same child map"
+            );
+        });
+
+        local.no_gc(|nogc, heap| {
+            let pairs = parent
+                .heap_ref(nogc)
+                .transitions
+                .heap_ref(nogc, heap)
+                .expect("transition array");
+            assert_eq!(pairs.len(), 2, "exactly one edge recorded");
         });
     }
 

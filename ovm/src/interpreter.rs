@@ -1,8 +1,8 @@
 use bytecode::{Opcode, decode};
 
 use vm::{
-    FixedArray, Handle, HeapObject, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
-    ObjectSlotsInit, SlotName, Smi, Symbol, Tagged, Value, ValueRef,
+    FixedArray, Handle, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
+    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, Value, ValueRef,
 };
 
 use crate::{ContextState, Heap, NativeContext, NativeIndex, VM, VmError};
@@ -77,6 +77,27 @@ fn classify_key<'a, L: LocalHeap>(nogc: &'a NoGc<'a>, heap: &'a L, key: Value) -
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
     Err(VmError::Type)
+}
+
+fn store_transition<L: LocalHeap>(
+    heap: &mut L,
+    state: &ContextState,
+    receiver: Value,
+    name: SlotName,
+    value: Value,
+) -> Result<(), VmError> {
+    state.handle_scope(|scope| {
+        let receiver = scope
+            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
+            .expect("receiver must be strong");
+        let name = scope
+            .create_handle(name.tagged())
+            .expect("name must be strong");
+        let value = scope
+            .create_handle(Tagged::from_value(value))
+            .expect("value must be strong");
+        Object::store_new_data_property(heap, receiver, name, value)
+    })
 }
 
 fn element_array<'a, L: LocalHeap>(
@@ -179,20 +200,23 @@ fn dispatch<H: Heap>(
                 });
                 acc = v;
             }
-            Opcode::StoreNamedProperty => {
-                heap.no_gc(|nogc, heap| {
+            Opcode::StoreNamedProperty | Opcode::StoreNamedPropertyShadow => {
+                let semantics = match op {
+                    Opcode::StoreNamedPropertyShadow => StoreSemantics::Shadow,
+                    _ => StoreSemantics::WriteThrough,
+                };
+                let outcome = heap.no_gc(|nogc, heap| {
                     let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
-                    match stack.reg(&meta, ops.reg(0)).lookup(nogc, heap, name) {
-                        Lookup::Data { slot, holder, .. } => {
-                            let ValueRef::Object(host) = holder else {
-                                return Err(VmError::Type);
-                            };
-                            slot.set(heap, host.as_ref().erase(), Tagged::from_value(acc));
-                            Ok(())
-                        }
-                        _ => unimplemented!("TODO: shape transitions (at least naive way)"),
-                    }
+                    stack
+                        .reg(&meta, ops.reg(0))
+                        .store_lookup(nogc, heap, name, acc, semantics)
                 })?;
+                if let StoreOutcome::Transition { receiver, name } = outcome {
+                    cache.spill_acc(acc);
+                    let result = store_transition(heap, state, receiver, name, acc);
+                    let _ = cache.take_acc();
+                    result?;
+                }
             }
             Opcode::LoadKeyedProperty => {
                 let v = heap.no_gc(|nogc, heap| {
@@ -212,28 +236,31 @@ fn dispatch<H: Heap>(
                 })?;
                 acc = v;
             }
-            Opcode::StoreKeyedProperty => {
-                heap.no_gc(|nogc, heap| {
+            Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyShadow => {
+                let semantics = match op {
+                    Opcode::StoreKeyedPropertyShadow => StoreSemantics::Shadow,
+                    _ => StoreSemantics::WriteThrough,
+                };
+                let outcome = heap.no_gc(|nogc, heap| {
                     let receiver = stack.reg(&meta, ops.reg(0));
                     let key = stack.reg(&meta, ops.reg(1));
                     match classify_key(nogc, heap, key)? {
                         Key::Element(i) => {
                             let arr = element_array(nogc, heap, receiver, i)?;
                             arr.set(heap, i, acc);
-                            Ok(())
+                            Ok(StoreOutcome::Done)
                         }
-                        Key::Name(name) => match receiver.lookup(nogc, heap, name) {
-                            Lookup::Data { slot, holder, .. } => {
-                                let ValueRef::Object(host) = holder else {
-                                    return Err(VmError::Type);
-                                };
-                                slot.set(heap, host.as_ref().erase(), Tagged::from_value(acc));
-                                Ok(())
-                            }
-                            _ => unimplemented!("TODO: shape transitions (at least naive way)"),
-                        },
+                        Key::Name(name) => {
+                            receiver.store_lookup(nogc, heap, name, acc, semantics)
+                        }
                     }
                 })?;
+                if let StoreOutcome::Transition { receiver, name } = outcome {
+                    cache.spill_acc(acc);
+                    let result = store_transition(heap, state, receiver, name, acc);
+                    let _ = cache.take_acc();
+                    result?;
+                }
             }
             Opcode::CreateObjectFromMap => {
                 let map = heap.no_gc(|nogc, heap| {
