@@ -2,9 +2,9 @@ use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeIndex, Thread, VM, VmError};
 use vm::{
-    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Handle, HandleScope, HeapPtr,
-    LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi, Tagged,
-    Value,
+    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandleScope,
+    HeapPtr, LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi,
+    Tagged, Value,
 };
 
 fn smi(v: i64) -> Value {
@@ -407,7 +407,8 @@ fn object_program(
                     (
                         SlotName::from(y.as_tagged()),
                         SlotFlags::VALUE.union(SlotFlags::WRITABLE),
-                        Smi::new(1).encode()),
+                        Smi::new(1).encode(),
+                    ),
                 ],
             },
             &scope,
@@ -491,11 +492,7 @@ fn transition_object_program(
             MapInit {
                 kind,
                 value_slot_count: 1,
-                descriptors: &[(
-                    SlotName::from(x.as_tagged()),
-                    x_flags,
-                    Smi::new(0).encode(),
-                )],
+                descriptors: &[(SlotName::from(x.as_tagged()), x_flags, Smi::new(0).encode())],
             },
             &scope,
         );
@@ -605,15 +602,11 @@ fn named_store_new_property_to_non_extensible_fails() {
     let mut thread = vm.attach();
 
     // plain OBJECT map: not extendable
-    let result = transition_object_program(
-        &mut thread,
-        MapKind::OBJECT,
-        WRITABLE_VALUE,
-        |program| {
+    let result =
+        transition_object_program(&mut thread, MapKind::OBJECT, WRITABLE_VALUE, |program| {
             emit(program, Opcode::LoadSmi, &[42]);
             emit(program, Opcode::StoreNamedProperty, &[2, 2, 0]);
-        },
-    );
+        });
     assert_eq!(result, Err(VmError::NotExtensible));
 }
 
@@ -623,11 +616,10 @@ fn named_store_to_non_writable_fails() {
     let mut thread = vm.attach();
 
     // x is a non-writable value slot
-    let result =
-        transition_object_program(&mut thread, EXTENDABLE, SlotFlags::VALUE, |program| {
-            emit(program, Opcode::LoadSmi, &[42]);
-            emit(program, Opcode::StoreNamedProperty, &[2, 1, 0]);
-        });
+    let result = transition_object_program(&mut thread, EXTENDABLE, SlotFlags::VALUE, |program| {
+        emit(program, Opcode::LoadSmi, &[42]);
+        emit(program, Opcode::StoreNamedProperty, &[2, 1, 0]);
+    });
     assert_eq!(result, Err(VmError::Type));
 }
 
@@ -736,4 +728,184 @@ fn shadow_store_creates_own_slot_and_leaves_parent() {
     let result = parent_object_program(&mut thread, Opcode::StoreNamedPropertyShadow);
     // child.p = 2 (new own slot) + parent.p = 1 (untouched)
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 3);
+}
+
+#[test]
+fn fallthrough_return_is_undefined() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 0, &[]).unwrap();
+    assert_eq!(result, thread.heap().known().undefined.value());
+}
+
+#[test]
+fn jump_skips_instructions() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // LoadSmi 1 (0..2); Jump ->6 (2..4); LoadSmi 2 (4..6); Return (6..7)
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::Jump, &[4]); // offset is relative to the jump's own pc
+    emit(&mut program, Opcode::LoadSmi, &[2]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 0, &[]).unwrap();
+    assert_eq!(Smi::decode(result).unwrap().value(), 1);
+}
+
+#[test]
+fn jump_loop_counts_down_to_zero() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r0 = 3; r1 = -1;
+    // loop: if falsy(r0) goto end; r0 = r0 + r1; goto loop;
+    // end: return r0
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[3]); // 0..2
+    emit(&mut program, Opcode::Store, &[0]); // 2..4
+    emit(&mut program, Opcode::LoadSmi, &[(-1i32) as u32]); // 4..6
+    emit(&mut program, Opcode::Store, &[1]); // 6..8
+    // loop @ 8
+    emit(&mut program, Opcode::Load, &[0]); // 8..10
+    emit(&mut program, Opcode::JumpIfFalsy, &[9]); // 10..12 -> 19
+    emit(&mut program, Opcode::Add, &[0, 1]); // 12..15
+    emit(&mut program, Opcode::Store, &[0]); // 15..17
+    emit(&mut program, Opcode::JumpLoop, &[(-9i32) as u32]); // 17..19 -> 8
+    // end @ 19
+    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 2, &[]).unwrap();
+    assert_eq!(Smi::decode(result).unwrap().value(), 0);
+}
+
+#[test]
+fn jump_if_truthy_follows_toboolean() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // acc = param0; JumpIfTruthy L; LoadSmi 0; Return; L: LoadSmi 1; Return
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::Load, &[(-1i32) as u32]); // 0..2
+    emit(&mut program, Opcode::JumpIfTruthy, &[5]); // 2..4 -> 7
+    emit(&mut program, Opcode::LoadSmi, &[0]); // 4..6
+    emit(&mut program, Opcode::Return, &[]); // 6..7
+    emit(&mut program, Opcode::LoadSmi, &[1]); // 7..9
+    emit(&mut program, Opcode::Return, &[]); // 9..10
+
+    thread.handle_scope(|thread, scope| {
+        let (undefined, null, true_v, false_v, hole, empty) = {
+            let k = thread.heap().known();
+            (
+                k.undefined.value(),
+                k.null.value(),
+                k.true_object.value(),
+                k.false_object.value(),
+                k.void.value(),
+                k.empty_string.value(),
+            )
+        };
+        let hello = thread.intern(&scope, "hello").value();
+        let zero = thread.heap().allocate_handle::<Float>(0.0, &scope).value();
+        let neg_zero = thread.heap().allocate_handle::<Float>(-0.0, &scope).value();
+        let nan = thread
+            .heap()
+            .allocate_handle::<Float>(f64::NAN, &scope)
+            .value();
+        let one_half = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
+        let object = {
+            let void = thread.heap().known().void.value();
+            let map = thread.heap().allocate_handle::<Map>(
+                MapInit {
+                    kind: MapKind::OBJECT,
+                    value_slot_count: 0,
+                    descriptors: &[],
+                },
+                &scope,
+            );
+            thread
+                .heap()
+                .allocate_object(
+                    &scope,
+                    ObjectSlotsInit {
+                        map,
+                        values: &[],
+                        elements: void,
+                        length: 0,
+                    },
+                )
+                .into_handle(&scope)
+                .value()
+        };
+
+        let falsey = [
+            smi(0),
+            undefined,
+            null,
+            false_v,
+            hole,
+            empty,
+            zero,
+            neg_zero,
+            nan,
+        ];
+        let truthy = [smi(1), smi(-1), true_v, hello, one_half, object];
+
+        for v in falsey {
+            let result = run_program(thread, program.clone(), 0, &[v]).unwrap();
+            assert_eq!(
+                Smi::decode(result).unwrap().value(),
+                0,
+                "{v:?} must be falsey"
+            );
+        }
+        for v in truthy {
+            let result = run_program(thread, program.clone(), 0, &[v]).unwrap();
+            assert_eq!(
+                Smi::decode(result).unwrap().value(),
+                1,
+                "{v:?} must be truthy"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_reference_equal_compares_identity() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // acc = param0; TestReferenceEqual param1; Return
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
+    emit(&mut program, Opcode::TestReferenceEqual, &[(-2i32) as u32]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let (true_v, false_v, undefined, null) = {
+        let k = thread.heap().known();
+        (
+            k.true_object.value(),
+            k.false_object.value(),
+            k.undefined.value(),
+            k.null.value(),
+        )
+    };
+
+    for (a, b, expected) in [
+        (undefined, undefined, true_v),
+        (undefined, null, false_v),
+        (smi(1), smi(1), true_v),
+        (smi(1), smi(2), false_v),
+        (true_v, true_v, true_v),
+        (true_v, false_v, false_v),
+    ] {
+        let result = run_program(&mut thread, program.clone(), 0, &[a, b]).unwrap();
+        assert_eq!(result, expected);
+    }
 }

@@ -24,8 +24,8 @@ pub enum Opcode {
     // own property on the receiver instead of written through to the holder.
     StoreNamedPropertyShadow, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
 
-    LoadKeyedProperty,  // reg (obj) idx (feedback); key in acc -> acc
-    StoreKeyedProperty, // acc -> reg (obj) reg (key) idx (feedback)
+    LoadKeyedProperty,        // reg (obj) idx (feedback); key in acc -> acc
+    StoreKeyedProperty,       // acc -> reg (obj) reg (key) idx (feedback)
     StoreKeyedPropertyShadow, // acc -> reg (obj) reg (key) idx (feedback)
 
     // reglist is the first register (index) we dont have literally the whole list there.
@@ -39,6 +39,14 @@ pub enum Opcode {
 
     // here to see if it makes a different over CallNative with Add
     Add, // reg1 reg2 -> acc
+
+    Jump,     // imm (offset)
+    JumpLoop, // imm (negative offset); safepoint-polls before jumping
+
+    JumpIfTruthy, // imm; jump if ToBoolean(acc) == true
+    JumpIfFalsy,  // imm; jump if ToBoolean(acc) == false
+
+    TestReferenceEqual, // reg; acc = true singleton iff bits(reg) == bits(acc), else false
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -135,6 +143,11 @@ impl Opcode {
             b if b == CreateObjectFromMap as u8 => CreateObjectFromMap,
             b if b == CreateArrayLiteral as u8 => CreateArrayLiteral,
             b if b == Add as u8 => Add,
+            b if b == Jump as u8 => Jump,
+            b if b == JumpLoop as u8 => JumpLoop,
+            b if b == JumpIfTruthy as u8 => JumpIfTruthy,
+            b if b == JumpIfFalsy as u8 => JumpIfFalsy,
+            b if b == TestReferenceEqual as u8 => TestReferenceEqual,
             _ => return None,
         })
     }
@@ -171,6 +184,9 @@ impl Opcode {
             Self::CreateArrayLiteral => &[RegisterListStart, RegisterCount],
 
             Self::Add => &[Register, Register],
+
+            Self::Jump | Self::JumpLoop | Self::JumpIfTruthy | Self::JumpIfFalsy => &[Immediate],
+            Self::TestReferenceEqual => &[Register],
         }
     }
 

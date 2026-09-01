@@ -125,6 +125,13 @@ impl Heap for DummyHeap {
         );
     }
 
+    fn known(&self) -> &WellKnown {
+        self.inner
+            .known
+            .get()
+            .expect("well-known maps not installed")
+    }
+
     fn iterate_roots(&self, roots: &mut impl RootVisitor) {
         // The well-known objects' root table lives in the heap state.
         if let Some(known) = self.inner.known.get() {
@@ -356,7 +363,12 @@ mod tests {
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         // parent {}, child {smi(1) -> slot 0}
         let parent = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
-        let child = alloc_map(&mut heap, MapKind::OBJECT, 1, &[(1, flags, Smi::new(0).encode())]);
+        let child = alloc_map(
+            &mut heap,
+            MapKind::OBJECT,
+            1,
+            &[(1, flags, Smi::new(0).encode())],
+        );
         // hand-built transition pairs [name, target]
         let pairs = heap
             .allocate::<FixedArray>(&[smi_name(1).value(), child.value()])
@@ -511,7 +523,10 @@ mod tests {
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, kind, 1, &[(1, flags, Smi::new(0).encode())]);
-        let obj = root_object(&scope, alloc_object(&mut heap, map, &[Smi::new(7).encode()]));
+        let obj = root_object(
+            &scope,
+            alloc_object(&mut heap, map, &[Smi::new(7).encode()]),
+        );
 
         Object::store_new_data_property(
             &mut heap,

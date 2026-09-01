@@ -4,8 +4,8 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, HeapRef, LocalHeap, NoGc, OptionGcSlot, PointerStrength, Smi,
-    STRONG_PTR, Tagged, TransitionGuard, Value, Visitor, WEAK_PTR, Word,
+    EdgeVisitable, GcSlot, Handle, HeapRef, LocalHeap, NoGc, OptionGcSlot, PointerStrength,
+    STRONG_PTR, Smi, Tagged, TransitionGuard, Value, Visitor, WEAK_PTR, Word,
 };
 
 pub trait HeapObject: 'static {
@@ -117,7 +117,10 @@ impl Map {
     ) -> Option<HeapRef<'a, Map>> {
         let array = self.transitions.heap_ref(nogc, heap)?;
         let pairs = array.as_slice();
-        debug_assert!(pairs.len() % 2 == 0, "transition pairs are flat [name, map]");
+        debug_assert!(
+            pairs.len() % 2 == 0,
+            "transition pairs are flat [name, map]"
+        );
         for pair in pairs.chunks_exact(2) {
             if pair[0].inner() != name.value() {
                 continue;
@@ -614,6 +617,17 @@ pub struct VMString {
     pub hash: GcSlot<Smi>,
 }
 
+/// Content hash for strings (FNV-1a, masked into smi range).
+/// TODO: decide on a hash algorithm
+pub fn string_content_hash(bytes: &[u8]) -> i64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h & ((1 << 62) - 1)) as i64
+}
+
 impl VMString {
     pub fn backing<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
         self.backing.heap_ref(nogc)
@@ -669,7 +683,7 @@ impl EdgeVisitable for VMString {
 }
 
 #[repr(C)]
-pub struct InternedString(VMString);
+pub struct InternedString(pub VMString);
 
 impl InternedString {
     pub fn string(&self) -> &VMString {

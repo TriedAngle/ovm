@@ -13,12 +13,13 @@ pub use heap::{
     OptionGcSlot, RawCell, Register, RootVisitor, Visitor, WeakGcCell, WellKnown, WordType,
 };
 pub use lookup::Lookup;
-pub use transition::{StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock};
 pub use object::{
     AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Header,
     HeapObject, InternedString, Map, MapInit, MapKind, Object, ObjectInit, ObjectKind,
     ObjectSlotsInit, SlotDescriptor, SlotFlags, SlotKind, SlotName, Symbol, VMString,
+    string_content_hash,
 };
+pub use transition::{StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock};
 pub use value::{
     HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,
     Word,

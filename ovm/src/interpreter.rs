@@ -1,8 +1,9 @@
 use bytecode::{Opcode, decode};
 
 use vm::{
-    FixedArray, Handle, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
-    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, Value, ValueRef,
+    FixedArray, Float, Handle, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
+    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, VMString, Value,
+    ValueRef,
 };
 
 use crate::{ContextState, Heap, NativeContext, NativeIndex, VM, VmError};
@@ -64,7 +65,11 @@ enum Key {
     Name(SlotName),
 }
 
-fn classify_key<'a, L: LocalHeap>(nogc: &'a NoGc<'a>, heap: &'a L, key: Value) -> Result<Key, VmError> {
+fn classify_key<'a, L: LocalHeap>(
+    nogc: &'a NoGc<'a>,
+    heap: &'a L,
+    key: Value,
+) -> Result<Key, VmError> {
     if let Some(smi) = Smi::decode(key) {
         return usize::try_from(smi.value())
             .map(Key::Element)
@@ -115,6 +120,37 @@ fn element_array<'a, L: LocalHeap>(
     Ok(arr)
 }
 
+/// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN, everything else is truthy
+fn is_truthy<'a, L: LocalHeap>(nogc: &'a NoGc<'a>, heap: &L, v: Value) -> bool {
+    if let Some(smi) = Smi::decode(v) {
+        return smi.value() != 0;
+    }
+    let known = heap.known();
+    if v == known.false_object.value()
+        || v == known.undefined.value()
+        || v == known.null.value()
+        || v == known.void.value()
+    {
+        return false;
+    }
+    if v == known.true_object.value() {
+        return true;
+    }
+    if let Some(f) = v.get_as::<Float>(nogc, known.float_map) {
+        let x = f.value.get();
+        // -0.0 compares equal to 0.0; NaN compares unequal to everything
+        return x != 0.0 && !x.is_nan();
+    }
+    if let Some(s) = v.get_as::<VMString>(nogc, known.string_map) {
+        return s.len(nogc) != 0;
+    }
+    true
+}
+
+fn jump_target(pc: usize, offset: i32) -> usize {
+    pc.wrapping_add_signed(offset as isize)
+}
+
 // TODO: pass stack and cache directly, could be benificial for threading dispatch later
 fn dispatch<H: Heap>(
     vm: &VM<H>,
@@ -123,10 +159,11 @@ fn dispatch<H: Heap>(
 ) -> Result<Value, VmError> {
     let stack = &state.stack;
     let cache = &state.cache;
-    let mut acc = heap.known().void.value();
+
+    let mut acc = heap.known().undefined.value();
     loop {
-        let (op, ops, next_pc) =
-            heap.no_gc(|nogc, _| decode(cache.code_ref(nogc).as_slice(), cache.pc()));
+        let pc = cache.pc();
+        let (op, ops, next_pc) = heap.no_gc(|nogc, _| decode(cache.code_ref(nogc).as_slice(), pc));
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
@@ -162,6 +199,34 @@ fn dispatch<H: Heap>(
                     return Err(VmError::Overflow);
                 }
                 acc = Smi::new(r).encode();
+            }
+            Opcode::Jump => {
+                cache.set_pc(jump_target(pc, ops.imm(0)));
+            }
+            Opcode::JumpLoop => {
+                cache.spill_acc(acc);
+                heap.safepoint_poll();
+                acc = cache.take_acc();
+                cache.set_pc(jump_target(pc, ops.imm(0)));
+            }
+            Opcode::JumpIfTruthy => {
+                if heap.no_gc(|nogc, heap| is_truthy(nogc, heap, acc)) {
+                    cache.set_pc(jump_target(pc, ops.imm(0)));
+                }
+            }
+            Opcode::JumpIfFalsy => {
+                if !heap.no_gc(|nogc, heap| is_truthy(nogc, heap, acc)) {
+                    cache.set_pc(jump_target(pc, ops.imm(0)));
+                }
+            }
+            Opcode::TestReferenceEqual => {
+                let other = stack.reg(&meta, ops.reg(0));
+                let known = heap.known();
+                acc = if other == acc {
+                    known.true_object.value()
+                } else {
+                    known.false_object.value()
+                };
             }
             Opcode::CallNative => {
                 let f = vm.native(NativeIndex(ops.idx(0)));
@@ -250,9 +315,7 @@ fn dispatch<H: Heap>(
                             arr.set(heap, i, acc);
                             Ok(StoreOutcome::Done)
                         }
-                        Key::Name(name) => {
-                            receiver.store_lookup(nogc, heap, name, acc, semantics)
-                        }
+                        Key::Name(name) => receiver.store_lookup(nogc, heap, name, acc, semantics),
                     }
                 })?;
                 if let StoreOutcome::Transition { receiver, name } = outcome {
