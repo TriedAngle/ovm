@@ -115,7 +115,10 @@ fn transition_target(
 
     let (descriptor_count, value_slot_count, kind, pairs_len) = heap.no_gc(|nogc, heap| {
         let parent = parent(nogc);
-        let pairs_len = parent.transitions.heap_ref(nogc, heap).map_or(0, |a| a.len());
+        let pairs_len = parent
+            .transitions
+            .heap_ref(nogc, heap)
+            .map_or(0, |a| a.len());
         (
             parent.descriptor_count(),
             parent.value_slot_count(),
@@ -205,12 +208,7 @@ impl Object {
                 .header
                 .map
                 .heap_ref(nogc)
-                .find_transition(
-                    nogc,
-                    heap,
-                    name.into(),
-                    DATA_PROPERTY_FLAGS,
-                )
+                .find_transition(nogc, heap, name.into(), DATA_PROPERTY_FLAGS)
                 .expect("transition recorded above");
             let mut values: Vec<Value> = Vec::with_capacity(slot_count);
 
@@ -227,7 +225,10 @@ impl Object {
             let slots = token.allocate::<FixedArray>(&values);
             let host = receiver.value();
             receiver_ref.slots.set(heap, host, slots.into_tagged());
-            receiver_ref.header.map.set(heap, host, target.into_tagged());
+            receiver_ref
+                .header
+                .map
+                .set(heap, host, target.into_tagged());
         });
         Ok(())
     }

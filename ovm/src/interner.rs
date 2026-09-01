@@ -3,20 +3,9 @@ use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
 use vm::{
-    EdgeVisitable, FixedByteArray, Handle, HandleScope, InternedString, LocalHeap, Visitor,
-    WeakGcCell,
+    EdgeVisitable, FixedByteArray, Global, Handle, HandleScope, InternedString, LocalHeap, Visitor,
+    WeakGcCell, string_content_hash,
 };
-
-/// Content hash for interned strings (FNV-1a, masked into smi range).
-/// TODO: decide on a hash algorithm
-fn hash_bytes(bytes: &[u8]) -> i64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    (h & ((1 << 62) - 1)) as i64
-}
 
 // TODO: weak GC cell is fake kinda, make this better
 pub struct StringInterner {
@@ -28,6 +17,13 @@ impl StringInterner {
         Self {
             table: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn insert(&self, s: &str, value: Global<InternedString>) {
+        self.table
+            .lock()
+            .unwrap()
+            .insert(s.into(), WeakGcCell::new(value.get()));
     }
 
     pub fn intern<'s, L: LocalHeap>(
@@ -54,7 +50,7 @@ impl StringInterner {
         let backing = heap
             .allocate::<FixedByteArray>(s.as_bytes())
             .into_handle(scope);
-        let hash = hash_bytes(s.as_bytes());
+        let hash = string_content_hash(s.as_bytes());
         let handle = heap
             .allocate::<InternedString>((backing, hash))
             .into_handle(scope);

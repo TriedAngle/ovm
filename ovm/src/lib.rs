@@ -19,9 +19,7 @@ pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use cache::StackCache;
 
 pub use interner::StringInterner;
-pub use natives::{
-    EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry,
-};
+pub use natives::{EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use vm::VmError;
 
 // TODO: get rid of the generic heap, instead make only init generic.
@@ -155,11 +153,14 @@ impl<H: Heap> VM<H> {
     pub fn new(config: H::Config) -> Result<Self, AllocError> {
         let heap = H::new(config)?;
         heap.install_well_known_maps();
+        let interner = StringInterner::new();
+        // canonical empty string
+        interner.insert("", heap.known().empty_string);
         Ok(Self {
             shared: Arc::new(SharedVM {
                 heap,
                 threads: Mutex::new(Vec::new()),
-                interner: StringInterner::new(),
+                interner,
                 natives: NativeRegistry::new(),
             }),
         })
