@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use core::alloc::Layout;
+
 use crate::{
-    FixedArray, Handle, HeapObject, HeapRef, LocalHeap, Lookup, Map, MapInit, NoGc, Object,
-    SlotFlags, SlotName, Smi, Tagged, Value, ValueRef, VmError,
+    AccessorPair, FixedArray, Handle, HeapObject, HeapRef, LocalHeap, Lookup, Map, MapInit, NoGc,
+    Object, SlotFlags, SlotName, Smi, Tagged, Value, ValueRef, VmError,
 };
 
 #[derive(Clone)]
@@ -31,6 +33,11 @@ const DATA_PROPERTY_FLAGS: SlotFlags = SlotFlags::VALUE
     .union(SlotFlags::ENUMERABLE)
     .union(SlotFlags::CONFIGURABLE);
 
+/// Default attributes for define-created accessor properties
+const ACCESSOR_PROPERTY_FLAGS: SlotFlags = SlotFlags::ACCESSOR
+    .union(SlotFlags::ENUMERABLE)
+    .union(SlotFlags::CONFIGURABLE);
+
 /// Store semantics:
 /// - Self-style writes through to an inherited writable slot
 /// - JS-style shadows it with a new own property on the receiver.
@@ -44,6 +51,7 @@ pub enum StoreSemantics {
 pub enum StoreOutcome {
     Done,
     Transition { receiver: Value, name: SlotName },
+    CallSetter { setter: Value },
 }
 
 impl Value {
@@ -90,7 +98,14 @@ impl Value {
             }
             // const is never writable
             Lookup::Const { .. } => Err(VmError::Type),
-            Lookup::Accessor { .. } => unimplemented!("TODO: implement accessors"),
+            Lookup::Accessor { pair, .. } => {
+                let setter = pair.set.inner();
+                // no setter: sloppy-mode writes to a setter-less accessor are silently ignored
+                if setter == heap.known().void.value() {
+                    return Ok(StoreOutcome::Done);
+                }
+                Ok(StoreOutcome::CallSetter { setter })
+            }
         }
     }
 }
@@ -229,6 +244,61 @@ impl Object {
                 .header
                 .map
                 .set(heap, host, target.into_tagged());
+        });
+        Ok(())
+    }
+
+    /// Define a new own accessor property backed by a fresh `AccessorPair`
+    ///
+    /// Unlike data properties this never goes through the transition cache:
+    /// the descriptor value is the pair identity, which is not shareable
+    /// between objects, so a fresh child map is created every time.
+    pub fn store_new_accessor_property(
+        heap: &mut impl LocalHeap,
+        receiver: Handle<Object>,
+        name: Handle<SlotName>,
+        get: Handle<Value>,
+        set: Handle<Value>,
+    ) -> Result<(), VmError> {
+        let (extendable, kind, descriptor_count, value_slot_count) = heap.no_gc(|nogc, _| {
+            let map = receiver.heap_ref(nogc).header.map.heap_ref(nogc);
+            (
+                map.kind().is_extendable(),
+                map.kind(),
+                map.descriptor_count(),
+                map.value_slot_count(),
+            )
+        });
+        if !extendable {
+            return Err(VmError::NotExtensible);
+        }
+
+        let layout = Layout::new::<AccessorPair>()
+            .extend(Map::layout_for(descriptor_count + 1))
+            .expect("accessor layout")
+            .0;
+
+        heap.allocate_token_enter_nogc(layout, |token, nogc, heap| {
+            let pair = token.allocate::<AccessorPair>((get.value(), set.value()));
+
+            let receiver_ref = receiver.heap_ref(nogc);
+            let mut descriptors: Vec<(SlotName, SlotFlags, Value)> = receiver_ref
+                .header
+                .map
+                .heap_ref(nogc)
+                .descriptors()
+                .iter()
+                .map(|d| (d.name(), d.flags(), d.value.inner()))
+                .collect();
+            descriptors.push((name.into(), ACCESSOR_PROPERTY_FLAGS, pair.erase()));
+
+            let map = token.allocate::<Map>(MapInit {
+                kind,
+                value_slot_count,
+                descriptors: &descriptors,
+            });
+            let host = receiver.value();
+            receiver_ref.header.map.set(heap, host, map.into_tagged());
         });
         Ok(())
     }

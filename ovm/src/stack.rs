@@ -130,6 +130,28 @@ impl Stack {
         Ok(callee)
     }
 
+    pub fn push_frame_with_args(
+        &self,
+        caller: FrameMeta,
+        callable: Tagged<Object>,
+        register_count: usize,
+        args: &[Value],
+    ) -> Result<FrameMeta, VmError> {
+        let base = self.reserve(register_count, args.len())?;
+        let dst = base + register_count + HEADER_SLOTS;
+        debug_assert!(args.iter().all(|v| !v.is_weak_ptr()));
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                args.as_ptr(),
+                self.slots.as_ptr().add(dst) as *mut Value,
+                args.len(),
+            )
+        }
+        let callee = self.init_frame_header(base, register_count, callable, args.len());
+        self.frames.borrow_mut().push(caller);
+        Ok(callee)
+    }
+
     pub fn pop_frame(&self, current_base: usize) -> Option<FrameMeta> {
         self.set_top(current_base);
         self.frames.borrow_mut().pop()
