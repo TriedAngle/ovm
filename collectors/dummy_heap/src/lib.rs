@@ -258,7 +258,7 @@ mod tests {
 
     use vm::{
         AccessorPair, Global, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit,
-        SlotFlags, SlotName, Tagged, Value, VmError,
+        SlotFlags, SlotName, StoreOutcome, StoreSemantics, Tagged, Value, VmError,
     };
     use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Smi};
 
@@ -761,6 +761,148 @@ mod tests {
             }
             _ => panic!("expected accessor lookup result"),
         });
+    }
+
+    #[test]
+    fn store_lookup_on_accessor_with_setter_calls_setter() {
+        let mut heap = local_with_maps(1 << 16);
+
+        let pair_ptr = heap
+            .allocate::<AccessorPair>((Smi::new(111).encode(), Smi::new(222).encode()))
+            .into_ptr();
+        let map = alloc_map(
+            &mut heap,
+            MapKind::OBJECT,
+            0,
+            &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
+        );
+        let obj = alloc_object(&mut heap, map, &[]);
+
+        heap.no_gc(|nogc, heap| {
+            let outcome = obj
+                .encode_strong()
+                .store_lookup(
+                    nogc,
+                    heap,
+                    smi_name(5),
+                    Smi::new(1).encode(),
+                    StoreSemantics::WriteThrough,
+                )
+                .unwrap();
+            match outcome {
+                StoreOutcome::CallSetter { setter } => {
+                    assert_eq!(Smi::decode(setter).unwrap().value(), 222)
+                }
+                _ => panic!("expected CallSetter outcome"),
+            }
+        });
+    }
+
+    #[test]
+    fn store_lookup_on_accessor_without_setter_is_ignored() {
+        let mut heap = local_with_maps(1 << 16);
+
+        let void = heap.known().void.value();
+        let pair_ptr = heap.allocate::<AccessorPair>((void, void)).into_ptr();
+        let map = alloc_map(
+            &mut heap,
+            MapKind::OBJECT,
+            0,
+            &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
+        );
+        let obj = alloc_object(&mut heap, map, &[]);
+
+        heap.no_gc(|nogc, heap| {
+            let outcome = obj.encode_strong().store_lookup(
+                nogc,
+                heap,
+                smi_name(5),
+                Smi::new(1).encode(),
+                StoreSemantics::WriteThrough,
+            );
+            assert_eq!(outcome, Ok(StoreOutcome::Done));
+        });
+    }
+
+    #[test]
+    fn store_new_accessor_property_adds_descriptor_without_slot() {
+        let mut heap = local_with_maps(1 << 16);
+
+        let map = alloc_map(
+            &mut heap,
+            MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            1,
+            &[(
+                1,
+                SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                Smi::new(0).encode(),
+            )],
+        );
+
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let obj = heap
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[Smi::new(7).encode()],
+                    elements: heap.known().void.value(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
+
+        let void = heap.known().void.value();
+        let name = scope.create_handle(smi_name(5).tagged()).unwrap();
+        let get = scope
+            .create_handle(Tagged::from_value(Smi::new(111).encode()))
+            .unwrap();
+        let set = scope.create_handle(Tagged::from_value(void)).unwrap();
+        Object::store_new_accessor_property(&mut heap, obj, name, get, set).unwrap();
+
+        heap.no_gc(|nogc, heap| {
+            let obj_ref = obj.heap_ref(nogc);
+            let map = obj_ref.header.map.heap_ref(nogc);
+            // the accessor takes no value slot; the existing slot stays put
+            assert_eq!(map.value_slot_count(), 1);
+            assert_eq!(map.descriptor_count(), 2);
+            match obj.value().lookup(nogc, heap, smi_name(5)) {
+                Lookup::Accessor { pair, .. } => {
+                    assert_eq!(Smi::decode(pair.get.get().erase()).unwrap().value(), 111);
+                    assert_eq!(pair.set.get().erase(), void);
+                }
+                _ => panic!("expected accessor lookup result"),
+            }
+            expect_data(obj.value().lookup(nogc, heap, smi_name(1)), 7);
+        });
+    }
+
+    #[test]
+    fn store_new_accessor_property_to_non_extensible_fails() {
+        let mut heap = local_with_maps(1 << 16);
+
+        let map = alloc_map(&mut heap, MapKind::OBJECT, 0, &[]);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let obj = heap
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[],
+                    elements: heap.known().void.value(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
+
+        let void = heap.known().void.value();
+        let name = scope.create_handle(smi_name(5).tagged()).unwrap();
+        let get = scope.create_handle(Tagged::from_value(void)).unwrap();
+        let set = scope.create_handle(Tagged::from_value(void)).unwrap();
+        let result = Object::store_new_accessor_property(&mut heap, obj, name, get, set);
+        assert_eq!(result, Err(VmError::NotExtensible));
     }
 
     #[test]

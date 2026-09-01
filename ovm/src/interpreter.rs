@@ -6,7 +6,9 @@ use vm::{
     ValueRef,
 };
 
-use crate::{ContextState, Heap, NativeContext, NativeIndex, VM, VmError};
+use crate::{
+    ContextState, FrameMeta, Heap, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
+};
 
 pub fn run<H: Heap>(
     vm: &VM<H>,
@@ -82,6 +84,62 @@ fn classify_key<'a, L: LocalHeap>(
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
     Err(VmError::Type)
+}
+
+enum LoadOutcome {
+    Value(Value),
+    Getter(Value),
+}
+
+fn load_outcome<'a, L: LocalHeap>(
+    nogc: &'a NoGc<'a>,
+    heap: &'a L,
+    receiver: Value,
+    name: SlotName,
+) -> LoadOutcome {
+    match receiver.lookup(nogc, heap, name) {
+        Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => LoadOutcome::Value(slot.inner()),
+        Lookup::Accessor { pair, .. } => {
+            let getter = pair.get.inner();
+            // no getter (void sentinel): the load yields undefined
+            if getter == heap.known().void.value() {
+                LoadOutcome::Value(heap.known().undefined.value())
+            } else {
+                LoadOutcome::Getter(getter)
+            }
+        }
+        Lookup::NotFound => LoadOutcome::Value(heap.known().undefined.value()),
+    }
+}
+
+fn resolve_callable<'a, L: LocalHeap>(
+    nogc: &'a NoGc<'a>,
+    heap: &'a L,
+    f: Value,
+) -> Option<(Tagged<Object>, usize)> {
+    let ValueRef::Object(obj) = f.value_ref(nogc) else {
+        return None;
+    };
+    let info = obj.as_ref().callable_info(nogc, heap)?;
+    let register_count = info.register_count.to_smi().value() as usize;
+    Some((obj.into_tagged(), register_count))
+}
+
+fn call_value<H: Heap>(
+    heap: &mut H::Local,
+    stack: &Stack,
+    cache: &StackCache,
+    meta: FrameMeta,
+    f: Value,
+    args: &[Value],
+) -> Result<bool, VmError> {
+    let target = heap.no_gc(|nogc, heap| resolve_callable(nogc, heap, f));
+    let Some((target, register_count)) = target else {
+        return Ok(false);
+    };
+    let callee = stack.push_frame_with_args(meta, target, register_count, args)?;
+    cache.load(stack, callee, heap);
+    Ok(true)
 }
 
 fn store_transition<L: LocalHeap>(
@@ -256,14 +314,20 @@ fn dispatch<H: Heap>(
                 cache.load(stack, callee, heap);
             }
             Opcode::LoadNamedProperty => {
-                let v = heap.no_gc(|nogc, heap| {
+                let outcome = heap.no_gc(|nogc, heap| {
                     let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
-                    match stack.reg(&meta, ops.reg(0)).lookup(nogc, heap, name) {
-                        Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => slot.inner(),
-                        _ => unimplemented!("TODO: implement accessors"),
-                    }
+                    load_outcome(nogc, heap, stack.reg(&meta, ops.reg(0)), name)
                 });
-                acc = v;
+                match outcome {
+                    LoadOutcome::Value(v) => acc = v,
+                    LoadOutcome::Getter(getter) => {
+                        let receiver = stack.reg(&meta, ops.reg(0));
+                        if !call_value::<H>(heap, stack, cache, meta, getter, &[receiver])? {
+                            // non-callable getter: the load yields undefined
+                            acc = heap.known().undefined.value();
+                        }
+                    }
+                }
             }
             Opcode::StoreNamedProperty | Opcode::StoreNamedPropertyShadow => {
                 let semantics = match op {
@@ -276,30 +340,40 @@ fn dispatch<H: Heap>(
                         .reg(&meta, ops.reg(0))
                         .store_lookup(nogc, heap, name, acc, semantics)
                 })?;
-                if let StoreOutcome::Transition { receiver, name } = outcome {
-                    cache.spill_acc(acc);
-                    let result = store_transition(heap, state, receiver, name, acc);
-                    let _ = cache.take_acc();
-                    result?;
+                match outcome {
+                    StoreOutcome::Transition { receiver, name } => {
+                        cache.spill_acc(acc);
+                        let result = store_transition(heap, state, receiver, name, acc);
+                        let _ = cache.take_acc();
+                        result?;
+                    }
+                    StoreOutcome::CallSetter { setter } => {
+                        let receiver = stack.reg(&meta, ops.reg(0));
+                        call_value::<H>(heap, stack, cache, meta, setter, &[receiver, acc])?;
+                    }
+                    StoreOutcome::Done => {}
                 }
             }
             Opcode::LoadKeyedProperty => {
-                let v = heap.no_gc(|nogc, heap| {
+                let outcome = heap.no_gc(|nogc, heap| {
                     let receiver = stack.reg(&meta, ops.reg(0));
                     match classify_key(nogc, heap, acc)? {
                         Key::Element(i) => {
                             let arr = element_array(nogc, heap, receiver, i)?;
-                            Ok(arr.at(i))
+                            Ok(LoadOutcome::Value(arr.at(i)))
                         }
-                        Key::Name(name) => match receiver.lookup(nogc, heap, name) {
-                            Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => {
-                                Ok(slot.inner())
-                            }
-                            _ => unimplemented!("TODO: implement accessors"),
-                        },
+                        Key::Name(name) => Ok(load_outcome(nogc, heap, receiver, name)),
                     }
                 })?;
-                acc = v;
+                match outcome {
+                    LoadOutcome::Value(v) => acc = v,
+                    LoadOutcome::Getter(getter) => {
+                        let receiver = stack.reg(&meta, ops.reg(0));
+                        if !call_value::<H>(heap, stack, cache, meta, getter, &[receiver])? {
+                            acc = heap.known().undefined.value();
+                        }
+                    }
+                }
             }
             Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyShadow => {
                 let semantics = match op {
@@ -318,11 +392,18 @@ fn dispatch<H: Heap>(
                         Key::Name(name) => receiver.store_lookup(nogc, heap, name, acc, semantics),
                     }
                 })?;
-                if let StoreOutcome::Transition { receiver, name } = outcome {
-                    cache.spill_acc(acc);
-                    let result = store_transition(heap, state, receiver, name, acc);
-                    let _ = cache.take_acc();
-                    result?;
+                match outcome {
+                    StoreOutcome::Transition { receiver, name } => {
+                        cache.spill_acc(acc);
+                        let result = store_transition(heap, state, receiver, name, acc);
+                        let _ = cache.take_acc();
+                        result?;
+                    }
+                    StoreOutcome::CallSetter { setter } => {
+                        let receiver = stack.reg(&meta, ops.reg(0));
+                        call_value::<H>(heap, stack, cache, meta, setter, &[receiver, acc])?;
+                    }
+                    StoreOutcome::Done => {}
                 }
             }
             Opcode::CreateObjectFromMap => {

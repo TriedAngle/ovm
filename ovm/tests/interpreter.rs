@@ -2,9 +2,9 @@ use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeIndex, Thread, VM, VmError};
 use vm::{
-    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandleScope,
-    HeapPtr, LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags, SlotName, Smi,
-    Tagged, Value,
+    AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle,
+    HandleScope, HeapPtr, LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
+    SlotName, Smi, Tagged, Value,
 };
 
 fn smi(v: i64) -> Value {
@@ -908,4 +908,308 @@ fn test_reference_equal_compares_identity() {
         let result = run_program(&mut thread, program.clone(), 0, &[a, b]).unwrap();
         assert_eq!(result, expected);
     }
+}
+
+/// getter: `return this.y` (receiver is param 0, "y" is constants[0])
+fn getter_program() -> Vec<u8> {
+    let mut p = Vec::new();
+    emit(&mut p, Opcode::Load, &[(-1i32) as u32]);
+    emit(&mut p, Opcode::Store, &[0]);
+    emit(&mut p, Opcode::LoadNamedProperty, &[0, 0, 0]);
+    emit(&mut p, Opcode::Return, &[]);
+    p
+}
+
+/// setter: `this.y = value` (receiver is param 0, value is param 1)
+fn setter_program() -> Vec<u8> {
+    let mut p = Vec::new();
+    emit(&mut p, Opcode::Load, &[(-1i32) as u32]);
+    emit(&mut p, Opcode::Store, &[0]);
+    emit(&mut p, Opcode::Load, &[(-2i32) as u32]);
+    emit(&mut p, Opcode::StoreNamedProperty, &[0, 0, 0]);
+    emit(&mut p, Opcode::Return, &[]);
+    p
+}
+
+/// Build an object (y = 7 in slot 0, accessor `x` backed by the given
+/// getter/setter) in r2. Map in constants at 0, interned "x" at 1, "y" at 2,
+/// "z" at 3.
+fn accessor_object_program(
+    thread: &mut Thread<DummyHeap>,
+    getter: Option<&[u8]>,
+    setter: Option<&[u8]>,
+    build: impl FnOnce(&mut Vec<u8>),
+) -> Result<Value, VmError> {
+    thread.handle_scope(|thread, scope| {
+        let void = thread.heap().known().void.value();
+        let x = thread.intern(&scope, "x");
+        let y = thread.intern(&scope, "y");
+        let z = thread.intern(&scope, "z");
+
+        // getter/setter get constants ["y"] so they can reach the backing slot
+        let make = |thread: &mut Thread<DummyHeap>, program: &[u8]| -> Value {
+            let bytecode = thread
+                .heap()
+                .allocate_handle::<FixedByteArray>(program, &scope);
+            let constants = thread
+                .heap()
+                .allocate_handle::<FixedArray>(&[y.as_tagged().erase()], &scope);
+            let info = thread.heap().allocate_handle::<CallableInfoObject>(
+                CallableInfoInit {
+                    bytecode,
+                    constants,
+                    register_count: 1,
+                    context: void,
+                },
+                &scope,
+            );
+            callable_object(thread, &scope, info).value()
+        };
+        let get = getter.map_or(void, |p| make(&mut *thread, p));
+        let set = setter.map_or(void, |p| make(&mut *thread, p));
+        let pair = thread
+            .heap()
+            .allocate_handle::<AccessorPair>((get, set), &scope);
+
+        let map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                kind: MapKind::OBJECT,
+                value_slot_count: 1,
+                descriptors: &[
+                    (
+                        SlotName::from(y.as_tagged()),
+                        WRITABLE_VALUE,
+                        Smi::new(0).encode(),
+                    ),
+                    (
+                        SlotName::from(x.as_tagged()),
+                        SlotFlags::ACCESSOR,
+                        pair.value(),
+                    ),
+                ],
+            },
+            &scope,
+        );
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[
+                map.as_tagged().erase(),
+                x.as_tagged().erase(),
+                y.as_tagged().erase(),
+                z.as_tagged().erase(),
+            ],
+            &scope,
+        );
+
+        // r0 = 7 (initial y); r2 = object
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadSmi, &[7]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 1]);
+        emit(&mut program, Opcode::Store, &[2]);
+        build(&mut program);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 4,
+                context: void,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.run(callable, &[])
+    })
+}
+
+#[test]
+fn named_load_calls_getter_with_receiver() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // acc = r2.x (calls the getter, which reads this.y)
+    let result = accessor_object_program(&mut thread, Some(&getter_program()), None, |program| {
+        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+#[test]
+fn named_store_calls_setter_with_receiver_and_value() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r2.x = 21 (calls the setter, which writes this.y); acc = r2.y
+    let result = accessor_object_program(&mut thread, None, Some(&setter_program()), |program| {
+        emit(program, Opcode::LoadSmi, &[21]);
+        emit(program, Opcode::StoreNamedProperty, &[2, 1, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 21);
+}
+
+#[test]
+fn named_load_without_getter_is_undefined() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let undefined = thread.heap().known().undefined.value();
+    let result = accessor_object_program(&mut thread, None, None, |program| {
+        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+    });
+    assert_eq!(result.unwrap(), undefined);
+}
+
+#[test]
+fn named_store_without_setter_is_ignored() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r2.x = 21 is ignored (no setter); y keeps its initial value 7
+    let result = accessor_object_program(&mut thread, None, None, |program| {
+        emit(program, Opcode::LoadSmi, &[21]);
+        emit(program, Opcode::StoreNamedProperty, &[2, 1, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+#[test]
+fn keyed_load_calls_getter() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // acc = "x"; acc = r2[acc] (calls the getter)
+    let result = accessor_object_program(&mut thread, Some(&getter_program()), None, |program| {
+        emit(program, Opcode::LoadConstant, &[1]);
+        emit(program, Opcode::LoadKeyedProperty, &[2, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+#[test]
+fn keyed_store_calls_setter() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r3 = "x"; r2[r3] = 21 (calls the setter); acc = r2.y
+    let result = accessor_object_program(&mut thread, None, Some(&setter_program()), |program| {
+        emit(program, Opcode::LoadConstant, &[1]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadSmi, &[21]);
+        emit(program, Opcode::StoreKeyedProperty, &[2, 3, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 21);
+}
+
+#[test]
+fn named_load_missing_property_is_undefined() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let undefined = thread.heap().known().undefined.value();
+    // r2.z does not exist on the map
+    let result = accessor_object_program(&mut thread, None, None, |program| {
+        emit(program, Opcode::LoadNamedProperty, &[2, 3, 0]);
+    });
+    assert_eq!(result.unwrap(), undefined);
+}
+
+#[test]
+fn store_new_accessor_property_defines_own_accessor() {
+    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        let void = thread.heap().known().void.value();
+        let x = thread.intern(&scope, "x");
+        let y = thread.intern(&scope, "y");
+
+        // object { y: 7 } on an extendable map
+        let map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                kind: EXTENDABLE,
+                value_slot_count: 1,
+                descriptors: &[(
+                    SlotName::from(y.as_tagged()),
+                    WRITABLE_VALUE,
+                    Smi::new(0).encode(),
+                )],
+            },
+            &scope,
+        );
+        let obj = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[smi(7)],
+                    elements: void,
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
+
+        // define `x` as an accessor with a getter (this.y) and no setter
+        let getter = {
+            let bytecode = thread
+                .heap()
+                .allocate_handle::<FixedByteArray>(&getter_program(), &scope);
+            let constants = thread
+                .heap()
+                .allocate_handle::<FixedArray>(&[y.as_tagged().erase()], &scope);
+            let info = thread.heap().allocate_handle::<CallableInfoObject>(
+                CallableInfoInit {
+                    bytecode,
+                    constants,
+                    register_count: 1,
+                    context: void,
+                },
+                &scope,
+            );
+            callable_object(thread, &scope, info)
+        };
+        let name = scope
+            .create_handle(SlotName::from(x.as_tagged()).tagged())
+            .expect("name is strong");
+        let get = scope
+            .create_handle(Tagged::from_value(getter.value()))
+            .expect("getter is strong");
+        let set = scope
+            .create_handle(Tagged::from_value(void))
+            .expect("void is strong");
+        Object::store_new_accessor_property(thread.heap(), obj, name, get, set).unwrap();
+
+        // program: acc = param0.x
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[x.as_tagged().erase()], &scope);
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 1,
+                context: void,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.run(callable, &[obj.value()])
+    });
+
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
