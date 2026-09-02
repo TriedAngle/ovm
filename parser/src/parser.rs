@@ -1,5 +1,8 @@
-use crate::token::Span;
-use crate::{Ast, Bookmark, CharStream, FunctionId, Scanner, SymbolTable};
+use crate::token::{Span, Token, TokenKind};
+use crate::{
+    Ast, Bookmark, CharStream, ClassId, ClassInfo, ClassMember, FunctionId, FunctionInfo, Node,
+    NodeId, NodeList, PropKind, Scanner, Symbol, SymbolTable, VarKind,
+};
 
 #[derive(Debug, Clone)]
 pub struct ParseError {
@@ -28,10 +31,57 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+fn is_identifier_like(kind: TokenKind) -> bool {
+    kind == TokenKind::Identifier || kind.is_contextual()
+}
+
+#[derive(Clone, Copy, Default)]
+struct FnFlags {
+    declaration: bool,
+    generator: bool,
+    arrow: bool,
+}
+
+fn starts_property_key(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Identifier | TokenKind::String | TokenKind::Number | TokenKind::LBracket
+    ) || kind.is_keyword()
+}
+
+struct Scope {
+    is_function: bool,
+    lexically_declared: Vec<Symbol>,
+    var_declared: Vec<Symbol>,
+}
+
+impl Scope {
+    fn function() -> Self {
+        Self {
+            is_function: true,
+            lexically_declared: Vec::new(),
+            var_declared: Vec::new(),
+        }
+    }
+
+    fn block() -> Self {
+        Self {
+            is_function: false,
+            lexically_declared: Vec::new(),
+            var_declared: Vec::new(),
+        }
+    }
+}
+
 pub struct Parser<S: CharStream> {
     scanner: Scanner<S>,
     ast: Ast,
     errors: Vec<ParseError>,
+    scopes: Vec<Scope>,
+    loop_depth: u32,
+    /// functions currently being parsed (ids into the Ast table); last = innermost
+    fn_stack: Vec<FunctionId>,
+    next_literal_id: u32,
 }
 
 impl<S: CharStream> Parser<S> {
@@ -40,6 +90,10 @@ impl<S: CharStream> Parser<S> {
             scanner: Scanner::new(stream),
             ast: Ast::new(),
             errors: Vec::new(),
+            scopes: Vec::new(),
+            loop_depth: 0,
+            fn_stack: Vec::new(),
+            next_literal_id: 0,
         }
     }
 
@@ -72,14 +126,1330 @@ impl<S: CharStream> Parser<S> {
         self.scanner.restore(bookmark);
     }
 
-    /// The top level parses as an implicit function.
+    /// The top level parses as an implicit function, pre-registered as
+    /// FunctionId(0); nested functions are added as they complete.
     pub fn parse_script(&mut self) -> Result<FunctionId, ParseError> {
-        todo!("grammar lands next")
+        let start = self.peek()?.span.start;
+        let literal_id = self.alloc_literal_id();
+        let top_id = self.ast.add_function(FunctionInfo {
+            span: Span::new(start, start),
+            name: None,
+            params: Vec::new(),
+            body: None,
+            literal_id,
+            is_declaration: false,
+            is_generator: false,
+            is_arrow: false,
+            strict: false,
+            lazy_data: None,
+        });
+        self.fn_stack.push(top_id);
+        self.scopes.push(Scope::function());
+        let stmts = self.parse_statement_list(TokenKind::Eof)?;
+        let end = self.next()?.span.end; // consume Eof
+        self.scopes.pop();
+        let body = self.add_block(stmts, Span::new(start, end));
+        self.fn_stack.pop();
+        let top = self.ast.function_mut(top_id);
+        top.body = Some(body);
+        top.span = Span::new(start, end);
+        Ok(top_id)
     }
 
     /// Future lazy entry point: re-parse one function body from its start.
     pub fn parse_function_at(&mut self, start: u32) -> Result<FunctionId, ParseError> {
         self.scanner.seek_to(start);
         todo!("lazy re-parse entry point; needs scope summaries first")
+    }
+
+    // -- token helpers --------------------------------------------------------
+
+    fn peek(&mut self) -> Result<Token, ParseError> {
+        self.scanner.peek().clone()
+    }
+
+    fn peek_ahead(&mut self) -> Result<Token, ParseError> {
+        self.scanner.peek_ahead().clone()
+    }
+
+    fn next(&mut self) -> Result<Token, ParseError> {
+        self.scanner.next_token()
+    }
+
+    fn eat(&mut self, kind: TokenKind) -> Result<bool, ParseError> {
+        if self.peek()?.kind == kind {
+            self.next()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn expect(&mut self, kind: TokenKind) -> Result<Token, ParseError> {
+        let t = self.peek()?;
+        if t.kind != kind {
+            return Err(ParseError::new(
+                t.span,
+                format!("expected `{}`, found `{}`", kind.text(), kind_text(t)),
+            ));
+        }
+        self.next()
+    }
+
+    /// ASI: a statement ends at `;`, or without one before `}`, at Eof, or
+    /// across a line terminator.
+    fn expect_semicolon(&mut self) -> Result<(), ParseError> {
+        let t = self.peek()?;
+        if t.kind == TokenKind::Semicolon {
+            self.next()?;
+            return Ok(());
+        }
+        if t.kind == TokenKind::RBrace || t.kind == TokenKind::Eof || t.after_newline {
+            return Ok(());
+        }
+        Err(ParseError::new(
+            t.span,
+            format!("expected `;`, found `{}`", kind_text(t)),
+        ))
+    }
+
+    /// Symbol for a token used as a name (identifier or keyword).
+    fn ident_symbol(&mut self, t: Token) -> Result<Symbol, ParseError> {
+        match t.kind {
+            TokenKind::Identifier => Ok(Symbol(t.value.symbol().unwrap())),
+            k if k.is_contextual() => Ok(self.symbols_mut().intern(k.text().as_bytes())),
+            _ => Err(ParseError::new(t.span, "expected identifier")),
+        }
+    }
+
+    // -- scopes ---------------------------------------------------------------
+
+    fn alloc_literal_id(&mut self) -> u32 {
+        let id = self.next_literal_id;
+        self.next_literal_id += 1;
+        id
+    }
+
+    fn declare_var(&mut self, sym: Symbol, span: Span) -> Result<(), ParseError> {
+        let scope = self
+            .scopes
+            .iter_mut()
+            .rev()
+            .find(|s| s.is_function)
+            .expect("always inside a function scope");
+        if scope.lexically_declared.contains(&sym) {
+            return Err(ParseError::new(span, "identifier already declared"));
+        }
+        if !scope.var_declared.contains(&sym) {
+            scope.var_declared.push(sym);
+        }
+        Ok(())
+    }
+
+    fn declare_lexical(&mut self, sym: Symbol, span: Span) -> Result<(), ParseError> {
+        let scope = self.scopes.last_mut().expect("always inside a scope");
+        if scope.lexically_declared.contains(&sym) || scope.var_declared.contains(&sym) {
+            return Err(ParseError::new(span, "identifier already declared"));
+        }
+        scope.lexically_declared.push(sym);
+        Ok(())
+    }
+
+    /// Function declarations: var-like in a function scope, lexical in a block.
+    fn declare_function(&mut self, sym: Symbol, span: Span) -> Result<(), ParseError> {
+        if self.scopes.last().unwrap().is_function {
+            self.declare_var(sym, span)
+        } else {
+            self.declare_lexical(sym, span)
+        }
+    }
+
+    // -- statements -----------------------------------------------------------
+
+    /// Parse statements until `terminator` (not consumed). Detects the
+    /// directive prologue ("use strict" etc.) at the start.
+    fn parse_statement_list(&mut self, terminator: TokenKind) -> Result<Vec<NodeId>, ParseError> {
+        let mut stmts = Vec::new();
+        let mut prologue = true;
+        loop {
+            let t = self.peek()?;
+            if t.kind == terminator {
+                break;
+            }
+            if t.kind == TokenKind::Eof {
+                return Err(ParseError::new(t.span, "unexpected end of input"));
+            }
+            let stmt = self.parse_statement()?;
+            // Directive prologue: leading bare string-literal statements.
+            // (Deviation: uses decoded text, so 'use\x20strict' counts too.)
+            if prologue {
+                if let Node::ExprStmt { expr } = *self.ast.node(stmt)
+                    && let Node::StringLiteral(sym) = *self.ast.node(expr)
+                {
+                    if self.symbols().get(sym) == b"use strict" {
+                        let fid = *self.fn_stack.last().unwrap();
+                        self.ast.function_mut(fid).strict = true;
+                    }
+                } else {
+                    prologue = false;
+                }
+            }
+            stmts.push(stmt);
+        }
+        Ok(stmts)
+    }
+
+    /// Peek for a declaration keyword; `let` only counts when a name follows
+    /// (`let = 5`, `let.x` are identifier uses in sloppy mode).
+    fn peek_var_kind(&mut self) -> Result<Option<VarKind>, ParseError> {
+        let kind = match self.peek()?.kind {
+            TokenKind::Var => VarKind::Var,
+            TokenKind::Const => VarKind::Const,
+            TokenKind::Let => {
+                if !is_identifier_like(self.peek_ahead()?.kind) {
+                    return Ok(None);
+                }
+                VarKind::Let
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(kind))
+    }
+
+    fn parse_statement(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.peek()?;
+        if let Some(kind) = self.peek_var_kind()? {
+            return self.parse_var_decl(kind, true);
+        }
+        match t.kind {
+            TokenKind::Function => {
+                let function = self.parse_function(true)?;
+                let span = self.ast.function(function).span;
+                Ok(self.ast.add(Node::FunctionDecl { function }, span))
+            }
+            TokenKind::Class => {
+                let class = self.parse_class(true)?;
+                let span = self.ast.class(class).span;
+                Ok(self.ast.add(Node::ClassDecl { class }, span))
+            }
+            TokenKind::If => self.parse_if(),
+            TokenKind::While => self.parse_while(),
+            TokenKind::For => self.parse_for(),
+            TokenKind::Return => self.parse_return(),
+            TokenKind::Throw => self.parse_throw(),
+            TokenKind::Try => self.parse_try(),
+            TokenKind::Break | TokenKind::Continue => self.parse_break_continue(t.kind),
+            TokenKind::LBrace => self.parse_block(),
+            TokenKind::Semicolon => {
+                let t = self.next()?;
+                Ok(self.ast.add(Node::Empty, t.span))
+            }
+            _ => self.parse_expr_stmt(),
+        }
+    }
+
+    fn parse_statement_block(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::LBrace)?.span.start;
+        let stmts = self.parse_statement_list(TokenKind::RBrace)?;
+        let end = self.expect(TokenKind::RBrace)?.span.end;
+        Ok(self.add_block(stmts, Span::new(start, end)))
+    }
+
+    fn parse_block(&mut self) -> Result<NodeId, ParseError> {
+        self.scopes.push(Scope::block());
+        let block = self.parse_statement_block();
+        self.scopes.pop();
+        block
+    }
+
+    fn add_block(&mut self, stmts: Vec<NodeId>, span: Span) -> NodeId {
+        let stmts = self.ast.list(&stmts);
+        self.ast.add(Node::Block { stmts }, span)
+    }
+
+    fn parse_var_decl(&mut self, kind: VarKind, need_semi: bool) -> Result<NodeId, ParseError> {
+        let start = self.next()?.span.start; // var / let / const
+        let mut decls = Vec::new();
+        loop {
+            let t = self.next()?;
+            let name = self.ident_symbol(t)?;
+            match kind {
+                VarKind::Var => self.declare_var(name, t.span)?,
+                VarKind::Let | VarKind::Const => self.declare_lexical(name, t.span)?,
+            }
+            let init = if self.eat(TokenKind::Assign)? {
+                Some(self.parse_assignment()?)
+            } else {
+                None
+            };
+            if kind == VarKind::Const && init.is_none() {
+                return Err(ParseError::new(
+                    t.span,
+                    "missing initializer in const declaration",
+                ));
+            }
+            let end = init.map(|i| self.ast.span(i).end).unwrap_or(t.span.end);
+            decls.push(self.ast.add(
+                Node::VarDeclarator { name, init },
+                Span::new(t.span.start, end),
+            ));
+            if !self.eat(TokenKind::Comma)? {
+                break;
+            }
+        }
+        if need_semi {
+            self.expect_semicolon()?;
+        }
+        let end = self.ast.span(*decls.last().unwrap()).end;
+        let decls = self.ast.list(&decls);
+        Ok(self
+            .ast
+            .add(Node::VarDecl { kind, decls }, Span::new(start, end)))
+    }
+
+    fn parse_if(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::If)?.span.start;
+        self.expect(TokenKind::LParen)?;
+        let cond = self.parse_expression()?;
+        self.expect(TokenKind::RParen)?;
+        let then = self.parse_statement()?;
+        let else_ = if self.eat(TokenKind::Else)? {
+            Some(self.parse_statement()?)
+        } else {
+            None
+        };
+        let end = else_.unwrap_or(then);
+        let end = self.ast.span(end).end;
+        Ok(self
+            .ast
+            .add(Node::If { cond, then, else_ }, Span::new(start, end)))
+    }
+
+    fn parse_while(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::While)?.span.start;
+        self.expect(TokenKind::LParen)?;
+        let cond = self.parse_expression()?;
+        self.expect(TokenKind::RParen)?;
+        self.loop_depth += 1;
+        let body = self.parse_statement();
+        self.loop_depth -= 1;
+        let body = body?;
+        let end = self.ast.span(body).end;
+        Ok(self
+            .ast
+            .add(Node::While { cond, body }, Span::new(start, end)))
+    }
+
+    fn parse_for(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::For)?.span.start;
+        self.expect(TokenKind::LParen)?;
+        let init = if self.eat(TokenKind::Semicolon)? {
+            None
+        } else {
+            let init = if let Some(kind) = self.peek_var_kind()? {
+                self.parse_var_decl(kind, false)?
+            } else {
+                self.parse_expression()?
+            };
+            self.expect(TokenKind::Semicolon)?;
+            Some(init)
+        };
+        let cond = if self.eat(TokenKind::Semicolon)? {
+            None
+        } else {
+            let c = self.parse_expression()?;
+            self.expect(TokenKind::Semicolon)?;
+            Some(c)
+        };
+        let next = if self.peek()?.kind == TokenKind::RParen {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        self.expect(TokenKind::RParen)?;
+        self.loop_depth += 1;
+        let body = self.parse_statement();
+        self.loop_depth -= 1;
+        let body = body?;
+        let end = self.ast.span(body).end;
+        Ok(self.ast.add(
+            Node::For {
+                init,
+                cond,
+                next,
+                body,
+            },
+            Span::new(start, end),
+        ))
+    }
+
+    fn parse_return(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.expect(TokenKind::Return)?;
+        // restricted production: no line terminator before the argument
+        let next = self.peek()?;
+        let value = if next.after_newline
+            || matches!(
+                next.kind,
+                TokenKind::Semicolon | TokenKind::RBrace | TokenKind::Eof
+            ) {
+            None
+        } else {
+            Some(self.parse_expression()?)
+        };
+        let end = value.map(|v| self.ast.span(v).end).unwrap_or(t.span.end);
+        self.expect_semicolon()?;
+        Ok(self
+            .ast
+            .add(Node::Return { value }, Span::new(t.span.start, end)))
+    }
+
+    fn parse_break_continue(&mut self, kind: TokenKind) -> Result<NodeId, ParseError> {
+        let t = self.next()?;
+        let mut end = t.span.end;
+        let next = self.peek()?;
+        // restricted production: no line terminator before the label
+        let label = if !next.after_newline && is_identifier_like(next.kind) {
+            let sym = self.ident_symbol(next)?;
+            end = next.span.end;
+            self.next()?;
+            Some(sym)
+        } else {
+            None
+        };
+        if label.is_some() {
+            return Err(ParseError::new(
+                t.span,
+                "labeled break/continue need labeled statements (not yet supported)",
+            ));
+        }
+        if self.loop_depth == 0 {
+            return Err(ParseError::new(
+                t.span,
+                format!("`{}` outside of a loop", kind.text()),
+            ));
+        }
+        self.expect_semicolon()?;
+        let node = if kind == TokenKind::Break {
+            Node::Break { label }
+        } else {
+            Node::Continue { label }
+        };
+        Ok(self.ast.add(node, Span::new(t.span.start, end)))
+    }
+
+    fn parse_expr_stmt(&mut self) -> Result<NodeId, ParseError> {
+        let expr = self.parse_expression()?;
+        let span = self.ast.span(expr);
+        self.expect_semicolon()?;
+        Ok(self.ast.add(Node::ExprStmt { expr }, span))
+    }
+
+    fn parse_throw(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.expect(TokenKind::Throw)?;
+        // restricted production: no line terminator between throw and its argument
+        if self.peek()?.after_newline {
+            return Err(ParseError::new(
+                t.span,
+                "line terminator not allowed after `throw`",
+            ));
+        }
+        let expr = self.parse_expression()?;
+        let span = Span::new(t.span.start, self.ast.span(expr).end);
+        self.expect_semicolon()?;
+        Ok(self.ast.add(Node::Throw { expr }, span))
+    }
+
+    fn parse_try(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::Try)?.span.start;
+        let try_block = self.parse_block()?;
+        let mut catch_param = None;
+        let mut catch_block = None;
+        let mut finally_block = None;
+        if self.eat(TokenKind::Catch)? {
+            // the catch param lives in the catch block's own scope:
+            // `catch (e) { let e; }` is an early error, `var e` is not
+            self.scopes.push(Scope::block());
+            if self.eat(TokenKind::LParen)? {
+                let t = self.next()?;
+                let sym = self.ident_symbol(t)?;
+                self.expect(TokenKind::RParen)?;
+                self.declare_lexical(sym, t.span)?;
+                catch_param = Some(sym);
+            }
+            catch_block = Some(self.parse_statement_block()?);
+            self.scopes.pop();
+        }
+        if self.eat(TokenKind::Finally)? {
+            finally_block = Some(self.parse_block()?);
+        }
+        if catch_block.is_none() && finally_block.is_none() {
+            return Err(ParseError::new(
+                Span::new(start, self.ast.span(try_block).end),
+                "`try` requires a `catch` or `finally` block",
+            ));
+        }
+        let end = finally_block.or(catch_block).unwrap_or(try_block);
+        let end = self.ast.span(end).end;
+        Ok(self.ast.add(
+            Node::TryCatch {
+                try_block,
+                catch_param,
+                catch_block,
+                finally_block,
+            },
+            Span::new(start, end),
+        ))
+    }
+
+    // -- functions ------------------------------------------------------------
+
+    fn parse_function(&mut self, is_declaration: bool) -> Result<FunctionId, ParseError> {
+        let start = self.expect(TokenKind::Function)?.span.start;
+        let generator = self.eat(TokenKind::Star)?;
+        let t = self.peek()?;
+        let name = if is_identifier_like(t.kind) {
+            let sym = self.ident_symbol(t)?;
+            self.next()?;
+            Some(sym)
+        } else if is_declaration {
+            return Err(ParseError::new(
+                t.span,
+                "function declaration requires a name",
+            ));
+        } else {
+            None
+        };
+        if let Some(name) = name.filter(|_| is_declaration) {
+            self.declare_function(name, Span::new(start, start))?;
+        }
+        self.parse_function_rest(
+            start,
+            name,
+            FnFlags {
+                declaration: is_declaration,
+                generator,
+                arrow: false,
+            },
+        )
+    }
+
+    /// `( params ) { body }` — shared by functions, methods, getters, setters.
+    fn parse_function_rest(
+        &mut self,
+        start: u32,
+        name: Option<Symbol>,
+        flags: FnFlags,
+    ) -> Result<FunctionId, ParseError> {
+        let params = self.parse_params()?;
+        let fid = self.add_function_info(start, name, params, flags);
+        let saved_loop_depth = self.begin_fn_body(fid);
+        let body = self.parse_statement_block();
+        let body = body?;
+        self.end_fn_body(fid, start, body, saved_loop_depth);
+        Ok(fid)
+    }
+
+    fn parse_params(&mut self) -> Result<Vec<Symbol>, ParseError> {
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        if self.peek()?.kind != TokenKind::RParen {
+            loop {
+                let t = self.next()?;
+                let sym = self.ident_symbol(t)?;
+                params.push(sym);
+                if !self.eat(TokenKind::Comma)? {
+                    break;
+                }
+                if self.peek()?.kind == TokenKind::RParen {
+                    break; // trailing comma
+                }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        Ok(params)
+    }
+
+    fn add_function_info(
+        &mut self,
+        start: u32,
+        name: Option<Symbol>,
+        params: Vec<Symbol>,
+        flags: FnFlags,
+    ) -> FunctionId {
+        let strict = self
+            .fn_stack
+            .last()
+            .is_some_and(|&f| self.ast.function(f).strict);
+        let literal_id = self.alloc_literal_id();
+        self.ast.add_function(FunctionInfo {
+            span: Span::new(start, start),
+            name,
+            params,
+            body: None,
+            literal_id,
+            is_declaration: flags.declaration,
+            is_generator: flags.generator,
+            is_arrow: flags.arrow,
+            strict,
+            lazy_data: None,
+        })
+    }
+
+    /// Push the function scope and declare its params. Returns the outer
+    /// loop depth for `end_fn_body`.
+    fn begin_fn_body(&mut self, fid: FunctionId) -> u32 {
+        self.fn_stack.push(fid);
+        self.scopes.push(Scope::function());
+        // params live in the function scope; sloppy mode allows duplicates
+        let scope = self.scopes.last_mut().unwrap();
+        for &p in &self.ast.function(fid).params {
+            if !scope.var_declared.contains(&p) {
+                scope.var_declared.push(p);
+            }
+        }
+        std::mem::replace(&mut self.loop_depth, 0)
+    }
+
+    fn end_fn_body(&mut self, fid: FunctionId, start: u32, body: NodeId, saved_loop_depth: u32) {
+        self.loop_depth = saved_loop_depth;
+        self.scopes.pop();
+        self.fn_stack.pop();
+        let end = self.ast.span(body).end;
+        let info = self.ast.function_mut(fid);
+        info.span = Span::new(start, end);
+        info.body = Some(body);
+    }
+
+    /// `=> body` after the params: expression bodies get an implicit return.
+    fn parse_arrow_rest(&mut self, start: u32, params: Vec<Symbol>) -> Result<NodeId, ParseError> {
+        let arrow = self.expect(TokenKind::Arrow)?;
+        // restricted production: no line terminator before `=>`
+        if arrow.after_newline {
+            return Err(ParseError::new(
+                arrow.span,
+                "no line terminator allowed before `=>`",
+            ));
+        }
+        let fid = self.add_function_info(start, None, params, FnFlags {
+            arrow: true,
+            ..Default::default()
+        });
+        let saved_loop_depth = self.begin_fn_body(fid);
+        let body = if self.peek()?.kind == TokenKind::LBrace {
+            self.parse_statement_block()?
+        } else {
+            let expr = self.parse_assignment()?;
+            let span = self.ast.span(expr);
+            let ret = self.ast.add(Node::Return { value: Some(expr) }, span);
+            self.add_block(vec![ret], span)
+        };
+        self.end_fn_body(fid, start, body, saved_loop_depth);
+        let span = self.ast.function(fid).span;
+        Ok(self.ast.add(Node::FunctionExpr { function: fid }, span))
+    }
+
+    /// On `(`, try to parse an identifier-only parameter list followed by
+    /// `=>`. Rest/destructuring params are not supported yet. Consumes
+    /// nothing on None (the caller restores the bookmark).
+    fn try_parse_arrow_params(&mut self) -> Result<Option<(u32, Vec<Symbol>)>, ParseError> {
+        let start = self.peek()?.span.start;
+        self.next()?; // (
+        let mut params = Vec::new();
+        if self.peek()?.kind != TokenKind::RParen {
+            loop {
+                let t = self.peek()?;
+                if !is_identifier_like(t.kind) {
+                    return Ok(None);
+                }
+                let sym = self.ident_symbol(t)?;
+                self.next()?;
+                params.push(sym);
+                if !self.eat(TokenKind::Comma)? {
+                    break;
+                }
+                if self.peek()?.kind == TokenKind::RParen {
+                    break; // trailing comma
+                }
+            }
+        }
+        if self.peek()?.kind != TokenKind::RParen {
+            return Ok(None);
+        }
+        self.next()?;
+        if self.peek()?.kind != TokenKind::Arrow {
+            return Ok(None);
+        }
+        Ok(Some((start, params)))
+    }
+
+    // -- classes --------------------------------------------------------------
+
+    /// Class declarations and expressions. Deferred: fields, private names,
+    /// static blocks (all get a clean error).
+    fn parse_class(&mut self, is_declaration: bool) -> Result<ClassId, ParseError> {
+        let start = self.expect(TokenKind::Class)?.span.start;
+        let t = self.peek()?;
+        let name = if is_identifier_like(t.kind) {
+            let sym = self.ident_symbol(t)?;
+            self.next()?;
+            Some(sym)
+        } else if is_declaration {
+            return Err(ParseError::new(t.span, "class declaration requires a name"));
+        } else {
+            None
+        };
+        // class declarations are lexical (TDZ like let)
+        if let Some(name) = name.filter(|_| is_declaration) {
+            self.declare_lexical(name, t.span)?;
+        }
+        let superclass = if self.eat(TokenKind::Extends)? {
+            Some(self.parse_assignment()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LBrace)?;
+        let mut members = Vec::new();
+        let mut has_constructor = false;
+        let end = loop {
+            let t = self.peek()?;
+            match t.kind {
+                TokenKind::RBrace => break self.next()?.span.end,
+                TokenKind::Semicolon => {
+                    self.next()?; // stray `;` is allowed in class bodies
+                    continue;
+                }
+                _ => {}
+            }
+            let member_start = t.span.start;
+
+            // `static` modifier vs a member literally named `static`
+            let mut is_static = false;
+            if t.kind == TokenKind::Static {
+                let ahead = self.peek_ahead()?;
+                if ahead.kind == TokenKind::LBrace {
+                    return Err(ParseError::new(
+                        ahead.span,
+                        "class static blocks are not supported yet",
+                    ));
+                }
+                if starts_property_key(ahead.kind) {
+                    is_static = true;
+                    self.next()?;
+                }
+            }
+
+            let accessor = self.eat_accessor_prefix()?;
+            let (key, key_sym, computed) = self.parse_property_key()?;
+            let key_span = self.ast.span(key);
+
+            // constructor rules
+            let is_constructor_name =
+                !computed && key_sym.is_some_and(|s| self.symbols().get(s) == b"constructor");
+            if is_constructor_name {
+                if is_static {
+                    return Err(ParseError::new(key_span, "constructor can't be static"));
+                }
+                if accessor.is_some() {
+                    return Err(ParseError::new(
+                        key_span,
+                        "constructor can't be an accessor",
+                    ));
+                }
+                if has_constructor {
+                    return Err(ParseError::new(key_span, "duplicate constructor"));
+                }
+                has_constructor = true;
+            }
+
+            if self.peek()?.kind != TokenKind::LParen {
+                return Err(ParseError::new(
+                    self.peek()?.span,
+                    "class fields are not supported yet",
+                ));
+            }
+            let kind = match accessor {
+                Some(true) => PropKind::Get,
+                Some(false) => PropKind::Set,
+                None => PropKind::Method,
+            };
+            // class members are always strict
+            let (value, _) =
+                self.parse_method_value(member_start, key_sym, kind, true, key_span)?;
+            members.push(ClassMember {
+                key,
+                value,
+                kind,
+                is_static,
+                is_constructor: is_constructor_name,
+                computed,
+            });
+        };
+        Ok(self.ast.add_class(ClassInfo {
+            span: Span::new(start, end),
+            name,
+            superclass,
+            members,
+        }))
+    }
+
+    // -- expressions ------------------------------------------------------------
+
+    /// Comma operator is deferred; expression == assignment for now.
+    fn parse_expression(&mut self) -> Result<NodeId, ParseError> {
+        self.parse_assignment()
+    }
+
+    fn parse_assignment(&mut self) -> Result<NodeId, ParseError> {
+        // arrow functions: `x => ...` or `(params) => ...`
+        let t = self.peek()?;
+        if is_identifier_like(t.kind) && self.peek_ahead()?.kind == TokenKind::Arrow {
+            let sym = self.ident_symbol(t)?;
+            self.next()?;
+            return self.parse_arrow_rest(t.span.start, vec![sym]);
+        }
+        if t.kind == TokenKind::LParen {
+            let bm = self.bookmark();
+            if let Some((start, params)) = self.try_parse_arrow_params()? {
+                return self.parse_arrow_rest(start, params);
+            }
+            self.restore(bm);
+        }
+        let lhs = self.parse_conditional()?;
+        let t = self.peek()?;
+        if !t.kind.is_assignment() {
+            return Ok(lhs);
+        }
+        self.check_assign_target(lhs)?;
+        let op = t.kind;
+        self.next()?;
+        let value = self.parse_assignment()?; // right-associative
+        let span = Span::new(self.ast.span(lhs).start, self.ast.span(value).end);
+        Ok(self.ast.add(
+            Node::Assign {
+                op,
+                target: lhs,
+                value,
+            },
+            span,
+        ))
+    }
+
+    fn parse_conditional(&mut self) -> Result<NodeId, ParseError> {
+        let cond = self.parse_binary(1)?;
+        if !self.eat(TokenKind::Question)? {
+            return Ok(cond);
+        }
+        let then = self.parse_assignment()?;
+        self.expect(TokenKind::Colon)?;
+        let else_ = self.parse_assignment()?;
+        let span = Span::new(self.ast.span(cond).start, self.ast.span(else_).end);
+        Ok(self.ast.add(Node::Conditional { cond, then, else_ }, span))
+    }
+
+    /// Precedence climbing: one loop over the token precedence table.
+    fn parse_binary(&mut self, min_prec: u8) -> Result<NodeId, ParseError> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let t = self.peek()?;
+            let prec = t.kind.precedence();
+            if prec == 0 || prec < min_prec {
+                break;
+            }
+            let op = t.kind;
+            self.next()?;
+            let next_min = if op.is_right_associative() {
+                prec
+            } else {
+                prec + 1
+            };
+            let rhs = self.parse_binary(next_min)?;
+            let span = Span::new(self.ast.span(lhs).start, self.ast.span(rhs).end);
+            lhs = self.ast.add(Node::Binary { op, lhs, rhs }, span);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.peek()?;
+        match t.kind {
+            TokenKind::Bang
+            | TokenKind::Tilde
+            | TokenKind::Plus
+            | TokenKind::Minus
+            | TokenKind::Typeof
+            | TokenKind::Void
+            | TokenKind::Delete => {
+                self.next()?;
+                let expr = self.parse_unary()?;
+                let span = Span::new(t.span.start, self.ast.span(expr).end);
+                Ok(self.ast.add(Node::Unary { op: t.kind, expr }, span))
+            }
+            TokenKind::PlusPlus | TokenKind::MinusMinus => {
+                self.next()?;
+                let target = self.parse_unary()?;
+                self.check_assign_target(target)?;
+                let span = Span::new(t.span.start, self.ast.span(target).end);
+                Ok(self.ast.add(
+                    Node::Update {
+                        op: t.kind,
+                        prefix: true,
+                        target,
+                    },
+                    span,
+                ))
+            }
+            _ => self.parse_postfix(),
+        }
+    }
+
+    fn parse_postfix(&mut self) -> Result<NodeId, ParseError> {
+        let expr = self.parse_member()?;
+        let t = self.peek()?;
+        // restricted production: no line terminator before postfix ++/--
+        if matches!(t.kind, TokenKind::PlusPlus | TokenKind::MinusMinus) && !t.after_newline {
+            self.next()?;
+            self.check_assign_target(expr)?;
+            let span = Span::new(self.ast.span(expr).start, t.span.end);
+            return Ok(self.ast.add(
+                Node::Update {
+                    op: t.kind,
+                    prefix: false,
+                    target: expr,
+                },
+                span,
+            ));
+        }
+        Ok(expr)
+    }
+
+    /// primary followed by any run of `.name`, `[expr]`, `(args)`.
+    fn parse_member(&mut self) -> Result<NodeId, ParseError> {
+        let expr = match self.peek()?.kind {
+            TokenKind::New => self.parse_new()?,
+            _ => self.parse_primary()?,
+        };
+        self.parse_member_tail(expr, true)
+    }
+
+    /// `new f`, `new f()`, `new a.b.c()`, `new new f()()`.
+    /// The callee binds member tails but NOT call parens: `new a.b()` is
+    /// `new (a.b)()` while `new a().b` is `(new a()).b`.
+    fn parse_new(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::New)?.span.start;
+        if self.peek()?.kind == TokenKind::Period {
+            return Err(ParseError::new(
+                Span::new(start, start + 3),
+                "new.target is not supported",
+            ));
+        }
+        let callee = match self.peek()?.kind {
+            TokenKind::New => self.parse_new()?,
+            _ => {
+                let base = self.parse_primary()?;
+                self.parse_member_tail(base, false)?
+            }
+        };
+        let (args, end) = if self.peek()?.kind == TokenKind::LParen {
+            let (args, end) = self.parse_args()?;
+            (Some(args), end)
+        } else {
+            (None, self.ast.span(callee).end)
+        };
+        Ok(self
+            .ast
+            .add(Node::New { callee, args }, Span::new(start, end)))
+    }
+
+    fn parse_member_tail(
+        &mut self,
+        mut expr: NodeId,
+        allow_call: bool,
+    ) -> Result<NodeId, ParseError> {
+        loop {
+            let t = self.peek()?;
+            match t.kind {
+                TokenKind::Period => {
+                    self.next()?;
+                    let name = self.next()?;
+                    let sym = match name.kind {
+                        TokenKind::Identifier => Symbol(name.value.symbol().unwrap()),
+                        // any keyword may be a property name: `a.class`
+                        k if k.is_keyword() => self.symbols_mut().intern(k.text().as_bytes()),
+                        _ => return Err(ParseError::new(name.span, "expected property name")),
+                    };
+                    let key = self.ast.add(Node::StringLiteral(sym), name.span);
+                    let span = Span::new(self.ast.span(expr).start, name.span.end);
+                    expr = self.ast.add(
+                        Node::Property {
+                            object: expr,
+                            key,
+                            computed: false,
+                        },
+                        span,
+                    );
+                }
+                TokenKind::LBracket => {
+                    self.next()?;
+                    let key = self.parse_expression()?;
+                    let end = self.expect(TokenKind::RBracket)?.span.end;
+                    let span = Span::new(self.ast.span(expr).start, end);
+                    expr = self.ast.add(
+                        Node::Property {
+                            object: expr,
+                            key,
+                            computed: true,
+                        },
+                        span,
+                    );
+                }
+                TokenKind::LParen if allow_call => {
+                    let start = self.ast.span(expr).start;
+                    let (args, end) = self.parse_args()?;
+                    expr = self
+                        .ast
+                        .add(Node::Call { callee: expr, args }, Span::new(start, end));
+                }
+                _ => break,
+            }
+        }
+        Ok(expr)
+    }
+
+    fn parse_args(&mut self) -> Result<(NodeList, u32), ParseError> {
+        self.expect(TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if self.peek()?.kind != TokenKind::RParen {
+            loop {
+                let t = self.peek()?;
+                if t.kind == TokenKind::Ellipsis {
+                    self.next()?;
+                    let expr = self.parse_assignment()?;
+                    let span = Span::new(t.span.start, self.ast.span(expr).end);
+                    args.push(self.ast.add(Node::Spread { expr }, span));
+                } else {
+                    args.push(self.parse_assignment()?);
+                }
+                if !self.eat(TokenKind::Comma)? {
+                    break;
+                }
+                if self.peek()?.kind == TokenKind::RParen {
+                    break; // trailing comma
+                }
+            }
+        }
+        let end = self.expect(TokenKind::RParen)?.span.end;
+        Ok((self.ast.list(&args), end))
+    }
+
+    fn parse_primary(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.peek()?;
+        match t.kind {
+            TokenKind::Number => {
+                self.next()?;
+                let n = t.value.number().unwrap();
+                Ok(self.ast.add(Node::NumberLiteral(n), t.span))
+            }
+            TokenKind::String => {
+                self.next()?;
+                let sym = Symbol(t.value.symbol().unwrap());
+                Ok(self.ast.add(Node::StringLiteral(sym), t.span))
+            }
+            TokenKind::BigInt => {
+                self.next()?;
+                let sym = Symbol(t.value.symbol().unwrap());
+                Ok(self.ast.add(Node::BigIntLiteral(sym), t.span))
+            }
+            TokenKind::True | TokenKind::False => {
+                self.next()?;
+                Ok(self
+                    .ast
+                    .add(Node::BoolLiteral(t.kind == TokenKind::True), t.span))
+            }
+            TokenKind::Null => {
+                self.next()?;
+                Ok(self.ast.add(Node::NullLiteral, t.span))
+            }
+            TokenKind::This => {
+                self.next()?;
+                Ok(self.ast.add(Node::This, t.span))
+            }
+            k if is_identifier_like(k) => {
+                let sym = self.ident_symbol(t)?;
+                self.next()?;
+                Ok(self.ast.add(Node::Identifier { sym }, t.span))
+            }
+            TokenKind::LParen => {
+                self.next()?;
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RParen)?;
+                Ok(expr)
+            }
+            TokenKind::LBracket => self.parse_array_literal(),
+            TokenKind::LBrace => self.parse_object_literal(),
+            TokenKind::Function => {
+                let function = self.parse_function(false)?;
+                let span = self.ast.function(function).span;
+                Ok(self.ast.add(Node::FunctionExpr { function }, span))
+            }
+            TokenKind::Class => {
+                let class = self.parse_class(false)?;
+                let span = self.ast.class(class).span;
+                Ok(self.ast.add(Node::ClassExpr { class }, span))
+            }
+            _ => Err(ParseError::new(
+                t.span,
+                format!("unexpected token `{}`", kind_text(t)),
+            )),
+        }
+    }
+
+    fn parse_array_literal(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::LBracket)?.span.start;
+        let mut elements = Vec::new();
+        let end;
+        loop {
+            let t = self.peek()?;
+            match t.kind {
+                TokenKind::RBracket => {
+                    end = self.next()?.span.end;
+                    break;
+                }
+                TokenKind::Comma => {
+                    let t = self.next()?;
+                    elements.push(self.ast.add(Node::Hole, t.span));
+                }
+                TokenKind::Ellipsis => {
+                    self.next()?;
+                    let expr = self.parse_assignment()?;
+                    let span = Span::new(t.span.start, self.ast.span(expr).end);
+                    elements.push(self.ast.add(Node::Spread { expr }, span));
+                    if self.eat(TokenKind::Comma)? {
+                        continue;
+                    }
+                    end = self.expect(TokenKind::RBracket)?.span.end;
+                    break;
+                }
+                _ => {
+                    elements.push(self.parse_assignment()?);
+                    if self.eat(TokenKind::Comma)? {
+                        continue;
+                    }
+                    end = self.expect(TokenKind::RBracket)?.span.end;
+                    break;
+                }
+            }
+        }
+        let elements = self.ast.list(&elements);
+        Ok(self
+            .ast
+            .add(Node::ArrayLiteral { elements }, Span::new(start, end)))
+    }
+
+    fn parse_object_literal(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::LBrace)?.span.start;
+        let mut props = Vec::new();
+        let end = loop {
+            let t = self.peek()?;
+            match t.kind {
+                TokenKind::RBrace => break self.next()?.span.end,
+                TokenKind::Ellipsis => {
+                    self.next()?;
+                    let expr = self.parse_assignment()?;
+                    let span = Span::new(t.span.start, self.ast.span(expr).end);
+                    props.push(self.ast.add(Node::Spread { expr }, span));
+                }
+                _ => {
+                    props.push(self.parse_object_property()?);
+                }
+            }
+            if self.eat(TokenKind::Comma)? {
+                continue;
+            }
+            break self.expect(TokenKind::RBrace)?.span.end;
+        };
+        let props = self.ast.list(&props);
+        Ok(self
+            .ast
+            .add(Node::ObjectLiteral { props }, Span::new(start, end)))
+    }
+
+    /// One object literal entry: `k: v`, shorthand, method, accessor,
+    /// computed key. Spread is handled by the caller.
+    fn parse_object_property(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.peek()?;
+        if let Some(is_get) = self.eat_accessor_prefix()? {
+            let (key, key_sym, computed) = self.parse_property_key()?;
+            let kind = if is_get { PropKind::Get } else { PropKind::Set };
+            let (value, vspan) =
+                self.parse_method_value(t.span.start, key_sym, kind, false, t.span)?;
+            return Ok(self.ast.add(
+                Node::ObjectProperty {
+                    key,
+                    value,
+                    kind,
+                    computed,
+                },
+                Span::new(t.span.start, vspan.end),
+            ));
+        }
+        let (key, shorthand, computed) = self.parse_property_key()?;
+        let key_span = self.ast.span(key);
+        if self.peek()?.kind == TokenKind::LParen {
+            // method shorthand
+            let (value, vspan) = self.parse_method_value(
+                key_span.start,
+                shorthand,
+                PropKind::Method,
+                false,
+                key_span,
+            )?;
+            return Ok(self.ast.add(
+                Node::ObjectProperty {
+                    key,
+                    value,
+                    kind: PropKind::Method,
+                    computed,
+                },
+                Span::new(key_span.start, vspan.end),
+            ));
+        }
+        let value = if self.eat(TokenKind::Colon)? {
+            self.parse_assignment()?
+        } else {
+            // shorthand: `{ a }` means `{ a: a }`
+            let Some(sym) = shorthand else {
+                return Err(ParseError::new(
+                    key_span,
+                    "expected `:` after property name",
+                ));
+            };
+            self.ast.add(Node::Identifier { sym }, key_span)
+        };
+        let span = Span::new(key_span.start, self.ast.span(value).end);
+        Ok(self.ast.add(
+            Node::ObjectProperty {
+                key,
+                value,
+                kind: PropKind::Init,
+                computed,
+            },
+            span,
+        ))
+    }
+
+    /// Detects `get`/`set` before a property key (both are plain identifiers,
+    /// so `get: 1`, `{get}`, `{ get() {} }` stay valid). Returns Some(is_get)
+    /// and consumes the word, or None.
+    fn eat_accessor_prefix(&mut self) -> Result<Option<bool>, ParseError> {
+        let t = self.peek()?;
+        if t.kind != TokenKind::Identifier {
+            return Ok(None);
+        }
+        let sym = Symbol(t.value.symbol().unwrap());
+        let text = self.symbols().get(sym);
+        let (is_get, is_set) = (text == b"get", text == b"set");
+        if !is_get && !is_set {
+            return Ok(None);
+        }
+        if !starts_property_key(self.peek_ahead()?.kind) {
+            return Ok(None);
+        }
+        self.next()?;
+        Ok(Some(is_get))
+    }
+
+    /// Parses `(params) { body }`, wraps it in a FunctionExpr node, and checks
+    /// accessor arity. `force_strict`: class members are always strict.
+    /// Returns the node and its span.
+    fn parse_method_value(
+        &mut self,
+        start: u32,
+        name: Option<Symbol>,
+        kind: PropKind,
+        force_strict: bool,
+        err_span: Span,
+    ) -> Result<(NodeId, Span), ParseError> {
+        let fid = self.parse_function_rest(start, name, FnFlags::default())?;
+        if force_strict {
+            self.ast.function_mut(fid).strict = true;
+        }
+        let nparams = self.ast.function(fid).params.len();
+        if kind == PropKind::Get && nparams != 0 {
+            return Err(ParseError::new(err_span, "getter must not have parameters"));
+        }
+        if kind == PropKind::Set && nparams != 1 {
+            return Err(ParseError::new(
+                err_span,
+                "setter needs exactly one parameter",
+            ));
+        }
+        let span = self.ast.function(fid).span;
+        let value = self.ast.add(Node::FunctionExpr { function: fid }, span);
+        Ok((value, span))
+    }
+
+    /// Returns (key node, name symbol if usable for shorthand/method name,
+    /// computed flag).
+    fn parse_property_key(&mut self) -> Result<(NodeId, Option<Symbol>, bool), ParseError> {
+        let t = self.next()?;
+        Ok(match t.kind {
+            TokenKind::Identifier => {
+                let sym = Symbol(t.value.symbol().unwrap());
+                (
+                    self.ast.add(Node::StringLiteral(sym), t.span),
+                    Some(sym),
+                    false,
+                )
+            }
+            k if k.is_keyword() => {
+                let sym = self.symbols_mut().intern(k.text().as_bytes());
+                let shorthand = k.is_contextual().then_some(sym);
+                (
+                    self.ast.add(Node::StringLiteral(sym), t.span),
+                    shorthand,
+                    false,
+                )
+            }
+            TokenKind::String => {
+                let sym = Symbol(t.value.symbol().unwrap());
+                (
+                    self.ast.add(Node::StringLiteral(sym), t.span),
+                    Some(sym),
+                    false,
+                )
+            }
+            TokenKind::Number => {
+                let n = t.value.number().unwrap();
+                (self.ast.add(Node::NumberLiteral(n), t.span), None, false)
+            }
+            TokenKind::LBracket => {
+                let expr = self.parse_expression()?;
+                self.expect(TokenKind::RBracket)?;
+                (expr, None, true)
+            }
+            _ => return Err(ParseError::new(t.span, "expected property name")),
+        })
+    }
+
+    // -- misc -----------------------------------------------------------------
+
+    fn check_assign_target(&self, node: NodeId) -> Result<(), ParseError> {
+        match self.ast.node(node) {
+            Node::Identifier { .. } | Node::Property { .. } => Ok(()),
+            _ => Err(ParseError::new(
+                self.ast.span(node),
+                "invalid assignment target",
+            )),
+        }
+    }
+}
+
+fn kind_text(t: Token) -> String {
+    match t.kind {
+        TokenKind::Identifier => "identifier".to_string(),
+        TokenKind::Number => "number".to_string(),
+        TokenKind::String => "string".to_string(),
+        TokenKind::Eof => "end of input".to_string(),
+        k => format!("`{}`", k.text()),
     }
 }

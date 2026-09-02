@@ -22,6 +22,7 @@ pub enum TokenKind {
     PrivateName, // #name
     Number,
     String,
+    BigInt, // 123n
 
     LParen,      // (
     RParen,      // )
@@ -170,6 +171,7 @@ const TOKEN_INFO: &[TokenInfo] = &[
     I::new("", 0, 0),                                             // PrivateName
     I::new("", 0, 0),                                             // Number
     I::new("", 0, 0),                                             // String
+    I::new("", 0, 0),                                             // BigInt
     I::new("(", 0, 0),                                            // LParen
     I::new(")", 0, 0),                                            // RParen
     I::new("{", 0, 0),                                            // LBrace

@@ -17,6 +17,9 @@ pub struct Symbol(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub u32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ClassId(pub u32);
+
 /// (start, len) slice of the arena's `lists` pool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NodeList {
@@ -34,6 +37,8 @@ pub enum VarKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PropKind {
     Init,
+    /// method shorthand `{ foo() {} }`
+    Method,
     Get,
     Set,
 }
@@ -42,6 +47,8 @@ pub enum PropKind {
 pub enum Node {
     NumberLiteral(f64),
     StringLiteral(Symbol),
+    /// raw literal text without the trailing `n`; radix via `0x`/`0b`/`0o` prefix
+    BigIntLiteral(Symbol),
     BoolLiteral(bool),
     NullLiteral,
     Identifier {
@@ -76,6 +83,11 @@ pub enum Node {
         callee: NodeId,
         args: NodeList,
     },
+    /// args: None for `new f` (no parens)
+    New {
+        callee: NodeId,
+        args: Option<NodeList>,
+    },
     /// a.b (computed = false) or a[b]
     Property {
         object: NodeId,
@@ -87,6 +99,10 @@ pub enum Node {
     },
     /// array elision in `[1, , 2]`
     Hole,
+    /// `...expr` in array literals, call args, and object literals
+    Spread {
+        expr: NodeId,
+    },
     ObjectLiteral {
         props: NodeList,
     },
@@ -94,9 +110,13 @@ pub enum Node {
         key: NodeId,
         value: NodeId,
         kind: PropKind,
+        computed: bool,
     },
     FunctionExpr {
         function: FunctionId,
+    },
+    ClassExpr {
+        class: ClassId,
     },
 
     // statements & declarations
@@ -139,8 +159,20 @@ pub enum Node {
     Continue {
         label: Option<Symbol>,
     },
+    Throw {
+        expr: NodeId,
+    },
+    TryCatch {
+        try_block: NodeId,
+        catch_param: Option<Symbol>,
+        catch_block: Option<NodeId>,
+        finally_block: Option<NodeId>,
+    },
     FunctionDecl {
         function: FunctionId,
+    },
+    ClassDecl {
+        class: ClassId,
     },
     Empty,
 }
@@ -154,9 +186,30 @@ pub struct FunctionInfo {
     /// stable across a skipping (pre)parse and a later full re-parse
     pub literal_id: u32,
     pub is_declaration: bool,
+    /// `function*` — yields an iterator, body can suspend via `yield`
+    pub is_generator: bool,
+    /// `=>` — no own `this`/`arguments` binding, not constructible
+    pub is_arrow: bool,
     pub strict: bool,
     /// preparse data slot for lazy body skipping
     pub lazy_data: Option<Box<[u8]>>,
+}
+
+pub struct ClassMember {
+    pub key: NodeId,
+    /// FunctionExpr node
+    pub value: NodeId,
+    pub kind: PropKind,
+    pub is_static: bool,
+    pub is_constructor: bool,
+    pub computed: bool,
+}
+
+pub struct ClassInfo {
+    pub span: Span,
+    pub name: Option<Symbol>,
+    pub superclass: Option<NodeId>,
+    pub members: Vec<ClassMember>,
 }
 
 /// parse-local byte-slice interner; heap internalization at materialization
@@ -198,6 +251,7 @@ pub struct Ast {
     lists: Vec<NodeId>,
     strings: SymbolTable,
     functions: Vec<FunctionInfo>,
+    classes: Vec<ClassInfo>,
 }
 
 impl Default for Ast {
@@ -214,6 +268,7 @@ impl Ast {
             lists: Vec::new(),
             strings: SymbolTable::default(),
             functions: Vec::new(),
+            classes: Vec::new(),
         }
     }
 
@@ -269,6 +324,16 @@ impl Ast {
 
     pub fn function_mut(&mut self, id: FunctionId) -> &mut FunctionInfo {
         &mut self.functions[id.0 as usize]
+    }
+
+    pub fn add_class(&mut self, info: ClassInfo) -> ClassId {
+        let id = ClassId(self.classes.len() as u32);
+        self.classes.push(info);
+        id
+    }
+
+    pub fn class(&self, id: ClassId) -> &ClassInfo {
+        &self.classes[id.0 as usize]
     }
 
     pub(crate) fn set_symbol_table(&mut self, strings: SymbolTable) {

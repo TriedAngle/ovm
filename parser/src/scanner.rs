@@ -148,6 +148,45 @@ const fn first_char_table() -> [Action; 128] {
 
 const FIRST_CHAR: [Action; 128] = first_char_table();
 
+/// Longest-match suffixes for multi-char operators: for the consumed first
+/// char, the candidate suffixes (longest first) and the fallback kind.
+/// `?` and `.` have extra digit rules and stay hand-written in scan_special.
+type Suffixes = (&'static [(&'static str, TokenKind)], TokenKind);
+
+fn special_ops(c: u8) -> Option<Suffixes> {
+    use TokenKind::*;
+    Some(match c {
+        b'=' => (&[("==", EqEqEq), ("=", EqEq), (">", Arrow)], Assign),
+        b'!' => (&[("==", NotEqEq), ("=", NotEq)], Bang),
+        b'<' => (&[("<=", ShlAssign), ("<", Shl), ("=", LtEq)], Lt),
+        b'>' => (
+            &[
+                (">>=", UshrAssign),
+                (">>", Ushr),
+                (">=", ShrAssign),
+                (">", Shr),
+                ("=", GtEq),
+            ],
+            Gt,
+        ),
+        b'+' => (&[("+", PlusPlus), ("=", PlusAssign)], Plus),
+        b'-' => (&[("-", MinusMinus), ("=", MinusAssign)], Minus),
+        b'*' => (
+            &[("*=", StarStarAssign), ("*", StarStar), ("=", StarAssign)],
+            Star,
+        ),
+        b'/' => (&[("=", SlashAssign)], Slash),
+        b'%' => (&[("=", PercentAssign)], Percent),
+        b'&' => (
+            &[("&=", AmpAmpAssign), ("&", AmpAmp), ("=", AmpAssign)],
+            Amp,
+        ),
+        b'|' => (&[("|=", OrOrAssign), ("|", OrOr), ("=", PipeAssign)], Pipe),
+        b'^' => (&[("=", CaretAssign)], Caret),
+        _ => return None,
+    })
+}
+
 /// Saved scanner state for backwards rewinds (speculative parses, lazy
 /// re-parse). Only valid within already-consumed input.
 #[derive(Clone)]
@@ -394,12 +433,42 @@ impl<S: CharStream> Scanner<S> {
     }
 
     fn scan_number(&mut self, start: u32) -> ScanResult {
+        // radix literals: 0x.. 0b.. 0o.. (optional `n` suffix for BigInt)
+        if self.stream.peek() == Some(b'0' as u32) {
+            let save = self.stream.pos();
+            self.stream.advance();
+            let radix = match self.stream.peek() {
+                Some(c) if c == b'x' as u32 || c == b'X' as u32 => Some(16),
+                Some(c) if c == b'b' as u32 || c == b'B' as u32 => Some(2),
+                Some(c) if c == b'o' as u32 || c == b'O' as u32 => Some(8),
+                _ => None,
+            };
+            if let Some(radix) = radix {
+                self.stream.advance();
+                return self.scan_radix_number(start, radix);
+            }
+            self.stream.seek(save);
+        }
         let started_with_dot = self.stream.peek() == Some(b'.' as u32);
         if started_with_dot {
             self.stream.advance();
             self.consume_digits();
         } else {
             self.consume_digits();
+            // BigInt: integer digits followed by `n` (no fraction/exponent)
+            if self.stream.peek() == Some(b'n' as u32) {
+                self.stream.advance();
+                let span = Span::new(start, self.stream.pos());
+                // intern the digits without the trailing `n`
+                let digits = Span::new(start, span.end - 1);
+                let sym = self.intern_span(digits);
+                return Ok(Token {
+                    kind: TokenKind::BigInt,
+                    after_newline: false,
+                    value: TokenValue::Symbol(sym.0),
+                    span,
+                });
+            }
             if self.stream.peek() == Some(b'.' as u32) {
                 self.stream.advance();
                 self.consume_digits();
@@ -441,8 +510,71 @@ impl<S: CharStream> Scanner<S> {
         }
     }
 
-    /// String literal. Contents are one byte per code point (Latin-1):
-    /// raw chars and escapes above 0xFF are rejected for now.
+    /// After `0x`/`0b`/`0o`: scan radix digits, optional `n` for BigInt.
+    fn scan_radix_number(&mut self, start: u32, radix: u32) -> ScanResult {
+        let digits_start = self.stream.pos();
+        while let Some(c) = self.stream.peek() {
+            match hex_digit(c) {
+                Some(d) if d < radix => {
+                    self.stream.advance();
+                }
+                // a valid digit of a lower radix is still a syntax error:
+                // `0b2`, `0o9`
+                Some(_) => {
+                    return Err(ParseError::new(
+                        Span::new(self.stream.pos(), self.stream.pos() + 1),
+                        "invalid digit in radix literal",
+                    ));
+                }
+                None => break,
+            }
+        }
+        let digits_end = self.stream.pos();
+        if digits_end == digits_start {
+            return Err(ParseError::new(
+                Span::new(start, digits_end),
+                "expected digits after radix prefix",
+            ));
+        }
+        let span = Span::new(start, digits_end);
+        if self.stream.peek() == Some(b'n' as u32) {
+            self.stream.advance();
+            // intern the full literal text minus the `n` (radix via prefix)
+            let sym = self.intern_span(span);
+            return Ok(Token {
+                kind: TokenKind::BigInt,
+                after_newline: false,
+                value: TokenValue::Symbol(sym.0),
+                span: Span::new(start, digits_end + 1),
+            });
+        }
+        // a letter or digit right after the literal is an error: `0x1g`
+        if matches!(self.stream.peek(), Some(c) if is_ident_continue(c)) {
+            return Err(ParseError::new(
+                Span::new(self.stream.pos(), self.stream.pos() + 1),
+                "unexpected character after number literal",
+            ));
+        }
+        let value = Self::with_span_bytes(
+            &mut self.stream,
+            &mut self.scratch,
+            Span::new(digits_start, digits_end),
+            |b| {
+                b.iter().fold(0f64, |v, &c| {
+                    v * radix as f64 + (c as char).to_digit(16).unwrap() as f64
+                })
+            },
+        );
+        Ok(Token {
+            kind: TokenKind::Number,
+            after_newline: false,
+            value: TokenValue::Number(value),
+            span,
+        })
+    }
+
+    /// String literal. Contents are WTF-8: raw source chars pass through,
+    /// escapes are encoded (lone surrogates as the 3-byte pattern).
     fn scan_string(&mut self, quote: u32, start: u32) -> ScanResult {
         self.stream.advance(); // opening quote
         let content_start = self.stream.pos();
@@ -476,30 +608,26 @@ impl<S: CharStream> Scanner<S> {
                 ));
             }
             if c == BACKSLASH {
-                let buf = decoded.get_or_insert_with(|| {
-                    let mut v = Vec::new();
-                    self.copy_span(Span::new(content_start, self.stream.pos()), &mut v);
-                    v
-                });
+                self.ensure_decoded(&mut decoded, content_start);
                 self.stream.advance();
-                self.scan_escape(buf)?;
+                self.scan_escape(decoded.as_mut().unwrap())?;
                 continue;
             }
             if c > 0x7F || decoded.is_some() {
-                let buf = decoded.get_or_insert_with(|| {
-                    let mut v = Vec::new();
-                    self.copy_span(Span::new(content_start, self.stream.pos()), &mut v);
-                    v
-                });
-                if c > 0xFF {
-                    return Err(ParseError::new(
-                        Span::new(self.stream.pos(), self.stream.pos() + 1),
-                        "character above 0xFF in one-byte string literal",
-                    ));
-                }
-                buf.push(c as u8);
+                self.ensure_decoded(&mut decoded, content_start);
+                push_wtf8(decoded.as_mut().unwrap(), c);
             }
             self.stream.advance();
+        }
+    }
+
+    /// Switch from the zero-copy span path to the decode buffer: copy the
+    /// string content scanned so far into `decoded` (once).
+    fn ensure_decoded(&mut self, decoded: &mut Option<Vec<u8>>, content_start: u32) {
+        if decoded.is_none() {
+            let mut v = Vec::new();
+            self.copy_span(Span::new(content_start, self.stream.pos()), &mut v);
+            *decoded = Some(v);
         }
     }
 
@@ -538,19 +666,20 @@ impl<S: CharStream> Scanner<S> {
                             ));
                         };
                         n = n * 16 + d;
+                        if n > 0x10FFFF {
+                            return Err(ParseError::new(
+                                Span::new(pos, self.stream.pos()),
+                                "code point out of range in \\u{...} escape",
+                            ));
+                        }
                         self.stream.advance();
                     }
                     n
                 } else {
                     self.scan_hex(4)?
                 };
-                if v > 0xFF {
-                    return Err(ParseError::new(
-                        Span::new(pos, self.stream.pos()),
-                        "escape above 0xFF in one-byte string literal",
-                    ));
-                }
-                out.push(v as u8);
+                // lone surrogates are legal JS string content (WTF-8)
+                push_wtf8(out, v);
                 // closing } / last hex char consumed below for the 4-hex case
                 if self.stream.peek() == Some(b'}' as u32) {
                     self.stream.advance();
@@ -567,13 +696,7 @@ impl<S: CharStream> Scanner<S> {
                 return Ok(());
             }
             LS | PS => {}
-            c if c > 0xFF => {
-                return Err(ParseError::new(
-                    Span::new(pos, pos + 1),
-                    "escape above 0xFF in one-byte string literal",
-                ));
-            }
-            c => out.push(c as u8), // \', \", \\, and any other char is itself
+            c => push_wtf8(out, c), // \', \", \\, and any other char is itself
         }
         self.stream.advance();
         Ok(())
@@ -600,125 +723,6 @@ impl<S: CharStream> Scanner<S> {
         let c = self.stream.peek().unwrap();
         self.stream.advance();
         let kind = match c as u8 {
-            b'=' => {
-                if self.try_consume("==") {
-                    EqEqEq
-                } else if self.try_consume("=") {
-                    EqEq
-                } else if self.try_consume(">") {
-                    Arrow
-                } else {
-                    Assign
-                }
-            }
-            b'!' => {
-                if self.try_consume("==") {
-                    NotEqEq
-                } else if self.try_consume("=") {
-                    NotEq
-                } else {
-                    Bang
-                }
-            }
-            b'<' => {
-                if self.try_consume("<=") {
-                    ShlAssign
-                } else if self.try_consume("<") {
-                    Shl
-                } else if self.try_consume("=") {
-                    LtEq
-                } else {
-                    Lt
-                }
-            }
-            b'>' => {
-                if self.try_consume(">>=") {
-                    UshrAssign
-                } else if self.try_consume(">>") {
-                    Ushr
-                } else if self.try_consume(">=") {
-                    ShrAssign
-                } else if self.try_consume(">") {
-                    Shr
-                } else if self.try_consume("=") {
-                    GtEq
-                } else {
-                    Gt
-                }
-            }
-            b'+' => {
-                if self.try_consume("+") {
-                    PlusPlus
-                } else if self.try_consume("=") {
-                    PlusAssign
-                } else {
-                    Plus
-                }
-            }
-            b'-' => {
-                if self.try_consume("-") {
-                    MinusMinus
-                } else if self.try_consume("=") {
-                    MinusAssign
-                } else {
-                    Minus
-                }
-            }
-            b'*' => {
-                if self.try_consume("*=") {
-                    StarStarAssign
-                } else if self.try_consume("*") {
-                    StarStar
-                } else if self.try_consume("=") {
-                    StarAssign
-                } else {
-                    Star
-                }
-            }
-            // comments were handled in skip_trivia; '/' here is division
-            b'/' => {
-                if self.try_consume("=") {
-                    SlashAssign
-                } else {
-                    Slash
-                }
-            }
-            b'%' => {
-                if self.try_consume("=") {
-                    PercentAssign
-                } else {
-                    Percent
-                }
-            }
-            b'&' => {
-                if self.try_consume("&=") {
-                    AmpAmpAssign
-                } else if self.try_consume("&") {
-                    AmpAmp
-                } else if self.try_consume("=") {
-                    AmpAssign
-                } else {
-                    Amp
-                }
-            }
-            b'|' => {
-                if self.try_consume("|=") {
-                    OrOrAssign
-                } else if self.try_consume("|") {
-                    OrOr
-                } else if self.try_consume("=") {
-                    PipeAssign
-                } else {
-                    Pipe
-                }
-            }
-            b'^' => {
-                if self.try_consume("=") {
-                    CaretAssign
-                } else {
-                    Caret
-                }
-            }
             b'?' => {
                 if self.try_consume("?=") {
                     NullishAssign
@@ -751,7 +755,20 @@ impl<S: CharStream> Scanner<S> {
                     Period
                 }
             }
-            _ => unreachable!("scan_special dispatched on non-special char"),
+            c => {
+                // comments were handled in skip_trivia; '/' here is division
+                let Some((suffixes, default)) = special_ops(c) else {
+                    unreachable!("scan_special dispatched on non-special char");
+                };
+                let mut kind = default;
+                for &(suffix, k) in suffixes {
+                    if self.try_consume(suffix) {
+                        kind = k;
+                        break;
+                    }
+                }
+                kind
+            }
         };
         Ok(Token::new(kind, Span::new(start, self.stream.pos())))
     }
@@ -820,4 +837,20 @@ fn hex_digit(c: u32) -> Option<u32> {
         return None;
     }
     (c as u8 as char).to_digit(16)
+}
+
+/// Encode a code point as WTF-8: identical to UTF-8 for scalar values, plus
+/// the 3-byte pattern for lone surrogates (legal JS string content).
+fn push_wtf8(out: &mut Vec<u8>, cp: u32) {
+    match char::from_u32(cp) {
+        Some(ch) => {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        None => out.extend_from_slice(&[
+            0xE0 | (cp >> 12) as u8,
+            0x80 | ((cp >> 6) & 0x3F) as u8,
+            0x80 | (cp & 0x3F) as u8,
+        ]),
+    }
 }
