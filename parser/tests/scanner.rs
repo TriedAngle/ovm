@@ -188,7 +188,7 @@ b' 'é'"#,
             b"A".to_vec(),  // A
             b"B".to_vec(),  // B
             b"ab".to_vec(), // line continuation
-            vec![0xE9],     // é as one Latin-1 byte
+            vec![0xC3, 0xA9], // é as UTF-8 (WTF-8) bytes
         ]
     );
 }
@@ -197,8 +197,33 @@ b' 'é'"#,
 fn string_errors() {
     scan_err("'abc"); // unterminated
     scan_err("'a\nb'"); // raw newline
-    scan_err("'\\u{1F600}'"); // above 0xFF
+    scan_err("'\\u{110000}'"); // code point out of range
     scan_err("'\\xZZ'");
+}
+
+#[test]
+fn wtf8_string_contents() {
+    let mut sc = Scanner::new(Utf8SliceStream::new("'\\u2028' '\\u{1F600}' '\\uD800'"));
+    let mut texts = vec![];
+    loop {
+        let t = sc.next_token().expect("scan error");
+        if t.kind == Eof {
+            break;
+        }
+        texts.push(
+            sc.symbols()
+                .get(parser::Symbol(t.value.symbol().unwrap()))
+                .to_vec(),
+        );
+    }
+    assert_eq!(
+        texts,
+        vec![
+            vec![0xE2, 0x80, 0xA8],       // U+2028, normal UTF-8
+            vec![0xF0, 0x9F, 0x98, 0x80], // U+1F600, normal UTF-8
+            vec![0xED, 0xA0, 0x80],       // lone surrogate: WTF-8 3-byte pattern
+        ]
+    );
 }
 
 #[test]
@@ -273,4 +298,48 @@ fn bookmark_restore() {
     assert_eq!(sc.next_token().unwrap().kind, Plus);
     assert_eq!(sc.next_token().unwrap().kind, Identifier);
     assert_eq!(sc.next_token().unwrap().kind, Eof);
+}
+
+#[test]
+fn radix_numbers() {
+    let cases = [
+        ("0x1F", 31.0),
+        ("0XFF", 255.0),
+        ("0b101", 5.0),
+        ("0o17", 15.0),
+        ("0O10", 8.0),
+        ("0x0", 0.0),
+    ];
+    for (src, want) in cases {
+        let toks = scan_all(src);
+        assert_eq!(toks[0].kind, Number, "for {src:?}");
+        assert_eq!(toks[0].value.number(), Some(want), "for {src:?}");
+    }
+    scan_err("0x");
+    scan_err("0b");
+    scan_err("0b2");
+    scan_err("0o9");
+    scan_err("0x1g");
+}
+
+#[test]
+fn bigint_radix() {
+    let mut sc = Scanner::new(Utf8SliceStream::new("0xFFn 0b11n 123n"));
+    let mut texts = vec![];
+    loop {
+        let t = sc.next_token().expect("scan error");
+        if t.kind == Eof {
+            break;
+        }
+        assert_eq!(t.kind, BigInt, "expected bigint");
+        texts.push(
+            sc.symbols()
+                .get(parser::Symbol(t.value.symbol().unwrap()))
+                .to_vec(),
+        );
+    }
+    assert_eq!(
+        texts,
+        vec![b"0xFF".to_vec(), b"0b11".to_vec(), b"123".to_vec()]
+    );
 }
