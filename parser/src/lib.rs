@@ -1,10 +1,12 @@
 pub mod parser;
+pub mod resolver;
 pub mod scanner;
 pub mod token;
 
 use std::collections::HashMap;
 
 pub use parser::{ParseError, Parser};
+pub use resolver::{FunctionLayout, Resolution, Resolved, resolve};
 pub use scanner::{Bookmark, ScanResult, Scanner};
 pub use token::{Span, Token, TokenInfo, TokenKind, TokenValue};
 
@@ -19,6 +21,71 @@ pub struct FunctionId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ClassId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ScopeId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeKind {
+    Script,
+    Function,
+    Block,
+    /// for-loop head scope: `for (let i = ...)` binds there, not outside
+    For,
+    /// catch block scope; the param lives in it
+    Catch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclKind {
+    /// function parameter
+    Param,
+    Var,
+    Let,
+    Const,
+    /// function declaration (var-like in a function scope, lexical in a block)
+    Function,
+    CatchParam,
+    Class,
+}
+
+pub struct Declaration {
+    pub name: Symbol,
+    pub kind: DeclKind,
+    pub span: Span,
+}
+
+/// A scope recorded during parsing. Written by the
+/// parser, consumed by the resolver; also the summary lazy parsing resumes
+/// from later.
+pub struct ScopeInfo {
+    pub kind: ScopeKind,
+    pub parent: Option<ScopeId>,
+    pub decls: Vec<Declaration>,
+    /// set on Script/Function scopes
+    pub function: Option<FunctionId>,
+    pub strict: bool,
+    /// direct eval call somewhere in this function's code: bindings in the
+    /// whole visible chain must stay dynamic-safe (context-allocated)
+    pub calls_eval: bool,
+    /// this function contains a nested function/class/eval anywhere —
+    /// gates the for-loop per-iteration-environment desugar
+    pub contains_function_or_eval: bool,
+}
+
+impl ScopeInfo {
+    fn new(kind: ScopeKind, parent: Option<ScopeId>) -> Self {
+        Self {
+            kind,
+            parent,
+            decls: Vec::new(),
+            function: None,
+            strict: false,
+            calls_eval: false,
+            contains_function_or_eval: false,
+        }
+    }
+}
 
 /// (start, len) slice of the arena's `lists` pool.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -252,6 +319,10 @@ pub struct Ast {
     strings: SymbolTable,
     functions: Vec<FunctionInfo>,
     classes: Vec<ClassInfo>,
+    scopes: Vec<ScopeInfo>,
+    /// parallel to `nodes`: the scope a scope-introducing node owns
+    /// (Block, For, function bodies)
+    node_scope: Vec<Option<ScopeId>>,
 }
 
 impl Default for Ast {
@@ -269,6 +340,8 @@ impl Ast {
             strings: SymbolTable::default(),
             functions: Vec::new(),
             classes: Vec::new(),
+            scopes: Vec::new(),
+            node_scope: Vec::new(),
         }
     }
 
@@ -276,6 +349,7 @@ impl Ast {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(node);
         self.spans.push(span);
+        self.node_scope.push(None);
         id
     }
 
@@ -312,6 +386,10 @@ impl Ast {
         self.strings.get(sym)
     }
 
+    pub fn symbol_count(&self) -> usize {
+        self.strings.len()
+    }
+
     pub fn add_function(&mut self, info: FunctionInfo) -> FunctionId {
         let id = FunctionId(self.functions.len() as u32);
         self.functions.push(info);
@@ -326,6 +404,10 @@ impl Ast {
         &mut self.functions[id.0 as usize]
     }
 
+    pub fn function_count(&self) -> usize {
+        self.functions.len()
+    }
+
     pub fn add_class(&mut self, info: ClassInfo) -> ClassId {
         let id = ClassId(self.classes.len() as u32);
         self.classes.push(info);
@@ -334,6 +416,40 @@ impl Ast {
 
     pub fn class(&self, id: ClassId) -> &ClassInfo {
         &self.classes[id.0 as usize]
+    }
+
+    // ---- scopes ----
+
+    pub fn add_scope(&mut self, kind: ScopeKind, parent: Option<ScopeId>) -> ScopeId {
+        let id = ScopeId(self.scopes.len() as u32);
+        self.scopes.push(ScopeInfo::new(kind, parent));
+        id
+    }
+
+    pub fn scope(&self, id: ScopeId) -> &ScopeInfo {
+        &self.scopes[id.0 as usize]
+    }
+
+    pub fn scope_mut(&mut self, id: ScopeId) -> &mut ScopeInfo {
+        &mut self.scopes[id.0 as usize]
+    }
+
+    pub fn scope_count(&self) -> usize {
+        self.scopes.len()
+    }
+
+    pub fn declare(&mut self, scope: ScopeId, name: Symbol, kind: DeclKind, span: Span) {
+        self.scopes[scope.0 as usize]
+            .decls
+            .push(Declaration { name, kind, span });
+    }
+
+    pub fn set_node_scope(&mut self, node: NodeId, scope: ScopeId) {
+        self.node_scope[node.0 as usize] = Some(scope);
+    }
+
+    pub fn node_scope(&self, node: NodeId) -> Option<ScopeId> {
+        self.node_scope[node.0 as usize]
     }
 
     pub(crate) fn set_symbol_table(&mut self, strings: SymbolTable) {

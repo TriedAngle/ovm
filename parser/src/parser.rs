@@ -1,7 +1,7 @@
 use crate::token::{Span, Token, TokenKind};
 use crate::{
-    Ast, Bookmark, CharStream, ClassId, ClassInfo, ClassMember, FunctionId, FunctionInfo, Node,
-    NodeId, NodeList, PropKind, Scanner, Symbol, SymbolTable, VarKind,
+    Ast, Bookmark, CharStream, ClassId, ClassInfo, ClassMember, DeclKind, FunctionId, FunctionInfo,
+    Node, NodeId, NodeList, PropKind, Scanner, ScopeId, ScopeKind, Symbol, SymbolTable, VarKind,
 };
 
 #[derive(Debug, Clone)]
@@ -50,27 +50,10 @@ fn starts_property_key(kind: TokenKind) -> bool {
 }
 
 struct Scope {
+    id: ScopeId,
     is_function: bool,
     lexically_declared: Vec<Symbol>,
     var_declared: Vec<Symbol>,
-}
-
-impl Scope {
-    fn function() -> Self {
-        Self {
-            is_function: true,
-            lexically_declared: Vec::new(),
-            var_declared: Vec::new(),
-        }
-    }
-
-    fn block() -> Self {
-        Self {
-            is_function: false,
-            lexically_declared: Vec::new(),
-            var_declared: Vec::new(),
-        }
-    }
 }
 
 pub struct Parser<S: CharStream> {
@@ -144,11 +127,13 @@ impl<S: CharStream> Parser<S> {
             lazy_data: None,
         });
         self.fn_stack.push(top_id);
-        self.scopes.push(Scope::function());
+        let scope_id = self.push_scope(ScopeKind::Script);
+        self.ast.scope_mut(scope_id).function = Some(top_id);
         let stmts = self.parse_statement_list(TokenKind::Eof)?;
         let end = self.next()?.span.end; // consume Eof
         self.scopes.pop();
         let body = self.add_block(stmts, Span::new(start, end));
+        self.ast.set_node_scope(body, scope_id);
         self.fn_stack.pop();
         let top = self.ast.function_mut(top_id);
         top.body = Some(body);
@@ -230,37 +215,69 @@ impl<S: CharStream> Parser<S> {
         id
     }
 
-    fn declare_var(&mut self, sym: Symbol, span: Span) -> Result<(), ParseError> {
-        let scope = self
-            .scopes
-            .iter_mut()
+    fn push_scope(&mut self, kind: ScopeKind) -> ScopeId {
+        let parent = self.scopes.last().map(|s| s.id);
+        let id = self.ast.add_scope(kind, parent);
+        if matches!(kind, ScopeKind::Script | ScopeKind::Function) {
+            self.ast.scope_mut(id).strict =
+                self.fn_stack.last().is_some_and(|&f| self.ast.function(f).strict);
+        }
+        self.scopes.push(Scope {
+            id,
+            is_function: matches!(kind, ScopeKind::Script | ScopeKind::Function),
+            lexically_declared: Vec::new(),
+            var_declared: Vec::new(),
+        });
+        id
+    }
+
+    /// Innermost enclosing function/script scope (flag target for eval etc.).
+    fn fn_scope_id(&self) -> ScopeId {
+        self.scopes
+            .iter()
             .rev()
             .find(|s| s.is_function)
+            .expect("always inside a function scope")
+            .id
+    }
+
+    fn declare_var(&mut self, sym: Symbol, span: Span, kind: DeclKind) -> Result<(), ParseError> {
+        let idx = self
+            .scopes
+            .iter()
+            .rposition(|s| s.is_function)
             .expect("always inside a function scope");
+        let scope = &mut self.scopes[idx];
         if scope.lexically_declared.contains(&sym) {
             return Err(ParseError::new(span, "identifier already declared"));
         }
+        let scope_id = scope.id;
         if !scope.var_declared.contains(&sym) {
             scope.var_declared.push(sym);
+            self.ast.declare(scope_id, sym, kind, span);
         }
         Ok(())
     }
 
-    fn declare_lexical(&mut self, sym: Symbol, span: Span) -> Result<(), ParseError> {
-        let scope = self.scopes.last_mut().expect("always inside a scope");
-        if scope.lexically_declared.contains(&sym) || scope.var_declared.contains(&sym) {
-            return Err(ParseError::new(span, "identifier already declared"));
+    fn declare_lexical(&mut self, sym: Symbol, span: Span, kind: DeclKind) -> Result<(), ParseError> {
+        let scope_id = self.scopes.last().expect("always inside a scope").id;
+        {
+            let scope = self.scopes.last_mut().unwrap();
+            if scope.lexically_declared.contains(&sym) || scope.var_declared.contains(&sym) {
+                return Err(ParseError::new(span, "identifier already declared"));
+            }
+            scope.lexically_declared.push(sym);
         }
-        scope.lexically_declared.push(sym);
+        self.ast.declare(scope_id, sym, kind, span);
         Ok(())
     }
 
     /// Function declarations: var-like in a function scope, lexical in a block.
     fn declare_function(&mut self, sym: Symbol, span: Span) -> Result<(), ParseError> {
         if self.scopes.last().unwrap().is_function {
-            self.declare_var(sym, span)
+            self.declare_var(sym, span, DeclKind::Function)
         } else {
-            self.declare_lexical(sym, span)
+            self.declare_lexical(sym, span, DeclKind::Function)
         }
     }
 
@@ -289,6 +306,8 @@ impl<S: CharStream> Parser<S> {
                     if self.symbols().get(sym) == b"use strict" {
                         let fid = *self.fn_stack.last().unwrap();
                         self.ast.function_mut(fid).strict = true;
+                        let scope = self.fn_scope_id();
+                        self.ast.scope_mut(scope).strict = true;
                     }
                 } else {
                     prologue = false;
@@ -349,14 +368,21 @@ impl<S: CharStream> Parser<S> {
     }
 
     fn parse_statement_block(&mut self) -> Result<NodeId, ParseError> {
+        // link the block to the innermost active scope (function body → its
+        // function scope, plain block → the block scope from parse_block)
+        let scope = self.scopes.last().map(|s| s.id);
         let start = self.expect(TokenKind::LBrace)?.span.start;
         let stmts = self.parse_statement_list(TokenKind::RBrace)?;
         let end = self.expect(TokenKind::RBrace)?.span.end;
-        Ok(self.add_block(stmts, Span::new(start, end)))
+        let block = self.add_block(stmts, Span::new(start, end));
+        if let Some(scope) = scope {
+            self.ast.set_node_scope(block, scope);
+        }
+        Ok(block)
     }
 
     fn parse_block(&mut self) -> Result<NodeId, ParseError> {
-        self.scopes.push(Scope::block());
+        self.push_scope(ScopeKind::Block);
         let block = self.parse_statement_block();
         self.scopes.pop();
         block
@@ -374,8 +400,9 @@ impl<S: CharStream> Parser<S> {
             let t = self.next()?;
             let name = self.ident_symbol(t)?;
             match kind {
-                VarKind::Var => self.declare_var(name, t.span)?,
-                VarKind::Let | VarKind::Const => self.declare_lexical(name, t.span)?,
+                VarKind::Var => self.declare_var(name, t.span, DeclKind::Var)?,
+                VarKind::Let => self.declare_lexical(name, t.span, DeclKind::Let)?,
+                VarKind::Const => self.declare_lexical(name, t.span, DeclKind::Const)?,
             }
             let init = if self.eat(TokenKind::Assign)? {
                 Some(self.parse_assignment()?)
@@ -442,6 +469,9 @@ impl<S: CharStream> Parser<S> {
 
     fn parse_for(&mut self) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::For)?.span.start;
+        // the head gets its own scope: `for (let i ...)` binds there and does
+        // not leak into the enclosing scope
+        let scope_id = self.push_scope(ScopeKind::For);
         self.expect(TokenKind::LParen)?;
         let init = if self.eat(TokenKind::Semicolon)? {
             None
@@ -470,17 +500,15 @@ impl<S: CharStream> Parser<S> {
         self.loop_depth += 1;
         let body = self.parse_statement();
         self.loop_depth -= 1;
+        self.scopes.pop();
         let body = body?;
         let end = self.ast.span(body).end;
-        Ok(self.ast.add(
-            Node::For {
-                init,
-                cond,
-                next,
-                body,
-            },
+        let node = self.ast.add(
+            Node::For { init, cond, next, body },
             Span::new(start, end),
-        ))
+        );
+        self.ast.set_node_scope(node, scope_id);
+        Ok(node)
     }
 
     fn parse_return(&mut self) -> Result<NodeId, ParseError> {
@@ -568,12 +596,12 @@ impl<S: CharStream> Parser<S> {
         if self.eat(TokenKind::Catch)? {
             // the catch param lives in the catch block's own scope:
             // `catch (e) { let e; }` is an early error, `var e` is not
-            self.scopes.push(Scope::block());
+            self.push_scope(ScopeKind::Catch);
             if self.eat(TokenKind::LParen)? {
                 let t = self.next()?;
                 let sym = self.ident_symbol(t)?;
                 self.expect(TokenKind::RParen)?;
-                self.declare_lexical(sym, t.span)?;
+                self.declare_lexical(sym, t.span, DeclKind::CatchParam)?;
                 catch_param = Some(sym);
             }
             catch_block = Some(self.parse_statement_block()?);
@@ -680,6 +708,10 @@ impl<S: CharStream> Parser<S> {
             .fn_stack
             .last()
             .is_some_and(|&f| self.ast.function(f).strict);
+        // the enclosing function contains a function → gates the for-loop
+        // per-iteration-environment desugar
+        let enclosing = self.fn_scope_id();
+        self.ast.scope_mut(enclosing).contains_function_or_eval = true;
         let literal_id = self.alloc_literal_id();
         self.ast.add_function(FunctionInfo {
             span: Span::new(start, start),
@@ -699,13 +731,19 @@ impl<S: CharStream> Parser<S> {
     /// loop depth for `end_fn_body`.
     fn begin_fn_body(&mut self, fid: FunctionId) -> u32 {
         self.fn_stack.push(fid);
-        self.scopes.push(Scope::function());
+        let scope_id = self.push_scope(ScopeKind::Function);
+        self.ast.scope_mut(scope_id).function = Some(fid);
         // params live in the function scope; sloppy mode allows duplicates
         let scope = self.scopes.last_mut().unwrap();
-        for &p in &self.ast.function(fid).params {
+        let params: Vec<Symbol> = self.ast.function(fid).params.clone();
+        for &p in &params {
             if !scope.var_declared.contains(&p) {
                 scope.var_declared.push(p);
             }
+        }
+        let span = self.ast.function(fid).span;
+        for p in params {
+            self.ast.declare(scope_id, p, DeclKind::Param, span);
         }
         std::mem::replace(&mut self.loop_depth, 0)
     }
@@ -800,7 +838,7 @@ impl<S: CharStream> Parser<S> {
         };
         // class declarations are lexical (TDZ like let)
         if let Some(name) = name.filter(|_| is_declaration) {
-            self.declare_lexical(name, t.span)?;
+            self.declare_lexical(name, t.span, DeclKind::Class)?;
         }
         let superclass = if self.eat(TokenKind::Extends)? {
             Some(self.parse_assignment()?)
@@ -1103,6 +1141,16 @@ impl<S: CharStream> Parser<S> {
                     );
                 }
                 TokenKind::LParen if allow_call => {
+                    // direct eval: `eval(...)` forces the whole visible scope
+                    // chain to stay dynamic-safe
+                    if let Node::Identifier { sym } = self.ast.node(expr)
+                        && self.symbols().get(*sym) == b"eval"
+                    {
+                        let scope = self.fn_scope_id();
+                        let info = self.ast.scope_mut(scope);
+                        info.calls_eval = true;
+                        info.contains_function_or_eval = true;
+                    }
                     let start = self.ast.span(expr).start;
                     let (args, end) = self.parse_args()?;
                     expr = self
