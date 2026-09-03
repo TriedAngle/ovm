@@ -1,14 +1,43 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
+use ovm::{EXCEPTION_SENTINEL, NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle,
-    HandleScope, HeapPtr, LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
-    SlotName, Smi, Tagged, Value,
+    HandleScope, HeapPtr, LocalHeap, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit,
+    SlotFlags, SlotName, Smi, Tagged, Value, ValueRef,
 };
 
 fn smi(v: i64) -> Value {
     Smi::new(v).encode()
+}
+
+/// Assert a run escaped uncaught: the sentinel is returned and the pending
+/// exception is a materialized error object of the given class name.
+fn expect_escaped(
+    thread: &mut Thread<DummyHeap>,
+    result: Result<Value, VmError>,
+    class: &str,
+) -> Value {
+    assert_eq!(result, Ok(EXCEPTION_SENTINEL), "run must escape uncaught");
+    let ex = thread.take_pending_exception().expect("pending exception");
+    assert!(!thread.has_pending_exception(), "pending cleared on take");
+    let expected_name = thread
+        .handle_scope(|thread, scope| thread.intern(&scope, class).value());
+    thread.handle_scope(|thread, scope| {
+        let name_key = thread.intern(&scope, "name").value();
+        thread.heap().no_gc(|nogc, heap| {
+            let ValueRef::Object(o) = ex.value_ref(nogc) else {
+                panic!("pending exception must be an object");
+            };
+            match o.as_ref().lookup(nogc, heap, SlotName::from_value(name_key)) {
+                Lookup::Data { slot, .. } => {
+                    assert_eq!(slot.inner(), expected_name, "error class name");
+                }
+                _ => panic!("error object must have a name property"),
+            }
+        });
+    });
+    ex
 }
 
 /// Wrap a callable info in a normal object with a callable map
@@ -19,6 +48,7 @@ fn callable_object<'s>(
     info: Handle<'_, CallableInfoObject>,
 ) -> Handle<'s, Object> {
     let void = thread.heap().known().void.value();
+    let empty_context = thread.heap().known().empty_context;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: MapKind::OBJECT.union(MapKind::CALLABLE),
@@ -49,6 +79,7 @@ fn run_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
@@ -58,7 +89,8 @@ fn run_program(
                 bytecode,
                 constants,
                 register_count,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -113,13 +145,13 @@ fn failed_run_does_not_leak_frames_into_next_run() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // Add on uninitialized (void) registers fails with a type error,
-    // aborting the run with a frame still on the suspended list.
+    // Add on uninitialized (void) registers throws a TypeError, aborting
+    // the run with a frame still on the suspended list.
     let mut bad = Vec::new();
     emit(&mut bad, Opcode::Add, &[0, 1]);
     emit(&mut bad, Opcode::Return, &[]);
     let result = run_program(&mut thread, bad, 2, &[]);
-    assert_eq!(result, Err(VmError::Type));
+    expect_escaped(&mut thread, result, "TypeError");
 
     // The next run on the same thread must start from a clean slate.
     let mut good = Vec::new();
@@ -166,6 +198,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
 
     let result = thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
 
         // callee: returns smi 99
         let mut callee_program = Vec::new();
@@ -180,7 +213,8 @@ fn call_resolves_callable_object_and_pushes_frames() {
                 bytecode: callee_bytecode,
                 constants: callee_constants,
                 register_count: 2,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -203,7 +237,8 @@ fn call_resolves_callable_object_and_pushes_frames() {
                 bytecode,
                 constants: receiver_consts,
                 register_count: 2,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -249,6 +284,7 @@ fn create_object_from_map_fills_from_registers() {
 
     let (result, map_v) = thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
 
         // map with two writable value slots (offsets 0 and 1)
         let x = thread.intern(&scope, "x");
@@ -295,7 +331,8 @@ fn create_object_from_map_fills_from_registers() {
                 bytecode,
                 constants: consts,
                 register_count: 2,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -380,7 +417,7 @@ fn keyed_load_out_of_bounds_errors() {
         emit(&mut program, Opcode::Return, &[]);
 
         let result = run_program(&mut thread, program, 2, &[]);
-        assert_eq!(result, Err(VmError::OutOfBounds));
+        expect_escaped(&mut thread, result, "RangeError");
     }
 }
 
@@ -392,6 +429,7 @@ fn object_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
         let map = thread.heap().allocate_handle::<Map>(
@@ -437,7 +475,8 @@ fn object_program(
                 bytecode,
                 constants: consts,
                 register_count: 4,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -485,6 +524,7 @@ fn transition_object_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let z = thread.intern(&scope, "z");
         let w = thread.intern(&scope, "w");
@@ -523,7 +563,8 @@ fn transition_object_program(
                 bytecode,
                 constants: consts,
                 register_count: 5,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -607,7 +648,7 @@ fn named_store_new_property_to_non_extensible_fails() {
             emit(program, Opcode::LoadSmi, &[42]);
             emit(program, Opcode::StoreNamedProperty, &[2, 2, 0]);
         });
-    assert_eq!(result, Err(VmError::NotExtensible));
+    expect_escaped(&mut thread, result, "TypeError");
 }
 
 #[test]
@@ -620,7 +661,7 @@ fn named_store_to_non_writable_fails() {
         emit(program, Opcode::LoadSmi, &[42]);
         emit(program, Opcode::StoreNamedProperty, &[2, 1, 0]);
     });
-    assert_eq!(result, Err(VmError::Type));
+    expect_escaped(&mut thread, result, "TypeError");
 }
 
 /// Parent object (p = 1) in constants at 2, child object in r2 with a parent
@@ -631,6 +672,7 @@ fn parent_object_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
         let p = thread.intern(&scope, "p");
         let parent_map = thread.heap().allocate_handle::<Map>(
             MapInit {
@@ -701,7 +743,8 @@ fn parent_object_program(
                 bytecode,
                 constants: consts,
                 register_count: 6,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -821,6 +864,7 @@ fn jump_if_truthy_follows_toboolean() {
         let one_half = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
         let object = {
             let void = thread.heap().known().void.value();
+            let empty_context = thread.heap().known().empty_context;
             let map = thread.heap().allocate_handle::<Map>(
                 MapInit {
                     kind: MapKind::OBJECT,
@@ -942,6 +986,7 @@ fn accessor_object_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
         let z = thread.intern(&scope, "z");
@@ -959,7 +1004,8 @@ fn accessor_object_program(
                     bytecode,
                     constants,
                     register_count: 1,
-                    context: void,
+                    context: empty_context,
+                    handlers: None,
                 },
                 &scope,
             );
@@ -1017,7 +1063,8 @@ fn accessor_object_program(
                 bytecode,
                 constants: consts,
                 register_count: 4,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -1127,6 +1174,7 @@ fn store_new_accessor_property_defines_own_accessor() {
 
     let result = thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
 
@@ -1169,7 +1217,8 @@ fn store_new_accessor_property_defines_own_accessor() {
                     bytecode,
                     constants,
                     register_count: 1,
-                    context: void,
+                    context: empty_context,
+                    handlers: None,
                 },
                 &scope,
             );
@@ -1203,7 +1252,8 @@ fn store_new_accessor_property_defines_own_accessor() {
                 bytecode,
                 constants: consts,
                 register_count: 1,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -1222,6 +1272,7 @@ fn native_function<'s>(
     idx: NativeIndex,
 ) -> Handle<'s, Object> {
     let void = thread.heap().known().void.value();
+    let empty_context = thread.heap().known().empty_context;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: MapKind::OBJECT
@@ -1255,6 +1306,7 @@ fn bytecode_fn(
     register_count: usize,
 ) -> Value {
     let void = nctx.heap().known().void.value();
+    let empty_context = nctx.heap().known().empty_context;
     let bytecode = nctx
         .heap()
         .allocate_handle::<FixedByteArray>(program, scope);
@@ -1264,7 +1316,8 @@ fn bytecode_fn(
             bytecode,
             constants,
             register_count,
-            context: void,
+            context: empty_context,
+            handlers: None,
         },
         scope,
     );
@@ -1329,12 +1382,14 @@ fn call_dispatches_to_native_function_object() {
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let void = thread.heap().known().void.value();
+        let empty_context = thread.heap().known().empty_context;
         let caller = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
                 constants: consts,
                 register_count: 1,
-                context: void,
+                context: empty_context,
+                handlers: None,
             },
             &scope,
         );
@@ -1388,21 +1443,21 @@ fn native_reenters_interpreter_via_call() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 13);
 }
 
-/// Native that runs bytecode which fails one call deep; the suspended inner
+/// Native that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the native recovers.
 fn run_failing_inner(
     nctx: &mut NativeContext<'_, DummyHeap>,
     _args: &[Value],
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
-        // callee: Add on uninitialized (void) registers -> Type error
+        // callee: Add on uninitialized (void) registers -> TypeError throw
         let mut bad = Vec::new();
         emit(&mut bad, Opcode::Add, &[0, 1]);
         emit(&mut bad, Opcode::Return, &[]);
         let callee = bytecode_fn(nctx, &scope, &bad, &[], 2);
 
         // caller: calls callee, so one frame is suspended above the base
-        // depth when the error aborts the nested run
+        // depth when the exception escapes the nested run
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -1411,8 +1466,15 @@ fn run_failing_inner(
         let caller = bytecode_fn(nctx, &scope, &program, &[callee], 1);
 
         match nctx.call(caller, &[]) {
-            Err(VmError::Type) => Ok(smi(42)),
-            other => panic!("expected inner type error, got {other:?}"),
+            Ok(EXCEPTION_SENTINEL) => {
+                // the exception escapes the nested run as the sentinel with
+                // the pending exception set; the native recovers by
+                // clearing it
+                let ex = nctx.take_pending_exception().expect("pending exception");
+                assert!(ex.is_strong_ptr());
+                Ok(smi(42))
+            }
+            other => panic!("expected inner escape, got {other:?}"),
         }
     })
 }

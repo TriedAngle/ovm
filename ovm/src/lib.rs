@@ -5,7 +5,7 @@ use core::ptr::NonNull;
 
 use vm::{
     AllocError, EdgeVisitable, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap,
-    Object, RootVisitor, Value, Visitor,
+    Object, Register, RootVisitor, Value, Visitor,
 };
 
 pub mod cache;
@@ -19,6 +19,7 @@ pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use cache::StackCache;
 
 pub use interner::StringInterner;
+pub use interpreter::error_from_vm_error;
 pub use natives::{EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use vm::VmError;
 
@@ -39,12 +40,12 @@ pub struct VM<H: Heap> {
     shared: Arc<SharedVM<H>>,
 }
 
-// TODO: implement real exception and handler stack
 pub struct ContextState {
     handles: HandleData,
     stack: Stack,
     cache: StackCache,
-    pending_exception: Cell<Option<VmError>>,
+    pending_exception: Register,
+    has_pending_exception: Cell<bool>,
 }
 
 impl ContextState {
@@ -52,16 +53,22 @@ impl ContextState {
         &self.stack
     }
 
-    pub fn set_pending_exception(&self, err: VmError) {
-        self.pending_exception.set(Some(err));
+    pub fn set_pending_exception(&self, value: Value) {
+        self.pending_exception.store(value);
+        self.has_pending_exception.set(true);
     }
 
-    pub fn take_pending_exception(&self) -> Option<VmError> {
-        self.pending_exception.take()
+    pub fn take_pending_exception(&self) -> Option<Value> {
+        if self.has_pending_exception.get() {
+            self.has_pending_exception.set(false);
+            Some(self.pending_exception.inner())
+        } else {
+            None
+        }
     }
 
     pub fn has_pending_exception(&self) -> bool {
-        self.pending_exception.get().is_some()
+        self.has_pending_exception.get()
     }
 
     pub fn handle_scope<R>(&self, f: impl for<'s> FnOnce(HandleScope<'s>) -> R) -> R {
@@ -81,6 +88,7 @@ impl EdgeVisitable for ContextState {
         self.handles.visit_edges(visitor);
         self.stack.visit_edges(visitor);
         self.cache.visit_edges(visitor);
+        visitor.visit(self.pending_exception.as_raw());
     }
 }
 
@@ -111,11 +119,13 @@ impl<H: Heap> Thread<H> {
         self.vm.interner().intern(&mut self.heap, scope, s)
     }
 
-    pub fn set_pending_exception(&self, err: VmError) {
-        self.state.set_pending_exception(err);
+    pub fn set_pending_exception(&mut self, err: VmError) {
+        let ex = interpreter::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
+            .expect("error materialization must not fail");
+        self.state.set_pending_exception(ex);
     }
 
-    pub fn take_pending_exception(&self) -> Option<VmError> {
+    pub fn take_pending_exception(&self) -> Option<Value> {
         self.state.take_pending_exception()
     }
 
@@ -139,7 +149,14 @@ impl<H: Heap> Thread<H> {
         debug_assert_eq!(self.state.stack.top(), 0);
         debug_assert_eq!(self.state.stack.frame_depth(), 0);
         debug_assert!(!self.state.cache.is_active());
+
+        // don't leak pending exception if it exists
+        let _ = self.state.take_pending_exception();
         interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args)
+    }
+
+    pub fn error_object(&mut self, err: VmError) -> Result<Value, VmError> {
+        interpreter::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
     }
 
     pub fn run_native(&mut self, f: NativeFn<H>, args: &[Value]) -> Result<Value, VmError> {
@@ -214,7 +231,8 @@ impl<H: Heap> VM<H> {
             handles: HandleData::new(void),
             stack: Stack::new(STACK_SLOTS, void),
             cache: StackCache::new(void),
-            pending_exception: Cell::new(None),
+            pending_exception: unsafe { Register::from_value(void) },
+            has_pending_exception: Cell::new(false),
         });
         let mut threads = self.shared.threads.lock().unwrap();
         // TODO: should we really call this every attach() ?

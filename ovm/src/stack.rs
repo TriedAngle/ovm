@@ -105,6 +105,7 @@ impl Stack {
     pub fn push_frame(
         &self,
         caller: FrameMeta,
+        handler_pc: usize,
         callable: Tagged<Object>,
         register_count: usize,
         src_reg_base: i32,
@@ -126,6 +127,8 @@ impl Stack {
             )
         }
         let callee = self.init_frame_header(base, register_count, callable, count);
+        let mut caller = caller;
+        caller.handler_pc = handler_pc;
         self.frames.borrow_mut().push(caller);
         Ok(callee)
     }
@@ -133,6 +136,7 @@ impl Stack {
     pub fn push_frame_with_args(
         &self,
         caller: FrameMeta,
+        handler_pc: usize,
         callable: Tagged<Object>,
         register_count: usize,
         args: &[Value],
@@ -148,6 +152,8 @@ impl Stack {
             )
         }
         let callee = self.init_frame_header(base, register_count, callable, args.len());
+        let mut caller = caller;
+        caller.handler_pc = handler_pc;
         self.frames.borrow_mut().push(caller);
         Ok(callee)
     }
@@ -194,6 +200,7 @@ impl Stack {
             base,
             pc: 0,
             register_count,
+            handler_pc: 0,
         }
     }
 }
@@ -209,6 +216,9 @@ impl EdgeVisitable for Stack {
 #[derive(Copy, Clone)]
 pub struct FrameMeta {
     pub base: usize,
+    /// Resume pc for normal returns.
     pub pc: usize,
     pub register_count: usize,
+    /// Pc used for exception handler lookup when unwinding
+    pub handler_pc: usize,
 }

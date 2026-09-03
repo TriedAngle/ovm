@@ -1,7 +1,8 @@
 use crate::{
-    FixedArray, FixedByteArray, Global, Handle, HandleScope, HandleSet, HeapObject, HeapPtr,
-    InternedString, Map, MapKind, Object, ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR,
-    Smi, Tagged, TransitionLock, Value, Word, string_content_hash,
+    Context, FixedArray, FixedByteArray, Global, Handle, HandleScope, HandleSet, HeapObject,
+    HeapPtr, InternedString, Map, MapKind, Object, ObjectInit, ObjectSlotsInit, RootHandles,
+    STRONG_PTR, SlotFlags, SlotName, Smi, Tagged, TransitionLock, Value, Word,
+    string_content_hash,
 };
 use core::{
     alloc::Layout,
@@ -50,6 +51,16 @@ pub struct WellKnown {
     pub symbol_map: Global<Map>,
     pub accessor_pair_map: Global<Map>,
     pub callable_map: Global<Map>,
+    pub handler_table_map: Global<Map>,
+    pub context_map: Global<Map>,
+    /// `%Object.prototype%`: root of the ordinary-object prototype hierarchy.
+    pub object_prototype: Global<Object>,
+    /// `%Error.prototype%`: parent of all error instance maps.
+    pub error_prototype: Global<Object>,
+    /// Base map for ECMAScript error objects
+    pub error_map: Global<Map>,
+    /// TODO: Placeholder for now
+    pub empty_context: Global<Context>,
 }
 
 pub trait Heap: Sized + Send + Sync {
@@ -88,6 +99,66 @@ pub trait Heap: Sized + Send + Sync {
             // placeholder: `void` does not exist yet, fixed up below
             map.transitions.as_raw().store_raw(Smi::new(0).encode());
             global
+        }
+
+        /// Bootstrap a map with a single `CONST | PARENT` descriptor linking
+        /// it to `parent` in the prototype hierarchy.
+        fn bootstrap_map_with_parent(
+            local: &mut impl LocalHeap,
+            roots: &RootHandles,
+            map_map: Global<Map>,
+            kind: MapKind,
+            parent: Global<Object>,
+        ) -> Global<Map> {
+            let raw = local
+                .allocate_raw(Map::layout_for(1))
+                .expect("bootstrap map allocation");
+            let ptr = unsafe { HeapPtr::<Map>::new(raw.as_ptr().cast()) };
+            let global = roots.create_handle(Tagged::from_ptr(ptr));
+            let map = unsafe { global.get().as_mut() };
+            let host = map.erase();
+            map.header.map.set(local, host, map_map.as_tagged());
+            map.value_slot_count.set(local, host, Smi::new(0));
+            map.descriptor_count.set(local, host, Smi::new(1));
+            map.kind.set(local, host, Smi::new(kind.bits() as i64));
+            // placeholder: `void` does not exist yet, fixed up below
+            map.transitions.as_raw().store_raw(Smi::new(0).encode());
+            let d = map.descriptor(0);
+            d.name
+                .set(local, host, SlotName::from(Tagged::from_smi(Smi::new(1))).tagged());
+            d.flags.set(
+                local,
+                host,
+                Smi::new(SlotFlags::CONST.union(SlotFlags::PARENT).bits() as i64),
+            );
+            d.value
+                .set(local, host, parent.as_tagged().erase_tagged());
+            global
+        }
+
+        /// Bootstrap an ordinary empty object (no own properties) whose
+        /// `slots` array is a real, empty `FixedArray` so that later
+        /// transitions can extend it.
+        fn bootstrap_empty_object(
+            local: &mut impl LocalHeap,
+            roots: &RootHandles,
+            map: Global<Map>,
+            slots: Global<FixedArray>,
+            void: Global<Object>,
+        ) -> Global<Object> {
+            let raw = local
+                .allocate_raw(Object::layout_for())
+                .expect("bootstrap object allocation");
+            let ptr = unsafe { HeapPtr::<Object>::new(raw.as_ptr().cast()) };
+            let tagged = Tagged::from_ptr(ptr);
+            let obj = unsafe { ptr.as_mut() };
+            let host = obj.erase();
+            obj.header.map.set(local, host, map.as_tagged());
+            obj.slots.set(local, host, slots.as_tagged());
+            obj.elements
+                .set(local, host, void.as_tagged().erase_tagged());
+            obj.length.set(local, host, Smi::new(0));
+            roots.create_handle(tagged)
         }
 
         let map_map = {
@@ -132,6 +203,58 @@ pub trait Heap: Sized + Send + Sync {
         let symbol_map = bootstrap_map(&mut local, &roots, map_map, MapKind::SYMBOL);
         let accessor_pair_map = bootstrap_map(&mut local, &roots, map_map, MapKind::ACCESSOR_PAIR);
         let callable_map = bootstrap_map(&mut local, &roots, map_map, MapKind::CALLABLE_INFO);
+        let handler_table_map = bootstrap_map(&mut local, &roots, map_map, MapKind::HANDLER_TABLE);
+        let context_map = bootstrap_map(&mut local, &roots, map_map, MapKind::CONTEXT);
+
+        let object_prototype_map = bootstrap_map(
+            &mut local,
+            &roots,
+            map_map,
+            MapKind::OBJECT.union(MapKind::EXTENDABLE),
+        );
+
+        let empty_slots = {
+            let raw = local
+                .allocate_raw(FixedArray::layout_for(0))
+                .expect("bootstrap empty slots allocation");
+            let ptr = unsafe { HeapPtr::<FixedArray>::new(raw.as_ptr().cast()) };
+            let tagged = Tagged::from_ptr(ptr);
+            let slots = unsafe { ptr.as_mut() };
+            let host = slots.erase();
+            slots.header.map.set(&local, host, array_map.as_tagged());
+            slots.size.set(&local, host, Smi::new(0));
+            roots.create_handle(tagged)
+        };
+
+        let object_prototype =
+            bootstrap_empty_object(&mut local, &roots, object_prototype_map, empty_slots, void);
+
+        // undefined/true/false live in the ordinary hierarchy (their primitive
+        // boxing resolves against %Object.prototype%); null and the hole stay
+        // parentless on void_map (null has no prototype per spec).
+        let oddball_map = bootstrap_map_with_parent(
+            &mut local,
+            &roots,
+            map_map,
+            MapKind::OBJECT,
+            object_prototype,
+        );
+        let error_prototype_map = bootstrap_map_with_parent(
+            &mut local,
+            &roots,
+            map_map,
+            MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            object_prototype,
+        );
+        let error_prototype =
+            bootstrap_empty_object(&mut local, &roots, error_prototype_map, empty_slots, void);
+        let error_map = bootstrap_map_with_parent(
+            &mut local,
+            &roots,
+            map_map,
+            MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            error_prototype,
+        );
 
         local.no_gc(|nogc, _| {
             for map in [
@@ -145,6 +268,12 @@ pub trait Heap: Sized + Send + Sync {
                 &symbol_map,
                 &accessor_pair_map,
                 &callable_map,
+                &handler_table_map,
+                &context_map,
+                &object_prototype_map,
+                &oddball_map,
+                &error_prototype_map,
+                &error_map,
             ] {
                 map.heap_ref(nogc).transitions.clear(void.value());
             }
@@ -172,7 +301,7 @@ pub trait Heap: Sized + Send + Sync {
             roots.create_handle(tagged)
         }
 
-        let undefined = bootstrap_oddball(&mut local, &roots, void_map, void);
+        let undefined = bootstrap_oddball(&mut local, &roots, oddball_map, void);
         let null = bootstrap_oddball(&mut local, &roots, void_map, void);
 
         let empty_string = {
@@ -209,8 +338,22 @@ pub trait Heap: Sized + Send + Sync {
             roots.create_handle(tagged)
         };
 
-        let false_object = bootstrap_oddball(&mut local, &roots, void_map, void);
-        let true_object = bootstrap_oddball(&mut local, &roots, void_map, void);
+        let false_object = bootstrap_oddball(&mut local, &roots, oddball_map, void);
+        let true_object = bootstrap_oddball(&mut local, &roots, oddball_map, void);
+
+        let empty_context = {
+            let raw = local
+                .allocate_raw(Layout::new::<Context>())
+                .expect("bootstrap empty context allocation");
+            let ptr = unsafe { HeapPtr::<Context>::new(raw.as_ptr().cast()) };
+            let tagged = Tagged::from_ptr(ptr);
+            let context = unsafe { ptr.as_mut() };
+            let host = context.erase();
+            context.header.map.set(&local, host, context_map.as_tagged());
+            context.outer.clear(void.value());
+            context.slots.set(&local, host, empty_slots.as_tagged());
+            roots.create_handle(tagged)
+        };
 
         let known = WellKnown {
             map_map,
@@ -228,6 +371,12 @@ pub trait Heap: Sized + Send + Sync {
             symbol_map,
             accessor_pair_map,
             callable_map,
+            handler_table_map,
+            context_map,
+            object_prototype,
+            error_prototype,
+            error_map,
+            empty_context,
             roots,
         };
         self.set_known(known);

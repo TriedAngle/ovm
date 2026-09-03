@@ -35,8 +35,10 @@ impl<'a, H: Heap> NativeContext<'a, H> {
         self.vm.interner().intern(self.heap, scope, s)
     }
 
-    pub fn set_pending_exception(&self, err: VmError) {
-        self.state.set_pending_exception(err);
+    pub fn set_pending_exception(&mut self, err: VmError) {
+        let ex = crate::interpreter::error_from_vm_error(self.vm, self.heap, self.state, err)
+            .expect("error materialization must not fail");
+        self.state.set_pending_exception(ex);
     }
 
     pub fn handle_scope<R>(&mut self, f: impl FnOnce(&mut Self, HandleScope<'_>) -> R) -> R {
@@ -52,7 +54,7 @@ impl<'a, H: Heap> NativeContext<'a, H> {
         crate::interpreter::execute(self.vm, self.heap, self.state, callable, args)
     }
 
-    pub fn take_pending_exception(&self) -> Option<VmError> {
+    pub fn take_pending_exception(&self) -> Option<Value> {
         self.state.take_pending_exception()
     }
 
@@ -76,7 +78,9 @@ pub extern "C" fn native_trampoline<H: Heap>(
     match f(&mut nctx, args) {
         Ok(v) => v,
         Err(e) => {
-            nctx.set_pending_exception(e);
+            let ex = crate::interpreter::error_from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
+                .expect("error materialization must not fail");
+            thread.state.set_pending_exception(ex);
             EXCEPTION_SENTINEL
         }
     }

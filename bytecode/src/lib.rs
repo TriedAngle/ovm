@@ -47,6 +47,10 @@ pub enum Opcode {
     JumpIfFalsy,  // imm; jump if ToBoolean(acc) == false
 
     TestReferenceEqual, // reg; acc = true singleton iff bits(reg) == bits(acc), else false
+
+    // exception handling
+    Throw,   // acc -> pending exception
+    ReThrow, // acc -> pending exception
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -148,6 +152,8 @@ impl Opcode {
             b if b == JumpIfTruthy as u8 => JumpIfTruthy,
             b if b == JumpIfFalsy as u8 => JumpIfFalsy,
             b if b == TestReferenceEqual as u8 => TestReferenceEqual,
+            b if b == Throw as u8 => Throw,
+            b if b == ReThrow as u8 => ReThrow,
             _ => return None,
         })
     }
@@ -155,7 +161,7 @@ impl Opcode {
     pub const fn operands(self) -> &'static [Operand] {
         use Operand::*;
         match self {
-            Self::Wide | Self::Return => &[],
+            Self::Wide | Self::Return | Self::Throw | Self::ReThrow => &[],
 
             Self::Load => &[Register],
             Self::Store => &[Register],
