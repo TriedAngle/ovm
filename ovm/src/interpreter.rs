@@ -1,13 +1,14 @@
 use bytecode::{Opcode, decode};
 
 use vm::{
-    FixedArray, Float, Handle, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc, Object,
-    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, VMString, Value,
-    ValueRef,
+    Context, FixedArray, Float, Handle, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc,
+    Object, ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, VMString,
+    Value, ValueRef,
 };
 
 use crate::{
     ContextState, FrameMeta, Heap, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
+    natives::EXCEPTION_SENTINEL,
 };
 
 pub fn execute<H: Heap>(
@@ -163,6 +164,7 @@ fn call_value<H: Heap>(
     stack: &Stack,
     cache: &StackCache,
     meta: FrameMeta,
+    handler_pc: usize,
     f: Value,
     args: &[Value],
 ) -> Result<bool, VmError> {
@@ -171,7 +173,7 @@ fn call_value<H: Heap>(
     let Some(CallTarget::Bytecode(target, register_count)) = target else {
         return Ok(false);
     };
-    let callee = stack.push_frame_with_args(meta, target, register_count, args)?;
+    let callee = stack.push_frame_with_args(meta, handler_pc, target, register_count, args)?;
     cache.load(stack, callee, heap);
     Ok(true)
 }
@@ -194,6 +196,51 @@ fn store_transition<L: LocalHeap>(
             .create_handle(Tagged::from_value(value))
             .expect("value must be strong");
         Object::store_new_data_property(heap, receiver, name, value)
+    })
+}
+
+/// Materialize a VM error as an ECMAScript error object
+pub fn error_from_vm_error<H: Heap>(
+    vm: &VM<H>,
+    heap: &mut H::Local,
+    state: &ContextState,
+    err: VmError,
+) -> Result<Value, VmError> {
+    state.handle_scope(|scope| {
+        let name_string = vm.interner().intern(heap, &scope, "name");
+        let message_string = vm.interner().intern(heap, &scope, "message");
+        let name_value = vm.interner().intern(heap, &scope, err.name());
+        let message_value = vm.interner().intern(heap, &scope, err.message());
+
+        let map = scope
+            .create_handle(heap.known().error_map.as_tagged())
+            .expect("error map is strong");
+        let obj = heap
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[],
+                    elements: heap.known().void.value(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
+        let name = scope
+            .create_handle(SlotName::from(name_string.as_tagged()).tagged())
+            .expect("name is strong");
+        let message = scope
+            .create_handle(SlotName::from(message_string.as_tagged()).tagged())
+            .expect("message is strong");
+        let name_value = scope
+            .create_handle(Tagged::from_value(name_value.value()))
+            .expect("name value is strong");
+        let message_value = scope
+            .create_handle(Tagged::from_value(message_value.value()))
+            .expect("message value is strong");
+        Object::store_new_data_property(heap, obj, name, name_value)?;
+        Object::store_new_data_property(heap, obj, message, message_value)?;
+        Ok(obj.value())
     })
 }
 
@@ -243,7 +290,74 @@ fn jump_target(pc: usize, offset: i32) -> usize {
     pc.wrapping_add_signed(offset as isize)
 }
 
+/// Result of an exception unwind.
+enum Unwind {
+    /// A handler was found: the accumulator must become the exception
+    Caught(Value),
+    /// No handler in this run: the exception escapes with the exception
+    /// sentinel in the accumulator
+    Escaped,
+}
+
+fn exception_dispatch<L: LocalHeap>(
+    heap: &mut L,
+    state: &ContextState,
+    base_depth: usize,
+    mut pc: usize,
+) -> Unwind {
+    let stack = &state.stack;
+    let cache = &state.cache;
+    loop {
+        let handled = heap.no_gc(|nogc, heap| {
+            let ValueRef::Object(obj) = stack
+                .callable_slot(&cache.frame_meta())
+                .inner()
+                .value_ref(nogc)
+            else {
+                return None;
+            };
+            let info = obj.as_ref().callable_info(nogc, heap)?;
+            info.handlers.heap_ref(nogc, heap)?.lookup(pc)
+        });
+        if let Some(handler_pc) = handled {
+            let ex = state
+                .take_pending_exception()
+                .expect("pending exception must be set while unwinding");
+            cache.set_pc(handler_pc);
+            return Unwind::Caught(ex);
+        }
+        if stack.frame_depth() == base_depth {
+            return Unwind::Escaped;
+        }
+        let base = cache.frame_meta().base;
+        let caller = stack
+            .pop_frame(base)
+            .expect("suspended frame above base depth");
+        cache.load(stack, caller, heap);
+        pc = caller.handler_pc;
+    }
+}
+
+fn raise<H: Heap>(
+    vm: &VM<H>,
+    heap: &mut H::Local,
+    state: &ContextState,
+    base_depth: usize,
+    acc: Value,
+    err: VmError,
+    pc: usize,
+) -> Unwind {
+    let cache = &state.cache;
+    cache.spill_acc(acc);
+    let ex = error_from_vm_error(vm, heap, state, err)
+        .expect("error materialization must not fail");
+    let _ = cache.take_acc();
+    state.set_pending_exception(ex);
+    exception_dispatch(heap, state, base_depth, pc)
+}
+
 // TODO: pass stack and cache directly, could be benificial for threading dispatch later
+// TODO: cleanup error handling here
 fn dispatch<H: Heap>(
     vm: &VM<H>,
     heap: &mut H::Local,
@@ -260,7 +374,6 @@ fn dispatch<H: Heap>(
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
-        // TODO: actually handle `Result` instead of just `?`
         match op {
             Opcode::Return => {
                 // a nested run stops above the frame suspended on its entry
@@ -291,11 +404,41 @@ fn dispatch<H: Heap>(
             }
             Opcode::Add => {
                 // TODO: JS semantics
-                let a = Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)?;
-                let b = Smi::decode(stack.reg(&meta, ops.reg(1))).ok_or(VmError::Type)?;
-                let r = a.value().checked_add(b.value()).ok_or(VmError::Overflow)?;
+                let Some(a) = Smi::decode(stack.reg(&meta, ops.reg(0))) else {
+                    match raise(vm, heap, state, base_depth, acc, VmError::Type, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    }
+                };
+                let Some(b) = Smi::decode(stack.reg(&meta, ops.reg(1))) else {
+                    match raise(vm, heap, state, base_depth, acc, VmError::Type, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    }
+                };
+                let Some(r) = a.value().checked_add(b.value()) else {
+                    match raise(vm, heap, state, base_depth, acc, VmError::Overflow, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    }
+                };
                 if !Smi::in_range(r) {
-                    return Err(VmError::Overflow);
+                    match raise(vm, heap, state, base_depth, acc, VmError::Overflow, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    }
                 }
                 acc = Smi::new(r).encode();
             }
@@ -327,37 +470,104 @@ fn dispatch<H: Heap>(
                     known.false_object.value()
                 };
             }
+            Opcode::Throw | Opcode::ReThrow => {
+                state.set_pending_exception(acc);
+                match exception_dispatch(heap, state, base_depth, pc) {
+                    Unwind::Caught(ex) => {
+                        acc = ex;
+                        continue;
+                    }
+                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                }
+            }
             Opcode::CallNative => {
                 let f = vm.native(NativeIndex(ops.idx(0)));
                 let count = ops.reg_count(2);
                 let mut nctx = NativeContext::new(vm, heap, state);
                 cache.spill_acc(acc);
                 let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
-                let _ = cache.take_acc();
-                acc = result?;
+                let saved = cache.take_acc();
+                match result {
+                    Ok(v) if v == EXCEPTION_SENTINEL => {
+                        match exception_dispatch(heap, state, base_depth, pc) {
+                            Unwind::Caught(ex) => {
+                                acc = ex;
+                                continue;
+                            }
+                            Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        }
+                    }
+                    Ok(v) => acc = v,
+                    Err(err) => {
+                        match raise(vm, heap, state, base_depth, saved, err, pc) {
+                            Unwind::Caught(ex) => {
+                                acc = ex;
+                                continue;
+                            }
+                            Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        }
+                    }
+                }
             }
             // TODO: feedback vectors and separation once they are there
             Opcode::Call | Opcode::CallNoFeedback => {
                 let count = ops.reg_count(2);
                 let target =
                     heap.no_gc(|nogc, heap| call_target(nogc, heap, stack.reg(&meta, ops.reg(0))));
-                match target.ok_or(VmError::Type)? {
+                let target = match target {
+                    Some(target) => target,
+                    None => match raise(vm, heap, state, base_depth, acc, VmError::Type, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    },
+                };
+                match target {
                     CallTarget::Native(idx) => {
                         let f = vm.native(NativeIndex(idx));
                         let mut nctx = NativeContext::new(vm, heap, state);
                         cache.spill_acc(acc);
                         let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
-                        let _ = cache.take_acc();
-                        acc = result?;
+                        let saved = cache.take_acc();
+                        match result {
+                            Ok(v) if v == EXCEPTION_SENTINEL => {
+                                match exception_dispatch(heap, state, base_depth, pc) {
+                                    Unwind::Caught(ex) => {
+                                        acc = ex;
+                                        continue;
+                                    }
+                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                }
+                            }
+                            Ok(v) => acc = v,
+                            Err(err) => {
+                                match raise(vm, heap, state, base_depth, saved, err, pc) {
+                                    Unwind::Caught(ex) => {
+                                        acc = ex;
+                                        continue;
+                                    }
+                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                }
+                            }
+                        }
                     }
                     CallTarget::Bytecode(target, register_count) => {
-                        let callee = stack.push_frame(
-                            meta,
-                            target,
-                            register_count,
-                            ops.reg_list(1),
-                            count,
-                        )?;
+                        let callee = stack
+                            .push_frame(meta, pc, target, register_count, ops.reg_list(1), count);
+                        let callee = match callee {
+                            Ok(callee) => callee,
+                            Err(err) => {
+                                match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                    Unwind::Caught(ex) => {
+                                        acc = ex;
+                                        continue;
+                                    }
+                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                }
+                            }
+                        };
                         cache.load(stack, callee, heap);
                     }
                 }
@@ -371,7 +581,21 @@ fn dispatch<H: Heap>(
                     LoadOutcome::Value(v) => acc = v,
                     LoadOutcome::Getter(getter) => {
                         let receiver = stack.reg(&meta, ops.reg(0));
-                        if !call_value::<H>(heap, stack, cache, meta, getter, &[receiver])? {
+                        let called =
+                            call_value::<H>(heap, stack, cache, meta, pc, getter, &[receiver]);
+                        let called = match called {
+                            Ok(called) => called,
+                            Err(err) => {
+                                match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                    Unwind::Caught(ex) => {
+                                        acc = ex;
+                                        continue;
+                                    }
+                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                }
+                            }
+                        };
+                        if !called {
                             // non-callable getter: the load yields undefined
                             acc = heap.known().undefined.value();
                         }
@@ -388,17 +612,48 @@ fn dispatch<H: Heap>(
                     stack
                         .reg(&meta, ops.reg(0))
                         .store_lookup(nogc, heap, name, acc, semantics)
-                })?;
+                });
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    },
+                };
                 match outcome {
                     StoreOutcome::Transition { receiver, name } => {
                         cache.spill_acc(acc);
                         let result = store_transition(heap, state, receiver, name, acc);
                         let _ = cache.take_acc();
-                        result?;
+                        if let Err(err) = result {
+                            match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
+                                }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            }
+                        }
                     }
                     StoreOutcome::CallSetter { setter } => {
                         let receiver = stack.reg(&meta, ops.reg(0));
-                        call_value::<H>(heap, stack, cache, meta, setter, &[receiver, acc])?;
+                        let called =
+                            call_value::<H>(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
+                        match called {
+                            Ok(_) => {}
+                            Err(err) => {
+                                match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                    Unwind::Caught(ex) => {
+                                        acc = ex;
+                                        continue;
+                                    }
+                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                }
+                            }
+                        }
                     }
                     StoreOutcome::Done => {}
                 }
@@ -413,12 +668,36 @@ fn dispatch<H: Heap>(
                         }
                         Key::Name(name) => Ok(load_outcome(nogc, heap, receiver, name)),
                     }
-                })?;
+                });
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    },
+                };
                 match outcome {
                     LoadOutcome::Value(v) => acc = v,
                     LoadOutcome::Getter(getter) => {
                         let receiver = stack.reg(&meta, ops.reg(0));
-                        if !call_value::<H>(heap, stack, cache, meta, getter, &[receiver])? {
+                        let called =
+                            call_value::<H>(heap, stack, cache, meta, pc, getter, &[receiver]);
+                        let called = match called {
+                            Ok(called) => called,
+                            Err(err) => {
+                                match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                    Unwind::Caught(ex) => {
+                                        acc = ex;
+                                        continue;
+                                    }
+                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                }
+                            }
+                        };
+                        if !called {
                             acc = heap.known().undefined.value();
                         }
                     }
@@ -440,17 +719,48 @@ fn dispatch<H: Heap>(
                         }
                         Key::Name(name) => receiver.store_lookup(nogc, heap, name, acc, semantics),
                     }
-                })?;
+                });
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    },
+                };
                 match outcome {
                     StoreOutcome::Transition { receiver, name } => {
                         cache.spill_acc(acc);
                         let result = store_transition(heap, state, receiver, name, acc);
                         let _ = cache.take_acc();
-                        result?;
+                        if let Err(err) = result {
+                            match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
+                                }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            }
+                        }
                     }
                     StoreOutcome::CallSetter { setter } => {
                         let receiver = stack.reg(&meta, ops.reg(0));
-                        call_value::<H>(heap, stack, cache, meta, setter, &[receiver, acc])?;
+                        let called =
+                            call_value::<H>(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
+                        match called {
+                            Ok(_) => {}
+                            Err(err) => {
+                                match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                    Unwind::Caught(ex) => {
+                                        acc = ex;
+                                        continue;
+                                    }
+                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                }
+                            }
+                        }
                     }
                     StoreOutcome::Done => {}
                 }
@@ -461,7 +771,17 @@ fn dispatch<H: Heap>(
                     v.get_as::<Map>(nogc, heap.known().map_map)
                         .map(|r| r.into_tagged())
                         .ok_or(VmError::Type)
-                })?;
+                });
+                let map = match map {
+                    Ok(map) => map,
+                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    },
+                };
                 let count = ops.reg_count(2);
                 cache.spill_acc(acc);
                 let args = stack.args(&meta, ops.reg_list(1), count);
@@ -504,21 +824,32 @@ fn dispatch<H: Heap>(
                         .as_ref()
                         .callable_info(nogc, heap)
                         .ok_or(VmError::Type)?;
-                    let ValueRef::Object(context) = info.context.inner().value_ref(nogc) else {
-                        return Err(VmError::Type);
-                    };
+                    let context = info
+                        .context
+                        .inner()
+                        .get_as::<Context>(nogc, heap.known().context_map)
+                        .ok_or(VmError::Type)?;
                     Ok(context
-                        .as_ref()
                         .slots
                         .heap_ref(nogc)
                         .as_ref()
                         .element_slot(ops.idx(0))
                         .inner())
-                })?;
+                });
+                let v = match v {
+                    Ok(v) => v,
+                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    },
+                };
                 acc = v;
             }
             Opcode::StoreContextSlot => {
-                heap.no_gc(|nogc, heap| {
+                let result = heap.no_gc(|nogc, heap| {
                     let ValueRef::Object(obj) = stack.callable_slot(&meta).inner().value_ref(nogc)
                     else {
                         return Err(VmError::Type);
@@ -528,17 +859,27 @@ fn dispatch<H: Heap>(
                         .callable_info(nogc, heap)
                         .ok_or(VmError::Type)?;
                     let host = info.context.inner();
-                    let ValueRef::Object(context) = info.context.inner().value_ref(nogc) else {
-                        return Err(VmError::Type);
-                    };
+                    let context = info
+                        .context
+                        .inner()
+                        .get_as::<Context>(nogc, heap.known().context_map)
+                        .ok_or(VmError::Type)?;
                     context
-                        .as_ref()
                         .slots
                         .heap_ref(nogc)
                         .element_slot(ops.idx(0))
                         .set(heap, host, Tagged::from_value(acc));
                     Ok(())
-                })?;
+                });
+                if let Err(err) = result {
+                    match raise(vm, heap, state, base_depth, acc, err, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
+                        }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    }
+                }
             }
             Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),
         }

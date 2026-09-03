@@ -87,6 +87,8 @@ impl StackCache {
             base: cache.base,
             pc: cache.pc,
             register_count: cache.register_count,
+            // Placeholder
+            handler_pc: 0,
         }
     }
 

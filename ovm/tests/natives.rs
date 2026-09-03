@@ -69,8 +69,32 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
     );
 
     assert_eq!(result, EXCEPTION_SENTINEL);
-    assert_eq!(thread.take_pending_exception(), Some(VmError::Arity));
+    let ex = thread.take_pending_exception().expect("pending exception set");
     assert!(!thread.has_pending_exception());
+
+    // the pending value is a materialized TypeError object (Arity -> TypeError)
+    let name = thread.handle_scope(|thread, scope| {
+        let name = thread.intern(&scope, "name").value();
+        let type_error = thread.intern(&scope, "TypeError").value();
+        thread.heap().no_gc(|nogc, heap| {
+            let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
+                panic!("pending exception must be an object");
+            };
+            match o
+                .as_ref()
+                .lookup(nogc, heap, vm::SlotName::from_value(name))
+            {
+                vm::Lookup::Data { slot, .. } => {
+                    assert_eq!(slot.inner(), type_error);
+                }
+                _ => panic!("error object must have a name property"),
+            }
+        });
+        type_error
+    });
+    assert_eq!(name, {
+        thread.handle_scope(|thread, scope| thread.intern(&scope, "TypeError").value())
+    });
 }
 
 #[test]

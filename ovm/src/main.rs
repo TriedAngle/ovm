@@ -1,11 +1,63 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::VM;
 use ovm::natives::NativeIndex;
+use ovm::{EXCEPTION_SENTINEL, Thread, VM};
 use vm::{
-    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, LocalHeap, Map,
-    MapInit, MapKind, ObjectSlotsInit, Smi,
+    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandlerEntryInit,
+    HandlerTable, HandlerTableInit, HandleScope, LocalHeap, Map, MapInit, MapKind, Object,
+    ObjectSlotsInit, Smi,
 };
+
+/// Build a bytecode callable object (empty constants table).
+fn callable<'s>(
+    thread: &mut Thread<DummyHeap>,
+    scope: &'s HandleScope<'_>,
+    program: &[u8],
+    register_count: usize,
+    handlers: Option<&[HandlerEntryInit]>,
+) -> Handle<'s, Object> {
+    let void = thread.heap().known().void.value();
+    let empty_context = thread.heap().known().empty_context;
+    let bytecode = thread
+        .heap()
+        .allocate_handle::<FixedByteArray>(program, scope);
+    let constants = thread.heap().allocate_handle::<FixedArray>(&[], scope);
+    let handlers = handlers.map(|entries| {
+        thread
+            .heap()
+            .allocate_handle::<HandlerTable>(HandlerTableInit { entries }, scope)
+    });
+    let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+        CallableInfoInit {
+            bytecode,
+            constants,
+            register_count,
+            context: empty_context,
+            handlers,
+        },
+        scope,
+    );
+    let callable_map = thread.heap().allocate_handle::<Map>(
+        MapInit {
+            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
+            value_slot_count: 1,
+            descriptors: &[],
+        },
+        scope,
+    );
+    thread
+        .heap()
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map: callable_map,
+                values: &[callable.as_tagged().erase()],
+                elements: void,
+                length: 0,
+            },
+        )
+        .into_handle(scope)
+}
 
 fn main() {
     let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).expect("failed to create heap");
@@ -63,49 +115,54 @@ fn main() {
     emit(&mut program, Opcode::Return, &[]);
 
     let result = thread.handle_scope(|thread, scope| {
-        // TODO: we should have a helper for this callable object creation section
-        let void = thread.heap().known().void.value();
-        let bytecode = thread
-            .heap()
-            .allocate_handle::<FixedByteArray>(program.as_slice(), &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
-        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
-            CallableInfoInit {
-                bytecode,
-                constants,
-                register_count: 2,
-                context: void,
-            },
-            &scope,
-        );
-        let callable_map = thread.heap().allocate_handle::<Map>(
-            MapInit {
-                kind: MapKind::OBJECT.union(MapKind::CALLABLE),
-                value_slot_count: 1,
-                descriptors: &[],
-            },
-            &scope,
-        );
-        let callable_obj = thread
-            .heap()
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map: callable_map,
-                    values: &[callable.as_tagged().erase()],
-                    elements: void,
-                    length: 0,
-                },
-            )
-            .into_handle(&scope);
-        thread.execute(callable_obj, &[])
+        let callable = callable(thread, &scope, &program, 2, None);
+        thread.execute(callable, &[])
     });
+    println!(
+        "6 + 7 = {}",
+        Smi::decode(result.unwrap()).unwrap().value()
+    );
 
+    // try { throw 42 } catch (e) { return e }
+    // 0: LoadSmi 42 | 2: Throw | 3: Return | 4: Store r0 | 6: Load r0 | 8: Return
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[42]);
+    emit(&mut program, Opcode::Throw, &[]);
+    emit(&mut program, Opcode::Return, &[]);
+    emit(&mut program, Opcode::Store, &[0]); // handler: bind e in r0
+    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = thread.handle_scope(|thread, scope| {
+        let callable = callable(
+            thread,
+            &scope,
+            &program,
+            1,
+            Some(&[HandlerEntryInit::new(0, 3, 4)]),
+        );
+        thread.execute(callable, &[])
+    });
+    println!(
+        "try {{ throw 42 }} catch (e) => e = {}",
+        Smi::decode(result.unwrap()).unwrap().value()
+    );
+
+    // throw 7 with no handler: escapes the run as the exception sentinel
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[7]);
+    emit(&mut program, Opcode::Throw, &[]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = thread.handle_scope(|thread, scope| {
+        let callable = callable(thread, &scope, &program, 0, None);
+        thread.execute(callable, &[])
+    });
     match result {
-        Ok(acc) => println!("result: {}", Smi::decode(acc).unwrap().value()),
-        Err(err) => {
-            eprintln!("runtime error: {err:?}");
-            std::process::exit(1);
+        Ok(v) if v == EXCEPTION_SENTINEL => {
+            let ex = thread.take_pending_exception().expect("pending exception");
+            println!("throw 7 (uncaught): escaped, pending exception = {ex:?}");
         }
+        other => panic!("expected uncaught escape, got {other:?}"),
     }
 }

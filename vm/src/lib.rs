@@ -14,7 +14,8 @@ pub use heap::{
 };
 pub use lookup::Lookup;
 pub use object::{
-    AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Header,
+    AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
+    FixedByteArray, Float, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit, Header,
     HeapObject, InternedString, Map, MapInit, MapKind, Object, ObjectInit, ObjectKind,
     ObjectSlotsInit, SlotDescriptor, SlotFlags, SlotKind, SlotName, Symbol, VMString,
     string_content_hash,
