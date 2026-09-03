@@ -1,5 +1,5 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::natives::{EXCEPTION_SENTINEL, NativeContext, NativeIndex, native_trampoline};
+use ovm::natives::{NativeContext, NativeIndex, native_trampoline};
 use ovm::{Thread, VM, VmError};
 use vm::{Float, Smi, Value};
 
@@ -68,7 +68,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
         args.len() as u32,
     );
 
-    assert_eq!(result, EXCEPTION_SENTINEL);
+    assert_eq!(result, vm.heap().known().exception.value());
     let ex = thread
         .take_pending_exception()
         .expect("pending exception set");

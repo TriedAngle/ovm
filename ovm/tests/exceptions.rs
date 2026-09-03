@@ -1,6 +1,6 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{EXCEPTION_SENTINEL, Thread, VM, VmError};
+use ovm::{Thread, VM, VmError};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
     HandlerTable, HandlerTableInit, Map, MapInit, MapKind, ObjectSlotsInit, Smi, Value,
@@ -118,7 +118,7 @@ fn throw_any_value_escapes_as_sentinel() {
             &[],
         )
     });
-    assert_eq!(result, Ok(EXCEPTION_SENTINEL));
+    assert_eq!(result, Ok(thread.heap().known().exception.value()));
     assert_eq!(
         thread.take_pending_exception(),
         Some(smi(42)),
@@ -235,7 +235,7 @@ fn rethrow_from_finally_escapes_past_its_own_handler() {
             &[],
         )
     });
-    assert_eq!(result, Ok(EXCEPTION_SENTINEL));
+    assert_eq!(result, Ok(thread.heap().known().exception.value()));
     assert_eq!(thread.take_pending_exception(), Some(smi(3)));
 }
 
@@ -259,7 +259,7 @@ fn stack_overflow_during_call_is_throwable() {
             .unwrap();
         thread.execute(handle, &[f])
     });
-    assert_eq!(result, Ok(EXCEPTION_SENTINEL));
+    assert_eq!(result, Ok(thread.heap().known().exception.value()));
     let ex = thread.take_pending_exception().expect("pending exception");
     let expected = thread.handle_scope(|thread, scope| thread.intern(&scope, "RangeError").value());
     thread.handle_scope(|thread, scope| {

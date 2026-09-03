@@ -6,10 +6,7 @@ use vm::{
     ValueRef,
 };
 
-use crate::{
-    ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
-    natives::EXCEPTION_SENTINEL,
-};
+use crate::{ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError};
 
 pub fn execute(
     vm: &VM,
@@ -362,7 +359,6 @@ fn dispatch(
 ) -> Result<Value, VmError> {
     let stack = &state.stack;
     let cache = &state.cache;
-
     let mut acc = heap.known().undefined.value();
     loop {
         let pc = cache.pc();
@@ -406,7 +402,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     }
                 };
                 let Some(b) = Smi::decode(stack.reg(&meta, ops.reg(1))) else {
@@ -415,7 +411,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     }
                 };
                 let Some(r) = a.value().checked_add(b.value()) else {
@@ -424,7 +420,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     }
                 };
                 if !Smi::in_range(r) {
@@ -433,7 +429,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     }
                 }
                 acc = Smi::new(r).encode();
@@ -473,7 +469,7 @@ fn dispatch(
                         acc = ex;
                         continue;
                     }
-                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    Unwind::Escaped => return Ok(heap.known().exception.value()),
                 }
             }
             Opcode::CallNative => {
@@ -484,13 +480,13 @@ fn dispatch(
                 let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
                 let saved = cache.take_acc();
                 match result {
-                    Ok(v) if v == EXCEPTION_SENTINEL => {
+                    Ok(v) if v == heap.known().exception.value() => {
                         match exception_dispatch(heap, state, base_depth, pc) {
                             Unwind::Caught(ex) => {
                                 acc = ex;
                                 continue;
                             }
-                            Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            Unwind::Escaped => return Ok(heap.known().exception.value()),
                         }
                     }
                     Ok(v) => acc = v,
@@ -499,7 +495,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     },
                 }
             }
@@ -515,7 +511,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     },
                 };
                 match target {
@@ -526,13 +522,13 @@ fn dispatch(
                         let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
                         let saved = cache.take_acc();
                         match result {
-                            Ok(v) if v == EXCEPTION_SENTINEL => {
+                            Ok(v) if v == heap.known().exception.value() => {
                                 match exception_dispatch(heap, state, base_depth, pc) {
                                     Unwind::Caught(ex) => {
                                         acc = ex;
                                         continue;
                                     }
-                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                    Unwind::Escaped => return Ok(heap.known().exception.value()),
                                 }
                             }
                             Ok(v) => acc = v,
@@ -541,7 +537,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             },
                         }
                     }
@@ -561,7 +557,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             },
                         };
                         cache.load(stack, callee, heap);
@@ -585,7 +581,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             },
                         };
                         if !called {
@@ -613,7 +609,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     },
                 };
                 match outcome {
@@ -627,7 +623,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             }
                         }
                     }
@@ -642,7 +638,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             },
                         }
                     }
@@ -667,7 +663,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     },
                 };
                 match outcome {
@@ -682,7 +678,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             },
                         };
                         if !called {
@@ -715,7 +711,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     },
                 };
                 match outcome {
@@ -729,7 +725,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             }
                         }
                     }
@@ -744,7 +740,7 @@ fn dispatch(
                                     acc = ex;
                                     continue;
                                 }
-                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                                Unwind::Escaped => return Ok(heap.known().exception.value()),
                             },
                         }
                     }
@@ -765,7 +761,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     },
                 };
                 let count = ops.reg_count(2);
@@ -829,7 +825,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     },
                 };
                 acc = v;
@@ -863,7 +859,7 @@ fn dispatch(
                             acc = ex;
                             continue;
                         }
-                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                        Unwind::Escaped => return Ok(heap.known().exception.value()),
                     }
                 }
             }

@@ -1,6 +1,6 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{EXCEPTION_SENTINEL, NativeContext, NativeIndex, Thread, VM, VmError};
+use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle,
     HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
@@ -14,7 +14,11 @@ fn smi(v: i64) -> Value {
 /// Assert a run escaped uncaught: the sentinel is returned and the pending
 /// exception is a materialized error object of the given class name.
 fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &str) -> Value {
-    assert_eq!(result, Ok(EXCEPTION_SENTINEL), "run must escape uncaught");
+    assert_eq!(
+        result,
+        Ok(thread.heap().known().exception.value()),
+        "run must escape uncaught"
+    );
     let ex = thread.take_pending_exception().expect("pending exception");
     assert!(!thread.has_pending_exception(), "pending cleared on take");
     let expected_name = thread.handle_scope(|thread, scope| thread.intern(&scope, class).value());
@@ -1455,7 +1459,7 @@ fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Va
         let caller = bytecode_fn(nctx, &scope, &program, &[callee], 1);
 
         match nctx.call(caller, &[]) {
-            Ok(EXCEPTION_SENTINEL) => {
+            Ok(exc) if exc == nctx.heap().known().exception.value() => {
                 // the exception escapes the nested run as the sentinel with
                 // the pending exception set; the native recovers by
                 // clearing it

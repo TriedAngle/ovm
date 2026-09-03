@@ -41,6 +41,8 @@ pub struct WellKnown {
     pub null: Global<Object>,
     pub false_object: Global<Object>,
     pub true_object: Global<Object>,
+    /// Never user-visible: a call returning it signals a pending exception.
+    pub exception: Global<Object>,
     /// Canonical empty string (synced with intern)
     pub empty_string: Global<InternedString>,
     /// Shared empty backing for objects without data slots (never written in
@@ -62,6 +64,8 @@ pub struct WellKnown {
     pub error_prototype: Global<Object>,
     /// Base map for ECMAScript error objects
     pub error_map: Global<Map>,
+    /// exception map
+    pub exception_map: Global<Map>,
     /// TODO: Placeholder for now
     pub empty_context: Global<Context>,
 }
@@ -83,6 +87,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         null: obj,
         false_object: obj,
         true_object: obj,
+        exception: obj,
         empty_string: string,
         empty_fixed_array: array,
         smi_map: map,
@@ -98,6 +103,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         object_prototype: obj,
         error_prototype: obj,
         error_map: map,
+        exception_map: map,
         empty_context: context,
     }
 }
@@ -244,6 +250,9 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let false_object = alloc_object(heap, &scope, roots, oddball_map);
     let true_object = alloc_object(heap, &scope, roots, oddball_map);
 
+    let exception_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
+    let exception = alloc_object(heap, &scope, roots, exception_map);
+
     let empty_string = {
         let backing = heap.allocate::<FixedByteArray>(&[]).into_handle(&scope);
         heap.allocate::<InternedString>((backing, string_content_hash(b"")))
@@ -261,10 +270,12 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.null = null;
     known.false_object = false_object;
     known.true_object = true_object;
+    known.exception = exception;
     known.empty_string = empty_string;
     known.object_prototype = object_prototype;
     known.error_prototype = error_prototype;
     known.error_map = error_map;
+    known.exception_map = exception_map;
     known.empty_context = empty_context;
     heap.set_known(known);
 }
