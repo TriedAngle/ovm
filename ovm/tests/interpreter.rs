@@ -1224,7 +1224,9 @@ fn native_function<'s>(
     let void = thread.heap().known().void.value();
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
-            kind: MapKind::OBJECT.union(MapKind::CALLABLE).union(MapKind::NATIVE),
+            kind: MapKind::OBJECT
+                .union(MapKind::CALLABLE)
+                .union(MapKind::NATIVE),
             value_slot_count: 1,
             descriptors: &[],
         },
@@ -1253,7 +1255,9 @@ fn bytecode_fn(
     register_count: usize,
 ) -> Value {
     let void = nctx.heap().known().void.value();
-    let bytecode = nctx.heap().allocate_handle::<FixedByteArray>(program, scope);
+    let bytecode = nctx
+        .heap()
+        .allocate_handle::<FixedByteArray>(program, scope);
     let constants = nctx.heap().allocate_handle::<FixedArray>(constants, scope);
     let info = nctx.heap().allocate_handle::<CallableInfoObject>(
         CallableInfoInit {

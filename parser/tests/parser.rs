@@ -944,17 +944,27 @@ fn class_early_errors() {
 #[test]
 fn generator_functions() {
     let ast = parse("function* g() {} var h = function*() {};");
-    let FunctionDecl { function } = *stmt(&ast, 0) else { panic!() };
+    let FunctionDecl { function } = *stmt(&ast, 0) else {
+        panic!()
+    };
     assert!(ast.function(function).is_generator);
     assert!(!ast.function(function).is_arrow);
-    let VarDecl { decls, .. } = *stmt(&ast, 1) else { panic!() };
-    let VarDeclarator { init, .. } = *ast.node(ast.list_items(decls)[0]) else { panic!() };
-    let FunctionExpr { function } = *ast.node(init.unwrap()) else { panic!() };
+    let VarDecl { decls, .. } = *stmt(&ast, 1) else {
+        panic!()
+    };
+    let VarDeclarator { init, .. } = *ast.node(ast.list_items(decls)[0]) else {
+        panic!()
+    };
+    let FunctionExpr { function } = *ast.node(init.unwrap()) else {
+        panic!()
+    };
     assert!(ast.function(function).is_generator);
 
     // plain functions are unaffected
     let ast = parse("function f() {}");
-    let FunctionDecl { function } = *stmt(&ast, 0) else { panic!() };
+    let FunctionDecl { function } = *stmt(&ast, 0) else {
+        panic!()
+    };
     assert!(!ast.function(function).is_generator);
 }
 
@@ -962,22 +972,38 @@ fn generator_functions() {
 fn arrow_functions() {
     // single ident param, expression body gets an implicit return
     let ast = parse("x => x + 1;");
-    let FunctionExpr { function } = *expr(&ast, 0) else { panic!() };
+    let FunctionExpr { function } = *expr(&ast, 0) else {
+        panic!()
+    };
     let f = ast.function(function);
     assert!(f.is_arrow);
     assert_eq!(f.params.len(), 1);
-    let Block { stmts } = ast.node(f.body.unwrap()) else { panic!() };
-    let Return { value } = *ast.node(ast.list_items(*stmts)[0]) else { panic!() };
-    assert!(matches!(ast.node(value.unwrap()), Binary { op: TokenKind::Plus, .. }));
+    let Block { stmts } = ast.node(f.body.unwrap()) else {
+        panic!()
+    };
+    let Return { value } = *ast.node(ast.list_items(*stmts)[0]) else {
+        panic!()
+    };
+    assert!(matches!(
+        ast.node(value.unwrap()),
+        Binary {
+            op: TokenKind::Plus,
+            ..
+        }
+    ));
 
     // parenthesized params
     let ast = parse("(a, b) => a * b;");
-    let FunctionExpr { function } = *expr(&ast, 0) else { panic!() };
+    let FunctionExpr { function } = *expr(&ast, 0) else {
+        panic!()
+    };
     assert_eq!(ast.function(function).params.len(), 2);
 
     // empty params, block body
     let ast = parse("() => { return 42; };");
-    let FunctionExpr { function } = *expr(&ast, 0) else { panic!() };
+    let FunctionExpr { function } = *expr(&ast, 0) else {
+        panic!()
+    };
     assert!(ast.function(function).params.is_empty());
 
     // trailing comma
@@ -985,14 +1011,26 @@ fn arrow_functions() {
 
     // arrows nest (right-associative bodies)
     let ast = parse("x => y => x;");
-    let FunctionExpr { function } = *expr(&ast, 0) else { panic!() };
-    let Block { stmts } = ast.node(ast.function(function).body.unwrap()) else { panic!() };
-    let Return { value } = *ast.node(ast.list_items(*stmts)[0]) else { panic!() };
+    let FunctionExpr { function } = *expr(&ast, 0) else {
+        panic!()
+    };
+    let Block { stmts } = ast.node(ast.function(function).body.unwrap()) else {
+        panic!()
+    };
+    let Return { value } = *ast.node(ast.list_items(*stmts)[0]) else {
+        panic!()
+    };
     assert!(matches!(ast.node(value.unwrap()), FunctionExpr { .. }));
 
     // parens without `=>` are still expressions
     let ast = parse("(a + b) * c;");
-    assert!(matches!(expr(&ast, 0), Binary { op: TokenKind::Star, .. }));
+    assert!(matches!(
+        expr(&ast, 0),
+        Binary {
+            op: TokenKind::Star,
+            ..
+        }
+    ));
 
     // newline before => is an error
     parse_err("x\n=> 1;");

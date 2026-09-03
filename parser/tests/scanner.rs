@@ -184,10 +184,10 @@ b' 'é'"#,
             b"a".to_vec(),
             b"b".to_vec(),
             b"x\ny".to_vec(),
-            b"AA".to_vec(), // \x41 = A
-            b"A".to_vec(),  // A
-            b"B".to_vec(),  // B
-            b"ab".to_vec(), // line continuation
+            b"AA".to_vec(),   // \x41 = A
+            b"A".to_vec(),    // A
+            b"B".to_vec(),    // B
+            b"ab".to_vec(),   // line continuation
             vec![0xC3, 0xA9], // é as UTF-8 (WTF-8) bytes
         ]
     );

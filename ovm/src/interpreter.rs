@@ -10,7 +10,6 @@ use crate::{
     ContextState, FrameMeta, Heap, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
 };
 
-
 pub fn execute<H: Heap>(
     vm: &VM<H>,
     heap: &mut H::Local,
@@ -340,9 +339,8 @@ fn dispatch<H: Heap>(
             // TODO: feedback vectors and separation once they are there
             Opcode::Call | Opcode::CallNoFeedback => {
                 let count = ops.reg_count(2);
-                let target = heap.no_gc(|nogc, heap| {
-                    call_target(nogc, heap, stack.reg(&meta, ops.reg(0)))
-                });
+                let target =
+                    heap.no_gc(|nogc, heap| call_target(nogc, heap, stack.reg(&meta, ops.reg(0))));
                 match target.ok_or(VmError::Type)? {
                     CallTarget::Native(idx) => {
                         let f = vm.native(NativeIndex(idx));
@@ -353,8 +351,13 @@ fn dispatch<H: Heap>(
                         acc = result?;
                     }
                     CallTarget::Bytecode(target, register_count) => {
-                        let callee =
-                            stack.push_frame(meta, target, register_count, ops.reg_list(1), count)?;
+                        let callee = stack.push_frame(
+                            meta,
+                            target,
+                            register_count,
+                            ops.reg_list(1),
+                            count,
+                        )?;
                         cache.load(stack, callee, heap);
                     }
                 }

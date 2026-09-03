@@ -1,4 +1,6 @@
-use parser::{Ast, DeclKind, FunctionId, Node, Parser, ScopeId, ScopeKind, Symbol, Utf8SliceStream};
+use parser::{
+    Ast, DeclKind, FunctionId, Node, Parser, ScopeId, ScopeKind, Symbol, Utf8SliceStream,
+};
 
 fn parse(src: &str) -> Ast {
     let mut p = Parser::new(Utf8SliceStream::new(src));
@@ -24,7 +26,12 @@ fn decls_in(ast: &Ast, scope: ScopeId) -> Vec<(String, DeclKind)> {
     ast.scope(scope)
         .decls
         .iter()
-        .map(|d| (String::from_utf8_lossy(ast.symbol(d.name)).into_owned(), d.kind))
+        .map(|d| {
+            (
+                String::from_utf8_lossy(ast.symbol(d.name)).into_owned(),
+                d.kind,
+            )
+        })
         .collect()
 }
 
@@ -64,9 +71,11 @@ fn var_hoists_to_function_scope_through_blocks() {
     assert_eq!(decl(&ast, fscope, "x"), Some(DeclKind::Var)); // hoisted
     assert_eq!(decl(&ast, fscope, "y"), Some(DeclKind::Let)); // body block IS the fn scope
     // x must NOT be in any block scope
-    assert!(scopes_of_kind(&ast, ScopeKind::Block)
-        .iter()
-        .all(|&s| decl(&ast, s, "x").is_none()));
+    assert!(
+        scopes_of_kind(&ast, ScopeKind::Block)
+            .iter()
+            .all(|&s| decl(&ast, s, "x").is_none())
+    );
 }
 
 fn ast_symbol(ast: &Ast, s: &str) -> Symbol {

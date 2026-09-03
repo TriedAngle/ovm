@@ -414,7 +414,6 @@ impl Object {
         info.get_as(guard, heap.known().callable_map)
     }
 
-
     pub fn native_index<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<usize> {
         if !self.header.map.heap_ref(guard).kind().is_native() {
             return None;
