@@ -209,7 +209,7 @@ pub enum ObjectKind {
     Context = 10,
     BuiltinEnd = 11,
 
-    /// elements and len empty
+    /// `elements` points to the well-known `empty_fixed_array`, `len` is 0
     Object = 12,
     /// `elements` points to a `FixedArray`.
     Array = 13,
