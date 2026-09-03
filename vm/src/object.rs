@@ -223,7 +223,9 @@ impl ObjectKind {
 }
 
 /// Low byte: the `ObjectKind`. Second byte: capability flags
-/// (extendable, callable, constructor). Constructor implies callable.
+/// (extendable, callable, constructor, native). Constructor implies callable.
+/// NATIVE is only valid together with CALLABLE and means slots[0] of the
+/// object is a Smi native registry index instead of a `CallableInfoObject`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct MapKind(u64);
 
@@ -233,6 +235,7 @@ impl MapKind {
     pub const EXTENDABLE: MapKind = MapKind(1 << 8);
     pub const CALLABLE: MapKind = MapKind(1 << 9);
     pub const CONSTRUCTOR: MapKind = MapKind(1 << 10);
+    pub const NATIVE: MapKind = MapKind(1 << 11);
 
     pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
     pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
@@ -289,6 +292,10 @@ impl MapKind {
 
     pub const fn is_callable(self) -> bool {
         self.0 & Self::CALLABLE.0 != 0
+    }
+
+    pub const fn is_native(self) -> bool {
+        self.0 & Self::NATIVE.0 != 0
     }
 
     pub const fn is_constructor(self) -> bool {
@@ -405,6 +412,15 @@ impl Object {
         }
         let info = self.slots.heap_ref(guard).at(0);
         info.get_as(guard, heap.known().callable_map)
+    }
+
+
+    pub fn native_index<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<usize> {
+        if !self.header.map.heap_ref(guard).kind().is_native() {
+            return None;
+        }
+        let idx = Smi::decode(self.slots.heap_ref(guard).at(0))?.value();
+        usize::try_from(idx).ok()
     }
 }
 

@@ -157,8 +157,16 @@ impl Stack {
         self.frames.borrow_mut().pop()
     }
 
-    pub fn clear_frames(&self) {
-        self.frames.borrow_mut().clear();
+    pub fn frame_depth(&self) -> usize {
+        self.frames.borrow().len()
+    }
+
+    pub fn suspend_frame(&self, frame: FrameMeta) {
+        self.frames.borrow_mut().push(frame);
+    }
+    
+    pub fn truncate_frames(&self, depth: usize) {
+        self.frames.borrow_mut().truncate(depth);
     }
 
     fn reserve(&self, register_count: usize, argc: usize) -> Result<usize, VmError> {

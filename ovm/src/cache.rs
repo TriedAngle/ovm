@@ -49,7 +49,6 @@ impl StackCache {
     }
 
     pub fn enter(&self, stack: &Stack, frame: FrameMeta, heap: &mut impl LocalHeap) {
-        debug_assert!(!self.is_active(), "re-entrant interpreter run");
         self.load(stack, frame, heap);
         self.get().active = true;
     }
@@ -121,6 +120,24 @@ impl StackCache {
         debug_assert!(cache.acc_spilled, "accumulator taken without spill");
         cache.acc_spilled = false;
         cache.acc.inner()
+    }
+
+    pub fn is_acc_spilled(&self) -> bool {
+        self.get().acc_spilled
+    }
+
+    pub fn reset_acc_spill(&self) {
+        let cache = self.get();
+        let void = cache.void;
+        cache.acc.store(void);
+        cache.acc_spilled = false;
+    }
+
+    pub fn restore_acc_spill(&self, was_spilled: bool) {
+        let cache = self.get();
+        let void = cache.void;
+        cache.acc.store(void);
+        cache.acc_spilled = was_spilled;
     }
 }
 

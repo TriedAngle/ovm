@@ -1,4 +1,6 @@
-use vm::{Float, Handle, HandleScope, InternedString, LocalHeap, Smi, Value, VmError};
+use core::ptr::NonNull;
+
+use vm::{Float, Handle, HandleScope, InternedString, LocalHeap, Object, Smi, Tagged, Value, VmError};
 
 use crate::{ContextState, Heap, Thread, VM};
 
@@ -33,6 +35,19 @@ impl<'a, H: Heap> NativeContext<'a, H> {
 
     pub fn set_pending_exception(&self, err: VmError) {
         self.state.set_pending_exception(err);
+    }
+
+    pub fn handle_scope<R>(&mut self, f: impl FnOnce(&mut Self, HandleScope<'_>) -> R) -> R {
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
+        f(self, scope)
+    }
+
+    pub fn call(&mut self, callable: Value, args: &[Value]) -> Result<Value, VmError> {
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
+        let callable = scope
+            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(callable) })
+            .expect("callable must be strong");
+        crate::interpreter::execute(self.vm, self.heap, self.state, callable, args)
     }
 
     pub fn take_pending_exception(&self) -> Option<VmError> {

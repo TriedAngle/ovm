@@ -1,6 +1,6 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{NativeIndex, Thread, VM, VmError};
+use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle,
     HandleScope, HeapPtr, LocalHeap, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
@@ -63,7 +63,7 @@ fn run_program(
             &scope,
         );
         let callable = callable_object(thread, &scope, callable);
-        thread.run(callable, args)
+        thread.execute(callable, args)
     })
 }
 
@@ -209,7 +209,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
         );
         let caller_obj = callable_object(thread, &scope, caller);
 
-        thread.run(caller_obj, &[])
+        thread.execute(caller_obj, &[])
     });
 
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 99);
@@ -300,7 +300,7 @@ fn create_object_from_map_fills_from_registers() {
             &scope,
         );
         let callable = callable_object(thread, &scope, callable);
-        (thread.run(callable, &[]), map.as_tagged().erase())
+        (thread.execute(callable, &[]), map.as_tagged().erase())
     });
 
     let obj = result.unwrap();
@@ -442,7 +442,7 @@ fn object_program(
             &scope,
         );
         let callable = callable_object(thread, &scope, callable);
-        thread.run(callable, &[])
+        thread.execute(callable, &[])
     })
 }
 
@@ -528,7 +528,7 @@ fn transition_object_program(
             &scope,
         );
         let callable = callable_object(thread, &scope, callable);
-        thread.run(callable, &[])
+        thread.execute(callable, &[])
     })
 }
 
@@ -706,7 +706,7 @@ fn parent_object_program(
             &scope,
         );
         let callable = callable_object(thread, &scope, callable);
-        thread.run(callable, &[])
+        thread.execute(callable, &[])
     })
 }
 
@@ -1022,7 +1022,7 @@ fn accessor_object_program(
             &scope,
         );
         let callable = callable_object(thread, &scope, callable);
-        thread.run(callable, &[])
+        thread.execute(callable, &[])
     })
 }
 
@@ -1208,8 +1208,230 @@ fn store_new_accessor_property_defines_own_accessor() {
             &scope,
         );
         let callable = callable_object(thread, &scope, callable);
-        thread.run(callable, &[obj.value()])
+        thread.execute(callable, &[obj.value()])
     });
 
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+/// A native function object: callable map with NATIVE flag, slots[0] = the
+/// native registry index as a Smi.
+fn native_function<'s>(
+    thread: &mut Thread<DummyHeap>,
+    scope: &'s HandleScope<'_>,
+    idx: NativeIndex,
+) -> Handle<'s, Object> {
+    let void = thread.heap().known().void.value();
+    let map = thread.heap().allocate_handle::<Map>(
+        MapInit {
+            kind: MapKind::OBJECT.union(MapKind::CALLABLE).union(MapKind::NATIVE),
+            value_slot_count: 1,
+            descriptors: &[],
+        },
+        scope,
+    );
+    thread
+        .heap()
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map,
+                values: &[Smi::new(idx.0 as i64).encode()],
+                elements: void,
+                length: 0,
+            },
+        )
+        .into_handle(scope)
+}
+
+/// Build a bytecode function object from inside a native.
+fn bytecode_fn(
+    nctx: &mut NativeContext<'_, DummyHeap>,
+    scope: &HandleScope<'_>,
+    program: &[u8],
+    constants: &[Value],
+    register_count: usize,
+) -> Value {
+    let void = nctx.heap().known().void.value();
+    let bytecode = nctx.heap().allocate_handle::<FixedByteArray>(program, scope);
+    let constants = nctx.heap().allocate_handle::<FixedArray>(constants, scope);
+    let info = nctx.heap().allocate_handle::<CallableInfoObject>(
+        CallableInfoInit {
+            bytecode,
+            constants,
+            register_count,
+            context: void,
+        },
+        scope,
+    );
+    let map = nctx.heap().allocate_handle::<Map>(
+        MapInit {
+            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
+            value_slot_count: 1,
+            descriptors: &[],
+        },
+        scope,
+    );
+    nctx.heap()
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map,
+                values: &[info.value()],
+                elements: void,
+                length: 0,
+            },
+        )
+        .erase()
+}
+
+fn forty_two(_: &mut NativeContext<'_, DummyHeap>, _: &[Value]) -> Result<Value, VmError> {
+    Ok(smi(42))
+}
+
+#[test]
+fn run_dispatches_native_callable_without_frame() {
+    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let idx = vm.register_native(forty_two);
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        let f = native_function(thread, &scope, idx);
+        thread.execute(f, &[smi(7)])
+    });
+    assert_eq!(result.unwrap(), smi(42));
+}
+
+#[test]
+fn call_dispatches_to_native_function_object() {
+    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let idx = vm.register_native(forty_two);
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        let f = native_function(thread, &scope, idx);
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[f.value()], &scope);
+
+        // r0 = native fn; Call r0 with r0 as the (single, receiver) arg
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let void = thread.heap().known().void.value();
+        let caller = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 1,
+                context: void,
+            },
+            &scope,
+        );
+        let caller = callable_object(thread, &scope, caller);
+        thread.execute(caller, &[])
+    });
+
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+}
+
+/// Native that runs `6 + 7` in a fresh nested interpreter execution, where
+/// the inner program itself spills the accumulator for a CallNative.
+fn run_inner(nctx: &mut NativeContext<'_, DummyHeap>, _args: &[Value]) -> Result<Value, VmError> {
+    nctx.handle_scope(|nctx, scope| {
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadSmi, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[6]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::LoadSmi, &[7]);
+        emit(&mut program, Opcode::Store, &[2]);
+        emit(
+            &mut program,
+            Opcode::CallNative,
+            &[NativeIndex::SMI_ADD.0 as u32, 0, 3],
+        );
+        emit(&mut program, Opcode::Return, &[]);
+
+        let callable = bytecode_fn(nctx, &scope, &program, &[], 3);
+        nctx.call(callable, &[])
+    })
+}
+
+#[test]
+fn native_reenters_interpreter_via_call() {
+    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let idx = vm.register_native(run_inner);
+    let mut thread = vm.attach();
+
+    // acc = 5 (spilled across the native call); acc = run_inner(); r1 = acc
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[0]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::LoadSmi, &[5]);
+    emit(&mut program, Opcode::CallNative, &[idx.0 as u32, 0, 1]);
+    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Load, &[1]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 2, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 13);
+}
+
+/// Native that runs bytecode which fails one call deep; the suspended inner
+/// frames are abandoned and must be unwound when the native recovers.
+fn run_failing_inner(
+    nctx: &mut NativeContext<'_, DummyHeap>,
+    _args: &[Value],
+) -> Result<Value, VmError> {
+    nctx.handle_scope(|nctx, scope| {
+        // callee: Add on uninitialized (void) registers -> Type error
+        let mut bad = Vec::new();
+        emit(&mut bad, Opcode::Add, &[0, 1]);
+        emit(&mut bad, Opcode::Return, &[]);
+        let callee = bytecode_fn(nctx, &scope, &bad, &[], 2);
+
+        // caller: calls callee, so one frame is suspended above the base
+        // depth when the error aborts the nested run
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
+        emit(&mut program, Opcode::Return, &[]);
+        let caller = bytecode_fn(nctx, &scope, &program, &[callee], 1);
+
+        match nctx.call(caller, &[]) {
+            Err(VmError::Type) => Ok(smi(42)),
+            other => panic!("expected inner type error, got {other:?}"),
+        }
+    })
+}
+
+#[test]
+fn inner_run_error_unwinds_and_native_recovers() {
+    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let idx = vm.register_native(run_failing_inner);
+    let mut thread = vm.attach();
+
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[0]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::CallNative, &[idx.0 as u32, 0, 1]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 1, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+
+    // the thread is clean afterwards: no leaked frames or stack slots
+    let mut good = Vec::new();
+    emit(&mut good, Opcode::LoadSmi, &[41]);
+    emit(&mut good, Opcode::Return, &[]);
+    let result = run_program(&mut thread, good, 1, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 41);
 }

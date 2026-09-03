@@ -131,8 +131,15 @@ impl<H: Heap> Thread<H> {
         f(self, scope)
     }
 
-    pub fn run(&mut self, callable: Handle<'_, Object>, args: &[Value]) -> Result<Value, VmError> {
-        interpreter::run(&self.vm, &mut self.heap, &self.state, callable, args)
+    pub fn execute(
+        &mut self,
+        callable: Handle<'_, Object>,
+        args: &[Value],
+    ) -> Result<Value, VmError> {
+        debug_assert_eq!(self.state.stack.top(), 0);
+        debug_assert_eq!(self.state.stack.frame_depth(), 0);
+        debug_assert!(!self.state.cache.is_active());
+        interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args)
     }
 
     pub fn run_native(&mut self, f: NativeFn<H>, args: &[Value]) -> Result<Value, VmError> {
