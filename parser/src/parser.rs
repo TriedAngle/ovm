@@ -219,8 +219,10 @@ impl<S: CharStream> Parser<S> {
         let parent = self.scopes.last().map(|s| s.id);
         let id = self.ast.add_scope(kind, parent);
         if matches!(kind, ScopeKind::Script | ScopeKind::Function) {
-            self.ast.scope_mut(id).strict =
-                self.fn_stack.last().is_some_and(|&f| self.ast.function(f).strict);
+            self.ast.scope_mut(id).strict = self
+                .fn_stack
+                .last()
+                .is_some_and(|&f| self.ast.function(f).strict);
         }
         self.scopes.push(Scope {
             id,
@@ -259,7 +261,12 @@ impl<S: CharStream> Parser<S> {
         Ok(())
     }
 
-    fn declare_lexical(&mut self, sym: Symbol, span: Span, kind: DeclKind) -> Result<(), ParseError> {
+    fn declare_lexical(
+        &mut self,
+        sym: Symbol,
+        span: Span,
+        kind: DeclKind,
+    ) -> Result<(), ParseError> {
         let scope_id = self.scopes.last().expect("always inside a scope").id;
         {
             let scope = self.scopes.last_mut().unwrap();
@@ -504,7 +511,12 @@ impl<S: CharStream> Parser<S> {
         let body = body?;
         let end = self.ast.span(body).end;
         let node = self.ast.add(
-            Node::For { init, cond, next, body },
+            Node::For {
+                init,
+                cond,
+                next,
+                body,
+            },
             Span::new(start, end),
         );
         self.ast.set_node_scope(node, scope_id);
@@ -768,10 +780,15 @@ impl<S: CharStream> Parser<S> {
                 "no line terminator allowed before `=>`",
             ));
         }
-        let fid = self.add_function_info(start, None, params, FnFlags {
-            arrow: true,
-            ..Default::default()
-        });
+        let fid = self.add_function_info(
+            start,
+            None,
+            params,
+            FnFlags {
+                arrow: true,
+                ..Default::default()
+            },
+        );
         let saved_loop_depth = self.begin_fn_body(fid);
         let body = if self.peek()?.kind == TokenKind::LBrace {
             self.parse_statement_block()?

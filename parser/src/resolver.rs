@@ -112,7 +112,11 @@ pub fn resolve(ast: &Ast) -> Resolved {
 
 impl<'a> Resolver<'a> {
     fn walk_function(&mut self, fid: FunctionId) {
-        let body = self.ast.function(fid).body.expect("function must be parsed");
+        let body = self
+            .ast
+            .function(fid)
+            .body
+            .expect("function must be parsed");
         self.fn_stack.push(fid);
         self.walk_node(body);
         self.fn_stack.pop();
@@ -173,7 +177,11 @@ impl<'a> Resolver<'a> {
                     self.walk_list(args);
                 }
             }
-            Node::Property { object, key, computed } => {
+            Node::Property {
+                object,
+                key,
+                computed,
+            } => {
                 self.walk_node(object);
                 if computed {
                     self.walk_node(key);
@@ -182,7 +190,12 @@ impl<'a> Resolver<'a> {
             Node::ArrayLiteral { elements } => self.walk_list(elements),
             Node::Spread { expr } => self.walk_node(expr),
             Node::ObjectLiteral { props } => self.walk_list(props),
-            Node::ObjectProperty { key, value, computed, .. } => {
+            Node::ObjectProperty {
+                key,
+                value,
+                computed,
+                ..
+            } => {
                 if computed {
                     self.walk_node(key);
                 }
@@ -313,10 +326,7 @@ impl<'a> Resolver<'a> {
                         _ => {
                             let reg = next_reg;
                             next_reg += 1;
-                            Resolution::Local {
-                                reg,
-                                hole_check,
-                            }
+                            Resolution::Local { reg, hole_check }
                         }
                     };
                     slots.insert(key, res);

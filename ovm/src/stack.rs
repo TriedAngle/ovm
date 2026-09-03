@@ -164,7 +164,7 @@ impl Stack {
     pub fn suspend_frame(&self, frame: FrameMeta) {
         self.frames.borrow_mut().push(frame);
     }
-    
+
     pub fn truncate_frames(&self, depth: usize) {
         self.frames.borrow_mut().truncate(depth);
     }

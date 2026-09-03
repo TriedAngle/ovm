@@ -14,9 +14,7 @@ fn resolutions_of(ast: &Ast, r: &parser::Resolved, name: &str) -> Vec<Resolution
     (0..ast.node_count())
         .map(|i| NodeId(i as u32))
         .filter_map(|id| match ast.node(id) {
-            Node::Identifier { sym } if ast.symbol(*sym) == name.as_bytes() => {
-                r.resolution(id)
-            }
+            Node::Identifier { sym } if ast.symbol(*sym) == name.as_bytes() => r.resolution(id),
             _ => None,
         })
         .collect()
@@ -27,12 +25,10 @@ fn locals_and_params() {
     let (ast, r) = resolve_src("var x = 1; x; function f(a, b) { return a + b; }");
     assert_eq!(
         resolutions_of(&ast, &r, "x"),
-        vec![
-            Resolution::Local {
-                reg: 0,
-                hole_check: false
-            }
-        ]
+        vec![Resolution::Local {
+            reg: 0,
+            hole_check: false
+        }]
     );
     assert_eq!(resolutions_of(&ast, &r, "a"), vec![Resolution::Param(0)]);
     assert_eq!(resolutions_of(&ast, &r, "b"), vec![Resolution::Param(1)]);
@@ -69,15 +65,24 @@ fn let_const_need_hole_checks_var_does_not() {
     let (ast, r) = resolve_src("let a = 1; a; const b = 2; b; var c = 3; c;");
     assert!(matches!(
         resolutions_of(&ast, &r, "a")[0],
-        Resolution::Local { hole_check: true, .. }
+        Resolution::Local {
+            hole_check: true,
+            ..
+        }
     ));
     assert!(matches!(
         resolutions_of(&ast, &r, "b")[0],
-        Resolution::Local { hole_check: true, .. }
+        Resolution::Local {
+            hole_check: true,
+            ..
+        }
     ));
     assert!(matches!(
         resolutions_of(&ast, &r, "c")[0],
-        Resolution::Local { hole_check: false, .. }
+        Resolution::Local {
+            hole_check: false,
+            ..
+        }
     ));
 }
 
@@ -87,7 +92,10 @@ fn block_shadowing_resolves_innermost() {
     // the only x *use* is in the block → the let (hole check on)
     assert!(matches!(
         resolutions_of(&ast, &r, "x")[0],
-        Resolution::Local { hole_check: true, .. }
+        Resolution::Local {
+            hole_check: true,
+            ..
+        }
     ));
 }
 
