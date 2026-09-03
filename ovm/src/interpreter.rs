@@ -10,41 +10,88 @@ use crate::{
     ContextState, FrameMeta, Heap, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
 };
 
-pub fn run<H: Heap>(
+
+pub fn execute<H: Heap>(
     vm: &VM<H>,
     heap: &mut H::Local,
     state: &ContextState,
     callable: Handle<'_, Object>,
     args: &[Value],
 ) -> Result<Value, VmError> {
-    // TODO: merge getting the register count into the frame allocation function (I think)
-    let register_count = heap
-        .no_gc(|nogc, heap| {
-            callable
-                .heap_ref(nogc)
-                .as_ref()
-                .callable_info(nogc, heap)
-                .map(|info| info.register_count.to_smi().value() as usize)
-        })
-        .ok_or(VmError::Type)?;
-
     let stack = &state.stack;
     let cache = &state.cache;
 
-    // TODO: consider having a frame scope?
-    let result = stack
-        .push_initial_frame(callable.as_tagged(), register_count, args)
-        .and_then(|frame| {
-            cache.enter(stack, frame, heap);
-            let result = dispatch(vm, heap, state);
-            cache.deactivate();
-            result
-        });
+    let saved_top = stack.top();
+    let was_active = cache.is_active();
+    let was_acc_spilled = cache.is_acc_spilled();
+    if was_active {
+        stack.suspend_frame(cache.frame_meta());
+        cache.reset_acc_spill();
+    }
+    let base_depth = stack.frame_depth();
 
-    stack.set_top(0);
-    stack.clear_frames();
+    let result = start(vm, heap, state, callable, args, base_depth);
 
+    stack.truncate_frames(base_depth);
+    if was_active {
+        let outer = stack.pop_frame(saved_top).expect("suspended caller frame");
+        cache.load(stack, outer, heap);
+        cache.restore_acc_spill(was_acc_spilled);
+    } else {
+        stack.set_top(saved_top);
+        cache.deactivate();
+    }
     result
+}
+
+fn start<H: Heap>(
+    vm: &VM<H>,
+    heap: &mut H::Local,
+    state: &ContextState,
+    callable: Handle<'_, Object>,
+    args: &[Value],
+    base_depth: usize,
+) -> Result<Value, VmError> {
+    match heap.no_gc(|nogc, heap| call_target(nogc, heap, callable.value())) {
+        Some(CallTarget::Native(idx)) => {
+            let f = vm.native(NativeIndex(idx));
+            let void = heap.known().void.value();
+            let mut nctx = NativeContext::new(vm, heap, state);
+            let cache = &state.cache;
+            cache.spill_acc(void);
+            let result = f(&mut nctx, args);
+            let _ = cache.take_acc();
+            result
+        }
+        Some(CallTarget::Bytecode(target, register_count)) => {
+            let stack = &state.stack;
+            let frame = stack.push_initial_frame(target, register_count, args)?;
+            state.cache.enter(stack, frame, heap);
+            dispatch(vm, heap, state, base_depth)
+        }
+        None => Err(VmError::Type),
+    }
+}
+
+enum CallTarget {
+    Bytecode(Tagged<Object>, usize),
+    Native(usize),
+}
+
+fn call_target<'a, L: LocalHeap>(nogc: &'a NoGc<'a>, heap: &'a L, f: Value) -> Option<CallTarget> {
+    let ValueRef::Object(obj) = f.value_ref(nogc) else {
+        return None;
+    };
+    let kind = obj.as_ref().header.map.heap_ref(nogc).kind();
+    if !kind.is_callable() {
+        return None;
+    }
+    if kind.is_native() {
+        return Some(CallTarget::Native(obj.as_ref().native_index(nogc)?));
+    }
+    let info = obj.as_ref().callable_info(nogc, heap)?;
+    let register_count = info.register_count.to_smi().value() as usize;
+    Some(CallTarget::Bytecode(obj.into_tagged(), register_count))
 }
 
 fn property_name<'a, L: LocalHeap>(
@@ -112,19 +159,6 @@ fn load_outcome<'a, L: LocalHeap>(
     }
 }
 
-fn resolve_callable<'a, L: LocalHeap>(
-    nogc: &'a NoGc<'a>,
-    heap: &'a L,
-    f: Value,
-) -> Option<(Tagged<Object>, usize)> {
-    let ValueRef::Object(obj) = f.value_ref(nogc) else {
-        return None;
-    };
-    let info = obj.as_ref().callable_info(nogc, heap)?;
-    let register_count = info.register_count.to_smi().value() as usize;
-    Some((obj.into_tagged(), register_count))
-}
-
 fn call_value<H: Heap>(
     heap: &mut H::Local,
     stack: &Stack,
@@ -133,8 +167,9 @@ fn call_value<H: Heap>(
     f: Value,
     args: &[Value],
 ) -> Result<bool, VmError> {
-    let target = heap.no_gc(|nogc, heap| resolve_callable(nogc, heap, f));
-    let Some((target, register_count)) = target else {
+    let target = heap.no_gc(|nogc, heap| call_target(nogc, heap, f));
+    // TODO: native getters/setters invoke in place instead of pushing a frame
+    let Some(CallTarget::Bytecode(target, register_count)) = target else {
         return Ok(false);
     };
     let callee = stack.push_frame_with_args(meta, target, register_count, args)?;
@@ -214,6 +249,7 @@ fn dispatch<H: Heap>(
     vm: &VM<H>,
     heap: &mut H::Local,
     state: &ContextState,
+    base_depth: usize,
 ) -> Result<Value, VmError> {
     let stack = &state.stack;
     let cache = &state.cache;
@@ -227,10 +263,16 @@ fn dispatch<H: Heap>(
 
         // TODO: actually handle `Result` instead of just `?`
         match op {
-            Opcode::Return => match stack.pop_frame(meta.base) {
-                Some(caller) => cache.load(stack, caller, heap),
-                None => return Ok(acc),
-            },
+            Opcode::Return => {
+                // a nested run stops above the frame suspended on its entry
+                if stack.frame_depth() == base_depth {
+                    return Ok(acc);
+                }
+                let caller = stack
+                    .pop_frame(meta.base)
+                    .expect("suspended frame above base depth");
+                cache.load(stack, caller, heap);
+            }
             Opcode::Load => {
                 acc = stack.reg(&meta, ops.reg(0));
             }
@@ -299,19 +341,23 @@ fn dispatch<H: Heap>(
             Opcode::Call | Opcode::CallNoFeedback => {
                 let count = ops.reg_count(2);
                 let target = heap.no_gc(|nogc, heap| {
-                    let ValueRef::Object(obj) = stack.reg(&meta, ops.reg(0)).value_ref(nogc) else {
-                        return None;
-                    };
-                    let info = obj.as_ref().callable_info(nogc, heap)?;
-                    let register_count = info.register_count.to_smi().value() as usize;
-                    Some((obj.into_tagged(), register_count))
+                    call_target(nogc, heap, stack.reg(&meta, ops.reg(0)))
                 });
-                let Some((target, register_count)) = target else {
-                    return Err(VmError::Type);
-                };
-                let callee =
-                    stack.push_frame(meta, target, register_count, ops.reg_list(1), count)?;
-                cache.load(stack, callee, heap);
+                match target.ok_or(VmError::Type)? {
+                    CallTarget::Native(idx) => {
+                        let f = vm.native(NativeIndex(idx));
+                        let mut nctx = NativeContext::new(vm, heap, state);
+                        cache.spill_acc(acc);
+                        let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
+                        let _ = cache.take_acc();
+                        acc = result?;
+                    }
+                    CallTarget::Bytecode(target, register_count) => {
+                        let callee =
+                            stack.push_frame(meta, target, register_count, ops.reg_list(1), count)?;
+                        cache.load(stack, callee, heap);
+                    }
+                }
             }
             Opcode::LoadNamedProperty => {
                 let outcome = heap.no_gc(|nogc, heap| {

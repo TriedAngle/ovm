@@ -98,7 +98,7 @@ fn main() {
                 },
             )
             .into_handle(&scope);
-        thread.run(callable_obj, &[])
+        thread.execute(callable_obj, &[])
     });
 
     match result {
