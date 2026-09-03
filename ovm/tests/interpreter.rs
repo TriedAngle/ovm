@@ -45,7 +45,7 @@ fn callable_object<'s>(
     scope: &'s HandleScope<'_>,
     info: Handle<'_, CallableInfoObject>,
 ) -> Handle<'s, Object> {
-    let void = thread.heap().known().void.value();
+    let void = thread.heap().known().void;
     let empty_context = thread.heap().known().empty_context;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
@@ -62,7 +62,7 @@ fn callable_object<'s>(
             ObjectSlotsInit {
                 map,
                 values: &[info.as_tagged().erase()],
-                elements: void,
+                elements: void.erase(),
                 length: 0,
             },
         )
@@ -76,7 +76,7 @@ fn run_program(
     args: &[Value],
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let bytecode = thread
             .heap()
@@ -195,7 +195,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
 
         // callee: returns smi 99
@@ -281,7 +281,7 @@ fn create_object_from_map_fills_from_registers() {
     let mut thread = vm.attach();
 
     let (result, map_v) = thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
 
         // map with two writable value slots (offsets 0 and 1)
@@ -423,7 +423,7 @@ fn keyed_load_out_of_bounds_errors() {
 /// at index 0, and the interned name "x" at index 1.
 fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
@@ -518,7 +518,7 @@ fn transition_object_program(
     build: impl FnOnce(&mut Vec<u8>),
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let z = thread.intern(&scope, "z");
@@ -663,7 +663,7 @@ fn named_store_to_non_writable_fails() {
 /// descriptor pointing at it; interned "p" at 1.
 fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let p = thread.intern(&scope, "p");
         let parent_map = thread.heap().allocate_handle::<Map>(
@@ -685,7 +685,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 ObjectSlotsInit {
                     map: parent_map,
                     values: &[Smi::new(1).encode()],
-                    elements: void,
+                    elements: void.erase(),
                     length: 0,
                 },
             )
@@ -855,7 +855,7 @@ fn jump_if_truthy_follows_toboolean() {
             .value();
         let one_half = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
         let object = {
-            let void = thread.heap().known().void.value();
+            let void = thread.heap().known().void;
             let empty_context = thread.heap().known().empty_context;
             let map = thread.heap().allocate_handle::<Map>(
                 MapInit {
@@ -872,7 +872,7 @@ fn jump_if_truthy_follows_toboolean() {
                     ObjectSlotsInit {
                         map,
                         values: &[],
-                        elements: void,
+                        elements: void.erase(),
                         length: 0,
                     },
                 )
@@ -977,7 +977,7 @@ fn accessor_object_program(
     build: impl FnOnce(&mut Vec<u8>),
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
@@ -1003,8 +1003,8 @@ fn accessor_object_program(
             );
             callable_object(thread, &scope, info).value()
         };
-        let get = getter.map_or(void, |p| make(&mut *thread, p));
-        let set = setter.map_or(void, |p| make(&mut *thread, p));
+        let get = getter.map_or(void.value(), |p| make(&mut *thread, p));
+        let set = setter.map_or(void.value(), |p| make(&mut *thread, p));
         let pair = thread
             .heap()
             .allocate_handle::<AccessorPair>((get, set), &scope);
@@ -1165,7 +1165,7 @@ fn store_new_accessor_property_defines_own_accessor() {
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
@@ -1190,7 +1190,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 ObjectSlotsInit {
                     map,
                     values: &[smi(7)],
-                    elements: void,
+                    elements: void.erase(),
                     length: 0,
                 },
             )
@@ -1223,7 +1223,7 @@ fn store_new_accessor_property_defines_own_accessor() {
             .create_handle(Tagged::from_value(getter.value()))
             .expect("getter is strong");
         let set = scope
-            .create_handle(Tagged::from_value(void))
+            .create_handle(Tagged::from_value(void.value()))
             .expect("void is strong");
         Object::store_new_accessor_property(thread.heap(), obj, name, get, set).unwrap();
 
@@ -1263,7 +1263,7 @@ fn native_function<'s>(
     scope: &'s HandleScope<'_>,
     idx: NativeIndex,
 ) -> Handle<'s, Object> {
-    let void = thread.heap().known().void.value();
+    let void = thread.heap().known().void;
     let empty_context = thread.heap().known().empty_context;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
@@ -1282,7 +1282,7 @@ fn native_function<'s>(
             ObjectSlotsInit {
                 map,
                 values: &[Smi::new(idx.0 as i64).encode()],
-                elements: void,
+                elements: void.erase(),
                 length: 0,
             },
         )
@@ -1297,7 +1297,7 @@ fn bytecode_fn(
     constants: &[Value],
     register_count: usize,
 ) -> Value {
-    let void = nctx.heap().known().void.value();
+    let void = nctx.heap().known().void;
     let empty_context = nctx.heap().known().empty_context;
     let bytecode = nctx
         .heap()
@@ -1327,7 +1327,7 @@ fn bytecode_fn(
             ObjectSlotsInit {
                 map,
                 values: &[info.value()],
-                elements: void,
+                elements: void.erase(),
                 length: 0,
             },
         )
@@ -1373,7 +1373,7 @@ fn call_dispatches_to_native_function_object() {
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let caller = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {

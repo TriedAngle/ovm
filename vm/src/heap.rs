@@ -1,7 +1,8 @@
 use crate::{
-    Context, FixedArray, FixedByteArray, Global, Handle, HandleScope, HandleSet, HeapObject,
-    HeapPtr, InternedString, Map, MapKind, Object, ObjectInit, ObjectSlotsInit, RootHandles,
-    STRONG_PTR, SlotFlags, SlotName, Smi, Tagged, TransitionLock, Value, Word, string_content_hash,
+    Context, ContextInit, FixedArray, FixedByteArray, Global, Handle, HandleData, HandleScope,
+    HandleSet, HeapObject, HeapPtr, InternedString, Map, MapInit, MapKind, Object, ObjectInit,
+    ObjectSlotsInit, RootHandles, STRONG_PTR, SlotFlags, SlotName, Smi, Tagged, TransitionLock,
+    Value, Word, string_content_hash,
 };
 use core::{
     alloc::Layout,
@@ -31,8 +32,8 @@ impl core::fmt::Display for AllocError {
 
 impl std::error::Error for AllocError {}
 
+#[derive(Clone, Copy)]
 pub struct WellKnown {
-    pub roots: RootHandles,
     pub map_map: Global<Map>,
     /// "hole"
     pub void: Global<Object>,
@@ -62,318 +63,205 @@ pub struct WellKnown {
     pub empty_context: Global<Context>,
 }
 
-/// Bootstrap the well-known objects
-fn bootstrap_well_known(mut local: &mut Heap) -> WellKnown {
-    let roots = unsafe { RootHandles::new(64, Smi::new(0).encode()) };
-
-    fn bootstrap_map(
-        local: &mut Heap,
-        roots: &RootHandles,
-        map_map: Global<Map>,
-        kind: MapKind,
-    ) -> Global<Map> {
-        let raw = local
-            .allocate_raw(Map::layout_for(0))
-            .expect("bootstrap map allocation");
-        let ptr = unsafe { HeapPtr::<Map>::new(raw.as_ptr().cast()) };
-        let global = roots.create_handle(Tagged::from_ptr(ptr));
-        let map = unsafe { global.get().as_mut() };
-        let host = map.erase();
-        map.header.map.set(local, host, map_map.as_tagged());
-        map.value_slot_count.set(local, host, Smi::new(0));
-        map.descriptor_count.set(local, host, Smi::new(0));
-        map.kind.set(local, host, Smi::new(kind.bits() as i64));
-        // placeholder: `void` does not exist yet, fixed up below
-        map.transitions.as_raw().store_raw(Smi::new(0).encode());
-        global
-    }
-
-    /// Bootstrap a map with a single `CONST | PARENT` descriptor linking
-    /// it to `parent` in the prototype hierarchy.
-    fn bootstrap_map_with_parent(
-        local: &mut Heap,
-        roots: &RootHandles,
-        map_map: Global<Map>,
-        kind: MapKind,
-        parent: Global<Object>,
-    ) -> Global<Map> {
-        let raw = local
-            .allocate_raw(Map::layout_for(1))
-            .expect("bootstrap map allocation");
-        let ptr = unsafe { HeapPtr::<Map>::new(raw.as_ptr().cast()) };
-        let global = roots.create_handle(Tagged::from_ptr(ptr));
-        let map = unsafe { global.get().as_mut() };
-        let host = map.erase();
-        map.header.map.set(local, host, map_map.as_tagged());
-        map.value_slot_count.set(local, host, Smi::new(0));
-        map.descriptor_count.set(local, host, Smi::new(1));
-        map.kind.set(local, host, Smi::new(kind.bits() as i64));
-        // placeholder: `void` does not exist yet, fixed up below
-        map.transitions.as_raw().store_raw(Smi::new(0).encode());
-        let d = map.descriptor(0);
-        d.name.set(
-            local,
-            host,
-            SlotName::from(Tagged::from_smi(Smi::new(1))).tagged(),
-        );
-        d.flags.set(
-            local,
-            host,
-            Smi::new(SlotFlags::CONST.union(SlotFlags::PARENT).bits() as i64),
-        );
-        d.value.set(local, host, parent.as_tagged().erase_tagged());
-        global
-    }
-
-    /// Bootstrap an ordinary empty object (no own properties) whose
-    /// `slots` array is a real, empty `FixedArray` so that later
-    /// transitions can extend it.
-    fn bootstrap_empty_object(
-        local: &mut Heap,
-        roots: &RootHandles,
-        map: Global<Map>,
-        slots: Global<FixedArray>,
-        void: Global<Object>,
-    ) -> Global<Object> {
-        let raw = local
-            .allocate_raw(Object::layout_for())
-            .expect("bootstrap object allocation");
-        let ptr = unsafe { HeapPtr::<Object>::new(raw.as_ptr().cast()) };
-        let tagged = Tagged::from_ptr(ptr);
-        let obj = unsafe { ptr.as_mut() };
-        let host = obj.erase();
-        obj.header.map.set(local, host, map.as_tagged());
-        obj.slots.set(local, host, slots.as_tagged());
-        obj.elements
-            .set(local, host, void.as_tagged().erase_tagged());
-        obj.length.set(local, host, Smi::new(0));
-        roots.create_handle(tagged)
-    }
-
-    let map_map = {
-        let raw = local
-            .allocate_raw(Map::layout_for(0))
-            .expect("bootstrap map map allocation");
-        let ptr = unsafe { HeapPtr::<Map>::new(raw.as_ptr().cast()) };
-        let tagged = Tagged::from_ptr(ptr);
-        let map = unsafe { ptr.as_mut() };
-        let host = map.erase();
-        map.header.map.set(&local, host, tagged);
-        map.value_slot_count.set(&local, host, Smi::new(0));
-        map.descriptor_count.set(&local, host, Smi::new(0));
-        map.kind
-            .set(&local, host, Smi::new(MapKind::MAP.bits() as i64));
-        // placeholder: `void` does not exist yet, fixed up below
-        map.transitions.as_raw().store_raw(Smi::new(0).encode());
-        roots.create_handle(tagged)
-    };
-    let void_map = bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT);
-
-    let void = {
-        let raw = local
-            .allocate_raw(Object::layout_for())
-            .expect("bootstrap void allocation");
-        let ptr = unsafe { HeapPtr::<Object>::new(raw.as_ptr().cast()) };
-        let tagged = Tagged::from_ptr(ptr);
-        let obj = unsafe { ptr.as_mut() };
-        let host = obj.erase();
-        obj.header.map.set(&local, host, void_map.as_tagged());
-        obj.slots.set(&local, host, unsafe { tagged.cast() });
-        obj.elements.set(&local, host, tagged.erase_tagged());
-        obj.length.set(&local, host, Smi::new(0));
-        roots.create_handle(tagged)
-    };
-
-    let smi_map = bootstrap_map(&mut local, &roots, map_map, MapKind::OBJECT);
-    let float_map = bootstrap_map(&mut local, &roots, map_map, MapKind::FLOAT);
-    let array_map = bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_ARRAY);
-    let byte_array_map = bootstrap_map(&mut local, &roots, map_map, MapKind::FIXED_BYTE_ARRAY);
-    let string_map = bootstrap_map(&mut local, &roots, map_map, MapKind::VM_STRING);
-    let symbol_map = bootstrap_map(&mut local, &roots, map_map, MapKind::SYMBOL);
-    let accessor_pair_map = bootstrap_map(&mut local, &roots, map_map, MapKind::ACCESSOR_PAIR);
-    let callable_map = bootstrap_map(&mut local, &roots, map_map, MapKind::CALLABLE_INFO);
-    let handler_table_map = bootstrap_map(&mut local, &roots, map_map, MapKind::HANDLER_TABLE);
-    let context_map = bootstrap_map(&mut local, &roots, map_map, MapKind::CONTEXT);
-
-    let object_prototype_map = bootstrap_map(
-        &mut local,
-        &roots,
-        map_map,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-    );
-
-    let empty_slots = {
-        let raw = local
-            .allocate_raw(FixedArray::layout_for(0))
-            .expect("bootstrap empty slots allocation");
-        let ptr = unsafe { HeapPtr::<FixedArray>::new(raw.as_ptr().cast()) };
-        let tagged = Tagged::from_ptr(ptr);
-        let slots = unsafe { ptr.as_mut() };
-        let host = slots.erase();
-        slots.header.map.set(&local, host, array_map.as_tagged());
-        slots.size.set(&local, host, Smi::new(0));
-        roots.create_handle(tagged)
-    };
-
-    let object_prototype =
-        bootstrap_empty_object(&mut local, &roots, object_prototype_map, empty_slots, void);
-
-    // undefined/true/false live in the ordinary hierarchy (their primitive
-    // boxing resolves against %Object.prototype%); null and the hole stay
-    // parentless on void_map (null has no prototype per spec).
-    let oddball_map = bootstrap_map_with_parent(
-        &mut local,
-        &roots,
-        map_map,
-        MapKind::OBJECT,
-        object_prototype,
-    );
-    let error_prototype_map = bootstrap_map_with_parent(
-        &mut local,
-        &roots,
-        map_map,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-        object_prototype,
-    );
-    let error_prototype =
-        bootstrap_empty_object(&mut local, &roots, error_prototype_map, empty_slots, void);
-    let error_map = bootstrap_map_with_parent(
-        &mut local,
-        &roots,
-        map_map,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-        error_prototype,
-    );
-
-    local.no_gc(|nogc, _| {
-        for map in [
-            &map_map,
-            &void_map,
-            &smi_map,
-            &float_map,
-            &array_map,
-            &byte_array_map,
-            &string_map,
-            &symbol_map,
-            &accessor_pair_map,
-            &callable_map,
-            &handler_table_map,
-            &context_map,
-            &object_prototype_map,
-            &oddball_map,
-            &error_prototype_map,
-            &error_map,
-        ] {
-            map.heap_ref(nogc).transitions.clear(void.value());
-        }
-    });
-
-    fn bootstrap_oddball(
-        local: &mut Heap,
-        roots: &RootHandles,
-        oddball_map: Global<Map>,
-        void: Global<Object>,
-    ) -> Global<Object> {
-        let raw = local
-            .allocate_raw(Object::layout_for())
-            .expect("bootstrap oddball allocation");
-        let ptr = unsafe { HeapPtr::<Object>::new(raw.as_ptr().cast()) };
-        let tagged = Tagged::from_ptr(ptr);
-        let obj = unsafe { ptr.as_mut() };
-        let host = obj.erase();
-        obj.header.map.set(local, host, oddball_map.as_tagged());
-        obj.slots
-            .set(local, host, unsafe { void.as_tagged().cast() });
-        obj.elements
-            .set(local, host, void.as_tagged().erase_tagged());
-        obj.length.set(local, host, Smi::new(0));
-        roots.create_handle(tagged)
-    }
-
-    let undefined = bootstrap_oddball(&mut local, &roots, oddball_map, void);
-    let null = bootstrap_oddball(&mut local, &roots, void_map, void);
-
-    let empty_string = {
-        let raw = local
-            .allocate_raw(FixedByteArray::layout_for(0))
-            .expect("bootstrap empty string backing allocation");
-        let backing_ptr = unsafe { HeapPtr::<FixedByteArray>::new(raw.as_ptr().cast()) };
-        let backing = unsafe { backing_ptr.as_mut() };
-        let host = backing.erase();
-        backing
-            .header
-            .map
-            .set(&local, host, byte_array_map.as_tagged());
-        backing.size.set(&local, host, Smi::new(0));
-        let backing = roots.create_handle(Tagged::from_ptr(backing_ptr));
-
-        let raw = local
-            .allocate_raw(Layout::new::<InternedString>())
-            .expect("bootstrap empty string allocation");
-        let ptr = unsafe { HeapPtr::<InternedString>::new(raw.as_ptr().cast()) };
-        let tagged = Tagged::from_ptr(ptr);
-        let string = unsafe { ptr.as_mut() };
-        let host = string.erase();
-        string
-            .0
-            .header
-            .map
-            .set(&local, host, string_map.as_tagged());
-        string.0.backing.set(&local, host, backing.as_tagged());
-        string
-            .0
-            .hash
-            .set(&local, host, Smi::new(string_content_hash(b"")));
-        roots.create_handle(tagged)
-    };
-
-    let false_object = bootstrap_oddball(&mut local, &roots, oddball_map, void);
-    let true_object = bootstrap_oddball(&mut local, &roots, oddball_map, void);
-
-    let empty_context = {
-        let raw = local
-            .allocate_raw(Layout::new::<Context>())
-            .expect("bootstrap empty context allocation");
-        let ptr = unsafe { HeapPtr::<Context>::new(raw.as_ptr().cast()) };
-        let tagged = Tagged::from_ptr(ptr);
-        let context = unsafe { ptr.as_mut() };
-        let host = context.erase();
-        context
-            .header
-            .map
-            .set(&local, host, context_map.as_tagged());
-        context.outer.clear(void.value());
-        context.slots.set(&local, host, empty_slots.as_tagged());
-        roots.create_handle(tagged)
-    };
-
-    let known = WellKnown {
-        map_map,
-        void,
-        undefined,
-        null,
-        false_object,
-        true_object,
-        empty_string,
-        smi_map,
-        float_map,
-        array_map,
-        byte_array_map,
-        string_map,
-        symbol_map,
-        accessor_pair_map,
-        callable_map,
-        handler_table_map,
-        context_map,
-        object_prototype,
-        error_prototype,
-        error_map,
-        empty_context,
-        roots,
-    };
-    known
+unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
+    roots.create_handle(unsafe { Tagged::from_value_unchecked(Smi::new(0).encode()) })
 }
 
+fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
+    let map = unsafe { smi_handle::<Map>(roots) };
+    let obj = unsafe { smi_handle::<Object>(roots) };
+    let string = unsafe { smi_handle::<InternedString>(roots) };
+    let context = unsafe { smi_handle::<Context>(roots) };
+    WellKnown {
+        map_map: map,
+        void: obj,
+        undefined: obj,
+        null: obj,
+        false_object: obj,
+        true_object: obj,
+        empty_string: string,
+        smi_map: map,
+        float_map: map,
+        array_map: map,
+        byte_array_map: map,
+        string_map: map,
+        symbol_map: map,
+        accessor_pair_map: map,
+        callable_map: map,
+        handler_table_map: map,
+        context_map: map,
+        object_prototype: obj,
+        error_prototype: obj,
+        error_map: map,
+        empty_context: context,
+    }
+}
+
+fn alloc_map(heap: &mut Heap, roots: &RootHandles, kind: MapKind) -> Global<Map> {
+    heap.allocate::<Map>(MapInit {
+        kind,
+        value_slot_count: 0,
+        descriptors: &[],
+    })
+    .into_global(roots)
+}
+
+fn alloc_parent_map(
+    heap: &mut Heap,
+    roots: &RootHandles,
+    kind: MapKind,
+    parent: Global<Object>,
+) -> Global<Map> {
+    heap.allocate::<Map>(MapInit {
+        kind,
+        value_slot_count: 0,
+        descriptors: &[(
+            SlotName::from(Tagged::from_smi(Smi::new(1))),
+            SlotFlags::CONST.union(SlotFlags::PARENT),
+            parent.value(),
+        )],
+    })
+    .into_global(roots)
+}
+
+fn alloc_object(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    roots: &RootHandles,
+    map: Global<Map>,
+    void: Global<Object>,
+) -> Global<Object> {
+    heap.allocate_object(
+        scope,
+        ObjectSlotsInit {
+            map,
+            values: &[],
+            elements: void.erase(),
+            length: 0,
+        },
+    )
+    .into_global(roots)
+}
+
+fn bootstrap_map_map_and_void(heap: &mut Heap, roots: &RootHandles) -> (Global<Map>, WellKnown) {
+    let mut known = uninited_wellknown(roots);
+    heap.set_known(known);
+
+    let map_map = heap
+        .allocate::<Map>(MapInit {
+            kind: MapKind::MAP,
+            value_slot_count: 0,
+            descriptors: &[],
+        })
+        .into_global(roots);
+    heap.no_gc(|nogc, heap| {
+        map_map
+            .heap_ref(nogc)
+            .header
+            .map
+            .set(heap, map_map.value(), map_map.as_tagged());
+    });
+    known.map_map = map_map;
+
+    let void_map = alloc_map(heap, roots, MapKind::OBJECT);
+    let void = heap
+        .allocate::<Object>(ObjectInit {
+            map: void_map,
+            slots: unsafe { smi_handle::<FixedArray>(roots) },
+            elements: unsafe { smi_handle::<Value>(roots) },
+            length: 0,
+        })
+        .into_global(roots);
+    heap.no_gc(|nogc, _heap| {
+        map_map.heap_ref(nogc).transitions.clear(void.value());
+        void_map.heap_ref(nogc).transitions.clear(void.value());
+    });
+    known.void = void;
+    heap.set_known(known);
+
+    (void_map, known)
+}
+
+pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
+    let (void_map, mut known) = bootstrap_map_map_and_void(heap, roots);
+    let void = known.void;
+
+    // All remaining maps: `Map::init` now reads the real map_map/void.
+    let smi_map = alloc_map(heap, roots, MapKind::OBJECT);
+    let float_map = alloc_map(heap, roots, MapKind::FLOAT);
+    let array_map = alloc_map(heap, roots, MapKind::FIXED_ARRAY);
+    let byte_array_map = alloc_map(heap, roots, MapKind::FIXED_BYTE_ARRAY);
+    let string_map = alloc_map(heap, roots, MapKind::VM_STRING);
+    let symbol_map = alloc_map(heap, roots, MapKind::SYMBOL);
+    let accessor_pair_map = alloc_map(heap, roots, MapKind::ACCESSOR_PAIR);
+    let callable_map = alloc_map(heap, roots, MapKind::CALLABLE_INFO);
+    let handler_table_map = alloc_map(heap, roots, MapKind::HANDLER_TABLE);
+    let context_map = alloc_map(heap, roots, MapKind::CONTEXT);
+    let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
+    known.smi_map = smi_map;
+    known.float_map = float_map;
+    known.array_map = array_map;
+    known.byte_array_map = byte_array_map;
+    known.string_map = string_map;
+    known.symbol_map = symbol_map;
+    known.accessor_pair_map = accessor_pair_map;
+    known.callable_map = callable_map;
+    known.handler_table_map = handler_table_map;
+    known.context_map = context_map;
+    heap.set_known(known);
+
+    // Everything else; `init` only reads the maps published above.
+    let data = HandleData::new(void.value());
+    let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
+
+    let empty_slots = heap.allocate::<FixedArray>(&[]).into_global(roots);
+    let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map, void);
+
+    let error_prototype_map = alloc_parent_map(
+        heap,
+        roots,
+        MapKind::OBJECT.union(MapKind::EXTENDABLE),
+        object_prototype,
+    );
+    let error_prototype = alloc_object(heap, &scope, roots, error_prototype_map, void);
+
+    let oddball_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
+    let error_map = alloc_parent_map(
+        heap,
+        roots,
+        MapKind::OBJECT.union(MapKind::EXTENDABLE),
+        error_prototype,
+    );
+
+    let undefined = alloc_object(heap, &scope, roots, oddball_map, void);
+    let null = alloc_object(heap, &scope, roots, void_map, void);
+    let false_object = alloc_object(heap, &scope, roots, oddball_map, void);
+    let true_object = alloc_object(heap, &scope, roots, oddball_map, void);
+
+    let empty_string = {
+        let backing = heap.allocate::<FixedByteArray>(&[]).into_handle(&scope);
+        heap.allocate::<InternedString>((backing, string_content_hash(b"")))
+            .into_global(roots)
+    };
+
+    let empty_context = heap
+        .allocate::<Context>(ContextInit {
+            outer: None,
+            slots: empty_slots,
+        })
+        .into_global(roots);
+
+    known.undefined = undefined;
+    known.null = null;
+    known.false_object = false_object;
+    known.true_object = true_object;
+    known.empty_string = empty_string;
+    known.object_prototype = object_prototype;
+    known.error_prototype = error_prototype;
+    known.error_map = error_map;
+    known.empty_context = empty_context;
+    heap.set_known(known);
+}
 pub struct NoGc<'a> {
     _phantom: PhantomData<&'a mut &'a ()>,
 }
@@ -804,6 +692,7 @@ pub struct HeapStats {
 pub struct HeapVtable {
     pub allocate_raw: fn(local: *mut (), layout: Layout) -> Result<NonNull<u8>, AllocError>,
     pub known: fn(local: *const ()) -> &'static WellKnown,
+    pub set_known: fn(shared: *const (), known: WellKnown),
     pub transition_lock: fn(local: *const ()) -> TransitionLock,
     pub write_barrier: fn(local: *const (), host: Value, slot: &RawCell, value: Value),
     pub collection_requested: fn(local: *const ()) -> bool,
@@ -817,7 +706,6 @@ pub struct GlobalVtable {
     /// Vtable used for [`Heap`]s created by [`GlobalHeap::new_local`].
     pub local_vtable: &'static HeapVtable,
     pub new_local: fn(shared: *const ()) -> *mut (),
-    pub set_known: fn(shared: *mut (), known: WellKnown),
     pub known: fn(shared: *const ()) -> &'static WellKnown,
     pub iterate_roots: fn(shared: *const (), roots: &mut dyn RootVisitor),
     pub collect: fn(shared: *const ()),
@@ -844,8 +732,12 @@ impl Heap {
         (self.vtable.allocate_raw)(self.local, layout)
     }
 
-    pub fn known(&self) -> &WellKnown {
+    pub fn known(&self) -> &'static WellKnown {
         (self.vtable.known)(self.local)
+    }
+
+    fn set_known(&self, known: WellKnown) {
+        (self.vtable.set_known)(self.shared, known)
     }
 
     pub fn transition_lock(&self) -> TransitionLock {
@@ -980,7 +872,7 @@ impl GlobalHeap {
         }
     }
 
-    pub fn known(&self) -> &WellKnown {
+    pub fn known(&self) -> &'static WellKnown {
         (self.vtable.known)(self.state)
     }
 
@@ -1010,13 +902,6 @@ impl GlobalHeap {
 
     pub fn stats(&self) -> HeapStats {
         (self.vtable.stats)(self.state)
-    }
-
-    /// Bootstrap and install the well-known objects.
-    pub fn install_well_known_maps(&self) {
-        let mut local = self.new_local();
-        let known = bootstrap_well_known(&mut local);
-        (self.vtable.set_known)(self.state, known);
     }
 }
 

@@ -138,7 +138,7 @@ fn callable_info_carries_handler_table() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread: &mut Thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let t = table(thread, &scope, &[HandlerEntryInit::new(2, 8, 33)]);
 
@@ -171,7 +171,7 @@ fn callable_info_carries_handler_table() {
                 ObjectSlotsInit {
                     map,
                     values: &[info.as_tagged().erase()],
-                    elements: void,
+                    elements: void.erase(),
                     length: 0,
                 },
             )
@@ -198,7 +198,7 @@ fn callable_info_without_handler_table() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread: &mut Thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let empty_context = thread.heap().known().empty_context;
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
