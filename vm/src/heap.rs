@@ -43,6 +43,9 @@ pub struct WellKnown {
     pub true_object: Global<Object>,
     /// Canonical empty string (synced with intern)
     pub empty_string: Global<InternedString>,
+    /// Shared empty backing for objects without data slots (never written in
+    /// place; the first property store swaps in a fresh array).
+    pub empty_fixed_array: Global<FixedArray>,
     pub smi_map: Global<Map>,
     pub float_map: Global<Map>,
     pub array_map: Global<Map>,
@@ -71,6 +74,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     let map = unsafe { smi_handle::<Map>(roots) };
     let obj = unsafe { smi_handle::<Object>(roots) };
     let string = unsafe { smi_handle::<InternedString>(roots) };
+    let array = unsafe { smi_handle::<FixedArray>(roots) };
     let context = unsafe { smi_handle::<Context>(roots) };
     WellKnown {
         map_map: map,
@@ -80,6 +84,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         false_object: obj,
         true_object: obj,
         empty_string: string,
+        empty_fixed_array: array,
         smi_map: map,
         float_map: map,
         array_map: map,
@@ -129,14 +134,13 @@ fn alloc_object(
     scope: &HandleScope<'_>,
     roots: &RootHandles,
     map: Global<Map>,
-    void: Global<Object>,
 ) -> Global<Object> {
     heap.allocate_object(
         scope,
         ObjectSlotsInit {
             map,
             values: &[],
-            elements: void.erase(),
+            elements: heap.known().empty_fixed_array.erase(),
             length: 0,
         },
     )
@@ -215,7 +219,9 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
     let empty_slots = heap.allocate::<FixedArray>(&[]).into_global(roots);
-    let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map, void);
+    known.empty_fixed_array = heap.allocate::<FixedArray>(&[]).into_global(roots);
+    heap.set_known(known);
+    let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map);
 
     let error_prototype_map = alloc_parent_map(
         heap,
@@ -223,7 +229,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         object_prototype,
     );
-    let error_prototype = alloc_object(heap, &scope, roots, error_prototype_map, void);
+    let error_prototype = alloc_object(heap, &scope, roots, error_prototype_map);
 
     let oddball_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
     let error_map = alloc_parent_map(
@@ -233,10 +239,10 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         error_prototype,
     );
 
-    let undefined = alloc_object(heap, &scope, roots, oddball_map, void);
-    let null = alloc_object(heap, &scope, roots, void_map, void);
-    let false_object = alloc_object(heap, &scope, roots, oddball_map, void);
-    let true_object = alloc_object(heap, &scope, roots, oddball_map, void);
+    let undefined = alloc_object(heap, &scope, roots, oddball_map);
+    let null = alloc_object(heap, &scope, roots, void_map);
+    let false_object = alloc_object(heap, &scope, roots, oddball_map);
+    let true_object = alloc_object(heap, &scope, roots, oddball_map);
 
     let empty_string = {
         let backing = heap.allocate::<FixedByteArray>(&[]).into_handle(&scope);
@@ -789,7 +795,11 @@ impl Heap {
         handles: &'a impl HandleSet,
         config: ObjectSlotsInit<'a, '_>,
     ) -> Fresh<'_, Object> {
-        let slots = handles.create_handle(self.allocate::<FixedArray>(config.values).into_tagged());
+        let slots = if config.values.is_empty() {
+            handles.create_handle(self.known().empty_fixed_array.as_tagged())
+        } else {
+            handles.create_handle(self.allocate::<FixedArray>(config.values).into_tagged())
+        };
         self.allocate::<Object>(ObjectInit {
             map: config.map,
             slots,

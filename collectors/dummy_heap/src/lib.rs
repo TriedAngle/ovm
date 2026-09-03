@@ -439,7 +439,7 @@ mod tests {
     fn alloc_object(heap: &mut Heap, map: Global<Map>, values: &[Value]) -> HeapPtr<Object> {
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let elements = heap.known().void.erase();
+        let elements = heap.known().empty_fixed_array.erase();
         heap.allocate_object(
             &scope,
             ObjectSlotsInit {
@@ -760,6 +760,52 @@ mod tests {
             // object untouched: same map, no slots
             assert_eq!(obj.header.map.inner(), map.value());
             assert_eq!(obj.slots.heap_ref(nogc).len(), 0);
+        });
+    }
+
+    #[test]
+    fn empty_objects_share_the_well_known_empty_fixed_array() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
+        let b = root_object(&scope, alloc_object(&mut heap, map, &[]));
+
+        heap.no_gc(|nogc, heap| {
+            let slots_a = a.heap_ref(nogc).slots.inner();
+            let slots_b = b.heap_ref(nogc).slots.inner();
+            assert_eq!(slots_a, slots_b);
+            assert_eq!(slots_a, heap.known().empty_fixed_array.value());
+            assert_eq!(a.heap_ref(nogc).slots.heap_ref(nogc).len(), 0);
+            assert_eq!(
+                a.heap_ref(nogc).elements.inner(),
+                heap.known().empty_fixed_array.value()
+            );
+        });
+
+        // a real data slot swaps in a fresh array
+        let map = alloc_map(
+            &mut heap,
+            &_roots,
+            MapKind::OBJECT,
+            1,
+            &[(
+                1,
+                SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                Smi::new(0).encode(),
+            )],
+        );
+        let c = root_object(
+            &scope,
+            alloc_object(&mut heap, map, &[Smi::new(7).encode()]),
+        );
+        heap.no_gc(|nogc, heap| {
+            assert_ne!(
+                c.heap_ref(nogc).slots.inner(),
+                heap.known().empty_fixed_array.value()
+            );
+            assert_eq!(c.heap_ref(nogc).slots.heap_ref(nogc).len(), 1);
         });
     }
 
