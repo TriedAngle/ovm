@@ -4,8 +4,6 @@ use vm::{Float, Handle, HandleScope, Heap, InternedString, Object, Smi, Tagged, 
 
 use crate::{ContextState, Thread, VM};
 
-pub const EXCEPTION_SENTINEL: Value = Value::CLEARED;
-
 pub struct NativeContext<'a> {
     vm: &'a VM,
     heap: &'a mut Heap,
@@ -86,7 +84,7 @@ pub extern "C" fn native_trampoline(
             )
             .expect("error materialization must not fail");
             thread.state.set_pending_exception(ex);
-            EXCEPTION_SENTINEL
+            thread.heap.known().exception.value()
         }
     }
 }

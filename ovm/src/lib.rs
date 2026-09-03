@@ -20,7 +20,7 @@ pub use cache::StackCache;
 
 pub use interner::StringInterner;
 pub use interpreter::error_from_vm_error;
-pub use natives::{EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry};
+pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use vm::VmError;
 
 pub struct SharedVM {

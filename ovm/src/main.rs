@@ -1,7 +1,7 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::natives::NativeIndex;
-use ovm::{EXCEPTION_SENTINEL, Thread, VM};
+use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandleScope,
     HandlerEntryInit, HandlerTable, HandlerTableInit, Map, MapInit, MapKind, Object,
@@ -156,7 +156,7 @@ fn main() {
         thread.execute(callable, &[])
     });
     match result {
-        Ok(v) if v == EXCEPTION_SENTINEL => {
+        Ok(v) if v == thread.heap().known().exception.value() => {
             let ex = thread.take_pending_exception().expect("pending exception");
             println!("throw 7 (uncaught): escaped, pending exception = {ex:?}");
         }
