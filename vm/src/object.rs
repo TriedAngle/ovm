@@ -1048,7 +1048,8 @@ impl HeapObject for HandlerTable {
             let slot = unsafe { &*self.entry_ptr().add(i) };
             slot.try_start.set(heap, host, Smi::new(e.try_start as i64));
             slot.try_end.set(heap, host, Smi::new(e.try_end as i64));
-            slot.handler_pc.set(heap, host, Smi::new(e.handler_pc as i64));
+            slot.handler_pc
+                .set(heap, host, Smi::new(e.handler_pc as i64));
         }
     }
 

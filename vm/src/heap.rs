@@ -1,8 +1,7 @@
 use crate::{
     Context, FixedArray, FixedByteArray, Global, Handle, HandleScope, HandleSet, HeapObject,
     HeapPtr, InternedString, Map, MapKind, Object, ObjectInit, ObjectSlotsInit, RootHandles,
-    STRONG_PTR, SlotFlags, SlotName, Smi, Tagged, TransitionLock, Value, Word,
-    string_content_hash,
+    STRONG_PTR, SlotFlags, SlotName, Smi, Tagged, TransitionLock, Value, Word, string_content_hash,
 };
 use core::{
     alloc::Layout,
@@ -124,15 +123,17 @@ pub trait Heap: Sized + Send + Sync {
             // placeholder: `void` does not exist yet, fixed up below
             map.transitions.as_raw().store_raw(Smi::new(0).encode());
             let d = map.descriptor(0);
-            d.name
-                .set(local, host, SlotName::from(Tagged::from_smi(Smi::new(1))).tagged());
+            d.name.set(
+                local,
+                host,
+                SlotName::from(Tagged::from_smi(Smi::new(1))).tagged(),
+            );
             d.flags.set(
                 local,
                 host,
                 Smi::new(SlotFlags::CONST.union(SlotFlags::PARENT).bits() as i64),
             );
-            d.value
-                .set(local, host, parent.as_tagged().erase_tagged());
+            d.value.set(local, host, parent.as_tagged().erase_tagged());
             global
         }
 
@@ -349,7 +350,10 @@ pub trait Heap: Sized + Send + Sync {
             let tagged = Tagged::from_ptr(ptr);
             let context = unsafe { ptr.as_mut() };
             let host = context.erase();
-            context.header.map.set(&local, host, context_map.as_tagged());
+            context
+                .header
+                .map
+                .set(&local, host, context_map.as_tagged());
             context.outer.clear(void.value());
             context.slots.set(&local, host, empty_slots.as_tagged());
             roots.create_handle(tagged)

@@ -349,8 +349,8 @@ fn raise<H: Heap>(
 ) -> Unwind {
     let cache = &state.cache;
     cache.spill_acc(acc);
-    let ex = error_from_vm_error(vm, heap, state, err)
-        .expect("error materialization must not fail");
+    let ex =
+        error_from_vm_error(vm, heap, state, err).expect("error materialization must not fail");
     let _ = cache.take_acc();
     state.set_pending_exception(ex);
     exception_dispatch(heap, state, base_depth, pc)
@@ -498,15 +498,13 @@ fn dispatch<H: Heap>(
                         }
                     }
                     Ok(v) => acc = v,
-                    Err(err) => {
-                        match raise(vm, heap, state, base_depth, saved, err, pc) {
-                            Unwind::Caught(ex) => {
-                                acc = ex;
-                                continue;
-                            }
-                            Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    Err(err) => match raise(vm, heap, state, base_depth, saved, err, pc) {
+                        Unwind::Caught(ex) => {
+                            acc = ex;
+                            continue;
                         }
-                    }
+                        Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                    },
                 }
             }
             // TODO: feedback vectors and separation once they are there
@@ -542,31 +540,33 @@ fn dispatch<H: Heap>(
                                 }
                             }
                             Ok(v) => acc = v,
-                            Err(err) => {
-                                match raise(vm, heap, state, base_depth, saved, err, pc) {
-                                    Unwind::Caught(ex) => {
-                                        acc = ex;
-                                        continue;
-                                    }
-                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            Err(err) => match raise(vm, heap, state, base_depth, saved, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
                                 }
-                            }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            },
                         }
                     }
                     CallTarget::Bytecode(target, register_count) => {
-                        let callee = stack
-                            .push_frame(meta, pc, target, register_count, ops.reg_list(1), count);
+                        let callee = stack.push_frame(
+                            meta,
+                            pc,
+                            target,
+                            register_count,
+                            ops.reg_list(1),
+                            count,
+                        );
                         let callee = match callee {
                             Ok(callee) => callee,
-                            Err(err) => {
-                                match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                    Unwind::Caught(ex) => {
-                                        acc = ex;
-                                        continue;
-                                    }
-                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
                                 }
-                            }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            },
                         };
                         cache.load(stack, callee, heap);
                     }
@@ -585,15 +585,13 @@ fn dispatch<H: Heap>(
                             call_value::<H>(heap, stack, cache, meta, pc, getter, &[receiver]);
                         let called = match called {
                             Ok(called) => called,
-                            Err(err) => {
-                                match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                    Unwind::Caught(ex) => {
-                                        acc = ex;
-                                        continue;
-                                    }
-                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
                                 }
-                            }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            },
                         };
                         if !called {
                             // non-callable getter: the load yields undefined
@@ -644,15 +642,13 @@ fn dispatch<H: Heap>(
                             call_value::<H>(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
                         match called {
                             Ok(_) => {}
-                            Err(err) => {
-                                match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                    Unwind::Caught(ex) => {
-                                        acc = ex;
-                                        continue;
-                                    }
-                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
                                 }
-                            }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            },
                         }
                     }
                     StoreOutcome::Done => {}
@@ -687,15 +683,13 @@ fn dispatch<H: Heap>(
                             call_value::<H>(heap, stack, cache, meta, pc, getter, &[receiver]);
                         let called = match called {
                             Ok(called) => called,
-                            Err(err) => {
-                                match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                    Unwind::Caught(ex) => {
-                                        acc = ex;
-                                        continue;
-                                    }
-                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
                                 }
-                            }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            },
                         };
                         if !called {
                             acc = heap.known().undefined.value();
@@ -751,15 +745,13 @@ fn dispatch<H: Heap>(
                             call_value::<H>(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
                         match called {
                             Ok(_) => {}
-                            Err(err) => {
-                                match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                    Unwind::Caught(ex) => {
-                                        acc = ex;
-                                        continue;
-                                    }
-                                    Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                                Unwind::Caught(ex) => {
+                                    acc = ex;
+                                    continue;
                                 }
-                            }
+                                Unwind::Escaped => return Ok(EXCEPTION_SENTINEL),
+                            },
                         }
                     }
                     StoreOutcome::Done => {}
@@ -864,11 +856,11 @@ fn dispatch<H: Heap>(
                         .inner()
                         .get_as::<Context>(nogc, heap.known().context_map)
                         .ok_or(VmError::Type)?;
-                    context
-                        .slots
-                        .heap_ref(nogc)
-                        .element_slot(ops.idx(0))
-                        .set(heap, host, Tagged::from_value(acc));
+                    context.slots.heap_ref(nogc).element_slot(ops.idx(0)).set(
+                        heap,
+                        host,
+                        Tagged::from_value(acc),
+                    );
                     Ok(())
                 });
                 if let Err(err) = result {

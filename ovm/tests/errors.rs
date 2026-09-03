@@ -15,10 +15,7 @@ fn get_prop(thread: &mut Thread<DummyHeap>, obj: Value, name: Value) -> Value {
     })
 }
 
-fn error_and_props(
-    thread: &mut Thread<DummyHeap>,
-    err: VmError,
-) -> (Value, Value, Value) {
+fn error_and_props(thread: &mut Thread<DummyHeap>, err: VmError) -> (Value, Value, Value) {
     let obj = thread.error_object(err).unwrap();
     let (name_key, name_val, message_key) = thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
@@ -46,8 +43,7 @@ fn error_names_map_to_spec_classes() {
         (VmError::StackOverflow, "RangeError"),
     ] {
         let (_, name, _) = error_and_props(&mut thread, err);
-        let expected = thread
-            .handle_scope(|thread, scope| thread.intern(&scope, expected).value());
+        let expected = thread.handle_scope(|thread, scope| thread.intern(&scope, expected).value());
         assert_eq!(name, expected, "{err:?}");
     }
 }
@@ -159,11 +155,11 @@ fn error_objects_are_extendable() {
         Ok(StoreOutcome::Transition { receiver, name }) => {
             thread.handle_scope(|thread, scope| {
                 let receiver = scope
-                    .create_handle(unsafe { vm::Tagged::<vm::Object>::from_value_unchecked(receiver) })
+                    .create_handle(unsafe {
+                        vm::Tagged::<vm::Object>::from_value_unchecked(receiver)
+                    })
                     .expect("receiver is strong");
-                let name = scope
-                    .create_handle(name.tagged())
-                    .expect("name is strong");
+                let name = scope.create_handle(name.tagged()).expect("name is strong");
                 let value = scope
                     .create_handle(vm::Tagged::from_value(extra_val))
                     .expect("value is strong");

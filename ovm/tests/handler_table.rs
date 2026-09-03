@@ -34,11 +34,7 @@ fn roundtrip_entries() {
                 .value()
                 .get_as::<HandlerTable>(nogc, heap.known().handler_table_map)
                 .expect("handler table value");
-            (
-                table.len(),
-                table.entry(0),
-                table.entry(1),
-            )
+            (table.len(), table.entry(0), table.entry(1))
         });
         assert_eq!(out.0, 2);
         assert_eq!(out.1, HandlerEntryInit::new(0, 10, 40));
@@ -52,11 +48,7 @@ fn lookup_finds_handler_inside_range() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let t = table(
-            thread,
-            &scope,
-            &[HandlerEntryInit::new(5, 15, 100)],
-        );
+        let t = table(thread, &scope, &[HandlerEntryInit::new(5, 15, 100)]);
         thread.heap().no_gc(|nogc, heap| {
             let table = t
                 .value()
@@ -76,11 +68,7 @@ fn lookup_returns_none_outside_range() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let t = table(
-            thread,
-            &scope,
-            &[HandlerEntryInit::new(5, 15, 100)],
-        );
+        let t = table(thread, &scope, &[HandlerEntryInit::new(5, 15, 100)]);
         thread.heap().no_gc(|nogc, heap| {
             let table = t
                 .value()
@@ -152,15 +140,9 @@ fn callable_info_carries_handler_table() {
     thread.handle_scope(|thread: &mut Thread<DummyHeap>, scope| {
         let void = thread.heap().known().void.value();
         let empty_context = thread.heap().known().empty_context;
-        let t = table(
-            thread,
-            &scope,
-            &[HandlerEntryInit::new(2, 8, 33)],
-        );
+        let t = table(thread, &scope, &[HandlerEntryInit::new(2, 8, 33)]);
 
-        let bytecode = thread
-            .heap()
-            .allocate_handle::<FixedByteArray>(&[], &scope);
+        let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
@@ -218,9 +200,7 @@ fn callable_info_without_handler_table() {
     thread.handle_scope(|thread: &mut Thread<DummyHeap>, scope| {
         let void = thread.heap().known().void.value();
         let empty_context = thread.heap().known().empty_context;
-        let bytecode = thread
-            .heap()
-            .allocate_handle::<FixedByteArray>(&[], &scope);
+        let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {

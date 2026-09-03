@@ -19,7 +19,11 @@ fn empty_context_is_the_well_known_root() {
         )
     });
     assert_eq!(kind, ObjectKind::Context);
-    assert_eq!(outer, thread.heap().known().void.value(), "no outer context");
+    assert_eq!(
+        outer,
+        thread.heap().known().void.value(),
+        "no outer context"
+    );
     assert_eq!(len, 0, "no context slots");
 }
 
@@ -32,13 +36,9 @@ fn contexts_chain_through_outer() {
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(42).encode()], &scope);
-        let inner = thread.heap().allocate_handle::<Context>(
-            ContextInit {
-                outer: None,
-                slots,
-            },
-            &scope,
-        );
+        let inner = thread
+            .heap()
+            .allocate_handle::<Context>(ContextInit { outer: None, slots }, &scope);
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(7).encode()], &scope);
@@ -78,17 +78,11 @@ fn callable_info_carries_typed_context() {
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(9).encode()], &scope);
-        let context = thread.heap().allocate_handle::<Context>(
-            ContextInit {
-                outer: None,
-                slots,
-            },
-            &scope,
-        );
-
-        let bytecode = thread
+        let context = thread
             .heap()
-            .allocate_handle::<FixedByteArray>(&[], &scope);
+            .allocate_handle::<Context>(ContextInit { outer: None, slots }, &scope);
+
+        let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
