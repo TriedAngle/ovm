@@ -74,7 +74,7 @@ fn callable_info_carries_typed_context() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void.value();
+        let void = thread.heap().known().void;
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(9).encode()], &scope);
@@ -110,7 +110,7 @@ fn callable_info_carries_typed_context() {
                 ObjectSlotsInit {
                     map,
                     values: &[info.as_tagged().erase()],
-                    elements: void,
+                    elements: void.erase(),
                     length: 0,
                 },
             )

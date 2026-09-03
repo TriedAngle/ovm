@@ -432,14 +432,14 @@ impl Object {
 pub struct ObjectInit<'a> {
     pub map: Handle<'a, Map>,
     pub slots: Handle<'a, FixedArray>,
-    pub elements: Value,
+    pub elements: Handle<'a, Value>,
     pub length: usize,
 }
 
 pub struct ObjectSlotsInit<'m, 'v> {
     pub map: Handle<'m, Map>,
     pub values: &'v [Value],
-    pub elements: Value,
+    pub elements: Handle<'m, Value>,
     pub length: usize,
 }
 
@@ -454,8 +454,7 @@ impl HeapObject for Object {
         let host = self.erase();
         self.header.map.set(heap, host, config.map.as_tagged());
         self.slots.set(heap, host, config.slots.as_tagged());
-        self.elements
-            .set(heap, host, Tagged::from_value(config.elements));
+        self.elements.set(heap, host, config.elements.erase());
         self.length.set(heap, host, Smi::new(config.length as i64));
     }
 

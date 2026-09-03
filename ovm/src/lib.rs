@@ -5,7 +5,7 @@ use core::ptr::NonNull;
 
 use vm::{
     AllocError, EdgeVisitable, GlobalHeap, Handle, HandleData, HandleScope, Heap, HeapBackend,
-    InternedString, Object, Register, RootVisitor, Value, Visitor,
+    InternedString, Object, Register, RootHandles, RootVisitor, Smi, Value, Visitor,
 };
 
 pub mod cache;
@@ -25,6 +25,7 @@ pub use vm::VmError;
 
 pub struct SharedVM {
     heap: GlobalHeap,
+    roots: RootHandles,
     // TODO: investiage if Mutex is fine, maybe a lock-free mechanism exists
     threads: Mutex<Vec<Weak<ContextState>>>,
     interner: StringInterner,
@@ -171,13 +172,16 @@ impl Clone for VM {
 impl VM {
     pub fn new<B: HeapBackend>(config: B::Config) -> Result<Self, AllocError> {
         let heap = B::new(config)?.into_global();
-        heap.install_well_known_maps();
+        let mut local = heap.new_local();
+        let roots = unsafe { RootHandles::new(64, Smi::new(0).encode()) };
+        vm::bootstrap_well_known(&mut local, &roots);
         let interner = StringInterner::new();
         // canonical empty string
         interner.insert("", heap.known().empty_string);
         Ok(Self {
             shared: Arc::new(SharedVM {
                 heap,
+                roots,
                 threads: Mutex::new(Vec::new()),
                 interner,
                 natives: NativeRegistry::new(),
@@ -213,6 +217,7 @@ impl VM {
 
     pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
         self.shared.interner.visit_edges(visitor);
+        self.shared.roots.visit_edges(visitor);
         self.shared.heap.iterate_roots(visitor);
         let threads = self.shared.threads.lock().unwrap();
         for state in threads.iter().filter_map(Weak::upgrade) {

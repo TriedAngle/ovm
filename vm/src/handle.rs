@@ -259,6 +259,9 @@ pub struct RootHandles {
     next: AtomicUsize,
 }
 
+unsafe impl Send for RootHandles {}
+unsafe impl Sync for RootHandles {}
+
 impl RootHandles {
     pub unsafe fn new(capacity: usize, fill: Value) -> Self {
         Self {

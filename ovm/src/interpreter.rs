@@ -217,7 +217,7 @@ pub fn error_from_vm_error(
                 ObjectSlotsInit {
                     map,
                     values: &[],
-                    elements: heap.known().void.value(),
+                    elements: heap.known().void.erase(),
                     length: 0,
                 },
             )
@@ -780,7 +780,7 @@ fn dispatch(
                         ObjectSlotsInit {
                             map,
                             values: args,
-                            elements: heap.known().void.value(),
+                            elements: heap.known().void.erase(),
                             length: 0,
                         },
                     )

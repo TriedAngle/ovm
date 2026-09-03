@@ -11,7 +11,7 @@ pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, HandleSe
 pub use heap::{
     AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, GlobalHeap, GlobalVtable, Heap,
     HeapBackend, HeapRef, HeapStats, HeapVtable, NoGc, OptionGcSlot, RawCell, Register,
-    RootVisitor, Visitor, WeakGcCell, WellKnown, WordType,
+    RootVisitor, Visitor, WeakGcCell, WellKnown, WordType, bootstrap_well_known,
 };
 pub use lookup::Lookup;
 pub use object::{
