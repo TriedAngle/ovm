@@ -1,9 +1,9 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{Thread, VM, VmError};
-use vm::{LocalHeap, Lookup, SlotName, StoreOutcome, StoreSemantics, Value, ValueRef};
+use vm::{Lookup, SlotName, StoreOutcome, StoreSemantics, Value, ValueRef};
 
 /// Read a data property by interned name value.
-fn get_prop(thread: &mut Thread<DummyHeap>, obj: Value, name: Value) -> Value {
+fn get_prop(thread: &mut Thread, obj: Value, name: Value) -> Value {
     thread.heap().no_gc(|nogc, heap| {
         let ValueRef::Object(o) = obj.value_ref(nogc) else {
             panic!("expected object");
@@ -15,7 +15,7 @@ fn get_prop(thread: &mut Thread<DummyHeap>, obj: Value, name: Value) -> Value {
     })
 }
 
-fn error_and_props(thread: &mut Thread<DummyHeap>, err: VmError) -> (Value, Value, Value) {
+fn error_and_props(thread: &mut Thread, err: VmError) -> (Value, Value, Value) {
     let obj = thread.error_object(err).unwrap();
     let (name_key, name_val, message_key) = thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
@@ -31,7 +31,7 @@ fn error_and_props(thread: &mut Thread<DummyHeap>, err: VmError) -> (Value, Valu
 
 #[test]
 fn error_names_map_to_spec_classes() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     for (err, expected) in [
@@ -50,7 +50,7 @@ fn error_names_map_to_spec_classes() {
 
 #[test]
 fn error_object_carries_name_and_message() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (_, name, message) = error_and_props(&mut thread, VmError::Type);
@@ -66,7 +66,7 @@ fn error_object_carries_name_and_message() {
 
 #[test]
 fn distinct_vm_errors_have_distinct_messages() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (_, _, type_msg) = error_and_props(&mut thread, VmError::Type);
@@ -76,7 +76,7 @@ fn distinct_vm_errors_have_distinct_messages() {
 
 #[test]
 fn error_objects_are_distinct_but_share_shapes() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (a, _, _) = error_and_props(&mut thread, VmError::Type);
@@ -103,7 +103,7 @@ fn error_objects_are_distinct_but_share_shapes() {
 
 #[test]
 fn error_properties_are_writable() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (obj, _, _) = error_and_props(&mut thread, VmError::Type);
@@ -129,7 +129,7 @@ fn error_properties_are_writable() {
 
 #[test]
 fn error_objects_are_extendable() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (obj, _, _) = error_and_props(&mut thread, VmError::Type);
@@ -172,7 +172,7 @@ fn error_objects_are_extendable() {
 }
 
 /// The object this object's map links to via its PARENT descriptor.
-fn prototype_of(thread: &mut Thread<DummyHeap>, obj: Value) -> Option<Value> {
+fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
     thread.heap().no_gc(|nogc, _heap| {
         let ValueRef::Object(o) = obj.value_ref(nogc) else {
             panic!("expected object");
@@ -187,7 +187,7 @@ fn prototype_of(thread: &mut Thread<DummyHeap>, obj: Value) -> Option<Value> {
 
 #[test]
 fn startup_prototype_hierarchy() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (error_obj, _, _) = error_and_props(&mut thread, VmError::Type);

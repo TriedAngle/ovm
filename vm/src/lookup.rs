@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, GcSlot, HeapPtr, HeapRef, LocalHeap, Map, NoGc, Object, SlotDescriptor,
-    SlotFlags, SlotKind, SlotName, Smi, Value, ValueRef,
+    AccessorPair, GcSlot, Heap, HeapPtr, HeapRef, Map, NoGc, Object, SlotDescriptor, SlotFlags,
+    SlotKind, SlotName, Smi, Value, ValueRef,
 };
 
 pub enum Lookup<'a> {
@@ -29,12 +29,7 @@ impl Value {
         value_ref(*self, guard)
     }
 
-    pub fn lookup<'a>(
-        &self,
-        guard: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
-        name: SlotName,
-    ) -> Lookup<'a> {
+    pub fn lookup<'a>(&self, guard: &'a NoGc<'a>, heap: &Heap, name: SlotName) -> Lookup<'a> {
         lookup_value(*self, guard, heap, name)
     }
 }
@@ -50,7 +45,7 @@ fn value_ref<'a>(v: Value, _guard: &'a NoGc<'a>) -> ValueRef<'a> {
 fn lookup_value<'a>(
     receiver: Value,
     guard: &'a NoGc<'a>,
-    heap: &impl LocalHeap,
+    heap: &Heap,
     name: SlotName,
 ) -> Lookup<'a> {
     let receiver = value_ref(receiver, guard);
@@ -65,7 +60,7 @@ impl Map {
     pub fn lookup<'a>(
         &'a self,
         guard: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
+        heap: &Heap,
         receiver: ValueRef<'a>,
         name: SlotName,
     ) -> Lookup<'a> {
@@ -121,7 +116,7 @@ impl Map {
     pub fn lookup_parent<'a>(
         &'a self,
         guard: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
+        heap: &Heap,
         name: SlotName,
         parent: SlotName,
     ) -> Lookup<'a> {
@@ -139,12 +134,7 @@ impl Map {
 }
 
 impl Object {
-    pub fn lookup<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
-        name: SlotName,
-    ) -> Lookup<'a> {
+    pub fn lookup<'a>(&'a self, guard: &'a NoGc<'a>, heap: &Heap, name: SlotName) -> Lookup<'a> {
         self.header.map.heap_ref(guard).as_ref().lookup(
             guard,
             heap,
@@ -156,7 +146,7 @@ impl Object {
     pub fn lookup_parent<'a>(
         &'a self,
         guard: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
+        heap: &Heap,
         name: SlotName,
         parent: SlotName,
     ) -> Lookup<'a> {

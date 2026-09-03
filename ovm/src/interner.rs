@@ -3,7 +3,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
 use vm::{
-    EdgeVisitable, FixedByteArray, Global, Handle, HandleScope, InternedString, LocalHeap, Visitor,
+    EdgeVisitable, FixedByteArray, Global, Handle, HandleScope, Heap, InternedString, Visitor,
     WeakGcCell, string_content_hash,
 };
 
@@ -26,9 +26,9 @@ impl StringInterner {
             .insert(s.into(), WeakGcCell::new(value.get()));
     }
 
-    pub fn intern<'s, L: LocalHeap>(
+    pub fn intern<'s>(
         &self,
-        heap: &mut L,
+        heap: &mut Heap,
         scope: &'s HandleScope<'_>,
         s: impl AsRef<str>,
     ) -> Handle<'s, InternedString> {
@@ -73,8 +73,8 @@ impl StringInterner {
     }
 }
 
-fn handle_from_entry<'s, L: LocalHeap>(
-    heap: &mut L,
+fn handle_from_entry<'s>(
+    heap: &mut Heap,
     scope: &'s HandleScope<'_>,
     entry: &WeakGcCell<InternedString>,
 ) -> Option<Handle<'s, InternedString>> {

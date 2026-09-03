@@ -1,13 +1,13 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
 use vm::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray,
-    LocalHeap, Map, MapInit, MapKind, ObjectKind, ObjectSlotsInit, Smi,
+    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Map,
+    MapInit, MapKind, ObjectKind, ObjectSlotsInit, Smi,
 };
 
 #[test]
 fn empty_context_is_the_well_known_root() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (kind, outer, len) = thread.heap().no_gc(|nogc, heap| {
@@ -29,7 +29,7 @@ fn empty_context_is_the_well_known_root() {
 
 #[test]
 fn contexts_chain_through_outer() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -70,7 +70,7 @@ fn contexts_chain_through_outer() {
 
 #[test]
 fn callable_info_carries_typed_context() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {

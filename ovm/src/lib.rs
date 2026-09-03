@@ -4,8 +4,8 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use vm::{
-    AllocError, EdgeVisitable, Handle, HandleData, HandleScope, Heap, InternedString, LocalHeap,
-    Object, Register, RootVisitor, Value, Visitor,
+    AllocError, EdgeVisitable, GlobalHeap, Handle, HandleData, HandleScope, Heap, HeapBackend,
+    InternedString, Object, Register, RootVisitor, Value, Visitor,
 };
 
 pub mod cache;
@@ -23,21 +23,16 @@ pub use interpreter::error_from_vm_error;
 pub use natives::{EXCEPTION_SENTINEL, NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use vm::VmError;
 
-// TODO: get rid of the generic heap, instead make only init generic.
-// in runtime we only want a Generic interface with vtable pointers probably
-// this is especially problematic with C/native interaces which dont support generics
-// also these generics have not shown any benifit really.
-// additionnaly without generics we can do runtime GC swapping (whatever the usecase may be)
-pub struct SharedVM<H: Heap> {
-    heap: H,
+pub struct SharedVM {
+    heap: GlobalHeap,
     // TODO: investiage if Mutex is fine, maybe a lock-free mechanism exists
     threads: Mutex<Vec<Weak<ContextState>>>,
     interner: StringInterner,
-    natives: NativeRegistry<H>,
+    natives: NativeRegistry,
 }
 
-pub struct VM<H: Heap> {
-    shared: Arc<SharedVM<H>>,
+pub struct VM {
+    shared: Arc<SharedVM>,
 }
 
 pub struct ContextState {
@@ -92,18 +87,18 @@ impl EdgeVisitable for ContextState {
     }
 }
 
-pub struct Thread<H: Heap> {
-    vm: VM<H>,
-    heap: H::Local,
+pub struct Thread {
+    vm: VM,
+    heap: Heap,
     state: Arc<ContextState>,
 }
 
-impl<H: Heap> Thread<H> {
-    pub fn vm(&self) -> &VM<H> {
+impl Thread {
+    pub fn vm(&self) -> &VM {
         &self.vm
     }
 
-    pub fn heap(&mut self) -> &mut H::Local {
+    pub fn heap(&mut self) -> &mut Heap {
         &mut self.heap
     }
 
@@ -159,13 +154,13 @@ impl<H: Heap> Thread<H> {
         interpreter::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
     }
 
-    pub fn run_native(&mut self, f: NativeFn<H>, args: &[Value]) -> Result<Value, VmError> {
+    pub fn run_native(&mut self, f: NativeFn, args: &[Value]) -> Result<Value, VmError> {
         let mut nctx = NativeContext::new(&self.vm, &mut self.heap, &self.state);
         f(&mut nctx, args)
     }
 }
 
-impl<H: Heap> Clone for VM<H> {
+impl Clone for VM {
     fn clone(&self) -> Self {
         Self {
             shared: Arc::clone(&self.shared),
@@ -173,9 +168,9 @@ impl<H: Heap> Clone for VM<H> {
     }
 }
 
-impl<H: Heap> VM<H> {
-    pub fn new(config: H::Config) -> Result<Self, AllocError> {
-        let heap = H::new(config)?;
+impl VM {
+    pub fn new<B: HeapBackend>(config: B::Config) -> Result<Self, AllocError> {
+        let heap = B::new(config)?.into_global();
         heap.install_well_known_maps();
         let interner = StringInterner::new();
         // canonical empty string
@@ -190,7 +185,7 @@ impl<H: Heap> VM<H> {
         })
     }
 
-    pub fn heap(&self) -> &H {
+    pub fn heap(&self) -> &GlobalHeap {
         &self.shared.heap
     }
 
@@ -198,18 +193,18 @@ impl<H: Heap> VM<H> {
         &self.shared.interner
     }
 
-    pub fn natives(&self) -> &NativeRegistry<H> {
+    pub fn natives(&self) -> &NativeRegistry {
         &self.shared.natives
     }
 
-    pub fn native(&self, index: NativeIndex) -> NativeFn<H> {
+    pub fn native(&self, index: NativeIndex) -> NativeFn {
         self.shared
             .natives
             .get(index)
             .expect("unknown native index")
     }
 
-    pub fn register_native(&mut self, f: NativeFn<H>) -> NativeIndex {
+    pub fn register_native(&mut self, f: NativeFn) -> NativeIndex {
         Arc::get_mut(&mut self.shared)
             .expect("cannot register natives on a shared VM")
             .natives
@@ -218,13 +213,14 @@ impl<H: Heap> VM<H> {
 
     pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
         self.shared.interner.visit_edges(visitor);
+        self.shared.heap.iterate_roots(visitor);
         let threads = self.shared.threads.lock().unwrap();
         for state in threads.iter().filter_map(Weak::upgrade) {
             state.visit_edges(visitor);
         }
     }
 
-    pub fn attach(&self) -> Thread<H> {
+    pub fn attach(&self) -> Thread {
         let heap = self.shared.heap.new_local();
         let void = heap.known().void.value();
         let state = Arc::new(ContextState {
@@ -247,9 +243,8 @@ impl<H: Heap> VM<H> {
 
     pub fn spawn<F, R>(&self, f: F) -> std::thread::JoinHandle<R>
     where
-        F: FnOnce(&mut Thread<H>) -> R + Send + 'static,
+        F: FnOnce(&mut Thread) -> R + Send + 'static,
         R: Send + 'static,
-        H: 'static,
     {
         let vm = self.clone();
         std::thread::spawn(move || {

@@ -9,8 +9,9 @@ pub mod value;
 pub use error::VmError;
 pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, RootHandles};
 pub use heap::{
-    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, Heap, HeapRef, LocalHeap, NoGc,
-    OptionGcSlot, RawCell, Register, RootVisitor, Visitor, WeakGcCell, WellKnown, WordType,
+    AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, GlobalHeap, GlobalVtable, Heap,
+    HeapBackend, HeapRef, HeapStats, HeapVtable, NoGc, OptionGcSlot, RawCell, Register,
+    RootVisitor, Visitor, WeakGcCell, WellKnown, WordType,
 };
 pub use lookup::Lookup;
 pub use object::{

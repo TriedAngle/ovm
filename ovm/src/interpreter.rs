@@ -1,19 +1,19 @@
 use bytecode::{Opcode, decode};
 
 use vm::{
-    Context, FixedArray, Float, Handle, HeapRef, InternedString, LocalHeap, Lookup, Map, NoGc,
-    Object, ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, VMString,
-    Value, ValueRef,
+    Context, FixedArray, Float, Handle, Heap, HeapRef, InternedString, Lookup, Map, NoGc, Object,
+    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, VMString, Value,
+    ValueRef,
 };
 
 use crate::{
-    ContextState, FrameMeta, Heap, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
+    ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
     natives::EXCEPTION_SENTINEL,
 };
 
-pub fn execute<H: Heap>(
-    vm: &VM<H>,
-    heap: &mut H::Local,
+pub fn execute(
+    vm: &VM,
+    heap: &mut Heap,
     state: &ContextState,
     callable: Handle<'_, Object>,
     args: &[Value],
@@ -44,9 +44,9 @@ pub fn execute<H: Heap>(
     result
 }
 
-fn start<H: Heap>(
-    vm: &VM<H>,
-    heap: &mut H::Local,
+fn start(
+    vm: &VM,
+    heap: &mut Heap,
     state: &ContextState,
     callable: Handle<'_, Object>,
     args: &[Value],
@@ -78,7 +78,7 @@ enum CallTarget {
     Native(usize),
 }
 
-fn call_target<'a, L: LocalHeap>(nogc: &'a NoGc<'a>, heap: &'a L, f: Value) -> Option<CallTarget> {
+fn call_target<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, f: Value) -> Option<CallTarget> {
     let ValueRef::Object(obj) = f.value_ref(nogc) else {
         return None;
     };
@@ -94,9 +94,9 @@ fn call_target<'a, L: LocalHeap>(nogc: &'a NoGc<'a>, heap: &'a L, f: Value) -> O
     Some(CallTarget::Bytecode(obj.into_tagged(), register_count))
 }
 
-fn property_name<'a, L: LocalHeap>(
+fn property_name<'a>(
     nogc: &'a NoGc<'a>,
-    heap: &'a L,
+    heap: &'a Heap,
     constants: HeapRef<'a, FixedArray>,
     idx: usize,
 ) -> SlotName {
@@ -114,11 +114,7 @@ enum Key {
     Name(SlotName),
 }
 
-fn classify_key<'a, L: LocalHeap>(
-    nogc: &'a NoGc<'a>,
-    heap: &'a L,
-    key: Value,
-) -> Result<Key, VmError> {
+fn classify_key<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, key: Value) -> Result<Key, VmError> {
     if let Some(smi) = Smi::decode(key) {
         return usize::try_from(smi.value())
             .map(Key::Element)
@@ -138,9 +134,9 @@ enum LoadOutcome {
     Getter(Value),
 }
 
-fn load_outcome<'a, L: LocalHeap>(
+fn load_outcome<'a>(
     nogc: &'a NoGc<'a>,
-    heap: &'a L,
+    heap: &'a Heap,
     receiver: Value,
     name: SlotName,
 ) -> LoadOutcome {
@@ -159,8 +155,8 @@ fn load_outcome<'a, L: LocalHeap>(
     }
 }
 
-fn call_value<H: Heap>(
-    heap: &mut H::Local,
+fn call_value(
+    heap: &mut Heap,
     stack: &Stack,
     cache: &StackCache,
     meta: FrameMeta,
@@ -178,8 +174,8 @@ fn call_value<H: Heap>(
     Ok(true)
 }
 
-fn store_transition<L: LocalHeap>(
-    heap: &mut L,
+fn store_transition(
+    heap: &mut Heap,
     state: &ContextState,
     receiver: Value,
     name: SlotName,
@@ -200,9 +196,9 @@ fn store_transition<L: LocalHeap>(
 }
 
 /// Materialize a VM error as an ECMAScript error object
-pub fn error_from_vm_error<H: Heap>(
-    vm: &VM<H>,
-    heap: &mut H::Local,
+pub fn error_from_vm_error(
+    vm: &VM,
+    heap: &mut Heap,
     state: &ContextState,
     err: VmError,
 ) -> Result<Value, VmError> {
@@ -244,9 +240,9 @@ pub fn error_from_vm_error<H: Heap>(
     })
 }
 
-fn element_array<'a, L: LocalHeap>(
+fn element_array<'a>(
     nogc: &'a NoGc<'a>,
-    heap: &'a L,
+    heap: &'a Heap,
     receiver: Value,
     i: usize,
 ) -> Result<HeapRef<'a, FixedArray>, VmError> {
@@ -260,7 +256,7 @@ fn element_array<'a, L: LocalHeap>(
 }
 
 /// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN, everything else is truthy
-fn is_truthy<'a, L: LocalHeap>(nogc: &'a NoGc<'a>, heap: &L, v: Value) -> bool {
+fn is_truthy<'a>(nogc: &'a NoGc<'a>, heap: &Heap, v: Value) -> bool {
     if let Some(smi) = Smi::decode(v) {
         return smi.value() != 0;
     }
@@ -299,8 +295,8 @@ enum Unwind {
     Escaped,
 }
 
-fn exception_dispatch<L: LocalHeap>(
-    heap: &mut L,
+fn exception_dispatch(
+    heap: &mut Heap,
     state: &ContextState,
     base_depth: usize,
     mut pc: usize,
@@ -338,9 +334,9 @@ fn exception_dispatch<L: LocalHeap>(
     }
 }
 
-fn raise<H: Heap>(
-    vm: &VM<H>,
-    heap: &mut H::Local,
+fn raise(
+    vm: &VM,
+    heap: &mut Heap,
     state: &ContextState,
     base_depth: usize,
     acc: Value,
@@ -358,9 +354,9 @@ fn raise<H: Heap>(
 
 // TODO: pass stack and cache directly, could be benificial for threading dispatch later
 // TODO: cleanup error handling here
-fn dispatch<H: Heap>(
-    vm: &VM<H>,
-    heap: &mut H::Local,
+fn dispatch(
+    vm: &VM,
+    heap: &mut Heap,
     state: &ContextState,
     base_depth: usize,
 ) -> Result<Value, VmError> {
@@ -581,8 +577,7 @@ fn dispatch<H: Heap>(
                     LoadOutcome::Value(v) => acc = v,
                     LoadOutcome::Getter(getter) => {
                         let receiver = stack.reg(&meta, ops.reg(0));
-                        let called =
-                            call_value::<H>(heap, stack, cache, meta, pc, getter, &[receiver]);
+                        let called = call_value(heap, stack, cache, meta, pc, getter, &[receiver]);
                         let called = match called {
                             Ok(called) => called,
                             Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
@@ -639,7 +634,7 @@ fn dispatch<H: Heap>(
                     StoreOutcome::CallSetter { setter } => {
                         let receiver = stack.reg(&meta, ops.reg(0));
                         let called =
-                            call_value::<H>(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
+                            call_value(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
                         match called {
                             Ok(_) => {}
                             Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
@@ -679,8 +674,7 @@ fn dispatch<H: Heap>(
                     LoadOutcome::Value(v) => acc = v,
                     LoadOutcome::Getter(getter) => {
                         let receiver = stack.reg(&meta, ops.reg(0));
-                        let called =
-                            call_value::<H>(heap, stack, cache, meta, pc, getter, &[receiver]);
+                        let called = call_value(heap, stack, cache, meta, pc, getter, &[receiver]);
                         let called = match called {
                             Ok(called) => called,
                             Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
@@ -742,7 +736,7 @@ fn dispatch<H: Heap>(
                     StoreOutcome::CallSetter { setter } => {
                         let receiver = stack.reg(&meta, ops.reg(0));
                         let called =
-                            call_value::<H>(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
+                            call_value(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
                         match called {
                             Ok(_) => {}
                             Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {

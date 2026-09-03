@@ -1,10 +1,9 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
-use vm::LocalHeap;
 
 #[test]
 fn interning_deduplicates_and_preserves_content() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut ctx = vm.attach();
 
     ctx.handle_scope(|ctx, scope| {
@@ -35,7 +34,7 @@ fn interning_deduplicates_and_preserves_content() {
 
 #[test]
 fn interning_is_thread_safe() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut ctx = vm.attach();
 
     let expected = ctx.handle_scope(|ctx, scope| ctx.intern(&scope, "shared").value().to_bits());
