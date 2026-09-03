@@ -3,8 +3,8 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::natives::NativeIndex;
 use ovm::{EXCEPTION_SENTINEL, Thread, VM};
 use vm::{
-    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandlerEntryInit,
-    HandlerTable, HandlerTableInit, HandleScope, LocalHeap, Map, MapInit, MapKind, Object,
+    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandleScope,
+    HandlerEntryInit, HandlerTable, HandlerTableInit, LocalHeap, Map, MapInit, MapKind, Object,
     ObjectSlotsInit, Smi,
 };
 
@@ -118,10 +118,7 @@ fn main() {
         let callable = callable(thread, &scope, &program, 2, None);
         thread.execute(callable, &[])
     });
-    println!(
-        "6 + 7 = {}",
-        Smi::decode(result.unwrap()).unwrap().value()
-    );
+    println!("6 + 7 = {}", Smi::decode(result.unwrap()).unwrap().value());
 
     // try { throw 42 } catch (e) { return e }
     // 0: LoadSmi 42 | 2: Throw | 3: Return | 4: Store r0 | 6: Load r0 | 8: Return

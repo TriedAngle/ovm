@@ -261,8 +261,7 @@ fn stack_overflow_during_call_is_throwable() {
     });
     assert_eq!(result, Ok(EXCEPTION_SENTINEL));
     let ex = thread.take_pending_exception().expect("pending exception");
-    let expected = thread
-        .handle_scope(|thread, scope| thread.intern(&scope, "RangeError").value());
+    let expected = thread.handle_scope(|thread, scope| thread.intern(&scope, "RangeError").value());
     thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
         thread.heap().no_gc(|nogc, heap| {

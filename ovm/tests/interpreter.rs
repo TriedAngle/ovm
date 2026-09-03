@@ -21,15 +21,17 @@ fn expect_escaped(
     assert_eq!(result, Ok(EXCEPTION_SENTINEL), "run must escape uncaught");
     let ex = thread.take_pending_exception().expect("pending exception");
     assert!(!thread.has_pending_exception(), "pending cleared on take");
-    let expected_name = thread
-        .handle_scope(|thread, scope| thread.intern(&scope, class).value());
+    let expected_name = thread.handle_scope(|thread, scope| thread.intern(&scope, class).value());
     thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
         thread.heap().no_gc(|nogc, heap| {
             let ValueRef::Object(o) = ex.value_ref(nogc) else {
                 panic!("pending exception must be an object");
             };
-            match o.as_ref().lookup(nogc, heap, SlotName::from_value(name_key)) {
+            match o
+                .as_ref()
+                .lookup(nogc, heap, SlotName::from_value(name_key))
+            {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(slot.inner(), expected_name, "error class name");
                 }

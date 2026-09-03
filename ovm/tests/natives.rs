@@ -69,7 +69,9 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
     );
 
     assert_eq!(result, EXCEPTION_SENTINEL);
-    let ex = thread.take_pending_exception().expect("pending exception set");
+    let ex = thread
+        .take_pending_exception()
+        .expect("pending exception set");
     assert!(!thread.has_pending_exception());
 
     // the pending value is a materialized TypeError object (Arity -> TypeError)

@@ -78,8 +78,13 @@ pub extern "C" fn native_trampoline<H: Heap>(
     match f(&mut nctx, args) {
         Ok(v) => v,
         Err(e) => {
-            let ex = crate::interpreter::error_from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
-                .expect("error materialization must not fail");
+            let ex = crate::interpreter::error_from_vm_error(
+                &thread.vm,
+                &mut thread.heap,
+                &thread.state,
+                e,
+            )
+            .expect("error materialization must not fail");
             thread.state.set_pending_exception(ex);
             EXCEPTION_SENTINEL
         }
