@@ -4,13 +4,13 @@ use ovm::natives::NativeIndex;
 use ovm::{EXCEPTION_SENTINEL, Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandleScope,
-    HandlerEntryInit, HandlerTable, HandlerTableInit, LocalHeap, Map, MapInit, MapKind, Object,
+    HandlerEntryInit, HandlerTable, HandlerTableInit, Map, MapInit, MapKind, Object,
     ObjectSlotsInit, Smi,
 };
 
 /// Build a bytecode callable object (empty constants table).
 fn callable<'s>(
-    thread: &mut Thread<DummyHeap>,
+    thread: &mut Thread,
     scope: &'s HandleScope<'_>,
     program: &[u8],
     register_count: usize,
@@ -60,7 +60,7 @@ fn callable<'s>(
 }
 
 fn main() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).expect("failed to create heap");
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).expect("failed to create heap");
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -78,8 +78,8 @@ fn main() {
     });
     println!(
         "heap initialized: {} bytes ({} used)",
-        vm.heap().capacity(),
-        vm.heap().used()
+        vm.heap().stats().capacity,
+        vm.heap().stats().used
     );
 
     let receiver = Smi::new(0).encode();

@@ -1,29 +1,27 @@
 use core::ptr::NonNull;
 
-use vm::{
-    Float, Handle, HandleScope, InternedString, LocalHeap, Object, Smi, Tagged, Value, VmError,
-};
+use vm::{Float, Handle, HandleScope, Heap, InternedString, Object, Smi, Tagged, Value, VmError};
 
-use crate::{ContextState, Heap, Thread, VM};
+use crate::{ContextState, Thread, VM};
 
 pub const EXCEPTION_SENTINEL: Value = Value::CLEARED;
 
-pub struct NativeContext<'a, H: Heap> {
-    vm: &'a VM<H>,
-    heap: &'a mut H::Local,
+pub struct NativeContext<'a> {
+    vm: &'a VM,
+    heap: &'a mut Heap,
     state: &'a ContextState,
 }
 
-impl<'a, H: Heap> NativeContext<'a, H> {
-    pub fn new(vm: &'a VM<H>, heap: &'a mut H::Local, state: &'a ContextState) -> Self {
+impl<'a> NativeContext<'a> {
+    pub fn new(vm: &'a VM, heap: &'a mut Heap, state: &'a ContextState) -> Self {
         Self { vm, heap, state }
     }
 
-    pub fn vm(&self) -> &VM<H> {
+    pub fn vm(&self) -> &VM {
         self.vm
     }
 
-    pub fn heap(&mut self) -> &mut H::Local {
+    pub fn heap(&mut self) -> &mut Heap {
         self.heap
     }
 
@@ -63,12 +61,14 @@ impl<'a, H: Heap> NativeContext<'a, H> {
     }
 }
 
-pub type NativeFn<H> = for<'a> fn(&mut NativeContext<'a, H>, &[Value]) -> Result<Value, VmError>;
+pub type NativeFn = for<'a> fn(&mut NativeContext<'a>, &[Value]) -> Result<Value, VmError>;
 
+// TODO: this is still not a sound C interface (Rust-ABI `NativeFn` with
+// reference/slice arguments); decide on the C ABI before exporting.
 #[allow(improper_ctypes_definitions)]
-pub extern "C" fn native_trampoline<H: Heap>(
-    f: NativeFn<H>,
-    thread: *mut Thread<H>,
+pub extern "C" fn native_trampoline(
+    f: NativeFn,
+    thread: *mut Thread,
     args: *const Value,
     argc: u32,
 ) -> Value {
@@ -99,11 +99,11 @@ impl NativeIndex {
     pub const FLOAT_ADD: Self = Self(1);
 }
 
-pub struct NativeRegistry<H: Heap> {
-    entries: Vec<NativeFn<H>>,
+pub struct NativeRegistry {
+    entries: Vec<NativeFn>,
 }
 
-impl<H: Heap> NativeRegistry<H> {
+impl NativeRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             entries: Vec::new(),
@@ -113,13 +113,13 @@ impl<H: Heap> NativeRegistry<H> {
         registry
     }
 
-    pub fn insert(&mut self, f: NativeFn<H>) -> NativeIndex {
+    pub fn insert(&mut self, f: NativeFn) -> NativeIndex {
         let index = NativeIndex(self.entries.len());
         self.entries.push(f);
         index
     }
 
-    pub fn get(&self, index: NativeIndex) -> Option<NativeFn<H>> {
+    pub fn get(&self, index: NativeIndex) -> Option<NativeFn> {
         self.entries.get(index.0).copied()
     }
 
@@ -132,13 +132,13 @@ impl<H: Heap> NativeRegistry<H> {
     }
 }
 
-impl<H: Heap> Default for NativeRegistry<H> {
+impl Default for NativeRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-fn smi_add<H: Heap>(_nctx: &mut NativeContext<'_, H>, args: &[Value]) -> Result<Value, VmError> {
+fn smi_add(_nctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
     let (a, b) = match args {
         [_, a, b] => (*a, *b),
         _ => return Err(VmError::Arity),
@@ -152,7 +152,7 @@ fn smi_add<H: Heap>(_nctx: &mut NativeContext<'_, H>, args: &[Value]) -> Result<
     Ok(Smi::new(r).encode())
 }
 
-fn float_add<H: Heap>(nctx: &mut NativeContext<'_, H>, args: &[Value]) -> Result<Value, VmError> {
+fn float_add(nctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
     let (a, b) = match args {
         [_, a, b] => (*a, *b),
         _ => return Err(VmError::Arity),

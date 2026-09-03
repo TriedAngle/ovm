@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use core::alloc::Layout;
 
 use crate::{
-    AccessorPair, FixedArray, Handle, HeapObject, HeapRef, LocalHeap, Lookup, Map, MapInit, NoGc,
+    AccessorPair, FixedArray, Handle, Heap, HeapObject, HeapRef, Lookup, Map, MapInit, NoGc,
     Object, SlotFlags, SlotName, Smi, Tagged, Value, ValueRef, VmError,
 };
 
@@ -58,7 +58,7 @@ impl Value {
     pub fn store_lookup<'a>(
         &self,
         nogc: &'a NoGc<'a>,
-        heap: &'a impl LocalHeap,
+        heap: &'a Heap,
         name: SlotName,
         value: Value,
         semantics: StoreSemantics,
@@ -111,7 +111,7 @@ impl Value {
 }
 
 fn transition_target(
-    heap: &mut impl LocalHeap,
+    heap: &mut Heap,
     parent: impl for<'a> Fn(&'a NoGc<'a>) -> HeapRef<'a, Map>,
     name: Handle<SlotName>,
     flags: SlotFlags,
@@ -185,7 +185,7 @@ fn transition_target(
 
 impl Map {
     pub fn transition_target(
-        heap: &mut impl LocalHeap,
+        heap: &mut Heap,
         parent: Handle<Map>,
         name: Handle<SlotName>,
         flags: SlotFlags,
@@ -196,7 +196,7 @@ impl Map {
 
 impl Object {
     pub fn store_new_data_property(
-        heap: &mut impl LocalHeap,
+        heap: &mut Heap,
         receiver: Handle<Object>,
         name: Handle<SlotName>,
         value: Handle<Value>,
@@ -254,7 +254,7 @@ impl Object {
     /// the descriptor value is the pair identity, which is not shareable
     /// between objects, so a fresh child map is created every time.
     pub fn store_new_accessor_property(
-        heap: &mut impl LocalHeap,
+        heap: &mut Heap,
         receiver: Handle<Object>,
         name: Handle<SlotName>,
         get: Handle<Value>,

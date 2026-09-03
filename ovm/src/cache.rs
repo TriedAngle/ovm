@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 
 use vm::{
-    EdgeVisitable, FixedArray, FixedByteArray, HeapRef, LocalHeap, NoGc, Register, Value, ValueRef,
+    EdgeVisitable, FixedArray, FixedByteArray, Heap, HeapRef, NoGc, Register, Value, ValueRef,
     Visitor,
 };
 
@@ -48,12 +48,12 @@ impl StackCache {
         self.get().active
     }
 
-    pub fn enter(&self, stack: &Stack, frame: FrameMeta, heap: &mut impl LocalHeap) {
+    pub fn enter(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
         self.load(stack, frame, heap);
         self.get().active = true;
     }
 
-    pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut impl LocalHeap) {
+    pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
         heap.no_gc(|nogc, heap| {
             let ValueRef::Object(obj) = stack.callable_slot(&frame).inner().value_ref(nogc) else {
                 panic!("frame callable must be an object");

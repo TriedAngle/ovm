@@ -1,9 +1,9 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::natives::{EXCEPTION_SENTINEL, NativeContext, NativeIndex, native_trampoline};
 use ovm::{Thread, VM, VmError};
-use vm::{Float, LocalHeap, Smi, Value};
+use vm::{Float, Smi, Value};
 
-fn float(thread: &mut Thread<DummyHeap>, v: f64) -> Value {
+fn float(thread: &mut Thread, v: f64) -> Value {
     thread.heap().allocate::<Float>(v).erase()
 }
 
@@ -13,7 +13,7 @@ fn smi(v: i64) -> Value {
 
 #[test]
 fn smi_add_adds_and_checks_types() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
     let add = vm.native(NativeIndex::SMI_ADD);
 
@@ -34,7 +34,7 @@ fn smi_add_adds_and_checks_types() {
 
 #[test]
 fn float_add_adds_and_boxes_result() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
     let add = vm.native(NativeIndex::FLOAT_ADD);
 
@@ -57,7 +57,7 @@ fn float_add_adds_and_boxes_result() {
 
 #[test]
 fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
     let args = [smi(0), smi(1)]; // arity error for smi_add
 
@@ -101,10 +101,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
 #[test]
 fn register_native_appends_after_well_known() {
-    fn double<H: vm::Heap>(
-        _nctx: &mut NativeContext<'_, H>,
-        args: &[Value],
-    ) -> Result<Value, VmError> {
+    fn double(_nctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
         match args {
             [_, v] => {
                 let v = Smi::decode(*v).ok_or(VmError::Type)?;
@@ -114,8 +111,8 @@ fn register_native_appends_after_well_known() {
         }
     }
 
-    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
-    let idx = vm.register_native(double as ovm::NativeFn<DummyHeap>);
+    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let idx = vm.register_native(double as ovm::NativeFn);
     assert!(idx > NativeIndex::FLOAT_ADD);
     assert_eq!(vm.natives().len(), 3);
 

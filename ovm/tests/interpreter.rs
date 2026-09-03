@@ -3,8 +3,8 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{EXCEPTION_SENTINEL, NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle,
-    HandleScope, HeapPtr, LocalHeap, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit,
-    SlotFlags, SlotName, Smi, Tagged, Value, ValueRef,
+    HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
+    SlotName, Smi, Tagged, Value, ValueRef,
 };
 
 fn smi(v: i64) -> Value {
@@ -13,11 +13,7 @@ fn smi(v: i64) -> Value {
 
 /// Assert a run escaped uncaught: the sentinel is returned and the pending
 /// exception is a materialized error object of the given class name.
-fn expect_escaped(
-    thread: &mut Thread<DummyHeap>,
-    result: Result<Value, VmError>,
-    class: &str,
-) -> Value {
+fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &str) -> Value {
     assert_eq!(result, Ok(EXCEPTION_SENTINEL), "run must escape uncaught");
     let ex = thread.take_pending_exception().expect("pending exception");
     assert!(!thread.has_pending_exception(), "pending cleared on take");
@@ -45,7 +41,7 @@ fn expect_escaped(
 /// Wrap a callable info in a normal object with a callable map
 /// (kind convention: CALLABLE flag => slots[0] is the callable info).
 fn callable_object<'s>(
-    thread: &mut Thread<DummyHeap>,
+    thread: &mut Thread,
     scope: &'s HandleScope<'_>,
     info: Handle<'_, CallableInfoObject>,
 ) -> Handle<'s, Object> {
@@ -74,7 +70,7 @@ fn callable_object<'s>(
 }
 
 fn run_program(
-    thread: &mut Thread<DummyHeap>,
+    thread: &mut Thread,
     program: Vec<u8>,
     register_count: usize,
     args: &[Value],
@@ -103,7 +99,7 @@ fn run_program(
 
 #[test]
 fn load_smi_signed_immediates() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // byte1 range, byte1-via-sign-extension traps (128..=255 used to
@@ -120,7 +116,7 @@ fn load_smi_signed_immediates() {
 
 #[test]
 fn call_native_passes_receiver_and_args() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = receiver, r1 = 6, r2 = 7; CallNative smi_add, r0, 3
@@ -144,7 +140,7 @@ fn call_native_passes_receiver_and_args() {
 
 #[test]
 fn failed_run_does_not_leak_frames_into_next_run() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // Add on uninitialized (void) registers throws a TypeError, aborting
@@ -165,7 +161,7 @@ fn failed_run_does_not_leak_frames_into_next_run() {
 
 #[test]
 fn parameters_are_readable_via_negative_registers() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -178,7 +174,7 @@ fn parameters_are_readable_via_negative_registers() {
 
 #[test]
 fn wide_parameter_operand_uses_two_bytes() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -195,7 +191,7 @@ fn wide_parameter_operand_uses_two_bytes() {
 
 #[test]
 fn call_resolves_callable_object_and_pushes_frames() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -254,7 +250,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
 
 #[test]
 fn create_array_literal_fills_from_registers() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -281,7 +277,7 @@ fn create_array_literal_fills_from_registers() {
 
 #[test]
 fn create_object_from_map_fills_from_registers() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (result, map_v) = thread.handle_scope(|thread, scope| {
@@ -359,7 +355,7 @@ fn create_object_from_map_fills_from_registers() {
 
 #[test]
 fn keyed_load_reads_array_element() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0..r2 = 10, 20, 30; r3 = [r0, r1, r2]; acc = 1; acc = r3[acc]
@@ -382,7 +378,7 @@ fn keyed_load_reads_array_element() {
 
 #[test]
 fn keyed_store_writes_array_element() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = [1]; r4 = 0 (key); acc = 99 (value); r3[r4] = acc; acc = r3[0]
@@ -405,7 +401,7 @@ fn keyed_store_writes_array_element() {
 
 #[test]
 fn keyed_load_out_of_bounds_errors() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     for key in [2u32, (-1i32) as u32] {
@@ -425,10 +421,7 @@ fn keyed_load_out_of_bounds_errors() {
 
 /// Build an object with map (x -> slot 0, y -> slot 1) in the constants table
 /// at index 0, and the interned name "x" at index 1.
-fn object_program(
-    thread: &mut Thread<DummyHeap>,
-    build: impl FnOnce(&mut Vec<u8>),
-) -> Result<Value, VmError> {
+fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
         let empty_context = thread.heap().known().empty_context;
@@ -489,7 +482,7 @@ fn object_program(
 
 #[test]
 fn keyed_load_reads_named_property_via_string_key() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = "x" (constants[1]); acc = r2[acc]
@@ -502,7 +495,7 @@ fn keyed_load_reads_named_property_via_string_key() {
 
 #[test]
 fn keyed_store_writes_named_property_via_string_key() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = "x"; acc = 42; r2[r3] = acc; acc = r2.x
@@ -519,7 +512,7 @@ fn keyed_store_writes_named_property_via_string_key() {
 /// Build an object (x = 7) in r2 with map (x -> slot 0, attributes `x_flags`)
 /// in constants at 0, interned "x" at 1, "z" at 2 and "w" at 3.
 fn transition_object_program(
-    thread: &mut Thread<DummyHeap>,
+    thread: &mut Thread,
     kind: MapKind,
     x_flags: SlotFlags,
     build: impl FnOnce(&mut Vec<u8>),
@@ -580,7 +573,7 @@ const WRITABLE_VALUE: SlotFlags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
 
 #[test]
 fn named_store_new_property_transitions() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.z = 42 (transition); acc = r2.x + r2.z
@@ -599,7 +592,7 @@ fn named_store_new_property_transitions() {
 
 #[test]
 fn named_store_chained_transitions() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.z = 42 (transition); r2.w = 1 (chained transition);
@@ -625,7 +618,7 @@ fn named_store_chained_transitions() {
 
 #[test]
 fn keyed_store_new_property_via_string_key_transitions() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = "z"; acc = 42; r2[r3] = acc (transition); acc = r2.z
@@ -641,7 +634,7 @@ fn keyed_store_new_property_via_string_key_transitions() {
 
 #[test]
 fn named_store_new_property_to_non_extensible_fails() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // plain OBJECT map: not extendable
@@ -655,7 +648,7 @@ fn named_store_new_property_to_non_extensible_fails() {
 
 #[test]
 fn named_store_to_non_writable_fails() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // x is a non-writable value slot
@@ -668,10 +661,7 @@ fn named_store_to_non_writable_fails() {
 
 /// Parent object (p = 1) in constants at 2, child object in r2 with a parent
 /// descriptor pointing at it; interned "p" at 1.
-fn parent_object_program(
-    thread: &mut Thread<DummyHeap>,
-    store_op: Opcode,
-) -> Result<Value, VmError> {
+fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void.value();
         let empty_context = thread.heap().known().empty_context;
@@ -757,7 +747,7 @@ fn parent_object_program(
 
 #[test]
 fn self_store_writes_through_to_parent_slot() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = parent_object_program(&mut thread, Opcode::StoreNamedProperty);
@@ -767,7 +757,7 @@ fn self_store_writes_through_to_parent_slot() {
 
 #[test]
 fn shadow_store_creates_own_slot_and_leaves_parent() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = parent_object_program(&mut thread, Opcode::StoreNamedPropertyShadow);
@@ -777,7 +767,7 @@ fn shadow_store_creates_own_slot_and_leaves_parent() {
 
 #[test]
 fn fallthrough_return_is_undefined() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -789,7 +779,7 @@ fn fallthrough_return_is_undefined() {
 
 #[test]
 fn jump_skips_instructions() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // LoadSmi 1 (0..2); Jump ->6 (2..4); LoadSmi 2 (4..6); Return (6..7)
@@ -805,7 +795,7 @@ fn jump_skips_instructions() {
 
 #[test]
 fn jump_loop_counts_down_to_zero() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = 3; r1 = -1;
@@ -832,7 +822,7 @@ fn jump_loop_counts_down_to_zero() {
 
 #[test]
 fn jump_if_truthy_follows_toboolean() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = param0; JumpIfTruthy L; LoadSmi 0; Return; L: LoadSmi 1; Return
@@ -924,7 +914,7 @@ fn jump_if_truthy_follows_toboolean() {
 
 #[test]
 fn test_reference_equal_compares_identity() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = param0; TestReferenceEqual param1; Return
@@ -981,7 +971,7 @@ fn setter_program() -> Vec<u8> {
 /// getter/setter) in r2. Map in constants at 0, interned "x" at 1, "y" at 2,
 /// "z" at 3.
 fn accessor_object_program(
-    thread: &mut Thread<DummyHeap>,
+    thread: &mut Thread,
     getter: Option<&[u8]>,
     setter: Option<&[u8]>,
     build: impl FnOnce(&mut Vec<u8>),
@@ -994,7 +984,7 @@ fn accessor_object_program(
         let z = thread.intern(&scope, "z");
 
         // getter/setter get constants ["y"] so they can reach the backing slot
-        let make = |thread: &mut Thread<DummyHeap>, program: &[u8]| -> Value {
+        let make = |thread: &mut Thread, program: &[u8]| -> Value {
             let bytecode = thread
                 .heap()
                 .allocate_handle::<FixedByteArray>(program, &scope);
@@ -1077,7 +1067,7 @@ fn accessor_object_program(
 
 #[test]
 fn named_load_calls_getter_with_receiver() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = r2.x (calls the getter, which reads this.y)
@@ -1089,7 +1079,7 @@ fn named_load_calls_getter_with_receiver() {
 
 #[test]
 fn named_store_calls_setter_with_receiver_and_value() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.x = 21 (calls the setter, which writes this.y); acc = r2.y
@@ -1103,7 +1093,7 @@ fn named_store_calls_setter_with_receiver_and_value() {
 
 #[test]
 fn named_load_without_getter_is_undefined() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let undefined = thread.heap().known().undefined.value();
@@ -1115,7 +1105,7 @@ fn named_load_without_getter_is_undefined() {
 
 #[test]
 fn named_store_without_setter_is_ignored() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.x = 21 is ignored (no setter); y keeps its initial value 7
@@ -1129,7 +1119,7 @@ fn named_store_without_setter_is_ignored() {
 
 #[test]
 fn keyed_load_calls_getter() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = "x"; acc = r2[acc] (calls the getter)
@@ -1142,7 +1132,7 @@ fn keyed_load_calls_getter() {
 
 #[test]
 fn keyed_store_calls_setter() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = "x"; r2[r3] = 21 (calls the setter); acc = r2.y
@@ -1158,7 +1148,7 @@ fn keyed_store_calls_setter() {
 
 #[test]
 fn named_load_missing_property_is_undefined() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let undefined = thread.heap().known().undefined.value();
@@ -1171,7 +1161,7 @@ fn named_load_missing_property_is_undefined() {
 
 #[test]
 fn store_new_accessor_property_defines_own_accessor() {
-    let vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -1269,7 +1259,7 @@ fn store_new_accessor_property_defines_own_accessor() {
 /// A native function object: callable map with NATIVE flag, slots[0] = the
 /// native registry index as a Smi.
 fn native_function<'s>(
-    thread: &mut Thread<DummyHeap>,
+    thread: &mut Thread,
     scope: &'s HandleScope<'_>,
     idx: NativeIndex,
 ) -> Handle<'s, Object> {
@@ -1301,7 +1291,7 @@ fn native_function<'s>(
 
 /// Build a bytecode function object from inside a native.
 fn bytecode_fn(
-    nctx: &mut NativeContext<'_, DummyHeap>,
+    nctx: &mut NativeContext<'_>,
     scope: &HandleScope<'_>,
     program: &[u8],
     constants: &[Value],
@@ -1344,13 +1334,13 @@ fn bytecode_fn(
         .erase()
 }
 
-fn forty_two(_: &mut NativeContext<'_, DummyHeap>, _: &[Value]) -> Result<Value, VmError> {
+fn forty_two(_: &mut NativeContext<'_>, _: &[Value]) -> Result<Value, VmError> {
     Ok(smi(42))
 }
 
 #[test]
 fn run_dispatches_native_callable_without_frame() {
-    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let idx = vm.register_native(forty_two);
     let mut thread = vm.attach();
 
@@ -1363,7 +1353,7 @@ fn run_dispatches_native_callable_without_frame() {
 
 #[test]
 fn call_dispatches_to_native_function_object() {
-    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let idx = vm.register_native(forty_two);
     let mut thread = vm.attach();
 
@@ -1404,7 +1394,7 @@ fn call_dispatches_to_native_function_object() {
 
 /// Native that runs `6 + 7` in a fresh nested interpreter execution, where
 /// the inner program itself spills the accumulator for a CallNative.
-fn run_inner(nctx: &mut NativeContext<'_, DummyHeap>, _args: &[Value]) -> Result<Value, VmError> {
+fn run_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadSmi, &[0]);
@@ -1427,7 +1417,7 @@ fn run_inner(nctx: &mut NativeContext<'_, DummyHeap>, _args: &[Value]) -> Result
 
 #[test]
 fn native_reenters_interpreter_via_call() {
-    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let idx = vm.register_native(run_inner);
     let mut thread = vm.attach();
 
@@ -1447,10 +1437,7 @@ fn native_reenters_interpreter_via_call() {
 
 /// Native that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the native recovers.
-fn run_failing_inner(
-    nctx: &mut NativeContext<'_, DummyHeap>,
-    _args: &[Value],
-) -> Result<Value, VmError> {
+fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // callee: Add on uninitialized (void) registers -> TypeError throw
         let mut bad = Vec::new();
@@ -1483,7 +1470,7 @@ fn run_failing_inner(
 
 #[test]
 fn inner_run_error_unwinds_and_native_recovers() {
-    let mut vm = VM::<DummyHeap>::new(DummyHeapConfig::default()).unwrap();
+    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let idx = vm.register_native(run_failing_inner);
     let mut thread = vm.attach();
 

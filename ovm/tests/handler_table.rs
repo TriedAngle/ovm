@@ -2,11 +2,11 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
-    HandlerTable, HandlerTableInit, LocalHeap, Map, MapInit, MapKind, ObjectSlotsInit, ValueRef,
+    HandlerTable, HandlerTableInit, Map, MapInit, MapKind, ObjectSlotsInit, ValueRef,
 };
 
 fn table<'s>(
-    thread: &mut Thread<DummyHeap>,
+    thread: &mut Thread,
     scope: &'s vm::HandleScope<'_>,
     entries: &[HandlerEntryInit],
 ) -> vm::Handle<'s, HandlerTable> {
@@ -17,7 +17,7 @@ fn table<'s>(
 
 #[test]
 fn roundtrip_entries() {
-    let vm = VM::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -44,7 +44,7 @@ fn roundtrip_entries() {
 
 #[test]
 fn lookup_finds_handler_inside_range() {
-    let vm = VM::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -64,7 +64,7 @@ fn lookup_finds_handler_inside_range() {
 
 #[test]
 fn lookup_returns_none_outside_range() {
-    let vm = VM::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -86,7 +86,7 @@ fn lookup_returns_none_outside_range() {
 
 #[test]
 fn lookup_returns_innermost_of_nested_ranges() {
-    let vm = VM::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -116,7 +116,7 @@ fn lookup_returns_innermost_of_nested_ranges() {
 
 #[test]
 fn lookup_on_empty_table_returns_none() {
-    let vm = VM::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -134,10 +134,10 @@ fn lookup_on_empty_table_returns_none() {
 
 #[test]
 fn callable_info_carries_handler_table() {
-    let vm = VM::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    thread.handle_scope(|thread: &mut Thread<DummyHeap>, scope| {
+    thread.handle_scope(|thread: &mut Thread, scope| {
         let void = thread.heap().known().void.value();
         let empty_context = thread.heap().known().empty_context;
         let t = table(thread, &scope, &[HandlerEntryInit::new(2, 8, 33)]);
@@ -194,10 +194,10 @@ fn callable_info_carries_handler_table() {
 
 #[test]
 fn callable_info_without_handler_table() {
-    let vm = VM::new(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    thread.handle_scope(|thread: &mut Thread<DummyHeap>, scope| {
+    thread.handle_scope(|thread: &mut Thread, scope| {
         let void = thread.heap().known().void.value();
         let empty_context = thread.heap().known().empty_context;
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);

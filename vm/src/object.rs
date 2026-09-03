@@ -4,8 +4,8 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, HeapRef, LocalHeap, NoGc, OptionGcSlot, PointerStrength,
-    STRONG_PTR, Smi, Tagged, TransitionGuard, Value, Visitor, WEAK_PTR, Word,
+    EdgeVisitable, GcSlot, Handle, Heap, HeapRef, NoGc, OptionGcSlot, PointerStrength, STRONG_PTR,
+    Smi, Tagged, TransitionGuard, Value, Visitor, WEAK_PTR, Word,
 };
 
 pub trait HeapObject: 'static {
@@ -13,7 +13,7 @@ pub trait HeapObject: 'static {
 
     fn layout_for(config: &Self::Init<'_>) -> Layout;
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>);
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>);
 
     fn header(&self) -> &Header;
 
@@ -98,7 +98,7 @@ impl Map {
     pub fn find_transition<'a>(
         &self,
         nogc: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
+        heap: &Heap,
         name: SlotName,
         flags: SlotFlags,
     ) -> Option<HeapRef<'a, Map>> {
@@ -110,7 +110,7 @@ impl Map {
     pub fn find_transition_locked<'a>(
         &self,
         nogc: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
+        heap: &Heap,
         name: SlotName,
         flags: SlotFlags,
         _guard: &TransitionGuard<'_>,
@@ -153,7 +153,7 @@ impl HeapObject for Map {
         Self::layout_for(config.descriptors.len())
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -411,7 +411,7 @@ impl Object {
     pub fn callable_info<'a>(
         &'a self,
         guard: &'a NoGc<'a>,
-        heap: &impl LocalHeap,
+        heap: &Heap,
     ) -> Option<HeapRef<'a, CallableInfoObject>> {
         if !self.header.map.heap_ref(guard).kind().is_callable() {
             return None;
@@ -450,7 +450,7 @@ impl HeapObject for Object {
         Self::layout_for()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header.map.set(heap, host, config.map.as_tagged());
         self.slots.set(heap, host, config.slots.as_tagged());
@@ -513,7 +513,7 @@ impl FixedArray {
         self.element_slot(i).get().erase()
     }
 
-    pub fn set(&self, heap: &impl LocalHeap, i: usize, v: Value) {
+    pub fn set(&self, heap: &Heap, i: usize, v: Value) {
         self.element_slot(i)
             .set(heap, self.erase(), Tagged::from_value(v));
     }
@@ -526,7 +526,7 @@ impl HeapObject for FixedArray {
         Self::layout_for(config.len())
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -605,7 +605,7 @@ impl HeapObject for FixedByteArray {
         Self::layout_for(config.len())
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -678,7 +678,7 @@ impl HeapObject for VMString {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -719,7 +719,7 @@ impl HeapObject for InternedString {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         self.0.init(heap, config);
     }
 
@@ -769,7 +769,7 @@ impl HeapObject for Symbol {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -864,7 +864,7 @@ impl HeapObject for AccessorPair {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -915,7 +915,7 @@ impl HeapObject for CallableInfoObject {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -1037,7 +1037,7 @@ impl HeapObject for HandlerTable {
         Self::layout_for(config.entries.len())
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -1087,7 +1087,7 @@ impl HeapObject for Context {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
@@ -1129,7 +1129,7 @@ impl HeapObject for Float {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, heap: &impl LocalHeap, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
