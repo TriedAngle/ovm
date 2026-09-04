@@ -769,6 +769,37 @@ pub fn string_content_hash(bytes: &[u8]) -> i64 {
 }
 
 impl VMString {
+    pub fn from_bytes<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        bytes: &[u8],
+    ) -> Handle<'s, VMString> {
+        let backing = heap.allocate_handle::<FixedByteArray>(bytes, scope);
+        heap.allocate_handle::<VMString>((backing, string_content_hash(bytes)), scope)
+    }
+
+    pub fn concat<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        a: Value,
+        b: Value,
+    ) -> Handle<'s, VMString> {
+        let bytes = heap.no_gc(|nogc, heap| {
+            let known = heap.known();
+            let sa = a
+                .get_as::<VMString>(nogc, known.string_map)
+                .expect("concat operand must be a string");
+            let sb = b
+                .get_as::<VMString>(nogc, known.string_map)
+                .expect("concat operand must be a string");
+            let mut out = Vec::with_capacity(sa.len(nogc) + sb.len(nogc));
+            out.extend_from_slice(sa.as_slice(nogc));
+            out.extend_from_slice(sb.as_slice(nogc));
+            out
+        });
+        Self::from_bytes(heap, scope, &bytes)
+    }
+
     pub fn backing<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
         self.backing.heap_ref(nogc)
     }
@@ -864,6 +895,15 @@ pub struct Symbol {
 }
 
 impl Symbol {
+    pub fn new<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        description: &[u8],
+    ) -> Handle<'s, Symbol> {
+        let backing = heap.allocate_handle::<FixedByteArray>(description, scope);
+        heap.allocate_handle::<Symbol>(backing, scope)
+    }
+
     pub fn backing<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
         self.backing.heap_ref(nogc)
     }
