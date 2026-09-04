@@ -1,8 +1,8 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
 use vm::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Map,
-    MapInit, MapKind, ObjectKind, ObjectSlotsInit, Smi,
+    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray,
+    ObjectKind, ObjectSlotsInit, Smi,
 };
 
 #[test]
@@ -69,7 +69,7 @@ fn contexts_chain_through_outer() {
 }
 
 #[test]
-fn callable_info_carries_typed_context() {
+fn closure_object_carries_typed_context() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
@@ -89,27 +89,19 @@ fn callable_info_carries_typed_context() {
                 bytecode,
                 constants,
                 register_count: 0,
-                context,
                 handlers: None,
             },
             &scope,
         );
 
-        let map = thread.heap().allocate_handle::<Map>(
-            MapInit {
-                kind: MapKind::OBJECT.union(MapKind::CALLABLE),
-                value_slot_count: 1,
-                descriptors: &[],
-            },
-            &scope,
-        );
+        let map = thread.heap().known().function_map;
         let obj = thread
             .heap()
             .allocate_object(
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[info.as_tagged().erase()],
+                    values: &[info.as_tagged().erase(), context.as_tagged().erase()],
                     elements: void.erase(),
                     length: 0,
                 },
@@ -120,11 +112,9 @@ fn callable_info_carries_typed_context() {
             let vm::ValueRef::Object(o) = obj.value().value_ref(nogc) else {
                 panic!("callable must be an object");
             };
-            let info = o.as_ref().callable_info(nogc, heap).unwrap();
-            let context = info
-                .context
-                .inner()
-                .get_as::<Context>(nogc, heap.known().context_map)
+            let context = o
+                .as_ref()
+                .closure_context(nogc, heap)
                 .expect("context must be typed as Context");
             context.slots.heap_ref(nogc).at(0)
         });

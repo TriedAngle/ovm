@@ -1,10 +1,10 @@
 use bytecode::{Opcode, Operands, decode, jump_target};
 
 use vm::{
-    CallTarget, Context, FixedArray, Handle, Heap, Key, LoadOutcome, Map, NoGc, Object,
-    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value, ValueRef,
-    call_target, classify_key, element_value, encode_smi, is_truthy, load_outcome,
-    store_array_element, store_new_data_property_values,
+    CallTarget, CallableInfoObject, Handle, Heap, Key, LoadOutcome, NoGc, Object, ObjectSlotsInit,
+    SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value, ValueRef, call_target,
+    classify_key, element_value, encode_smi, is_truthy, load_outcome, store_array_element,
+    store_new_data_property_values,
 };
 
 use crate::{
@@ -636,25 +636,17 @@ fn step(
             }
             Step::Next
         }
-        Opcode::CreateObjectFromMap => {
-            let map = step_try!(heap.no_gc(|nogc, heap| {
-                let v = cache.constants_ref(nogc).at(ops.idx(0));
-                v.get_as::<Map>(nogc, heap.known().map_map)
-                    .map(|r| r.into_tagged())
-                    .ok_or(VmError::Type)
-            }));
-            let count = ops.reg_count(2);
+        Opcode::CreateEmptyObjectLiteral => {
             cache.spill_acc(*acc);
-            let args = stack.args(&meta, ops.reg_list(1), count);
-
-            // TODO: maybe have a handlescope always accessible or a quickspill cache
             let obj = state.handle_scope(|scope| {
-                let map = scope.create_handle(map).expect("map is a strong pointer");
+                let map = scope
+                    .create_handle(heap.known().object_initial_map.as_tagged())
+                    .expect("object initial map is strong");
                 heap.allocate_object(
                     &scope,
                     ObjectSlotsInit {
                         map,
-                        values: args,
+                        values: &[],
                         elements: heap.known().empty_fixed_array.erase(),
                         length: 0,
                     },
@@ -664,24 +656,19 @@ fn step(
             *acc = obj.erase();
             Step::Next
         }
-        // TODO: create more array creation operations, this one is only for &[Value]
-        Opcode::CreateArrayLiteral => {
-            let count = ops.reg_count(1);
+        Opcode::CreateEmptyArrayLiteral => {
             cache.spill_acc(*acc);
-            let args = stack.args(&meta, ops.reg_list(0), count);
-
             let obj = state.handle_scope(|scope| {
                 let map = scope
                     .create_handle(heap.known().js_array_map.as_tagged())
                     .expect("array object map is strong");
-                let elements = heap.allocate_handle::<FixedArray>(args, &scope);
                 heap.allocate_object(
                     &scope,
                     ObjectSlotsInit {
                         map,
                         values: &[],
-                        elements: elements.erase(),
-                        length: count,
+                        elements: heap.known().empty_fixed_array.erase(),
+                        length: 0,
                     },
                 )
                 .into_tagged()
@@ -689,6 +676,44 @@ fn step(
             });
             let _ = cache.take_acc();
             *acc = obj;
+            Step::Next
+        }
+        Opcode::CreateClosure => {
+            // constants[idx] is the shared callable-info template (SFI-like);
+            // the closure inherits the current frame's context
+            let info = step_try!(heap.no_gc(|nogc, heap| {
+                let v = cache.constants_ref(nogc).at(ops.idx(0));
+                v.get_as::<CallableInfoObject>(nogc, heap.known().callable_map)
+                    .map(|r| r.into_tagged().erase())
+                    .ok_or(VmError::Type)
+            }));
+            let context = step_try!(heap.no_gc(|nogc, heap| {
+                let ValueRef::Object(obj) = stack.callable_slot(&meta).inner().value_ref(nogc)
+                else {
+                    return Err(VmError::Type);
+                };
+                obj.as_ref()
+                    .closure_context(nogc, heap)
+                    .map(|c| c.into_tagged().erase())
+                    .ok_or(VmError::Type)
+            }));
+            cache.spill_acc(*acc);
+            let obj = state.handle_scope(|scope| {
+                let map = scope
+                    .create_handle(heap.known().function_map.as_tagged())
+                    .expect("function map is strong");
+                heap.allocate_object(
+                    &scope,
+                    ObjectSlotsInit {
+                        map,
+                        values: &[info, context],
+                        elements: heap.known().empty_fixed_array.erase(),
+                        length: 0,
+                    },
+                )
+            });
+            let _ = cache.take_acc();
+            *acc = obj.erase();
             Step::Next
         }
         Opcode::LoadGlobal => {
@@ -729,14 +754,9 @@ fn step(
                 else {
                     return Err(VmError::Type);
                 };
-                let info = obj
+                let context = obj
                     .as_ref()
-                    .callable_info(nogc, heap)
-                    .ok_or(VmError::Type)?;
-                let context = info
-                    .context
-                    .inner()
-                    .get_as::<Context>(nogc, heap.known().context_map)
+                    .closure_context(nogc, heap)
                     .ok_or(VmError::Type)?;
                 Ok(context
                     .slots
@@ -754,16 +774,11 @@ fn step(
                 else {
                     return Err(VmError::Type);
                 };
-                let info = obj
+                let context = obj
                     .as_ref()
-                    .callable_info(nogc, heap)
+                    .closure_context(nogc, heap)
                     .ok_or(VmError::Type)?;
-                let host = info.context.inner();
-                let context = info
-                    .context
-                    .inner()
-                    .get_as::<Context>(nogc, heap.known().context_map)
-                    .ok_or(VmError::Type)?;
+                let host = obj.as_ref().slots.heap_ref(nogc).at(1);
                 context.slots.heap_ref(nogc).element_slot(ops.idx(0)).set(
                     heap,
                     host,
