@@ -1,3 +1,4 @@
+pub mod convert;
 pub mod error;
 pub mod handle;
 pub mod heap;
@@ -6,6 +7,7 @@ pub mod object;
 pub mod transition;
 pub mod value;
 
+pub use convert::is_truthy;
 pub use error::VmError;
 pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, RootHandles};
 pub use heap::{
@@ -13,15 +15,17 @@ pub use heap::{
     HeapBackend, HeapRef, HeapStats, HeapVtable, NoGc, OptionGcSlot, RawCell, Register,
     RootVisitor, Visitor, WeakGcCell, WellKnown, WordType, bootstrap_well_known,
 };
-pub use lookup::Lookup;
+pub use lookup::{Key, LoadOutcome, Lookup, classify_key, element_value, load_outcome};
 pub use object::{
-    AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
-    FixedByteArray, Float, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit, Header,
-    HeapObject, InternedString, Map, MapInit, MapKind, Object, ObjectInit, ObjectKind,
-    ObjectSlotsInit, SlotDescriptor, SlotFlags, SlotKind, SlotName, Symbol, VMString,
-    string_content_hash,
+    AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
+    FixedArray, FixedByteArray, Float, HandlerEntry, HandlerEntryInit, HandlerTable,
+    HandlerTableInit, Header, HeapObject, InternedString, Map, MapInit, MapKind, Object,
+    ObjectInit, ObjectKind, ObjectSlotsInit, SlotDescriptor, SlotFlags, SlotKind, SlotName, Symbol,
+    VMString, call_target, store_array_element, string_content_hash,
 };
-pub use transition::{StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock};
+pub use transition::{
+    StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock, store_new_data_property_values,
+};
 pub use value::{
     HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,
     Word,
