@@ -79,6 +79,9 @@ pub struct WellKnown {
     pub array_prototype: Global<Object>,
     /// `%Error.prototype%`: parent of all error instance maps.
     pub error_prototype: Global<Object>,
+    /// The realm global object: global variables are properties on it
+    /// (top-level `var`/assignments; lexical script-context globals later).
+    pub global_object: Global<Object>,
 }
 
 unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
@@ -121,6 +124,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         object_prototype: obj,
         array_prototype: obj,
         error_prototype: obj,
+        global_object: obj,
     }
 }
 
@@ -276,6 +280,15 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         error_prototype,
     );
 
+    // realm global object: plain extendable object hanging off %Object.prototype%
+    let global_object_map = alloc_parent_map(
+        heap,
+        roots,
+        MapKind::OBJECT.union(MapKind::EXTENDABLE),
+        object_prototype,
+    );
+    let global_object = alloc_object(heap, &scope, roots, global_object_map);
+
     // each oddball gets its own map (booleans share theirs)
     let undefined_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
     let boolean_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
@@ -318,6 +331,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.exception_map = exception_map;
     known.js_array_map = js_array_map;
     known.empty_context = empty_context;
+    known.global_object = global_object;
     heap.set_known(known);
 }
 pub struct NoGc<'a> {

@@ -3,8 +3,8 @@ use bytecode::{Opcode, Operands, decode, jump_target};
 use vm::{
     CallTarget, Context, FixedArray, Handle, Heap, Key, LoadOutcome, Map, NoGc, Object,
     ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value, ValueRef,
-    call_target, classify_key, element_value, is_truthy, load_outcome, store_array_element,
-    store_new_data_property_values,
+    call_target, classify_key, element_value, encode_smi, is_truthy, load_outcome,
+    store_array_element, store_new_data_property_values,
 };
 
 use crate::{
@@ -312,14 +312,115 @@ fn step(
             Step::Next
         }
         Opcode::Add => {
-            // TODO: JS semantics
-            let a = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type));
-            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(1))).ok_or(VmError::Type));
-            let r = step_try!(a.value().checked_add(b.value()).ok_or(VmError::Overflow));
-            if !Smi::in_range(r) {
-                return Step::Error(VmError::Overflow);
-            }
-            *acc = Smi::new(r).encode();
+            // TODO: JS semantics (ToNumeric coercion, float results, string concat)
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
+            let b =
+                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
+            let r = step_try!(a.checked_add(b).ok_or(VmError::Overflow));
+            *acc = step_try!(encode_smi(r));
+            Step::Next
+        }
+        Opcode::Sub => {
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
+            let b =
+                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
+            let r = step_try!(a.checked_sub(b).ok_or(VmError::Overflow));
+            *acc = step_try!(encode_smi(r));
+            Step::Next
+        }
+        Opcode::Mul => {
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
+            let b =
+                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
+            let r = step_try!(a.checked_mul(b).ok_or(VmError::Overflow));
+            *acc = step_try!(encode_smi(r));
+            Step::Next
+        }
+        Opcode::Div => {
+            // TODO: JS semantics: non-integral results and division by zero
+            // yield doubles (Infinity/NaN), not errors
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
+            let b =
+                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
+            let r = step_try!(if b == 0 {
+                Err(VmError::Overflow)
+            } else {
+                a.checked_div(b).ok_or(VmError::Overflow)
+            });
+            *acc = step_try!(encode_smi(r));
+            Step::Next
+        }
+        Opcode::Mod => {
+            // TODO: JS semantics: division by zero yields NaN
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
+            let b =
+                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
+            let r = step_try!(if b == 0 {
+                Err(VmError::Overflow)
+            } else {
+                a.checked_rem(b).ok_or(VmError::Overflow)
+            });
+            *acc = step_try!(encode_smi(r));
+            Step::Next
+        }
+        Opcode::Exp => {
+            // TODO: JS semantics: fractional results yield doubles
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
+            let b =
+                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
+            let r = (a as f64).powf(b as f64);
+            let r = step_try!(if !r.is_finite() || r.fract() != 0.0 {
+                Err(VmError::Overflow)
+            } else {
+                Ok(r as i64)
+            });
+            *acc = step_try!(encode_smi(r));
+            Step::Next
+        }
+        Opcode::BitwiseOr => {
+            // ToInt32 semantics on the (integer) smi inputs
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
+                .value() as i32;
+            *acc = Smi::new((a | b) as i64).encode();
+            Step::Next
+        }
+        Opcode::BitwiseXor => {
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
+                .value() as i32;
+            *acc = Smi::new((a ^ b) as i64).encode();
+            Step::Next
+        }
+        Opcode::BitwiseAnd => {
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
+                .value() as i32;
+            *acc = Smi::new((a & b) as i64).encode();
+            Step::Next
+        }
+        Opcode::ShiftLeft => {
+            // ToInt32(lhs) << (ToUint32(rhs) & 31), truncated to int32
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
+                .value() as u32;
+            *acc = Smi::new((a.wrapping_shl(b & 31) as i32) as i64).encode();
+            Step::Next
+        }
+        Opcode::ShiftRight => {
+            // ToInt32(lhs) >> (ToUint32(rhs) & 31), sign-extending
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
+                .value() as u32;
+            *acc = Smi::new((a.wrapping_shr(b & 31) as i32) as i64).encode();
+            Step::Next
+        }
+        Opcode::ShiftRightLogical => {
+            // ToUint32(lhs) >>> (ToUint32(rhs) & 31): always non-negative
+            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as u32;
+            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
+                .value() as u32;
+            *acc = Smi::new(a.wrapping_shr(b & 31) as i64).encode();
             Step::Next
         }
         Opcode::Jump => {
@@ -588,6 +689,38 @@ fn step(
             });
             let _ = cache.take_acc();
             *acc = obj;
+            Step::Next
+        }
+        Opcode::LoadGlobal => {
+            let global = heap.known().global_object.value();
+            let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                let name = callable_name(nogc, heap, stack, &meta, ops.idx(0));
+                load_outcome(nogc, heap, global, name)
+            }));
+            match outcome {
+                LoadOutcome::Value(v) => *acc = v,
+                LoadOutcome::Getter(getter) => {
+                    let called =
+                        step_try!(call_value(heap, stack, cache, meta, pc, getter, &[global]));
+                    if !called {
+                        *acc = heap.known().undefined.value();
+                    }
+                }
+            }
+            // TODO: full semantics: lookup the script-context table first
+            // (lexical globals), throw ReferenceError on unresolved loads;
+            // the global-object property path is the only one implemented
+            Step::Next
+        }
+        Opcode::StoreGlobal => {
+            let global = heap.known().global_object.value();
+            let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                let name = callable_name(nogc, heap, stack, &meta, ops.idx(0));
+                global.store_lookup(nogc, heap, name, *acc, StoreSemantics::WriteThrough)
+            }));
+            step_try!(apply_store_outcome(
+                heap, state, stack, cache, meta, pc, global, *acc, outcome,
+            ));
             Step::Next
         }
         Opcode::LoadContextSlot => {

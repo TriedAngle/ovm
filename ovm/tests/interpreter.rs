@@ -147,10 +147,10 @@ fn failed_run_does_not_leak_frames_into_next_run() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // Add on uninitialized (void) registers throws a TypeError, aborting
-    // the run with a frame still on the suspended list.
+    // Add on a non-smi accumulator (undefined at entry) throws a TypeError,
+    // aborting the run with a frame still on the suspended list.
     let mut bad = Vec::new();
-    emit(&mut bad, Opcode::Add, &[0, 1]);
+    emit(&mut bad, Opcode::Add, &[1]);
     emit(&mut bad, Opcode::Return, &[]);
     let result = run_program(&mut thread, bad, 2, &[]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -651,7 +651,7 @@ fn named_store_new_property_transitions() {
         emit(program, Opcode::Store, &[3]);
         emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
         emit(program, Opcode::Store, &[4]);
-        emit(program, Opcode::Add, &[3, 4]);
+        emit(program, Opcode::Add, &[3]);
     });
     // existing slot preserved (7) and new slot written (42)
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 49);
@@ -673,11 +673,11 @@ fn named_store_chained_transitions() {
         emit(program, Opcode::Store, &[3]);
         emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
         emit(program, Opcode::Store, &[4]);
-        emit(program, Opcode::Add, &[3, 4]);
+        emit(program, Opcode::Add, &[3]);
         emit(program, Opcode::Store, &[3]);
         emit(program, Opcode::LoadNamedProperty, &[2, 3, 0]);
         emit(program, Opcode::Store, &[4]);
-        emit(program, Opcode::Add, &[3, 4]);
+        emit(program, Opcode::Add, &[3]);
     });
     // x = 7 (preserved), z = 42, w = 1
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 50);
@@ -791,7 +791,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
         emit(&mut program, Opcode::Store, &[4]);
         emit(&mut program, Opcode::LoadNamedProperty, &[4, 1, 0]);
         emit(&mut program, Opcode::Store, &[5]);
-        emit(&mut program, Opcode::Add, &[3, 5]);
+        emit(&mut program, Opcode::Add, &[3]);
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -875,11 +875,12 @@ fn jump_loop_counts_down_to_zero() {
     emit(&mut program, Opcode::Store, &[1]); // 6..8
     // loop @ 8
     emit(&mut program, Opcode::Load, &[0]); // 8..10
-    emit(&mut program, Opcode::JumpIfFalsy, &[9]); // 10..12 -> 19
-    emit(&mut program, Opcode::Add, &[0, 1]); // 12..15
-    emit(&mut program, Opcode::Store, &[0]); // 15..17
-    emit(&mut program, Opcode::JumpLoop, &[(-9i32) as u32]); // 17..19 -> 8
-    // end @ 19
+    emit(&mut program, Opcode::JumpIfFalsy, &[10]); // 10..12 -> 20
+    emit(&mut program, Opcode::Load, &[0]); // 12..14
+    emit(&mut program, Opcode::Add, &[1]); // 14..16
+    emit(&mut program, Opcode::Store, &[0]); // 16..18
+    emit(&mut program, Opcode::JumpLoop, &[(-10i32) as u32]); // 18..20 -> 8
+    // end @ 20
     emit(&mut program, Opcode::Load, &[0]);
     emit(&mut program, Opcode::Return, &[]);
 
@@ -1506,9 +1507,9 @@ fn native_reenters_interpreter_via_call() {
 /// frames are abandoned and must be unwound when the native recovers.
 fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
-        // callee: Add on uninitialized (void) registers -> TypeError throw
+        // callee: Add on a non-smi accumulator -> TypeError throw
         let mut bad = Vec::new();
-        emit(&mut bad, Opcode::Add, &[0, 1]);
+        emit(&mut bad, Opcode::Add, &[1]);
         emit(&mut bad, Opcode::Return, &[]);
         let callee = bytecode_fn(nctx, &scope, &bad, &[], 2);
 
@@ -1556,4 +1557,154 @@ fn inner_run_error_unwinds_and_native_recovers() {
     emit(&mut good, Opcode::Return, &[]);
     let result = run_program(&mut thread, good, 1, &[]);
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 41);
+}
+
+/// acc = param0; acc = acc op param1; return acc
+fn binary_op_program(op: Opcode) -> Vec<u8> {
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
+    emit(&mut program, op, &[(-2i32) as u32]);
+    emit(&mut program, Opcode::Return, &[]);
+    program
+}
+
+#[test]
+fn arithmetic_ops_use_accumulator_convention() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let cases: &[(Opcode, i64, i64, i64)] = &[
+        (Opcode::Add, 6, 7, 13),
+        (Opcode::Sub, 10, 4, 6),
+        (Opcode::Mul, 6, 7, 42),
+        (Opcode::Div, 42, 7, 6),
+        (Opcode::Mod, 42, 10, 2),
+        (Opcode::Exp, 2, 10, 1024),
+        (Opcode::BitwiseOr, 0b1010, 0b0110, 0b1110),
+        (Opcode::BitwiseXor, 12, 10, 6),
+        (Opcode::BitwiseAnd, 12, 10, 8),
+        (Opcode::ShiftLeft, 1, 4, 16),
+        (Opcode::ShiftRight, -8, 1, -4),
+        (Opcode::ShiftRightLogical, -1, 1, 0x7fff_ffff),
+    ];
+    for &(op, a, b, expected) in cases {
+        let program = binary_op_program(op);
+        let result = run_program(&mut thread, program, 0, &[smi(a), smi(b)]);
+        assert_eq!(
+            Smi::decode(result.unwrap()).unwrap().value(),
+            expected,
+            "op {op:?} with {a}, {b}"
+        );
+    }
+}
+
+#[test]
+fn shift_counts_are_masked_to_five_bits() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // JS: the shift count is ToUint32(rhs) & 31, so -1 shifts by 31
+    let result = run_program(
+        &mut thread,
+        binary_op_program(Opcode::ShiftLeft),
+        0,
+        &[smi(1), smi(-1)],
+    );
+    assert_eq!(
+        Smi::decode(result.unwrap()).unwrap().value(),
+        i32::MIN as i64
+    );
+}
+
+#[test]
+fn arithmetic_overflow_reports_range_error() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Add),
+        0,
+        &[smi(Smi::MAX - 1), smi(5)],
+    );
+    expect_escaped(&mut thread, result, "RangeError");
+}
+
+/// Like `run_program` but with a non-empty constants table.
+fn run_program_consts(
+    thread: &mut Thread,
+    program: Vec<u8>,
+    register_count: usize,
+    args: &[Value],
+    constants: &[Value],
+) -> Result<Value, VmError> {
+    thread.handle_scope(|thread, scope| {
+        let void = thread.heap().known().void;
+        let empty_context = thread.heap().known().empty_context;
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let constants = thread
+            .heap()
+            .allocate_handle::<FixedArray>(constants, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants,
+                register_count,
+                context: empty_context,
+                handlers: None,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.execute(callable, args)
+    })
+}
+
+#[test]
+fn global_store_then_load_roundtrips() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let (x, result) = thread.handle_scope(|thread, scope| {
+        let x = thread.intern(&scope, "x");
+        let x = x.value();
+
+        // x = 42; return x
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadSmi, &[42]);
+        emit(&mut program, Opcode::StoreGlobal, &[0, 0]);
+        emit(&mut program, Opcode::LoadGlobal, &[0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let result = run_program_consts(&mut *thread, program, 0, &[], &[x]);
+        (x, result)
+    });
+
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+
+    // globals persist on the VM: a fresh program sees the stored value
+    let result = thread.handle_scope(|thread, scope| {
+        let x = thread.intern(&scope, "x");
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadGlobal, &[0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        run_program_consts(&mut *thread, program, 0, &[], &[x.value()])
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+}
+
+#[test]
+fn load_global_missing_name_is_undefined() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        let missing = thread.intern(&scope, "not_defined_anywhere");
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadGlobal, &[0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        run_program_consts(&mut *thread, program, 0, &[], &[missing.value()])
+    });
+    assert_eq!(result.unwrap(), thread.heap().known().undefined.value());
 }
