@@ -2,12 +2,11 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
-use vm::{
-    EdgeVisitable, FixedByteArray, Global, Handle, HandleScope, Heap, InternedString, Visitor,
-    WeakGcCell, string_content_hash,
+use crate::{
+    EdgeVisitable, FixedByteArray, Handle, HandleScope, Heap, InternedString, Visitor,
+    heap::WeakGcCell, string_content_hash,
 };
 
-// TODO: weak GC cell is fake kinda, make this better
 pub struct StringInterner {
     table: Mutex<HashMap<Box<str>, WeakGcCell<InternedString>>>,
 }
@@ -17,13 +16,6 @@ impl StringInterner {
         Self {
             table: Mutex::new(HashMap::new()),
         }
-    }
-
-    pub fn insert(&self, s: &str, value: Global<InternedString>) {
-        self.table
-            .lock()
-            .unwrap()
-            .insert(s.into(), WeakGcCell::new(value.get()));
     }
 
     pub fn intern<'s>(
@@ -61,12 +53,12 @@ impl StringInterner {
                 Some(h) => h,
                 // the entry died mid-race => replace it
                 None => {
-                    e.insert(WeakGcCell::new(handle.get()));
+                    e.insert(WeakGcCell::new_strong(handle.get()));
                     handle
                 }
             },
             Entry::Vacant(e) => {
-                e.insert(WeakGcCell::new(handle.get()));
+                e.insert(WeakGcCell::new_strong(handle.get()));
                 handle
             }
         }

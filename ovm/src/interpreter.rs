@@ -1,15 +1,16 @@
 use bytecode::{Opcode, Operands, decode, jump_target};
 
 use vm::{
-    CallTarget, CallableInfoObject, Context, ContextInit, FixedArray, Handle, Heap, Key,
-    LoadOutcome, NoGc, Object, ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics,
-    Tagged, Value, ValueRef, call_target, classify_key, element_value, encode_smi, is_truthy,
+    CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, FixedArray, Handle,
+    Heap, Key, LoadOutcome, NoGc, Object, ObjectSlotsInit, SlotName, Smi, StoreOutcome,
+    StoreSemantics, Tagged, VMString, Value, ValueRef, call_target, classify_key, element_value,
     load_outcome, set_prototype, store_array_element, store_new_data_property_values,
 };
 
 use crate::{
     ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
     error_from_vm_error,
+    runtime::{Coercion, Hint, numeric_op, to_primitive},
 };
 
 pub fn execute(
@@ -93,7 +94,6 @@ fn callable_name<'a>(
 }
 
 /// The frame's current context: the function object's closure context
-/// (the interpreter frame's context slot).
 fn frame_context(heap: &mut Heap, stack: &Stack, meta: &FrameMeta) -> Result<Value, VmError> {
     heap.no_gc(|nogc, heap| {
         let ValueRef::Object(obj) = stack.callable_slot(meta).inner().value_ref(nogc) else {
@@ -349,69 +349,153 @@ fn step(
             Step::Next
         }
         Opcode::Add => {
-            // TODO: JS semantics (ToNumeric coercion, float results, string concat)
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
-            let b =
-                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
-            let r = step_try!(a.checked_add(b).ok_or(VmError::Overflow));
-            *acc = step_try!(encode_smi(r));
+            let other = stack.reg(&meta, ops.reg(0));
+            let mut result = None;
+            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+                if let Some(r) = a.value().checked_add(b.value()) {
+                    if Smi::in_range(r) {
+                        result = Some(Smi::new(r).encode());
+                    }
+                }
+            }
+            match result {
+                Some(v) => *acc = v,
+                None => {
+                    let lhs = step_try!(to_primitive(vm, heap, state, *acc, Hint::Default));
+                    let lhs = match lhs {
+                        Coercion::Threw => return Step::PendingThrow,
+                        Coercion::Value(v) => v,
+                    };
+                    let rhs = step_try!(to_primitive(vm, heap, state, other, Hint::Default));
+                    let rhs = match rhs {
+                        Coercion::Threw => return Step::PendingThrow,
+                        Coercion::Value(v) => v,
+                    };
+                    let is_string = heap.no_gc(|nogc, heap| {
+                        let known = heap.known();
+                        (
+                            lhs.get_as::<VMString>(nogc, known.string_map).is_some(),
+                            rhs.get_as::<VMString>(nogc, known.string_map).is_some(),
+                        )
+                    });
+                    if is_string.0 || is_string.1 {
+                        let s = step_try!(state.handle_scope(|scope| {
+                            let a = Convert::to_string(heap, &scope, vm.interner(), lhs)?;
+                            let b = Convert::to_string(heap, &scope, vm.interner(), rhs)?;
+                            Ok::<_, VmError>(VMString::concat(heap, &scope, a, b).value())
+                        }));
+                        *acc = s;
+                    } else {
+                        let r = step_try!(heap.no_gc(|nogc, heap| {
+                            let a = Convert::to_number(nogc, heap, lhs)?;
+                            let b = Convert::to_number(nogc, heap, rhs)?;
+                            Ok::<_, VmError>(a + b)
+                        }));
+                        let v = state.handle_scope(|scope| Convert::to_value(heap, &scope, r));
+                        *acc = v;
+                    }
+                }
+            }
             Step::Next
         }
         Opcode::Sub => {
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
-            let b =
-                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
-            let r = step_try!(a.checked_sub(b).ok_or(VmError::Overflow));
-            *acc = step_try!(encode_smi(r));
+            let other = stack.reg(&meta, ops.reg(0));
+            let mut result = None;
+            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+                if let Some(r) = a.value().checked_sub(b.value()) {
+                    if Smi::in_range(r) {
+                        result = Some(Smi::new(r).encode());
+                    }
+                }
+            }
+            match result {
+                Some(v) => *acc = v,
+                None => {
+                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a - b));
+                    let Some(v) = v else {
+                        return Step::PendingThrow;
+                    };
+                    *acc = v;
+                }
+            }
             Step::Next
         }
         Opcode::Mul => {
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
-            let b =
-                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
-            let r = step_try!(a.checked_mul(b).ok_or(VmError::Overflow));
-            *acc = step_try!(encode_smi(r));
+            let other = stack.reg(&meta, ops.reg(0));
+            let mut result = None;
+            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+                if let Some(r) = a.value().checked_mul(b.value()) {
+                    if Smi::in_range(r) {
+                        result = Some(Smi::new(r).encode());
+                    }
+                }
+            }
+            match result {
+                Some(v) => *acc = v,
+                None => {
+                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a * b));
+                    let Some(v) = v else {
+                        return Step::PendingThrow;
+                    };
+                    *acc = v;
+                }
+            }
             Step::Next
         }
         Opcode::Div => {
-            // TODO: JS semantics: non-integral results and division by zero
-            // yield doubles (Infinity/NaN), not errors
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
-            let b =
-                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
-            let r = step_try!(if b == 0 {
-                Err(VmError::Overflow)
-            } else {
-                a.checked_div(b).ok_or(VmError::Overflow)
-            });
-            *acc = step_try!(encode_smi(r));
+            // JS division is IEEE double division: 7/2 = 3.5, x/0 = ±Infinity
+            // or NaN, MIN/-1 overflows to a double.
+            let other = stack.reg(&meta, ops.reg(0));
+            let mut result = None;
+            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+                if b.value() != 0 && a.value() % b.value() == 0 {
+                    if let Some(r) = a.value().checked_div(b.value()) {
+                        result = Some(Smi::new(r).encode());
+                    }
+                }
+            }
+            match result {
+                Some(v) => *acc = v,
+                None => {
+                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a / b));
+                    let Some(v) = v else {
+                        return Step::PendingThrow;
+                    };
+                    *acc = v;
+                }
+            }
             Step::Next
         }
         Opcode::Mod => {
-            // TODO: JS semantics: division by zero yields NaN
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
-            let b =
-                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
-            let r = step_try!(if b == 0 {
-                Err(VmError::Overflow)
-            } else {
-                a.checked_rem(b).ok_or(VmError::Overflow)
-            });
-            *acc = step_try!(encode_smi(r));
+            // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.
+            let other = stack.reg(&meta, ops.reg(0));
+            let mut result = None;
+            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+                if b.value() != 0 {
+                    result = Some(Smi::new(a.value() % b.value()).encode());
+                }
+            }
+            match result {
+                Some(v) => *acc = v,
+                None => {
+                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a % b));
+                    let Some(v) = v else {
+                        return Step::PendingThrow;
+                    };
+                    *acc = v;
+                }
+            }
             Step::Next
         }
         Opcode::Exp => {
-            // TODO: JS semantics: fractional results yield doubles
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value();
-            let b =
-                step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type)).value();
-            let r = (a as f64).powf(b as f64);
-            let r = step_try!(if !r.is_finite() || r.fract() != 0.0 {
-                Err(VmError::Overflow)
-            } else {
-                Ok(r as i64)
-            });
-            *acc = step_try!(encode_smi(r));
+            // JS exponentiation is always IEEE double math; the result only
+            // needs a Smi tag when it is an in-range integer.
+            let other = stack.reg(&meta, ops.reg(0));
+            let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a.powf(b)));
+            let Some(v) = v else {
+                return Step::PendingThrow;
+            };
+            *acc = v;
             Step::Next
         }
         Opcode::BitwiseOr => {
@@ -472,13 +556,13 @@ fn step(
             Step::Next
         }
         Opcode::JumpIfTruthy => {
-            if heap.no_gc(|nogc, heap| is_truthy(nogc, heap, *acc)) {
+            if heap.no_gc(|nogc, heap| Convert::is_truthy(nogc, heap, *acc)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
         }
         Opcode::JumpIfFalsy => {
-            if !heap.no_gc(|nogc, heap| is_truthy(nogc, heap, *acc)) {
+            if !heap.no_gc(|nogc, heap| Convert::is_truthy(nogc, heap, *acc)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
@@ -491,6 +575,97 @@ fn step(
             } else {
                 known.false_object.value()
             };
+            Step::Next
+        }
+        Opcode::EqualStrict => {
+            let other = stack.reg(&meta, ops.reg(0));
+            let r = heap.no_gc(|nogc, heap| Compare::strict_equal(nogc, heap, *acc, other));
+            *acc = Convert::boolean(heap, r);
+            Step::Next
+        }
+        Opcode::Equal => {
+            // IsLooselyEqual: objects are ToPrimitive'd (hint default) first
+            let other = stack.reg(&meta, ops.reg(0));
+            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Default));
+            let x = match x {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Default));
+            let y = match y {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let r = step_try!(heap.no_gc(|nogc, heap| Compare::equal(nogc, heap, x, y)));
+            *acc = Convert::boolean(heap, r);
+            Step::Next
+        }
+        Opcode::LessThan => {
+            // Abstract Relational Comparison: objects ToPrimitive'd with hint Number
+            let other = stack.reg(&meta, ops.reg(0));
+            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = match x {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = match y {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let r = step_try!(heap.no_gc(|nogc, heap| Compare::less_than(nogc, heap, x, y)));
+            *acc = Convert::boolean(heap, r);
+            Step::Next
+        }
+        Opcode::LessThanOrEqual => {
+            let other = stack.reg(&meta, ops.reg(0));
+            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = match x {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = match y {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let r =
+                step_try!(heap.no_gc(|nogc, heap| Compare::less_than_or_equal(nogc, heap, x, y)));
+            *acc = Convert::boolean(heap, r);
+            Step::Next
+        }
+        Opcode::GreaterThan => {
+            let other = stack.reg(&meta, ops.reg(0));
+            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = match x {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = match y {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let r = step_try!(heap.no_gc(|nogc, heap| Compare::greater_than(nogc, heap, x, y)));
+            *acc = Convert::boolean(heap, r);
+            Step::Next
+        }
+        Opcode::GreaterThanOrEqual => {
+            let other = stack.reg(&meta, ops.reg(0));
+            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = match x {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = match y {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => v,
+            };
+            let r = step_try!(
+                heap.no_gc(|nogc, heap| Compare::greater_than_or_equal(nogc, heap, x, y))
+            );
+            *acc = Convert::boolean(heap, r);
             Step::Next
         }
         Opcode::Throw | Opcode::ReThrow => Step::Throw(*acc),
