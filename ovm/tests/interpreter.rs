@@ -271,11 +271,15 @@ fn create_array_literal_fills_from_registers() {
     let array = result.unwrap();
     thread.heap().no_gc(|nogc, heap| {
         let a = array
-            .get_as::<FixedArray>(nogc, heap.known().array_map)
+            .get_as::<Object>(nogc, heap.known().js_array_map)
             .expect("array literal result");
-        assert_eq!(Smi::decode(a.at(0)).unwrap().value(), 1);
-        assert_eq!(Smi::decode(a.at(1)).unwrap().value(), 2);
-        assert_eq!(Smi::decode(a.at(2)).unwrap().value(), 3);
+        let a = a.as_ref();
+        assert!(a.is_array(nogc));
+        assert_eq!(a.length(), 3);
+        let elements = a.elements_array(nogc, heap).expect("array elements");
+        assert_eq!(Smi::decode(elements.at(0)).unwrap().value(), 1);
+        assert_eq!(Smi::decode(elements.at(1)).unwrap().value(), 2);
+        assert_eq!(Smi::decode(elements.at(2)).unwrap().value(), 3);
     });
 }
 
@@ -404,10 +408,12 @@ fn keyed_store_writes_array_element() {
 }
 
 #[test]
-fn keyed_load_out_of_bounds_errors() {
+fn keyed_load_out_of_bounds_yields_undefined() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
+    // out-of-range and negative indices are ordinary property lookups and
+    // yield undefined
     for key in [2u32, (-1i32) as u32] {
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadSmi, &[1]);
@@ -419,8 +425,65 @@ fn keyed_load_out_of_bounds_errors() {
         emit(&mut program, Opcode::Return, &[]);
 
         let result = run_program(&mut thread, program, 2, &[]);
-        expect_escaped(&mut thread, result, "RangeError");
+        assert_eq!(result.unwrap(), thread.heap().known().undefined.value());
     }
+}
+
+#[test]
+fn keyed_store_grows_array_and_fills_holes() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r1 = [1]; r1[3] = 42; acc = r1[3]; then acc = r1[1] (hole -> undefined)
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::LoadSmi, &[3]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::LoadSmi, &[42]);
+    emit(&mut program, Opcode::StoreKeyedProperty, &[1, 2, 0]);
+    emit(&mut program, Opcode::LoadSmi, &[3]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[1, 0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 3, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+
+    // the grown array must have length 4 with holes at 1..3
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::LoadSmi, &[3]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::LoadSmi, &[42]);
+    emit(&mut program, Opcode::StoreKeyedProperty, &[1, 2, 0]);
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[1, 0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 3, &[]);
+    assert_eq!(result.unwrap(), thread.heap().known().undefined.value());
+}
+
+#[test]
+fn keyed_store_creates_numeric_property_on_plain_object() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r3 = 0 (key); r2[0] = 42 (numeric property on an object); acc = r2[0]
+    let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
+        emit(program, Opcode::LoadSmi, &[0]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadSmi, &[42]);
+        emit(program, Opcode::StoreKeyedProperty, &[2, 3, 0]);
+        emit(program, Opcode::LoadSmi, &[0]);
+        emit(program, Opcode::LoadKeyedProperty, &[2, 0]);
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
 
 /// Build an object with map (x -> slot 0, y -> slot 1) in the constants table

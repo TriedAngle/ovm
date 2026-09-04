@@ -289,3 +289,7 @@ fn read_opcode(code: &[u8], pc: &mut usize) -> Opcode {
     *pc += 1;
     Opcode::from_byte(byte).expect("invalid opcode")
 }
+
+pub fn jump_target(pc: usize, offset: i32) -> usize {
+    pc.wrapping_add_signed(offset as isize)
+}

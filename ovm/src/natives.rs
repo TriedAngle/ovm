@@ -32,7 +32,7 @@ impl<'a> NativeContext<'a> {
     }
 
     pub fn set_pending_exception(&mut self, err: VmError) {
-        let ex = crate::interpreter::error_from_vm_error(self.vm, self.heap, self.state, err)
+        let ex = crate::errors::error_from_vm_error(self.vm, self.heap, self.state, err)
             .expect("error materialization must not fail");
         self.state.set_pending_exception(ex);
     }
@@ -76,13 +76,9 @@ pub extern "C" fn native_trampoline(
     match f(&mut nctx, args) {
         Ok(v) => v,
         Err(e) => {
-            let ex = crate::interpreter::error_from_vm_error(
-                &thread.vm,
-                &mut thread.heap,
-                &thread.state,
-                e,
-            )
-            .expect("error materialization must not fail");
+            let ex =
+                crate::errors::error_from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
+                    .expect("error materialization must not fail");
             thread.state.set_pending_exception(ex);
             thread.heap.known().exception.value()
         }

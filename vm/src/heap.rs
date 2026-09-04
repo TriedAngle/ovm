@@ -34,20 +34,21 @@ impl std::error::Error for AllocError {}
 
 #[derive(Clone, Copy)]
 pub struct WellKnown {
+    // vm internal machinery: sentinels, canonical empties, builtin maps
     pub map_map: Global<Map>,
     /// "hole"
     pub void: Global<Object>,
-    pub undefined: Global<Object>,
-    pub null: Global<Object>,
-    pub false_object: Global<Object>,
-    pub true_object: Global<Object>,
     /// Never user-visible: a call returning it signals a pending exception.
     pub exception: Global<Object>,
+    /// exception map
+    pub exception_map: Global<Map>,
     /// Canonical empty string (synced with intern)
     pub empty_string: Global<InternedString>,
     /// Shared empty backing for objects without data slots (never written in
     /// place; the first property store swaps in a fresh array).
     pub empty_fixed_array: Global<FixedArray>,
+    /// TODO: Placeholder for now
+    pub empty_context: Global<Context>,
     pub smi_map: Global<Map>,
     pub float_map: Global<Map>,
     pub array_map: Global<Map>,
@@ -58,16 +59,26 @@ pub struct WellKnown {
     pub callable_map: Global<Map>,
     pub handler_table_map: Global<Map>,
     pub context_map: Global<Map>,
-    /// `%Object.prototype%`: root of the ordinary-object prototype hierarchy.
-    pub object_prototype: Global<Object>,
-    /// `%Error.prototype%`: parent of all error instance maps.
-    pub error_prototype: Global<Object>,
+    // js userspace primitives and object base maps
+    pub undefined: Global<Object>,
+    pub undefined_map: Global<Map>,
+    pub null: Global<Object>,
+    pub null_map: Global<Map>,
+    pub false_object: Global<Object>,
+    pub true_object: Global<Object>,
+    pub boolean_map: Global<Map>,
+    /// Base map for ECMAScript array objects (elements + length, prototype
+    /// %Array.prototype%).
+    pub js_array_map: Global<Map>,
     /// Base map for ECMAScript error objects
     pub error_map: Global<Map>,
-    /// exception map
-    pub exception_map: Global<Map>,
-    /// TODO: Placeholder for now
-    pub empty_context: Global<Context>,
+    // prototypes
+    /// `%Object.prototype%`: root of the ordinary-object prototype hierarchy.
+    pub object_prototype: Global<Object>,
+    /// `%Array.prototype%`: an array object, parent of all array instance maps.
+    pub array_prototype: Global<Object>,
+    /// `%Error.prototype%`: parent of all error instance maps.
+    pub error_prototype: Global<Object>,
 }
 
 unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
@@ -83,13 +94,11 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     WellKnown {
         map_map: map,
         void: obj,
-        undefined: obj,
-        null: obj,
-        false_object: obj,
-        true_object: obj,
         exception: obj,
+        exception_map: map,
         empty_string: string,
         empty_fixed_array: array,
+        empty_context: context,
         smi_map: map,
         float_map: map,
         array_map: map,
@@ -100,11 +109,18 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         callable_map: map,
         handler_table_map: map,
         context_map: map,
-        object_prototype: obj,
-        error_prototype: obj,
+        undefined: obj,
+        undefined_map: map,
+        null: obj,
+        null_map: map,
+        false_object: obj,
+        true_object: obj,
+        boolean_map: map,
+        js_array_map: map,
         error_map: map,
-        exception_map: map,
-        empty_context: context,
+        object_prototype: obj,
+        array_prototype: obj,
+        error_prototype: obj,
     }
 }
 
@@ -193,7 +209,7 @@ fn bootstrap_map_map_and_void(heap: &mut Heap, roots: &RootHandles) -> (Global<M
 }
 
 pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
-    let (void_map, mut known) = bootstrap_map_map_and_void(heap, roots);
+    let (_void_map, mut known) = bootstrap_map_map_and_void(heap, roots);
     let void = known.void;
 
     // All remaining maps: `Map::init` now reads the real map_map/void.
@@ -229,6 +245,22 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     heap.set_known(known);
     let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map);
 
+    // %Array.prototype% is itself an array whose prototype is %Object.prototype%;
+    // array instance maps hang off it.
+    let array_prototype_map = alloc_parent_map(
+        heap,
+        roots,
+        MapKind::ARRAY.union(MapKind::EXTENDABLE),
+        object_prototype,
+    );
+    let array_prototype = alloc_object(heap, &scope, roots, array_prototype_map);
+    let js_array_map = alloc_parent_map(
+        heap,
+        roots,
+        MapKind::ARRAY.union(MapKind::EXTENDABLE),
+        array_prototype,
+    );
+
     let error_prototype_map = alloc_parent_map(
         heap,
         roots,
@@ -237,7 +269,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     );
     let error_prototype = alloc_object(heap, &scope, roots, error_prototype_map);
 
-    let oddball_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
     let error_map = alloc_parent_map(
         heap,
         roots,
@@ -245,10 +276,15 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         error_prototype,
     );
 
-    let undefined = alloc_object(heap, &scope, roots, oddball_map);
-    let null = alloc_object(heap, &scope, roots, void_map);
-    let false_object = alloc_object(heap, &scope, roots, oddball_map);
-    let true_object = alloc_object(heap, &scope, roots, oddball_map);
+    // each oddball gets its own map (booleans share theirs)
+    let undefined_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
+    let boolean_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
+    let null_map = alloc_map(heap, roots, MapKind::OBJECT);
+
+    let undefined = alloc_object(heap, &scope, roots, undefined_map);
+    let null = alloc_object(heap, &scope, roots, null_map);
+    let false_object = alloc_object(heap, &scope, roots, boolean_map);
+    let true_object = alloc_object(heap, &scope, roots, boolean_map);
 
     let exception_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
     let exception = alloc_object(heap, &scope, roots, exception_map);
@@ -267,15 +303,20 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         .into_global(roots);
 
     known.undefined = undefined;
+    known.undefined_map = undefined_map;
     known.null = null;
+    known.null_map = null_map;
     known.false_object = false_object;
     known.true_object = true_object;
+    known.boolean_map = boolean_map;
     known.exception = exception;
     known.empty_string = empty_string;
     known.object_prototype = object_prototype;
+    known.array_prototype = array_prototype;
     known.error_prototype = error_prototype;
     known.error_map = error_map;
     known.exception_map = exception_map;
+    known.js_array_map = js_array_map;
     known.empty_context = empty_context;
     heap.set_known(known);
 }

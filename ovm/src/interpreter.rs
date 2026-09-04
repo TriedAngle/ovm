@@ -1,12 +1,16 @@
-use bytecode::{Opcode, Operands, decode};
+use bytecode::{Opcode, Operands, decode, jump_target};
 
 use vm::{
-    Context, FixedArray, Float, Handle, Heap, HeapRef, InternedString, Lookup, Map, NoGc, Object,
-    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, VMString, Value,
-    ValueRef,
+    CallTarget, Context, FixedArray, Handle, Heap, Key, LoadOutcome, Map, NoGc, Object,
+    ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value, ValueRef,
+    call_target, classify_key, element_value, is_truthy, load_outcome, store_array_element,
+    store_new_data_property_values,
 };
 
-use crate::{ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError};
+use crate::{
+    ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
+    error_from_vm_error,
+};
 
 pub fn execute(
     vm: &VM,
@@ -70,86 +74,22 @@ fn start(
     }
 }
 
-enum CallTarget {
-    Bytecode(Tagged<Object>, usize),
-    Native(usize),
-}
-
-fn call_target<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, f: Value) -> Option<CallTarget> {
-    let ValueRef::Object(obj) = f.value_ref(nogc) else {
-        return None;
-    };
-    let kind = obj.as_ref().header.map.heap_ref(nogc).kind();
-    if !kind.is_callable() {
-        return None;
-    }
-    if kind.is_native() {
-        return Some(CallTarget::Native(obj.as_ref().native_index(nogc)?));
-    }
-    let info = obj.as_ref().callable_info(nogc, heap)?;
-    let register_count = info.register_count.to_smi().value() as usize;
-    Some(CallTarget::Bytecode(obj.into_tagged(), register_count))
-}
-
-fn property_name<'a>(
+fn callable_name<'a>(
     nogc: &'a NoGc<'a>,
     heap: &'a Heap,
-    constants: HeapRef<'a, FixedArray>,
+    stack: &Stack,
+    meta: &FrameMeta,
     idx: usize,
 ) -> SlotName {
-    // TODO: this function must handle also non constants and non interned strings and symbols
-    let v = constants.at(idx);
-    let name = v
-        .get_as::<InternedString>(nogc, heap.known().string_map)
-        .expect("property name constant must be an interned string");
-    SlotName::from(name.into_tagged())
-}
-
-/// A runtime property key: a smi element index or a name (interned string / symbol).
-enum Key {
-    Element(usize),
-    Name(SlotName),
-}
-
-fn classify_key<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, key: Value) -> Result<Key, VmError> {
-    if let Some(smi) = Smi::decode(key) {
-        return usize::try_from(smi.value())
-            .map(Key::Element)
-            .map_err(|_| VmError::OutOfBounds);
-    }
-    if let Some(s) = key.get_as::<InternedString>(nogc, heap.known().string_map) {
-        return Ok(Key::Name(SlotName::from(s.into_tagged())));
-    }
-    if let Some(s) = key.get_as::<Symbol>(nogc, heap.known().symbol_map) {
-        return Ok(Key::Name(SlotName::from(s.into_tagged())));
-    }
-    Err(VmError::Type)
-}
-
-enum LoadOutcome {
-    Value(Value),
-    Getter(Value),
-}
-
-fn load_outcome<'a>(
-    nogc: &'a NoGc<'a>,
-    heap: &'a Heap,
-    receiver: Value,
-    name: SlotName,
-) -> LoadOutcome {
-    match receiver.lookup(nogc, heap, name) {
-        Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => LoadOutcome::Value(slot.inner()),
-        Lookup::Accessor { pair, .. } => {
-            let getter = pair.get.inner();
-            // no getter (void sentinel): the load yields undefined
-            if getter == heap.known().void.value() {
-                LoadOutcome::Value(heap.known().undefined.value())
-            } else {
-                LoadOutcome::Getter(getter)
-            }
-        }
-        Lookup::NotFound => LoadOutcome::Value(heap.known().undefined.value()),
-    }
+    let callable = stack.callable_slot(meta).inner();
+    let ValueRef::Object(callable) = callable.value_ref(nogc) else {
+        panic!("frame callable must be an object");
+    };
+    let info = callable
+        .as_ref()
+        .callable_info(nogc, heap)
+        .expect("frame callable must have callable info");
+    info.constant_slot_name(nogc, heap, idx)
 }
 
 fn call_value(
@@ -169,120 +109,6 @@ fn call_value(
     let callee = stack.push_frame_with_args(meta, handler_pc, target, register_count, args)?;
     cache.load(stack, callee, heap);
     Ok(true)
-}
-
-fn store_transition(
-    heap: &mut Heap,
-    state: &ContextState,
-    receiver: Value,
-    name: SlotName,
-    value: Value,
-) -> Result<(), VmError> {
-    state.handle_scope(|scope| {
-        let receiver = scope
-            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
-            .expect("receiver must be strong");
-        let name = scope
-            .create_handle(name.tagged())
-            .expect("name must be strong");
-        let value = scope
-            .create_handle(Tagged::from_value(value))
-            .expect("value must be strong");
-        Object::store_new_data_property(heap, receiver, name, value)
-    })
-}
-
-/// Materialize a VM error as an ECMAScript error object
-#[cold]
-#[inline(never)]
-pub fn error_from_vm_error(
-    vm: &VM,
-    heap: &mut Heap,
-    state: &ContextState,
-    err: VmError,
-) -> Result<Value, VmError> {
-    state.handle_scope(|scope| {
-        let name_string = vm.interner().intern(heap, &scope, "name");
-        let message_string = vm.interner().intern(heap, &scope, "message");
-        let name_value = vm.interner().intern(heap, &scope, err.name());
-        let message_value = vm.interner().intern(heap, &scope, err.message());
-
-        let map = scope
-            .create_handle(heap.known().error_map.as_tagged())
-            .expect("error map is strong");
-        let obj = heap
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map,
-                    values: &[],
-                    elements: heap.known().empty_fixed_array.erase(),
-                    length: 0,
-                },
-            )
-            .into_handle(&scope);
-        let name = scope
-            .create_handle(SlotName::from(name_string.as_tagged()).tagged())
-            .expect("name is strong");
-        let message = scope
-            .create_handle(SlotName::from(message_string.as_tagged()).tagged())
-            .expect("message is strong");
-        let name_value = scope
-            .create_handle(Tagged::from_value(name_value.value()))
-            .expect("name value is strong");
-        let message_value = scope
-            .create_handle(Tagged::from_value(message_value.value()))
-            .expect("message value is strong");
-        Object::store_new_data_property(heap, obj, name, name_value)?;
-        Object::store_new_data_property(heap, obj, message, message_value)?;
-        Ok(obj.value())
-    })
-}
-
-fn element_array<'a>(
-    nogc: &'a NoGc<'a>,
-    heap: &'a Heap,
-    receiver: Value,
-    i: usize,
-) -> Result<HeapRef<'a, FixedArray>, VmError> {
-    let arr = receiver
-        .get_as::<FixedArray>(nogc, heap.known().array_map)
-        .ok_or(VmError::Type)?;
-    if i >= arr.len() {
-        return Err(VmError::OutOfBounds);
-    }
-    Ok(arr)
-}
-
-/// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN, everything else is truthy
-fn is_truthy<'a>(nogc: &'a NoGc<'a>, heap: &Heap, v: Value) -> bool {
-    if let Some(smi) = Smi::decode(v) {
-        return smi.value() != 0;
-    }
-    let known = heap.known();
-    if v == known.false_object.value()
-        || v == known.undefined.value()
-        || v == known.null.value()
-        || v == known.void.value()
-    {
-        return false;
-    }
-    if v == known.true_object.value() {
-        return true;
-    }
-    if let Some(f) = v.get_as::<Float>(nogc, known.float_map) {
-        let x = f.value.get();
-        // -0.0 compares equal to 0.0; NaN compares unequal to everything
-        return x != 0.0 && !x.is_nan();
-    }
-    if let Some(s) = v.get_as::<VMString>(nogc, known.string_map) {
-        return s.len(nogc) != 0;
-    }
-    true
-}
-
-fn jump_target(pc: usize, offset: i32) -> usize {
-    pc.wrapping_add_signed(offset as isize)
 }
 
 /// Result of an exception unwind.
@@ -355,7 +181,23 @@ fn raise(
     exception_dispatch(heap, state, base_depth, pc)
 }
 
-// TODO: pass stack and cache directly, could be benificial for threading dispatch later
+enum Step {
+    Next,
+    Return(Value),
+    Throw(Value),
+    PendingThrow,
+    Error(VmError),
+}
+
+macro_rules! step_try {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(err) => return Step::Error(err),
+        }
+    };
+}
+
 fn dispatch(
     vm: &VM,
     heap: &mut Heap,
@@ -393,23 +235,6 @@ fn dispatch(
     }
 }
 
-enum Step {
-    Next,
-    Return(Value),
-    Throw(Value),
-    PendingThrow,
-    Error(VmError),
-}
-
-macro_rules! step_try {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(err) => return Step::Error(err),
-        }
-    };
-}
-
 fn apply_store_outcome(
     heap: &mut Heap,
     state: &ContextState,
@@ -424,7 +249,9 @@ fn apply_store_outcome(
     match outcome {
         StoreOutcome::Transition { receiver, name } => {
             cache.spill_acc(acc);
-            let result = store_transition(heap, state, receiver, name, acc);
+            let result = state.handle_scope(|scope| {
+                store_new_data_property_values(heap, &scope, receiver, name, acc)
+            });
             let _ = cache.take_acc();
             result
         }
@@ -584,16 +411,23 @@ fn step(
             }
         }
         Opcode::LoadNamedProperty => {
-            let outcome = heap.no_gc(|nogc, heap| {
-                let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
+            let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                let name = callable_name(nogc, heap, stack, &meta, ops.idx(1));
                 load_outcome(nogc, heap, stack.reg(&meta, ops.reg(0)), name)
-            });
+            }));
             match outcome {
                 LoadOutcome::Value(v) => *acc = v,
                 LoadOutcome::Getter(getter) => {
                     let receiver = stack.reg(&meta, ops.reg(0));
-                    let called =
-                        step_try!(call_value(heap, stack, cache, meta, pc, getter, &[receiver]));
+                    let called = step_try!(call_value(
+                        heap,
+                        stack,
+                        cache,
+                        meta,
+                        pc,
+                        getter,
+                        &[receiver]
+                    ));
                     if !called {
                         // non-callable getter: the load yields undefined
                         *acc = heap.known().undefined.value();
@@ -609,7 +443,7 @@ fn step(
             };
             let receiver = stack.reg(&meta, ops.reg(0));
             let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
+                let name = callable_name(nogc, heap, stack, &meta, ops.idx(1));
                 receiver.store_lookup(nogc, heap, name, *acc, semantics)
             }));
             step_try!(apply_store_outcome(
@@ -621,18 +455,32 @@ fn step(
             let receiver = stack.reg(&meta, ops.reg(0));
             let outcome = step_try!(heap.no_gc(|nogc, heap| {
                 match classify_key(nogc, heap, *acc)? {
-                    Key::Element(i) => {
-                        let arr = element_array(nogc, heap, receiver, i)?;
-                        Ok(LoadOutcome::Value(arr.at(i)))
-                    }
-                    Key::Name(name) => Ok(load_outcome(nogc, heap, receiver, name)),
+                    Key::Element(i) => match element_value(nogc, heap, receiver, i) {
+                        Some(v) => Ok(LoadOutcome::Value(v)),
+                        // past the end, a hole, or a non-array receiver:
+                        // fall back to an ordinary property lookup
+                        None => load_outcome(
+                            nogc,
+                            heap,
+                            receiver,
+                            SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                        ),
+                    },
+                    Key::Name(name) => load_outcome(nogc, heap, receiver, name),
                 }
             }));
             match outcome {
                 LoadOutcome::Value(v) => *acc = v,
                 LoadOutcome::Getter(getter) => {
-                    let called =
-                        step_try!(call_value(heap, stack, cache, meta, pc, getter, &[receiver]));
+                    let called = step_try!(call_value(
+                        heap,
+                        stack,
+                        cache,
+                        meta,
+                        pc,
+                        getter,
+                        &[receiver]
+                    ));
                     if !called {
                         *acc = heap.known().undefined.value();
                     }
@@ -647,19 +495,44 @@ fn step(
             };
             let receiver = stack.reg(&meta, ops.reg(0));
             let key = stack.reg(&meta, ops.reg(1));
-            let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                match classify_key(nogc, heap, key)? {
-                    Key::Element(i) => {
-                        let arr = element_array(nogc, heap, receiver, i)?;
-                        arr.set(heap, i, *acc);
-                        Ok(StoreOutcome::Done)
+            let key = step_try!(heap.no_gc(|nogc, heap| classify_key(nogc, heap, key)));
+            match key {
+                Key::Element(i) => {
+                    let is_array = heap.no_gc(|nogc, _heap| {
+                        let ValueRef::Object(obj) = receiver.value_ref(nogc) else {
+                            return false;
+                        };
+                        obj.as_ref().is_array(nogc)
+                    });
+                    if is_array {
+                        step_try!(state.handle_scope(|scope| {
+                            store_array_element(heap, &scope, receiver, i, *acc)
+                        }));
+                    } else {
+                        // numeric property on a non-array receiver
+                        let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                            receiver.store_lookup(
+                                nogc,
+                                heap,
+                                SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                                *acc,
+                                semantics,
+                            )
+                        }));
+                        step_try!(apply_store_outcome(
+                            heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
+                        ));
                     }
-                    Key::Name(name) => receiver.store_lookup(nogc, heap, name, *acc, semantics),
                 }
-            }));
-            step_try!(apply_store_outcome(
-                heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
-            ));
+                Key::Name(name) => {
+                    let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                        receiver.store_lookup(nogc, heap, name, *acc, semantics)
+                    }));
+                    step_try!(apply_store_outcome(
+                        heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
+                    ));
+                }
+            }
             Step::Next
         }
         Opcode::CreateObjectFromMap => {
@@ -695,12 +568,26 @@ fn step(
             let count = ops.reg_count(1);
             cache.spill_acc(*acc);
             let args = stack.args(&meta, ops.reg_list(0), count);
-            let array = heap
-                .allocate_enter_nogc(args, |dst: HeapRef<'_, FixedArray>, _nogc, _| {
-                    dst.into_tagged().erase()
-                });
+
+            let obj = state.handle_scope(|scope| {
+                let map = scope
+                    .create_handle(heap.known().js_array_map.as_tagged())
+                    .expect("array object map is strong");
+                let elements = heap.allocate_handle::<FixedArray>(args, &scope);
+                heap.allocate_object(
+                    &scope,
+                    ObjectSlotsInit {
+                        map,
+                        values: &[],
+                        elements: elements.erase(),
+                        length: count,
+                    },
+                )
+                .into_tagged()
+                .erase()
+            });
             let _ = cache.take_acc();
-            *acc = array;
+            *acc = obj;
             Step::Next
         }
         Opcode::LoadContextSlot => {

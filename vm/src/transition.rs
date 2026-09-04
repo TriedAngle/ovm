@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use core::alloc::Layout;
 
 use crate::{
-    AccessorPair, FixedArray, Handle, Heap, HeapObject, HeapRef, Lookup, Map, MapInit, NoGc,
-    Object, SlotFlags, SlotName, Smi, Tagged, Value, ValueRef, VmError,
+    AccessorPair, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef, Lookup, Map, MapInit,
+    NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, ValueRef, VmError,
 };
 
 #[derive(Clone)]
@@ -64,6 +64,10 @@ impl Value {
         semantics: StoreSemantics,
     ) -> Result<StoreOutcome, VmError> {
         let receiver = *self;
+        // null/undefined have no [[Prototype]]: property access throws
+        if receiver == heap.known().null.value() || receiver == heap.known().undefined.value() {
+            return Err(VmError::Type);
+        }
         match receiver.lookup(nogc, heap, name) {
             Lookup::Data {
                 slot,
@@ -302,4 +306,25 @@ impl Object {
         });
         Ok(())
     }
+}
+
+/// `Object::store_new_data_property` for unrooted inputs: roots
+/// receiver/name/value in `scope`, then defines the data property.
+pub fn store_new_data_property_values(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    receiver: Value,
+    name: SlotName,
+    value: Value,
+) -> Result<(), VmError> {
+    let receiver = scope
+        .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
+        .expect("receiver must be strong");
+    let name = scope
+        .create_handle(name.tagged())
+        .expect("name must be strong");
+    let value = scope
+        .create_handle(Tagged::from_value(value))
+        .expect("value must be strong");
+    Object::store_new_data_property(heap, receiver, name, value)
 }
