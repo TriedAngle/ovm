@@ -266,7 +266,12 @@ mod tests {
     /// allocating object kinds whose map comes from `known()`.
     fn install_well_known(global: &GlobalHeap) -> RootHandles {
         let mut local = global.new_local();
-        let roots = unsafe { RootHandles::new(64, Smi::new(0).encode()) };
+        let roots = unsafe { RootHandles::new(128, Smi::new(0).encode()) };
+        // throwaway string table: the interned well-known strings are kept
+        // alive by the table's strong entries while the table itself lives
+        let interner = vm::StringInterner::new();
+        vm::bootstrap_basics(&mut local, &roots);
+        vm::intern_well_known_strings(&mut local, &interner);
         vm::bootstrap_well_known(&mut local, &roots);
         roots
     }
@@ -332,7 +337,6 @@ mod tests {
             k.null.value(),
             k.false_object.value(),
             k.true_object.value(),
-            k.empty_string.value(),
             k.smi_map.value(),
             k.float_map.value(),
             k.array_map.value(),

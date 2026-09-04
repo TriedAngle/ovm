@@ -55,9 +55,6 @@ pub struct Declaration {
     pub span: Span,
 }
 
-/// A scope recorded during parsing. Written by the
-/// parser, consumed by the resolver; also the summary lazy parsing resumes
-/// from later.
 pub struct ScopeInfo {
     pub kind: ScopeKind,
     pub parent: Option<ScopeId>,

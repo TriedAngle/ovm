@@ -5,14 +5,15 @@ use core::ptr::NonNull;
 
 use vm::{
     AllocError, EdgeVisitable, GlobalHeap, Handle, HandleData, HandleScope, Heap, HeapBackend,
-    InternedString, Object, Register, RootHandles, RootVisitor, Smi, Value, Visitor,
+    InternedString, Object, Register, RootHandles, RootVisitor, Smi, StringInterner, Value,
+    Visitor, bootstrap_basics, bootstrap_well_known, intern_well_known_strings,
 };
 
 pub mod cache;
 pub mod errors;
-pub mod interner;
 pub mod interpreter;
 pub mod natives;
+pub mod runtime;
 pub mod stack;
 
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
@@ -20,7 +21,6 @@ pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use cache::StackCache;
 
 pub use errors::error_from_vm_error;
-pub use interner::StringInterner;
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use vm::VmError;
 
@@ -174,11 +174,11 @@ impl VM {
     pub fn new<B: HeapBackend>(config: B::Config) -> Result<Self, AllocError> {
         let heap = B::new(config)?.into_global();
         let mut local = heap.new_local();
-        let roots = unsafe { RootHandles::new(64, Smi::new(0).encode()) };
-        vm::bootstrap_well_known(&mut local, &roots);
+        let roots = unsafe { RootHandles::new(128, Smi::new(0).encode()) };
         let interner = StringInterner::new();
-        // canonical empty string
-        interner.insert("", heap.known().empty_string);
+        bootstrap_basics(&mut local, &roots);
+        intern_well_known_strings(&mut local, &interner);
+        bootstrap_well_known(&mut local, &roots);
         Ok(Self {
             shared: Arc::new(SharedVM {
                 heap,

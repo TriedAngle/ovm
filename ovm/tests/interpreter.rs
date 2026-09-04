@@ -4,8 +4,8 @@ use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
     FixedByteArray, Float, Handle, HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
-    ObjectSlotsInit, SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value,
-    ValueRef, store_new_data_property_values,
+    ObjectSlotsInit, SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
+    Value, ValueRef, store_new_data_property_values, string_content_hash,
 };
 
 fn smi(v: i64) -> Value {
@@ -138,12 +138,32 @@ fn failed_run_does_not_leak_frames_into_next_run() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // Add on a non-smi accumulator (undefined at entry) throws a TypeError,
-    // aborting the run with a frame still on the suspended list.
+    // Add on an object operand needs ToPrimitive (not implemented yet) and
+    // throws a TypeError, aborting the run with a frame still suspended.
+    let obj = thread.handle_scope(|thread, scope| {
+        let known = thread.heap().known();
+        thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map: known.object_initial_map,
+                    values: &[],
+                    elements: known.empty_fixed_array.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope)
+            .as_tagged()
+            .erase()
+    });
     let mut bad = Vec::new();
+    emit(&mut bad, Opcode::Load, &[(-1i32) as u32]);
+    emit(&mut bad, Opcode::Store, &[1]);
+    emit(&mut bad, Opcode::Load, &[(-1i32) as u32]);
     emit(&mut bad, Opcode::Add, &[1]);
     emit(&mut bad, Opcode::Return, &[]);
-    let result = run_program(&mut thread, bad, 2, &[]);
+    let result = run_program(&mut thread, bad, 2, &[obj]);
     expect_escaped(&mut thread, result, "TypeError");
 
     // The next run on the same thread must start from a clean slate.
@@ -950,13 +970,14 @@ fn jump_if_truthy_follows_toboolean() {
     thread.handle_scope(|thread, scope| {
         let (undefined, null, true_v, false_v, hole, empty) = {
             let k = thread.heap().known();
+            let empty = thread.intern(&scope, "").value();
             (
                 k.undefined.value(),
                 k.null.value(),
                 k.true_object.value(),
                 k.false_object.value(),
                 k.void.value(),
-                k.empty_string.value(),
+                empty,
             )
         };
         let hello = thread.intern(&scope, "hello").value();
@@ -1658,17 +1679,489 @@ fn shift_counts_are_masked_to_five_bits() {
 }
 
 #[test]
-fn arithmetic_overflow_reports_range_error() {
+fn arithmetic_overflow_promotes_to_float() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
+    // Smi::MAX - 1 + 5 no longer fits an smi: the double path rounds it to 2^62
     let result = run_program(
         &mut thread,
         binary_op_program(Opcode::Add),
         0,
         &[smi(Smi::MAX - 1), smi(5)],
     );
-    expect_escaped(&mut thread, result, "RangeError");
+    let result = result.unwrap();
+    let value = thread.heap().no_gc(|nogc, heap| {
+        result
+            .get_as::<Float>(nogc, heap.known().float_map)
+            .expect("overflow must promote to float")
+            .value
+            .get()
+    });
+    assert_eq!(value, (1u64 << 62) as f64);
+}
+
+/// acc = constants[0] op constants[1]; return acc
+fn binary_op_consts_program(op: Opcode) -> Vec<u8> {
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadConstant, &[1]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::LoadConstant, &[0]);
+    emit(&mut program, op, &[0]);
+    emit(&mut program, Opcode::Return, &[]);
+    program
+}
+
+/// Run a binary op whose operands come from the constants pool (for floats
+/// and distinct-but-equal strings, which cannot be params in these tests).
+fn run_binary_consts(
+    thread: &mut Thread,
+    op: Opcode,
+    a: Value,
+    b: Value,
+) -> Result<Value, VmError> {
+    let program = binary_op_consts_program(op);
+    run_program_consts(thread, program, 1, &[], &[a, b])
+}
+
+fn float_value(thread: &mut Thread, v: Value) -> f64 {
+    thread.heap().no_gc(|nogc, heap| {
+        v.get_as::<Float>(nogc, heap.known().float_map)
+            .expect("expected float result")
+            .value
+            .get()
+    })
+}
+
+#[test]
+fn equal_strict_compares_numbers_strings_and_objects() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let true_v = thread.heap().known().true_object.value();
+        let false_v = thread.heap().known().false_object.value();
+        let nan1 = thread
+            .heap()
+            .allocate_handle::<Float>(f64::NAN, &scope)
+            .value();
+        let nan2 = thread
+            .heap()
+            .allocate_handle::<Float>(f64::NAN, &scope)
+            .value();
+        let one_float = thread.heap().allocate_handle::<Float>(1.0, &scope).value();
+        let mk_string = |thread: &mut Thread, scope: &HandleScope<'_>, s: &str| {
+            let backing = thread
+                .heap()
+                .allocate_handle::<FixedByteArray>(s.as_bytes(), scope);
+            thread
+                .heap()
+                .allocate_handle::<VMString>((backing, string_content_hash(s.as_bytes())), scope)
+                .value()
+        };
+        let ab1 = mk_string(thread, &scope, "ab");
+        let ab2 = mk_string(thread, &scope, "ab");
+        let ac = mk_string(thread, &scope, "ac");
+        let object_init = thread.heap().known();
+        let obj = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map: object_init.object_initial_map,
+                    values: &[],
+                    elements: object_init.empty_fixed_array.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope)
+            .as_tagged()
+            .erase();
+        let obj2 = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map: object_init.object_initial_map,
+                    values: &[],
+                    elements: object_init.empty_fixed_array.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope)
+            .as_tagged()
+            .erase();
+
+        // smis
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, smi(1), smi(1)).unwrap(),
+            true_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, smi(1), smi(2)).unwrap(),
+            false_v
+        );
+        // NaN is unequal to itself, even as two freshly allocated floats
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, nan1, nan2).unwrap(),
+            false_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, nan1, nan1).unwrap(),
+            false_v
+        );
+        // Float(1.0) === 1
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, one_float, smi(1)).unwrap(),
+            true_v
+        );
+        // Float(1.0) === "1" is false: no parsing in strict equality
+        let s1 = thread.intern(&scope, "1").value();
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, one_float, s1).unwrap(),
+            false_v
+        );
+        // string content equality, including distinct-but-equal strings
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, ab1, ab2).unwrap(),
+            true_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, ab1, ac).unwrap(),
+            false_v
+        );
+        // object identity
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, obj, obj).unwrap(),
+            true_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::EqualStrict, obj, obj2).unwrap(),
+            false_v
+        );
+    });
+}
+
+#[test]
+fn abstract_equality_follows_spec() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let known = thread.heap().known();
+    let true_v = known.true_object.value();
+    let false_v = known.false_object.value();
+    let null = known.null.value();
+    let undefined = known.undefined.value();
+
+    // null == undefined
+    assert_eq!(
+        run_program(
+            &mut thread,
+            binary_op_program(Opcode::Equal),
+            0,
+            &[null, undefined]
+        )
+        .unwrap(),
+        true_v
+    );
+    // false == 0, true == 1
+    assert_eq!(
+        run_program(
+            &mut thread,
+            binary_op_program(Opcode::Equal),
+            0,
+            &[known.false_object.value(), smi(0)]
+        )
+        .unwrap(),
+        true_v
+    );
+    assert_eq!(
+        run_program(
+            &mut thread,
+            binary_op_program(Opcode::Equal),
+            0,
+            &[known.true_object.value(), smi(1)]
+        )
+        .unwrap(),
+        true_v
+    );
+    // 0 == null is false (only null/undefined are loosely equal to null)
+    assert_eq!(
+        run_program(
+            &mut thread,
+            binary_op_program(Opcode::Equal),
+            0,
+            &[smi(0), null]
+        )
+        .unwrap(),
+        false_v
+    );
+    // "" == 0 parses the empty string as +0
+    let empty_string = thread.handle_scope(|thread, scope| thread.intern(&scope, "").value());
+    assert_eq!(
+        run_program(
+            &mut thread,
+            binary_op_program(Opcode::Equal),
+            0,
+            &[smi(0), empty_string]
+        )
+        .unwrap(),
+        true_v
+    );
+
+    thread.handle_scope(|thread, scope| {
+        let s1 = thread.intern(&scope, "1").value();
+        let s15 = thread.intern(&scope, "1.5").value();
+        let f15 = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
+        let nan = thread
+            .heap()
+            .allocate_handle::<Float>(f64::NAN, &scope)
+            .value();
+        // "1" == 1, "1.5" == 1.5
+        assert_eq!(
+            run_binary_consts(thread, Opcode::Equal, s1, smi(1)).unwrap(),
+            true_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::Equal, s15, f15).unwrap(),
+            true_v
+        );
+        // NaN == NaN stays false through the loose path too
+        assert_eq!(
+            run_binary_consts(thread, Opcode::Equal, nan, nan).unwrap(),
+            false_v
+        );
+    });
+}
+
+#[test]
+fn relational_operators_follow_spec() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let true_v = thread.heap().known().true_object.value();
+    let false_v = thread.heap().known().false_object.value();
+
+    let cases: &[(Opcode, i64, i64, Value)] = &[
+        (Opcode::LessThan, 1, 2, true_v),
+        (Opcode::LessThan, 2, 1, false_v),
+        (Opcode::LessThan, 2, 2, false_v),
+        (Opcode::LessThanOrEqual, 1, 1, true_v),
+        (Opcode::LessThanOrEqual, 2, 1, false_v),
+        (Opcode::GreaterThan, 2, 1, true_v),
+        (Opcode::GreaterThan, 1, 2, false_v),
+        (Opcode::GreaterThan, 2, 2, false_v),
+        (Opcode::GreaterThanOrEqual, 2, 2, true_v),
+        (Opcode::GreaterThanOrEqual, 1, 2, false_v),
+    ];
+    for &(op, a, b, expected) in cases {
+        let r = run_program(&mut thread, binary_op_program(op), 0, &[smi(a), smi(b)]);
+        assert_eq!(r.unwrap(), expected, "op {op:?} with {a}, {b}");
+    }
+
+    thread.handle_scope(|thread, scope| {
+        let true_v = thread.heap().known().true_object.value();
+        let false_v = thread.heap().known().false_object.value();
+        let nan = thread
+            .heap()
+            .allocate_handle::<Float>(f64::NAN, &scope)
+            .value();
+        let one = smi(1);
+
+        // NaN compares false against everything, in all four directions
+        for op in [
+            Opcode::LessThan,
+            Opcode::LessThanOrEqual,
+            Opcode::GreaterThan,
+            Opcode::GreaterThanOrEqual,
+        ] {
+            assert_eq!(
+                run_binary_consts(thread, op, nan, one).unwrap(),
+                false_v,
+                "{op:?}"
+            );
+            assert_eq!(
+                run_binary_consts(thread, op, one, nan).unwrap(),
+                false_v,
+                "{op:?}"
+            );
+        }
+
+        // both-strings comparisons are lexicographic
+        let abc = thread.intern(&scope, "abc").value();
+        let abd = thread.intern(&scope, "abd").value();
+        assert_eq!(
+            run_binary_consts(thread, Opcode::LessThan, abc, abd).unwrap(),
+            true_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::LessThan, abd, abc).unwrap(),
+            false_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::LessThanOrEqual, abc, abc).unwrap(),
+            true_v
+        );
+
+        // mixed string/number comparisons parse the string
+        let s2 = thread.intern(&scope, "2").value();
+        let s10 = thread.intern(&scope, "10").value();
+        assert_eq!(
+            run_binary_consts(thread, Opcode::LessThan, s2, smi(10)).unwrap(),
+            true_v
+        );
+        assert_eq!(
+            run_binary_consts(thread, Opcode::LessThan, s10, smi(9)).unwrap(),
+            false_v
+        );
+    });
+}
+
+#[test]
+fn division_and_modulo_follow_ieee() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // 7 / 2 = 3.5 (float), 42 / 7 = 6 (smi fast path, covered above)
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Div),
+        0,
+        &[smi(7), smi(2)],
+    );
+    assert_eq!(float_value(&mut thread, r.unwrap()), 3.5);
+
+    // division by zero: sign-correct infinities and NaN
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Div),
+        0,
+        &[smi(1), smi(0)],
+    );
+    assert_eq!(float_value(&mut thread, r.unwrap()), f64::INFINITY);
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Div),
+        0,
+        &[smi(-1), smi(0)],
+    );
+    assert_eq!(float_value(&mut thread, r.unwrap()), f64::NEG_INFINITY);
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Div),
+        0,
+        &[smi(0), smi(0)],
+    );
+    assert!(float_value(&mut thread, r.unwrap()).is_nan());
+
+    // modulo by zero is NaN; the float path yields the IEEE remainder
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Mod),
+        0,
+        &[smi(5), smi(0)],
+    );
+    assert!(float_value(&mut thread, r.unwrap()).is_nan());
+
+    let r = thread.handle_scope(|thread, scope| {
+        let f55 = thread.heap().allocate_handle::<Float>(5.5, &scope).value();
+        run_binary_consts(thread, Opcode::Mod, f55, smi(2)).unwrap()
+    });
+    assert_eq!(float_value(&mut thread, r), 1.5);
+}
+
+#[test]
+fn exp_produces_floats() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // fractional exponent
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Exp),
+        0,
+        &[smi(2), smi(1)],
+    );
+    assert_eq!(Smi::decode(r.unwrap()).unwrap().value(), 2);
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Exp),
+        0,
+        &[smi(4), smi(1)],
+    );
+    assert_eq!(Smi::decode(r.unwrap()).unwrap().value(), 4);
+
+    // fractional results become floats instead of erroring
+    let r = thread.handle_scope(|thread, scope| {
+        let half = thread.heap().allocate_handle::<Float>(0.5, &scope).value();
+        run_binary_consts(thread, Opcode::Exp, smi(2), half).unwrap()
+    });
+    assert_eq!(float_value(&mut thread, r), 2f64.sqrt());
+
+    // 2 ** -1 = 0.5, 2 ** 1024 overflows doubles to Infinity
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Exp),
+        0,
+        &[smi(2), smi(-1)],
+    );
+    assert_eq!(float_value(&mut thread, r.unwrap()), 0.5);
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Exp),
+        0,
+        &[smi(2), smi(1024)],
+    );
+    assert_eq!(float_value(&mut thread, r.unwrap()), f64::INFINITY);
+}
+
+#[test]
+fn arithmetic_coerces_primitives_to_number() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let known = thread.heap().known();
+
+    // null + 1 = 1
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Add),
+        0,
+        &[known.null.value(), smi(1)],
+    );
+    assert_eq!(Smi::decode(r.unwrap()).unwrap().value(), 1);
+
+    // undefined + 1 = NaN
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Add),
+        0,
+        &[known.undefined.value(), smi(1)],
+    );
+    assert!(float_value(&mut thread, r.unwrap()).is_nan());
+
+    // true + 1 = 2, false + 1 = 1
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Add),
+        0,
+        &[known.true_object.value(), smi(1)],
+    );
+    assert_eq!(Smi::decode(r.unwrap()).unwrap().value(), 2);
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Add),
+        0,
+        &[known.false_object.value(), smi(1)],
+    );
+    assert_eq!(Smi::decode(r.unwrap()).unwrap().value(), 1);
+
+    // "2" * 3 = 6 (strings parse in numeric contexts)
+    let r = thread.handle_scope(|thread, scope| {
+        let s2 = thread.intern(&scope, "2").value();
+        run_binary_consts(thread, Opcode::Mul, s2, smi(3)).unwrap()
+    });
+    assert_eq!(Smi::decode(r).unwrap().value(), 6);
 }
 
 /// Like `run_program` but with a non-empty constants table.
@@ -2319,4 +2812,381 @@ fn set_prototype_on_non_extensible_throws_type_error() {
         thread.execute(callable, &[])
     });
     expect_escaped(&mut thread, result, "TypeError");
+}
+
+/// Build a callable function object wrapping `program` with `constants`.
+fn make_callable<'s>(
+    thread: &mut Thread,
+    scope: &'s HandleScope<'_>,
+    program: &[u8],
+    constants: &[Value],
+) -> Value {
+    let bytecode = thread
+        .heap()
+        .allocate_handle::<FixedByteArray>(program, scope);
+    let constants = thread
+        .heap()
+        .allocate_handle::<FixedArray>(constants, scope);
+    let info = thread.heap().allocate_handle::<CallableInfoObject>(
+        CallableInfoInit {
+            bytecode,
+            constants,
+            register_count: 1,
+            handlers: None,
+        },
+        scope,
+    );
+    callable_object(thread, scope, info).value()
+}
+
+/// Fresh `{}` with the realm's object initial map.
+fn empty_object<'s>(thread: &mut Thread, scope: &'s HandleScope<'_>) -> Handle<'s, Object> {
+    let known = thread.heap().known();
+    thread
+        .heap()
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map: known.object_initial_map,
+                values: &[],
+                elements: known.empty_fixed_array.erase(),
+                length: 0,
+            },
+        )
+        .into_handle(scope)
+}
+
+/// Own callable data property `name` -> function running `program`.
+fn set_property_fn(
+    thread: &mut Thread,
+    scope: &HandleScope<'_>,
+    obj: Value,
+    name: Value,
+    program: &[u8],
+    constants: &[Value],
+) {
+    let f = make_callable(thread, scope, program, constants);
+    store_new_data_property_values(thread.heap(), scope, obj, SlotName::from_value(name), f)
+        .unwrap();
+}
+
+fn program_return_1() -> Vec<u8> {
+    let mut p = Vec::new();
+    emit(&mut p, Opcode::LoadSmi, &[1]);
+    emit(&mut p, Opcode::Return, &[]);
+    p
+}
+
+fn program_return_constant() -> Vec<u8> {
+    let mut p = Vec::new();
+    emit(&mut p, Opcode::LoadConstant, &[0]);
+    emit(&mut p, Opcode::Return, &[]);
+    p
+}
+
+fn program_return_empty_object() -> Vec<u8> {
+    let mut p = Vec::new();
+    emit(&mut p, Opcode::CreateEmptyObjectLiteral, &[]);
+    emit(&mut p, Opcode::Return, &[]);
+    p
+}
+
+/// Call a non-callable (smi) → TypeError escapes the function.
+fn program_throw_type_error() -> Vec<u8> {
+    let mut p = Vec::new();
+    emit(&mut p, Opcode::LoadSmi, &[0]);
+    emit(&mut p, Opcode::Store, &[0]);
+    emit(&mut p, Opcode::LoadSmi, &[0]);
+    emit(&mut p, Opcode::CallNoFeedback, &[0, 0, 0]);
+    emit(&mut p, Opcode::Return, &[]);
+    p
+}
+
+#[test]
+fn to_primitive_calls_value_of_in_numeric_contexts() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let value_of = thread.intern(&scope, "valueOf").value();
+        set_property_fn(thread, &scope, obj, value_of, &program_return_1(), &[]);
+
+        // + and * both coerce the object with hint number → valueOf() = 1
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::Add),
+            0,
+            &[obj, smi(1)],
+        )
+        .unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 2);
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::Mul),
+            0,
+            &[obj, smi(3)],
+        )
+        .unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 3);
+    });
+}
+
+#[test]
+fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let value_of = thread.intern(&scope, "valueOf").value();
+        let to_string = thread.intern(&scope, "toString").value();
+        let x = thread.intern(&scope, "x").value();
+
+        // valueOf returns an object → skipped → toString() = "x"
+        set_property_fn(
+            thread,
+            &scope,
+            obj,
+            value_of,
+            &program_return_empty_object(),
+            &[],
+        );
+        set_property_fn(
+            thread,
+            &scope,
+            obj,
+            to_string,
+            &program_return_constant(),
+            &[x],
+        );
+
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::Add),
+            0,
+            &[obj, smi(1)],
+        )
+        .unwrap();
+        thread.heap().no_gc(|nogc, heap| {
+            let s = r
+                .get_as::<VMString>(nogc, heap.known().string_map)
+                .expect("concat result must be a string");
+            assert_eq!(s.as_str(nogc), Some("x1"));
+        });
+    });
+}
+
+#[test]
+fn add_concatenates_strings() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        // string + string, string + number, number + string
+        let a = thread.intern(&scope, "a").value();
+        let b = thread.intern(&scope, "b").value();
+        for (lhs, rhs, expected) in [
+            (a, b, "ab"),
+            (a, smi(2), "a2"),
+            (smi(2), b, "2b"),
+            (a, smi(1000), "a1000"),
+        ] {
+            let r =
+                run_program(&mut *thread, binary_op_program(Opcode::Add), 0, &[lhs, rhs]).unwrap();
+            thread.heap().no_gc(|nogc, heap| {
+                let s = r
+                    .get_as::<VMString>(nogc, heap.known().string_map)
+                    .expect("concat result must be a string");
+                assert_eq!(s.as_str(nogc), Some(expected), "{lhs:?} + {rhs:?}");
+            });
+        }
+    });
+}
+
+#[test]
+fn to_primitive_uses_to_primitive_symbol_first() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        // @@toPrimitive = () => 1: wins over valueOf, called with hint "default"
+        let sym = thread.heap().known().to_primitive_symbol.value();
+        let value_of = thread.intern(&scope, "valueOf").value();
+        set_property_fn(thread, &scope, obj, sym, &program_return_1(), &[]);
+        set_property_fn(
+            thread,
+            &scope,
+            obj,
+            value_of,
+            &{
+                // valueOf = () => 2: must NOT be called
+                let mut p = Vec::new();
+                emit(&mut p, Opcode::LoadSmi, &[2]);
+                emit(&mut p, Opcode::Return, &[]);
+                p
+            },
+            &[],
+        );
+
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::Add),
+            0,
+            &[obj, smi(1)],
+        )
+        .unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 2);
+    });
+}
+
+#[test]
+fn to_primitive_symbol_returning_object_throws() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let obj = thread.handle_scope(|thread, scope| {
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let sym = thread.heap().known().to_primitive_symbol.value();
+        set_property_fn(
+            thread,
+            &scope,
+            obj,
+            sym,
+            &program_return_empty_object(),
+            &[],
+        );
+        obj
+    });
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Add),
+        0,
+        &[obj, smi(1)],
+    );
+    expect_escaped(&mut thread, r, "TypeError");
+}
+
+#[test]
+fn to_primitive_calls_getter_accessors() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let obj = empty_object(thread, &scope);
+        let value_of = thread.intern(&scope, "valueOf");
+        // valueOf defined as an accessor whose getter returns a function
+        // returning 2 (Get(O, "valueOf") runs the getter, then the result is
+        // called with the object as receiver)
+        let inner = make_callable(
+            thread,
+            &scope,
+            &{
+                let mut p = Vec::new();
+                emit(&mut p, Opcode::LoadSmi, &[2]);
+                emit(&mut p, Opcode::Return, &[]);
+                p
+            },
+            &[],
+        );
+        let getter = make_callable(thread, &scope, &program_return_constant(), &[inner]);
+        let name = scope
+            .create_handle(SlotName::from_value(value_of.value()).tagged())
+            .expect("name is strong");
+        let get = scope
+            .create_handle(Tagged::from_value(getter))
+            .expect("getter is strong");
+        let set = scope
+            .create_handle(Tagged::from_value(thread.heap().known().undefined.value()))
+            .expect("undefined is strong");
+        Object::store_new_accessor_property(thread.heap(), &scope, obj, name, get, set).unwrap();
+
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::Add),
+            0,
+            &[obj.as_tagged().erase(), smi(1)],
+        )
+        .unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 3);
+    });
+}
+
+#[test]
+fn relational_and_equality_operators_coerce_objects() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let true_v = thread.heap().known().true_object.value();
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let value_of = thread.intern(&scope, "valueOf").value();
+        // valueOf = () => 2
+        set_property_fn(
+            thread,
+            &scope,
+            obj,
+            value_of,
+            &{
+                let mut p = Vec::new();
+                emit(&mut p, Opcode::LoadSmi, &[2]);
+                emit(&mut p, Opcode::Return, &[]);
+                p
+            },
+            &[],
+        );
+
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::LessThan),
+            0,
+            &[obj, smi(3)],
+        )
+        .unwrap();
+        assert_eq!(r, true_v);
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::GreaterThan),
+            0,
+            &[obj, smi(3)],
+        )
+        .unwrap();
+        assert_eq!(r, thread.heap().known().false_object.value());
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::Equal),
+            0,
+            &[obj, smi(2)],
+        )
+        .unwrap();
+        assert_eq!(r, true_v);
+    });
+}
+
+#[test]
+fn value_of_exception_propagates() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let obj = thread.handle_scope(|thread, scope| {
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let value_of = thread.intern(&scope, "valueOf").value();
+        set_property_fn(
+            thread,
+            &scope,
+            obj,
+            value_of,
+            &program_throw_type_error(),
+            &[],
+        );
+        obj
+    });
+    let r = run_program(
+        &mut thread,
+        binary_op_program(Opcode::Add),
+        0,
+        &[obj, smi(1)],
+    );
+    expect_escaped(&mut thread, r, "TypeError");
 }

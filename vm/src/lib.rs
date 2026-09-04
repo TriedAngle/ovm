@@ -1,20 +1,25 @@
+pub mod compare;
 pub mod convert;
 pub mod error;
 pub mod handle;
 pub mod heap;
+pub mod interner;
 pub mod lookup;
 pub mod object;
 pub mod transition;
 pub mod value;
 
-pub use convert::is_truthy;
+pub use compare::Compare;
+pub use convert::Convert;
 pub use error::VmError;
 pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, RootHandles};
 pub use heap::{
     AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, GlobalHeap, GlobalVtable, Heap,
     HeapBackend, HeapRef, HeapStats, HeapVtable, NoGc, OptionGcSlot, RawCell, Register,
-    RootVisitor, Visitor, WeakGcCell, WellKnown, WordType, bootstrap_well_known,
+    RootVisitor, Visitor, WellKnown, WordType, bootstrap_basics, bootstrap_well_known,
+    intern_well_known_strings,
 };
+pub use interner::StringInterner;
 pub use lookup::{Key, LoadOutcome, Lookup, classify_key, element_value, load_outcome};
 pub use object::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,

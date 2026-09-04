@@ -71,6 +71,14 @@ pub enum Opcode {
 
     TestReferenceEqual, // reg; acc = true singleton iff bits(reg) == bits(acc), else false
 
+    // comparisons: acc = acc op reg, yielding the true/false singleton
+    EqualStrict,        // reg; ES Strict Equality Comparison (===)
+    Equal,              // reg; ES IsLooselyEqual (==)
+    LessThan,           // reg; ES Abstract Relational Comparison <
+    LessThanOrEqual,    // reg; <=
+    GreaterThan,        // reg; >
+    GreaterThanOrEqual, // reg; >=
+
     // exception handling
     Throw,   // acc -> pending exception
     ReThrow, // acc -> pending exception
@@ -201,6 +209,12 @@ impl Opcode {
             b if b == JumpIfTruthy as u8 => JumpIfTruthy,
             b if b == JumpIfFalsy as u8 => JumpIfFalsy,
             b if b == TestReferenceEqual as u8 => TestReferenceEqual,
+            b if b == EqualStrict as u8 => EqualStrict,
+            b if b == Equal as u8 => Equal,
+            b if b == LessThan as u8 => LessThan,
+            b if b == LessThanOrEqual as u8 => LessThanOrEqual,
+            b if b == GreaterThan as u8 => GreaterThan,
+            b if b == GreaterThanOrEqual as u8 => GreaterThanOrEqual,
             b if b == Throw as u8 => Throw,
             b if b == ReThrow as u8 => ReThrow,
             _ => return None,
@@ -262,7 +276,13 @@ impl Opcode {
             | Self::ShiftRightLogical => &[Register],
 
             Self::Jump | Self::JumpLoop | Self::JumpIfTruthy | Self::JumpIfFalsy => &[Immediate],
-            Self::TestReferenceEqual => &[Register],
+            Self::TestReferenceEqual
+            | Self::EqualStrict
+            | Self::Equal
+            | Self::LessThan
+            | Self::LessThanOrEqual
+            | Self::GreaterThan
+            | Self::GreaterThanOrEqual => &[Register],
         }
     }
 

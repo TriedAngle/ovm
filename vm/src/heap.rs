@@ -1,8 +1,7 @@
 use crate::{
-    Context, ContextInit, FixedArray, FixedByteArray, Global, Handle, HandleData, HandleScope,
-    HandleSet, HeapObject, HeapPtr, InternedString, Map, MapInit, MapKind, Object, ObjectInit,
-    ObjectSlotsInit, RootHandles, STRONG_PTR, Smi, Tagged, TransitionLock, Value, Word,
-    string_content_hash,
+    Context, ContextInit, FixedArray, Global, Handle, HandleData, HandleScope, HandleSet,
+    HeapObject, HeapPtr, Map, MapInit, MapKind, Object, ObjectInit, ObjectSlotsInit, RootHandles,
+    STRONG_PTR, Smi, StringInterner, Symbol, Tagged, TransitionLock, Value, Word,
 };
 use core::{
     alloc::Layout,
@@ -42,8 +41,6 @@ pub struct WellKnown {
     pub exception: Global<Object>,
     /// exception map
     pub exception_map: Global<Map>,
-    /// Canonical empty string (synced with intern)
-    pub empty_string: Global<InternedString>,
     /// Shared empty backing for objects without data slots (never written in
     /// place; the first property store swaps in a fresh array).
     pub empty_fixed_array: Global<FixedArray>,
@@ -88,6 +85,8 @@ pub struct WellKnown {
     /// Function object map
     /// slots[0] = shared CallableInfoObject, slots[1] = closure context.
     pub function_map: Global<Map>,
+    /// The `@@toPrimitive` well-known symbol
+    pub to_primitive_symbol: Global<Symbol>,
 }
 
 unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
@@ -97,7 +96,6 @@ unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
 fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     let map = unsafe { smi_handle::<Map>(roots) };
     let obj = unsafe { smi_handle::<Object>(roots) };
-    let string = unsafe { smi_handle::<InternedString>(roots) };
     let array = unsafe { smi_handle::<FixedArray>(roots) };
     let context = unsafe { smi_handle::<Context>(roots) };
     WellKnown {
@@ -105,7 +103,6 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         void: obj,
         exception: obj,
         exception_map: map,
-        empty_string: string,
         empty_fixed_array: array,
         empty_context: context,
         smi_map: map,
@@ -133,6 +130,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         global_object: obj,
         object_initial_map: map,
         function_map: map,
+        to_primitive_symbol: unsafe { smi_handle::<Symbol>(roots) },
     }
 }
 
@@ -189,7 +187,11 @@ fn alloc_object(
     .into_global(roots)
 }
 
-fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) -> (Global<Map>, WellKnown) {
+/// First bootstrap phase: the internal sentinels (`void`, `null`, the
+/// exception singleton) and every builtin map. Every allocation init path
+/// reads `known()` maps, so this must run before anything else is created.
+/// Follow with `intern_well_known_strings` and `bootstrap_well_known`.
+pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let mut known = uninited_wellknown(roots);
     heap.set_known(known);
 
@@ -272,16 +274,8 @@ fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) -> (Global<Map>, WellK
     known.null_map = null_map;
     heap.set_known(known);
 
-    (void_map, known)
-}
-
-pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
-    let (_void_map, mut known) = bootstrap_basics(heap, roots);
-    let void = known.void;
-
-    let data = HandleData::new(void.value());
-    let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
-
+    // builtin maps: every allocation init path looks these up, so they must
+    // exist before any other object is created (incl. interned strings)
     let smi_map = alloc_map(heap, &scope, roots, MapKind::OBJECT);
     let float_map = alloc_map(heap, &scope, roots, MapKind::FLOAT);
     let array_map = alloc_map(heap, &scope, roots, MapKind::FIXED_ARRAY);
@@ -303,12 +297,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
                 .expect("null is a strong pointer"),
         })
         .into_global(roots);
-    let object_prototype_map = alloc_map(
-        heap,
-        &scope,
-        roots,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-    );
     known.smi_map = smi_map;
     known.float_map = float_map;
     known.array_map = array_map;
@@ -321,7 +309,50 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.context_map = context_map;
     known.function_map = function_map;
     heap.set_known(known);
+}
 
+/// Second bootstrap phase: internalize the canonical well-known strings into
+/// the string table. The table owns them (strong entries for now; the GC
+/// walks the table), so consumers look them up through `interner.intern` —
+/// no separate rooting, no WellKnown fields. Must run after
+/// `bootstrap_basics` and before `bootstrap_well_known`.
+pub fn intern_well_known_strings(heap: &mut Heap, interner: &StringInterner) {
+    let data = HandleData::new(Smi::new(0).encode());
+    let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
+    for s in [
+        "",
+        "valueOf",
+        "toString",
+        "default",
+        "number",
+        "string",
+        "true",
+        "false",
+        "null",
+        "undefined",
+    ] {
+        let _ = interner.intern(heap, &scope, s);
+    }
+}
+
+pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
+    // sentinels and builtin maps were installed by bootstrap_basics
+    let mut known = *heap.known();
+    let void = known.void;
+    debug_assert!(
+        !void.value().is_smi(),
+        "bootstrap_basics must run before bootstrap_well_known"
+    );
+
+    let data = HandleData::new(void.value());
+    let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
+
+    let object_prototype_map = alloc_map(
+        heap,
+        &scope,
+        roots,
+        MapKind::OBJECT.union(MapKind::EXTENDABLE),
+    );
     let empty_slots = heap.allocate::<FixedArray>(&[]).into_global(roots);
     known.empty_fixed_array = heap.allocate::<FixedArray>(&[]).into_global(roots);
     heap.set_known(known);
@@ -379,11 +410,8 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let exception_map = alloc_parent_map(heap, &scope, roots, MapKind::OBJECT, object_prototype);
     let exception = alloc_object(heap, &scope, roots, exception_map);
 
-    let empty_string = {
-        let backing = heap.allocate::<FixedByteArray>(&[]).into_handle(&scope);
-        heap.allocate::<InternedString>((backing, string_content_hash(b"")))
-            .into_global(roots)
-    };
+    let to_primitive_symbol =
+        roots.create_handle(Symbol::new(heap, &scope, b"Symbol.toPrimitive").as_tagged());
 
     let empty_context = heap
         .allocate::<Context>(ContextInit {
@@ -398,7 +426,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.true_object = true_object;
     known.boolean_map = boolean_map;
     known.exception = exception;
-    known.empty_string = empty_string;
+    known.to_primitive_symbol = to_primitive_symbol;
     known.object_prototype = object_prototype;
     known.array_prototype = array_prototype;
     known.error_prototype = error_prototype;
@@ -659,6 +687,15 @@ impl<T: HeapObject> WeakGcCell<T> {
     pub fn new(ptr: HeapPtr<T>) -> Self {
         Self {
             cell: unsafe { RawCell::from_value(ptr.encode_weak()) },
+            _phantom: PhantomData,
+        }
+    }
+
+    /// A "maybe-weak" cell holding a strong reference for now: the GC treats
+    /// it as reachable until we decide to weaken selected entries.
+    pub fn new_strong(ptr: HeapPtr<T>) -> Self {
+        Self {
+            cell: unsafe { RawCell::from_value(ptr.encode_strong()) },
             _phantom: PhantomData,
         }
     }
