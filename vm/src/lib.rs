@@ -28,7 +28,7 @@ pub use transition::{
 };
 pub use value::{
     HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,
-    Word,
+    Word, encode_smi,
 };
 
 pub type Local<'scope, T> = Handle<'scope, T, Strong>;
