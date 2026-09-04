@@ -54,6 +54,11 @@ pub struct Map {
     pub descriptor_count: GcSlot<Smi>,
     /// Object kind tag (low byte) and capability flags (second byte).
     pub kind: GcSlot<Smi>,
+    /// The prototype(s) for property lookup:
+    /// - an object: single parent (JS `[[Prototype]]`)
+    /// - a `FixedArray` of objects: multiple parents in priority order (Self-style `parent*`)
+    /// - `void`: no parents (null-proto root)
+    pub prototype: GcSlot,
     /// Empty, or a `FixedArray` of flat `[name, target_map]` transition pairs.
     // TODO: make transition targets weak (V8 does this so unused shape subtrees die)
     pub transitions: OptionGcSlot<FixedArray>,
@@ -144,6 +149,9 @@ pub struct MapInit<'a> {
     pub kind: MapKind,
     pub value_slot_count: usize,
     pub descriptors: &'a [(SlotName, SlotFlags, Value)],
+    /// `void` = no prototype (null-proto for JS maps).
+    /// Handled because `Map` allocation may move the prototype.
+    pub prototype: Handle<'a, Value>,
 }
 
 impl HeapObject for Map {
@@ -164,6 +172,8 @@ impl HeapObject for Map {
             .set(heap, host, Smi::new(config.descriptors.len() as i64));
         self.kind
             .set(heap, host, Smi::new(config.kind.bits() as i64));
+        self.prototype
+            .set(heap, host, Tagged::from_value(config.prototype.value()));
         self.transitions.clear(heap.known().void.value());
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
@@ -185,6 +195,7 @@ impl HeapObject for Map {
 impl EdgeVisitable for Map {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.prototype.as_raw());
         visitor.visit(self.transitions.as_raw());
         for d in self.descriptors() {
             visitor.visit(d.name.as_raw());
@@ -325,7 +336,6 @@ impl SlotFlags {
     const KIND_CONST: u64 = 0b01;
     const KIND_ACCESSOR: u64 = 0b10;
 
-    pub const PARENT: SlotFlags = SlotFlags(1 << 2);
     pub const WRITABLE: SlotFlags = SlotFlags(1 << 3);
     pub const CONFIGURABLE: SlotFlags = SlotFlags(1 << 4);
     pub const ENUMERABLE: SlotFlags = SlotFlags(1 << 5);
@@ -353,10 +363,6 @@ impl SlotFlags {
             Self::KIND_ACCESSOR => SlotKind::Accessor,
             _ => panic!("invalid slot kind"),
         }
-    }
-
-    pub const fn is_parent(self) -> bool {
-        self.0 & Self::PARENT.0 != 0
     }
 
     pub const fn is_writable(self) -> bool {

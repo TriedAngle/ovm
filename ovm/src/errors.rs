@@ -43,8 +43,8 @@ pub fn error_from_vm_error(
         let message_value = scope
             .create_handle(Tagged::from_value(message_value.value()))
             .expect("message value is strong");
-        Object::store_new_data_property(heap, obj, name, name_value)?;
-        Object::store_new_data_property(heap, obj, message, message_value)?;
+        Object::store_new_data_property(heap, &scope, obj, name, name_value)?;
+        Object::store_new_data_property(heap, &scope, obj, message, message_value)?;
         Ok(obj.value())
     })
 }

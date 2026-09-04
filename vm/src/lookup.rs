@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, GcSlot, Heap, HeapPtr, HeapRef, InternedString, Map, NoGc, Object,
-    SlotDescriptor, SlotFlags, SlotKind, SlotName, Smi, Symbol, Tagged, Value, ValueRef, VmError,
+    AccessorPair, FixedArray, GcSlot, Heap, HeapPtr, HeapRef, InternedString, Map, NoGc, Object,
+    SlotFlags, SlotKind, SlotName, Smi, Symbol, Tagged, Value, ValueRef, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -90,7 +90,6 @@ pub fn load_outcome<'a>(
     name: SlotName,
 ) -> Result<LoadOutcome, VmError> {
     let known = heap.known();
-    // null/undefined have no [[Prototype]]: property access throws
     if receiver == known.null.value() || receiver == known.undefined.value() {
         return Err(VmError::Type);
     }
@@ -100,8 +99,7 @@ pub fn load_outcome<'a>(
         }
         Lookup::Accessor { pair, .. } => {
             let getter = pair.get.inner();
-            // no getter (void sentinel): the load yields undefined
-            if getter == known.void.value() {
+            if getter == known.undefined.value() {
                 Ok(LoadOutcome::Value(known.undefined.value()))
             } else {
                 Ok(LoadOutcome::Getter(getter))
@@ -152,7 +150,7 @@ impl Map {
         name: SlotName,
     ) -> Lookup<'a> {
         for (index, d) in self.descriptors().iter().enumerate() {
-            if !d.flags().is_parent() && d.name() == name {
+            if d.name() == name {
                 return match d.flags().kind() {
                     SlotKind::Value => {
                         // TODO: smis have no value slots not sure if we need to protect from this?
@@ -188,35 +186,24 @@ impl Map {
             }
         }
 
-        for d in self.descriptors() {
-            if d.flags().is_parent() {
-                let result = d.value.inner().lookup(guard, heap, name);
+        // Prototype walk:
+        // - null: no parents (null-proto root)
+        // - object: single parent (JS [[Prototype]])
+        // - FixedArray: multiple parents in priority order (Self parent*)
+        let proto = self.prototype.inner();
+        if proto == heap.known().null.value() {
+            return Lookup::NotFound;
+        }
+        if let Some(parents) = proto.get_as::<FixedArray>(guard, heap.known().array_map) {
+            for i in 0..parents.len() {
+                let result = parents.at(i).lookup(guard, heap, name);
                 if !matches!(result, Lookup::NotFound) {
                     return result;
                 }
             }
+            return Lookup::NotFound;
         }
-
-        Lookup::NotFound
-    }
-
-    pub fn lookup_parent<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-        heap: &Heap,
-        name: SlotName,
-        parent: SlotName,
-    ) -> Lookup<'a> {
-        match self.find_parent(parent) {
-            Some(d) => d.value.inner().lookup(guard, heap, name),
-            None => Lookup::NotFound,
-        }
-    }
-
-    pub fn find_parent(&self, name: SlotName) -> Option<&SlotDescriptor> {
-        self.descriptors()
-            .iter()
-            .find(|d| d.flags().is_parent() && d.name() == name)
+        proto.lookup(guard, heap, name)
     }
 }
 
@@ -228,19 +215,5 @@ impl Object {
             ValueRef::Object(HeapRef::from_ref(self)),
             name,
         )
-    }
-
-    pub fn lookup_parent<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-        heap: &Heap,
-        name: SlotName,
-        parent: SlotName,
-    ) -> Lookup<'a> {
-        self.header
-            .map
-            .heap_ref(guard)
-            .as_ref()
-            .lookup_parent(guard, heap, name, parent)
     }
 }
