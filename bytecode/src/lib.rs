@@ -15,8 +15,15 @@ pub enum Opcode {
     // I don't think we need this right now, LoadConstant should be enough?
     LoadGlobal,       // idx (constant pool name) idx (feedback) -> acc
     StoreGlobal,      // acc -> idx (constant pool name) idx (feedback)
-    LoadContextSlot,  // idx -> acc
-    StoreContextSlot, // acc -> idx
+    LoadContextSlot,  // idx (slot) uimm (depth) -> acc; from the frame context
+    StoreContextSlot, // acc -> idx (slot) uimm (depth); frame context
+
+    CreateFunctionContext, // uimm (slot count) -> acc; outer = frame context
+    CreateBlockContext,    // uimm (slot count) -> acc; outer = frame context
+    CreateCatchContext,    // reg (exception) -> acc; outer = frame context
+    PushContext,           // acc (context) -> frame context; reg <- old context
+    PopContext,            // reg (context) -> frame context
+    ThrowReferenceErrorIfHole, // acc -> throw ReferenceError if the hole
 
     LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
     StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
@@ -129,6 +136,11 @@ impl Operands {
     }
 
     #[inline]
+    pub fn uimm(&self, i: usize) -> u32 {
+        self.at(i, Operand::UImmediate)
+    }
+
+    #[inline]
     pub fn idx(&self, i: usize) -> usize {
         self.at(i, Operand::Index) as usize
     }
@@ -150,6 +162,12 @@ impl Opcode {
             b if b == StoreGlobal as u8 => StoreGlobal,
             b if b == LoadContextSlot as u8 => LoadContextSlot,
             b if b == StoreContextSlot as u8 => StoreContextSlot,
+            b if b == CreateFunctionContext as u8 => CreateFunctionContext,
+            b if b == CreateBlockContext as u8 => CreateBlockContext,
+            b if b == CreateCatchContext as u8 => CreateCatchContext,
+            b if b == PushContext as u8 => PushContext,
+            b if b == PopContext as u8 => PopContext,
+            b if b == ThrowReferenceErrorIfHole as u8 => ThrowReferenceErrorIfHole,
             b if b == LoadNamedProperty as u8 => LoadNamedProperty,
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
             b if b == StoreNamedPropertyShadow as u8 => StoreNamedPropertyShadow,
@@ -201,8 +219,13 @@ impl Opcode {
             Self::LoadGlobal => &[Index, Index],
             Self::StoreGlobal => &[Index, Index],
 
-            Self::LoadContextSlot => &[Index],
-            Self::StoreContextSlot => &[Index],
+            Self::LoadContextSlot => &[Index, UImmediate],
+            Self::StoreContextSlot => &[Index, UImmediate],
+
+            Self::CreateFunctionContext | Self::CreateBlockContext => &[UImmediate],
+            Self::CreateCatchContext => &[Register],
+            Self::PushContext | Self::PopContext => &[Register],
+            Self::ThrowReferenceErrorIfHole => &[],
 
             Self::LoadNamedProperty => &[Register, Index, Index],
             Self::StoreNamedProperty => &[Register, Index, Index],

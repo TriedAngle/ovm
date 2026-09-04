@@ -8,6 +8,8 @@ pub enum VmError {
     StackOverflow,
     /// Tried to add a property to a non-extensible object (spec: TypeError).
     NotExtensible,
+    /// Unresolvable binding or TDZ access (spec: ReferenceError).
+    Reference,
 }
 
 impl VmError {
@@ -16,6 +18,7 @@ impl VmError {
         match self {
             Self::Arity | Self::Type | Self::NotExtensible => "TypeError",
             Self::Overflow | Self::OutOfBounds | Self::StackOverflow => "RangeError",
+            Self::Reference => "ReferenceError",
         }
     }
 
@@ -28,6 +31,7 @@ impl VmError {
             Self::OutOfBounds => "index out of bounds",
             Self::StackOverflow => "maximum call stack size exceeded",
             Self::NotExtensible => "object is not extensible",
+            Self::Reference => "cannot access variable before initialization",
         }
     }
 }
