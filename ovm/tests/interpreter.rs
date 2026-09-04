@@ -2,9 +2,10 @@ use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
-    AccessorPair, CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle,
-    HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, SlotFlags,
-    SlotName, Smi, Tagged, Value, ValueRef,
+    AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
+    FixedByteArray, Float, Handle, HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
+    ObjectSlotsInit, SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value,
+    ValueRef, store_new_data_property_values,
 };
 
 fn smi(v: i64) -> Value {
@@ -42,8 +43,8 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
     ex
 }
 
-/// Wrap a callable info in a normal object with a callable map
-/// (kind convention: CALLABLE flag => slots[0] is the callable info).
+/// Wrap a callable info in a function object with the well-known function map
+/// (slots[0] = callable info, slots[1] = closure context).
 fn callable_object<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
@@ -51,21 +52,14 @@ fn callable_object<'s>(
 ) -> Handle<'s, Object> {
     let void = thread.heap().known().void;
     let empty_context = thread.heap().known().empty_context;
-    let map = thread.heap().allocate_handle::<Map>(
-        MapInit {
-            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
-            value_slot_count: 1,
-            descriptors: &[],
-        },
-        scope,
-    );
+    let map = thread.heap().known().function_map;
     thread
         .heap()
         .allocate_object(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.as_tagged().erase()],
+                values: &[info.as_tagged().erase(), empty_context.as_tagged().erase()],
                 elements: void.erase(),
                 length: 0,
             },
@@ -80,8 +74,6 @@ fn run_program(
     args: &[Value],
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
@@ -91,7 +83,6 @@ fn run_program(
                 bytecode,
                 constants,
                 register_count,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -199,9 +190,6 @@ fn call_resolves_callable_object_and_pushes_frames() {
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
-
         // callee: returns smi 99
         let mut callee_program = Vec::new();
         emit(&mut callee_program, Opcode::LoadSmi, &[99]);
@@ -215,7 +203,6 @@ fn call_resolves_callable_object_and_pushes_frames() {
                 bytecode: callee_bytecode,
                 constants: callee_constants,
                 register_count: 2,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -239,7 +226,6 @@ fn call_resolves_callable_object_and_pushes_frames() {
                 bytecode,
                 constants: receiver_consts,
                 register_count: 2,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -253,21 +239,24 @@ fn call_resolves_callable_object_and_pushes_frames() {
 }
 
 #[test]
-fn create_array_literal_fills_from_registers() {
+fn array_literal_built_with_manual_stores() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
+    // r3 = []; r3[0] = 1; r3[1] = 2; r3[2] = 3; return r3
     let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::LoadSmi, &[2]);
-    emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::LoadSmi, &[3]);
-    emit(&mut program, Opcode::Store, &[2]);
-    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 3]);
+    emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
+    emit(&mut program, Opcode::Store, &[3]);
+    for (key, value) in [(0i32, 1i32), (1, 2), (2, 3)] {
+        emit(&mut program, Opcode::LoadSmi, &[key as u32]);
+        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::LoadSmi, &[value as u32]);
+        emit(&mut program, Opcode::StoreKeyedProperty, &[3, 4, 0]);
+    }
+    emit(&mut program, Opcode::Load, &[3]);
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program(&mut thread, program, 3, &[]);
+    let result = run_program(&mut thread, program, 5, &[]);
     let array = result.unwrap();
     thread.heap().no_gc(|nogc, heap| {
         let a = array
@@ -284,81 +273,134 @@ fn create_array_literal_fills_from_registers() {
 }
 
 #[test]
-fn create_object_from_map_fills_from_registers() {
+fn create_empty_array_literal_starts_empty() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    let (result, map_v) = thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
+    emit(&mut program, Opcode::Return, &[]);
 
-        // map with two writable value slots (offsets 0 and 1)
-        let x = thread.intern(&scope, "x");
-        let y = thread.intern(&scope, "y");
-        let map = thread.heap().allocate_handle::<Map>(
-            MapInit {
-                kind: MapKind::OBJECT,
-                value_slot_count: 2,
-                descriptors: &[
-                    (
-                        SlotName::from(x.as_tagged()),
-                        SlotFlags::VALUE.union(SlotFlags::WRITABLE),
-                        Smi::new(0).encode(),
-                    ),
-                    (
-                        SlotName::from(y.as_tagged()),
-                        SlotFlags::VALUE.union(SlotFlags::WRITABLE),
-                        Smi::new(1).encode(),
-                    ),
-                ],
-            },
-            &scope,
-        );
-
-        // constants[0] = the map
-        let consts = thread
-            .heap()
-            .allocate_handle::<FixedArray>(&[map.as_tagged().erase()], &scope);
-
-        // r0 = 7, r1 = 9; CreateObjectFromMap 0 (map constant) r0 2
-        let mut program = Vec::new();
-        emit(&mut program, Opcode::LoadSmi, &[7]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::LoadSmi, &[9]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 2]);
-        emit(&mut program, Opcode::Return, &[]);
-
-        let bytecode = thread
-            .heap()
-            .allocate_handle::<FixedByteArray>(&program, &scope);
-        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
-            CallableInfoInit {
-                bytecode,
-                constants: consts,
-                register_count: 2,
-                context: empty_context,
-                handlers: None,
-            },
-            &scope,
-        );
-        let callable = callable_object(thread, &scope, callable);
-        (thread.execute(callable, &[]), map.as_tagged().erase())
+    let result = run_program(&mut thread, program, 0, &[]);
+    let array = result.unwrap();
+    thread.heap().no_gc(|nogc, heap| {
+        let a = array
+            .get_as::<Object>(nogc, heap.known().js_array_map)
+            .expect("array literal result");
+        let a = a.as_ref();
+        assert!(a.is_array(nogc));
+        assert_eq!(a.length(), 0);
+        let elements = a.elements_array(nogc, heap).expect("array elements");
+        assert_eq!(elements.len(), 0);
     });
+}
 
-    let obj = result.unwrap();
-    thread.heap().no_gc(|_nogc, _| {
-        let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
-        // Safety: `obj` is a strong, live reference to the object
-        // literal returned by `run`, and no collection can happen
-        // inside the no-GC scope.
-        let o = unsafe { ptr.cast::<Object>().as_ref() };
-        let slots = unsafe { o.slots.get().as_ptr().unwrap().as_ref() };
-        assert_eq!(Smi::decode(slots.at(0)).unwrap().value(), 7);
-        assert_eq!(Smi::decode(slots.at(1)).unwrap().value(), 9);
-        // the object's map must be the map from the constants table
-        assert_eq!(o.header.map.get().erase(), map_v);
+#[test]
+fn array_literal_with_holes_keeps_length() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // [1, , 2]: never store index 1; storing index 2 grows length to 3
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
+    emit(&mut program, Opcode::Store, &[3]);
+    for (key, value) in [(0i32, 1i32), (2, 2)] {
+        emit(&mut program, Opcode::LoadSmi, &[key as u32]);
+        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::LoadSmi, &[value as u32]);
+        emit(&mut program, Opcode::StoreKeyedProperty, &[3, 4, 0]);
+    }
+    emit(&mut program, Opcode::Load, &[3]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 5, &[]);
+    let array = result.unwrap();
+    thread.heap().no_gc(|nogc, heap| {
+        let a = array
+            .get_as::<Object>(nogc, heap.known().js_array_map)
+            .expect("array literal result");
+        let a = a.as_ref();
+        assert_eq!(a.length(), 3);
+        let elements = a.elements_array(nogc, heap).expect("array elements");
+        assert_eq!(Smi::decode(elements.at(0)).unwrap().value(), 1);
+        assert_eq!(
+            elements.at(1),
+            heap.known().void.value(),
+            "elided index stays a hole"
+        );
+        assert_eq!(Smi::decode(elements.at(2)).unwrap().value(), 2);
     });
+}
+
+#[test]
+fn object_literal_built_with_manual_stores() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let build = |thread: &mut Thread| -> Value {
+        thread.handle_scope(|thread, scope| {
+            let x = thread.intern(&scope, "x");
+            let y = thread.intern(&scope, "y");
+            let consts = thread.heap().allocate_handle::<FixedArray>(
+                &[x.as_tagged().erase(), y.as_tagged().erase()],
+                &scope,
+            );
+
+            // r0 = {}; r0.x = 7; r0.y = 9; return r0
+            let mut program = Vec::new();
+            emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
+            emit(&mut program, Opcode::Store, &[0]);
+            emit(&mut program, Opcode::LoadSmi, &[7]);
+            emit(&mut program, Opcode::StoreNamedPropertyShadow, &[0, 0, 0]);
+            emit(&mut program, Opcode::LoadSmi, &[9]);
+            emit(&mut program, Opcode::StoreNamedPropertyShadow, &[0, 1, 0]);
+            emit(&mut program, Opcode::Load, &[0]);
+            emit(&mut program, Opcode::Return, &[]);
+
+            let bytecode = thread
+                .heap()
+                .allocate_handle::<FixedByteArray>(&program, &scope);
+            let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+                CallableInfoInit {
+                    bytecode,
+                    constants: consts,
+                    register_count: 1,
+                    handlers: None,
+                },
+                &scope,
+            );
+            let callable = callable_object(thread, &scope, callable);
+            thread.execute(callable, &[]).unwrap()
+        })
+    };
+
+    let obj1 = build(&mut thread);
+    let obj2 = build(&mut thread);
+    let ((x1, y1, map1), (x2, y2, map2), initial) = thread.heap().no_gc(|_nogc, heap| {
+        let read = |obj: Value| {
+            let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
+            // Safety: `obj` is a strong, live reference to the object
+            // literal, and no collection can happen inside the no-GC scope.
+            let o = unsafe { ptr.cast::<Object>().as_ref() };
+            let slots = unsafe { o.slots.get().as_ptr().unwrap().as_ref() };
+            (
+                Smi::decode(slots.at(0)).unwrap().value(),
+                Smi::decode(slots.at(1)).unwrap().value(),
+                o.header.map.get().erase(),
+            )
+        };
+        (
+            read(obj1),
+            read(obj2),
+            heap.known().object_initial_map.as_tagged().erase(),
+        )
+    });
+    assert_eq!((x1, y1), (7, 9));
+    assert_eq!((x2, y2), (7, 9));
+    // stores transitioned off the initial map...
+    assert_ne!(map1, initial);
+    // ...and identically-built literals share one transition map
+    assert_eq!(map1, map2);
 }
 
 #[test]
@@ -366,21 +408,21 @@ fn keyed_load_reads_array_element() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // r0..r2 = 10, 20, 30; r3 = [r0, r1, r2]; acc = 1; acc = r3[acc]
+    // r3 = []; r3[0..2] = 10, 20, 30; acc = 1; acc = r3[acc]
     let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[10]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::LoadSmi, &[20]);
-    emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::LoadSmi, &[30]);
-    emit(&mut program, Opcode::Store, &[2]);
-    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 3]);
+    emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
     emit(&mut program, Opcode::Store, &[3]);
+    for (key, value) in [(0i32, 10i32), (1, 20), (2, 30)] {
+        emit(&mut program, Opcode::LoadSmi, &[key as u32]);
+        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::LoadSmi, &[value as u32]);
+        emit(&mut program, Opcode::StoreKeyedProperty, &[3, 4, 0]);
+    }
     emit(&mut program, Opcode::LoadSmi, &[1]);
     emit(&mut program, Opcode::LoadKeyedProperty, &[3, 0]);
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program(&mut thread, program, 4, &[]);
+    let result = run_program(&mut thread, program, 5, &[]);
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 20);
 }
 
@@ -389,14 +431,14 @@ fn keyed_store_writes_array_element() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // r3 = [1]; r4 = 0 (key); acc = 99 (value); r3[r4] = acc; acc = r3[0]
+    // r3 = []; r3[0] = 1; r4 = 0 (key); acc = 99; r3[r4] = acc; acc = r3[0]
     let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+    emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
     emit(&mut program, Opcode::Store, &[3]);
     emit(&mut program, Opcode::LoadSmi, &[0]);
     emit(&mut program, Opcode::Store, &[4]);
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::StoreKeyedProperty, &[3, 4, 0]);
     emit(&mut program, Opcode::LoadSmi, &[99]);
     emit(&mut program, Opcode::StoreKeyedProperty, &[3, 4, 0]);
     emit(&mut program, Opcode::LoadSmi, &[0]);
@@ -416,15 +458,17 @@ fn keyed_load_out_of_bounds_yields_undefined() {
     // yield undefined
     for key in [2u32, (-1i32) as u32] {
         let mut program = Vec::new();
-        emit(&mut program, Opcode::LoadSmi, &[1]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+        emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
         emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::LoadSmi, &[0]);
+        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::LoadSmi, &[1]);
+        emit(&mut program, Opcode::StoreKeyedProperty, &[1, 2, 0]);
         emit(&mut program, Opcode::LoadSmi, &[key]);
         emit(&mut program, Opcode::LoadKeyedProperty, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);
 
-        let result = run_program(&mut thread, program, 2, &[]);
+        let result = run_program(&mut thread, program, 3, &[]);
         assert_eq!(result.unwrap(), thread.heap().known().undefined.value());
     }
 }
@@ -434,12 +478,14 @@ fn keyed_store_grows_array_and_fills_holes() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // r1 = [1]; r1[3] = 42; acc = r1[3]; then acc = r1[1] (hole -> undefined)
+    // r1 = []; r1[0] = 1; r1[3] = 42; acc = r1[3]; then acc = r1[1] (hole -> undefined)
     let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+    emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
     emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::LoadSmi, &[0]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::StoreKeyedProperty, &[1, 2, 0]);
     emit(&mut program, Opcode::LoadSmi, &[3]);
     emit(&mut program, Opcode::Store, &[2]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
@@ -453,10 +499,12 @@ fn keyed_store_grows_array_and_fills_holes() {
 
     // the grown array must have length 4 with holes at 1..3
     let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::CreateArrayLiteral, &[0, 1]);
+    emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
     emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::LoadSmi, &[0]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::LoadSmi, &[1]);
+    emit(&mut program, Opcode::StoreKeyedProperty, &[1, 2, 0]);
     emit(&mut program, Opcode::LoadSmi, &[3]);
     emit(&mut program, Opcode::Store, &[2]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
@@ -486,46 +534,23 @@ fn keyed_store_creates_numeric_property_on_plain_object() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
 
-/// Build an object with map (x -> slot 0, y -> slot 1) in the constants table
-/// at index 0, and the interned name "x" at index 1.
+/// Build `{x: 7, y: 9}` in r2 via manual stores; constants: "x" at 0, "y" at 1.
 fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
-        let map = thread.heap().allocate_handle::<Map>(
-            MapInit {
-                kind: MapKind::OBJECT,
-                value_slot_count: 2,
-                descriptors: &[
-                    (
-                        SlotName::from(x.as_tagged()),
-                        SlotFlags::VALUE.union(SlotFlags::WRITABLE),
-                        Smi::new(0).encode(),
-                    ),
-                    (
-                        SlotName::from(y.as_tagged()),
-                        SlotFlags::VALUE.union(SlotFlags::WRITABLE),
-                        Smi::new(1).encode(),
-                    ),
-                ],
-            },
-            &scope,
-        );
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[map.as_tagged().erase(), x.as_tagged().erase()],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[x.as_tagged().erase(), y.as_tagged().erase()], &scope);
 
-        // r0 = 7, r1 = 9; r2 = object
+        // r2 = {}; r2.x = 7; r2.y = 9
         let mut program = Vec::new();
-        emit(&mut program, Opcode::LoadSmi, &[7]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::LoadSmi, &[9]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 2]);
+        emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
         emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::LoadSmi, &[7]);
+        emit(&mut program, Opcode::StoreNamedPropertyShadow, &[2, 0, 0]);
+        emit(&mut program, Opcode::LoadSmi, &[9]);
+        emit(&mut program, Opcode::StoreNamedPropertyShadow, &[2, 1, 0]);
         build(&mut program);
         emit(&mut program, Opcode::Return, &[]);
 
@@ -537,7 +562,6 @@ fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Resu
                 bytecode,
                 constants: consts,
                 register_count: 4,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -552,9 +576,9 @@ fn keyed_load_reads_named_property_via_string_key() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // acc = "x" (constants[1]); acc = r2[acc]
+    // acc = "x" (constants[0]); acc = r2[acc]
     let result = object_program(&mut thread, |program| {
-        emit(program, Opcode::LoadConstant, &[1]);
+        emit(program, Opcode::LoadConstant, &[0]);
         emit(program, Opcode::LoadKeyedProperty, &[2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
@@ -567,17 +591,17 @@ fn keyed_store_writes_named_property_via_string_key() {
 
     // r3 = "x"; acc = 42; r2[r3] = acc; acc = r2.x
     let result = object_program(&mut thread, |program| {
-        emit(program, Opcode::LoadConstant, &[1]);
+        emit(program, Opcode::LoadConstant, &[0]);
         emit(program, Opcode::Store, &[3]);
         emit(program, Opcode::LoadSmi, &[42]);
         emit(program, Opcode::StoreKeyedProperty, &[2, 3, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[2, 0, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
 
-/// Build an object (x = 7) in r2 with map (x -> slot 0, attributes `x_flags`)
-/// in constants at 0, interned "x" at 1, "z" at 2 and "w" at 3.
+/// Build an object (x = 7) host-side in constants at 0, interned "x" at 1,
+/// "z" at 2 and "w" at 3; the program loads it into r2.
 fn transition_object_program(
     thread: &mut Thread,
     kind: MapKind,
@@ -586,7 +610,6 @@ fn transition_object_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let z = thread.intern(&scope, "z");
         let w = thread.intern(&scope, "w");
@@ -598,9 +621,21 @@ fn transition_object_program(
             },
             &scope,
         );
+        let obj = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[smi(7)],
+                    elements: void.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
         let consts = thread.heap().allocate_handle::<FixedArray>(
             &[
-                map.as_tagged().erase(),
+                obj.as_tagged().erase(),
                 x.as_tagged().erase(),
                 z.as_tagged().erase(),
                 w.as_tagged().erase(),
@@ -608,11 +643,9 @@ fn transition_object_program(
             &scope,
         );
 
-        // r0 = 7; r2 = object
+        // r2 = object
         let mut program = Vec::new();
-        emit(&mut program, Opcode::LoadSmi, &[7]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 1]);
+        emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[2]);
         build(&mut program);
         emit(&mut program, Opcode::Return, &[]);
@@ -625,7 +658,6 @@ fn transition_object_program(
                 bytecode,
                 constants: consts,
                 register_count: 5,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -726,12 +758,11 @@ fn named_store_to_non_writable_fails() {
     expect_escaped(&mut thread, result, "TypeError");
 }
 
-/// Parent object (p = 1) in constants at 2, child object in r2 with a parent
-/// descriptor pointing at it; interned "p" at 1.
+/// Parent object (p = 1) in constants at 2, child object in constants at 0
+/// with a parent descriptor pointing at it; interned "p" at 1.
 fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let p = thread.intern(&scope, "p");
         let parent_map = thread.heap().allocate_handle::<Map>(
             MapInit {
@@ -770,9 +801,21 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
             },
             &scope,
         );
+        let child = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map: child_map,
+                    values: &[],
+                    elements: void.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
         let consts = thread.heap().allocate_handle::<FixedArray>(
             &[
-                child_map.as_tagged().erase(),
+                child.as_tagged().erase(),
                 p.as_tagged().erase(),
                 parent.as_tagged().erase(),
             ],
@@ -781,7 +824,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
 
         // r2 = child; r2.p = 2 (via `store_op`); acc = r2.p + parent.p
         let mut program = Vec::new();
-        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 0]);
+        emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[2]);
         emit(&mut program, Opcode::LoadSmi, &[2]);
         emit(&mut program, store_op, &[2, 1, 0]);
@@ -802,7 +845,6 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 bytecode,
                 constants: consts,
                 register_count: 6,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -924,7 +966,6 @@ fn jump_if_truthy_follows_toboolean() {
         let one_half = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
         let object = {
             let void = thread.heap().known().void;
-            let empty_context = thread.heap().known().empty_context;
             let map = thread.heap().allocate_handle::<Map>(
                 MapInit {
                     kind: MapKind::OBJECT,
@@ -1036,8 +1077,8 @@ fn setter_program() -> Vec<u8> {
 }
 
 /// Build an object (y = 7 in slot 0, accessor `x` backed by the given
-/// getter/setter) in r2. Map in constants at 0, interned "x" at 1, "y" at 2,
-/// "z" at 3.
+/// getter/setter) host-side in constants at 0; interned "x" at 1, "y" at 2,
+/// "z" at 3. The program loads it into r2.
 fn accessor_object_program(
     thread: &mut Thread,
     getter: Option<&[u8]>,
@@ -1046,7 +1087,6 @@ fn accessor_object_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
         let z = thread.intern(&scope, "z");
@@ -1064,7 +1104,6 @@ fn accessor_object_program(
                     bytecode,
                     constants,
                     register_count: 1,
-                    context: empty_context,
                     handlers: None,
                 },
                 &scope,
@@ -1096,9 +1135,21 @@ fn accessor_object_program(
             },
             &scope,
         );
+        let obj = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[smi(7)],
+                    elements: void.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
         let consts = thread.heap().allocate_handle::<FixedArray>(
             &[
-                map.as_tagged().erase(),
+                obj.as_tagged().erase(),
                 x.as_tagged().erase(),
                 y.as_tagged().erase(),
                 z.as_tagged().erase(),
@@ -1106,11 +1157,9 @@ fn accessor_object_program(
             &scope,
         );
 
-        // r0 = 7 (initial y); r2 = object
+        // r2 = object
         let mut program = Vec::new();
-        emit(&mut program, Opcode::LoadSmi, &[7]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::CreateObjectFromMap, &[0, 0, 1]);
+        emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[2]);
         build(&mut program);
         emit(&mut program, Opcode::Return, &[]);
@@ -1123,7 +1172,6 @@ fn accessor_object_program(
                 bytecode,
                 constants: consts,
                 register_count: 4,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -1234,7 +1282,6 @@ fn store_new_accessor_property_defines_own_accessor() {
 
     let result = thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
 
@@ -1277,7 +1324,6 @@ fn store_new_accessor_property_defines_own_accessor() {
                     bytecode,
                     constants,
                     register_count: 1,
-                    context: empty_context,
                     handlers: None,
                 },
                 &scope,
@@ -1312,7 +1358,6 @@ fn store_new_accessor_property_defines_own_accessor() {
                 bytecode,
                 constants: consts,
                 register_count: 1,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -1332,7 +1377,6 @@ fn native_function<'s>(
     idx: NativeIndex,
 ) -> Handle<'s, Object> {
     let void = thread.heap().known().void;
-    let empty_context = thread.heap().known().empty_context;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: MapKind::OBJECT
@@ -1376,25 +1420,17 @@ fn bytecode_fn(
             bytecode,
             constants,
             register_count,
-            context: empty_context,
             handlers: None,
         },
         scope,
     );
-    let map = nctx.heap().allocate_handle::<Map>(
-        MapInit {
-            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
-            value_slot_count: 1,
-            descriptors: &[],
-        },
-        scope,
-    );
+    let map = nctx.heap().known().function_map;
     nctx.heap()
         .allocate_object(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.value()],
+                values: &[info.value(), empty_context.as_tagged().erase()],
                 elements: void.erase(),
                 length: 0,
             },
@@ -1441,14 +1477,11 @@ fn call_dispatches_to_native_function_object() {
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
-        let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let caller = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
                 constants: consts,
                 register_count: 1,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -1639,8 +1672,6 @@ fn run_program_consts(
     constants: &[Value],
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
@@ -1652,7 +1683,6 @@ fn run_program_consts(
                 bytecode,
                 constants,
                 register_count,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
@@ -1667,7 +1697,7 @@ fn global_store_then_load_roundtrips() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    let (x, result) = thread.handle_scope(|thread, scope| {
+    let (_, result) = thread.handle_scope(|thread, scope| {
         let x = thread.intern(&scope, "x");
         let x = x.value();
 
@@ -1707,4 +1737,188 @@ fn load_global_missing_name_is_undefined() {
         run_program_consts(&mut *thread, program, 0, &[], &[missing.value()])
     });
     assert_eq!(result.unwrap(), thread.heap().known().undefined.value());
+}
+
+#[test]
+fn empty_object_literal_inherits_from_object_prototype() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        let p = thread.intern(&scope, "p");
+        let name = SlotName::from(p.as_tagged());
+        let proto = thread.heap().known().object_prototype.value();
+
+        // host-side: %Object.prototype%.p = 1
+        let outcome = thread
+            .heap()
+            .no_gc(|nogc, heap| {
+                proto.store_lookup(nogc, heap, name, smi(1), StoreSemantics::Shadow)
+            })
+            .unwrap();
+        match outcome {
+            StoreOutcome::Transition { receiver, name } => {
+                store_new_data_property_values(thread.heap(), &scope, receiver, name, smi(1))
+                    .unwrap();
+            }
+            other => panic!("expected transition, got {other:?}"),
+        }
+
+        // {}.p reads through the prototype chain
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let first = run_program_consts(&mut *thread, program, 1, &[], &[p.value()]);
+        assert_eq!(Smi::decode(first.unwrap()).unwrap().value(), 1);
+
+        // ({}.p = 2) shadows: own property on the instance...
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[2]);
+        emit(&mut program, Opcode::StoreNamedPropertyShadow, &[0, 0, 0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let second = run_program_consts(&mut *thread, program, 1, &[], &[p.value()]);
+        assert_eq!(Smi::decode(second.unwrap()).unwrap().value(), 2);
+
+        // ...and a fresh {} still sees the prototype value
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        run_program_consts(&mut *thread, program, 1, &[], &[p.value()])
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 1);
+}
+
+#[test]
+fn create_closure_inherits_current_context_and_is_callable() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        let void = thread.heap().known().void;
+
+        // callee info template: return context slot 0
+        let mut callee_program = Vec::new();
+        emit(&mut callee_program, Opcode::LoadContextSlot, &[0]);
+        emit(&mut callee_program, Opcode::Return, &[]);
+        let callee_bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&callee_program, &scope);
+        let callee_consts = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode: callee_bytecode,
+                constants: callee_consts,
+                register_count: 0,
+                handlers: None,
+            },
+            &scope,
+        );
+
+        // caller: r1 = CreateClosure(template); call r1; return
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateClosure, &[0]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::CallNoFeedback, &[1, 1, 1]);
+        emit(&mut program, Opcode::Return, &[]);
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[callee_info.as_tagged().erase()], &scope);
+        let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 2,
+                handlers: None,
+            },
+            &scope,
+        );
+
+        // the caller runs in a context whose slot 0 = 42
+        let slots = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[smi(42)], &scope);
+        let context = thread
+            .heap()
+            .allocate_handle::<Context>(ContextInit { outer: None, slots }, &scope);
+
+        let map = thread.heap().known().function_map;
+        let caller = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[caller_info.as_tagged().erase(), context.as_tagged().erase()],
+                    elements: void.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
+        thread.execute(caller, &[])
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+}
+
+#[test]
+fn create_closure_shares_callable_info_template() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let (result, template) = thread.handle_scope(|thread, scope| {
+        let callee_bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
+        let callee_consts = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode: callee_bytecode,
+                constants: callee_consts,
+                register_count: 0,
+                handlers: None,
+            },
+            &scope,
+        );
+
+        // CreateClosure(template); return the closure
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateClosure, &[0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let result = run_program_consts(
+            &mut *thread,
+            program,
+            0,
+            &[],
+            &[callee_info.as_tagged().erase()],
+        );
+        (result.unwrap(), callee_info.as_tagged().erase())
+    });
+
+    thread.heap().no_gc(|nogc, heap| {
+        let ValueRef::Object(o) = result.value_ref(nogc) else {
+            panic!("closure must be an object");
+        };
+        let info = o
+            .as_ref()
+            .callable_info(nogc, heap)
+            .expect("closure carries a callable info");
+        // the info is shared, not copied per closure
+        assert_eq!(info.into_tagged().erase(), template);
+        // the closure's context slot is the caller's (empty) context
+        let context = o
+            .as_ref()
+            .closure_context(nogc, heap)
+            .expect("closure carries a context");
+        assert_eq!(
+            context.into_tagged().erase(),
+            heap.known().empty_context.as_tagged().erase()
+        );
+    });
 }

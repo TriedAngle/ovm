@@ -82,6 +82,12 @@ pub struct WellKnown {
     /// The realm global object: global variables are properties on it
     /// (top-level `var`/assignments; lexical script-context globals later).
     pub global_object: Global<Object>,
+    /// Initial map of `%Object.prototype%`: every fresh `{}` gets it
+    /// (extendable, parent = object_prototype). Shared with `global_object`.
+    pub object_initial_map: Global<Map>,
+    /// Function object map (the initial map of `%Function.prototype%`):
+    /// slots[0] = shared CallableInfoObject, slots[1] = closure context.
+    pub function_map: Global<Map>,
 }
 
 unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
@@ -125,6 +131,8 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         array_prototype: obj,
         error_prototype: obj,
         global_object: obj,
+        object_initial_map: map,
+        function_map: map,
     }
 }
 
@@ -227,6 +235,14 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let callable_map = alloc_map(heap, roots, MapKind::CALLABLE_INFO);
     let handler_table_map = alloc_map(heap, roots, MapKind::HANDLER_TABLE);
     let context_map = alloc_map(heap, roots, MapKind::CONTEXT);
+    // 2 slots: [0] callable info, [1] closure context
+    let function_map = heap
+        .allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
+            value_slot_count: 2,
+            descriptors: &[],
+        })
+        .into_global(roots);
     let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
     known.smi_map = smi_map;
     known.float_map = float_map;
@@ -238,9 +254,9 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.callable_map = callable_map;
     known.handler_table_map = handler_table_map;
     known.context_map = context_map;
+    known.function_map = function_map;
     heap.set_known(known);
 
-    // Everything else; `init` only reads the maps published above.
     let data = HandleData::new(void.value());
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
@@ -249,8 +265,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     heap.set_known(known);
     let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map);
 
-    // %Array.prototype% is itself an array whose prototype is %Object.prototype%;
-    // array instance maps hang off it.
     let array_prototype_map = alloc_parent_map(
         heap,
         roots,
@@ -280,16 +294,14 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         error_prototype,
     );
 
-    // realm global object: plain extendable object hanging off %Object.prototype%
-    let global_object_map = alloc_parent_map(
+    let object_initial_map = alloc_parent_map(
         heap,
         roots,
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         object_prototype,
     );
-    let global_object = alloc_object(heap, &scope, roots, global_object_map);
+    let global_object = alloc_object(heap, &scope, roots, object_initial_map);
 
-    // each oddball gets its own map (booleans share theirs)
     let undefined_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
     let boolean_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
     let null_map = alloc_map(heap, roots, MapKind::OBJECT);
@@ -332,6 +344,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.js_array_map = js_array_map;
     known.empty_context = empty_context;
     known.global_object = global_object;
+    known.object_initial_map = object_initial_map;
     heap.set_known(known);
 }
 pub struct NoGc<'a> {

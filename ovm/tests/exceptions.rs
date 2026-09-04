@@ -1,9 +1,9 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{Thread, VM, VmError};
+use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
-    HandlerTable, HandlerTableInit, Map, MapInit, MapKind, ObjectSlotsInit, Smi, Value,
+    HandlerTable, HandlerTableInit, ObjectSlotsInit, Smi, Value,
 };
 
 fn smi(v: i64) -> Value {
@@ -36,26 +36,18 @@ fn callable<'s>(
             bytecode,
             constants,
             register_count,
-            context: empty_context,
             handlers,
         },
         scope,
     );
-    let map = thread.heap().allocate_handle::<Map>(
-        MapInit {
-            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
-            value_slot_count: 1,
-            descriptors: &[],
-        },
-        scope,
-    );
+    let map = thread.heap().known().function_map;
     thread
         .heap()
         .allocate_object(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.as_tagged().erase()],
+                values: &[info.as_tagged().erase(), empty_context.as_tagged().erase()],
                 elements: void.erase(),
                 length: 0,
             },

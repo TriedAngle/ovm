@@ -34,10 +34,12 @@ pub enum Opcode {
     CallNoFeedback, // reg (callee) reglist (base) regcount (count) -> acc
     CallNative, // idx (native index) reglist (base, first element is the receiver) regcount (count) -> acc
 
-    CreateObjectFromMap, // idx (constant pool map) reglist regcount (slots) -> acc
-    CreateArrayLiteral,  // reglist regcount -> acc
+    CreateEmptyObjectLiteral, // -> acc (object_initial_map, no slots)
+    CreateEmptyArrayLiteral,  // -> acc (js_array_map, empty elements)
 
-    // binary arithmetic: acc = acc op reg (accumulator is the lhs)
+    CreateClosure, // idx -> acc
+
+    // binary arithmetic: acc = acc op reg
     Add, // reg
     Sub,
     Mul,
@@ -157,8 +159,9 @@ impl Opcode {
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
             b if b == CallNative as u8 => CallNative,
-            b if b == CreateObjectFromMap as u8 => CreateObjectFromMap,
-            b if b == CreateArrayLiteral as u8 => CreateArrayLiteral,
+            b if b == CreateEmptyObjectLiteral as u8 => CreateEmptyObjectLiteral,
+            b if b == CreateEmptyArrayLiteral as u8 => CreateEmptyArrayLiteral,
+            b if b == CreateClosure as u8 => CreateClosure,
             b if b == Add as u8 => Add,
             b if b == Sub as u8 => Sub,
             b if b == Mul as u8 => Mul,
@@ -213,8 +216,8 @@ impl Opcode {
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
             Self::CallNative => &[Index, RegisterListStart, RegisterCount],
 
-            Self::CreateObjectFromMap => &[Index, RegisterListStart, RegisterCount],
-            Self::CreateArrayLiteral => &[RegisterListStart, RegisterCount],
+            Self::CreateEmptyObjectLiteral | Self::CreateEmptyArrayLiteral => &[],
+            Self::CreateClosure => &[Index],
 
             Self::Add
             | Self::Sub

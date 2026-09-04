@@ -4,11 +4,10 @@ use ovm::natives::NativeIndex;
 use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandleScope,
-    HandlerEntryInit, HandlerTable, HandlerTableInit, Map, MapInit, MapKind, Object,
-    ObjectSlotsInit, Smi,
+    HandlerEntryInit, HandlerTable, HandlerTableInit, Object, ObjectSlotsInit, Smi,
 };
 
-/// Build a bytecode callable object (empty constants table).
+/// Build a bytecode function object (empty constants table).
 fn callable<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
@@ -31,27 +30,22 @@ fn callable<'s>(
             bytecode,
             constants,
             register_count,
-            context: empty_context,
             handlers,
         },
         scope,
     );
-    let callable_map = thread.heap().allocate_handle::<Map>(
-        MapInit {
-            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
-            value_slot_count: 1,
-            descriptors: &[],
-        },
-        scope,
-    );
+    let map = thread.heap().known().function_map;
     let empty_elements = thread.heap().known().empty_fixed_array.erase();
     thread
         .heap()
         .allocate_object(
             scope,
             ObjectSlotsInit {
-                map: callable_map,
-                values: &[callable.as_tagged().erase()],
+                map,
+                values: &[
+                    callable.as_tagged().erase(),
+                    empty_context.as_tagged().erase(),
+                ],
                 elements: empty_elements,
                 length: 0,
             },

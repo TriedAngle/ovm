@@ -2,7 +2,7 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
-    HandlerTable, HandlerTableInit, Map, MapInit, MapKind, ObjectSlotsInit, ValueRef,
+    HandlerTable, HandlerTableInit, ObjectSlotsInit, ValueRef,
 };
 
 fn table<'s>(
@@ -149,28 +149,20 @@ fn callable_info_carries_handler_table() {
                 bytecode,
                 constants,
                 register_count: 0,
-                context: empty_context,
                 handlers: Some(t),
             },
             &scope,
         );
 
         // wrap in a callable object so `callable_info` can be exercised
-        let map = thread.heap().allocate_handle::<Map>(
-            MapInit {
-                kind: MapKind::OBJECT.union(MapKind::CALLABLE),
-                value_slot_count: 1,
-                descriptors: &[],
-            },
-            &scope,
-        );
+        let map = thread.heap().known().function_map;
         let obj = thread
             .heap()
             .allocate_object(
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[info.as_tagged().erase()],
+                    values: &[info.as_tagged().erase(), empty_context.as_tagged().erase()],
                     elements: void.erase(),
                     length: 0,
                 },
@@ -198,8 +190,6 @@ fn callable_info_without_handler_table() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread: &mut Thread, scope| {
-        let void = thread.heap().known().void;
-        let empty_context = thread.heap().known().empty_context;
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
@@ -207,7 +197,6 @@ fn callable_info_without_handler_table() {
                 bytecode,
                 constants,
                 register_count: 0,
-                context: empty_context,
                 handlers: None,
             },
             &scope,
