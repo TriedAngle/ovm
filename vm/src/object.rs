@@ -4,8 +4,8 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, Heap, HeapRef, NoGc, OptionGcSlot, PointerStrength, STRONG_PTR,
-    Smi, Tagged, TransitionGuard, Value, Visitor, WEAK_PTR, Word,
+    EdgeVisitable, GcSlot, Handle, HandleScope, Heap, HeapRef, NoGc, OptionGcSlot, PointerStrength,
+    STRONG_PTR, Smi, Tagged, TransitionGuard, Value, ValueRef, Visitor, VmError, WEAK_PTR, Word,
 };
 
 pub trait HeapObject: 'static {
@@ -427,6 +427,106 @@ impl Object {
         let idx = Smi::decode(self.slots.heap_ref(guard).at(0))?.value();
         usize::try_from(idx).ok()
     }
+
+    pub fn is_array<'a>(&'a self, nogc: &'a NoGc<'a>) -> bool {
+        self.header.map.heap_ref(nogc).kind().kind() == ObjectKind::Array
+    }
+
+    pub fn length(&self) -> usize {
+        self.length.to_smi().value() as usize
+    }
+
+    pub fn elements_array<'a>(
+        &'a self,
+        nogc: &'a NoGc<'a>,
+        heap: &'a Heap,
+    ) -> Option<HeapRef<'a, FixedArray>> {
+        self.elements
+            .inner()
+            .get_as::<FixedArray>(nogc, heap.known().array_map)
+    }
+}
+
+/// What kind of callable a value refers to.
+pub enum CallTarget {
+    Bytecode(Tagged<Object>, usize),
+    Native(usize),
+}
+
+pub fn call_target<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, f: Value) -> Option<CallTarget> {
+    let ValueRef::Object(obj) = f.value_ref(nogc) else {
+        return None;
+    };
+    let kind = obj.as_ref().header.map.heap_ref(nogc).kind();
+    if !kind.is_callable() {
+        return None;
+    }
+    if kind.is_native() {
+        return Some(CallTarget::Native(obj.as_ref().native_index(nogc)?));
+    }
+    let info = obj.as_ref().callable_info(nogc, heap)?;
+    let register_count = info.register_count.to_smi().value() as usize;
+    Some(CallTarget::Bytecode(obj.into_tagged(), register_count))
+}
+
+/// Store `value` at element index `i` of an array object, growing the
+/// elements backing store and updating `length` when `i` is past the end.
+pub fn store_array_element(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    receiver: Value,
+    i: usize,
+    value: Value,
+) -> Result<(), VmError> {
+    let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
+    let receiver = scope
+        .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
+        .expect("receiver must be strong");
+
+    let grows = heap.no_gc(|nogc, _heap| {
+        let obj = receiver.heap_ref(nogc);
+        if !obj.as_ref().is_array(nogc) {
+            return Err(VmError::Type);
+        }
+        Ok(i >= obj.as_ref().length())
+    })?;
+
+    if grows {
+        let mut values = heap.no_gc(|nogc, heap| {
+            let obj = receiver.heap_ref(nogc);
+            let elements = obj
+                .as_ref()
+                .elements_array(nogc, heap)
+                .ok_or(VmError::Type)?;
+            // values beyond `length` are logically truncated
+            let keep = obj.as_ref().length().min(elements.len());
+            let mut values = Vec::with_capacity(new_len);
+            for k in 0..keep {
+                values.push(elements.at(k));
+            }
+            values.resize(new_len, heap.known().void.value());
+            Ok::<_, VmError>(values)
+        })?;
+        values[i] = value;
+        let elements = heap.allocate_handle::<FixedArray>(&values, scope);
+        heap.no_gc(|nogc, heap| {
+            let obj = receiver.heap_ref(nogc);
+            obj.elements
+                .set(heap, obj.erase(), elements.as_tagged().erase_tagged());
+            obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
+        });
+    } else {
+        heap.no_gc(|nogc, heap| {
+            let obj = receiver.heap_ref(nogc);
+            let elements = obj
+                .as_ref()
+                .elements_array(nogc, heap)
+                .ok_or(VmError::Type)?;
+            elements.set(heap, i, value);
+            Ok::<_, VmError>(())
+        })?;
+    }
+    Ok(())
 }
 
 pub struct ObjectInit<'a> {
@@ -947,6 +1047,23 @@ impl EdgeVisitable for CallableInfoObject {
         visitor.visit(self.constants.as_raw());
         visitor.visit(self.context.as_raw());
         visitor.visit(self.handlers.as_raw());
+    }
+}
+
+impl CallableInfoObject {
+    /// Decode a constant-pool property name.
+    // TODO: this must handle also non constants and non interned strings and symbols
+    pub fn constant_slot_name<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        heap: &'a Heap,
+        idx: usize,
+    ) -> SlotName {
+        let v = self.constants.heap_ref(nogc).at(idx);
+        let name = v
+            .get_as::<InternedString>(nogc, heap.known().string_map)
+            .expect("property name constant must be an interned string");
+        SlotName::from(name.into_tagged())
     }
 }
 

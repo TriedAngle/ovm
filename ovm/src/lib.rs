@@ -9,6 +9,7 @@ use vm::{
 };
 
 pub mod cache;
+pub mod errors;
 pub mod interner;
 pub mod interpreter;
 pub mod natives;
@@ -18,8 +19,8 @@ pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 
 pub use cache::StackCache;
 
+pub use errors::error_from_vm_error;
 pub use interner::StringInterner;
-pub use interpreter::error_from_vm_error;
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use vm::VmError;
 
@@ -116,7 +117,7 @@ impl Thread {
     }
 
     pub fn set_pending_exception(&mut self, err: VmError) {
-        let ex = interpreter::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
+        let ex = errors::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
             .expect("error materialization must not fail");
         self.state.set_pending_exception(ex);
     }
@@ -152,7 +153,7 @@ impl Thread {
     }
 
     pub fn error_object(&mut self, err: VmError) -> Result<Value, VmError> {
-        interpreter::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
+        errors::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
     }
 
     pub fn run_native(&mut self, f: NativeFn, args: &[Value]) -> Result<Value, VmError> {
