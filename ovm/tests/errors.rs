@@ -163,7 +163,8 @@ fn error_objects_are_extendable() {
                 let value = scope
                     .create_handle(vm::Tagged::from_value(extra_val))
                     .expect("value is strong");
-                vm::Object::store_new_data_property(thread.heap(), receiver, name, value).unwrap();
+                vm::Object::store_new_data_property(thread.heap(), &scope, receiver, name, value)
+                    .unwrap();
             });
         }
         other => panic!("expected transition, got {other:?}"),
@@ -171,17 +172,19 @@ fn error_objects_are_extendable() {
     assert_eq!(get_prop(&mut thread, obj, extra_key), extra_val);
 }
 
-/// The object this object's map links to via its PARENT descriptor.
+/// The object this object's map links to via its `prototype` slot.
 fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
-    thread.heap().no_gc(|nogc, _heap| {
+    thread.heap().no_gc(|nogc, heap| {
         let ValueRef::Object(o) = obj.value_ref(nogc) else {
             panic!("expected object");
         };
         let map = o.as_ref().header.map.heap_ref(nogc).as_ref();
-        map.descriptors()
-            .iter()
-            .find(|d| d.flags().is_parent())
-            .map(|d| d.value.inner())
+        let proto = map.prototype.inner();
+        if proto == heap.known().null.value() {
+            None
+        } else {
+            Some(proto)
+        }
     })
 }
 

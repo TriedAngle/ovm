@@ -24,7 +24,8 @@ pub use object::{
     VMString, call_target, store_array_element, string_content_hash,
 };
 pub use transition::{
-    StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock, store_new_data_property_values,
+    StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock, set_prototype,
+    store_new_data_property_values,
 };
 pub use value::{
     HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,
