@@ -111,7 +111,8 @@ fn main() {
     emit(&mut program, Opcode::Store, &[0]);
     emit(&mut program, Opcode::LoadSmi, &[7]);
     emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::Add, &[0, 1]);
+    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::Add, &[1]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = thread.handle_scope(|thread, scope| {

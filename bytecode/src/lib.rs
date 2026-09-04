@@ -13,8 +13,8 @@ pub enum Opcode {
     Move, // reg -> reg
 
     // I don't think we need this right now, LoadConstant should be enough?
-    // LoadGlobal, //
-    // StoreGlobal, //
+    LoadGlobal,       // idx (constant pool name) idx (feedback) -> acc
+    StoreGlobal,      // acc -> idx (constant pool name) idx (feedback)
     LoadContextSlot,  // idx -> acc
     StoreContextSlot, // acc -> idx
 
@@ -37,8 +37,19 @@ pub enum Opcode {
     CreateObjectFromMap, // idx (constant pool map) reglist regcount (slots) -> acc
     CreateArrayLiteral,  // reglist regcount -> acc
 
-    // here to see if it makes a different over CallNative with Add
-    Add, // reg1 reg2 -> acc
+    // binary arithmetic: acc = acc op reg (accumulator is the lhs)
+    Add, // reg
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Exp,
+    BitwiseOr,
+    BitwiseXor,
+    BitwiseAnd,
+    ShiftLeft,
+    ShiftRight,
+    ShiftRightLogical,
 
     Jump,     // imm (offset)
     JumpLoop, // imm (negative offset); safepoint-polls before jumping
@@ -133,6 +144,8 @@ impl Opcode {
             b if b == LoadSmi as u8 => LoadSmi,
             b if b == LoadConstant as u8 => LoadConstant,
             b if b == Move as u8 => Move,
+            b if b == LoadGlobal as u8 => LoadGlobal,
+            b if b == StoreGlobal as u8 => StoreGlobal,
             b if b == LoadContextSlot as u8 => LoadContextSlot,
             b if b == StoreContextSlot as u8 => StoreContextSlot,
             b if b == LoadNamedProperty as u8 => LoadNamedProperty,
@@ -147,6 +160,17 @@ impl Opcode {
             b if b == CreateObjectFromMap as u8 => CreateObjectFromMap,
             b if b == CreateArrayLiteral as u8 => CreateArrayLiteral,
             b if b == Add as u8 => Add,
+            b if b == Sub as u8 => Sub,
+            b if b == Mul as u8 => Mul,
+            b if b == Div as u8 => Div,
+            b if b == Mod as u8 => Mod,
+            b if b == Exp as u8 => Exp,
+            b if b == BitwiseOr as u8 => BitwiseOr,
+            b if b == BitwiseXor as u8 => BitwiseXor,
+            b if b == BitwiseAnd as u8 => BitwiseAnd,
+            b if b == ShiftLeft as u8 => ShiftLeft,
+            b if b == ShiftRight as u8 => ShiftRight,
+            b if b == ShiftRightLogical as u8 => ShiftRightLogical,
             b if b == Jump as u8 => Jump,
             b if b == JumpLoop as u8 => JumpLoop,
             b if b == JumpIfTruthy as u8 => JumpIfTruthy,
@@ -171,6 +195,9 @@ impl Opcode {
 
             Self::Move => &[Register, Register],
 
+            Self::LoadGlobal => &[Index, Index],
+            Self::StoreGlobal => &[Index, Index],
+
             Self::LoadContextSlot => &[Index],
             Self::StoreContextSlot => &[Index],
 
@@ -189,7 +216,18 @@ impl Opcode {
             Self::CreateObjectFromMap => &[Index, RegisterListStart, RegisterCount],
             Self::CreateArrayLiteral => &[RegisterListStart, RegisterCount],
 
-            Self::Add => &[Register, Register],
+            Self::Add
+            | Self::Sub
+            | Self::Mul
+            | Self::Div
+            | Self::Mod
+            | Self::Exp
+            | Self::BitwiseOr
+            | Self::BitwiseXor
+            | Self::BitwiseAnd
+            | Self::ShiftLeft
+            | Self::ShiftRight
+            | Self::ShiftRightLogical => &[Register],
 
             Self::Jump | Self::JumpLoop | Self::JumpIfTruthy | Self::JumpIfFalsy => &[Immediate],
             Self::TestReferenceEqual => &[Register],
