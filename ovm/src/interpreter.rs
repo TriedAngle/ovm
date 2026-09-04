@@ -1,10 +1,10 @@
 use bytecode::{Opcode, Operands, decode, jump_target};
 
 use vm::{
-    CallTarget, CallableInfoObject, Handle, Heap, Key, LoadOutcome, NoGc, Object, ObjectSlotsInit,
-    SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value, ValueRef, call_target,
-    classify_key, element_value, encode_smi, is_truthy, load_outcome, store_array_element,
-    store_new_data_property_values,
+    CallTarget, CallableInfoObject, Context, ContextInit, FixedArray, Handle, Heap, Key,
+    LoadOutcome, NoGc, Object, ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics,
+    Tagged, Value, ValueRef, call_target, classify_key, element_value, encode_smi, is_truthy,
+    load_outcome, store_array_element, store_new_data_property_values,
 };
 
 use crate::{
@@ -90,6 +90,43 @@ fn callable_name<'a>(
         .callable_info(nogc, heap)
         .expect("frame callable must have callable info");
     info.constant_slot_name(nogc, heap, idx)
+}
+
+/// The frame's current context: the function object's closure context
+/// (the interpreter frame's context slot).
+fn frame_context(heap: &mut Heap, stack: &Stack, meta: &FrameMeta) -> Result<Value, VmError> {
+    heap.no_gc(|nogc, heap| {
+        let ValueRef::Object(obj) = stack.callable_slot(meta).inner().value_ref(nogc) else {
+            return Err(VmError::Type);
+        };
+        obj.as_ref()
+            .closure_context(nogc, heap)
+            .map(|c| c.into_tagged().erase())
+            .ok_or(VmError::Type)
+    })
+}
+
+fn set_frame_context(
+    heap: &mut Heap,
+    stack: &Stack,
+    meta: &FrameMeta,
+    context: Value,
+) -> Result<(), VmError> {
+    heap.no_gc(|nogc, heap| {
+        let ValueRef::Object(obj) = stack.callable_slot(meta).inner().value_ref(nogc) else {
+            return Err(VmError::Type);
+        };
+        context
+            .get_as::<Context>(nogc, heap.known().context_map)
+            .ok_or(VmError::Type)?;
+        let host = stack.callable_slot(meta).inner();
+        obj.as_ref().slots.heap_ref(nogc).element_slot(1).set(
+            heap,
+            host,
+            Tagged::from_value(context),
+        );
+        Ok(())
+    })
 }
 
 fn call_value(
@@ -748,16 +785,79 @@ fn step(
             ));
             Step::Next
         }
+        Opcode::CreateFunctionContext | Opcode::CreateBlockContext => {
+            let count = ops.uimm(0) as usize;
+            let hole = heap.known().void.value();
+            let values = vec![hole; count];
+            let outer = step_try!(frame_context(heap, stack, &meta));
+            cache.spill_acc(*acc);
+            let ctx = state.handle_scope(|scope| {
+                let outer = scope
+                    .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
+                    .expect("frame context is strong");
+                let slots = heap.allocate_handle::<FixedArray>(&values, &scope);
+                heap.allocate::<Context>(ContextInit {
+                    outer: Some(outer),
+                    slots,
+                })
+            });
+            let _ = cache.take_acc();
+            *acc = ctx.erase();
+            Step::Next
+        }
+        Opcode::CreateCatchContext => {
+            let exception = stack.reg(&meta, ops.reg(0));
+            let outer = step_try!(frame_context(heap, stack, &meta));
+            cache.spill_acc(*acc);
+            let ctx = state.handle_scope(|scope| {
+                let outer = scope
+                    .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
+                    .expect("frame context is strong");
+                let slots = heap.allocate_handle::<FixedArray>(&[exception], &scope);
+                heap.allocate::<Context>(ContextInit {
+                    outer: Some(outer),
+                    slots,
+                })
+            });
+            let _ = cache.take_acc();
+            *acc = ctx.erase();
+            Step::Next
+        }
+        Opcode::PushContext => {
+            let old = step_try!(frame_context(heap, stack, &meta));
+            stack.set_reg(&meta, ops.reg(0), old);
+            step_try!(set_frame_context(heap, stack, &meta, *acc));
+            Step::Next
+        }
+        Opcode::PopContext => {
+            let context = stack.reg(&meta, ops.reg(0));
+            step_try!(set_frame_context(heap, stack, &meta, context));
+            Step::Next
+        }
+        Opcode::ThrowReferenceErrorIfHole => {
+            if *acc == heap.known().void.value() {
+                return Step::Error(VmError::Reference);
+            }
+            Step::Next
+        }
         Opcode::LoadContextSlot => {
+            let depth = ops.uimm(1);
             let v = step_try!(heap.no_gc(|nogc, heap| {
                 let ValueRef::Object(obj) = stack.callable_slot(&meta).inner().value_ref(nogc)
                 else {
                     return Err(VmError::Type);
                 };
-                let context = obj
+                let mut context = obj
                     .as_ref()
                     .closure_context(nogc, heap)
                     .ok_or(VmError::Type)?;
+                for _ in 0..depth {
+                    context = context
+                        .as_ref()
+                        .outer
+                        .heap_ref(nogc, heap)
+                        .ok_or(VmError::Type)?;
+                }
                 Ok(context
                     .slots
                     .heap_ref(nogc)
@@ -774,16 +874,24 @@ fn step(
                 else {
                     return Err(VmError::Type);
                 };
-                let context = obj
+                let mut context = obj
                     .as_ref()
                     .closure_context(nogc, heap)
                     .ok_or(VmError::Type)?;
-                let host = obj.as_ref().slots.heap_ref(nogc).at(1);
-                context.slots.heap_ref(nogc).element_slot(ops.idx(0)).set(
-                    heap,
-                    host,
-                    Tagged::from_value(*acc),
-                );
+                for _ in 0..ops.uimm(1) {
+                    context = context
+                        .as_ref()
+                        .outer
+                        .heap_ref(nogc, heap)
+                        .ok_or(VmError::Type)?;
+                }
+                let host = context.clone().into_tagged().erase();
+                context
+                    .slots
+                    .heap_ref(nogc)
+                    .as_ref()
+                    .element_slot(ops.idx(0))
+                    .set(heap, host, Tagged::from_value(*acc));
                 Ok(())
             }));
             Step::Next

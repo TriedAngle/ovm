@@ -1805,7 +1805,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
 
         // callee info template: return context slot 0
         let mut callee_program = Vec::new();
-        emit(&mut callee_program, Opcode::LoadContextSlot, &[0]);
+        emit(&mut callee_program, Opcode::LoadContextSlot, &[0, 0]);
         emit(&mut callee_program, Opcode::Return, &[]);
         let callee_bytecode = thread
             .heap()
@@ -1921,4 +1921,188 @@ fn create_closure_shares_callable_info_template() {
             heap.known().empty_context.as_tagged().erase()
         );
     });
+}
+
+#[test]
+fn function_context_slots_are_readable_and_writable() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // CreateFunctionContext 2; PushContext r0; x = 42; y = 43; return x + y
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::CreateFunctionContext, &[2]);
+    emit(&mut program, Opcode::PushContext, &[0]);
+    emit(&mut program, Opcode::LoadSmi, &[42]);
+    emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
+    emit(&mut program, Opcode::LoadSmi, &[43]);
+    emit(&mut program, Opcode::StoreContextSlot, &[1, 0]);
+    emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
+    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::LoadContextSlot, &[1, 0]);
+    emit(&mut program, Opcode::Add, &[1]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 2, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 85);
+}
+
+#[test]
+fn push_context_saves_previous_context_to_register() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // PushContext must save the old frame context (empty_context) into r0
+    let result = thread.handle_scope(|thread, _scope| {
+        let empty = thread.heap().known().empty_context.as_tagged().erase();
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+        emit(&mut program, Opcode::PushContext, &[0]);
+        emit(&mut program, Opcode::Load, &[0]); // r0 = saved old context
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::LoadConstant, &[0]); // acc = empty_context
+        emit(&mut program, Opcode::TestReferenceEqual, &[1]);
+        emit(&mut program, Opcode::Return, &[]);
+        run_program_consts(&mut *thread, program, 2, &[], &[empty])
+    });
+    assert_eq!(result.unwrap(), thread.heap().known().true_object.value());
+}
+
+#[test]
+fn pop_context_restores_previous_context() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // ctxA[0] = 42; push ctxB; ctxB[0] = 99; pop back to ctxA; read ctxA[0]
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+    emit(&mut program, Opcode::PushContext, &[0]); // r0 = old; frame = ctxA
+    emit(&mut program, Opcode::LoadSmi, &[42]);
+    emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
+    emit(&mut program, Opcode::CreateBlockContext, &[1]);
+    emit(&mut program, Opcode::PushContext, &[1]); // r1 = ctxA; frame = ctxB
+    emit(&mut program, Opcode::LoadSmi, &[99]);
+    emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // ctxB[0] = 99
+    emit(&mut program, Opcode::PopContext, &[1]); // frame = ctxA
+    emit(&mut program, Opcode::LoadContextSlot, &[0, 0]); // ctxA[0]
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 2, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
+}
+
+#[test]
+fn block_context_reads_outer_scope_via_depth() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // ctxA[0] = 7; inside ctxB (outer = ctxA), read slot 0 at depth 1
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+    emit(&mut program, Opcode::PushContext, &[0]); // frame = ctxA
+    emit(&mut program, Opcode::LoadSmi, &[7]);
+    emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
+    emit(&mut program, Opcode::CreateBlockContext, &[1]);
+    emit(&mut program, Opcode::PushContext, &[1]); // frame = ctxB, outer = ctxA
+    emit(&mut program, Opcode::LoadContextSlot, &[0, 1]); // ctxB.outer[0]
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 2, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+#[test]
+fn catch_context_binds_exception_in_slot_zero() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // CreateCatchContext r2 (exception); PushContext; read slot 0
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadSmi, &[55]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::CreateCatchContext, &[2]);
+    emit(&mut program, Opcode::PushContext, &[0]);
+    emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 3, &[]);
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 55);
+}
+
+#[test]
+fn tdz_hole_read_throws_reference_error() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // fresh context slots are the hole; reading one must throw ReferenceError
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+    emit(&mut program, Opcode::PushContext, &[0]);
+    emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
+    emit(&mut program, Opcode::ThrowReferenceErrorIfHole, &[]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 1, &[]);
+    expect_escaped(&mut thread, result, "ReferenceError");
+}
+
+#[test]
+fn closure_captures_function_context_end_to_end() {
+    // function f() { let x = 1; { let y = 2; } return () => x; }
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        // callee (arrow): return x from its (inherited) context
+        let mut callee_program = Vec::new();
+        emit(&mut callee_program, Opcode::LoadContextSlot, &[0, 0]);
+        emit(&mut callee_program, Opcode::Return, &[]);
+        let callee_bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&callee_program, &scope);
+        let callee_consts = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode: callee_bytecode,
+                constants: callee_consts,
+                register_count: 0,
+                handlers: None,
+            },
+            &scope,
+        );
+
+        // f's body
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateFunctionContext, &[1]); // ctxA: [x]
+        emit(&mut program, Opcode::PushContext, &[0]); // r0 = old; frame = ctxA
+        emit(&mut program, Opcode::LoadSmi, &[1]);
+        emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // x = 1
+        emit(&mut program, Opcode::CreateBlockContext, &[1]); // ctxB: [y]
+        emit(&mut program, Opcode::PushContext, &[1]); // r1 = ctxA; frame = ctxB
+        emit(&mut program, Opcode::LoadSmi, &[2]);
+        emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // y = 2
+        emit(&mut program, Opcode::PopContext, &[1]); // frame = ctxA
+        emit(&mut program, Opcode::CreateClosure, &[0]); // closure ctx = ctxA
+        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::CallNoFeedback, &[2, 2, 1]);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[callee_info.as_tagged().erase()], &scope);
+        let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 3,
+                handlers: None,
+            },
+            &scope,
+        );
+        let caller = callable_object(thread, &scope, caller_info);
+        thread.execute(caller, &[])
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 1);
 }
