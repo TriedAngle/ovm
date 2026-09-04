@@ -420,6 +420,20 @@ impl Object {
         info.get_as(guard, heap.known().callable_map)
     }
 
+    pub fn closure_context<'a>(
+        &'a self,
+        guard: &'a NoGc<'a>,
+        heap: &'a Heap,
+    ) -> Option<HeapRef<'a, Context>> {
+        if !self.header.map.heap_ref(guard).kind().is_callable() {
+            return None;
+        }
+        self.slots
+            .heap_ref(guard)
+            .at(1)
+            .get_as(guard, heap.known().context_map)
+    }
+
     pub fn native_index<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<usize> {
         if !self.header.map.heap_ref(guard).kind().is_native() {
             return None;
@@ -995,7 +1009,6 @@ pub struct CallableInfoObject {
     pub bytecode: GcSlot<FixedByteArray>,
     pub constants: GcSlot<FixedArray>,
     pub register_count: GcSlot<Smi>,
-    pub context: GcSlot,
     pub handlers: OptionGcSlot<HandlerTable>,
 }
 
@@ -1003,7 +1016,6 @@ pub struct CallableInfoInit<'a> {
     pub bytecode: Handle<'a, FixedByteArray>,
     pub constants: Handle<'a, FixedArray>,
     pub register_count: usize,
-    pub context: Handle<'a, Context>,
     pub handlers: Option<Handle<'a, HandlerTable>>,
 }
 
@@ -1023,8 +1035,6 @@ impl HeapObject for CallableInfoObject {
         self.constants.set(heap, host, config.constants.as_tagged());
         self.register_count
             .set(heap, host, Smi::new(config.register_count as i64));
-        self.context
-            .set(heap, host, config.context.as_tagged().erase_tagged());
         match config.handlers {
             Some(handlers) => self.handlers.set(heap, host, handlers.as_tagged()),
             None => self.handlers.clear(heap.known().void.value()),
@@ -1045,7 +1055,6 @@ impl EdgeVisitable for CallableInfoObject {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.bytecode.as_raw());
         visitor.visit(self.constants.as_raw());
-        visitor.visit(self.context.as_raw());
         visitor.visit(self.handlers.as_raw());
     }
 }
