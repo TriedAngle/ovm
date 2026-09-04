@@ -431,6 +431,31 @@ mod tests {
                 kind,
                 value_slot_count: value_slots,
                 descriptors: &descriptors,
+                prototype: roots.create_handle(Tagged::from_value(heap.known().null.value())),
+            })
+            .into_tagged();
+        roots.create_handle(map)
+    }
+
+    /// Like `alloc_map` but with an explicit prototype value.
+    fn alloc_map_proto(
+        heap: &mut Heap,
+        roots: &RootHandles,
+        kind: MapKind,
+        value_slots: usize,
+        descs: &[(i64, SlotFlags, Value)],
+        proto: Value,
+    ) -> Global<Map> {
+        let descriptors: Vec<(SlotName, SlotFlags, Value)> = descs
+            .iter()
+            .map(|(name, flags, value)| (smi_name(*name), *flags, *value))
+            .collect();
+        let map = heap
+            .allocate::<Map>(MapInit {
+                kind,
+                value_slot_count: value_slots,
+                descriptors: &descriptors,
+                prototype: roots.create_handle(Tagged::from_value(proto)),
             })
             .into_tagged();
         roots.create_handle(map)
@@ -572,7 +597,7 @@ mod tests {
         let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
 
-        let child = Map::transition_target(&mut heap, parent, name, flags);
+        let child = Map::transition_target(&mut heap, &scope, parent, name, flags);
         let child = scope.create_handle(child).expect("child map is strong");
 
         heap.no_gc(|nogc, heap| {
@@ -602,8 +627,8 @@ mod tests {
         let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
 
-        let a = Map::transition_target(&mut heap, parent, name, flags);
-        let b = Map::transition_target(&mut heap, parent, name, flags);
+        let a = Map::transition_target(&mut heap, &scope, parent, name, flags);
+        let b = Map::transition_target(&mut heap, &scope, parent, name, flags);
         assert_eq!(a.erase(), b.erase());
 
         heap.no_gc(|nogc, heap| {
@@ -628,16 +653,20 @@ mod tests {
 
         // two different properties off the same parent: sibling edges
         let a = scope
-            .create_handle(Map::transition_target(&mut heap, parent, name1, flags))
+            .create_handle(Map::transition_target(
+                &mut heap, &scope, parent, name1, flags,
+            ))
             .expect("strong");
         let b = scope
-            .create_handle(Map::transition_target(&mut heap, parent, name2, flags))
+            .create_handle(Map::transition_target(
+                &mut heap, &scope, parent, name2, flags,
+            ))
             .expect("strong");
         assert_ne!(a.value(), b.value());
 
         // and a chain: transition from a child map
         let c = scope
-            .create_handle(Map::transition_target(&mut heap, a, name2, flags))
+            .create_handle(Map::transition_target(&mut heap, &scope, a, name2, flags))
             .expect("strong");
 
         heap.no_gc(|nogc, heap| {
@@ -681,6 +710,7 @@ mod tests {
 
         Object::store_new_data_property(
             &mut heap,
+            &scope,
             obj,
             root_name(&scope, smi_name(2)),
             root_value(&scope, Smi::new(9).encode()),
@@ -716,6 +746,7 @@ mod tests {
 
         Object::store_new_data_property(
             &mut heap,
+            &scope,
             a,
             root_name(&scope, smi_name(1)),
             root_value(&scope, Smi::new(1).encode()),
@@ -723,6 +754,7 @@ mod tests {
         .unwrap();
         Object::store_new_data_property(
             &mut heap,
+            &scope,
             b,
             root_name(&scope, smi_name(1)),
             root_value(&scope, Smi::new(2).encode()),
@@ -749,6 +781,7 @@ mod tests {
 
         let result = Object::store_new_data_property(
             &mut heap,
+            &scope,
             obj,
             root_name(&scope, smi_name(1)),
             root_value(&scope, Smi::new(1).encode()),
@@ -823,8 +856,12 @@ mod tests {
         );
         let parent = alloc_object(&mut heap, parent_map, &[]);
 
-        // child: smi(1) = value slot 0, smi(2) = const 42, parent stored in the map
-        let child_map = alloc_map(
+        // child: smi(1) = value slot 0, smi(2) = const 42,
+        // prototype = FixedArray([parent])
+        let parents = heap
+            .allocate::<FixedArray>(&[parent.encode_strong()])
+            .into_ptr();
+        let child_map = alloc_map_proto(
             &mut heap,
             &_roots,
             MapKind::OBJECT,
@@ -836,12 +873,8 @@ mod tests {
                     Smi::new(0).encode(),
                 ),
                 (2, SlotFlags::CONST, Smi::new(42).encode()),
-                (
-                    999,
-                    SlotFlags::CONST.union(SlotFlags::PARENT),
-                    parent.encode_strong(),
-                ),
             ],
+            parents.encode_strong(),
         );
         let child = alloc_object(&mut heap, child_map, &[Smi::new(7).encode()]);
         let child = unsafe { child.as_ref() };
@@ -888,7 +921,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_via_specific_parent() {
+    fn lookup_multiple_parents_follow_priority_order() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
 
         // parent A: smi(3) = const 10; parent B: smi(3) = const 20
@@ -909,34 +942,39 @@ mod tests {
         );
         let parent_b = alloc_object(&mut heap, map_b, &[]);
 
-        // child: two named parents, both stored in the map
-        let child_map = alloc_map(
+        // child with prototype = [a, b]: the first parent wins
+        let parents_ab = heap
+            .allocate::<FixedArray>(&[parent_a.encode_strong(), parent_b.encode_strong()])
+            .into_ptr();
+        let child_ab_map = alloc_map_proto(
             &mut heap,
             &_roots,
             MapKind::OBJECT,
             0,
-            &[
-                (
-                    100,
-                    SlotFlags::CONST.union(SlotFlags::PARENT),
-                    parent_a.encode_strong(),
-                ),
-                (
-                    101,
-                    SlotFlags::CONST.union(SlotFlags::PARENT),
-                    parent_b.encode_strong(),
-                ),
-            ],
+            &[],
+            parents_ab.encode_strong(),
         );
-        let child = alloc_object(&mut heap, child_map, &[]);
-        let child = unsafe { child.as_ref() };
+        let child_ab = alloc_object(&mut heap, child_ab_map, &[]);
+        let child_ab = unsafe { child_ab.as_ref() };
+
+        // child with prototype = [b] alone reaches the second parent
+        let parents_b = heap
+            .allocate::<FixedArray>(&[parent_b.encode_strong()])
+            .into_ptr();
+        let child_b_map = alloc_map_proto(
+            &mut heap,
+            &_roots,
+            MapKind::OBJECT,
+            0,
+            &[],
+            parents_b.encode_strong(),
+        );
+        let child_b = alloc_object(&mut heap, child_b_map, &[]);
+        let child_b = unsafe { child_b.as_ref() };
 
         heap.no_gc(|nogc, heap| {
-            expect_data(child.lookup(nogc, heap, smi_name(3)), 10); // default: first parent
-            expect_data(
-                child.lookup_parent(nogc, heap, smi_name(3), smi_name(101)),
-                20,
-            ); // directed
+            expect_data(child_ab.lookup(nogc, heap, smi_name(3)), 10); // first parent wins
+            expect_data(child_b.lookup(nogc, heap, smi_name(3)), 20);
         });
     }
 
@@ -1007,8 +1045,10 @@ mod tests {
     fn store_lookup_on_accessor_without_setter_is_ignored() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
 
-        let void = heap.known().void.value();
-        let pair_ptr = heap.allocate::<AccessorPair>((void, void)).into_ptr();
+        let undefined = heap.known().undefined.value();
+        let pair_ptr = heap
+            .allocate::<AccessorPair>((undefined, undefined))
+            .into_ptr();
         let map = alloc_map(
             &mut heap,
             &_roots,
@@ -1060,13 +1100,13 @@ mod tests {
             )
             .into_handle(&scope);
 
-        let void = heap.known().void.value();
+        let undefined = heap.known().undefined.value();
         let name = scope.create_handle(smi_name(5).tagged()).unwrap();
         let get = scope
             .create_handle(Tagged::from_value(Smi::new(111).encode()))
             .unwrap();
-        let set = scope.create_handle(Tagged::from_value(void)).unwrap();
-        Object::store_new_accessor_property(&mut heap, obj, name, get, set).unwrap();
+        let set = scope.create_handle(Tagged::from_value(undefined)).unwrap();
+        Object::store_new_accessor_property(&mut heap, &scope, obj, name, get, set).unwrap();
 
         heap.no_gc(|nogc, heap| {
             let obj_ref = obj.heap_ref(nogc);
@@ -1077,7 +1117,7 @@ mod tests {
             match obj.value().lookup(nogc, heap, smi_name(5)) {
                 Lookup::Accessor { pair, .. } => {
                     assert_eq!(Smi::decode(pair.get.get().erase()).unwrap().value(), 111);
-                    assert_eq!(pair.set.get().erase(), void);
+                    assert_eq!(pair.set.get().erase(), undefined);
                 }
                 _ => panic!("expected accessor lookup result"),
             }
@@ -1104,11 +1144,11 @@ mod tests {
             )
             .into_handle(&scope);
 
-        let void = heap.known().void.value();
+        let undefined = heap.known().undefined.value();
         let name = scope.create_handle(smi_name(5).tagged()).unwrap();
-        let get = scope.create_handle(Tagged::from_value(void)).unwrap();
-        let set = scope.create_handle(Tagged::from_value(void)).unwrap();
-        let result = Object::store_new_accessor_property(&mut heap, obj, name, get, set);
+        let get = scope.create_handle(Tagged::from_value(undefined)).unwrap();
+        let set = scope.create_handle(Tagged::from_value(undefined)).unwrap();
+        let result = Object::store_new_accessor_property(&mut heap, &scope, obj, name, get, set);
         assert_eq!(result, Err(VmError::NotExtensible));
     }
 
@@ -1137,7 +1177,7 @@ mod tests {
                         .create_handle(Tagged::from_ptr(parent_ptr))
                         .expect("parent is strong");
                     let name = root_name(&scope, smi_name(1));
-                    Map::transition_target(&mut local, parent, name, flags).erase()
+                    Map::transition_target(&mut local, &scope, parent, name, flags).erase()
                 }));
             }
             let results: Vec<Value> = threads.into_iter().map(|t| t.join().unwrap()).collect();

@@ -17,13 +17,9 @@ fn slot_flags_attributes() {
     let f = SlotFlags::VALUE
         .union(SlotFlags::WRITABLE)
         .union(SlotFlags::ENUMERABLE);
-    assert!(!f.is_parent());
     assert!(f.is_writable());
     assert!(f.is_enumerable());
     assert!(!f.is_configurable());
-
-    let p = SlotFlags::VALUE.union(SlotFlags::PARENT);
-    assert!(p.is_parent());
 }
 
 #[test]

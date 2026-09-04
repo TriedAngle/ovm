@@ -4,7 +4,7 @@ use vm::{
     CallTarget, CallableInfoObject, Context, ContextInit, FixedArray, Handle, Heap, Key,
     LoadOutcome, NoGc, Object, ObjectSlotsInit, SlotName, Smi, StoreOutcome, StoreSemantics,
     Tagged, Value, ValueRef, call_target, classify_key, element_value, encode_smi, is_truthy,
-    load_outcome, store_array_element, store_new_data_property_values,
+    load_outcome, set_prototype, store_array_element, store_new_data_property_values,
 };
 
 use crate::{
@@ -832,6 +832,14 @@ fn step(
         Opcode::PopContext => {
             let context = stack.reg(&meta, ops.reg(0));
             step_try!(set_frame_context(heap, stack, &meta, context));
+            Step::Next
+        }
+        Opcode::SetPrototype => {
+            let proto = stack.reg(&meta, ops.reg(0));
+            cache.spill_acc(*acc);
+            let result = state.handle_scope(|scope| set_prototype(heap, &scope, *acc, proto));
+            let _ = cache.take_acc();
+            step_try!(result);
             Step::Next
         }
         Opcode::ThrowReferenceErrorIfHole => {

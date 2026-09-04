@@ -618,6 +618,7 @@ fn transition_object_program(
                 kind,
                 value_slot_count: 1,
                 descriptors: &[(SlotName::from(x.as_tagged()), x_flags, Smi::new(0).encode())],
+                prototype: void.erase(),
             },
             &scope,
         );
@@ -759,7 +760,7 @@ fn named_store_to_non_writable_fails() {
 }
 
 /// Parent object (p = 1) in constants at 2, child object in constants at 0
-/// with a parent descriptor pointing at it; interned "p" at 1.
+/// whose prototype (a FixedArray) points at it; interned "p" at 1.
 fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void;
@@ -773,6 +774,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                     WRITABLE_VALUE,
                     Smi::new(0).encode(),
                 )],
+                prototype: void.erase(),
             },
             &scope,
         );
@@ -788,16 +790,17 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 },
             )
             .into_handle(&scope);
-        // child: no own slots, parent stored in the map
+        // child: no own slots, prototype = FixedArray([parent]) (multiple
+        // parents in priority order; here a single one)
+        let parents = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[parent.as_tagged().erase()], &scope);
         let child_map = thread.heap().allocate_handle::<Map>(
             MapInit {
                 kind: EXTENDABLE,
                 value_slot_count: 0,
-                descriptors: &[(
-                    SlotName::from(Tagged::smi(999).unwrap()),
-                    SlotFlags::CONST.union(SlotFlags::PARENT),
-                    parent.as_tagged().erase(),
-                )],
+                descriptors: &[],
+                prototype: parents.erase(),
             },
             &scope,
         );
@@ -971,6 +974,7 @@ fn jump_if_truthy_follows_toboolean() {
                     kind: MapKind::OBJECT,
                     value_slot_count: 0,
                     descriptors: &[],
+                    prototype: void.erase(),
                 },
                 &scope,
             );
@@ -1087,6 +1091,7 @@ fn accessor_object_program(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void;
+        let undefined = thread.heap().known().undefined;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
         let z = thread.intern(&scope, "z");
@@ -1110,8 +1115,8 @@ fn accessor_object_program(
             );
             callable_object(thread, &scope, info).value()
         };
-        let get = getter.map_or(void.value(), |p| make(&mut *thread, p));
-        let set = setter.map_or(void.value(), |p| make(&mut *thread, p));
+        let get = getter.map_or(undefined.value(), |p| make(&mut *thread, p));
+        let set = setter.map_or(undefined.value(), |p| make(&mut *thread, p));
         let pair = thread
             .heap()
             .allocate_handle::<AccessorPair>((get, set), &scope);
@@ -1132,6 +1137,7 @@ fn accessor_object_program(
                         pair.value(),
                     ),
                 ],
+                prototype: void.erase(),
             },
             &scope,
         );
@@ -1295,6 +1301,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                     WRITABLE_VALUE,
                     Smi::new(0).encode(),
                 )],
+                prototype: void.erase(),
             },
             &scope,
         );
@@ -1337,9 +1344,9 @@ fn store_new_accessor_property_defines_own_accessor() {
             .create_handle(Tagged::from_value(getter.value()))
             .expect("getter is strong");
         let set = scope
-            .create_handle(Tagged::from_value(void.value()))
-            .expect("void is strong");
-        Object::store_new_accessor_property(thread.heap(), obj, name, get, set).unwrap();
+            .create_handle(Tagged::from_value(thread.heap().known().undefined.value()))
+            .expect("undefined is strong");
+        Object::store_new_accessor_property(thread.heap(), &scope, obj, name, get, set).unwrap();
 
         // program: acc = param0.x
         let consts = thread
@@ -1384,6 +1391,7 @@ fn native_function<'s>(
                 .union(MapKind::NATIVE),
             value_slot_count: 1,
             descriptors: &[],
+            prototype: void.erase(),
         },
         scope,
     );
@@ -2105,4 +2113,210 @@ fn closure_captures_function_context_end_to_end() {
         thread.execute(caller, &[])
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 1);
+}
+
+/// Host-side: an extendable object with a writable `p = 7` slot.
+fn proto_object<'s>(
+    thread: &mut Thread,
+    scope: &'s HandleScope<'_>,
+    p: vm::Handle<'s, vm::InternedString>,
+) -> vm::Handle<'s, Object> {
+    let void = thread.heap().known().void;
+    let map = thread.heap().allocate_handle::<Map>(
+        MapInit {
+            kind: EXTENDABLE,
+            value_slot_count: 1,
+            descriptors: &[(
+                SlotName::from(p.as_tagged()),
+                WRITABLE_VALUE,
+                Smi::new(0).encode(),
+            )],
+            prototype: void.erase(),
+        },
+        scope,
+    );
+    thread
+        .heap()
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map,
+                values: &[smi(7)],
+                elements: void.erase(),
+                length: 0,
+            },
+        )
+        .into_handle(scope)
+}
+
+#[test]
+fn set_prototype_changes_property_lookup_chain() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r0 = {}; r0.[[Prototype]] = objB (p = 7); return r0.p
+    let result = thread.handle_scope(|thread, scope| {
+        let p = thread.intern(&scope, "p");
+        let obj_b = proto_object(&mut *thread, &scope, p);
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[p.as_tagged().erase(), obj_b.as_tagged().erase()],
+            &scope,
+        );
+
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadConstant, &[1]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::Load, &[0]);
+        emit(&mut program, Opcode::SetPrototype, &[1]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 2,
+                handlers: None,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.execute(callable, &[])
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+#[test]
+fn set_prototype_survives_property_transitions() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r0 = {}; r0.[[Prototype]] = objB; r0.x = 1 (transition); return r0.p
+    let result = thread.handle_scope(|thread, scope| {
+        let p = thread.intern(&scope, "p");
+        let x = thread.intern(&scope, "x");
+        let obj_b = proto_object(&mut *thread, &scope, p);
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[
+                p.as_tagged().erase(),
+                obj_b.as_tagged().erase(),
+                x.as_tagged().erase(),
+            ],
+            &scope,
+        );
+
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadConstant, &[1]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::Load, &[0]);
+        emit(&mut program, Opcode::SetPrototype, &[1]);
+        emit(&mut program, Opcode::LoadSmi, &[1]);
+        emit(&mut program, Opcode::StoreNamedPropertyShadow, &[0, 2, 0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 2,
+                handlers: None,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.execute(callable, &[])
+    });
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
+}
+
+#[test]
+fn set_prototype_cycle_throws_type_error() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // r0 = {}; r0.[[Prototype]] = r0 (cycle)
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
+    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::SetPrototype, &[0]);
+    emit(&mut program, Opcode::Return, &[]);
+
+    let result = run_program(&mut thread, program, 1, &[]);
+    expect_escaped(&mut thread, result, "TypeError");
+}
+
+#[test]
+fn set_prototype_on_non_extensible_throws_type_error() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let result = thread.handle_scope(|thread, scope| {
+        let p = thread.intern(&scope, "p");
+        let obj_b = proto_object(&mut *thread, &scope, p);
+
+        // host-side: a plain, non-extendable object
+        let void = thread.heap().known().void;
+        let map = thread.heap().allocate_handle::<Map>(
+            MapInit {
+                kind: MapKind::OBJECT,
+                value_slot_count: 0,
+                descriptors: &[],
+                prototype: void.erase(),
+            },
+            &scope,
+        );
+        let frozen = thread
+            .heap()
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: &[],
+                    elements: void.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope);
+
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[frozen.as_tagged().erase(), obj_b.as_tagged().erase()],
+            &scope,
+        );
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadConstant, &[1]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::Load, &[0]);
+        emit(&mut program, Opcode::SetPrototype, &[1]);
+        emit(&mut program, Opcode::Return, &[]);
+
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants: consts,
+                register_count: 2,
+                handlers: None,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.execute(callable, &[])
+    });
+    expect_escaped(&mut thread, result, "TypeError");
 }

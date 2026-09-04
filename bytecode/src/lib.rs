@@ -18,6 +18,9 @@ pub enum Opcode {
     LoadContextSlot,  // idx (slot) uimm (depth) -> acc; from the frame context
     StoreContextSlot, // acc -> idx (slot) uimm (depth); frame context
 
+    // JS [[SetPrototypeOf]]: acc (object) gets reg (prototype) as [[Prototype]]
+    SetPrototype, // reg -> (acc stays the object)
+
     CreateFunctionContext, // uimm (slot count) -> acc; outer = frame context
     CreateBlockContext,    // uimm (slot count) -> acc; outer = frame context
     CreateCatchContext,    // reg (exception) -> acc; outer = frame context
@@ -162,6 +165,7 @@ impl Opcode {
             b if b == StoreGlobal as u8 => StoreGlobal,
             b if b == LoadContextSlot as u8 => LoadContextSlot,
             b if b == StoreContextSlot as u8 => StoreContextSlot,
+            b if b == SetPrototype as u8 => SetPrototype,
             b if b == CreateFunctionContext as u8 => CreateFunctionContext,
             b if b == CreateBlockContext as u8 => CreateBlockContext,
             b if b == CreateCatchContext as u8 => CreateCatchContext,
@@ -221,6 +225,8 @@ impl Opcode {
 
             Self::LoadContextSlot => &[Index, UImmediate],
             Self::StoreContextSlot => &[Index, UImmediate],
+
+            Self::SetPrototype => &[Register],
 
             Self::CreateFunctionContext | Self::CreateBlockContext => &[UImmediate],
             Self::CreateCatchContext => &[Register],
