@@ -1,4 +1,4 @@
-use bytecode::{Opcode, decode};
+use bytecode::{Opcode, Operands, decode};
 
 use vm::{
     Context, FixedArray, Float, Handle, Heap, HeapRef, InternedString, Lookup, Map, NoGc, Object,
@@ -193,6 +193,8 @@ fn store_transition(
 }
 
 /// Materialize a VM error as an ECMAScript error object
+#[cold]
+#[inline(never)]
 pub fn error_from_vm_error(
     vm: &VM,
     heap: &mut Heap,
@@ -292,6 +294,8 @@ enum Unwind {
     Escaped,
 }
 
+#[cold]
+#[inline(never)]
 fn exception_dispatch(
     heap: &mut Heap,
     state: &ContextState,
@@ -331,6 +335,8 @@ fn exception_dispatch(
     }
 }
 
+#[cold]
+#[inline(never)]
 fn raise(
     vm: &VM,
     heap: &mut Heap,
@@ -350,14 +356,12 @@ fn raise(
 }
 
 // TODO: pass stack and cache directly, could be benificial for threading dispatch later
-// TODO: cleanup error handling here
 fn dispatch(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
     base_depth: usize,
 ) -> Result<Value, VmError> {
-    let stack = &state.stack;
     let cache = &state.cache;
     let mut acc = heap.known().undefined.value();
     loop {
@@ -366,504 +370,389 @@ fn dispatch(
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
-        match op {
-            Opcode::Return => {
-                // a nested run stops above the frame suspended on its entry
-                if stack.frame_depth() == base_depth {
-                    return Ok(acc);
-                }
-                let caller = stack
-                    .pop_frame(meta.base)
-                    .expect("suspended frame above base depth");
-                cache.load(stack, caller, heap);
-            }
-            Opcode::Load => {
-                acc = stack.reg(&meta, ops.reg(0));
-            }
-            Opcode::Store => {
-                stack.set_reg(&meta, ops.reg(0), acc);
-            }
-            Opcode::Move => {
-                let v = stack.reg(&meta, ops.reg(1));
-                stack.set_reg(&meta, ops.reg(0), v);
-            }
-            Opcode::LoadSmi => {
-                acc = Smi::new(ops.imm(0) as i64).encode();
-            }
-            Opcode::LoadConstant => {
-                let v = heap.no_gc(|nogc, _| cache.constants_ref(nogc).at(ops.idx(0)));
-                acc = v;
-            }
-            Opcode::Add => {
-                // TODO: JS semantics
-                let Some(a) = Smi::decode(stack.reg(&meta, ops.reg(0))) else {
-                    match raise(vm, heap, state, base_depth, acc, VmError::Type, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    }
-                };
-                let Some(b) = Smi::decode(stack.reg(&meta, ops.reg(1))) else {
-                    match raise(vm, heap, state, base_depth, acc, VmError::Type, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    }
-                };
-                let Some(r) = a.value().checked_add(b.value()) else {
-                    match raise(vm, heap, state, base_depth, acc, VmError::Overflow, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    }
-                };
-                if !Smi::in_range(r) {
-                    match raise(vm, heap, state, base_depth, acc, VmError::Overflow, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    }
-                }
-                acc = Smi::new(r).encode();
-            }
-            Opcode::Jump => {
-                cache.set_pc(jump_target(pc, ops.imm(0)));
-            }
-            Opcode::JumpLoop => {
-                cache.spill_acc(acc);
-                heap.safepoint_poll();
-                acc = cache.take_acc();
-                cache.set_pc(jump_target(pc, ops.imm(0)));
-            }
-            Opcode::JumpIfTruthy => {
-                if heap.no_gc(|nogc, heap| is_truthy(nogc, heap, acc)) {
-                    cache.set_pc(jump_target(pc, ops.imm(0)));
-                }
-            }
-            Opcode::JumpIfFalsy => {
-                if !heap.no_gc(|nogc, heap| is_truthy(nogc, heap, acc)) {
-                    cache.set_pc(jump_target(pc, ops.imm(0)));
-                }
-            }
-            Opcode::TestReferenceEqual => {
-                let other = stack.reg(&meta, ops.reg(0));
-                let known = heap.known();
-                acc = if other == acc {
-                    known.true_object.value()
-                } else {
-                    known.false_object.value()
-                };
-            }
-            Opcode::Throw | Opcode::ReThrow => {
-                state.set_pending_exception(acc);
+        let result = step(vm, heap, state, base_depth, &mut acc, op, ops, meta, pc);
+        match result {
+            Step::Next => {}
+            Step::Return(v) => return Ok(v),
+            Step::Throw(v) => {
+                state.set_pending_exception(v);
                 match exception_dispatch(heap, state, base_depth, pc) {
-                    Unwind::Caught(ex) => {
-                        acc = ex;
-                        continue;
-                    }
+                    Unwind::Caught(ex) => acc = ex,
                     Unwind::Escaped => return Ok(heap.known().exception.value()),
                 }
             }
-            Opcode::CallNative => {
-                let f = vm.native(NativeIndex(ops.idx(0)));
-                let count = ops.reg_count(2);
-                let mut nctx = NativeContext::new(vm, heap, state);
-                cache.spill_acc(acc);
-                let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
-                let saved = cache.take_acc();
-                match result {
-                    Ok(v) if v == heap.known().exception.value() => {
-                        match exception_dispatch(heap, state, base_depth, pc) {
-                            Unwind::Caught(ex) => {
-                                acc = ex;
-                                continue;
-                            }
-                            Unwind::Escaped => return Ok(heap.known().exception.value()),
-                        }
-                    }
-                    Ok(v) => acc = v,
-                    Err(err) => match raise(vm, heap, state, base_depth, saved, err, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    },
-                }
-            }
-            // TODO: feedback vectors and separation once they are there
-            Opcode::Call | Opcode::CallNoFeedback => {
-                let count = ops.reg_count(2);
-                let target =
-                    heap.no_gc(|nogc, heap| call_target(nogc, heap, stack.reg(&meta, ops.reg(0))));
-                let target = match target {
-                    Some(target) => target,
-                    None => match raise(vm, heap, state, base_depth, acc, VmError::Type, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    },
-                };
-                match target {
-                    CallTarget::Native(idx) => {
-                        let f = vm.native(NativeIndex(idx));
-                        let mut nctx = NativeContext::new(vm, heap, state);
-                        cache.spill_acc(acc);
-                        let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
-                        let saved = cache.take_acc();
-                        match result {
-                            Ok(v) if v == heap.known().exception.value() => {
-                                match exception_dispatch(heap, state, base_depth, pc) {
-                                    Unwind::Caught(ex) => {
-                                        acc = ex;
-                                        continue;
-                                    }
-                                    Unwind::Escaped => return Ok(heap.known().exception.value()),
-                                }
-                            }
-                            Ok(v) => acc = v,
-                            Err(err) => match raise(vm, heap, state, base_depth, saved, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            },
-                        }
-                    }
-                    CallTarget::Bytecode(target, register_count) => {
-                        let callee = stack.push_frame(
-                            meta,
-                            pc,
-                            target,
-                            register_count,
-                            ops.reg_list(1),
-                            count,
-                        );
-                        let callee = match callee {
-                            Ok(callee) => callee,
-                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            },
-                        };
-                        cache.load(stack, callee, heap);
-                    }
-                }
-            }
-            Opcode::LoadNamedProperty => {
-                let outcome = heap.no_gc(|nogc, heap| {
-                    let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
-                    load_outcome(nogc, heap, stack.reg(&meta, ops.reg(0)), name)
-                });
-                match outcome {
-                    LoadOutcome::Value(v) => acc = v,
-                    LoadOutcome::Getter(getter) => {
-                        let receiver = stack.reg(&meta, ops.reg(0));
-                        let called = call_value(heap, stack, cache, meta, pc, getter, &[receiver]);
-                        let called = match called {
-                            Ok(called) => called,
-                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            },
-                        };
-                        if !called {
-                            // non-callable getter: the load yields undefined
-                            acc = heap.known().undefined.value();
-                        }
-                    }
-                }
-            }
-            Opcode::StoreNamedProperty | Opcode::StoreNamedPropertyShadow => {
-                let semantics = match op {
-                    Opcode::StoreNamedPropertyShadow => StoreSemantics::Shadow,
-                    _ => StoreSemantics::WriteThrough,
-                };
-                let outcome = heap.no_gc(|nogc, heap| {
-                    let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
-                    stack
-                        .reg(&meta, ops.reg(0))
-                        .store_lookup(nogc, heap, name, acc, semantics)
-                });
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    },
-                };
-                match outcome {
-                    StoreOutcome::Transition { receiver, name } => {
-                        cache.spill_acc(acc);
-                        let result = store_transition(heap, state, receiver, name, acc);
-                        let _ = cache.take_acc();
-                        if let Err(err) = result {
-                            match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            }
-                        }
-                    }
-                    StoreOutcome::CallSetter { setter } => {
-                        let receiver = stack.reg(&meta, ops.reg(0));
-                        let called =
-                            call_value(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
-                        match called {
-                            Ok(_) => {}
-                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            },
-                        }
-                    }
-                    StoreOutcome::Done => {}
-                }
-            }
-            Opcode::LoadKeyedProperty => {
-                let outcome = heap.no_gc(|nogc, heap| {
-                    let receiver = stack.reg(&meta, ops.reg(0));
-                    match classify_key(nogc, heap, acc)? {
-                        Key::Element(i) => {
-                            let arr = element_array(nogc, heap, receiver, i)?;
-                            Ok(LoadOutcome::Value(arr.at(i)))
-                        }
-                        Key::Name(name) => Ok(load_outcome(nogc, heap, receiver, name)),
-                    }
-                });
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    },
-                };
-                match outcome {
-                    LoadOutcome::Value(v) => acc = v,
-                    LoadOutcome::Getter(getter) => {
-                        let receiver = stack.reg(&meta, ops.reg(0));
-                        let called = call_value(heap, stack, cache, meta, pc, getter, &[receiver]);
-                        let called = match called {
-                            Ok(called) => called,
-                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            },
-                        };
-                        if !called {
-                            acc = heap.known().undefined.value();
-                        }
-                    }
-                }
-            }
-            Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyShadow => {
-                let semantics = match op {
-                    Opcode::StoreKeyedPropertyShadow => StoreSemantics::Shadow,
-                    _ => StoreSemantics::WriteThrough,
-                };
-                let outcome = heap.no_gc(|nogc, heap| {
-                    let receiver = stack.reg(&meta, ops.reg(0));
-                    let key = stack.reg(&meta, ops.reg(1));
-                    match classify_key(nogc, heap, key)? {
-                        Key::Element(i) => {
-                            let arr = element_array(nogc, heap, receiver, i)?;
-                            arr.set(heap, i, acc);
-                            Ok(StoreOutcome::Done)
-                        }
-                        Key::Name(name) => receiver.store_lookup(nogc, heap, name, acc, semantics),
-                    }
-                });
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    },
-                };
-                match outcome {
-                    StoreOutcome::Transition { receiver, name } => {
-                        cache.spill_acc(acc);
-                        let result = store_transition(heap, state, receiver, name, acc);
-                        let _ = cache.take_acc();
-                        if let Err(err) = result {
-                            match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            }
-                        }
-                    }
-                    StoreOutcome::CallSetter { setter } => {
-                        let receiver = stack.reg(&meta, ops.reg(0));
-                        let called =
-                            call_value(heap, stack, cache, meta, pc, setter, &[receiver, acc]);
-                        match called {
-                            Ok(_) => {}
-                            Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                                Unwind::Caught(ex) => {
-                                    acc = ex;
-                                    continue;
-                                }
-                                Unwind::Escaped => return Ok(heap.known().exception.value()),
-                            },
-                        }
-                    }
-                    StoreOutcome::Done => {}
-                }
-            }
-            Opcode::CreateObjectFromMap => {
-                let map = heap.no_gc(|nogc, heap| {
-                    let v = cache.constants_ref(nogc).at(ops.idx(0));
-                    v.get_as::<Map>(nogc, heap.known().map_map)
-                        .map(|r| r.into_tagged())
-                        .ok_or(VmError::Type)
-                });
-                let map = match map {
-                    Ok(map) => map,
-                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    },
-                };
-                let count = ops.reg_count(2);
-                cache.spill_acc(acc);
-                let args = stack.args(&meta, ops.reg_list(1), count);
-
-                // TODO: maybe have a handlescope always accessible or a quickspill cache
-                let obj = state.handle_scope(|scope| {
-                    let map = scope.create_handle(map).expect("map is a strong pointer");
-                    heap.allocate_object(
-                        &scope,
-                        ObjectSlotsInit {
-                            map,
-                            values: args,
-                            elements: heap.known().empty_fixed_array.erase(),
-                            length: 0,
-                        },
-                    )
-                });
-                let _ = cache.take_acc();
-                acc = obj.erase();
-            }
-            // TODO: create more array creation operations, this one is only for &[Value]
-            Opcode::CreateArrayLiteral => {
-                let count = ops.reg_count(1);
-                cache.spill_acc(acc);
-                let args = stack.args(&meta, ops.reg_list(0), count);
-                let array = heap
-                    .allocate_enter_nogc(args, |dst: HeapRef<'_, FixedArray>, _nogc, _| {
-                        dst.into_tagged().erase()
-                    });
-                let _ = cache.take_acc();
-                acc = array;
-            }
-            Opcode::LoadContextSlot => {
-                let v = heap.no_gc(|nogc, heap| {
-                    let ValueRef::Object(obj) = stack.callable_slot(&meta).inner().value_ref(nogc)
-                    else {
-                        return Err(VmError::Type);
-                    };
-                    let info = obj
-                        .as_ref()
-                        .callable_info(nogc, heap)
-                        .ok_or(VmError::Type)?;
-                    let context = info
-                        .context
-                        .inner()
-                        .get_as::<Context>(nogc, heap.known().context_map)
-                        .ok_or(VmError::Type)?;
-                    Ok(context
-                        .slots
-                        .heap_ref(nogc)
-                        .as_ref()
-                        .element_slot(ops.idx(0))
-                        .inner())
-                });
-                let v = match v {
-                    Ok(v) => v,
-                    Err(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    },
-                };
-                acc = v;
-            }
-            Opcode::StoreContextSlot => {
-                let result = heap.no_gc(|nogc, heap| {
-                    let ValueRef::Object(obj) = stack.callable_slot(&meta).inner().value_ref(nogc)
-                    else {
-                        return Err(VmError::Type);
-                    };
-                    let info = obj
-                        .as_ref()
-                        .callable_info(nogc, heap)
-                        .ok_or(VmError::Type)?;
-                    let host = info.context.inner();
-                    let context = info
-                        .context
-                        .inner()
-                        .get_as::<Context>(nogc, heap.known().context_map)
-                        .ok_or(VmError::Type)?;
-                    context.slots.heap_ref(nogc).element_slot(ops.idx(0)).set(
-                        heap,
-                        host,
-                        Tagged::from_value(acc),
-                    );
-                    Ok(())
-                });
-                if let Err(err) = result {
-                    match raise(vm, heap, state, base_depth, acc, err, pc) {
-                        Unwind::Caught(ex) => {
-                            acc = ex;
-                            continue;
-                        }
-                        Unwind::Escaped => return Ok(heap.known().exception.value()),
-                    }
-                }
-            }
-            Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),
+            Step::PendingThrow => match exception_dispatch(heap, state, base_depth, pc) {
+                Unwind::Caught(ex) => acc = ex,
+                Unwind::Escaped => return Ok(heap.known().exception.value()),
+            },
+            Step::Error(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
+                Unwind::Caught(ex) => acc = ex,
+                Unwind::Escaped => return Ok(heap.known().exception.value()),
+            },
         }
+    }
+}
+
+enum Step {
+    Next,
+    Return(Value),
+    Throw(Value),
+    PendingThrow,
+    Error(VmError),
+}
+
+macro_rules! step_try {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(err) => return Step::Error(err),
+        }
+    };
+}
+
+fn apply_store_outcome(
+    heap: &mut Heap,
+    state: &ContextState,
+    stack: &Stack,
+    cache: &StackCache,
+    meta: FrameMeta,
+    pc: usize,
+    receiver: Value,
+    acc: Value,
+    outcome: StoreOutcome,
+) -> Result<(), VmError> {
+    match outcome {
+        StoreOutcome::Transition { receiver, name } => {
+            cache.spill_acc(acc);
+            let result = store_transition(heap, state, receiver, name, acc);
+            let _ = cache.take_acc();
+            result
+        }
+        StoreOutcome::CallSetter { setter } => {
+            call_value(heap, stack, cache, meta, pc, setter, &[receiver, acc])?;
+            Ok(())
+        }
+        StoreOutcome::Done => Ok(()),
+    }
+}
+
+fn step(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    base_depth: usize,
+    acc: &mut Value,
+    op: Opcode,
+    ops: Operands,
+    meta: FrameMeta,
+    pc: usize,
+) -> Step {
+    let stack = &state.stack;
+    let cache = &state.cache;
+
+    match op {
+        Opcode::Return => {
+            // a nested run stops above the frame suspended on its entry
+            if stack.frame_depth() == base_depth {
+                return Step::Return(*acc);
+            }
+            let caller = stack
+                .pop_frame(meta.base)
+                .expect("suspended frame above base depth");
+            cache.load(stack, caller, heap);
+            Step::Next
+        }
+        Opcode::Load => {
+            *acc = stack.reg(&meta, ops.reg(0));
+            Step::Next
+        }
+        Opcode::Store => {
+            stack.set_reg(&meta, ops.reg(0), *acc);
+            Step::Next
+        }
+        Opcode::Move => {
+            let v = stack.reg(&meta, ops.reg(1));
+            stack.set_reg(&meta, ops.reg(0), v);
+            Step::Next
+        }
+        Opcode::LoadSmi => {
+            *acc = Smi::new(ops.imm(0) as i64).encode();
+            Step::Next
+        }
+        Opcode::LoadConstant => {
+            let v = heap.no_gc(|nogc, _| cache.constants_ref(nogc).at(ops.idx(0)));
+            *acc = v;
+            Step::Next
+        }
+        Opcode::Add => {
+            // TODO: JS semantics
+            let a = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type));
+            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(1))).ok_or(VmError::Type));
+            let r = step_try!(a.value().checked_add(b.value()).ok_or(VmError::Overflow));
+            if !Smi::in_range(r) {
+                return Step::Error(VmError::Overflow);
+            }
+            *acc = Smi::new(r).encode();
+            Step::Next
+        }
+        Opcode::Jump => {
+            cache.set_pc(jump_target(pc, ops.imm(0)));
+            Step::Next
+        }
+        Opcode::JumpLoop => {
+            cache.spill_acc(*acc);
+            heap.safepoint_poll();
+            *acc = cache.take_acc();
+            cache.set_pc(jump_target(pc, ops.imm(0)));
+            Step::Next
+        }
+        Opcode::JumpIfTruthy => {
+            if heap.no_gc(|nogc, heap| is_truthy(nogc, heap, *acc)) {
+                cache.set_pc(jump_target(pc, ops.imm(0)));
+            }
+            Step::Next
+        }
+        Opcode::JumpIfFalsy => {
+            if !heap.no_gc(|nogc, heap| is_truthy(nogc, heap, *acc)) {
+                cache.set_pc(jump_target(pc, ops.imm(0)));
+            }
+            Step::Next
+        }
+        Opcode::TestReferenceEqual => {
+            let other = stack.reg(&meta, ops.reg(0));
+            let known = heap.known();
+            *acc = if other == *acc {
+                known.true_object.value()
+            } else {
+                known.false_object.value()
+            };
+            Step::Next
+        }
+        Opcode::Throw | Opcode::ReThrow => Step::Throw(*acc),
+        Opcode::CallNative => {
+            let f = vm.native(NativeIndex(ops.idx(0)));
+            let count = ops.reg_count(2);
+            let mut nctx = NativeContext::new(vm, heap, state);
+            cache.spill_acc(*acc);
+            let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
+            let _ = cache.take_acc();
+            match result {
+                Ok(v) if v == heap.known().exception.value() => Step::PendingThrow,
+                Ok(v) => {
+                    *acc = v;
+                    Step::Next
+                }
+                Err(err) => Step::Error(err),
+            }
+        }
+        // TODO: feedback vectors and separation once they are there
+        Opcode::Call | Opcode::CallNoFeedback => {
+            let count = ops.reg_count(2);
+            let target =
+                heap.no_gc(|nogc, heap| call_target(nogc, heap, stack.reg(&meta, ops.reg(0))));
+            let Some(target) = target else {
+                return Step::Error(VmError::Type);
+            };
+            match target {
+                CallTarget::Native(idx) => {
+                    let f = vm.native(NativeIndex(idx));
+                    let mut nctx = NativeContext::new(vm, heap, state);
+                    cache.spill_acc(*acc);
+                    let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
+                    let _ = cache.take_acc();
+                    match result {
+                        Ok(v) if v == heap.known().exception.value() => Step::PendingThrow,
+                        Ok(v) => {
+                            *acc = v;
+                            Step::Next
+                        }
+                        Err(err) => Step::Error(err),
+                    }
+                }
+                CallTarget::Bytecode(target, register_count) => {
+                    let callee = step_try!(stack.push_frame(
+                        meta,
+                        pc,
+                        target,
+                        register_count,
+                        ops.reg_list(1),
+                        count,
+                    ));
+                    cache.load(stack, callee, heap);
+                    Step::Next
+                }
+            }
+        }
+        Opcode::LoadNamedProperty => {
+            let outcome = heap.no_gc(|nogc, heap| {
+                let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
+                load_outcome(nogc, heap, stack.reg(&meta, ops.reg(0)), name)
+            });
+            match outcome {
+                LoadOutcome::Value(v) => *acc = v,
+                LoadOutcome::Getter(getter) => {
+                    let receiver = stack.reg(&meta, ops.reg(0));
+                    let called =
+                        step_try!(call_value(heap, stack, cache, meta, pc, getter, &[receiver]));
+                    if !called {
+                        // non-callable getter: the load yields undefined
+                        *acc = heap.known().undefined.value();
+                    }
+                }
+            }
+            Step::Next
+        }
+        Opcode::StoreNamedProperty | Opcode::StoreNamedPropertyShadow => {
+            let semantics = match op {
+                Opcode::StoreNamedPropertyShadow => StoreSemantics::Shadow,
+                _ => StoreSemantics::WriteThrough,
+            };
+            let receiver = stack.reg(&meta, ops.reg(0));
+            let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                let name = property_name(nogc, heap, cache.constants_ref(nogc), ops.idx(1));
+                receiver.store_lookup(nogc, heap, name, *acc, semantics)
+            }));
+            step_try!(apply_store_outcome(
+                heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
+            ));
+            Step::Next
+        }
+        Opcode::LoadKeyedProperty => {
+            let receiver = stack.reg(&meta, ops.reg(0));
+            let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                match classify_key(nogc, heap, *acc)? {
+                    Key::Element(i) => {
+                        let arr = element_array(nogc, heap, receiver, i)?;
+                        Ok(LoadOutcome::Value(arr.at(i)))
+                    }
+                    Key::Name(name) => Ok(load_outcome(nogc, heap, receiver, name)),
+                }
+            }));
+            match outcome {
+                LoadOutcome::Value(v) => *acc = v,
+                LoadOutcome::Getter(getter) => {
+                    let called =
+                        step_try!(call_value(heap, stack, cache, meta, pc, getter, &[receiver]));
+                    if !called {
+                        *acc = heap.known().undefined.value();
+                    }
+                }
+            }
+            Step::Next
+        }
+        Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyShadow => {
+            let semantics = match op {
+                Opcode::StoreKeyedPropertyShadow => StoreSemantics::Shadow,
+                _ => StoreSemantics::WriteThrough,
+            };
+            let receiver = stack.reg(&meta, ops.reg(0));
+            let key = stack.reg(&meta, ops.reg(1));
+            let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                match classify_key(nogc, heap, key)? {
+                    Key::Element(i) => {
+                        let arr = element_array(nogc, heap, receiver, i)?;
+                        arr.set(heap, i, *acc);
+                        Ok(StoreOutcome::Done)
+                    }
+                    Key::Name(name) => receiver.store_lookup(nogc, heap, name, *acc, semantics),
+                }
+            }));
+            step_try!(apply_store_outcome(
+                heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
+            ));
+            Step::Next
+        }
+        Opcode::CreateObjectFromMap => {
+            let map = step_try!(heap.no_gc(|nogc, heap| {
+                let v = cache.constants_ref(nogc).at(ops.idx(0));
+                v.get_as::<Map>(nogc, heap.known().map_map)
+                    .map(|r| r.into_tagged())
+                    .ok_or(VmError::Type)
+            }));
+            let count = ops.reg_count(2);
+            cache.spill_acc(*acc);
+            let args = stack.args(&meta, ops.reg_list(1), count);
+
+            // TODO: maybe have a handlescope always accessible or a quickspill cache
+            let obj = state.handle_scope(|scope| {
+                let map = scope.create_handle(map).expect("map is a strong pointer");
+                heap.allocate_object(
+                    &scope,
+                    ObjectSlotsInit {
+                        map,
+                        values: args,
+                        elements: heap.known().empty_fixed_array.erase(),
+                        length: 0,
+                    },
+                )
+            });
+            let _ = cache.take_acc();
+            *acc = obj.erase();
+            Step::Next
+        }
+        // TODO: create more array creation operations, this one is only for &[Value]
+        Opcode::CreateArrayLiteral => {
+            let count = ops.reg_count(1);
+            cache.spill_acc(*acc);
+            let args = stack.args(&meta, ops.reg_list(0), count);
+            let array = heap
+                .allocate_enter_nogc(args, |dst: HeapRef<'_, FixedArray>, _nogc, _| {
+                    dst.into_tagged().erase()
+                });
+            let _ = cache.take_acc();
+            *acc = array;
+            Step::Next
+        }
+        Opcode::LoadContextSlot => {
+            let v = step_try!(heap.no_gc(|nogc, heap| {
+                let ValueRef::Object(obj) = stack.callable_slot(&meta).inner().value_ref(nogc)
+                else {
+                    return Err(VmError::Type);
+                };
+                let info = obj
+                    .as_ref()
+                    .callable_info(nogc, heap)
+                    .ok_or(VmError::Type)?;
+                let context = info
+                    .context
+                    .inner()
+                    .get_as::<Context>(nogc, heap.known().context_map)
+                    .ok_or(VmError::Type)?;
+                Ok(context
+                    .slots
+                    .heap_ref(nogc)
+                    .as_ref()
+                    .element_slot(ops.idx(0))
+                    .inner())
+            }));
+            *acc = v;
+            Step::Next
+        }
+        Opcode::StoreContextSlot => {
+            step_try!(heap.no_gc(|nogc, heap| {
+                let ValueRef::Object(obj) = stack.callable_slot(&meta).inner().value_ref(nogc)
+                else {
+                    return Err(VmError::Type);
+                };
+                let info = obj
+                    .as_ref()
+                    .callable_info(nogc, heap)
+                    .ok_or(VmError::Type)?;
+                let host = info.context.inner();
+                let context = info
+                    .context
+                    .inner()
+                    .get_as::<Context>(nogc, heap.known().context_map)
+                    .ok_or(VmError::Type)?;
+                context.slots.heap_ref(nogc).element_slot(ops.idx(0)).set(
+                    heap,
+                    host,
+                    Tagged::from_value(*acc),
+                );
+                Ok(())
+            }));
+            Step::Next
+        }
+        Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),
     }
 }
