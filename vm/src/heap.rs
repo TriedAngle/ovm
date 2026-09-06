@@ -1,7 +1,8 @@
 use crate::{
-    Context, ContextInit, FixedArray, Global, Handle, HandleData, HandleScope, HandleSet,
-    HeapObject, HeapPtr, Map, MapInit, MapKind, Object, ObjectInit, ObjectSlotsInit, RootHandles,
-    STRONG_PTR, Smi, StringInterner, Symbol, Tagged, TransitionLock, Value, Word,
+    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
+    Handle, HandleData, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapInit, MapKind, Object,
+    ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, Smi, StringInterner, Symbol, Tagged,
+    TransitionLock, Value, Word,
 };
 use core::{
     alloc::Layout,
@@ -76,6 +77,10 @@ pub struct WellKnown {
     pub array_prototype: Global<Object>,
     /// `%Error.prototype%`: parent of all error instance maps.
     pub error_prototype: Global<Object>,
+    /// `%Function.prototype%` (ES 19.2.3): the canonical empty function — a
+    /// callable, non-constructable function whose `[[Prototype]]` is
+    /// `%Object.prototype%`; the `[[Prototype]]` of ordinary function objects.
+    pub function_prototype: Global<Object>,
     /// The realm global object: global variables are properties on it
     /// (top-level `var`/assignments; lexical script-context globals later).
     pub global_object: Global<Object>,
@@ -127,6 +132,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         object_prototype: obj,
         array_prototype: obj,
         error_prototype: obj,
+        function_prototype: obj,
         global_object: obj,
         object_initial_map: map,
         function_map: map,
@@ -289,7 +295,12 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
 
     let function_map = heap
         .allocate::<Map>(MapInit {
-            kind: MapKind::OBJECT.union(MapKind::CALLABLE),
+            // TODO: arrow/generator functions get a non-constructor map
+            // once the compiler distinguishes them
+            kind: MapKind::OBJECT
+                .union(MapKind::CALLABLE)
+                .union(MapKind::CONSTRUCTOR)
+                .union(MapKind::EXTENDABLE),
             value_slot_count: 2,
             descriptors: &[],
             prototype: scope
@@ -420,6 +431,45 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         })
         .into_global(roots);
 
+    // %Function.prototype% (ES 19.2.3): the canonical empty function — a
+    // callable, non-constructable function whose [[Prototype]] is
+    // %Object.prototype%; the [[Prototype]] of ordinary function objects
+    // (patched onto function_map at the end). The body is a single
+    // `Return` (bytecode::Opcode::Return as u8) so calling it yields
+    // undefined.
+    let function_prototype_map = alloc_parent_map(
+        heap,
+        &scope,
+        roots,
+        MapKind::OBJECT
+            .union(MapKind::CALLABLE)
+            .union(MapKind::EXTENDABLE),
+        object_prototype,
+    );
+    let empty_code = heap.allocate::<FixedByteArray>(&[1]).into_handle(&scope);
+    let empty_constants = scope
+        .create_handle(known.empty_fixed_array.as_tagged())
+        .expect("empty fixed array is a strong pointer");
+    let empty_info = heap
+        .allocate::<CallableInfoObject>(CallableInfoInit {
+            bytecode: empty_code,
+            constants: empty_constants,
+            register_count: 0,
+            handlers: None,
+        })
+        .into_handle(&scope);
+    let function_prototype = heap
+        .allocate_object(
+            &scope,
+            ObjectSlotsInit {
+                map: function_prototype_map,
+                values: &[empty_info.value(), empty_context.as_tagged().erase()],
+                elements: known.empty_fixed_array.erase(),
+                length: 0,
+            },
+        )
+        .into_global(roots);
+
     known.undefined = undefined;
     known.undefined_map = undefined_map;
     known.false_object = false_object;
@@ -430,6 +480,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.object_prototype = object_prototype;
     known.array_prototype = array_prototype;
     known.error_prototype = error_prototype;
+    known.function_prototype = function_prototype;
     known.error_map = error_map;
     known.exception_map = exception_map;
     known.js_array_map = js_array_map;
@@ -445,6 +496,14 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         o.slots.set(heap, null.value(), empty);
         o.elements
             .set(heap, null.value(), Tagged::from_value(empty.erase()));
+        // ordinary function objects' [[Prototype]] is %Function.prototype%
+        // (ES 19.2.3.1): function_map was created with a null placeholder
+        // in bootstrap_basics.
+        known.function_map.heap_ref(nogc).prototype.set(
+            heap,
+            known.function_map.value(),
+            Tagged::from_value(function_prototype.value()),
+        );
     });
 }
 pub struct NoGc<'a> {

@@ -91,7 +91,7 @@ fn lookup_returns_innermost_of_nested_ranges() {
 
     thread.handle_scope(|thread, scope| {
         // inner entry emitted first: lookup must be independent of
-        // emission order, matching properly-nested try regions
+        // emission order (properly-nested try regions)
         let t = table(
             thread,
             &scope,

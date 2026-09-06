@@ -3,9 +3,10 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
-    FixedByteArray, Float, Handle, HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
-    ObjectSlotsInit, SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
-    Value, ValueRef, store_new_data_property_values, string_content_hash,
+    FixedByteArray, Float, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind,
+    Object, ObjectSlotsInit, PropertyDescriptor, SlotFlags, SlotName, Smi, StoreOutcome,
+    StoreSemantics, Tagged, VMString, Value, ValueRef, define_own_property_values, set_prototype,
+    string_content_hash,
 };
 
 fn smi(v: i64) -> Value {
@@ -753,17 +754,19 @@ fn keyed_store_new_property_via_string_key_transitions() {
 }
 
 #[test]
-fn named_store_new_property_to_non_extensible_fails() {
+fn named_store_new_property_to_non_extensible_is_ignored() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // plain OBJECT map: not extendable
+    // plain OBJECT map: not extendable. Sloppy-mode [[Set]] on an absent
+    // property silently does nothing ([[DefineOwnProperty]] returns false,
+    // which the store ignores; strict mode would throw).
     let result =
         transition_object_program(&mut thread, MapKind::OBJECT, WRITABLE_VALUE, |program| {
             emit(program, Opcode::LoadSmi, &[42]);
             emit(program, Opcode::StoreNamedProperty, &[2, 2, 0]);
         });
-    expect_escaped(&mut thread, result, "TypeError");
+    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
 
 #[test]
@@ -1367,7 +1370,19 @@ fn store_new_accessor_property_defines_own_accessor() {
         let set = scope
             .create_handle(Tagged::from_value(thread.heap().known().undefined.value()))
             .expect("undefined is strong");
-        Object::store_new_accessor_property(thread.heap(), &scope, obj, name, get, set).unwrap();
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::Accessor {
+                get: get.value(),
+                set: set.value(),
+                enumerable: true,
+                configurable: true,
+            },
+        )
+        .unwrap();
 
         // program: acc = param0.x
         let consts = thread
@@ -1409,7 +1424,8 @@ fn native_function<'s>(
         MapInit {
             kind: MapKind::OBJECT
                 .union(MapKind::CALLABLE)
-                .union(MapKind::NATIVE),
+                .union(MapKind::NATIVE)
+                .union(MapKind::CONSTRUCTOR),
             value_slot_count: 1,
             descriptors: &[],
             prototype: void.erase(),
@@ -1467,7 +1483,7 @@ fn bytecode_fn(
         .erase()
 }
 
-fn forty_two(_: &mut NativeContext<'_>, _: &[Value]) -> Result<Value, VmError> {
+fn forty_two(_: &mut NativeContext<'_>, _: GcSlice<'_>) -> Result<Value, VmError> {
     Ok(smi(42))
 }
 
@@ -1524,7 +1540,7 @@ fn call_dispatches_to_native_function_object() {
 
 /// Native that runs `6 + 7` in a fresh nested interpreter execution, where
 /// the inner program itself spills the accumulator for a CallNative.
-fn run_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Value, VmError> {
+fn run_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadSmi, &[0]);
@@ -1541,7 +1557,8 @@ fn run_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Value, VmE
         emit(&mut program, Opcode::Return, &[]);
 
         let callable = bytecode_fn(nctx, &scope, &program, &[], 3);
-        nctx.call(callable, &[])
+        // SAFETY: empty snapshot; consumed before any GC in the call
+        nctx.call(callable, unsafe { GcSlice::from_slice(&[]) })
     })
 }
 
@@ -1567,7 +1584,7 @@ fn native_reenters_interpreter_via_call() {
 
 /// Native that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the native recovers.
-fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Value, VmError> {
+fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // callee: Add on a non-smi accumulator -> TypeError throw
         let mut bad = Vec::new();
@@ -1584,7 +1601,8 @@ fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: &[Value]) -> Result<Va
         emit(&mut program, Opcode::Return, &[]);
         let caller = bytecode_fn(nctx, &scope, &program, &[callee], 1);
 
-        match nctx.call(caller, &[]) {
+        // SAFETY: empty snapshot; consumed before any GC in the call
+        match nctx.call(caller, unsafe { GcSlice::from_slice(&[]) }) {
             Ok(exc) if exc == nctx.heap().known().exception.value() => {
                 // the exception escapes the nested run as the sentinel with
                 // the pending exception set; the native recovers by
@@ -2259,8 +2277,13 @@ fn empty_object_literal_inherits_from_object_prototype() {
             .unwrap();
         match outcome {
             StoreOutcome::Transition { receiver, name } => {
-                store_new_data_property_values(thread.heap(), &scope, receiver, name, smi(1))
-                    .unwrap();
+                define_own_property_values(
+                    thread.heap(),
+                    &scope,
+                    receiver,
+                    name,
+                    PropertyDescriptor::data(smi(1)),
+                );
             }
             other => panic!("expected transition, got {other:?}"),
         }
@@ -2866,8 +2889,13 @@ fn set_property_fn(
     constants: &[Value],
 ) {
     let f = make_callable(thread, scope, program, constants);
-    store_new_data_property_values(thread.heap(), scope, obj, SlotName::from_value(name), f)
-        .unwrap();
+    define_own_property_values(
+        thread.heap(),
+        scope,
+        obj,
+        SlotName::from_value(name),
+        PropertyDescriptor::data(f),
+    );
 }
 
 fn program_return_1() -> Vec<u8> {
@@ -3100,7 +3128,19 @@ fn to_primitive_calls_getter_accessors() {
         let set = scope
             .create_handle(Tagged::from_value(thread.heap().known().undefined.value()))
             .expect("undefined is strong");
-        Object::store_new_accessor_property(thread.heap(), &scope, obj, name, get, set).unwrap();
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::Accessor {
+                get: get.value(),
+                set: set.value(),
+                enumerable: true,
+                configurable: true,
+            },
+        )
+        .unwrap();
 
         let r = run_program(
             &mut *thread,
@@ -3189,4 +3229,490 @@ fn value_of_exception_propagates() {
         &[obj, smi(1)],
     );
     expect_escaped(&mut thread, r, "TypeError");
+}
+
+/// acc = param0; acc = unary op; return acc
+fn unary_program(op: Opcode) -> Vec<u8> {
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
+    emit(&mut program, op, &[]);
+    emit(&mut program, Opcode::Return, &[]);
+    program
+}
+
+#[test]
+fn typeof_reports_spec_types() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let number = thread.intern(&scope, "number").value();
+        let string = thread.intern(&scope, "string").value();
+        let undefined = thread.intern(&scope, "undefined").value();
+        let object = thread.intern(&scope, "object").value();
+        let boolean = thread.intern(&scope, "boolean").value();
+        let function = thread.intern(&scope, "function").value();
+
+        let f = make_callable(thread, &scope, &program_return_1(), &[]);
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let float = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
+        let s = thread.intern(&scope, "x").value();
+        let known = thread.heap().known();
+
+        let cases: &[(Value, Value)] = &[
+            (smi(3), number),
+            (float, number),
+            (s, string),
+            (known.undefined.value(), undefined),
+            (known.null.value(), object),
+            (known.true_object.value(), boolean),
+            (known.false_object.value(), boolean),
+            (f, function),
+            (obj, object),
+        ];
+        for &(input, expected) in cases {
+            let r = run_program(&mut *thread, unary_program(Opcode::TestTypeof), 0, &[input]);
+            assert_eq!(r.unwrap(), expected, "typeof {input:?}");
+        }
+    });
+}
+
+#[test]
+fn negate_arithmetic_rules() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    // smi fast paths
+    let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(5)]).unwrap();
+    assert_eq!(Smi::decode(r).unwrap().value(), -5);
+    let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(-7)]).unwrap();
+    assert_eq!(Smi::decode(r).unwrap().value(), 7);
+
+    // -0 must be the -0.0 HeapNumber (1 / -0 === -Infinity)
+    let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(0)]).unwrap();
+    let r = thread.heap().no_gc(|nogc, heap| {
+        r.get_as::<Float>(nogc, heap.known().float_map)
+            .expect("-0 must stay a float")
+            .value
+            .get()
+    });
+    assert_eq!(r, 0.0);
+    assert!(r.is_sign_negative());
+
+    // Smi::MIN overflows to the double path
+    let r = run_program(
+        &mut thread,
+        unary_program(Opcode::Negate),
+        0,
+        &[smi(Smi::MIN)],
+    )
+    .unwrap();
+    assert_eq!(float_value(&mut thread, r), (1u64 << 62) as f64);
+
+    // floats and string coercion go through ToNumber
+    let r = thread.handle_scope(|thread, scope| {
+        let half = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
+        run_program(&mut *thread, unary_program(Opcode::Negate), 0, &[half]).unwrap()
+    });
+    assert_eq!(float_value(&mut thread, r), -1.5);
+    let r = thread.handle_scope(|thread, scope| {
+        let s3 = thread.intern(&scope, "3").value();
+        run_program(&mut *thread, unary_program(Opcode::Negate), 0, &[s3]).unwrap()
+    });
+    assert_eq!(Smi::decode(r).unwrap().value(), -3);
+}
+
+#[test]
+fn instance_of_walks_prototype_chain() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let known = thread.heap().known();
+        let true_v = known.true_object.value();
+        let false_v = known.false_object.value();
+        let prototype = thread.intern(&scope, "prototype").value();
+
+        // F with a .prototype object
+        let f = make_callable(thread, &scope, &program_return_1(), &[]);
+        let f_proto = empty_object(thread, &scope).as_tagged().erase();
+        define_own_property_values(
+            thread.heap(),
+            &scope,
+            f,
+            SlotName::from_value(prototype),
+            PropertyDescriptor::data(f_proto),
+        );
+
+        // obj inherits F.prototype; plain {} does not
+        let obj = empty_object(thread, &scope).as_tagged().erase();
+        set_prototype(thread.heap(), &scope, obj, f_proto).unwrap();
+        let plain = empty_object(thread, &scope).as_tagged().erase();
+
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::InstanceOf),
+            0,
+            &[obj, f],
+        )
+        .unwrap();
+        assert_eq!(r, true_v);
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::InstanceOf),
+            0,
+            &[plain, f],
+        )
+        .unwrap();
+        assert_eq!(r, false_v);
+
+        // a non-callable right operand is a TypeError
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::InstanceOf),
+            0,
+            &[obj, smi(5)],
+        );
+        expect_escaped(&mut *thread, r, "TypeError");
+
+        // a non-object .prototype is a TypeError
+        let f2 = make_callable(thread, &scope, &program_return_1(), &[]);
+        define_own_property_values(
+            thread.heap(),
+            &scope,
+            f2,
+            SlotName::from_value(prototype),
+            PropertyDescriptor::data(smi(42)),
+        );
+        let r = run_program(
+            &mut *thread,
+            binary_op_program(Opcode::InstanceOf),
+            0,
+            &[obj, f2],
+        );
+        expect_escaped(&mut *thread, r, "TypeError");
+    });
+}
+
+#[test]
+fn construct_uses_prototype_receiver_and_prefers_object_result() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let known = thread.heap().known();
+        let prototype = thread.intern(&scope, "prototype").value();
+
+        // G returns a primitive (42): the synthesized receiver wins, and its
+        // [[Prototype]] is G.prototype
+        let g = make_callable(
+            thread,
+            &scope,
+            &{
+                let mut p = Vec::new();
+                emit(&mut p, Opcode::LoadSmi, &[42]);
+                emit(&mut p, Opcode::Return, &[]);
+                p
+            },
+            &[],
+        );
+        let g_proto = empty_object(thread, &scope).as_tagged().erase();
+        define_own_property_values(
+            thread.heap(),
+            &scope,
+            g,
+            SlotName::from_value(prototype),
+            PropertyDescriptor::data(g_proto),
+        );
+
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[0]);
+        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let r = run_program_consts(&mut *thread, program, 1, &[], &[g]).unwrap();
+        assert!(r.is_strong_ptr(), "primitive result: receiver must win");
+
+        // the receiver is `instanceof G`
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[0]);
+        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::Load, &[1]);
+        emit(&mut program, Opcode::InstanceOf, &[0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let r = run_program_consts(&mut *thread, program, 2, &[], &[g]).unwrap();
+        assert_eq!(r, known.true_object.value());
+
+        // F returns an object: the object result wins over the receiver
+        let f = make_callable(thread, &scope, &program_return_empty_object(), &[]);
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[0]);
+        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let r = run_program_consts(&mut *thread, program, 1, &[], &[f]).unwrap();
+        assert!(r.is_strong_ptr(), "object result must win");
+
+        // constructing a non-constructible value is a TypeError
+        let plain = empty_object(thread, &scope).as_tagged().erase();
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[0]);
+        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let r = run_program_consts(&mut *thread, program, 1, &[], &[plain]);
+        expect_escaped(&mut *thread, r, "TypeError");
+    });
+}
+
+/// Native constructor probe: reports `nctx.is_construct()` by storing 1/0
+/// into the global property "constructProbe".
+fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<Value, VmError> {
+    let flag = Smi::new(if nctx.is_construct() { 1 } else { 0 }).encode();
+    nctx.handle_scope(|nctx, scope| {
+        let name = nctx.intern(&scope, "constructProbe");
+        let global = nctx.heap().known().global_object.value();
+        let outcome = nctx.heap().no_gc(|nogc, heap| {
+            global.store_lookup(
+                nogc,
+                heap,
+                SlotName::from(name.as_tagged()),
+                flag,
+                StoreSemantics::WriteThrough,
+            )
+        })?;
+        match outcome {
+            StoreOutcome::Done => {}
+            StoreOutcome::Transition { .. } => {
+                define_own_property_values(
+                    nctx.heap(),
+                    &scope,
+                    global,
+                    SlotName::from(name.as_tagged()),
+                    PropertyDescriptor::data(flag),
+                )?;
+            }
+            StoreOutcome::CallSetter { setter } => {
+                let args = [global, flag];
+                // SAFETY: fresh snapshots; consumed before any GC in the call
+                nctx.call(setter, unsafe { GcSlice::from_slice(&args) })?;
+            }
+        }
+        Ok(())
+    })?;
+    Ok(flag)
+}
+
+#[test]
+fn construct_sets_native_construct_flag() {
+    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let idx = vm.register_native(construct_probe);
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let f = native_function(thread, &scope, idx);
+        let f = f.as_tagged().erase();
+        let name = thread.intern(&scope, "constructProbe").value();
+
+        // Construct: flag is 1, and the probe's primitive result loses to
+        // the receiver (an object)
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::LoadSmi, &[0]);
+        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let r = run_program_consts(&mut *thread, program, 2, &[], &[f, name]).unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 1);
+
+        // plain Call: flag is 0
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Load, &[0]);
+        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
+        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        let r = run_program_consts(&mut *thread, program, 2, &[], &[f, name]).unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 0);
+    });
+}
+
+/// parent (own writable p=1) + child whose prototype is FixedArray([parent]).
+/// `child_extendable` controls whether shadowing may define an own property.
+fn shadow_setup<'s>(
+    thread: &mut Thread,
+    scope: &'s HandleScope<'_>,
+    child_extendable: bool,
+) -> (Handle<'s, Object>, Handle<'s, Object>, Value) {
+    let void = thread.heap().known().void;
+    let p = thread.intern(&scope, "p");
+    let parent_map = thread.heap().allocate_handle::<Map>(
+        MapInit {
+            kind: MapKind::OBJECT,
+            value_slot_count: 1,
+            descriptors: &[(
+                SlotName::from(p.as_tagged()),
+                WRITABLE_VALUE,
+                Smi::new(0).encode(),
+            )],
+            prototype: void.erase(),
+        },
+        &scope,
+    );
+    let parent = thread
+        .heap()
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map: parent_map,
+                values: &[Smi::new(1).encode()],
+                elements: void.erase(),
+                length: 0,
+            },
+        )
+        .into_handle(&scope);
+    let parents = thread
+        .heap()
+        .allocate_handle::<FixedArray>(&[parent.as_tagged().erase()], &scope);
+    let child_map = thread.heap().allocate_handle::<Map>(
+        MapInit {
+            kind: if child_extendable {
+                EXTENDABLE
+            } else {
+                MapKind::OBJECT
+            },
+            value_slot_count: 0,
+            descriptors: &[],
+            prototype: parents.erase(),
+        },
+        &scope,
+    );
+    let child = thread
+        .heap()
+        .allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map: child_map,
+                values: &[],
+                elements: void.erase(),
+                length: 0,
+            },
+        )
+        .into_handle(&scope);
+    (child, parent, p.value())
+}
+
+/// r2 = child (constants[0]); acc = 2; r2.p = acc via `store_op`; return acc
+fn shadow_store_program(store_op: Opcode) -> Vec<u8> {
+    let mut program = Vec::new();
+    emit(&mut program, Opcode::LoadConstant, &[0]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::LoadSmi, &[2]);
+    emit(&mut program, store_op, &[2, 1, 0]);
+    emit(&mut program, Opcode::Return, &[]);
+    program
+}
+
+#[test]
+fn shadow_store_to_non_extensible_receiver_is_ignored() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let (child, parent, p) = shadow_setup(thread, &scope, false);
+        // sloppy [[Set]] on an inherited writable property shadows with an
+        // own define; the non-extensible receiver rejects it (false) and the
+        // store is silently ignored
+        let r = run_program_consts(
+            &mut *thread,
+            shadow_store_program(Opcode::StoreNamedPropertyShadow),
+            3,
+            &[],
+            &[child.as_tagged().erase(), p, parent.as_tagged().erase()],
+        )
+        .unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 2, "acc keeps the value");
+
+        thread.heap().no_gc(|nogc, heap| {
+            // no own property appeared on the child, the parent is untouched
+            let child_ref = child.heap_ref(nogc);
+            assert_eq!(child_ref.header.map.heap_ref(nogc).descriptor_count(), 0);
+            let ValueRef::Object(parent_ref) = parent.as_tagged().erase().value_ref(nogc) else {
+                panic!("parent must be an object");
+            };
+            match parent_ref
+                .as_ref()
+                .lookup(nogc, heap, SlotName::from_value(p))
+            {
+                Lookup::Data { slot, .. } => {
+                    assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 1);
+                }
+                _ => panic!("parent must keep its writable property"),
+            }
+        });
+    });
+}
+
+#[test]
+fn shadow_store_defines_default_attributes() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    thread.handle_scope(|thread, scope| {
+        let (child, parent, p) = shadow_setup(thread, &scope, true);
+        let r = run_program_consts(
+            &mut *thread,
+            shadow_store_program(Opcode::StoreNamedPropertyShadow),
+            3,
+            &[],
+            &[child.as_tagged().erase(), p, parent.as_tagged().erase()],
+        )
+        .unwrap();
+        assert_eq!(Smi::decode(r).unwrap().value(), 2);
+
+        thread.heap().no_gc(|nogc, heap| {
+            let child_ref = child.heap_ref(nogc);
+            let map = child_ref.header.map.heap_ref(nogc);
+            assert_eq!(map.descriptor_count(), 1);
+            let d = map.descriptor(0);
+            assert_eq!(d.name(), SlotName::from_value(p));
+            assert_eq!(d.offset(), 0);
+            // [[Set]] shadowing defines with the assignment defaults
+            assert!(d.flags().is_writable());
+            assert!(d.flags().is_enumerable());
+            assert!(d.flags().is_configurable());
+            // the own slot wins, the parent keeps its value
+            match child_ref
+                .as_ref()
+                .lookup(nogc, heap, SlotName::from_value(p))
+            {
+                Lookup::Data { slot, .. } => {
+                    assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 2);
+                }
+                _ => panic!("expected own data property"),
+            }
+            let ValueRef::Object(parent_ref) = parent.as_tagged().erase().value_ref(nogc) else {
+                panic!("parent must be an object");
+            };
+            match parent_ref
+                .as_ref()
+                .lookup(nogc, heap, SlotName::from_value(p))
+            {
+                Lookup::Data { slot, .. } => {
+                    assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 1);
+                }
+                _ => panic!("parent must keep its writable property"),
+            }
+        });
+    });
 }

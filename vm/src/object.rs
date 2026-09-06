@@ -136,8 +136,15 @@ impl Map {
                 .get_as::<Map>(nogc, heap.known().map_map)
                 .expect("transition target must be a map");
 
-            let count = target.descriptor_count();
-            if count > 0 && target.descriptor(count - 1).flags() == flags {
+            // adds append the property (last descriptor), redefines keep
+            // its index: either way the descriptor row for `name` must
+            // carry the requested flags. This lets adds and redefines
+            // share one transition tree — identical shapes, identical maps.
+            if target
+                .descriptors()
+                .iter()
+                .any(|d| d.name() == name && d.flags() == flags)
+            {
                 return Some(target);
             }
         }

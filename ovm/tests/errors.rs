@@ -1,6 +1,6 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{Thread, VM, VmError};
-use vm::{Lookup, SlotName, StoreOutcome, StoreSemantics, Value, ValueRef};
+use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Value, ValueRef};
 
 /// Read a data property by interned name value.
 fn get_prop(thread: &mut Thread, obj: Value, name: Value) -> Value {
@@ -163,8 +163,14 @@ fn error_objects_are_extendable() {
                 let value = scope
                     .create_handle(vm::Tagged::from_value(extra_val))
                     .expect("value is strong");
-                vm::Object::store_new_data_property(thread.heap(), &scope, receiver, name, value)
-                    .unwrap();
+                vm::Object::define_own_property(
+                    thread.heap(),
+                    &scope,
+                    receiver,
+                    name,
+                    PropertyDescriptor::data(value.value()),
+                )
+                .unwrap();
             });
         }
         other => panic!("expected transition, got {other:?}"),
