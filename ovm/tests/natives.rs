@@ -1,7 +1,7 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::natives::{NativeContext, NativeIndex, native_trampoline};
 use ovm::{Thread, VM, VmError};
-use vm::{Float, Smi, Value};
+use vm::{Float, GcSlice, Smi, Value};
 
 fn float(thread: &mut Thread, v: f64) -> Value {
     thread.heap().allocate::<Float>(v).erase()
@@ -101,10 +101,10 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
 #[test]
 fn register_native_appends_after_well_known() {
-    fn double(_nctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
-        match args {
-            [_, v] => {
-                let v = Smi::decode(*v).ok_or(VmError::Type)?;
+    fn double(_nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+        match (args.get(1), args.get(2)) {
+            (Some(v), _) => {
+                let v = Smi::decode(v).ok_or(VmError::Type)?;
                 Ok(Smi::new(v.value() * 2).encode())
             }
             _ => Err(VmError::Arity),

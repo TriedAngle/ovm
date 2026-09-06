@@ -1,4 +1,7 @@
-use vm::{Convert, Heap, LoadOutcome, SlotName, Value, ValueRef, VmError, load_outcome};
+use vm::{
+    Convert, FixedArray, Float, GcSlice, Handle, Heap, LoadOutcome, NoGc, Object, ObjectSlotsInit,
+    SlotName, Symbol, Tagged, VMString, Value, ValueRef, VmError, load_outcome, set_prototype,
+};
 
 use crate::{ContextState, NativeContext, VM};
 
@@ -47,7 +50,11 @@ pub fn to_primitive(
         };
         let hint_string =
             state.handle_scope(|scope| vm.interner().intern(heap, &scope, hint_name).value());
-        let result = NativeContext::new(vm, heap, state).call(exotic, &[hint_string])?;
+        let args = [hint_string];
+        // SAFETY: hint_string was interned immediately above; the snapshot
+        // is consumed (staged/copied into the frame) before any GC
+        let args = unsafe { GcSlice::from_slice(&args) };
+        let result = NativeContext::new(vm, heap, state).call(exotic, args)?;
         if result == exception {
             return Ok(Coercion::Threw);
         }
@@ -79,7 +86,11 @@ pub fn to_primitive(
         if !is_callable(heap, method) {
             continue;
         }
-        let result = NativeContext::new(vm, heap, state).call(method, &[value])?;
+        let args = [value];
+        // SAFETY: `value` is a fresh snapshot read above; consumed
+        // (staged/copied into the frame) before any GC in the call
+        let args = unsafe { GcSlice::from_slice(&args) };
+        let result = NativeContext::new(vm, heap, state).call(method, args)?;
         if result == exception {
             return Ok(Coercion::Threw);
         }
@@ -140,7 +151,11 @@ fn get_property(
         LoadOutcome::Value(v) => Ok(Coercion::Value(v)),
         LoadOutcome::Getter(getter) => {
             let exception = heap.known().exception.value();
-            let result = NativeContext::new(vm, heap, state).call(getter, &[receiver])?;
+            let args = [receiver];
+            // SAFETY: `receiver` is a fresh snapshot read above; consumed
+            // (staged/copied into the frame) before any GC in the call
+            let args = unsafe { GcSlice::from_slice(&args) };
+            let result = NativeContext::new(vm, heap, state).call(getter, args)?;
             if result == exception {
                 Ok(Coercion::Threw)
             } else {
@@ -161,4 +176,135 @@ fn is_callable(heap: &mut Heap, v: Value) -> bool {
 
 fn intern_value(vm: &VM, heap: &mut Heap, state: &ContextState, s: &str) -> Value {
     state.handle_scope(|scope| vm.interner().intern(heap, &scope, s).value())
+}
+
+/// ES 13.5.3 typeof: the interned type string for a value. `null` reports
+/// `"object"`; callables report `"function"`.
+pub(crate) fn type_of(vm: &VM, heap: &mut Heap, state: &ContextState, v: Value) -> Value {
+    let name = heap.no_gc(|nogc, heap| {
+        let known = heap.known();
+        if v.is_smi() || v.get_as::<Float>(nogc, known.float_map).is_some() {
+            "number"
+        } else if v == known.undefined.value() || v == known.void.value() {
+            "undefined"
+        } else if v == known.null.value() {
+            "object"
+        } else if v == known.true_object.value() || v == known.false_object.value() {
+            "boolean"
+        } else if v.get_as::<VMString>(nogc, known.string_map).is_some() {
+            "string"
+        } else if v.get_as::<Symbol>(nogc, known.symbol_map).is_some() {
+            "symbol"
+        } else if let ValueRef::Object(obj) = v.value_ref(nogc) {
+            if obj.as_ref().header.map.heap_ref(nogc).kind().is_callable() {
+                "function"
+            } else {
+                "object"
+            }
+        } else {
+            "object"
+        }
+    });
+    intern_value(vm, heap, state, name)
+}
+
+/// ES 13.10.2 instanceof / 7.3.20 OrdinaryHasInstance: `Get(C, "prototype")`
+/// must yield an object (else TypeError), then walk the object's prototype
+/// chain for it. `None` means user code threw.
+pub(crate) fn instance_of(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    object: Value,
+    callable: Value,
+) -> Result<Option<bool>, VmError> {
+    if !is_callable(heap, callable) {
+        return Err(VmError::Type);
+    }
+    // 4. P = Get(C, "prototype") — full [[Get]], getters may run user code
+    let proto_name = intern_value(vm, heap, state, "prototype");
+    let proto = get_property(vm, heap, state, callable, proto_name)?;
+    let proto = match proto {
+        Coercion::Threw => return Ok(None),
+        Coercion::Value(v) => v,
+    };
+    // 5. P must be an object
+    if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, proto)) {
+        return Err(VmError::Type);
+    }
+    Ok(Some(heap.no_gc(|nogc, heap| {
+        has_proto_in_chain(nogc, heap, object, proto)
+    })))
+}
+
+/// OrdinaryHasInstance step 6: walk the prototype chain of `object`.
+fn has_proto_in_chain<'a>(nogc: &'a NoGc<'a>, heap: &Heap, object: Value, target: Value) -> bool {
+    let ValueRef::Object(obj) = object.value_ref(nogc) else {
+        return false;
+    };
+    let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
+    if proto == target {
+        return true;
+    }
+    if proto == heap.known().null.value() {
+        return false;
+    }
+    if let Some(parents) = proto.get_as::<FixedArray>(nogc, heap.known().array_map) {
+        for i in 0..parents.len() {
+            if has_proto_in_chain(nogc, heap, parents.at(i), target) {
+                return true;
+            }
+        }
+        return false;
+    }
+    has_proto_in_chain(nogc, heap, proto, target)
+}
+
+/// The Construct receiver (ES 9.2.2 step 5): a fresh `{}` whose
+/// [[Prototype]] is `new.target.prototype` when that is an object, else
+/// the ordinary object prototype (GetPrototypeFromConstructor,
+/// ES 9.1.14). The callee is irrelevant here — `this` always comes from
+/// new.target. `None` means user code threw.
+pub(crate) fn create_construct_receiver(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    new_target: Handle<'_, Object>,
+) -> Result<Option<Value>, VmError> {
+    let proto_name = intern_value(vm, heap, state, "prototype");
+    state.handle_scope(|scope| {
+        let proto = get_property(vm, heap, state, new_target.value(), proto_name)?;
+        let proto = match proto {
+            Coercion::Threw => return Ok(None),
+            Coercion::Value(v) => v,
+        };
+        // root the prototype before allocating below (GC may move it)
+        let proto = if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, proto)) {
+            None
+        } else {
+            Some(
+                scope
+                    .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(proto) })
+                    .expect("object prototype must be strong"),
+            )
+        };
+        let known = heap.known();
+        let obj = heap
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map: known.object_initial_map,
+                    values: &[],
+                    elements: known.empty_fixed_array.erase(),
+                    length: 0,
+                },
+            )
+            .into_handle(&scope)
+            .as_tagged()
+            .erase();
+        if let Some(proto) = proto {
+            set_prototype(heap, &scope, obj, proto.value())?;
+        }
+        Ok(Some(obj))
+    })
 }

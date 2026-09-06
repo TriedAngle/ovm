@@ -1,4 +1,4 @@
-use vm::{Heap, Object, ObjectSlotsInit, SlotName, Tagged, Value, VmError};
+use vm::{Heap, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Tagged, Value, VmError};
 
 use crate::{ContextState, VM};
 
@@ -43,8 +43,20 @@ pub fn error_from_vm_error(
         let message_value = scope
             .create_handle(Tagged::from_value(message_value.value()))
             .expect("message value is strong");
-        Object::store_new_data_property(heap, &scope, obj, name, name_value)?;
-        Object::store_new_data_property(heap, &scope, obj, message, message_value)?;
+        Object::define_own_property(
+            heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(name_value.value()),
+        )?;
+        Object::define_own_property(
+            heap,
+            &scope,
+            obj,
+            message,
+            PropertyDescriptor::data(message_value.value()),
+        )?;
         Ok(obj.value())
     })
 }

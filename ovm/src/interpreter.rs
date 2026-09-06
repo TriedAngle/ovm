@@ -1,16 +1,20 @@
 use bytecode::{Opcode, Operands, decode, jump_target};
 
 use vm::{
-    CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, FixedArray, Handle,
-    Heap, Key, LoadOutcome, NoGc, Object, ObjectSlotsInit, SlotName, Smi, StoreOutcome,
-    StoreSemantics, Tagged, VMString, Value, ValueRef, call_target, classify_key, element_value,
-    load_outcome, set_prototype, store_array_element, store_new_data_property_values,
+    CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, FixedArray, Float,
+    GcSlice, Handle, Heap, Key, LoadOutcome, NoGc, Object, ObjectSlotsInit, PropertyDescriptor,
+    SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, ValueRef,
+    add_own_property_values, call_target, classify_key, element_value, load_outcome, set_prototype,
+    store_array_element,
 };
 
 use crate::{
     ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
     error_from_vm_error,
-    runtime::{Coercion, Hint, numeric_op, to_primitive},
+    runtime::{
+        Coercion, Hint, create_construct_receiver, instance_of, numeric_op, to_numeric,
+        to_primitive, type_of,
+    },
 };
 
 pub fn execute(
@@ -18,7 +22,8 @@ pub fn execute(
     heap: &mut Heap,
     state: &ContextState,
     callable: Handle<'_, Object>,
-    args: &[Value],
+    args: GcSlice<'_>,
+    new_target: Option<Handle<'_, Object>>,
 ) -> Result<Value, VmError> {
     let stack = &state.stack;
     let cache = &state.cache;
@@ -32,7 +37,7 @@ pub fn execute(
     }
     let base_depth = stack.frame_depth();
 
-    let result = start(vm, heap, state, callable, args, base_depth);
+    let result = start(vm, heap, state, callable, args, new_target, base_depth);
 
     stack.truncate_frames(base_depth);
     if was_active {
@@ -51,21 +56,25 @@ fn start(
     heap: &mut Heap,
     state: &ContextState,
     callable: Handle<'_, Object>,
-    args: &[Value],
+    args: GcSlice<'_>,
+    new_target: Option<Handle<'_, Object>>,
     base_depth: usize,
 ) -> Result<Value, VmError> {
     match heap.no_gc(|nogc, heap| call_target(nogc, heap, callable.value())) {
         Some(CallTarget::Native(idx)) => {
             let f = vm.native(NativeIndex(idx));
             let void = heap.known().void.value();
-            let mut nctx = NativeContext::new(vm, heap, state);
+            let (saved_top, fargs) = state.stack.stage_args(args)?;
+            let mut nctx = NativeContext::with_new_target(vm, heap, state, new_target);
             let cache = &state.cache;
             cache.spill_acc(void);
-            let result = f(&mut nctx, args);
+            let result = f(&mut nctx, fargs);
             let _ = cache.take_acc();
+            state.stack.set_top(saved_top);
             result
         }
         Some(CallTarget::Bytecode(target, register_count)) => {
+            // TODO: update once we have classes
             let stack = &state.stack;
             let frame = stack.push_initial_frame(target, register_count, args)?;
             state.cache.enter(stack, frame, heap);
@@ -287,7 +296,8 @@ fn apply_store_outcome(
         StoreOutcome::Transition { receiver, name } => {
             cache.spill_acc(acc);
             let result = state.handle_scope(|scope| {
-                store_new_data_property_values(heap, &scope, receiver, name, acc)
+                add_own_property_values(heap, &scope, receiver, name, PropertyDescriptor::data(acc))
+                    .map(|_| ())
             });
             let _ = cache.take_acc();
             result
@@ -576,6 +586,106 @@ fn step(
                 known.false_object.value()
             };
             Step::Next
+        }
+        Opcode::TestTypeof => {
+            *acc = type_of(vm, heap, state, *acc);
+            Step::Next
+        }
+        Opcode::Negate => {
+            if let Some(smi) = Smi::decode(*acc) {
+                let v = smi.value();
+                *acc = if v == 0 {
+                    state.handle_scope(|scope| heap.allocate_handle::<Float>(-0.0, &scope).value())
+                } else if v == Smi::MIN {
+                    state.handle_scope(|scope| Convert::to_value(heap, &scope, -(v as f64)))
+                } else {
+                    Smi::new(-v).encode()
+                };
+            } else {
+                let n = step_try!(to_numeric(vm, heap, state, *acc));
+                let Some(n) = n else {
+                    return Step::PendingThrow;
+                };
+                *acc = state.handle_scope(|scope| {
+                    let r = -n;
+                    // preserve -0.0: `-0` must not fold into Smi 0
+                    if r == 0.0 && r.is_sign_negative() {
+                        heap.allocate_handle::<Float>(-0.0, &scope).value()
+                    } else {
+                        Convert::to_value(heap, &scope, r)
+                    }
+                });
+            }
+            Step::Next
+        }
+        Opcode::InstanceOf => {
+            let other = stack.reg(&meta, ops.reg(0));
+            let r = step_try!(instance_of(vm, heap, state, *acc, other));
+            let Some(r) = r else {
+                return Step::PendingThrow;
+            };
+            *acc = Convert::boolean(heap, r);
+            Step::Next
+        }
+        Opcode::Construct => {
+            // ES 9.2.2 [[Construct]]: `new.target` (here the callee itself;
+            // `super()`/Reflect.construct thread a different target later)
+            // decides the receiver's prototype via GetPrototypeFromConstructor,
+            // the callee runs with the receiver as `this`, and an object
+            // result wins over the receiver.
+            let constructible = heap.no_gc(|nogc, _heap| {
+                let callee = stack.reg(&meta, ops.reg(0));
+                let ValueRef::Object(obj) = callee.value_ref(nogc) else {
+                    return false;
+                };
+                obj.as_ref()
+                    .header
+                    .map
+                    .heap_ref(nogc)
+                    .kind()
+                    .is_constructor()
+            });
+            if !constructible {
+                return Step::Error(VmError::Type);
+            }
+            state.handle_scope(|scope| {
+                let callee = scope
+                    .create_handle(unsafe {
+                        Tagged::<Object>::from_value_unchecked(stack.reg(&meta, ops.reg(0)))
+                    })
+                    .expect("callee must be strong");
+                let receiver = match create_construct_receiver(vm, heap, state, callee) {
+                    Ok(Some(r)) => r,
+                    Ok(None) => return Step::PendingThrow,
+                    Err(err) => return Step::Error(err),
+                };
+                let receiver = scope
+                    .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
+                    .expect("receiver is an object");
+                // the register list holds only arguments; the receiver is
+                // synthesized and prepended
+                let count = ops.reg_count(2);
+                let mut args = Vec::with_capacity(count + 1);
+                args.push(receiver.value());
+                args.extend_from_slice(stack.args(&meta, ops.reg_list(1), count).as_slice());
+                let result = match NativeContext::new(vm, heap, state).call_construct(
+                    callee.value(),
+                    callee.value(),
+                    unsafe { GcSlice::from_slice(&args) },
+                ) {
+                    Ok(r) => r,
+                    Err(err) => return Step::Error(err),
+                };
+                if result == heap.known().exception.value() {
+                    return Step::PendingThrow;
+                }
+                *acc = if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, result)) {
+                    receiver.value()
+                } else {
+                    result
+                };
+                Step::Next
+            })
         }
         Opcode::EqualStrict => {
             let other = stack.reg(&meta, ops.reg(0));

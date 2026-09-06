@@ -1,6 +1,6 @@
 use core::cell::{Cell, RefCell};
 
-use vm::{EdgeVisitable, Object, Register, Smi, Tagged, Value, Visitor};
+use vm::{EdgeVisitable, GcSlice, Object, Register, Smi, Tagged, Value, Visitor};
 
 use crate::VmError;
 
@@ -78,8 +78,8 @@ impl Stack {
         self.slot_unchecked(Self::reg_index(meta, i)).store(v);
     }
 
-    pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> &[Value] {
-        self.value_slice(Self::reg_index(meta, reg_base), count)
+    pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> GcSlice<'_> {
+        unsafe { GcSlice::from_slice(self.value_slice(Self::reg_index(meta, reg_base), count)) }
     }
 
     /// `callable` slots[0] is the CallableInfoObject
@@ -87,14 +87,14 @@ impl Stack {
         &self,
         callable: Tagged<Object>,
         register_count: usize,
-        args: &[Value],
+        args: GcSlice<'_>,
     ) -> Result<FrameMeta, VmError> {
         let base = self.reserve(register_count, args.len())?;
         let dst = base + register_count + HEADER_SLOTS;
-        debug_assert!(args.iter().all(|v| !v.is_weak_ptr()));
+        debug_assert!(args.as_slice().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
             core::ptr::copy_nonoverlapping(
-                args.as_ptr(),
+                args.as_slice().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             )
@@ -156,6 +156,25 @@ impl Stack {
         caller.handler_pc = handler_pc;
         self.frames.borrow_mut().push(caller);
         Ok(callee)
+    }
+
+    /// Copy `args` into a fresh register region above the current top and
+    /// return a `GcSlice` over it (GC-visited: reads stay fresh across
+    /// allocations). Rewind the region with `set_top(saved_top)` when done.
+    pub fn stage_args(&self, args: GcSlice<'_>) -> Result<(usize, GcSlice<'_>), VmError> {
+        let saved_top = self.top();
+        let base = self.reserve(0, args.len())?;
+        let dst = base + HEADER_SLOTS;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                args.as_slice().as_ptr(),
+                self.slots.as_ptr().add(dst) as *mut Value,
+                args.len(),
+            )
+        }
+        // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
+        let staged = unsafe { GcSlice::from_slice(self.value_slice(dst, args.len())) };
+        Ok((saved_top, staged))
     }
 
     pub fn pop_frame(&self, current_base: usize) -> Option<FrameMeta> {

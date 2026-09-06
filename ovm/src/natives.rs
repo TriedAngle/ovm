@@ -1,6 +1,8 @@
 use core::ptr::NonNull;
 
-use vm::{Float, Handle, HandleScope, Heap, InternedString, Object, Smi, Tagged, Value, VmError};
+use vm::{
+    Float, GcSlice, Handle, HandleScope, Heap, InternedString, Object, Smi, Tagged, Value, VmError,
+};
 
 use crate::{ContextState, Thread, VM};
 
@@ -8,11 +10,43 @@ pub struct NativeContext<'a> {
     vm: &'a VM,
     heap: &'a mut Heap,
     state: &'a ContextState,
+    /// `new.target` of the active [[Construct]] call (ES 9.2.2): the
+    /// invoked constructor, or `None` when called via [[Call]] (where
+    /// `new.target` is undefined).
+    // TODO: the Error family constructors read this once they exist
+    new_target: Option<Handle<'a, Object>>,
 }
 
 impl<'a> NativeContext<'a> {
     pub fn new(vm: &'a VM, heap: &'a mut Heap, state: &'a ContextState) -> Self {
-        Self { vm, heap, state }
+        Self {
+            vm,
+            heap,
+            state,
+            new_target: None,
+        }
+    }
+
+    pub(crate) fn with_new_target(
+        vm: &'a VM,
+        heap: &'a mut Heap,
+        state: &'a ContextState,
+        new_target: Option<Handle<'a, Object>>,
+    ) -> Self {
+        Self {
+            vm,
+            heap,
+            state,
+            new_target,
+        }
+    }
+
+    pub fn is_construct(&self) -> bool {
+        self.new_target.is_some()
+    }
+
+    pub fn new_target(&self) -> Option<Value> {
+        self.new_target.map(|h| h.value())
     }
 
     pub fn vm(&self) -> &VM {
@@ -42,12 +76,38 @@ impl<'a> NativeContext<'a> {
         f(self, scope)
     }
 
-    pub fn call(&mut self, callable: Value, args: &[Value]) -> Result<Value, VmError> {
+    pub fn call<'s>(&mut self, callable: Value, args: GcSlice<'s>) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
         let callable = scope
             .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(callable) })
             .expect("callable must be strong");
-        crate::interpreter::execute(self.vm, self.heap, self.state, callable, args)
+        crate::interpreter::execute(self.vm, self.heap, self.state, callable, args, None)
+    }
+
+    /// Invoke `callable` as a constructor with `new.target` = `new_target`:
+    /// native callees see `is_construct()` and the receiver's prototype
+    /// comes from `new_target.prototype` (ES 9.2.2).
+    pub fn call_construct<'s>(
+        &mut self,
+        callable: Value,
+        new_target: Value,
+        args: GcSlice<'s>,
+    ) -> Result<Value, VmError> {
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
+        let callable = scope
+            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(callable) })
+            .expect("callable must be strong");
+        let new_target = scope
+            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(new_target) })
+            .expect("new.target must be strong");
+        crate::interpreter::execute(
+            self.vm,
+            self.heap,
+            self.state,
+            callable,
+            args,
+            Some(new_target),
+        )
     }
 
     pub fn take_pending_exception(&self) -> Option<Value> {
@@ -59,7 +119,7 @@ impl<'a> NativeContext<'a> {
     }
 }
 
-pub type NativeFn = for<'a> fn(&mut NativeContext<'a>, &[Value]) -> Result<Value, VmError>;
+pub type NativeFn = for<'a, 's> fn(&mut NativeContext<'a>, GcSlice<'s>) -> Result<Value, VmError>;
 
 // TODO: this is still not a sound C interface (Rust-ABI `NativeFn` with
 // reference/slice arguments); decide on the C ABI before exporting.
@@ -71,7 +131,9 @@ pub extern "C" fn native_trampoline(
     argc: u32,
 ) -> Value {
     let thread = unsafe { &mut *thread };
-    let args = unsafe { core::slice::from_raw_parts(args, argc as usize) };
+    // SAFETY: caller-owned C memory; the native must not read it after
+    // allocating (see GcSlice)
+    let args = unsafe { GcSlice::from_slice(core::slice::from_raw_parts(args, argc as usize)) };
     let mut nctx = NativeContext::new(&thread.vm, &mut thread.heap, &thread.state);
     match f(&mut nctx, args) {
         Ok(v) => v,
@@ -132,9 +194,9 @@ impl Default for NativeRegistry {
     }
 }
 
-fn smi_add(_nctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
-    let (a, b) = match args {
-        [_, a, b] => (*a, *b),
+fn smi_add(_nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+    let (a, b) = match (args.get(1), args.get(2)) {
+        (Some(a), Some(b)) => (a, b),
         _ => return Err(VmError::Arity),
     };
     let a = Smi::decode(a).ok_or(VmError::Type)?;
@@ -146,9 +208,9 @@ fn smi_add(_nctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmErr
     Ok(Smi::new(r).encode())
 }
 
-fn float_add(nctx: &mut NativeContext<'_>, args: &[Value]) -> Result<Value, VmError> {
-    let (a, b) = match args {
-        [_, a, b] => (*a, *b),
+fn float_add(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+    let (a, b) = match (args.get(1), args.get(2)) {
+        (Some(a), Some(b)) => (a, b),
         _ => return Err(VmError::Arity),
     };
     let sum = nctx.heap().no_gc(|nogc, heap| {
