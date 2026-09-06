@@ -38,11 +38,12 @@ pub enum Opcode {
     StoreKeyedProperty,       // acc -> reg (obj) reg (key) idx (feedback)
     StoreKeyedPropertyShadow, // acc -> reg (obj) reg (key) idx (feedback)
 
-    // reglist is the first register (index) we dont have literally the whole list there.
     // for methods the `self` is the first element in the reglist
     Call,           // reg (callee) reglist (base) regcount (count) idx (feedback) -> acc
     CallNoFeedback, // reg (callee) reglist (base) regcount (count) -> acc
     CallNative, // idx (native index) reglist (base, first element is the receiver) regcount (count) -> acc
+
+    Construct, // reg (callee) reglist (base) regcount (count) -> acc
 
     CreateEmptyObjectLiteral, // -> acc (object_initial_map, no slots)
     CreateEmptyArrayLiteral,  // -> acc (js_array_map, empty elements)
@@ -70,6 +71,10 @@ pub enum Opcode {
     JumpIfFalsy,  // imm; jump if ToBoolean(acc) == false
 
     TestReferenceEqual, // reg; acc = true singleton iff bits(reg) == bits(acc), else false
+
+    TestTypeof, // -> acc = interned type string
+    Negate,     // -> acc = -acc (Smi fast path, -0.0 preserved, else ToNumber)
+    InstanceOf, // reg; acc = acc instanceof reg
 
     // comparisons: acc = acc op reg, yielding the true/false singleton
     EqualStrict,        // reg; ES Strict Equality Comparison (===)
@@ -189,6 +194,7 @@ impl Opcode {
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
             b if b == CallNative as u8 => CallNative,
+            b if b == Construct as u8 => Construct,
             b if b == CreateEmptyObjectLiteral as u8 => CreateEmptyObjectLiteral,
             b if b == CreateEmptyArrayLiteral as u8 => CreateEmptyArrayLiteral,
             b if b == CreateClosure as u8 => CreateClosure,
@@ -209,6 +215,9 @@ impl Opcode {
             b if b == JumpIfTruthy as u8 => JumpIfTruthy,
             b if b == JumpIfFalsy as u8 => JumpIfFalsy,
             b if b == TestReferenceEqual as u8 => TestReferenceEqual,
+            b if b == TestTypeof as u8 => TestTypeof,
+            b if b == Negate as u8 => Negate,
+            b if b == InstanceOf as u8 => InstanceOf,
             b if b == EqualStrict as u8 => EqualStrict,
             b if b == Equal as u8 => Equal,
             b if b == LessThan as u8 => LessThan,
@@ -258,6 +267,7 @@ impl Opcode {
             Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
             Self::CallNative => &[Index, RegisterListStart, RegisterCount],
+            Self::Construct => &[Register, RegisterListStart, RegisterCount],
 
             Self::CreateEmptyObjectLiteral | Self::CreateEmptyArrayLiteral => &[],
             Self::CreateClosure => &[Index],
@@ -276,13 +286,15 @@ impl Opcode {
             | Self::ShiftRightLogical => &[Register],
 
             Self::Jump | Self::JumpLoop | Self::JumpIfTruthy | Self::JumpIfFalsy => &[Immediate],
+            Self::TestTypeof | Self::Negate => &[],
             Self::TestReferenceEqual
             | Self::EqualStrict
             | Self::Equal
             | Self::LessThan
             | Self::LessThanOrEqual
             | Self::GreaterThan
-            | Self::GreaterThanOrEqual => &[Register],
+            | Self::GreaterThanOrEqual
+            | Self::InstanceOf => &[Register],
         }
     }
 

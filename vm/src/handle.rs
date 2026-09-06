@@ -299,3 +299,42 @@ impl HandleSet for HandleScope<'_> {
             .expect("weak value cannot be rooted in a handle")
     }
 }
+
+#[derive(Copy, Clone)]
+pub struct GcSlice<'a> {
+    slice: &'a [Value],
+}
+
+impl<'a> GcSlice<'a> {
+    pub unsafe fn from_slice(slice: &'a [Value]) -> Self {
+        Self { slice }
+    }
+
+    pub fn as_slice(&self) -> &'a [Value] {
+        self.slice
+    }
+
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slice.is_empty()
+    }
+
+    pub fn get(&self, index: usize) -> Option<Value> {
+        self.slice.get(index).copied()
+    }
+
+    pub fn iter(&self) -> core::slice::Iter<'a, Value> {
+        self.slice.iter()
+    }
+}
+
+impl core::ops::Index<usize> for GcSlice<'_> {
+    type Output = Value;
+
+    fn index(&self, index: usize) -> &Value {
+        &self.slice[index]
+    }
+}

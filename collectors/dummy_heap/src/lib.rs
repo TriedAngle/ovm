@@ -253,6 +253,7 @@ impl HeapBackend for DummyHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vm::PropertyDescriptor;
 
     fn local(size: usize) -> (GlobalHeap, Heap) {
         let global = DummyHeap::new(DummyHeapConfig { heap_size: size })
@@ -407,11 +408,14 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, Global, Heap, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
+        AccessorPair, Float, Global, Heap, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
         ObjectSlotsInit, RootHandles, SlotFlags, SlotName, StoreOutcome, StoreSemantics, Tagged,
         Value, VmError,
     };
-    use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Smi};
+    use vm::{
+        FixedArray, FixedByteArray, HandleData, HandleScope, InternedString, Smi,
+        string_content_hash,
+    };
 
     fn scope(data: &HandleData) -> HandleScope<'_> {
         unsafe { HandleScope::from_raw(NonNull::from(data)) }
@@ -712,12 +716,12 @@ mod tests {
             alloc_object(&mut heap, map, &[Smi::new(7).encode()]),
         );
 
-        Object::store_new_data_property(
+        Object::define_own_property(
             &mut heap,
             &scope,
             obj,
             root_name(&scope, smi_name(2)),
-            root_value(&scope, Smi::new(9).encode()),
+            PropertyDescriptor::data(root_value(&scope, Smi::new(9).encode()).value()),
         )
         .unwrap();
 
@@ -748,20 +752,20 @@ mod tests {
         let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let b = root_object(&scope, alloc_object(&mut heap, map, &[]));
 
-        Object::store_new_data_property(
+        Object::define_own_property(
             &mut heap,
             &scope,
             a,
             root_name(&scope, smi_name(1)),
-            root_value(&scope, Smi::new(1).encode()),
+            PropertyDescriptor::data(root_value(&scope, Smi::new(1).encode()).value()),
         )
         .unwrap();
-        Object::store_new_data_property(
+        Object::define_own_property(
             &mut heap,
             &scope,
             b,
             root_name(&scope, smi_name(1)),
-            root_value(&scope, Smi::new(2).encode()),
+            PropertyDescriptor::data(root_value(&scope, Smi::new(2).encode()).value()),
         )
         .unwrap();
 
@@ -775,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn store_new_data_property_rejects_non_extensible() {
+    fn define_own_property_returns_false_on_non_extensible() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
@@ -783,14 +787,16 @@ mod tests {
         let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
 
-        let result = Object::store_new_data_property(
+        let result = Object::define_own_property(
             &mut heap,
             &scope,
             obj,
             root_name(&scope, smi_name(1)),
-            root_value(&scope, Smi::new(1).encode()),
+            PropertyDescriptor::data(root_value(&scope, Smi::new(1).encode()).value()),
         );
-        assert_eq!(result, Err(VmError::NotExtensible));
+        // spec: [[DefineOwnProperty]] reports false; the caller decides
+        // whether that is a TypeError
+        assert_eq!(result, Ok(false));
 
         heap.no_gc(|nogc, _| {
             let obj = obj.heap_ref(nogc);
@@ -1110,7 +1116,19 @@ mod tests {
             .create_handle(Tagged::from_value(Smi::new(111).encode()))
             .unwrap();
         let set = scope.create_handle(Tagged::from_value(undefined)).unwrap();
-        Object::store_new_accessor_property(&mut heap, &scope, obj, name, get, set).unwrap();
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::Accessor {
+                get: get.value(),
+                set: set.value(),
+                enumerable: true,
+                configurable: true,
+            },
+        )
+        .unwrap();
 
         heap.no_gc(|nogc, heap| {
             let obj_ref = obj.heap_ref(nogc);
@@ -1130,7 +1148,7 @@ mod tests {
     }
 
     #[test]
-    fn store_new_accessor_property_to_non_extensible_fails() {
+    fn define_accessor_on_non_extensible_returns_false() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
 
         let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
@@ -1152,8 +1170,245 @@ mod tests {
         let name = scope.create_handle(smi_name(5).tagged()).unwrap();
         let get = scope.create_handle(Tagged::from_value(undefined)).unwrap();
         let set = scope.create_handle(Tagged::from_value(undefined)).unwrap();
-        let result = Object::store_new_accessor_property(&mut heap, &scope, obj, name, get, set);
-        assert_eq!(result, Err(VmError::NotExtensible));
+        let result = Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::Accessor {
+                get: get.value(),
+                set: set.value(),
+                enumerable: true,
+                configurable: true,
+            },
+        );
+        assert_eq!(result, Ok(false));
+    }
+
+    #[test]
+    fn define_own_property_redefines_existing_data_in_place() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
+        let name = root_name(&scope, smi_name(1));
+
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(Smi::new(1).encode()),
+        )
+        .unwrap();
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(Smi::new(2).encode()),
+        )
+        .unwrap();
+
+        heap.no_gc(|nogc, heap| {
+            let obj = obj.heap_ref(nogc);
+            let map = obj.header.map.heap_ref(nogc);
+            // the literal duplicate-key shape: one descriptor, updated value
+            assert_eq!(map.descriptor_count(), 1, "redefinition must not duplicate");
+            assert_eq!(map.value_slot_count(), 1);
+            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 2);
+        });
+    }
+
+    #[test]
+    fn define_own_property_respects_non_configurable_guards() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
+        let name = root_name(&scope, smi_name(1));
+
+        let define = |heap: &mut Heap,
+                      writable: bool,
+                      enumerable: bool,
+                      configurable: bool,
+                      value: i64|
+         -> Result<bool, VmError> {
+            Object::define_own_property(
+                heap,
+                &scope,
+                obj,
+                name,
+                PropertyDescriptor::Data {
+                    value: Smi::new(value).encode(),
+                    writable,
+                    enumerable,
+                    configurable,
+                },
+            )
+        };
+
+        assert_eq!(define(&mut heap, true, true, false, 1).unwrap(), true);
+        // writable stays true: value changes freely, attributes are locked
+        assert_eq!(define(&mut heap, true, true, false, 2).unwrap(), true);
+        // writable true → false is allowed on a non-configurable property
+        assert_eq!(define(&mut heap, false, true, false, 3).unwrap(), true);
+        // writable false → true is not
+        assert_eq!(define(&mut heap, true, true, false, 4), Ok(false));
+        // non-writable value changes must be SameValue
+        assert_eq!(define(&mut heap, false, true, false, 5), Ok(false));
+        // attribute changes are locked
+        assert_eq!(define(&mut heap, false, false, false, 3), Ok(false));
+        assert_eq!(define(&mut heap, false, true, true, 3), Ok(false));
+        // data → accessor conversion is locked too
+        let undefined = heap.known().undefined.value();
+        let result = Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::Accessor {
+                get: undefined,
+                set: undefined,
+                enumerable: true,
+                configurable: false,
+            },
+        );
+        assert_eq!(result, Ok(false));
+
+        heap.no_gc(|nogc, heap| {
+            let obj = obj.heap_ref(nogc);
+            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 3);
+        });
+    }
+
+    #[test]
+    fn define_own_property_converts_between_data_and_accessor() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
+        let name = root_name(&scope, smi_name(1));
+        let undefined = heap.known().undefined.value();
+
+        // data → accessor (configurable: allowed)
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(Smi::new(1).encode()),
+        )
+        .unwrap();
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::Accessor {
+                get: Smi::new(11).encode(),
+                set: undefined,
+                enumerable: true,
+                configurable: true,
+            },
+        )
+        .unwrap();
+        heap.no_gc(|nogc, heap| {
+            let obj = obj.heap_ref(nogc);
+            match obj.as_ref().lookup(nogc, heap, smi_name(1)) {
+                Lookup::Accessor { pair, .. } => {
+                    assert_eq!(Smi::decode(pair.get.inner()).unwrap().value(), 11);
+                }
+                _ => panic!("expected accessor"),
+            }
+        });
+
+        // accessor → data appends a fresh slot and restores data semantics
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(Smi::new(2).encode()),
+        )
+        .unwrap();
+        heap.no_gc(|nogc, heap| {
+            let obj = obj.heap_ref(nogc);
+            let map = obj.header.map.heap_ref(nogc);
+            assert_eq!(map.descriptor_count(), 1);
+            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 2);
+        });
+    }
+
+    #[test]
+    fn same_value_matches_spec() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+
+        let nan1 = heap.allocate_handle::<Float>(f64::NAN, &scope).value();
+        let nan2 = heap.allocate_handle::<Float>(f64::NAN, &scope).value();
+        let neg_zero = heap.allocate_handle::<Float>(-0.0, &scope).value();
+        let pos_zero = heap.allocate_handle::<Float>(0.0, &scope).value();
+        let one_float = heap.allocate_handle::<Float>(1.0, &scope).value();
+        let mut mk_string = |s: &str| {
+            let backing = heap
+                .allocate::<FixedByteArray>(s.as_bytes())
+                .into_handle(&scope);
+            heap.allocate::<InternedString>((backing, string_content_hash(s.as_bytes())))
+                .into_handle(&scope)
+                .value()
+        };
+        let ab1 = mk_string("ab");
+        let ab2 = mk_string("ab");
+        let ac = mk_string("ac");
+
+        heap.no_gc(|nogc, heap| {
+            use vm::Compare;
+            // NaN equals NaN
+            assert!(Compare::same_value(nogc, heap, nan1, nan2));
+            assert!(Compare::same_value(nogc, heap, nan1, nan1));
+            // +/-0 are distinct
+            assert!(!Compare::same_value(nogc, heap, neg_zero, pos_zero));
+            assert!(Compare::same_value(nogc, heap, neg_zero, neg_zero));
+            assert!(!Compare::same_value(
+                nogc,
+                heap,
+                Smi::new(0).encode(),
+                neg_zero
+            ));
+            // number equality across representations
+            assert!(Compare::same_value(
+                nogc,
+                heap,
+                Smi::new(1).encode(),
+                one_float
+            ));
+            assert!(Compare::same_value(
+                nogc,
+                heap,
+                Smi::new(1).encode(),
+                Smi::new(1).encode()
+            ));
+            // strings by content
+            assert!(Compare::same_value(nogc, heap, ab1, ab2));
+            assert!(!Compare::same_value(nogc, heap, ab1, ac));
+            // objects by identity
+            let map = heap.known().object_initial_map;
+            assert!(Compare::same_value(
+                nogc,
+                heap,
+                heap.known().undefined.value(),
+                heap.known().undefined.value()
+            ));
+            let _ = map;
+        });
     }
 
     #[test]
@@ -1320,5 +1575,283 @@ mod tests {
         let total = Layout::from_size_align(64, 16).unwrap();
         let tok = heap.allocate_token(total);
         let _ = tok.allocate::<FixedByteArray>(&[0u8; 4096]);
+    }
+
+    #[test]
+    fn define_same_attributes_reuses_the_map() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
+        let name = root_name(&scope, smi_name(1));
+
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(Smi::new(1).encode()),
+        )
+        .unwrap();
+        let after_first = heap.no_gc(|nogc, _| obj.heap_ref(nogc).header.map.inner());
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(Smi::new(2).encode()),
+        )
+        .unwrap();
+        let after_second = heap.no_gc(|nogc, _| obj.heap_ref(nogc).header.map.inner());
+        // identical attributes: [[DefineOwnProperty]] only writes the slot;
+        // the map (and with it the property layout) must not change
+        assert_eq!(after_first, after_second);
+
+        heap.no_gc(|nogc, heap| {
+            let obj = obj.heap_ref(nogc);
+            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 2);
+        });
+    }
+
+    #[test]
+    fn shadow_store_defines_own_property_above_multiple_parents() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let writable = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+
+        // parent A (priority): writable smi(1) = 10; parent B: writable = 20
+        let map_a = alloc_map(
+            &mut heap,
+            &_roots,
+            MapKind::OBJECT,
+            1,
+            &[(1, writable, Smi::new(0).encode())],
+        );
+        let parent_a = root_object(
+            &scope,
+            alloc_object(&mut heap, map_a, &[Smi::new(10).encode()]),
+        );
+        let map_b = alloc_map(
+            &mut heap,
+            &_roots,
+            MapKind::OBJECT,
+            1,
+            &[(1, writable, Smi::new(0).encode())],
+        );
+        let parent_b = root_object(
+            &scope,
+            alloc_object(&mut heap, map_b, &[Smi::new(20).encode()]),
+        );
+
+        let parents = heap
+            .allocate::<FixedArray>(&[parent_a.as_tagged().erase(), parent_b.as_tagged().erase()])
+            .into_handle(&scope);
+        let child_map = alloc_map_proto(
+            &mut heap,
+            &_roots,
+            MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            0,
+            &[],
+            parents.as_tagged().erase(),
+        );
+        let child = root_object(&scope, alloc_object(&mut heap, child_map, &[]));
+        let name = root_name(&scope, smi_name(1));
+
+        // [[Set]] with Shadow semantics: the lookup hits parent A's writable
+        // slot first, so the receiver shadows it with an own property
+        let outcome = heap
+            .no_gc(|nogc, heap| {
+                child.value().store_lookup(
+                    nogc,
+                    heap,
+                    name.into(),
+                    Smi::new(30).encode(),
+                    StoreSemantics::Shadow,
+                )
+            })
+            .unwrap();
+        match outcome {
+            StoreOutcome::Transition { receiver, name } => {
+                assert_eq!(receiver, child.value());
+                Object::add_own_property(
+                    &mut heap,
+                    &scope,
+                    child,
+                    root_name(&scope, name),
+                    PropertyDescriptor::data(Smi::new(30).encode()),
+                )
+                .unwrap();
+            }
+            other => panic!("expected transition, got {other:?}"),
+        }
+
+        heap.no_gc(|nogc, heap| {
+            // the own slot wins over both parents; both parents untouched
+            expect_data(
+                child
+                    .heap_ref(nogc)
+                    .as_ref()
+                    .lookup(nogc, heap, smi_name(1)),
+                30,
+            );
+            expect_data(
+                parent_a
+                    .heap_ref(nogc)
+                    .as_ref()
+                    .lookup(nogc, heap, smi_name(1)),
+                10,
+            );
+            expect_data(
+                parent_b
+                    .heap_ref(nogc)
+                    .as_ref()
+                    .lookup(nogc, heap, smi_name(1)),
+                20,
+            );
+        });
+    }
+    #[test]
+    fn redefine_attributes_share_cached_transition() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        // both objects start from the same map with one writable property
+        let writable = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+        let map = alloc_map(
+            &mut heap,
+            &_roots,
+            kind,
+            1,
+            &[(1, writable, Smi::new(0).encode())],
+        );
+        let a = root_object(
+            &scope,
+            alloc_object(&mut heap, map, &[Smi::new(10).encode()]),
+        );
+        let b = root_object(
+            &scope,
+            alloc_object(&mut heap, map, &[Smi::new(20).encode()]),
+        );
+        let name = root_name(&scope, smi_name(1));
+
+        // the same shape change on two objects with the same map converges
+        // on ONE target map (cached transition, keyed by name + flags)
+        let frozen = PropertyDescriptor::Data {
+            value: Smi::new(30).encode(),
+            writable: false,
+            enumerable: false,
+            configurable: false,
+        };
+        Object::define_own_property(&mut heap, &scope, a, name, frozen).unwrap();
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            b,
+            name,
+            PropertyDescriptor::Data {
+                value: Smi::new(40).encode(),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            },
+        )
+        .unwrap();
+
+        heap.no_gc(|nogc, heap| {
+            let map_a = a.heap_ref(nogc).header.map.inner();
+            let map_b = b.heap_ref(nogc).header.map.inner();
+            assert_eq!(map_a, map_b, "identical redefines must share the map");
+            let map_a = a.heap_ref(nogc).header.map.heap_ref(nogc);
+            let d = map_a.descriptor(0);
+            // writable/enumerable/configurable all false after the redefine
+            assert!(!d.flags().is_writable());
+            assert!(!d.flags().is_enumerable());
+            assert!(!d.flags().is_configurable());
+            // values stay per-object
+            expect_data(
+                a.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)),
+                30,
+            );
+            expect_data(
+                b.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)),
+                40,
+            );
+        });
+    }
+
+    #[test]
+    fn accessor_to_data_redefine_appends_slot() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
+        let name = root_name(&scope, smi_name(1));
+
+        // accessor first: the descriptor row embeds the per-object pair
+        let undefined = heap.known().undefined.value();
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::Accessor {
+                get: Smi::new(111).encode(),
+                set: undefined,
+                enumerable: true,
+                configurable: true,
+            },
+        )
+        .unwrap();
+        // converting back to data appends a fresh slot for the value
+        Object::define_own_property(
+            &mut heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(Smi::new(7).encode()),
+        )
+        .unwrap();
+
+        heap.no_gc(|nogc, heap| {
+            let obj_ref = obj.heap_ref(nogc);
+            let map = obj_ref.header.map.heap_ref(nogc);
+            assert_eq!(
+                map.value_slot_count(),
+                1,
+                "accessor -> data grows the slots"
+            );
+            expect_data(obj_ref.as_ref().lookup(nogc, heap, smi_name(1)), 7);
+        });
+    }
+    #[test]
+    fn bootstrap_wires_function_prototype() {
+        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        heap.no_gc(|nogc, heap| {
+            let known = heap.known();
+            let fp = known.function_prototype.heap_ref(nogc);
+            let kind = fp.header.map.heap_ref(nogc).kind();
+            // ES 19.2.3: callable, not a constructor
+            assert!(kind.is_callable());
+            assert!(!kind.is_constructor());
+            // its [[Prototype]] is %Object.prototype%
+            assert_eq!(
+                fp.header.map.heap_ref(nogc).prototype.inner(),
+                known.object_prototype.value()
+            );
+            // ordinary function objects' [[Prototype]] points at it
+            // (ES 19.2.3.1)
+            assert_eq!(
+                known.function_map.heap_ref(nogc).prototype.inner(),
+                known.function_prototype.value()
+            );
+            // it is a real callable with callable info
+            assert!(fp.as_ref().callable_info(nogc, heap).is_some());
+        });
     }
 }

@@ -12,7 +12,9 @@ pub mod value;
 pub use compare::Compare;
 pub use convert::Convert;
 pub use error::VmError;
-pub use handle::{EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, RootHandles};
+pub use handle::{
+    EscapableHandleScope, GcSlice, Handle, HandleData, HandleScope, HandleSet, RootHandles,
+};
 pub use heap::{
     AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, GlobalHeap, GlobalVtable, Heap,
     HeapBackend, HeapRef, HeapStats, HeapVtable, NoGc, OptionGcSlot, RawCell, Register,
@@ -29,8 +31,8 @@ pub use object::{
     VMString, call_target, store_array_element, string_content_hash,
 };
 pub use transition::{
-    StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock, set_prototype,
-    store_new_data_property_values,
+    PropertyDescriptor, StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock,
+    add_own_property_values, define_own_property_values, set_prototype,
 };
 pub use value::{
     HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,

@@ -74,6 +74,43 @@ impl Compare {
         Ok(false)
     }
 
+    /// ES SameValue (7.2.11): NaN equals NaN, +0 and -0 are distinct, and
+    /// strings compare by content (identity for everything else).
+    /// Unlike `strict_equal` (===); used by [[DefineOwnProperty]] validation.
+    pub fn same_value<'a>(nogc: &'a NoGc<'a>, heap: &Heap, x: Value, y: Value) -> bool {
+        // identical bits: same object, same string, same smi, or the very
+        // same NaN heap object
+        if x == y {
+            return true;
+        }
+        let known = heap.known();
+        let x_num = x.is_smi() || x.get_as::<Float>(nogc, known.float_map).is_some();
+        let y_num = y.is_smi() || y.get_as::<Float>(nogc, known.float_map).is_some();
+        if x_num && y_num {
+            let number_value = |v: Value| match v.get_as::<Float>(nogc, known.float_map) {
+                Some(f) => f.value.get(),
+                None => Smi::decode(v).unwrap().value() as f64,
+            };
+            let a = number_value(x);
+            let b = number_value(y);
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a != b {
+                return false;
+            }
+            // equal values: +/-0 are distinct
+            return !(a == 0.0 && a.is_sign_negative() != b.is_sign_negative());
+        }
+        if let (Some(sx), Some(sy)) = (
+            x.get_as::<VMString>(nogc, known.string_map),
+            y.get_as::<VMString>(nogc, known.string_map),
+        ) {
+            return sx.as_slice(nogc) == sy.as_slice(nogc);
+        }
+        false
+    }
+
     pub fn less_than<'a>(
         nogc: &'a NoGc<'a>,
         heap: &Heap,
