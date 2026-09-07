@@ -60,7 +60,7 @@ fn start(
     new_target: Option<Handle<'_, Object>>,
     base_depth: usize,
 ) -> Result<Value, VmError> {
-    match heap.no_gc(|nogc, heap| call_target(nogc, heap, callable.value())) {
+    match heap.no_gc(|nogc| call_target(nogc, callable.value())) {
         Some(CallTarget::Native(idx)) => {
             let f = vm.native(NativeIndex(idx));
             let void = heap.known().void.value();
@@ -76,7 +76,7 @@ fn start(
         Some(CallTarget::Bytecode(target, register_count)) => {
             // TODO: update once we have classes
             let stack = &state.stack;
-            let context = heap.no_gc(|nogc, heap| closure_context(nogc, heap, target));
+            let context = heap.no_gc(|nogc| closure_context(nogc, target));
             let frame = stack.push_initial_frame(target, register_count, context, args)?;
             state.cache.enter(stack, frame, heap);
             dispatch(vm, heap, state, base_depth)
@@ -85,22 +85,16 @@ fn start(
     }
 }
 
-fn callable_name<'a>(
-    nogc: &'a NoGc<'a>,
-    heap: &'a Heap,
-    stack: &Stack,
-    meta: &FrameMeta,
-    idx: usize,
-) -> SlotName {
+fn callable_name<'a>(nogc: &'a NoGc<'a>, stack: &Stack, meta: &FrameMeta, idx: usize) -> SlotName {
     let callable = stack.callable_slot(meta).inner();
     let ValueRef::Object(callable) = callable.value_ref(nogc) else {
         panic!("frame callable must be an object");
     };
     let info = callable
         .as_ref()
-        .callable_info(nogc, heap)
+        .callable_info(nogc)
         .expect("frame callable must have callable info");
-    info.constant_slot_name(nogc, heap, idx)
+    info.constant_slot_name(nogc, idx)
 }
 
 /// The frame's current context: the frame header's context slot (per-frame,
@@ -117,9 +111,9 @@ fn set_frame_context(
     meta: &FrameMeta,
     context: Value,
 ) -> Result<(), VmError> {
-    heap.no_gc(|nogc, heap| {
+    heap.no_gc(|nogc| {
         context
-            .get_as::<Context>(nogc, heap.known().context_map)
+            .get_as::<Context>(nogc, nogc.known().context_map)
             .ok_or(VmError::Type)?;
         stack.context_slot(meta).store(context);
         Ok(())
@@ -128,12 +122,12 @@ fn set_frame_context(
 
 /// The closure context a freshly pushed frame starts with: the callee's
 /// immutable captured context (its closure slot).
-fn closure_context<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, callable: Tagged<Object>) -> Value {
+fn closure_context<'a>(nogc: &'a NoGc<'a>, callable: Tagged<Object>) -> Value {
     let ValueRef::Object(obj) = callable.erase().value_ref(nogc) else {
         panic!("callable must be an object");
     };
     obj.as_ref()
-        .closure_context(nogc, heap)
+        .closure_context(nogc)
         .expect("callable must have a closure context")
         .into_tagged()
         .erase()
@@ -143,12 +137,11 @@ fn closure_context<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, callable: Tagged<Obje
 /// the slot cell, or Reference when no context in the chain has the name.
 fn dynamic_slot<'a>(
     nogc: &'a NoGc<'a>,
-    heap: &'a Heap,
     context: &mut HeapRef<'a, Context>,
     name: Value,
 ) -> Result<&'a vm::GcSlot, VmError> {
     let name_str = name
-        .get_as::<VMString>(nogc, heap.known().string_map)
+        .get_as::<VMString>(nogc, nogc.known().string_map)
         .ok_or(VmError::Type)?;
     let name_hash = name_str.hash();
     let name_bytes = name_str.as_slice(nogc);
@@ -157,13 +150,13 @@ fn dynamic_slot<'a>(
         let names = ctx.scope_info.heap_ref(nogc).as_ref().names.heap_ref(nogc);
         for i in 0..names.len() {
             let candidate = names.at(i);
-            if let Some(s) = candidate.get_as::<VMString>(nogc, heap.known().string_map) {
+            if let Some(s) = candidate.get_as::<VMString>(nogc, nogc.known().string_map) {
                 if s.hash() == name_hash && s.as_slice(nogc) == name_bytes {
                     return Ok(ctx.slots.heap_ref(nogc).as_ref().element_slot(i));
                 }
             }
         }
-        match ctx.outer.heap_ref(nogc, heap) {
+        match ctx.outer.heap_ref(nogc) {
             Some(outer) => *context = outer,
             None => return Err(VmError::Reference),
         }
@@ -174,7 +167,6 @@ fn dynamic_slot<'a>(
 /// eval: unresolved names resolve through the caller's chain).
 fn dynamic_lookup<'a>(
     nogc: &'a NoGc<'a>,
-    heap: &'a Heap,
     stack: &Stack,
     meta: &FrameMeta,
     name: Value,
@@ -182,9 +174,9 @@ fn dynamic_lookup<'a>(
     let mut context = stack
         .context_slot(meta)
         .inner()
-        .get_as::<Context>(nogc, heap.known().context_map)
+        .get_as::<Context>(nogc, nogc.known().context_map)
         .ok_or(VmError::Type)?;
-    match dynamic_slot(nogc, heap, &mut context, name) {
+    match dynamic_slot(nogc, &mut context, name) {
         Ok(slot) => Ok(Some(slot.inner())),
         Err(VmError::Reference) => Ok(None),
         Err(e) => Err(e),
@@ -200,12 +192,12 @@ fn call_value(
     f: Value,
     args: &[Value],
 ) -> Result<bool, VmError> {
-    let target = heap.no_gc(|nogc, heap| call_target(nogc, heap, f));
+    let target = heap.no_gc(|nogc| call_target(nogc, f));
     // TODO: native getters/setters invoke in place instead of pushing a frame
     let Some(CallTarget::Bytecode(target, register_count)) = target else {
         return Ok(false);
     };
-    let context = heap.no_gc(|nogc, heap| closure_context(nogc, heap, target));
+    let context = heap.no_gc(|nogc| closure_context(nogc, target));
     let callee =
         stack.push_frame_with_args(meta, handler_pc, target, register_count, context, args)?;
     cache.load(stack, callee, heap);
@@ -232,7 +224,7 @@ fn exception_dispatch(
     let stack = &state.stack;
     let cache = &state.cache;
     loop {
-        let handled = heap.no_gc(|nogc, heap| {
+        let handled = heap.no_gc(|nogc| {
             let ValueRef::Object(obj) = stack
                 .callable_slot(&cache.frame_meta())
                 .inner()
@@ -240,8 +232,8 @@ fn exception_dispatch(
             else {
                 return None;
             };
-            let info = obj.as_ref().callable_info(nogc, heap)?;
-            info.handlers.heap_ref(nogc, heap)?.lookup(pc)
+            let info = obj.as_ref().callable_info(nogc)?;
+            info.handlers.heap_ref(nogc)?.lookup(pc)
         });
         if let Some(handler_pc) = handled {
             let ex = state
@@ -320,7 +312,7 @@ fn dispatch(
                 cache.frame_meta().register_count
             );
         }
-        let (op, ops, next_pc) = heap.no_gc(|nogc, _| decode(cache.code_ref(nogc).as_slice(), pc));
+        let (op, ops, next_pc) = heap.no_gc(|nogc| decode(cache.code_ref(nogc).as_slice(), pc));
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
@@ -420,7 +412,7 @@ fn step(
             Step::Next
         }
         Opcode::LoadConstant => {
-            let v = heap.no_gc(|nogc, _| cache.constants_ref(nogc).at(ops.idx(0)));
+            let v = heap.no_gc(|nogc| cache.constants_ref(nogc).at(ops.idx(0)));
             *acc = v;
             Step::Next
         }
@@ -447,8 +439,8 @@ fn step(
                         Coercion::Threw => return Step::PendingThrow,
                         Coercion::Value(v) => v,
                     };
-                    let is_string = heap.no_gc(|nogc, heap| {
-                        let known = heap.known();
+                    let is_string = heap.no_gc(|nogc| {
+                        let known = nogc.known();
                         (
                             lhs.get_as::<VMString>(nogc, known.string_map).is_some(),
                             rhs.get_as::<VMString>(nogc, known.string_map).is_some(),
@@ -462,9 +454,9 @@ fn step(
                         }));
                         *acc = s;
                     } else {
-                        let r = step_try!(heap.no_gc(|nogc, heap| {
-                            let a = Convert::to_number(nogc, heap, lhs)?;
-                            let b = Convert::to_number(nogc, heap, rhs)?;
+                        let r = step_try!(heap.no_gc(|nogc| {
+                            let a = Convert::to_number(nogc, lhs)?;
+                            let b = Convert::to_number(nogc, rhs)?;
                             // IEEE `-0 + -0` yields +0; the spec demands -0
                             let r = a + b;
                             let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative() {
@@ -639,13 +631,13 @@ fn step(
             Step::Next
         }
         Opcode::JumpIfTruthy => {
-            if heap.no_gc(|nogc, heap| Convert::is_truthy(nogc, heap, *acc)) {
+            if heap.no_gc(|nogc| Convert::is_truthy(nogc, *acc)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
         }
         Opcode::JumpIfFalsy => {
-            if !heap.no_gc(|nogc, heap| Convert::is_truthy(nogc, heap, *acc)) {
+            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, *acc)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
@@ -706,7 +698,7 @@ fn step(
             // decides the receiver's prototype via GetPrototypeFromConstructor,
             // the callee runs with the receiver as `this`, and an object
             // result wins over the receiver.
-            let constructible = heap.no_gc(|nogc, _heap| {
+            let constructible = heap.no_gc(|nogc| {
                 let callee = stack.reg(&meta, ops.reg(0));
                 let ValueRef::Object(obj) = callee.value_ref(nogc) else {
                     return false;
@@ -752,7 +744,7 @@ fn step(
                 if result == heap.known().exception.value() {
                     return Step::PendingThrow;
                 }
-                *acc = if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, result)) {
+                *acc = if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
                     receiver.value()
                 } else {
                     result
@@ -762,7 +754,7 @@ fn step(
         }
         Opcode::EqualStrict => {
             let other = stack.reg(&meta, ops.reg(0));
-            let r = heap.no_gc(|nogc, heap| Compare::strict_equal(nogc, heap, *acc, other));
+            let r = heap.no_gc(|nogc| Compare::strict_equal(nogc, *acc, other));
             *acc = Convert::boolean(heap, r);
             Step::Next
         }
@@ -779,7 +771,7 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc, heap| Compare::equal(nogc, heap, x, y)));
+            let r = step_try!(heap.no_gc(|nogc| Compare::equal(nogc, x, y)));
             *acc = Convert::boolean(heap, r);
             Step::Next
         }
@@ -796,7 +788,7 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc, heap| Compare::less_than(nogc, heap, x, y)));
+            let r = step_try!(heap.no_gc(|nogc| Compare::less_than(nogc, x, y)));
             *acc = Convert::boolean(heap, r);
             Step::Next
         }
@@ -812,8 +804,7 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r =
-                step_try!(heap.no_gc(|nogc, heap| Compare::less_than_or_equal(nogc, heap, x, y)));
+            let r = step_try!(heap.no_gc(|nogc| Compare::less_than_or_equal(nogc, x, y)));
             *acc = Convert::boolean(heap, r);
             Step::Next
         }
@@ -829,7 +820,7 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc, heap| Compare::greater_than(nogc, heap, x, y)));
+            let r = step_try!(heap.no_gc(|nogc| Compare::greater_than(nogc, x, y)));
             *acc = Convert::boolean(heap, r);
             Step::Next
         }
@@ -845,9 +836,7 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(
-                heap.no_gc(|nogc, heap| Compare::greater_than_or_equal(nogc, heap, x, y))
-            );
+            let r = step_try!(heap.no_gc(|nogc| Compare::greater_than_or_equal(nogc, x, y)));
             *acc = Convert::boolean(heap, r);
             Step::Next
         }
@@ -871,8 +860,7 @@ fn step(
         // TODO: feedback vectors and separation once they are there
         Opcode::Call | Opcode::CallNoFeedback => {
             let count = ops.reg_count(2);
-            let target =
-                heap.no_gc(|nogc, heap| call_target(nogc, heap, stack.reg(&meta, ops.reg(0))));
+            let target = heap.no_gc(|nogc| call_target(nogc, stack.reg(&meta, ops.reg(0))));
             let Some(target) = target else {
                 return Step::Error(VmError::Type);
             };
@@ -893,7 +881,7 @@ fn step(
                     }
                 }
                 CallTarget::Bytecode(target, register_count) => {
-                    let context = heap.no_gc(|nogc, heap| closure_context(nogc, heap, target));
+                    let context = heap.no_gc(|nogc| closure_context(nogc, target));
                     let callee = step_try!(stack.push_frame(
                         meta,
                         pc,
@@ -909,9 +897,9 @@ fn step(
             }
         }
         Opcode::LoadNamedProperty => {
-            let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                let name = callable_name(nogc, heap, stack, &meta, ops.idx(1));
-                load_outcome(nogc, heap, stack.reg(&meta, ops.reg(0)), name)
+            let outcome = step_try!(heap.no_gc(|nogc| {
+                let name = callable_name(nogc, stack, &meta, ops.idx(1));
+                load_outcome(nogc, stack.reg(&meta, ops.reg(0)), name)
             }));
             match outcome {
                 LoadOutcome::Value(v) => *acc = v,
@@ -940,9 +928,9 @@ fn step(
                 _ => StoreSemantics::WriteThrough,
             };
             let receiver = stack.reg(&meta, ops.reg(0));
-            let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                let name = callable_name(nogc, heap, stack, &meta, ops.idx(1));
-                receiver.store_lookup(nogc, heap, name, *acc, semantics)
+            let outcome = step_try!(heap.no_gc(|nogc| {
+                let name = callable_name(nogc, stack, &meta, ops.idx(1));
+                receiver.store_lookup(nogc, name, *acc, semantics)
             }));
             step_try!(apply_store_outcome(
                 heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
@@ -951,20 +939,19 @@ fn step(
         }
         Opcode::LoadKeyedProperty => {
             let receiver = stack.reg(&meta, ops.reg(0));
-            let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                match classify_key(nogc, heap, *acc)? {
-                    Key::Element(i) => match element_value(nogc, heap, receiver, i) {
+            let outcome = step_try!(heap.no_gc(|nogc| {
+                match classify_key(nogc, *acc)? {
+                    Key::Element(i) => match element_value(nogc, receiver, i) {
                         Some(v) => Ok(LoadOutcome::Value(v)),
                         // past the end, a hole, or a non-array receiver:
                         // fall back to an ordinary property lookup
                         None => load_outcome(
                             nogc,
-                            heap,
                             receiver,
                             SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
                         ),
                     },
-                    Key::Name(name) => load_outcome(nogc, heap, receiver, name),
+                    Key::Name(name) => load_outcome(nogc, receiver, name),
                 }
             }));
             match outcome {
@@ -993,10 +980,10 @@ fn step(
             };
             let receiver = stack.reg(&meta, ops.reg(0));
             let key = stack.reg(&meta, ops.reg(1));
-            let key = step_try!(heap.no_gc(|nogc, heap| classify_key(nogc, heap, key)));
+            let key = step_try!(heap.no_gc(|nogc| classify_key(nogc, key)));
             match key {
                 Key::Element(i) => {
-                    let is_array = heap.no_gc(|nogc, _heap| {
+                    let is_array = heap.no_gc(|nogc| {
                         let ValueRef::Object(obj) = receiver.value_ref(nogc) else {
                             return false;
                         };
@@ -1008,10 +995,9 @@ fn step(
                         }));
                     } else {
                         // numeric property on a non-array receiver
-                        let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                        let outcome = step_try!(heap.no_gc(|nogc| {
                             receiver.store_lookup(
                                 nogc,
-                                heap,
                                 SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
                                 *acc,
                                 semantics,
@@ -1023,9 +1009,9 @@ fn step(
                     }
                 }
                 Key::Name(name) => {
-                    let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                        receiver.store_lookup(nogc, heap, name, *acc, semantics)
-                    }));
+                    let outcome = step_try!(
+                        heap.no_gc(|nogc| { receiver.store_lookup(nogc, name, *acc, semantics) })
+                    );
                     step_try!(apply_store_outcome(
                         heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
                     ));
@@ -1078,9 +1064,9 @@ fn step(
         Opcode::CreateClosure => {
             // constants[idx] is the shared callable-info template (SFI-like);
             // the closure captures the current frame's context
-            let info = step_try!(heap.no_gc(|nogc, heap| {
+            let info = step_try!(heap.no_gc(|nogc| {
                 let v = cache.constants_ref(nogc).at(ops.idx(0));
-                v.get_as::<CallableInfoObject>(nogc, heap.known().callable_map)
+                v.get_as::<CallableInfoObject>(nogc, nogc.known().callable_map)
                     .map(|r| r.into_tagged().erase())
                     .ok_or(VmError::Type)
             }));
@@ -1161,12 +1147,10 @@ fn step(
                 Missing,
             }
             let global = heap.known().global_object.value();
-            let lookup = heap.no_gc(|nogc, heap| {
-                let name = callable_name(nogc, heap, stack, &meta, ops.idx(0));
-                match global.lookup(nogc, heap, name) {
-                    Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => {
-                        GlobalLoad::Data(slot.inner())
-                    }
+            let lookup = heap.no_gc(|nogc| {
+                let name = callable_name(nogc, stack, &meta, ops.idx(0));
+                match global.lookup(nogc, name) {
+                    Lookup::Data { slot, .. } => GlobalLoad::Data(slot.inner()),
                     Lookup::Accessor { pair, .. } => GlobalLoad::Getter(pair.get.inner()),
                     Lookup::NotFound => GlobalLoad::Missing,
                 }
@@ -1199,9 +1183,9 @@ fn step(
         }
         Opcode::StoreGlobal => {
             let global = heap.known().global_object.value();
-            let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                let name = callable_name(nogc, heap, stack, &meta, ops.idx(0));
-                global.store_lookup(nogc, heap, name, *acc, StoreSemantics::WriteThrough)
+            let outcome = step_try!(heap.no_gc(|nogc| {
+                let name = callable_name(nogc, stack, &meta, ops.idx(0));
+                global.store_lookup(nogc, name, *acc, StoreSemantics::WriteThrough)
             }));
             step_try!(apply_store_outcome(
                 heap, state, stack, cache, meta, pc, global, *acc, outcome,
@@ -1211,17 +1195,17 @@ fn step(
         Opcode::CreateFunctionContext => {
             // constants[idx] is the scope's shared ScopeInfo (its `names`
             // array is parallel to the context's slots)
-            let scope_info = step_try!(heap.no_gc(|nogc, heap| {
+            let scope_info = step_try!(heap.no_gc(|nogc| {
                 cache
                     .constants_ref(nogc)
                     .at(ops.idx(0))
-                    .get_as::<ScopeInfo>(nogc, heap.known().scope_info_map)
+                    .get_as::<ScopeInfo>(nogc, nogc.known().scope_info_map)
                     .map(|r| r.into_tagged().erase())
                     .ok_or(VmError::Type)
             }));
-            let count = step_try!(heap.no_gc(|nogc, heap| {
+            let count = step_try!(heap.no_gc(|nogc| {
                 scope_info
-                    .get_as::<ScopeInfo>(nogc, heap.known().scope_info_map)
+                    .get_as::<ScopeInfo>(nogc, nogc.known().scope_info_map)
                     .map(|r| r.as_ref().names.heap_ref(nogc).len())
                     .ok_or(VmError::Type)
             }));
@@ -1314,18 +1298,14 @@ fn step(
         }
         Opcode::LoadContextSlot => {
             let depth = ops.uimm(1);
-            let v = step_try!(heap.no_gc(|nogc, heap| {
+            let v = step_try!(heap.no_gc(|nogc| {
                 let mut context = stack
                     .context_slot(&meta)
                     .inner()
-                    .get_as::<Context>(nogc, heap.known().context_map)
+                    .get_as::<Context>(nogc, nogc.known().context_map)
                     .ok_or(VmError::Type)?;
                 for _ in 0..depth {
-                    context = context
-                        .as_ref()
-                        .outer
-                        .heap_ref(nogc, heap)
-                        .ok_or(VmError::Type)?;
+                    context = context.as_ref().outer.heap_ref(nogc).ok_or(VmError::Type)?;
                 }
                 Ok(context
                     .slots
@@ -1338,18 +1318,14 @@ fn step(
             Step::Next
         }
         Opcode::StoreContextSlot => {
-            step_try!(heap.no_gc(|nogc, heap| {
+            step_try!(heap.no_gc(|nogc| {
                 let mut context = stack
                     .context_slot(&meta)
                     .inner()
-                    .get_as::<Context>(nogc, heap.known().context_map)
+                    .get_as::<Context>(nogc, nogc.known().context_map)
                     .ok_or(VmError::Type)?;
                 for _ in 0..ops.uimm(1) {
-                    context = context
-                        .as_ref()
-                        .outer
-                        .heap_ref(nogc, heap)
-                        .ok_or(VmError::Type)?;
+                    context = context.as_ref().outer.heap_ref(nogc).ok_or(VmError::Type)?;
                 }
                 let host = context.clone().into_tagged().erase();
                 context
@@ -1357,25 +1333,24 @@ fn step(
                     .heap_ref(nogc)
                     .as_ref()
                     .element_slot(ops.idx(0))
-                    .set(heap, host, Tagged::from_value(*acc));
+                    .set(nogc.heap(), host, Tagged::from_value(*acc));
                 Ok(())
             }));
             Step::Next
         }
         Opcode::LoadDynamicName => {
-            let name = heap.no_gc(|nogc, _| cache.constants_ref(nogc).at(ops.idx(0)));
-            let found = step_try!(
-                heap.no_gc(|nogc, heap| { dynamic_lookup(nogc, heap, stack, &meta, name) })
-            );
+            let name = heap.no_gc(|nogc| cache.constants_ref(nogc).at(ops.idx(0)));
+            let found = step_try!(heap.no_gc(|nogc| { dynamic_lookup(nogc, stack, &meta, name) }));
             match found {
                 Some(v) if v != heap.known().void.value() => *acc = v,
                 Some(_) => return Step::Error(VmError::Reference),
                 None => {
                     // unresolved: fall back to a global object property
                     let global = heap.known().global_object.value();
-                    let outcome = step_try!(heap.no_gc(|nogc, heap| {
-                        load_outcome(nogc, heap, global, SlotName::from_value(name))
-                    }));
+                    let outcome =
+                        step_try!(heap.no_gc(|nogc| {
+                            load_outcome(nogc, global, SlotName::from_value(name))
+                        }));
                     match outcome {
                         LoadOutcome::Value(v) => *acc = v,
                         LoadOutcome::Getter(getter) => {
@@ -1398,32 +1373,29 @@ fn step(
             Step::Next
         }
         Opcode::StoreDynamicName => {
-            let name = heap.no_gc(|nogc, _| cache.constants_ref(nogc).at(ops.idx(0)));
-            let found = step_try!(
-                heap.no_gc(|nogc, heap| { dynamic_lookup(nogc, heap, stack, &meta, name) })
-            );
+            let name = heap.no_gc(|nogc| cache.constants_ref(nogc).at(ops.idx(0)));
+            let found = step_try!(heap.no_gc(|nogc| { dynamic_lookup(nogc, stack, &meta, name) }));
             match found {
                 Some(v) if v != heap.known().void.value() => {
                     // write through to the found slot
-                    step_try!(heap.no_gc(|nogc, heap| {
+                    step_try!(heap.no_gc(|nogc| {
                         let mut context = stack
                             .context_slot(&meta)
                             .inner()
-                            .get_as::<Context>(nogc, heap.known().context_map)
+                            .get_as::<Context>(nogc, nogc.known().context_map)
                             .ok_or(VmError::Type)?;
-                        let target = dynamic_slot(nogc, heap, &mut context, name)?;
+                        let target = dynamic_slot(nogc, &mut context, name)?;
                         let host = context.into_tagged().erase();
-                        target.set(heap, host, Tagged::from_value(*acc));
+                        target.set(nogc.heap(), host, Tagged::from_value(*acc));
                         Ok(())
                     }));
                 }
                 Some(_) => return Step::Error(VmError::Reference),
                 None => {
                     let global = heap.known().global_object.value();
-                    let outcome = step_try!(heap.no_gc(|nogc, heap| {
+                    let outcome = step_try!(heap.no_gc(|nogc| {
                         global.store_lookup(
                             nogc,
-                            heap,
                             SlotName::from_value(name),
                             *acc,
                             StoreSemantics::WriteThrough,

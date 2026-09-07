@@ -7,11 +7,11 @@ pub struct Convert;
 impl Convert {
     /// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN,
     /// everything else is truthy.
-    pub fn is_truthy<'a>(nogc: &'a NoGc<'a>, heap: &Heap, v: Value) -> bool {
+    pub fn is_truthy<'a>(nogc: &'a NoGc<'a>, v: Value) -> bool {
         if let Some(smi) = Smi::decode(v) {
             return smi.value() != 0;
         }
-        let known = heap.known();
+        let known = nogc.known();
         if v == known.false_object.value()
             || v == known.undefined.value()
             || v == known.null.value()
@@ -33,11 +33,11 @@ impl Convert {
         true
     }
 
-    pub fn to_number<'a>(nogc: &'a NoGc<'a>, heap: &Heap, v: Value) -> Result<f64, VmError> {
+    pub fn to_number<'a>(nogc: &'a NoGc<'a>, v: Value) -> Result<f64, VmError> {
         if let Some(smi) = Smi::decode(v) {
             return Ok(smi.value() as f64);
         }
-        let known = heap.known();
+        let known = nogc.known();
         if v == known.undefined.value() || v == known.void.value() {
             return Ok(f64::NAN);
         }
@@ -120,11 +120,11 @@ impl Convert {
 
     /// ES Type check: numbers, strings, symbols, booleans, null, undefined
     /// are primitives; everything else is an object.
-    pub fn is_primitive<'a>(nogc: &'a NoGc<'a>, heap: &Heap, v: Value) -> bool {
+    pub fn is_primitive<'a>(nogc: &'a NoGc<'a>, v: Value) -> bool {
         if v.is_smi() {
             return true;
         }
-        let known = heap.known();
+        let known = nogc.known();
         v == known.undefined.value()
             || v == known.null.value()
             || v == known.true_object.value()
@@ -166,8 +166,8 @@ impl Convert {
             Float(f64),
             Other,
         }
-        let kind = heap.no_gc(|nogc, heap| {
-            let known = heap.known();
+        let kind = heap.no_gc(|nogc| {
+            let known = nogc.known();
             if v.get_as::<VMString>(nogc, known.string_map).is_some() {
                 PrimitiveString::IsString
             } else if let Some(f) = v.get_as::<Float>(nogc, known.float_map) {

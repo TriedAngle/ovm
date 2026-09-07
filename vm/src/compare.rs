@@ -1,10 +1,10 @@
-use crate::{Convert, Float, Heap, NoGc, Smi, VMString, Value, VmError};
+use crate::{Convert, Float, NoGc, Smi, VMString, Value, VmError};
 
 pub struct Compare;
 
 impl Compare {
-    pub fn strict_equal<'a>(nogc: &'a NoGc<'a>, heap: &Heap, x: Value, y: Value) -> bool {
-        let known = heap.known();
+    pub fn strict_equal<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> bool {
+        let known = nogc.known();
         let x_num = x.is_smi() || x.get_as::<Float>(nogc, known.float_map).is_some();
         let y_num = y.is_smi() || y.get_as::<Float>(nogc, known.float_map).is_some();
         if x_num || y_num {
@@ -38,11 +38,11 @@ impl Compare {
     }
 
     /// ES IsLooselyEqual (==) for primitives.
-    pub fn equal<'a>(nogc: &'a NoGc<'a>, heap: &Heap, x: Value, y: Value) -> Result<bool, VmError> {
-        if Self::strict_equal(nogc, heap, x, y) {
+    pub fn equal<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
+        if Self::strict_equal(nogc, x, y) {
             return Ok(true);
         }
-        let known = heap.known();
+        let known = nogc.known();
         let nullish = |v: Value| v == known.null.value() || v == known.undefined.value();
         if nullish(x) && nullish(y) {
             return Ok(true);
@@ -52,19 +52,19 @@ impl Compare {
         let is_number = |v: Value| v.is_smi() || v.get_as::<Float>(nogc, known.float_map).is_some();
         // number ↔ string: the string parses as a number
         if is_number(x) && is_string(y) {
-            return Ok(Convert::to_number(nogc, heap, x)? == Convert::to_number(nogc, heap, y)?);
+            return Ok(Convert::to_number(nogc, x)? == Convert::to_number(nogc, y)?);
         }
         if is_string(x) && is_number(y) {
-            return Ok(Convert::to_number(nogc, heap, x)? == Convert::to_number(nogc, heap, y)?);
+            return Ok(Convert::to_number(nogc, x)? == Convert::to_number(nogc, y)?);
         }
         // booleans become numbers (exactly representable as smis, no allocation)
         if is_bool(x) {
             let n = Smi::new(if x == known.true_object.value() { 1 } else { 0 }).encode();
-            return Self::equal(nogc, heap, n, y);
+            return Self::equal(nogc, n, y);
         }
         if is_bool(y) {
             let n = Smi::new(if y == known.true_object.value() { 1 } else { 0 }).encode();
-            return Self::equal(nogc, heap, x, n);
+            return Self::equal(nogc, x, n);
         }
         let is_object =
             |v: Value| !v.is_smi() && !is_bool(v) && !nullish(v) && !is_string(v) && !is_number(v);
@@ -77,13 +77,13 @@ impl Compare {
     /// ES SameValue (7.2.11): NaN equals NaN, +0 and -0 are distinct, and
     /// strings compare by content (identity for everything else).
     /// Unlike `strict_equal` (===); used by [[DefineOwnProperty]] validation.
-    pub fn same_value<'a>(nogc: &'a NoGc<'a>, heap: &Heap, x: Value, y: Value) -> bool {
+    pub fn same_value<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> bool {
         // identical bits: same object, same string, same smi, or the very
         // same NaN heap object
         if x == y {
             return true;
         }
-        let known = heap.known();
+        let known = nogc.known();
         let x_num = x.is_smi() || x.get_as::<Float>(nogc, known.float_map).is_some();
         let y_num = y.is_smi() || y.get_as::<Float>(nogc, known.float_map).is_some();
         if x_num && y_num {
@@ -111,75 +111,59 @@ impl Compare {
         false
     }
 
-    pub fn less_than<'a>(
-        nogc: &'a NoGc<'a>,
-        heap: &Heap,
-        x: Value,
-        y: Value,
-    ) -> Result<bool, VmError> {
-        let known = heap.known();
+    pub fn less_than<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
+        let known = nogc.known();
         if let (Some(sx), Some(sy)) = (
             x.get_as::<VMString>(nogc, known.string_map),
             y.get_as::<VMString>(nogc, known.string_map),
         ) {
             return Ok(sx.as_slice(nogc) < sy.as_slice(nogc));
         }
-        let a = Convert::to_number(nogc, heap, x)?;
-        let b = Convert::to_number(nogc, heap, y)?;
+        let a = Convert::to_number(nogc, x)?;
+        let b = Convert::to_number(nogc, y)?;
         Ok(a < b)
     }
 
-    pub fn less_than_or_equal<'a>(
-        nogc: &'a NoGc<'a>,
-        heap: &Heap,
-        x: Value,
-        y: Value,
-    ) -> Result<bool, VmError> {
-        let known = heap.known();
+    pub fn less_than_or_equal<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
+        let known = nogc.known();
         if let (Some(sx), Some(sy)) = (
             x.get_as::<VMString>(nogc, known.string_map),
             y.get_as::<VMString>(nogc, known.string_map),
         ) {
             return Ok(sx.as_slice(nogc) <= sy.as_slice(nogc));
         }
-        let a = Convert::to_number(nogc, heap, x)?;
-        let b = Convert::to_number(nogc, heap, y)?;
+        let a = Convert::to_number(nogc, x)?;
+        let b = Convert::to_number(nogc, y)?;
         Ok(a <= b)
     }
 
-    pub fn greater_than<'a>(
-        nogc: &'a NoGc<'a>,
-        heap: &Heap,
-        x: Value,
-        y: Value,
-    ) -> Result<bool, VmError> {
-        let known = heap.known();
+    pub fn greater_than<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
+        let known = nogc.known();
         if let (Some(sx), Some(sy)) = (
             x.get_as::<VMString>(nogc, known.string_map),
             y.get_as::<VMString>(nogc, known.string_map),
         ) {
             return Ok(sx.as_slice(nogc) > sy.as_slice(nogc));
         }
-        let a = Convert::to_number(nogc, heap, x)?;
-        let b = Convert::to_number(nogc, heap, y)?;
+        let a = Convert::to_number(nogc, x)?;
+        let b = Convert::to_number(nogc, y)?;
         Ok(a > b)
     }
 
     pub fn greater_than_or_equal<'a>(
         nogc: &'a NoGc<'a>,
-        heap: &Heap,
         x: Value,
         y: Value,
     ) -> Result<bool, VmError> {
-        let known = heap.known();
+        let known = nogc.known();
         if let (Some(sx), Some(sy)) = (
             x.get_as::<VMString>(nogc, known.string_map),
             y.get_as::<VMString>(nogc, known.string_map),
         ) {
             return Ok(sx.as_slice(nogc) >= sy.as_slice(nogc));
         }
-        let a = Convert::to_number(nogc, heap, x)?;
-        let b = Convert::to_number(nogc, heap, y)?;
+        let a = Convert::to_number(nogc, x)?;
+        let b = Convert::to_number(nogc, y)?;
         Ok(a >= b)
     }
 }

@@ -108,17 +108,14 @@ fn exception_name(thread: &mut ovm::Thread) -> String {
             return "exception".into();
         };
         let name_key = thread.intern(&scope, "name").value();
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
                 return "exception".into();
             };
-            match o
-                .as_ref()
-                .lookup(nogc, heap, vm::SlotName::from_value(name_key))
-            {
+            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
                 vm::Lookup::Data { slot, .. } => slot
                     .inner()
-                    .get_as::<vm::VMString>(nogc, heap.known().string_map)
+                    .get_as::<vm::VMString>(nogc, nogc.known().string_map)
                     .map(|s| String::from_utf8_lossy(s.as_slice(nogc)).into_owned())
                     .unwrap_or_else(|| "exception".into()),
                 _ => "exception".into(),

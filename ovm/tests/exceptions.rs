@@ -256,14 +256,11 @@ fn stack_overflow_during_call_is_throwable() {
     let expected = thread.handle_scope(|thread, scope| thread.intern(&scope, "RangeError").value());
     thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(nogc, heap, vm::SlotName::from_value(name_key))
-            {
+            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
                 vm::Lookup::Data { slot, .. } => {
                     assert_eq!(slot.inner(), expected, "stack overflow -> RangeError");
                 }

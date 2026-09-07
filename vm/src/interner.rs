@@ -70,7 +70,7 @@ fn handle_from_entry<'s>(
     scope: &'s HandleScope<'_>,
     entry: &WeakGcCell<InternedString>,
 ) -> Option<Handle<'s, InternedString>> {
-    heap.no_gc(|nogc, _| entry.upgrade(nogc).map(|r| r.into_handle(scope)))
+    heap.no_gc(|nogc| entry.upgrade(nogc).map(|r| r.into_handle(scope)))
 }
 
 impl EdgeVisitable for StringInterner {

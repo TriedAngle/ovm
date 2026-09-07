@@ -39,12 +39,12 @@ fn run_bool(src: &str) -> bool {
 
 fn run_num(src: &str) -> f64 {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         if let Some(smi) = Smi::decode(result) {
             return smi.value() as f64;
         }
         result
-            .get_as::<Float>(nogc, heap.known().float_map)
+            .get_as::<Float>(nogc, nogc.known().float_map)
             .expect("number result")
             .value
             .get()
@@ -53,9 +53,9 @@ fn run_num(src: &str) -> f64 {
 
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         let s = result
-            .get_as::<VMString>(nogc, heap.known().string_map)
+            .get_as::<VMString>(nogc, nogc.known().string_map)
             .expect("string result");
         String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
     })
@@ -272,14 +272,11 @@ fn tdz_throws_on_let_before_init() {
     thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
         let expected = thread.intern(&scope, "ReferenceError").value();
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(nogc, heap, vm::SlotName::from_value(name_key))
-            {
+            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
                 vm::Lookup::Data { slot, .. } => assert_eq!(slot.inner(), expected),
                 _ => panic!("error object must have a name property"),
             }

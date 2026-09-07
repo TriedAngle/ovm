@@ -26,14 +26,11 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
     let expected_name = thread.handle_scope(|thread, scope| thread.intern(&scope, class).value());
     thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             let ValueRef::Object(o) = ex.value_ref(nogc) else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(nogc, heap, SlotName::from_value(name_key))
-            {
+            match o.as_ref().lookup(nogc, SlotName::from_value(name_key)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(slot.inner(), expected_name, "error class name");
                 }
@@ -318,14 +315,14 @@ fn array_literal_built_with_manual_stores() {
 
     let result = run_program(&mut thread, program, 5, &[]);
     let array = result.unwrap();
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         let a = array
-            .get_as::<Object>(nogc, heap.known().js_array_map)
+            .get_as::<Object>(nogc, nogc.known().js_array_map)
             .expect("array literal result");
         let a = a.as_ref();
         assert!(a.is_array(nogc));
         assert_eq!(a.length(), 3);
-        let elements = a.elements_array(nogc, heap).expect("array elements");
+        let elements = a.elements_array(nogc).expect("array elements");
         assert_eq!(Smi::decode(elements.at(0)).unwrap().value(), 1);
         assert_eq!(Smi::decode(elements.at(1)).unwrap().value(), 2);
         assert_eq!(Smi::decode(elements.at(2)).unwrap().value(), 3);
@@ -343,14 +340,14 @@ fn create_empty_array_literal_starts_empty() {
 
     let result = run_program(&mut thread, program, 0, &[]);
     let array = result.unwrap();
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         let a = array
-            .get_as::<Object>(nogc, heap.known().js_array_map)
+            .get_as::<Object>(nogc, nogc.known().js_array_map)
             .expect("array literal result");
         let a = a.as_ref();
         assert!(a.is_array(nogc));
         assert_eq!(a.length(), 0);
-        let elements = a.elements_array(nogc, heap).expect("array elements");
+        let elements = a.elements_array(nogc).expect("array elements");
         assert_eq!(elements.len(), 0);
     });
 }
@@ -375,17 +372,17 @@ fn array_literal_with_holes_keeps_length() {
 
     let result = run_program(&mut thread, program, 5, &[]);
     let array = result.unwrap();
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         let a = array
-            .get_as::<Object>(nogc, heap.known().js_array_map)
+            .get_as::<Object>(nogc, nogc.known().js_array_map)
             .expect("array literal result");
         let a = a.as_ref();
         assert_eq!(a.length(), 3);
-        let elements = a.elements_array(nogc, heap).expect("array elements");
+        let elements = a.elements_array(nogc).expect("array elements");
         assert_eq!(Smi::decode(elements.at(0)).unwrap().value(), 1);
         assert_eq!(
             elements.at(1),
-            heap.known().void.value(),
+            nogc.known().void.value(),
             "elided index stays a hole"
         );
         assert_eq!(Smi::decode(elements.at(2)).unwrap().value(), 2);
@@ -436,7 +433,7 @@ fn object_literal_built_with_manual_stores() {
 
     let obj1 = build(&mut thread);
     let obj2 = build(&mut thread);
-    let ((x1, y1, map1), (x2, y2, map2), initial) = thread.heap().no_gc(|_nogc, heap| {
+    let ((x1, y1, map1), (x2, y2, map2), initial) = thread.heap().no_gc(|_nogc| {
         let read = |obj: Value| {
             let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
             // Safety: `obj` is a strong, live reference to the object
@@ -452,7 +449,7 @@ fn object_literal_built_with_manual_stores() {
         (
             read(obj1),
             read(obj2),
-            heap.known().object_initial_map.as_tagged().erase(),
+            _nogc.known().object_initial_map.as_tagged().erase(),
         )
     });
     assert_eq!((x1, y1), (7, 9));
@@ -1748,9 +1745,9 @@ fn arithmetic_overflow_promotes_to_float() {
         &[smi(Smi::MAX - 1), smi(5)],
     );
     let result = result.unwrap();
-    let value = thread.heap().no_gc(|nogc, heap| {
+    let value = thread.heap().no_gc(|nogc| {
         result
-            .get_as::<Float>(nogc, heap.known().float_map)
+            .get_as::<Float>(nogc, nogc.known().float_map)
             .expect("overflow must promote to float")
             .value
             .get()
@@ -1782,8 +1779,8 @@ fn run_binary_consts(
 }
 
 fn float_value(thread: &mut Thread, v: Value) -> f64 {
-    thread.heap().no_gc(|nogc, heap| {
-        v.get_as::<Float>(nogc, heap.known().float_map)
+    thread.heap().no_gc(|nogc| {
+        v.get_as::<Float>(nogc, nogc.known().float_map)
             .expect("expected float result")
             .value
             .get()
@@ -2322,9 +2319,7 @@ fn empty_object_literal_inherits_from_object_prototype() {
         // host-side: %Object.prototype%.p = 1
         let outcome = thread
             .heap()
-            .no_gc(|nogc, heap| {
-                proto.store_lookup(nogc, heap, name, smi(1), StoreSemantics::Shadow)
-            })
+            .no_gc(|nogc| proto.store_lookup(nogc, name, smi(1), StoreSemantics::Shadow))
             .unwrap();
         match outcome {
             StoreOutcome::Transition { receiver, name } => {
@@ -2494,24 +2489,24 @@ fn create_closure_shares_callable_info_template() {
         (result.unwrap(), callee_info.as_tagged().erase())
     });
 
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         let ValueRef::Object(o) = result.value_ref(nogc) else {
             panic!("closure must be an object");
         };
         let info = o
             .as_ref()
-            .callable_info(nogc, heap)
+            .callable_info(nogc)
             .expect("closure carries a callable info");
         // the info is shared, not copied per closure
         assert_eq!(info.into_tagged().erase(), template);
         // the closure's context slot is the caller's (empty) context
         let context = o
             .as_ref()
-            .closure_context(nogc, heap)
+            .closure_context(nogc)
             .expect("closure carries a context");
         assert_eq!(
             context.into_tagged().erase(),
-            heap.known().empty_context.as_tagged().erase()
+            nogc.known().empty_context.as_tagged().erase()
         );
     });
 }
@@ -3090,9 +3085,9 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
             &[obj, smi(1)],
         )
         .unwrap();
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             let s = r
-                .get_as::<VMString>(nogc, heap.known().string_map)
+                .get_as::<VMString>(nogc, nogc.known().string_map)
                 .expect("concat result must be a string");
             assert_eq!(s.as_str(nogc), Some("x1"));
         });
@@ -3116,9 +3111,9 @@ fn add_concatenates_strings() {
         ] {
             let r =
                 run_program(&mut *thread, binary_op_program(Opcode::Add), 0, &[lhs, rhs]).unwrap();
-            thread.heap().no_gc(|nogc, heap| {
+            thread.heap().no_gc(|nogc| {
                 let s = r
-                    .get_as::<VMString>(nogc, heap.known().string_map)
+                    .get_as::<VMString>(nogc, nogc.known().string_map)
                     .expect("concat result must be a string");
                 assert_eq!(s.as_str(nogc), Some(expected), "{lhs:?} + {rhs:?}");
             });
@@ -3384,8 +3379,8 @@ fn negate_arithmetic_rules() {
 
     // -0 must be the -0.0 HeapNumber (1 / -0 === -Infinity)
     let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(0)]).unwrap();
-    let r = thread.heap().no_gc(|nogc, heap| {
-        r.get_as::<Float>(nogc, heap.known().float_map)
+    let r = thread.heap().no_gc(|nogc| {
+        r.get_as::<Float>(nogc, nogc.known().float_map)
             .expect("-0 must stay a float")
             .value
             .get()
@@ -3575,10 +3570,9 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
     nctx.handle_scope(|nctx, scope| {
         let name = nctx.intern(&scope, "constructProbe");
         let global = nctx.heap().known().global_object.value();
-        let outcome = nctx.heap().no_gc(|nogc, heap| {
+        let outcome = nctx.heap().no_gc(|nogc| {
             global.store_lookup(
                 nogc,
-                heap,
                 SlotName::from(name.as_tagged()),
                 flag,
                 StoreSemantics::WriteThrough,
@@ -3740,17 +3734,14 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
         .unwrap();
         assert_eq!(Smi::decode(r).unwrap().value(), 2, "acc keeps the value");
 
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             // no own property appeared on the child, the parent is untouched
             let child_ref = child.heap_ref(nogc);
             assert_eq!(child_ref.header.map.heap_ref(nogc).descriptor_count(), 0);
             let ValueRef::Object(parent_ref) = parent.as_tagged().erase().value_ref(nogc) else {
                 panic!("parent must be an object");
             };
-            match parent_ref
-                .as_ref()
-                .lookup(nogc, heap, SlotName::from_value(p))
-            {
+            match parent_ref.as_ref().lookup(nogc, SlotName::from_value(p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 1);
                 }
@@ -3777,7 +3768,7 @@ fn shadow_store_defines_default_attributes() {
         .unwrap();
         assert_eq!(Smi::decode(r).unwrap().value(), 2);
 
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             let child_ref = child.heap_ref(nogc);
             let map = child_ref.header.map.heap_ref(nogc);
             assert_eq!(map.descriptor_count(), 1);
@@ -3789,10 +3780,7 @@ fn shadow_store_defines_default_attributes() {
             assert!(d.flags().is_enumerable());
             assert!(d.flags().is_configurable());
             // the own slot wins, the parent keeps its value
-            match child_ref
-                .as_ref()
-                .lookup(nogc, heap, SlotName::from_value(p))
-            {
+            match child_ref.as_ref().lookup(nogc, SlotName::from_value(p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 2);
                 }
@@ -3801,10 +3789,7 @@ fn shadow_store_defines_default_attributes() {
             let ValueRef::Object(parent_ref) = parent.as_tagged().erase().value_ref(nogc) else {
                 panic!("parent must be an object");
             };
-            match parent_ref
-                .as_ref()
-                .lookup(nogc, heap, SlotName::from_value(p))
-            {
+            match parent_ref.as_ref().lookup(nogc, SlotName::from_value(p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 1);
                 }

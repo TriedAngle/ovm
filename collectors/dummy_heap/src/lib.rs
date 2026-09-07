@@ -376,7 +376,7 @@ mod tests {
         // the heap remains fully usable afterwards
         let mut local = global.new_local();
         let bytes = local.allocate::<FixedByteArray>(&[1u8, 2, 3]).into_ptr();
-        local.no_gc(|_nogc, _heap| {
+        local.no_gc(|_nogc| {
             assert_eq!(unsafe { bytes.as_ref() }.as_slice(), &[1, 2, 3]);
         });
     }
@@ -399,9 +399,9 @@ mod tests {
         assert!(global.contains(raw.as_ptr() as Word));
         assert!(global.stats().used >= before + layout.size());
 
-        local.no_gc(|_nogc, heap| {
-            assert!(heap.known().void.value().is_strong_ptr());
-            assert!(!heap.gc_in_progress());
+        local.no_gc(|_nogc| {
+            assert!(_nogc.known().void.value().is_strong_ptr());
+            assert!(!_nogc.gc_in_progress());
         });
         drop(local);
         let _ = global.stats();
@@ -491,7 +491,7 @@ mod tests {
 
     fn expect_data(lookup: Lookup<'_>, expected: i64) {
         match lookup {
-            Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => {
+            Lookup::Data { slot, .. } => {
                 assert_eq!(Smi::decode(slot.inner()).unwrap().value(), expected)
             }
             _ => panic!("expected data lookup result"),
@@ -501,8 +501,8 @@ mod tests {
     #[test]
     fn bootstrap_maps_have_void_transitions() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
-        heap.no_gc(|nogc, heap| {
-            let known = heap.known();
+        heap.no_gc(|nogc| {
+            let known = nogc.known();
             let void = known.void.value();
             for map in [
                 known.map_map,
@@ -524,11 +524,11 @@ mod tests {
     fn fresh_map_has_no_transitions() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
         let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let map = map.heap_ref(nogc);
-            assert_eq!(map.transitions.inner(), heap.known().void.value());
+            assert_eq!(map.transitions.inner(), nogc.known().void.value());
             assert!(
-                map.find_transition(nogc, heap, smi_name(1), SlotFlags::VALUE)
+                map.find_transition(nogc, smi_name(1), SlotFlags::VALUE)
                     .is_none()
             );
         });
@@ -552,12 +552,14 @@ mod tests {
             .allocate::<FixedArray>(&[smi_name(1).value(), child.value()])
             .into_tagged();
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let parent_ref = parent.heap_ref(nogc);
-            parent_ref.transitions.set(heap, parent.value(), pairs);
+            parent_ref
+                .transitions
+                .set(nogc.heap(), parent.value(), pairs);
 
             let found = parent_ref
-                .find_transition(nogc, heap, smi_name(1), flags)
+                .find_transition(nogc, smi_name(1), flags)
                 .expect("transition by name and flags");
             assert_eq!(found.into_ptr().as_ptr(), child.get().as_ptr());
 
@@ -565,13 +567,13 @@ mod tests {
             let other = flags.union(SlotFlags::ENUMERABLE);
             assert!(
                 parent_ref
-                    .find_transition(nogc, heap, smi_name(1), other)
+                    .find_transition(nogc, smi_name(1), other)
                     .is_none()
             );
             // unknown name
             assert!(
                 parent_ref
-                    .find_transition(nogc, heap, smi_name(2), flags)
+                    .find_transition(nogc, smi_name(2), flags)
                     .is_none()
             );
         });
@@ -608,7 +610,7 @@ mod tests {
         let child = Map::transition_target(&mut heap, &scope, parent, name, flags);
         let child = scope.create_handle(child).expect("child map is strong");
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let child_ref = child.heap_ref(nogc);
             assert_eq!(child_ref.descriptor_count(), 1);
             assert_eq!(child_ref.value_slot_count(), 1);
@@ -620,7 +622,7 @@ mod tests {
             // the parent recorded the edge and finds it again
             let found = parent
                 .heap_ref(nogc)
-                .find_transition(nogc, heap, smi_name(1), flags)
+                .find_transition(nogc, smi_name(1), flags)
                 .expect("recorded transition");
             assert_eq!(found.into_ptr().as_ptr(), child.get().as_ptr());
         });
@@ -639,11 +641,11 @@ mod tests {
         let b = Map::transition_target(&mut heap, &scope, parent, name, flags);
         assert_eq!(a.erase(), b.erase());
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let pairs = parent
                 .heap_ref(nogc)
                 .transitions
-                .heap_ref(nogc, heap)
+                .heap_ref(nogc)
                 .expect("transition array");
             assert_eq!(pairs.len(), 2, "exactly one edge recorded");
         });
@@ -677,11 +679,11 @@ mod tests {
             .create_handle(Map::transition_target(&mut heap, &scope, a, name2, flags))
             .expect("strong");
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let pairs = parent
                 .heap_ref(nogc)
                 .transitions
-                .heap_ref(nogc, heap)
+                .heap_ref(nogc)
                 .expect("transition array");
             assert_eq!(pairs.len(), 4, "two edges recorded on the parent");
 
@@ -725,13 +727,13 @@ mod tests {
         )
         .unwrap();
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = obj.heap_ref(nogc);
             let map = obj.header.map.heap_ref(nogc);
             assert_eq!(map.descriptor_count(), 2);
             // old slot intact, new slot written
-            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 7);
-            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(2)), 9);
+            expect_data(obj.as_ref().lookup(nogc, smi_name(1)), 7);
+            expect_data(obj.as_ref().lookup(nogc, smi_name(2)), 9);
             // appended descriptor carries the CreateDataProperty default attributes
             let d = map.descriptor(1);
             assert_eq!(d.name(), smi_name(2));
@@ -769,12 +771,12 @@ mod tests {
         )
         .unwrap();
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let map_a = a.heap_ref(nogc).header.map.inner();
             let map_b = b.heap_ref(nogc).header.map.inner();
             assert_eq!(map_a, map_b, "same base shape converges to the same map");
-            expect_data(a.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)), 1);
-            expect_data(b.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)), 2);
+            expect_data(a.heap_ref(nogc).as_ref().lookup(nogc, smi_name(1)), 1);
+            expect_data(b.heap_ref(nogc).as_ref().lookup(nogc, smi_name(1)), 2);
         });
     }
 
@@ -798,7 +800,7 @@ mod tests {
         // whether that is a TypeError
         assert_eq!(result, Ok(false));
 
-        heap.no_gc(|nogc, _| {
+        heap.no_gc(|nogc| {
             let obj = obj.heap_ref(nogc);
             // object untouched: same map, no slots
             assert_eq!(obj.header.map.inner(), map.value());
@@ -815,15 +817,15 @@ mod tests {
         let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let b = root_object(&scope, alloc_object(&mut heap, map, &[]));
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let slots_a = a.heap_ref(nogc).slots.inner();
             let slots_b = b.heap_ref(nogc).slots.inner();
             assert_eq!(slots_a, slots_b);
-            assert_eq!(slots_a, heap.known().empty_fixed_array.value());
+            assert_eq!(slots_a, nogc.known().empty_fixed_array.value());
             assert_eq!(a.heap_ref(nogc).slots.heap_ref(nogc).len(), 0);
             assert_eq!(
                 a.heap_ref(nogc).elements.inner(),
-                heap.known().empty_fixed_array.value()
+                nogc.known().empty_fixed_array.value()
             );
         });
 
@@ -843,30 +845,34 @@ mod tests {
             &scope,
             alloc_object(&mut heap, map, &[Smi::new(7).encode()]),
         );
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             assert_ne!(
                 c.heap_ref(nogc).slots.inner(),
-                heap.known().empty_fixed_array.value()
+                nogc.known().empty_fixed_array.value()
             );
             assert_eq!(c.heap_ref(nogc).slots.heap_ref(nogc).len(), 1);
         });
     }
 
     #[test]
-    fn lookup_resolves_own_const_value_and_parent_chain() {
+    fn lookup_resolves_own_values_and_parent_chain() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
 
-        // parent: smi(3) = const 99
+        // parent: smi(3) = value slot 0 (99)
         let parent_map = alloc_map(
             &mut heap,
             &_roots,
             MapKind::OBJECT,
-            0,
-            &[(3, SlotFlags::CONST, Smi::new(99).encode())],
+            1,
+            &[(
+                3,
+                SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                Smi::new(0).encode(),
+            )],
         );
-        let parent = alloc_object(&mut heap, parent_map, &[]);
+        let parent = alloc_object(&mut heap, parent_map, &[Smi::new(99).encode()]);
 
-        // child: smi(1) = value slot 0, smi(2) = const 42,
+        // child: smi(1) = value slot 0, smi(2) = value slot 1,
         // prototype = FixedArray([parent])
         let parents = heap
             .allocate::<FixedArray>(&[parent.encode_strong()])
@@ -875,28 +881,33 @@ mod tests {
             &mut heap,
             &_roots,
             MapKind::OBJECT,
-            1,
+            2,
             &[
                 (
                     1,
                     SlotFlags::VALUE.union(SlotFlags::WRITABLE),
                     Smi::new(0).encode(),
                 ),
-                (2, SlotFlags::CONST, Smi::new(42).encode()),
+                (
+                    2,
+                    SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                    Smi::new(1).encode(),
+                ),
             ],
             parents.encode_strong(),
         );
-        let child = alloc_object(&mut heap, child_map, &[Smi::new(7).encode()]);
+        let child = alloc_object(
+            &mut heap,
+            child_map,
+            &[Smi::new(7).encode(), Smi::new(42).encode()],
+        );
         let child = unsafe { child.as_ref() };
 
-        heap.no_gc(|nogc, heap| {
-            expect_data(child.lookup(nogc, heap, smi_name(1)), 7); // own inline slot
-            expect_data(child.lookup(nogc, heap, smi_name(2)), 42); // const in map
-            expect_data(child.lookup(nogc, heap, smi_name(3)), 99); // inherited via parent
-            assert!(matches!(
-                child.lookup(nogc, heap, smi_name(4)),
-                Lookup::NotFound
-            ));
+        heap.no_gc(|nogc| {
+            expect_data(child.lookup(nogc, smi_name(1)), 7); // own slot 0
+            expect_data(child.lookup(nogc, smi_name(2)), 42); // own slot 1
+            expect_data(child.lookup(nogc, smi_name(3)), 99); // inherited via parent
+            assert!(matches!(child.lookup(nogc, smi_name(4)), Lookup::NotFound));
         });
     }
 
@@ -917,16 +928,13 @@ mod tests {
         );
         let obj = alloc_object(&mut heap, map, &[Smi::new(7).encode()]);
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             // smi receiver: looks up in the (descriptor-less) smi map
             let smi = Smi::new(42).encode();
-            assert!(matches!(
-                smi.lookup(nogc, heap, smi_name(1)),
-                Lookup::NotFound
-            ));
+            assert!(matches!(smi.lookup(nogc, smi_name(1)), Lookup::NotFound));
             // object receiver: same result as the typed entry point
             let obj_value = obj.encode_strong();
-            expect_data(obj_value.lookup(nogc, heap, smi_name(1)), 7);
+            expect_data(obj_value.lookup(nogc, smi_name(1)), 7);
         });
     }
 
@@ -934,23 +942,31 @@ mod tests {
     fn lookup_multiple_parents_follow_priority_order() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
 
-        // parent A: smi(3) = const 10; parent B: smi(3) = const 20
+        // parent A: smi(3) = value slot 0 (10); parent B: smi(3) = slot 0 (20)
         let map_a = alloc_map(
             &mut heap,
             &_roots,
             MapKind::OBJECT,
-            0,
-            &[(3, SlotFlags::CONST, Smi::new(10).encode())],
+            1,
+            &[(
+                3,
+                SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                Smi::new(0).encode(),
+            )],
         );
-        let parent_a = alloc_object(&mut heap, map_a, &[]);
+        let parent_a = alloc_object(&mut heap, map_a, &[Smi::new(10).encode()]);
         let map_b = alloc_map(
             &mut heap,
             &_roots,
             MapKind::OBJECT,
-            0,
-            &[(3, SlotFlags::CONST, Smi::new(20).encode())],
+            1,
+            &[(
+                3,
+                SlotFlags::VALUE.union(SlotFlags::WRITABLE),
+                Smi::new(0).encode(),
+            )],
         );
-        let parent_b = alloc_object(&mut heap, map_b, &[]);
+        let parent_b = alloc_object(&mut heap, map_b, &[Smi::new(20).encode()]);
 
         // child with prototype = [a, b]: the first parent wins
         let parents_ab = heap
@@ -982,9 +998,9 @@ mod tests {
         let child_b = alloc_object(&mut heap, child_b_map, &[]);
         let child_b = unsafe { child_b.as_ref() };
 
-        heap.no_gc(|nogc, heap| {
-            expect_data(child_ab.lookup(nogc, heap, smi_name(3)), 10); // first parent wins
-            expect_data(child_b.lookup(nogc, heap, smi_name(3)), 20);
+        heap.no_gc(|nogc| {
+            expect_data(child_ab.lookup(nogc, smi_name(3)), 10); // first parent wins
+            expect_data(child_b.lookup(nogc, smi_name(3)), 20);
         });
     }
 
@@ -1006,7 +1022,7 @@ mod tests {
         let obj = alloc_object(&mut heap, map, &[]);
         let obj = unsafe { obj.as_ref() };
 
-        heap.no_gc(|nogc, heap| match obj.lookup(nogc, heap, smi_name(5)) {
+        heap.no_gc(|nogc| match obj.lookup(nogc, smi_name(5)) {
             Lookup::Accessor { pair, .. } => {
                 assert_eq!(Smi::decode(pair.get.get().erase()).unwrap().value(), 111);
                 assert_eq!(Smi::decode(pair.set.get().erase()).unwrap().value(), 222);
@@ -1031,12 +1047,11 @@ mod tests {
         );
         let obj = alloc_object(&mut heap, map, &[]);
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let outcome = obj
                 .encode_strong()
                 .store_lookup(
                     nogc,
-                    heap,
                     smi_name(5),
                     Smi::new(1).encode(),
                     StoreSemantics::WriteThrough,
@@ -1068,10 +1083,9 @@ mod tests {
         );
         let obj = alloc_object(&mut heap, map, &[]);
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let outcome = obj.encode_strong().store_lookup(
                 nogc,
-                heap,
                 smi_name(5),
                 Smi::new(1).encode(),
                 StoreSemantics::WriteThrough,
@@ -1130,20 +1144,20 @@ mod tests {
         )
         .unwrap();
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj_ref = obj.heap_ref(nogc);
             let map = obj_ref.header.map.heap_ref(nogc);
             // the accessor takes no value slot; the existing slot stays put
             assert_eq!(map.value_slot_count(), 1);
             assert_eq!(map.descriptor_count(), 2);
-            match obj.value().lookup(nogc, heap, smi_name(5)) {
+            match obj.value().lookup(nogc, smi_name(5)) {
                 Lookup::Accessor { pair, .. } => {
                     assert_eq!(Smi::decode(pair.get.get().erase()).unwrap().value(), 111);
                     assert_eq!(pair.set.get().erase(), undefined);
                 }
                 _ => panic!("expected accessor lookup result"),
             }
-            expect_data(obj.value().lookup(nogc, heap, smi_name(1)), 7);
+            expect_data(obj.value().lookup(nogc, smi_name(1)), 7);
         });
     }
 
@@ -1212,13 +1226,13 @@ mod tests {
         )
         .unwrap();
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = obj.heap_ref(nogc);
             let map = obj.header.map.heap_ref(nogc);
             // the literal duplicate-key shape: one descriptor, updated value
             assert_eq!(map.descriptor_count(), 1, "redefinition must not duplicate");
             assert_eq!(map.value_slot_count(), 1);
-            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 2);
+            expect_data(obj.as_ref().lookup(nogc, smi_name(1)), 2);
         });
     }
 
@@ -1280,9 +1294,9 @@ mod tests {
         );
         assert_eq!(result, Ok(false));
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = obj.heap_ref(nogc);
-            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 3);
+            expect_data(obj.as_ref().lookup(nogc, smi_name(1)), 3);
         });
     }
 
@@ -1319,9 +1333,9 @@ mod tests {
             },
         )
         .unwrap();
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = obj.heap_ref(nogc);
-            match obj.as_ref().lookup(nogc, heap, smi_name(1)) {
+            match obj.as_ref().lookup(nogc, smi_name(1)) {
                 Lookup::Accessor { pair, .. } => {
                     assert_eq!(Smi::decode(pair.get.inner()).unwrap().value(), 11);
                 }
@@ -1338,11 +1352,11 @@ mod tests {
             PropertyDescriptor::data(Smi::new(2).encode()),
         )
         .unwrap();
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = obj.heap_ref(nogc);
             let map = obj.header.map.heap_ref(nogc);
             assert_eq!(map.descriptor_count(), 1);
-            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 2);
+            expect_data(obj.as_ref().lookup(nogc, smi_name(1)), 2);
         });
     }
 
@@ -1369,43 +1383,31 @@ mod tests {
         let ab2 = mk_string("ab");
         let ac = mk_string("ac");
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             use vm::Compare;
             // NaN equals NaN
-            assert!(Compare::same_value(nogc, heap, nan1, nan2));
-            assert!(Compare::same_value(nogc, heap, nan1, nan1));
+            assert!(Compare::same_value(nogc, nan1, nan2));
+            assert!(Compare::same_value(nogc, nan1, nan1));
             // +/-0 are distinct
-            assert!(!Compare::same_value(nogc, heap, neg_zero, pos_zero));
-            assert!(Compare::same_value(nogc, heap, neg_zero, neg_zero));
-            assert!(!Compare::same_value(
-                nogc,
-                heap,
-                Smi::new(0).encode(),
-                neg_zero
-            ));
+            assert!(!Compare::same_value(nogc, neg_zero, pos_zero));
+            assert!(Compare::same_value(nogc, neg_zero, neg_zero));
+            assert!(!Compare::same_value(nogc, Smi::new(0).encode(), neg_zero));
             // number equality across representations
+            assert!(Compare::same_value(nogc, Smi::new(1).encode(), one_float));
             assert!(Compare::same_value(
                 nogc,
-                heap,
-                Smi::new(1).encode(),
-                one_float
-            ));
-            assert!(Compare::same_value(
-                nogc,
-                heap,
                 Smi::new(1).encode(),
                 Smi::new(1).encode()
             ));
             // strings by content
-            assert!(Compare::same_value(nogc, heap, ab1, ab2));
-            assert!(!Compare::same_value(nogc, heap, ab1, ac));
+            assert!(Compare::same_value(nogc, ab1, ab2));
+            assert!(!Compare::same_value(nogc, ab1, ac));
             // objects by identity
-            let map = heap.known().object_initial_map;
+            let map = nogc.known().object_initial_map;
             assert!(Compare::same_value(
                 nogc,
-                heap,
-                heap.known().undefined.value(),
-                heap.known().undefined.value()
+                nogc.known().undefined.value(),
+                nogc.known().undefined.value()
             ));
             let _ = map;
         });
@@ -1446,11 +1448,11 @@ mod tests {
             );
         });
 
-        local.no_gc(|nogc, heap| {
+        local.no_gc(|nogc| {
             let pairs = parent
                 .heap_ref(nogc)
                 .transitions
-                .heap_ref(nogc, heap)
+                .heap_ref(nogc)
                 .expect("transition array");
             assert_eq!(pairs.len(), 2, "exactly one edge recorded");
         });
@@ -1526,7 +1528,7 @@ mod tests {
         let total = Layout::from_size_align(2 * lb.size(), 16).unwrap();
 
         let tok = heap.allocate_token(total);
-        tok.enter_no_gc(|nogc, _heap| {
+        tok.enter_no_gc(|nogc| {
             let a = tok.allocate_ref::<FixedByteArray>(&[0u8; 8], nogc);
             let b = tok.allocate_ref::<FixedByteArray>(&[0u8; 8], nogc);
             a.set(0, 1);
@@ -1543,7 +1545,7 @@ mod tests {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
         let lb = FixedByteArray::layout_for(4);
         let total = Layout::from_size_align(lb.size(), 16).unwrap();
-        heap.allocate_token_enter_nogc(total, |tok, nogc, _heap| {
+        heap.allocate_token_enter_nogc(total, |tok, nogc| {
             let a = tok.allocate_ref::<FixedByteArray>(&[0u8; 4], nogc);
             a.set(0, 1);
             assert_eq!(a.get(0), 1);
@@ -1553,7 +1555,7 @@ mod tests {
     #[test]
     fn allocate_enter_no_gc_gives_ref_instantly() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
-        heap.allocate_enter_nogc::<FixedByteArray, _>(&[1u8, 2, 3, 4], |bytes, _nogc, _heap| {
+        heap.allocate_enter_nogc::<FixedByteArray, _>(&[1u8, 2, 3, 4], |bytes, _nogc| {
             assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
         });
     }
@@ -1595,7 +1597,7 @@ mod tests {
             PropertyDescriptor::data(Smi::new(1).encode()),
         )
         .unwrap();
-        let after_first = heap.no_gc(|nogc, _| obj.heap_ref(nogc).header.map.inner());
+        let after_first = heap.no_gc(|nogc| obj.heap_ref(nogc).header.map.inner());
         Object::define_own_property(
             &mut heap,
             &scope,
@@ -1604,14 +1606,14 @@ mod tests {
             PropertyDescriptor::data(Smi::new(2).encode()),
         )
         .unwrap();
-        let after_second = heap.no_gc(|nogc, _| obj.heap_ref(nogc).header.map.inner());
+        let after_second = heap.no_gc(|nogc| obj.heap_ref(nogc).header.map.inner());
         // identical attributes: [[DefineOwnProperty]] only writes the slot;
         // the map (and with it the property layout) must not change
         assert_eq!(after_first, after_second);
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = obj.heap_ref(nogc);
-            expect_data(obj.as_ref().lookup(nogc, heap, smi_name(1)), 2);
+            expect_data(obj.as_ref().lookup(nogc, smi_name(1)), 2);
         });
     }
 
@@ -1663,10 +1665,9 @@ mod tests {
         // [[Set]] with Shadow semantics: the lookup hits parent A's writable
         // slot first, so the receiver shadows it with an own property
         let outcome = heap
-            .no_gc(|nogc, heap| {
+            .no_gc(|nogc| {
                 child.value().store_lookup(
                     nogc,
-                    heap,
                     name.into(),
                     Smi::new(30).encode(),
                     StoreSemantics::Shadow,
@@ -1688,27 +1689,15 @@ mod tests {
             other => panic!("expected transition, got {other:?}"),
         }
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             // the own slot wins over both parents; both parents untouched
+            expect_data(child.heap_ref(nogc).as_ref().lookup(nogc, smi_name(1)), 30);
             expect_data(
-                child
-                    .heap_ref(nogc)
-                    .as_ref()
-                    .lookup(nogc, heap, smi_name(1)),
-                30,
-            );
-            expect_data(
-                parent_a
-                    .heap_ref(nogc)
-                    .as_ref()
-                    .lookup(nogc, heap, smi_name(1)),
+                parent_a.heap_ref(nogc).as_ref().lookup(nogc, smi_name(1)),
                 10,
             );
             expect_data(
-                parent_b
-                    .heap_ref(nogc)
-                    .as_ref()
-                    .lookup(nogc, heap, smi_name(1)),
+                parent_b.heap_ref(nogc).as_ref().lookup(nogc, smi_name(1)),
                 20,
             );
         });
@@ -1761,7 +1750,7 @@ mod tests {
         )
         .unwrap();
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let map_a = a.heap_ref(nogc).header.map.inner();
             let map_b = b.heap_ref(nogc).header.map.inner();
             assert_eq!(map_a, map_b, "identical redefines must share the map");
@@ -1772,14 +1761,8 @@ mod tests {
             assert!(!d.flags().is_enumerable());
             assert!(!d.flags().is_configurable());
             // values stay per-object
-            expect_data(
-                a.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)),
-                30,
-            );
-            expect_data(
-                b.heap_ref(nogc).as_ref().lookup(nogc, heap, smi_name(1)),
-                40,
-            );
+            expect_data(a.heap_ref(nogc).as_ref().lookup(nogc, smi_name(1)), 30);
+            expect_data(b.heap_ref(nogc).as_ref().lookup(nogc, smi_name(1)), 40);
         });
     }
 
@@ -1818,7 +1801,7 @@ mod tests {
         )
         .unwrap();
 
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj_ref = obj.heap_ref(nogc);
             let map = obj_ref.header.map.heap_ref(nogc);
             assert_eq!(
@@ -1826,14 +1809,14 @@ mod tests {
                 1,
                 "accessor -> data grows the slots"
             );
-            expect_data(obj_ref.as_ref().lookup(nogc, heap, smi_name(1)), 7);
+            expect_data(obj_ref.as_ref().lookup(nogc, smi_name(1)), 7);
         });
     }
     #[test]
     fn bootstrap_wires_function_prototype() {
         let (_global, mut heap, _roots) = local_with_maps(1 << 16);
-        heap.no_gc(|nogc, heap| {
-            let known = heap.known();
+        heap.no_gc(|nogc| {
+            let known = nogc.known();
             let fp = known.function_prototype.heap_ref(nogc);
             let kind = fp.header.map.heap_ref(nogc).kind();
             // ES 19.2.3: callable, not a constructor
@@ -1851,7 +1834,7 @@ mod tests {
                 known.function_prototype.value()
             );
             // it is a real callable with callable info
-            assert!(fp.as_ref().callable_info(nogc, heap).is_some());
+            assert!(fp.as_ref().callable_info(nogc).is_some());
         });
     }
 }

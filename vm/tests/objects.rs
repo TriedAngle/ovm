@@ -1,15 +1,14 @@
-use vm::{SlotFlags, SlotKind, SlotName, Tagged};
+use vm::{SlotFlags, SlotName, Tagged};
 
 #[test]
-fn slot_flags_kind_decoding() {
-    assert_eq!(SlotFlags::VALUE.kind(), SlotKind::Value);
-    assert_eq!(SlotFlags::CONST.kind(), SlotKind::Const);
-    assert_eq!(SlotFlags::ACCESSOR.kind(), SlotKind::Accessor);
-    // attribute bits don't disturb the kind
-    let f = SlotFlags::CONST
+fn slot_flags_accessor_bit() {
+    assert!(!SlotFlags::VALUE.is_accessor());
+    assert!(SlotFlags::ACCESSOR.is_accessor());
+    // attribute bits don't disturb the accessor bit
+    let f = SlotFlags::VALUE
         .union(SlotFlags::WRITABLE)
         .union(SlotFlags::ENUMERABLE);
-    assert_eq!(f.kind(), SlotKind::Const);
+    assert!(!f.is_accessor());
 }
 
 #[test]

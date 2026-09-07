@@ -26,7 +26,7 @@ pub fn to_primitive(
     value: Value,
     hint: Hint,
 ) -> Result<Coercion, VmError> {
-    if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, value)) {
+    if heap.no_gc(|nogc| Convert::is_primitive(nogc, value)) {
         return Ok(Coercion::Value(value));
     }
     let known = heap.known();
@@ -58,7 +58,7 @@ pub fn to_primitive(
         if result == exception {
             return Ok(Coercion::Threw);
         }
-        return if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, result)) {
+        return if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
             Ok(Coercion::Value(result))
         } else {
             Err(VmError::Type)
@@ -94,7 +94,7 @@ pub fn to_primitive(
         if result == exception {
             return Ok(Coercion::Threw);
         }
-        if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, result)) {
+        if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
             return Ok(Coercion::Value(result));
         }
         // object result: try the next method name
@@ -112,9 +112,7 @@ pub fn to_numeric(
 ) -> Result<Option<f64>, VmError> {
     match to_primitive(vm, heap, state, value, Hint::Number)? {
         Coercion::Threw => Ok(None),
-        Coercion::Value(v) => Ok(Some(
-            heap.no_gc(|nogc, heap| Convert::to_number(nogc, heap, v))?,
-        )),
+        Coercion::Value(v) => Ok(Some(heap.no_gc(|nogc| Convert::to_number(nogc, v))?)),
     }
 }
 
@@ -145,8 +143,7 @@ pub(crate) fn get_property(
     receiver: Value,
     name: Value,
 ) -> Result<Coercion, VmError> {
-    let outcome =
-        heap.no_gc(|nogc, heap| load_outcome(nogc, heap, receiver, SlotName::from_value(name)))?;
+    let outcome = heap.no_gc(|nogc| load_outcome(nogc, receiver, SlotName::from_value(name)))?;
     match outcome {
         LoadOutcome::Value(v) => Ok(Coercion::Value(v)),
         LoadOutcome::Getter(getter) => {
@@ -166,7 +163,7 @@ pub(crate) fn get_property(
 }
 
 fn is_callable(heap: &mut Heap, v: Value) -> bool {
-    heap.no_gc(|nogc, _heap| {
+    heap.no_gc(|nogc| {
         let ValueRef::Object(obj) = v.value_ref(nogc) else {
             return false;
         };
@@ -181,8 +178,8 @@ fn intern_value(vm: &VM, heap: &mut Heap, state: &ContextState, s: &str) -> Valu
 /// ES 13.5.3 typeof: the interned type string for a value. `null` reports
 /// `"object"`; callables report `"function"`.
 pub(crate) fn type_of(vm: &VM, heap: &mut Heap, state: &ContextState, v: Value) -> Value {
-    let name = heap.no_gc(|nogc, heap| {
-        let known = heap.known();
+    let name = heap.no_gc(|nogc| {
+        let known = nogc.known();
         if v.is_smi() || v.get_as::<Float>(nogc, known.float_map).is_some() {
             "number"
         } else if v == known.undefined.value() || v == known.void.value() {
@@ -229,16 +226,16 @@ pub(crate) fn instance_of(
         Coercion::Value(v) => v,
     };
     // 5. P must be an object
-    if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, proto)) {
+    if heap.no_gc(|nogc| Convert::is_primitive(nogc, proto)) {
         return Err(VmError::Type);
     }
-    Ok(Some(heap.no_gc(|nogc, heap| {
-        has_proto_in_chain(nogc, heap, object, proto)
-    })))
+    Ok(Some(
+        heap.no_gc(|nogc| has_proto_in_chain(nogc, object, proto)),
+    ))
 }
 
 /// OrdinaryHasInstance step 6: walk the prototype chain of `object`.
-fn has_proto_in_chain<'a>(nogc: &'a NoGc<'a>, heap: &Heap, object: Value, target: Value) -> bool {
+fn has_proto_in_chain<'a>(nogc: &'a NoGc<'a>, object: Value, target: Value) -> bool {
     let ValueRef::Object(obj) = object.value_ref(nogc) else {
         return false;
     };
@@ -246,18 +243,18 @@ fn has_proto_in_chain<'a>(nogc: &'a NoGc<'a>, heap: &Heap, object: Value, target
     if proto == target {
         return true;
     }
-    if proto == heap.known().null.value() {
+    if proto == nogc.known().null.value() {
         return false;
     }
-    if let Some(parents) = proto.get_as::<FixedArray>(nogc, heap.known().array_map) {
+    if let Some(parents) = proto.get_as::<FixedArray>(nogc, nogc.known().array_map) {
         for i in 0..parents.len() {
-            if has_proto_in_chain(nogc, heap, parents.at(i), target) {
+            if has_proto_in_chain(nogc, parents.at(i), target) {
                 return true;
             }
         }
         return false;
     }
-    has_proto_in_chain(nogc, heap, proto, target)
+    has_proto_in_chain(nogc, proto, target)
 }
 
 /// The Construct receiver (ES 9.2.2 step 5): a fresh `{}` whose
@@ -279,7 +276,7 @@ pub(crate) fn create_construct_receiver(
             Coercion::Value(v) => v,
         };
         // root the prototype before allocating below (GC may move it)
-        let proto = if heap.no_gc(|nogc, heap| Convert::is_primitive(nogc, heap, proto)) {
+        let proto = if heap.no_gc(|nogc| Convert::is_primitive(nogc, proto)) {
             None
         } else {
             Some(

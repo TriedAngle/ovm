@@ -14,8 +14,8 @@ fn empty_context_is_the_well_known_root() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    let (kind, outer, len) = thread.heap().no_gc(|nogc, heap| {
-        let ctx = heap.known().empty_context.heap_ref(nogc).as_ref();
+    let (kind, outer, len) = thread.heap().no_gc(|nogc| {
+        let ctx = nogc.known().empty_context.heap_ref(nogc).as_ref();
         (
             ctx.header.map.heap_ref(nogc).kind().kind(),
             ctx.outer.inner(),
@@ -61,12 +61,12 @@ fn contexts_chain_through_outer() {
             &scope,
         );
 
-        let (own, via_outer) = thread.heap().no_gc(|nogc, heap| {
+        let (own, via_outer) = thread.heap().no_gc(|nogc| {
             let o = outer.heap_ref(nogc).as_ref();
             (
                 o.slots.heap_ref(nogc).at(0),
                 o.outer
-                    .heap_ref(nogc, heap)
+                    .heap_ref(nogc)
                     .expect("outer context")
                     .as_ref()
                     .slots
@@ -125,13 +125,13 @@ fn closure_object_carries_typed_context() {
             )
             .into_handle(&scope);
 
-        let slot0 = thread.heap().no_gc(|nogc, heap| {
+        let slot0 = thread.heap().no_gc(|nogc| {
             let vm::ValueRef::Object(o) = obj.value().value_ref(nogc) else {
                 panic!("callable must be an object");
             };
             let context = o
                 .as_ref()
-                .closure_context(nogc, heap)
+                .closure_context(nogc)
                 .expect("context must be typed as Context");
             context.slots.heap_ref(nogc).at(0)
         });
