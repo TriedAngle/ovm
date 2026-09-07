@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["bytecode", "collectors/dummy_heap", "ovm", "parser", "vm"]
+members = [
+    "base_compiler",
+    "bytecode",
+    "collectors/dummy_heap",
+    "ovm",
+    "parser",
+    "vm",
+]
 
 [workspace.package]
 edition = "2024"

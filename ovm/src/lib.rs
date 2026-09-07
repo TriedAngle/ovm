@@ -9,9 +9,11 @@ use vm::{
     Value, Visitor, bootstrap_basics, bootstrap_well_known, intern_well_known_strings,
 };
 
+pub mod builtins;
 pub mod cache;
 pub mod errors;
 pub mod interpreter;
+pub mod materialize;
 pub mod natives;
 pub mod runtime;
 pub mod stack;
@@ -68,6 +70,15 @@ impl ContextState {
         self.has_pending_exception.get()
     }
 
+    /// The current frame's context (the chain `LoadContextSlot` walks),
+    /// for direct eval. `None` when no frame is executing.
+    pub fn current_context(&self) -> Option<Value> {
+        if !self.cache.is_active() {
+            return None;
+        }
+        Some(self.stack.context_slot(&self.cache.frame_meta()).inner())
+    }
+
     pub fn handle_scope<R>(&self, f: impl for<'s> FnOnce(HandleScope<'s>) -> R) -> R {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.handles)) };
         f(scope)
@@ -104,6 +115,11 @@ impl Thread {
         &mut self.heap
     }
 
+    /// Split the thread into its parts (multi-borrow calls).
+    pub(crate) fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
+        (&self.vm, &mut self.heap, &self.state)
+    }
+
     pub fn state(&self) -> &ContextState {
         &self.state
     }
@@ -111,7 +127,7 @@ impl Thread {
     pub fn intern<'s>(
         &mut self,
         scope: &'s HandleScope<'_>,
-        s: impl AsRef<str>,
+        s: impl AsRef<[u8]>,
     ) -> Handle<'s, InternedString> {
         self.vm.interner().intern(&mut self.heap, scope, s)
     }
@@ -163,7 +179,42 @@ impl Thread {
         let args = unsafe { GcSlice::from_slice(args) };
         f(&mut nctx, args)
     }
+
+    /// Parse + compile + materialize + run a script to completion.
+    /// The VM must have the builtin library installed (see
+    /// [`VM::with_builtins`]).
+    pub fn run_script(&mut self, src: &str) -> Result<Value, ScriptError> {
+        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(src));
+        p.parse_script().map_err(ScriptError::Parse)?;
+        let ast = p.into_ast();
+        let compiled = base_compiler::compile_script(&ast).map_err(ScriptError::Compile)?;
+        self.handle_scope(|thread, scope| {
+            let closure = materialize::materialize_script(thread, &scope, &compiled)
+                .map_err(ScriptError::Vm)?;
+            thread.execute(closure, &[]).map_err(ScriptError::Vm)
+        })
+    }
 }
+
+/// Failure of any stage of [`Thread::run_script`].
+#[derive(Debug)]
+pub enum ScriptError {
+    Parse(parser::ParseError),
+    Compile(base_compiler::CompileError),
+    Vm(VmError),
+}
+
+impl core::fmt::Display for ScriptError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "parse error: {e}"),
+            Self::Compile(e) => write!(f, "compile error: {e}"),
+            Self::Vm(e) => write!(f, "runtime error: {e:?}"),
+        }
+    }
+}
+
+impl std::error::Error for ScriptError {}
 
 impl Clone for VM {
     fn clone(&self) -> Self {
@@ -260,5 +311,17 @@ impl VM {
             let mut thread = vm.attach();
             f(&mut thread)
         })
+    }
+
+    /// Create a VM with the builtin library installed (Number, Boolean,
+    /// Error, TypeError, eval, function prototypes).
+    pub fn with_builtins<B: HeapBackend>(config: B::Config) -> Result<Self, VmError>
+    where
+        Self: Sized,
+    {
+        let mut vm = Self::new::<B>(config).map_err(|_| VmError::OutOfBounds)?;
+        let idx = builtins::register_builtin_natives(&mut vm);
+        builtins::install_builtins(&mut vm, &idx)?;
+        Ok(vm)
     }
 }

@@ -4,9 +4,9 @@ use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
     FixedByteArray, Float, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind,
-    Object, ObjectSlotsInit, PropertyDescriptor, SlotFlags, SlotName, Smi, StoreOutcome,
-    StoreSemantics, Tagged, VMString, Value, ValueRef, define_own_property_values, set_prototype,
-    string_content_hash,
+    Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit, SlotFlags, SlotName,
+    Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, ValueRef,
+    define_own_property_values, set_prototype, string_content_hash,
 };
 
 fn smi(v: i64) -> Value {
@@ -79,6 +79,45 @@ fn run_program(
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callable = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants,
+                register_count,
+                handlers: None,
+            },
+            &scope,
+        );
+        let callable = callable_object(thread, &scope, callable);
+        thread.execute(callable, args)
+    })
+}
+
+/// `run_program` with a `slot_count`-long context-names array at
+/// constants[0] (the `CreateFunctionContext` operand; slot count comes
+/// from the names array length).
+fn run_program_ctx(
+    thread: &mut Thread,
+    program: Vec<u8>,
+    register_count: usize,
+    args: &[Value],
+    slot_count: usize,
+) -> Result<Value, VmError> {
+    thread.handle_scope(|thread, scope| {
+        let dummy: Vec<vm::Value> = (0..slot_count)
+            .map(|i| thread.intern(&scope, format!("slot{i}")))
+            .map(|h| h.as_tagged().erase())
+            .collect();
+        let names = thread.heap().allocate_handle::<FixedArray>(&dummy, &scope);
+        let scope_info = thread
+            .heap()
+            .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(&program, &scope);
+        let constants = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[scope_info.as_tagged().erase()], &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -2244,14 +2283,26 @@ fn global_store_then_load_roundtrips() {
 }
 
 #[test]
-fn load_global_missing_name_is_undefined() {
+fn load_global_missing_name_throws_reference_error() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
+    // unresolvable references throw ReferenceError (GetValue on an
+    // unresolvable reference); typeof uses LoadGlobalNoThrow instead
     let result = thread.handle_scope(|thread, scope| {
         let missing = thread.intern(&scope, "not_defined_anywhere");
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadGlobal, &[0, 0]);
+        emit(&mut program, Opcode::Return, &[]);
+        run_program_consts(&mut *thread, program, 0, &[], &[missing.value()])
+    });
+    expect_escaped(&mut thread, result, "ReferenceError");
+
+    // the no-throw variant yields undefined
+    let result = thread.handle_scope(|thread, scope| {
+        let missing = thread.intern(&scope, "not_defined_anywhere");
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::LoadGlobalNoThrow, &[0, 0]);
         emit(&mut program, Opcode::Return, &[]);
         run_program_consts(&mut *thread, program, 0, &[], &[missing.value()])
     });
@@ -2283,7 +2334,8 @@ fn empty_object_literal_inherits_from_object_prototype() {
                     receiver,
                     name,
                     PropertyDescriptor::data(smi(1)),
-                );
+                )
+                .expect("the transition receiver is fresh and extensible");
             }
             other => panic!("expected transition, got {other:?}"),
         }
@@ -2347,16 +2399,27 @@ fn create_closure_inherits_current_context_and_is_callable() {
 
         // caller: r1 = CreateClosure(template); call r1; return
         let mut program = Vec::new();
-        emit(&mut program, Opcode::CreateClosure, &[0]);
+        emit(&mut program, Opcode::CreateClosure, &[1]);
         emit(&mut program, Opcode::Store, &[1]);
         emit(&mut program, Opcode::CallNoFeedback, &[1, 1, 1]);
         emit(&mut program, Opcode::Return, &[]);
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
-        let consts = thread
+        let slot_name = thread.intern(&scope, "slot0");
+        let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[callee_info.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[slot_name.as_tagged().erase()], &scope);
+        let scope_info = thread
+            .heap()
+            .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[
+                scope_info.as_tagged().erase(),
+                callee_info.as_tagged().erase(),
+            ],
+            &scope,
+        );
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -2371,9 +2434,15 @@ fn create_closure_inherits_current_context_and_is_callable() {
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[smi(42)], &scope);
-        let context = thread
-            .heap()
-            .allocate_handle::<Context>(ContextInit { outer: None, slots }, &scope);
+        let scope_info = thread.heap().known().empty_scope_info;
+        let context = thread.heap().allocate_handle::<Context>(
+            ContextInit {
+                outer: None,
+                slots,
+                scope_info,
+            },
+            &scope,
+        );
 
         let map = thread.heap().known().function_map;
         let caller = thread
@@ -2452,9 +2521,9 @@ fn function_context_slots_are_readable_and_writable() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    // CreateFunctionContext 2; PushContext r0; x = 42; y = 43; return x + y
+    // CreateFunctionContext (2 slots); PushContext r0; x = 42; y = 43
     let mut program = Vec::new();
-    emit(&mut program, Opcode::CreateFunctionContext, &[2]);
+    emit(&mut program, Opcode::CreateFunctionContext, &[0]);
     emit(&mut program, Opcode::PushContext, &[0]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
     emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
@@ -2466,7 +2535,7 @@ fn function_context_slots_are_readable_and_writable() {
     emit(&mut program, Opcode::Add, &[1]);
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program(&mut thread, program, 2, &[]);
+    let result = run_program_ctx(&mut thread, program, 2, &[], 2);
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 85);
 }
 
@@ -2476,17 +2545,30 @@ fn push_context_saves_previous_context_to_register() {
     let mut thread = vm.attach();
 
     // PushContext must save the old frame context (empty_context) into r0
-    let result = thread.handle_scope(|thread, _scope| {
+    let result = thread.handle_scope(|thread, scope| {
         let empty = thread.heap().known().empty_context.as_tagged().erase();
+        let slot_name = thread.intern(&scope, "slot0");
+        let names = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[slot_name.as_tagged().erase()], &scope);
+        let scope_info = thread
+            .heap()
+            .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
         let mut program = Vec::new();
-        emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+        emit(&mut program, Opcode::CreateFunctionContext, &[0]);
         emit(&mut program, Opcode::PushContext, &[0]);
         emit(&mut program, Opcode::Load, &[0]); // r0 = saved old context
         emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::LoadConstant, &[0]); // acc = empty_context
+        emit(&mut program, Opcode::LoadConstant, &[1]); // acc = empty_context
         emit(&mut program, Opcode::TestReferenceEqual, &[1]);
         emit(&mut program, Opcode::Return, &[]);
-        run_program_consts(&mut *thread, program, 2, &[], &[empty])
+        run_program_consts(
+            &mut *thread,
+            program,
+            2,
+            &[],
+            &[scope_info.as_tagged().erase(), empty],
+        )
     });
     assert_eq!(result.unwrap(), thread.heap().known().true_object.value());
 }
@@ -2498,7 +2580,7 @@ fn pop_context_restores_previous_context() {
 
     // ctxA[0] = 42; push ctxB; ctxB[0] = 99; pop back to ctxA; read ctxA[0]
     let mut program = Vec::new();
-    emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+    emit(&mut program, Opcode::CreateFunctionContext, &[0]);
     emit(&mut program, Opcode::PushContext, &[0]); // r0 = old; frame = ctxA
     emit(&mut program, Opcode::LoadSmi, &[42]);
     emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
@@ -2510,7 +2592,7 @@ fn pop_context_restores_previous_context() {
     emit(&mut program, Opcode::LoadContextSlot, &[0, 0]); // ctxA[0]
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program(&mut thread, program, 2, &[]);
+    let result = run_program_ctx(&mut thread, program, 2, &[], 1);
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
 
@@ -2521,7 +2603,7 @@ fn block_context_reads_outer_scope_via_depth() {
 
     // ctxA[0] = 7; inside ctxB (outer = ctxA), read slot 0 at depth 1
     let mut program = Vec::new();
-    emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+    emit(&mut program, Opcode::CreateFunctionContext, &[0]);
     emit(&mut program, Opcode::PushContext, &[0]); // frame = ctxA
     emit(&mut program, Opcode::LoadSmi, &[7]);
     emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
@@ -2530,7 +2612,7 @@ fn block_context_reads_outer_scope_via_depth() {
     emit(&mut program, Opcode::LoadContextSlot, &[0, 1]); // ctxB.outer[0]
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program(&mut thread, program, 2, &[]);
+    let result = run_program_ctx(&mut thread, program, 2, &[], 1);
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
 
@@ -2559,13 +2641,13 @@ fn tdz_hole_read_throws_reference_error() {
 
     // fresh context slots are the hole; reading one must throw ReferenceError
     let mut program = Vec::new();
-    emit(&mut program, Opcode::CreateFunctionContext, &[1]);
+    emit(&mut program, Opcode::CreateFunctionContext, &[0]);
     emit(&mut program, Opcode::PushContext, &[0]);
     emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
     emit(&mut program, Opcode::ThrowReferenceErrorIfHole, &[]);
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program(&mut thread, program, 1, &[]);
+    let result = run_program_ctx(&mut thread, program, 1, &[], 1);
     expect_escaped(&mut thread, result, "ReferenceError");
 }
 
@@ -2596,7 +2678,7 @@ fn closure_captures_function_context_end_to_end() {
 
         // f's body
         let mut program = Vec::new();
-        emit(&mut program, Opcode::CreateFunctionContext, &[1]); // ctxA: [x]
+        emit(&mut program, Opcode::CreateFunctionContext, &[0]); // ctxA: [x]
         emit(&mut program, Opcode::PushContext, &[0]); // r0 = old; frame = ctxA
         emit(&mut program, Opcode::LoadSmi, &[1]);
         emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // x = 1
@@ -2605,7 +2687,7 @@ fn closure_captures_function_context_end_to_end() {
         emit(&mut program, Opcode::LoadSmi, &[2]);
         emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // y = 2
         emit(&mut program, Opcode::PopContext, &[1]); // frame = ctxA
-        emit(&mut program, Opcode::CreateClosure, &[0]); // closure ctx = ctxA
+        emit(&mut program, Opcode::CreateClosure, &[1]); // closure ctx = ctxA
         emit(&mut program, Opcode::Store, &[2]);
         emit(&mut program, Opcode::CallNoFeedback, &[2, 2, 1]);
         emit(&mut program, Opcode::Return, &[]);
@@ -2613,9 +2695,20 @@ fn closure_captures_function_context_end_to_end() {
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
-        let consts = thread
+        let slot_name = thread.intern(&scope, "slot0");
+        let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[callee_info.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[slot_name.as_tagged().erase()], &scope);
+        let scope_info = thread
+            .heap()
+            .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
+        let consts = thread.heap().allocate_handle::<FixedArray>(
+            &[
+                scope_info.as_tagged().erase(),
+                callee_info.as_tagged().erase(),
+            ],
+            &scope,
+        );
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -2895,7 +2988,8 @@ fn set_property_fn(
         obj,
         SlotName::from_value(name),
         PropertyDescriptor::data(f),
-    );
+    )
+    .expect("defining a fresh own property must succeed");
 }
 
 fn program_return_1() -> Vec<u8> {
@@ -3342,7 +3436,8 @@ fn instance_of_walks_prototype_chain() {
             f,
             SlotName::from_value(prototype),
             PropertyDescriptor::data(f_proto),
-        );
+        )
+        .expect("defining a fresh own property must succeed");
 
         // obj inherits F.prototype; plain {} does not
         let obj = empty_object(thread, &scope).as_tagged().erase();
@@ -3383,7 +3478,8 @@ fn instance_of_walks_prototype_chain() {
             f2,
             SlotName::from_value(prototype),
             PropertyDescriptor::data(smi(42)),
-        );
+        )
+        .expect("defining a fresh own property must succeed");
         let r = run_program(
             &mut *thread,
             binary_op_program(Opcode::InstanceOf),
@@ -3423,7 +3519,8 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
             g,
             SlotName::from_value(prototype),
             PropertyDescriptor::data(g_proto),
-        );
+        )
+        .expect("defining a fresh own property must succeed");
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);

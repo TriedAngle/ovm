@@ -8,7 +8,9 @@ use crate::{
 };
 
 pub struct StringInterner {
-    table: Mutex<HashMap<Box<str>, WeakGcCell<InternedString>>>,
+    /// keys are WTF-8: lone surrogates from JS string literals appear as
+    /// their 3-byte encoding, so keys are raw bytes, not `str`
+    table: Mutex<HashMap<Box<[u8]>, WeakGcCell<InternedString>>>,
 }
 
 impl StringInterner {
@@ -22,7 +24,7 @@ impl StringInterner {
         &self,
         heap: &mut Heap,
         scope: &'s HandleScope<'_>,
-        s: impl AsRef<str>,
+        s: impl AsRef<[u8]>,
     ) -> Handle<'s, InternedString> {
         let s = s.as_ref();
 
@@ -39,10 +41,8 @@ impl StringInterner {
             }
         }
 
-        let backing = heap
-            .allocate::<FixedByteArray>(s.as_bytes())
-            .into_handle(scope);
-        let hash = string_content_hash(s.as_bytes());
+        let backing = heap.allocate::<FixedByteArray>(s).into_handle(scope);
+        let hash = string_content_hash(s);
         let handle = heap
             .allocate::<InternedString>((backing, hash))
             .into_handle(scope);

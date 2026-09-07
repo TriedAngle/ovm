@@ -1,11 +1,8 @@
 [package]
-name = "ovm"
+name = "base_compiler"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-vm = { path = "../vm" }
 bytecode = { path = "../bytecode" }
-base_compiler = { path = "../base_compiler" }
 parser = { path = "../parser" }
-dummy_heap = { path = "../collectors/dummy_heap" }

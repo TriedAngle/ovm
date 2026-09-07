@@ -53,6 +53,11 @@ impl<'a> NativeContext<'a> {
         self.vm
     }
 
+    /// Split the context into its parts (for multi-borrow calls).
+    pub(crate) fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
+        (&self.vm, &mut self.heap, &self.state)
+    }
+
     pub fn heap(&mut self) -> &mut Heap {
         self.heap
     }
@@ -60,7 +65,7 @@ impl<'a> NativeContext<'a> {
     pub fn intern<'s>(
         &mut self,
         scope: &'s HandleScope<'_>,
-        s: impl AsRef<str>,
+        s: impl AsRef<[u8]>,
     ) -> Handle<'s, InternedString> {
         self.vm.interner().intern(self.heap, scope, s)
     }
@@ -116,6 +121,11 @@ impl<'a> NativeContext<'a> {
 
     pub fn has_pending_exception(&self) -> bool {
         self.state.has_pending_exception()
+    }
+
+    /// The current frame's context (direct eval chains to it).
+    pub fn current_context(&self) -> Option<Value> {
+        self.state.current_context()
     }
 }
 

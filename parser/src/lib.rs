@@ -6,7 +6,7 @@ pub mod token;
 use std::collections::HashMap;
 
 pub use parser::{ParseError, Parser};
-pub use resolver::{FunctionLayout, Resolution, Resolved, resolve};
+pub use resolver::{FunctionLayout, Resolution, Resolved, resolve, resolve_for_eval};
 pub use scanner::{Bookmark, ScanResult, Scanner};
 pub use token::{Span, Token, TokenInfo, TokenKind, TokenValue};
 
@@ -231,6 +231,19 @@ pub enum Node {
         catch_param: Option<Symbol>,
         catch_block: Option<NodeId>,
         finally_block: Option<NodeId>,
+    },
+    Switch {
+        disc: NodeId,
+        cases: NodeList,
+    },
+    /// `test: None` marks the `default:` clause
+    SwitchCase {
+        test: Option<NodeId>,
+        stmts: NodeList,
+    },
+    Labeled {
+        label: Symbol,
+        body: NodeId,
     },
     FunctionDecl {
         function: FunctionId,

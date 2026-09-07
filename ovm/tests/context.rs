@@ -2,8 +2,12 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
 use vm::{
     CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray,
-    ObjectKind, ObjectSlotsInit, Smi,
+    ObjectKind, ObjectSlotsInit, ScopeInfo, Smi,
 };
+
+fn empty_scope_info(thread: &mut ovm::Thread) -> vm::Global<ScopeInfo> {
+    thread.heap().known().empty_scope_info
+}
 
 #[test]
 fn empty_context_is_the_well_known_root() {
@@ -33,12 +37,18 @@ fn contexts_chain_through_outer() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
+        let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(42).encode()], &scope);
-        let inner = thread
-            .heap()
-            .allocate_handle::<Context>(ContextInit { outer: None, slots }, &scope);
+        let inner = thread.heap().allocate_handle::<Context>(
+            ContextInit {
+                outer: None,
+                slots,
+                scope_info,
+            },
+            &scope,
+        );
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(7).encode()], &scope);
@@ -46,6 +56,7 @@ fn contexts_chain_through_outer() {
             ContextInit {
                 outer: Some(inner),
                 slots,
+                scope_info,
             },
             &scope,
         );
@@ -75,12 +86,18 @@ fn closure_object_carries_typed_context() {
 
     thread.handle_scope(|thread, scope| {
         let void = thread.heap().known().void;
+        let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(9).encode()], &scope);
-        let context = thread
-            .heap()
-            .allocate_handle::<Context>(ContextInit { outer: None, slots }, &scope);
+        let context = thread.heap().allocate_handle::<Context>(
+            ContextInit {
+                outer: None,
+                slots,
+                scope_info,
+            },
+            &scope,
+        );
 
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);

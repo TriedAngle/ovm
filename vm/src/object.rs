@@ -225,16 +225,17 @@ pub enum ObjectKind {
     Symbol = 8,
     HandlerTable = 9,
     Context = 10,
-    BuiltinEnd = 11,
+    ScopeInfo = 11,
+    BuiltinEnd = 12,
 
     /// `elements` points to the well-known `empty_fixed_array`, `len` is 0
-    Object = 12,
+    Object = 13,
     /// `elements` points to a `FixedArray`.
-    Array = 13,
+    Array = 14,
     /// `elements` points to a `FixedByteArray`.
-    ByteArray = 14,
+    ByteArray = 15,
     /// `elements` points to a `VMString`.
-    String = 15,
+    String = 16,
 }
 
 impl ObjectKind {
@@ -256,6 +257,7 @@ impl MapKind {
     pub const CALLABLE: MapKind = MapKind(1 << 9);
     pub const CONSTRUCTOR: MapKind = MapKind(1 << 10);
     pub const NATIVE: MapKind = MapKind(1 << 11);
+    pub const PRIMITIVE_WRAPPER: MapKind = MapKind(1 << 12);
 
     pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
     pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
@@ -267,6 +269,7 @@ impl MapKind {
     pub const SYMBOL: MapKind = MapKind(ObjectKind::Symbol as u64);
     pub const HANDLER_TABLE: MapKind = MapKind(ObjectKind::HandlerTable as u64);
     pub const CONTEXT: MapKind = MapKind(ObjectKind::Context as u64);
+    pub const SCOPE_INFO: MapKind = MapKind(ObjectKind::ScopeInfo as u64);
     pub const OBJECT: MapKind = MapKind(ObjectKind::Object as u64);
     pub const ARRAY: MapKind = MapKind(ObjectKind::Array as u64);
     pub const BYTE_ARRAY: MapKind = MapKind(ObjectKind::ByteArray as u64);
@@ -284,6 +287,10 @@ impl MapKind {
         Self(self.0 | other.0)
     }
 
+    pub const fn contains(self, flags: Self) -> bool {
+        self.0 & flags.0 == flags.0
+    }
+
     // TODO: consider transmute with debug assert
     pub const fn kind(self) -> ObjectKind {
         match Self(self.0 & Self::KIND_MASK) {
@@ -297,6 +304,7 @@ impl MapKind {
             Self::SYMBOL => ObjectKind::Symbol,
             Self::HANDLER_TABLE => ObjectKind::HandlerTable,
             Self::CONTEXT => ObjectKind::Context,
+            Self::SCOPE_INFO => ObjectKind::ScopeInfo,
             Self::OBJECT => ObjectKind::Object,
             Self::ARRAY => ObjectKind::Array,
             Self::BYTE_ARRAY => ObjectKind::ByteArray,
@@ -1245,16 +1253,61 @@ impl EdgeVisitable for HandlerTable {
     }
 }
 
+// TODO: more info
+#[repr(C)]
+pub struct ScopeInfo {
+    pub header: Header,
+    /// parallel to the context's slots
+    pub names: GcSlot<FixedArray>,
+}
+
+pub struct ScopeInfoInit<'a> {
+    pub names: Handle<'a, FixedArray>,
+}
+
+impl HeapObject for ScopeInfo {
+    type Init<'a> = ScopeInfoInit<'a>;
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(heap, host, heap.known().scope_info_map.as_tagged());
+        self.names.set(heap, host, config.names.as_tagged());
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::new::<Self>()
+    }
+}
+
+impl EdgeVisitable for ScopeInfo {
+    fn visit_edges(&self, visitor: &mut impl Visitor) {
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.names.as_raw());
+    }
+}
+
 #[repr(C)]
 pub struct Context {
     pub header: Header,
     pub outer: OptionGcSlot<Context>,
     pub slots: GcSlot<FixedArray>,
+    pub scope_info: GcSlot<ScopeInfo>,
 }
 
 pub struct ContextInit<'a> {
     pub outer: Option<Handle<'a, Context>>,
     pub slots: Handle<'a, FixedArray>,
+    pub scope_info: Handle<'a, ScopeInfo>,
 }
 
 impl HeapObject for Context {
@@ -1274,6 +1327,8 @@ impl HeapObject for Context {
             None => self.outer.clear(heap.known().void.value()),
         }
         self.slots.set(heap, host, config.slots.as_tagged());
+        self.scope_info
+            .set(heap, host, config.scope_info.as_tagged());
     }
 
     fn header(&self) -> &Header {
@@ -1290,6 +1345,7 @@ impl EdgeVisitable for Context {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.outer.as_raw());
         visitor.visit(self.slots.as_raw());
+        visitor.visit(self.scope_info.as_raw());
     }
 }
 

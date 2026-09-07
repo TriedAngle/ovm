@@ -328,8 +328,14 @@ fn object_literal_forms() {
 fn braces_are_blocks_in_statement_position() {
     let ast = parse("{}");
     assert!(matches!(stmt(&ast, 0), Block { .. }));
-    // `{ a: 1 }` is NOT an object literal as a statement (labels unsupported)
-    parse_err("{ a: 1 }");
+    // `{ a: 1 }` is a block holding a labeled statement, not an object literal
+    let ast = parse("{ a: 1 }");
+    let Block { stmts } = *stmt(&ast, 0) else {
+        panic!()
+    };
+    let inner = ast.list_items(stmts);
+    assert_eq!(inner.len(), 1);
+    assert!(matches!(ast.node(inner[0]), Labeled { .. }));
 }
 
 // -- ASI -----------------------------------------------------------------------
@@ -529,7 +535,15 @@ fn break_continue_need_loop() {
     parse_err("break;");
     parse_err("continue;");
     parse_err("function f() { break; }"); // loop depth resets in functions
-    parse_err("while (a) { break outer; }"); // labels not supported yet
+    // labeled break/continue are supported; target existence is checked in codegen
+    parse("outer: while (a) { break outer; }");
+    parse("outer: while (a) { continue outer; }");
+    let ast = parse("outer: while (a) { break outer; }");
+    let Labeled { label, body } = *stmt(&ast, 0) else {
+        panic!()
+    };
+    assert_eq!(sym_text(&ast, label), b"outer");
+    assert!(matches!(ast.node(body), While { .. }));
 }
 
 // -- functions ----------------------------------------------------------------------
