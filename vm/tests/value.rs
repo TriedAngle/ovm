@@ -1,6 +1,6 @@
 use core::alloc::Layout;
 
-use vm::{Header, Heap, HeapObject, HeapPtr, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
+use vm::{Header, HeapObject, HeapPtr, NoGc, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
 
 /// Stand-in heap object, aligned like a real heap allocation.
 #[repr(align(8))]
@@ -13,7 +13,7 @@ impl HeapObject for TestObj {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, _heap: &Heap, _config: &Self::Init<'_>) {
+    fn init(&mut self, _nogc: &NoGc<'_>, _config: &Self::Init<'_>) {
         unimplemented!("TestObj is boxed, never heap-allocated by these tests")
     }
 

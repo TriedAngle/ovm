@@ -248,7 +248,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             .heap_ref(nogc)
             .header
             .map
-            .set(nogc.heap(), map_map.value(), map_map.as_tagged());
+            .set(nogc, map_map.value(), map_map.as_tagged());
     });
     known.map_map = map_map;
     heap.set_known(known);
@@ -299,12 +299,12 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         void_map.heap_ref(nogc).transitions.clear(void.value());
         null_map.heap_ref(nogc).transitions.clear(void.value());
         void_map.heap_ref(nogc).prototype.set(
-            nogc.heap(),
+            nogc,
             void_map.value(),
             Tagged::from_value(null.value()),
         );
         null_map.heap_ref(nogc).prototype.set(
-            nogc.heap(),
+            nogc,
             null_map.value(),
             Tagged::from_value(null.value()),
         );
@@ -544,14 +544,14 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     heap.no_gc(|nogc| {
         let empty = known.empty_fixed_array.as_tagged();
         let o = null.heap_ref(nogc);
-        o.slots.set(nogc.heap(), null.value(), empty);
+        o.slots.set(nogc, null.value(), empty);
         o.elements
-            .set(nogc.heap(), null.value(), Tagged::from_value(empty.erase()));
+            .set(nogc, null.value(), Tagged::from_value(empty.erase()));
         // ordinary function objects' [[Prototype]] is %Function.prototype%
         // (ES 19.2.3.1): function_map was created with a null placeholder
         // in bootstrap_basics
         known.function_map.heap_ref(nogc).prototype.set(
-            nogc.heap(),
+            nogc,
             known.function_map.value(),
             Tagged::from_value(function_prototype.value()),
         );
@@ -718,7 +718,9 @@ impl<'heap> AllocToken<'heap> {
 
     pub fn allocate<T: HeapObject>(&self, config: T::Init<'_>) -> Fresh<'heap, T> {
         let mut ptr = self.bump(T::layout_for(&config)).cast::<T>();
-        unsafe { ptr.as_mut() }.init(self.heap, &config);
+        // the token's reservation already proves no GC can happen here
+        let nogc = NoGc::new(&*self.heap);
+        unsafe { ptr.as_mut() }.init(&nogc, &config);
         Fresh {
             ptr,
             _phantom: PhantomData,
@@ -882,11 +884,11 @@ impl<T> GcSlot<T> {
         self.cell.load()
     }
 
-    pub fn set(&self, heap: &Heap, host: Value, value: impl Into<Tagged<T>>) {
+    pub fn set(&self, nogc: &NoGc<'_>, host: Value, value: impl Into<Tagged<T>>) {
         let v = value.into().erase();
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         if v.is_ptr() {
-            heap.write_barrier(host, self.as_raw(), v);
+            nogc.write_barrier(host, self.as_raw(), v);
         }
         self.cell.store_raw(v);
     }
@@ -938,8 +940,8 @@ impl<T> OptionGcSlot<T> {
         self.slot.as_raw()
     }
 
-    pub fn set(&self, heap: &Heap, host: Value, value: impl Into<Tagged<T>>) {
-        self.slot.set(heap, host, value);
+    pub fn set(&self, nogc: &NoGc<'_>, host: Value, value: impl Into<Tagged<T>>) {
+        self.slot.set(nogc, host, value);
     }
 
     pub fn clear(&self, void: Value) {
@@ -1092,7 +1094,8 @@ impl Heap {
             .allocate_raw(T::layout_for(&config))
             .expect("heap allocation failed (out of memory)");
         let mut ptr = raw.cast::<T>();
-        unsafe { ptr.as_mut() }.init(self, &config);
+        let nogc = NoGc::new(self);
+        unsafe { ptr.as_mut() }.init(&nogc, &config);
         Fresh::new(ptr)
     }
 

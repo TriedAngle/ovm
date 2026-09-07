@@ -31,8 +31,8 @@ pub use object::{
     SlotName, Symbol, VMString, call_target, store_array_element, string_content_hash,
 };
 pub use transition::{
-    PropertyDescriptor, StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock,
-    add_own_property_values, define_own_property_values, set_prototype,
+    Change, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition, TransitionGuard,
+    TransitionLock,
 };
 pub use value::{
     HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,
