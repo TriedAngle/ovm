@@ -19,6 +19,9 @@ pub enum Resolution {
     GlobalObject,
     /// a direct eval in the chain forced dynamic handling
     Dynamic,
+    /// `this` in an arrow function: the enclosing non-arrow function's
+    /// receiver, stored in that function's hidden this-slot
+    This(FunctionId),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26,6 +29,9 @@ pub struct FunctionLayout {
     /// local registers (params live in the negative-index param region)
     pub register_count: u32,
     pub context_slots: u32,
+    /// hidden context slot holding the receiver, when a nested arrow
+    /// function uses `this` (allocated after the named slots)
+    pub this_slot: Option<u32>,
 }
 
 pub struct Resolved {
@@ -37,6 +43,11 @@ pub struct Resolved {
     /// materializer must create a fresh environment per iteration
     /// (ECMA-262 13.7.4.8, CreatePerIterationEnvironment)
     pub per_iteration_loops: Vec<NodeId>,
+    /// per scope: name → decl index into `ScopeInfo.decls`
+    decl_maps: Vec<HashMap<Symbol, u32>>,
+    /// (scope, decl index) → concrete slot kind, for declarations whose
+    /// name never appears as an Identifier node (var/function decls)
+    slots: HashMap<(ScopeId, u32), Resolution>,
 }
 
 impl Resolved {
@@ -47,16 +58,32 @@ impl Resolved {
     pub fn layout(&self, f: FunctionId) -> FunctionLayout {
         self.layouts[f.0 as usize]
     }
+
+    /// The concrete slot kind of a declaration `name` in `scope`, for
+    /// declarations the materializer stores into without an Identifier
+    /// node (var declarators, function decls, catch params).
+    pub fn resolution_for_decl(&self, scope: ScopeId, name: Symbol) -> Option<Resolution> {
+        let idx = *self.decl_maps.get(scope.0 as usize)?.get(&name)?;
+        self.slots.get(&(scope, idx)).copied()
+    }
 }
 
 #[derive(Clone, Copy)]
 enum Pending {
     GlobalObject,
-    Decl { scope: ScopeId, decl: u32 },
+    /// unresolved name compiled as a runtime chain walk (direct eval)
+    Dynamic,
+    This(FunctionId),
+    Decl {
+        scope: ScopeId,
+        decl: u32,
+    },
 }
 
 struct Resolver<'a> {
     ast: &'a Ast,
+    /// direct eval source: unresolved names must resolve dynamically
+    for_eval: bool,
     /// per scope: name → index into ScopeInfo.decls
     decl_maps: Vec<HashMap<Symbol, u32>>,
     /// per scope: owning function
@@ -64,12 +91,24 @@ struct Resolver<'a> {
     /// function/script scope per function
     fn_scope: Vec<ScopeId>,
     captured: HashSet<(ScopeId, u32)>,
+    /// functions whose receiver a nested arrow captures
+    captures_this: HashSet<FunctionId>,
     pending: Vec<Option<Pending>>,
     scope_stack: Vec<ScopeId>,
     fn_stack: Vec<FunctionId>,
 }
 
 pub fn resolve(ast: &Ast) -> Resolved {
+    resolve_with_mode(ast, false)
+}
+
+/// Resolve with all unresolved names marked `Dynamic` (direct eval source:
+/// free names must resolve through the caller's context chain at runtime).
+pub fn resolve_for_eval(ast: &Ast) -> Resolved {
+    resolve_with_mode(ast, true)
+}
+
+fn resolve_with_mode(ast: &Ast, for_eval: bool) -> Resolved {
     let n_scopes = ast.scope_count();
     let mut decl_maps = vec![HashMap::new(); n_scopes];
     let mut fn_owner = vec![FunctionId(0); n_scopes];
@@ -97,10 +136,12 @@ pub fn resolve(ast: &Ast) -> Resolved {
 
     let mut r = Resolver {
         ast,
+        for_eval,
         decl_maps,
         fn_owner,
         fn_scope,
         captured: HashSet::new(),
+        captures_this: HashSet::new(),
         pending: vec![None; ast.node_count()],
         scope_stack: Vec::new(),
         fn_stack: Vec::new(),
@@ -124,7 +165,11 @@ impl<'a> Resolver<'a> {
 
     fn resolve_reference(&mut self, node: NodeId, name: Symbol) {
         let current_fn = *self.fn_stack.last().unwrap();
-        let mut pending = Pending::GlobalObject;
+        let mut pending = if self.for_eval {
+            Pending::Dynamic
+        } else {
+            Pending::GlobalObject
+        };
         for &scope in self.scope_stack.iter().rev() {
             if let Some(&decl) = self.decl_maps[scope.0 as usize].get(&name) {
                 if self.fn_owner[scope.0 as usize] != current_fn {
@@ -152,6 +197,18 @@ impl<'a> Resolver<'a> {
         }
         match *self.ast.node(id) {
             Node::Identifier { sym } => self.resolve_reference(id, sym),
+            Node::This => {
+                // nearest enclosing non-arrow function owns `this`
+                let owner = self
+                    .fn_stack
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&f| !self.ast.function(f).is_arrow)
+                    .expect("script function is never an arrow");
+                self.captures_this.insert(owner);
+                self.pending[id.0 as usize] = Some(Pending::This(owner));
+            }
             Node::Unary { expr, .. } => self.walk_node(expr),
             Node::Update { target, .. } => self.walk_node(target),
             Node::Binary { lhs, rhs, .. } => {
@@ -258,18 +315,47 @@ impl<'a> Resolver<'a> {
                 }
             }
             Node::Throw { expr } => self.walk_node(expr),
+            Node::Switch { disc, cases } => {
+                self.walk_node(disc);
+                for &case in self.ast.list_items(cases) {
+                    if let Node::SwitchCase { test, stmts } = *self.ast.node(case) {
+                        if let Some(test) = test {
+                            self.walk_node(test);
+                        }
+                        self.walk_list(stmts);
+                    }
+                }
+            }
+            Node::SwitchCase { .. } => unreachable!("switch cases handled by the switch walk"),
+            Node::Labeled { body, .. } => self.walk_node(body),
             Node::TryCatch {
                 try_block,
                 catch_block,
                 finally_block,
                 ..
             } => {
+                // the catch param scope covers only the catch block, not
+                // the try block (a name in the try body must resolve
+                // outside the catch scope)
+                if entered.is_some() {
+                    self.scope_stack.pop();
+                }
                 self.walk_node(try_block);
+                if let Some(scope) = entered {
+                    self.scope_stack.push(scope);
+                }
                 if let Some(c) = catch_block {
                     self.walk_node(c);
                 }
+                if entered.is_some() {
+                    self.scope_stack.pop();
+                }
                 if let Some(f) = finally_block {
                     self.walk_node(f);
+                }
+                // restore so the walk_node epilogue pops exactly once
+                if let Some(scope) = entered {
+                    self.scope_stack.push(scope);
                 }
             }
             Node::NumberLiteral(_)
@@ -277,7 +363,6 @@ impl<'a> Resolver<'a> {
             | Node::BigIntLiteral(_)
             | Node::BoolLiteral(_)
             | Node::NullLiteral
-            | Node::This
             | Node::Hole
             | Node::Empty
             | Node::Break { .. }
@@ -302,6 +387,11 @@ impl<'a> Resolver<'a> {
             let calls_eval = ast.scope(fscope).calls_eval;
             let mut next_reg = 0u32;
             let mut next_ctx = 0u32;
+            let mut this_slot = None;
+            if self.captures_this.contains(&fid) {
+                this_slot = Some(next_ctx);
+                next_ctx += 1;
+            }
             for s in 0..ast.scope_count() {
                 let scope = ScopeId(s as u32);
                 if self.fn_owner[s] != fid {
@@ -335,6 +425,7 @@ impl<'a> Resolver<'a> {
             layouts[fid.0 as usize] = FunctionLayout {
                 register_count: next_reg,
                 context_slots: next_ctx,
+                this_slot,
             };
         }
 
@@ -342,6 +433,8 @@ impl<'a> Resolver<'a> {
         for (node, pending) in self.pending.iter().enumerate() {
             resolutions[node] = pending.as_ref().map(|p| match *p {
                 Pending::GlobalObject => Resolution::GlobalObject,
+                Pending::Dynamic => Resolution::Dynamic,
+                Pending::This(owner) => Resolution::This(owner),
                 Pending::Decl { scope, decl } => slots[&(scope, decl)],
             });
         }
@@ -370,6 +463,8 @@ impl<'a> Resolver<'a> {
             resolutions,
             layouts,
             per_iteration_loops,
+            decl_maps: self.decl_maps,
+            slots,
         }
     }
 }

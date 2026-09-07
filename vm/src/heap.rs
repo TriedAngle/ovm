@@ -1,8 +1,8 @@
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
     Handle, HandleData, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapInit, MapKind, Object,
-    ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, Smi, StringInterner, Symbol, Tagged,
-    TransitionLock, Value, Word,
+    ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, ScopeInfo, ScopeInfoInit, Smi,
+    StringInterner, Symbol, Tagged, TransitionLock, Value, Word,
 };
 use core::{
     alloc::Layout,
@@ -57,6 +57,10 @@ pub struct WellKnown {
     pub callable_map: Global<Map>,
     pub handler_table_map: Global<Map>,
     pub context_map: Global<Map>,
+    pub scope_info_map: Global<Map>,
+    /// Shared immutable scope description for contexts without named slots
+    /// (block/catch contexts, the empty context)
+    pub empty_scope_info: Global<ScopeInfo>,
     // js userspace primitives and object base maps
     pub undefined: Global<Object>,
     pub undefined_map: Global<Map>,
@@ -70,6 +74,16 @@ pub struct WellKnown {
     pub js_array_map: Global<Map>,
     /// Base map for ECMAScript error objects
     pub error_map: Global<Map>,
+    /// Per-class error maps (prototype chain carries `.constructor`);
+    /// installed by the builtins bootstrap.
+    pub type_error_map: Global<Map>,
+    pub reference_error_map: Global<Map>,
+    pub range_error_map: Global<Map>,
+    /// Wrapper maps for boxed primitives (slots[0] = the primitive value);
+    /// installed by the builtins bootstrap.
+    pub number_wrapper_map: Global<Map>,
+    pub boolean_wrapper_map: Global<Map>,
+    pub string_wrapper_map: Global<Map>,
     // prototypes
     /// `%Object.prototype%`: root of the ordinary-object prototype hierarchy.
     pub object_prototype: Global<Object>,
@@ -103,6 +117,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     let obj = unsafe { smi_handle::<Object>(roots) };
     let array = unsafe { smi_handle::<FixedArray>(roots) };
     let context = unsafe { smi_handle::<Context>(roots) };
+    let scope_info = unsafe { smi_handle::<ScopeInfo>(roots) };
     WellKnown {
         map_map: map,
         void: obj,
@@ -120,6 +135,8 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         callable_map: map,
         handler_table_map: map,
         context_map: map,
+        scope_info_map: map,
+        empty_scope_info: scope_info,
         undefined: obj,
         undefined_map: map,
         null: obj,
@@ -129,6 +146,12 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         boolean_map: map,
         js_array_map: map,
         error_map: map,
+        type_error_map: map,
+        reference_error_map: map,
+        range_error_map: map,
+        number_wrapper_map: map,
+        boolean_wrapper_map: map,
+        string_wrapper_map: map,
         object_prototype: obj,
         array_prototype: obj,
         error_prototype: obj,
@@ -164,9 +187,20 @@ fn alloc_parent_map(
     kind: MapKind,
     parent: Global<Object>,
 ) -> Global<Map> {
+    alloc_parent_map_with_slots(heap, scope, roots, kind, parent, 0)
+}
+
+fn alloc_parent_map_with_slots(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    roots: &RootHandles,
+    kind: MapKind,
+    parent: Global<Object>,
+    value_slot_count: usize,
+) -> Global<Map> {
     heap.allocate::<Map>(MapInit {
-        kind: kind,
-        value_slot_count: 0,
+        kind,
+        value_slot_count,
         descriptors: &[],
         prototype: scope
             .create_handle(Tagged::from_value(parent.value()))
@@ -292,6 +326,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let callable_map = alloc_map(heap, &scope, roots, MapKind::CALLABLE_INFO);
     let handler_table_map = alloc_map(heap, &scope, roots, MapKind::HANDLER_TABLE);
     let context_map = alloc_map(heap, &scope, roots, MapKind::CONTEXT);
+    let scope_info_map = alloc_map(heap, &scope, roots, MapKind::SCOPE_INFO);
 
     let function_map = heap
         .allocate::<Map>(MapInit {
@@ -318,6 +353,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.callable_map = callable_map;
     known.handler_table_map = handler_table_map;
     known.context_map = context_map;
+    known.scope_info_map = scope_info_map;
     known.function_map = function_map;
     heap.set_known(known);
 }
@@ -424,10 +460,14 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let to_primitive_symbol =
         roots.create_handle(Symbol::new(heap, &scope, b"Symbol.toPrimitive").as_tagged());
 
+    let empty_scope_info = heap
+        .allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots })
+        .into_global(roots);
     let empty_context = heap
         .allocate::<Context>(ContextInit {
             outer: None,
             slots: empty_slots,
+            scope_info: empty_scope_info,
         })
         .into_global(roots);
 
@@ -437,7 +477,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     // (patched onto function_map at the end). The body is a single
     // `Return` (bytecode::Opcode::Return as u8) so calling it yields
     // undefined.
-    let function_prototype_map = alloc_parent_map(
+    let function_prototype_map = alloc_parent_map_with_slots(
         heap,
         &scope,
         roots,
@@ -445,6 +485,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
             .union(MapKind::CALLABLE)
             .union(MapKind::EXTENDABLE),
         object_prototype,
+        2, // [callable info, context], like function_map
     );
     let empty_code = heap.allocate::<FixedByteArray>(&[1]).into_handle(&scope);
     let empty_constants = scope
@@ -482,9 +523,19 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.error_prototype = error_prototype;
     known.function_prototype = function_prototype;
     known.error_map = error_map;
+    // the per-class error maps and wrapper maps are placeholders until the
+    // builtins bootstrap installs their prototypes (they start pointing at
+    // the plain error map so no allocation ever reads a garbage map)
+    known.type_error_map = error_map;
+    known.reference_error_map = error_map;
+    known.range_error_map = error_map;
+    known.number_wrapper_map = error_map;
+    known.boolean_wrapper_map = error_map;
+    known.string_wrapper_map = error_map;
     known.exception_map = exception_map;
     known.js_array_map = js_array_map;
     known.empty_context = empty_context;
+    known.empty_scope_info = empty_scope_info;
     known.global_object = global_object;
     known.object_initial_map = object_initial_map;
     heap.set_known(known);
@@ -498,7 +549,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
             .set(heap, null.value(), Tagged::from_value(empty.erase()));
         // ordinary function objects' [[Prototype]] is %Function.prototype%
         // (ES 19.2.3.1): function_map was created with a null placeholder
-        // in bootstrap_basics.
+        // in bootstrap_basics
         known.function_map.heap_ref(nogc).prototype.set(
             heap,
             known.function_map.value(),
@@ -989,7 +1040,9 @@ impl Heap {
         (self.vtable.known)(self.local)
     }
 
-    fn set_known(&self, known: WellKnown) {
+    /// Install a patched `WellKnown` (builtins bootstrap only: run once,
+    /// before any thread executes user code).
+    pub fn set_known(&self, known: WellKnown) {
         (self.vtable.set_known)(self.shared, known)
     }
 
@@ -1020,9 +1073,9 @@ impl Heap {
     }
 
     pub fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
-        let raw = self.allocate_raw(T::layout_for(&config));
-        debug_assert!(raw.is_ok(), "allocation must not fail");
-        let raw = unsafe { raw.unwrap_unchecked() };
+        let raw = self
+            .allocate_raw(T::layout_for(&config))
+            .expect("heap allocation failed (out of memory)");
         let mut ptr = raw.cast::<T>();
         unsafe { ptr.as_mut() }.init(self, &config);
         Fresh::new(ptr)
@@ -1068,9 +1121,9 @@ impl Heap {
     }
 
     pub fn allocate_token(&mut self, total: Layout) -> AllocToken<'_> {
-        let raw = self.allocate_raw(total);
-        debug_assert!(raw.is_ok(), "allocation must not fail");
-        let raw = unsafe { raw.unwrap_unchecked() };
+        let raw = self
+            .allocate_raw(total)
+            .expect("heap allocation failed (out of memory)");
         AllocToken::new(self, raw, total)
     }
 

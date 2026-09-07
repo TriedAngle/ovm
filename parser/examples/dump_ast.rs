@@ -176,6 +176,26 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
             );
             dump(ast, f.body.unwrap(), indent + 1);
         }
+        Node::Switch { disc, cases } => {
+            println!("{pad}Switch {at}");
+            dump(ast, disc, indent + 1);
+            for &case in ast.list_items(cases) {
+                dump(ast, case, indent + 1);
+            }
+        }
+        Node::Labeled { label, body } => {
+            println!("{pad}Labeled({}) {at}", name_of(ast, label));
+            dump(ast, body, indent + 1);
+        }
+        Node::SwitchCase { test, stmts } => {
+            println!("{pad}Case(default={}) {at}", test.is_none());
+            if let Some(t) = test {
+                dump(ast, t, indent + 1);
+            }
+            for &s in ast.list_items(stmts) {
+                dump(ast, s, indent + 1);
+            }
+        }
         Node::ClassDecl { class } => dump_class(ast, class, "ClassDecl", pad, at, indent),
         Node::ClassExpr { class } => dump_class(ast, class, "ClassExpr", pad, at, indent),
         Node::Empty => println!("{pad}Empty {at}"),

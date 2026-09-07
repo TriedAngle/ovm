@@ -8,15 +8,20 @@ use crate::VmError;
 pub const STACK_SLOTS: usize = 16 * 1024;
 
 /// Fixed header slots between the register file and the parameter region
-pub const HEADER_SLOTS: usize = 2;
+pub const HEADER_SLOTS: usize = 3;
 pub const CALLABLE_OFFSET: usize = 0;
 pub const ARGC_OFFSET: usize = 1;
+/// The frame's current context (the chain LoadContextSlot walks); unlike
+/// the function object's closure-context slot it is per-frame, so
+/// recursion cannot clobber a suspended frame's context.
+pub const CONTEXT_OFFSET: usize = 2;
 
 /// Frame layout:
 /// index                    content
 /// base + 0 .. +rc-1        register file (r0..rn)
 /// base + rc + 0            header: callable
 /// base + rc + 1            header: argc
+/// base + rc + 2            header: current context
 /// base + rc + H .. +argc   parameters (param 0 = receiver)
 ///
 /// Parameters are addressed with negative register indices.
@@ -27,6 +32,9 @@ pub struct Stack {
     slots: Box<[Register]>,
     top: Cell<usize>,
     frames: RefCell<Vec<FrameMeta>>,
+    /// Register files of fresh frames are initialized to this value
+    /// (the hole: uninitialized `let`/`const` reads must be TDZ errors).
+    fill: Value,
 }
 
 impl Stack {
@@ -37,6 +45,7 @@ impl Stack {
                 .collect(),
             top: Cell::new(0),
             frames: RefCell::new(Vec::new()),
+            fill,
         }
     }
 
@@ -62,6 +71,10 @@ impl Stack {
         self.slot_unchecked(meta.base + meta.register_count + CALLABLE_OFFSET)
     }
 
+    pub fn context_slot(&self, meta: &FrameMeta) -> &Register {
+        self.slot_unchecked(meta.base + meta.register_count + CONTEXT_OFFSET)
+    }
+
     fn reg_index(meta: &FrameMeta, i: i32) -> usize {
         if i >= 0 {
             meta.base + i as usize
@@ -82,11 +95,13 @@ impl Stack {
         unsafe { GcSlice::from_slice(self.value_slice(Self::reg_index(meta, reg_base), count)) }
     }
 
-    /// `callable` slots[0] is the CallableInfoObject
+    /// `callable` slots[0] is the CallableInfoObject; `context` is the
+    /// closure context the frame starts executing with.
     pub fn push_initial_frame(
         &self,
         callable: Tagged<Object>,
         register_count: usize,
+        context: Value,
         args: GcSlice<'_>,
     ) -> Result<FrameMeta, VmError> {
         let base = self.reserve(register_count, args.len())?;
@@ -99,7 +114,7 @@ impl Stack {
                 args.len(),
             )
         }
-        Ok(self.init_frame_header(base, register_count, callable, args.len()))
+        Ok(self.init_frame_header(base, register_count, callable, context, args.len()))
     }
 
     pub fn push_frame(
@@ -108,6 +123,7 @@ impl Stack {
         handler_pc: usize,
         callable: Tagged<Object>,
         register_count: usize,
+        context: Value,
         src_reg_base: i32,
         count: usize,
     ) -> Result<FrameMeta, VmError> {
@@ -126,7 +142,7 @@ impl Stack {
                 count,
             )
         }
-        let callee = self.init_frame_header(base, register_count, callable, count);
+        let callee = self.init_frame_header(base, register_count, callable, context, count);
         let mut caller = caller;
         caller.handler_pc = handler_pc;
         self.frames.borrow_mut().push(caller);
@@ -139,6 +155,7 @@ impl Stack {
         handler_pc: usize,
         callable: Tagged<Object>,
         register_count: usize,
+        context: Value,
         args: &[Value],
     ) -> Result<FrameMeta, VmError> {
         let base = self.reserve(register_count, args.len())?;
@@ -151,7 +168,7 @@ impl Stack {
                 args.len(),
             )
         }
-        let callee = self.init_frame_header(base, register_count, callable, args.len());
+        let callee = self.init_frame_header(base, register_count, callable, context, args.len());
         let mut caller = caller;
         caller.handler_pc = handler_pc;
         self.frames.borrow_mut().push(caller);
@@ -200,6 +217,11 @@ impl Stack {
         if base + size > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
+        // registers are born as the hole (TDZ); arguments are copied over
+        // them afterwards
+        for i in 0..register_count {
+            self.slot_unchecked(base + i).store(self.fill);
+        }
         self.set_top(base + size);
         Ok(base)
     }
@@ -209,12 +231,15 @@ impl Stack {
         base: usize,
         register_count: usize,
         callable: Tagged<Object>,
+        context: Value,
         argc: usize,
     ) -> FrameMeta {
         self.slot_unchecked(base + register_count + CALLABLE_OFFSET)
             .store(callable.erase());
         self.slot_unchecked(base + register_count + ARGC_OFFSET)
             .store(Smi::new(argc as i64).encode());
+        self.slot_unchecked(base + register_count + CONTEXT_OFFSET)
+            .store(context);
         FrameMeta {
             base,
             pc: 0,

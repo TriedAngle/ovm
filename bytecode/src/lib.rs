@@ -13,20 +13,26 @@ pub enum Opcode {
     Move, // reg -> reg
 
     // I don't think we need this right now, LoadConstant should be enough?
-    LoadGlobal,       // idx (constant pool name) idx (feedback) -> acc
-    StoreGlobal,      // acc -> idx (constant pool name) idx (feedback)
-    LoadContextSlot,  // idx (slot) uimm (depth) -> acc; from the frame context
-    StoreContextSlot, // acc -> idx (slot) uimm (depth); frame context
+    LoadGlobal,  // idx (constant pool name) idx (feedback) -> acc
+    StoreGlobal, // acc -> idx (constant pool name) idx (feedback)
+    // typeof on an unresolved global yields "undefined" instead of throwing
+    LoadGlobalNoThrow, // idx (constant pool name) idx (feedback) -> acc
+    LoadContextSlot,   // idx (slot) uimm (depth) -> acc; from the frame context
+    StoreContextSlot,  // acc -> idx (slot) uimm (depth); frame context
 
     // JS [[SetPrototypeOf]]: acc (object) gets reg (prototype) as [[Prototype]]
     SetPrototype, // reg -> (acc stays the object)
 
-    CreateFunctionContext, // uimm (slot count) -> acc; outer = frame context
+    CreateFunctionContext, // idx (constants: the scope's ScopeInfo) -> acc; outer = frame context
     CreateBlockContext,    // uimm (slot count) -> acc; outer = frame context
     CreateCatchContext,    // reg (exception) -> acc; outer = frame context
     PushContext,           // acc (context) -> frame context; reg <- old context
     PopContext,            // reg (context) -> frame context
     ThrowReferenceErrorIfHole, // acc -> throw ReferenceError if the hole
+    // dynamic name resolution (direct eval): walk the frame context chain
+    // by name; unresolved names fall back to the global object
+    LoadDynamicName,  // idx (name constant) -> acc
+    StoreDynamicName, // acc -> idx (name constant)
 
     LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
     StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
@@ -176,6 +182,7 @@ impl Opcode {
             b if b == Move as u8 => Move,
             b if b == LoadGlobal as u8 => LoadGlobal,
             b if b == StoreGlobal as u8 => StoreGlobal,
+            b if b == LoadGlobalNoThrow as u8 => LoadGlobalNoThrow,
             b if b == LoadContextSlot as u8 => LoadContextSlot,
             b if b == StoreContextSlot as u8 => StoreContextSlot,
             b if b == SetPrototype as u8 => SetPrototype,
@@ -185,6 +192,8 @@ impl Opcode {
             b if b == PushContext as u8 => PushContext,
             b if b == PopContext as u8 => PopContext,
             b if b == ThrowReferenceErrorIfHole as u8 => ThrowReferenceErrorIfHole,
+            b if b == LoadDynamicName as u8 => LoadDynamicName,
+            b if b == StoreDynamicName as u8 => StoreDynamicName,
             b if b == LoadNamedProperty as u8 => LoadNamedProperty,
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
             b if b == StoreNamedPropertyShadow as u8 => StoreNamedPropertyShadow,
@@ -243,7 +252,7 @@ impl Opcode {
 
             Self::Move => &[Register, Register],
 
-            Self::LoadGlobal => &[Index, Index],
+            Self::LoadGlobal | Self::LoadGlobalNoThrow => &[Index, Index],
             Self::StoreGlobal => &[Index, Index],
 
             Self::LoadContextSlot => &[Index, UImmediate],
@@ -251,10 +260,12 @@ impl Opcode {
 
             Self::SetPrototype => &[Register],
 
-            Self::CreateFunctionContext | Self::CreateBlockContext => &[UImmediate],
+            Self::CreateFunctionContext => &[Index],
+            Self::CreateBlockContext => &[UImmediate],
             Self::CreateCatchContext => &[Register],
             Self::PushContext | Self::PopContext => &[Register],
             Self::ThrowReferenceErrorIfHole => &[],
+            Self::LoadDynamicName | Self::StoreDynamicName => &[Index],
 
             Self::LoadNamedProperty => &[Register, Index, Index],
             Self::StoreNamedProperty => &[Register, Index, Index],
