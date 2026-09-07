@@ -408,9 +408,9 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, Float, Global, Heap, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
+        AccessorPair, Change, Float, Global, Heap, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
         ObjectSlotsInit, RootHandles, SlotFlags, SlotName, StoreOutcome, StoreSemantics, Tagged,
-        Value, VmError,
+        Transition, Value, VmError,
     };
     use vm::{
         FixedArray, FixedByteArray, HandleData, HandleScope, InternedString, Smi,
@@ -528,7 +528,7 @@ mod tests {
             let map = map.heap_ref(nogc);
             assert_eq!(map.transitions.inner(), nogc.known().void.value());
             assert!(
-                map.find_transition(nogc, smi_name(1), SlotFlags::VALUE)
+                map.find_transition(nogc, smi_name(1), SlotFlags::VALUE, None)
                     .is_none()
             );
         });
@@ -554,12 +554,10 @@ mod tests {
 
         heap.no_gc(|nogc| {
             let parent_ref = parent.heap_ref(nogc);
-            parent_ref
-                .transitions
-                .set(nogc.heap(), parent.value(), pairs);
+            parent_ref.transitions.set(nogc, parent.value(), pairs);
 
             let found = parent_ref
-                .find_transition(nogc, smi_name(1), flags)
+                .find_transition(nogc, smi_name(1), flags, None)
                 .expect("transition by name and flags");
             assert_eq!(found.into_ptr().as_ptr(), child.get().as_ptr());
 
@@ -567,13 +565,13 @@ mod tests {
             let other = flags.union(SlotFlags::ENUMERABLE);
             assert!(
                 parent_ref
-                    .find_transition(nogc, smi_name(1), other)
+                    .find_transition(nogc, smi_name(1), other, None)
                     .is_none()
             );
             // unknown name
             assert!(
                 parent_ref
-                    .find_transition(nogc, smi_name(2), flags)
+                    .find_transition(nogc, smi_name(2), flags, None)
                     .is_none()
             );
         });
@@ -607,7 +605,15 @@ mod tests {
         let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
 
-        let child = Map::transition_target(&mut heap, &scope, parent, name, flags);
+        let child = Transition::target(
+            &mut heap,
+            &scope,
+            |nogc| parent.heap_ref(nogc),
+            name,
+            flags,
+            None,
+            Change::Append,
+        );
         let child = scope.create_handle(child).expect("child map is strong");
 
         heap.no_gc(|nogc| {
@@ -622,7 +628,7 @@ mod tests {
             // the parent recorded the edge and finds it again
             let found = parent
                 .heap_ref(nogc)
-                .find_transition(nogc, smi_name(1), flags)
+                .find_transition(nogc, smi_name(1), flags, None)
                 .expect("recorded transition");
             assert_eq!(found.into_ptr().as_ptr(), child.get().as_ptr());
         });
@@ -637,8 +643,24 @@ mod tests {
         let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
 
-        let a = Map::transition_target(&mut heap, &scope, parent, name, flags);
-        let b = Map::transition_target(&mut heap, &scope, parent, name, flags);
+        let a = Transition::target(
+            &mut heap,
+            &scope,
+            |nogc| parent.heap_ref(nogc),
+            name,
+            flags,
+            None,
+            Change::Append,
+        );
+        let b = Transition::target(
+            &mut heap,
+            &scope,
+            |nogc| parent.heap_ref(nogc),
+            name,
+            flags,
+            None,
+            Change::Append,
+        );
         assert_eq!(a.erase(), b.erase());
 
         heap.no_gc(|nogc| {
@@ -663,20 +685,40 @@ mod tests {
 
         // two different properties off the same parent: sibling edges
         let a = scope
-            .create_handle(Map::transition_target(
-                &mut heap, &scope, parent, name1, flags,
+            .create_handle(Transition::target(
+                &mut heap,
+                &scope,
+                |nogc| parent.heap_ref(nogc),
+                name1,
+                flags,
+                None,
+                Change::Append,
             ))
             .expect("strong");
         let b = scope
-            .create_handle(Map::transition_target(
-                &mut heap, &scope, parent, name2, flags,
+            .create_handle(Transition::target(
+                &mut heap,
+                &scope,
+                |nogc| parent.heap_ref(nogc),
+                name2,
+                flags,
+                None,
+                Change::Append,
             ))
             .expect("strong");
         assert_ne!(a.value(), b.value());
 
         // and a chain: transition from a child map
         let c = scope
-            .create_handle(Map::transition_target(&mut heap, &scope, a, name2, flags))
+            .create_handle(Transition::target(
+                &mut heap,
+                &scope,
+                |nogc| a.heap_ref(nogc),
+                name2,
+                flags,
+                None,
+                Change::Append,
+            ))
             .expect("strong");
 
         heap.no_gc(|nogc| {
@@ -1438,7 +1480,16 @@ mod tests {
                         .create_handle(Tagged::from_ptr(parent_ptr))
                         .expect("parent is strong");
                     let name = root_name(&scope, smi_name(1));
-                    Map::transition_target(&mut local, &scope, parent, name, flags).erase()
+                    Transition::target(
+                        &mut local,
+                        &scope,
+                        |nogc| parent.heap_ref(nogc),
+                        name,
+                        flags,
+                        None,
+                        Change::Append,
+                    )
+                    .erase()
                 }));
             }
             let results: Vec<Value> = threads.into_iter().map(|t| t.join().unwrap()).collect();

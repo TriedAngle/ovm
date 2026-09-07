@@ -5,8 +5,7 @@ use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
     FixedByteArray, Float, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind,
     Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit, SlotFlags, SlotName,
-    Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, ValueRef,
-    define_own_property_values, set_prototype, string_content_hash,
+    Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, ValueRef, string_content_hash,
 };
 
 fn smi(v: i64) -> Value {
@@ -2323,7 +2322,7 @@ fn empty_object_literal_inherits_from_object_prototype() {
             .unwrap();
         match outcome {
             StoreOutcome::Transition { receiver, name } => {
-                define_own_property_values(
+                Object::define_own_property_values(
                     thread.heap(),
                     &scope,
                     receiver,
@@ -2977,7 +2976,7 @@ fn set_property_fn(
     constants: &[Value],
 ) {
     let f = make_callable(thread, scope, program, constants);
-    define_own_property_values(
+    Object::define_own_property_values(
         thread.heap(),
         scope,
         obj,
@@ -3425,7 +3424,7 @@ fn instance_of_walks_prototype_chain() {
         // F with a .prototype object
         let f = make_callable(thread, &scope, &program_return_1(), &[]);
         let f_proto = empty_object(thread, &scope).as_tagged().erase();
-        define_own_property_values(
+        Object::define_own_property_values(
             thread.heap(),
             &scope,
             f,
@@ -3436,7 +3435,7 @@ fn instance_of_walks_prototype_chain() {
 
         // obj inherits F.prototype; plain {} does not
         let obj = empty_object(thread, &scope).as_tagged().erase();
-        set_prototype(thread.heap(), &scope, obj, f_proto).unwrap();
+        Object::set_prototype(thread.heap(), &scope, obj, f_proto).unwrap();
         let plain = empty_object(thread, &scope).as_tagged().erase();
 
         let r = run_program(
@@ -3467,7 +3466,7 @@ fn instance_of_walks_prototype_chain() {
 
         // a non-object .prototype is a TypeError
         let f2 = make_callable(thread, &scope, &program_return_1(), &[]);
-        define_own_property_values(
+        Object::define_own_property_values(
             thread.heap(),
             &scope,
             f2,
@@ -3508,7 +3507,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
             &[],
         );
         let g_proto = empty_object(thread, &scope).as_tagged().erase();
-        define_own_property_values(
+        Object::define_own_property_values(
             thread.heap(),
             &scope,
             g,
@@ -3581,7 +3580,7 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
         match outcome {
             StoreOutcome::Done => {}
             StoreOutcome::Transition { .. } => {
-                define_own_property_values(
+                Object::define_own_property_values(
                     nctx.heap(),
                     &scope,
                     global,

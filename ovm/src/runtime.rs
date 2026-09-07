@@ -1,6 +1,6 @@
 use vm::{
     Convert, FixedArray, Float, GcSlice, Handle, Heap, LoadOutcome, NoGc, Object, ObjectSlotsInit,
-    SlotName, Symbol, Tagged, VMString, Value, ValueRef, VmError, load_outcome, set_prototype,
+    SlotName, Symbol, Tagged, VMString, Value, ValueRef, VmError, load_outcome,
 };
 
 use crate::{ContextState, NativeContext, VM};
@@ -300,7 +300,7 @@ pub(crate) fn create_construct_receiver(
             .as_tagged()
             .erase();
         if let Some(proto) = proto {
-            set_prototype(heap, &scope, obj, proto.value())?;
+            Object::set_prototype(heap, &scope, obj, proto.value())?;
         }
         Ok(Some(obj))
     })
