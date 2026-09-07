@@ -138,7 +138,7 @@ pub fn numeric_op(
 
 /// Get a property value with full [[Get]] semantics: accessor getters are
 /// called (nested run), missing properties yield undefined.
-fn get_property(
+pub(crate) fn get_property(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,

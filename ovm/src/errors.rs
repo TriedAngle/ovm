@@ -17,8 +17,15 @@ pub fn error_from_vm_error(
         let name_value = vm.interner().intern(heap, &scope, err.name());
         let message_value = vm.interner().intern(heap, &scope, err.message());
 
+        // per-class maps carry the right prototype chain (.constructor etc.)
+        let map = match err.name() {
+            "TypeError" => heap.known().type_error_map,
+            "ReferenceError" => heap.known().reference_error_map,
+            "RangeError" => heap.known().range_error_map,
+            _ => heap.known().error_map,
+        };
         let map = scope
-            .create_handle(heap.known().error_map.as_tagged())
+            .create_handle(map.as_tagged())
             .expect("error map is strong");
         let obj = heap
             .allocate_object(

@@ -1,6 +1,6 @@
 use crate::{
     AccessorPair, FixedArray, GcSlot, Heap, HeapPtr, HeapRef, InternedString, Map, NoGc, Object,
-    SlotFlags, SlotKind, SlotName, Smi, Symbol, Tagged, Value, ValueRef, VmError,
+    SlotFlags, SlotKind, SlotName, Smi, Symbol, Tagged, VMString, Value, ValueRef, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -32,12 +32,13 @@ pub enum Key {
 
 pub fn classify_key<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, key: Value) -> Result<Key, VmError> {
     if let Some(smi) = Smi::decode(key) {
-        if smi.value() >= 0 {
+        // ES 6.1.7: an array index is 0 ≤ i < 2^32−1; anything else (incl.
+        // 4294967295 itself) is an ordinary named property
+        if smi.value() >= 0 && smi.value() < u32::MAX as i64 {
             return usize::try_from(smi.value())
                 .map(Key::Element)
                 .map_err(|_| VmError::OutOfBounds);
         }
-        // negative indices are ordinary (numeric) property names
         return Ok(Key::Name(SlotName::from(Tagged::from_smi(smi))));
     }
     if let Some(s) = key.get_as::<InternedString>(nogc, heap.known().string_map) {
@@ -92,6 +93,16 @@ pub fn load_outcome<'a>(
     let known = heap.known();
     if receiver == known.null.value() || receiver == known.undefined.value() {
         return Err(VmError::Type);
+    }
+    // JSArray `length` is an internal slot, not a map descriptor
+    if let ValueRef::Object(obj) = receiver.value_ref(nogc) {
+        let obj = obj.as_ref();
+        if obj.is_array(nogc)
+            && let Some(s) = name.value().get_as::<VMString>(nogc, known.string_map)
+            && s.as_slice(nogc) == b"length"
+        {
+            return Ok(LoadOutcome::Value(obj.length.inner()));
+        }
     }
     match receiver.lookup(nogc, heap, name) {
         Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => {

@@ -1,6 +1,6 @@
 //! Parse-only test262 harness.
 //!
-//! Usage: cargo run -p parser --example test262 -- <file-or-dir>...
+//! Usage: cargo run -p parser --example test262_parse -- <file-or-dir>...
 //! With no args, runs a small default selection known to fit the parser subset.
 //!
 //! Frontmatter handling: files with `negative: { phase: parse|syntax }` are

@@ -62,6 +62,8 @@ pub struct Parser<S: CharStream> {
     errors: Vec<ParseError>,
     scopes: Vec<Scope>,
     loop_depth: u32,
+    /// switch statement nesting (break targets; continue stays loop-only)
+    switch_depth: u32,
     /// functions currently being parsed (ids into the Ast table); last = innermost
     fn_stack: Vec<FunctionId>,
     next_literal_id: u32,
@@ -75,6 +77,7 @@ impl<S: CharStream> Parser<S> {
             errors: Vec::new(),
             scopes: Vec::new(),
             loop_depth: 0,
+            switch_depth: 0,
             fn_stack: Vec::new(),
             next_literal_id: 0,
         }
@@ -297,7 +300,7 @@ impl<S: CharStream> Parser<S> {
         let mut prologue = true;
         loop {
             let t = self.peek()?;
-            if t.kind == terminator {
+            if t.kind == terminator || t.kind == TokenKind::Case || t.kind == TokenKind::Default {
                 break;
             }
             if t.kind == TokenKind::Eof {
@@ -342,8 +345,25 @@ impl<S: CharStream> Parser<S> {
         Ok(Some(kind))
     }
 
+    fn parse_labeled_statement(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.next()?;
+        let label = self.ident_symbol(t)?;
+        self.expect(TokenKind::Colon)?;
+        let body = self.parse_statement()?;
+        let span = Span::new(t.span.start, self.ast.span(body).end);
+        Ok(self.ast.add(Node::Labeled { label, body }, span))
+    }
+
     fn parse_statement(&mut self) -> Result<NodeId, ParseError> {
         let t = self.peek()?;
+        // labeled statement: `label : Statement` (not before function/class)
+        if is_identifier_like(t.kind)
+            && !matches!(t.kind, TokenKind::Function | TokenKind::Class)
+            && !t.after_newline
+            && self.peek_ahead()?.kind == TokenKind::Colon
+        {
+            return self.parse_labeled_statement();
+        }
         if let Some(kind) = self.peek_var_kind()? {
             return self.parse_var_decl(kind, true);
         }
@@ -364,6 +384,7 @@ impl<S: CharStream> Parser<S> {
             TokenKind::Return => self.parse_return(),
             TokenKind::Throw => self.parse_throw(),
             TokenKind::Try => self.parse_try(),
+            TokenKind::Switch => self.parse_switch(),
             TokenKind::Break | TokenKind::Continue => self.parse_break_continue(t.kind),
             TokenKind::LBrace => self.parse_block(),
             TokenKind::Semicolon => {
@@ -556,13 +577,10 @@ impl<S: CharStream> Parser<S> {
         } else {
             None
         };
-        if label.is_some() {
-            return Err(ParseError::new(
-                t.span,
-                "labeled break/continue need labeled statements (not yet supported)",
-            ));
-        }
-        if self.loop_depth == 0 {
+        let breakable = self.loop_depth > 0 || self.switch_depth > 0;
+        if (kind == TokenKind::Break && !breakable)
+            || (kind == TokenKind::Continue && self.loop_depth == 0)
+        {
             return Err(ParseError::new(
                 t.span,
                 format!("`{}` outside of a loop", kind.text()),
@@ -599,16 +617,74 @@ impl<S: CharStream> Parser<S> {
         Ok(self.ast.add(Node::Throw { expr }, span))
     }
 
+    fn parse_switch(&mut self) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::Switch)?.span.start;
+        self.expect(TokenKind::LParen)?;
+        let disc = self.parse_expression()?;
+        self.expect(TokenKind::RParen)?;
+        self.expect(TokenKind::LBrace)?;
+
+        // one lexical scope for the whole switch (ES 16.2.2)
+        let scope = self.push_scope(ScopeKind::Block);
+        self.switch_depth += 1;
+
+        let mut cases = Vec::new();
+        loop {
+            let t = self.peek()?;
+            let (test, case_start) = match t.kind {
+                TokenKind::Case => {
+                    self.next()?;
+                    let test = self.parse_expression()?;
+                    self.expect(TokenKind::Colon)?;
+                    (Some(test), t.span.start)
+                }
+                TokenKind::Default => {
+                    self.next()?;
+                    self.expect(TokenKind::Colon)?;
+                    (None, t.span.start)
+                }
+                TokenKind::RBrace => break,
+                _ => {
+                    return Err(ParseError::new(
+                        t.span,
+                        "expected `case`, `default` or `}` in switch",
+                    ));
+                }
+            };
+            let stmts = self.parse_statement_list(TokenKind::RBrace)?;
+            let end = stmts
+                .last()
+                .map(|s| self.ast.span(*s).end)
+                .unwrap_or(case_start);
+            let stmts = self.ast.list(&stmts);
+            cases.push(
+                self.ast
+                    .add(Node::SwitchCase { test, stmts }, Span::new(case_start, end)),
+            );
+        }
+
+        self.switch_depth -= 1;
+        self.scopes.pop();
+        let end = self.expect(TokenKind::RBrace)?.span.end;
+        let cases = self.ast.list(&cases);
+        let node = self
+            .ast
+            .add(Node::Switch { disc, cases }, Span::new(start, end));
+        self.ast.set_node_scope(node, scope);
+        Ok(node)
+    }
+
     fn parse_try(&mut self) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::Try)?.span.start;
         let try_block = self.parse_block()?;
         let mut catch_param = None;
         let mut catch_block = None;
         let mut finally_block = None;
+        let mut catch_scope = None;
         if self.eat(TokenKind::Catch)? {
             // the catch param lives in the catch block's own scope:
             // `catch (e) { let e; }` is an early error, `var e` is not
-            self.push_scope(ScopeKind::Catch);
+            catch_scope = Some(self.push_scope(ScopeKind::Catch));
             if self.eat(TokenKind::LParen)? {
                 let t = self.next()?;
                 let sym = self.ident_symbol(t)?;
@@ -630,7 +706,7 @@ impl<S: CharStream> Parser<S> {
         }
         let end = finally_block.or(catch_block).unwrap_or(try_block);
         let end = self.ast.span(end).end;
-        Ok(self.ast.add(
+        let node = self.ast.add(
             Node::TryCatch {
                 try_block,
                 catch_param,
@@ -638,7 +714,11 @@ impl<S: CharStream> Parser<S> {
                 finally_block,
             },
             Span::new(start, end),
-        ))
+        );
+        if let Some(scope) = catch_scope {
+            self.ast.set_node_scope(node, scope);
+        }
+        Ok(node)
     }
 
     // -- functions ------------------------------------------------------------
@@ -949,9 +1029,22 @@ impl<S: CharStream> Parser<S> {
 
     // -- expressions ------------------------------------------------------------
 
-    /// Comma operator is deferred; expression == assignment for now.
+    /// Sequence expressions: `a, b, c` (lowest precedence, ES 13.16).
     fn parse_expression(&mut self) -> Result<NodeId, ParseError> {
-        self.parse_assignment()
+        let mut expr = self.parse_assignment()?;
+        while self.eat(TokenKind::Comma)? {
+            let rhs = self.parse_assignment()?;
+            let span = Span::new(self.ast.span(expr).start, self.ast.span(rhs).end);
+            expr = self.ast.add(
+                Node::Binary {
+                    op: TokenKind::Comma,
+                    lhs: expr,
+                    rhs,
+                },
+                span,
+            );
+        }
+        Ok(expr)
     }
 
     fn parse_assignment(&mut self) -> Result<NodeId, ParseError> {
@@ -1158,15 +1251,23 @@ impl<S: CharStream> Parser<S> {
                     );
                 }
                 TokenKind::LParen if allow_call => {
-                    // direct eval: `eval(...)` forces the whole visible scope
-                    // chain to stay dynamic-safe
+                    // direct eval: `eval(...)` — every visible function scope
+                    // must keep its bindings dynamically resolvable
+                    // (context-allocated with names), not just the innermost
                     if let Node::Identifier { sym } = self.ast.node(expr)
                         && self.symbols().get(*sym) == b"eval"
                     {
+                        let fns: Vec<ScopeId> = self
+                            .scopes
+                            .iter()
+                            .filter(|s| s.is_function)
+                            .map(|s| s.id)
+                            .collect();
+                        for id in fns {
+                            self.ast.scope_mut(id).calls_eval = true;
+                        }
                         let scope = self.fn_scope_id();
-                        let info = self.ast.scope_mut(scope);
-                        info.calls_eval = true;
-                        info.contains_function_or_eval = true;
+                        self.ast.scope_mut(scope).contains_function_or_eval = true;
                     }
                     let start = self.ast.span(expr).start;
                     let (args, end) = self.parse_args()?;
