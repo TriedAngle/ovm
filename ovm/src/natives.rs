@@ -223,8 +223,8 @@ fn float_add(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, V
         (Some(a), Some(b)) => (a, b),
         _ => return Err(VmError::Arity),
     };
-    let sum = nctx.heap().no_gc(|nogc, heap| {
-        let float_map = heap.known().float_map;
+    let sum = nctx.heap().no_gc(|nogc| {
+        let float_map = nogc.known().float_map;
         let fa = a.get_as::<Float>(nogc, float_map).ok_or(VmError::Type)?;
         let fb = b.get_as::<Float>(nogc, float_map).ok_or(VmError::Type)?;
         Ok(fa.value.get() + fb.value.get())

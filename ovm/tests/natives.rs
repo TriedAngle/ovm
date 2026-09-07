@@ -41,8 +41,8 @@ fn float_add_adds_and_boxes_result() {
     let fa = float(&mut thread, 1.5);
     let fb = float(&mut thread, 2.25);
     let r = thread.run_native(add, &[smi(0), fa, fb]).unwrap();
-    let out = thread.heap().no_gc(|nogc, heap| {
-        r.get_as::<Float>(nogc, heap.known().float_map)
+    let out = thread.heap().no_gc(|nogc| {
+        r.get_as::<Float>(nogc, nogc.known().float_map)
             .unwrap()
             .value
             .get()
@@ -78,14 +78,11 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
     let name = thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name").value();
         let type_error = thread.intern(&scope, "TypeError").value();
-        thread.heap().no_gc(|nogc, heap| {
+        thread.heap().no_gc(|nogc| {
             let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(nogc, heap, vm::SlotName::from_value(name))
-            {
+            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name)) {
                 vm::Lookup::Data { slot, .. } => {
                     assert_eq!(slot.inner(), type_error);
                 }

@@ -28,7 +28,7 @@ pub use object::{
     FixedArray, FixedByteArray, Float, HandlerEntry, HandlerEntryInit, HandlerTable,
     HandlerTableInit, Header, HeapObject, InternedString, Map, MapInit, MapKind, Object,
     ObjectInit, ObjectKind, ObjectSlotsInit, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags,
-    SlotKind, SlotName, Symbol, VMString, call_target, store_array_element, string_content_hash,
+    SlotName, Symbol, VMString, call_target, store_array_element, string_content_hash,
 };
 pub use transition::{
     PropertyDescriptor, StoreOutcome, StoreSemantics, TransitionGuard, TransitionLock,

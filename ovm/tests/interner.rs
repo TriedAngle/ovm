@@ -16,7 +16,7 @@ fn interning_deduplicates_and_preserves_content() {
         assert_ne!(a.value().to_bits(), c.value().to_bits());
 
         // content round trip
-        let (text, hash_a, hash_b) = ctx.heap().no_gc(|nogc, _| {
+        let (text, hash_a, hash_b) = ctx.heap().no_gc(|nogc| {
             (
                 a.heap_ref(nogc).string().as_str(nogc).unwrap().to_owned(),
                 a.heap_ref(nogc).string().hash(),

@@ -4,11 +4,11 @@ use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Val
 
 /// Read a data property by interned name value.
 fn get_prop(thread: &mut Thread, obj: Value, name: Value) -> Value {
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         let ValueRef::Object(o) = obj.value_ref(nogc) else {
             panic!("expected object");
         };
-        match o.as_ref().lookup(nogc, heap, SlotName::from_value(name)) {
+        match o.as_ref().lookup(nogc, SlotName::from_value(name)) {
             Lookup::Data { slot, .. } => slot.inner(),
             _ => panic!("expected a data property"),
         }
@@ -86,7 +86,7 @@ fn error_objects_are_distinct_but_share_shapes() {
     // both started from the well-known error map and added the same
     // properties in the same order: the transition cache must yield one
     // shared final shape
-    let maps = thread.heap().no_gc(|nogc, _heap| {
+    let maps = thread.heap().no_gc(|nogc| {
         let ValueRef::Object(a) = a.value_ref(nogc) else {
             panic!("expected object");
         };
@@ -114,10 +114,9 @@ fn error_properties_are_writable() {
         )
     });
 
-    let outcome = thread.heap().no_gc(|nogc, heap| {
+    let outcome = thread.heap().no_gc(|nogc| {
         obj.store_lookup(
             nogc,
-            heap,
             SlotName::from_value(name_key),
             custom,
             StoreSemantics::WriteThrough,
@@ -142,10 +141,9 @@ fn error_objects_are_extendable() {
 
     // store_lookup on a missing property must propose a transition
     // (proof of extendability), and completing it adds the own property
-    let outcome = thread.heap().no_gc(|nogc, heap| {
+    let outcome = thread.heap().no_gc(|nogc| {
         obj.store_lookup(
             nogc,
-            heap,
             SlotName::from_value(extra_key),
             extra_val,
             StoreSemantics::WriteThrough,
@@ -180,13 +178,13 @@ fn error_objects_are_extendable() {
 
 /// The object this object's map links to via its `prototype` slot.
 fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
-    thread.heap().no_gc(|nogc, heap| {
+    thread.heap().no_gc(|nogc| {
         let ValueRef::Object(o) = obj.value_ref(nogc) else {
             panic!("expected object");
         };
         let map = o.as_ref().header.map.heap_ref(nogc).as_ref();
         let proto = map.prototype.inner();
-        if proto == heap.known().null.value() {
+        if proto == nogc.known().null.value() {
             None
         } else {
             Some(proto)

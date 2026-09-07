@@ -4,7 +4,7 @@ use core::alloc::Layout;
 
 use crate::{
     AccessorPair, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef, Lookup, Map,
-    MapInit, NoGc, Object, SlotFlags, SlotKind, SlotName, Smi, Tagged, Value, ValueRef, VmError,
+    MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, ValueRef, VmError,
 };
 
 #[derive(Clone)]
@@ -47,17 +47,16 @@ impl Value {
     pub fn store_lookup<'a>(
         &self,
         nogc: &'a NoGc<'a>,
-        heap: &'a Heap,
         name: SlotName,
         value: Value,
         semantics: StoreSemantics,
     ) -> Result<StoreOutcome, VmError> {
         let receiver = *self;
         // null/undefined have no [[Prototype]]: property access throws
-        if receiver == heap.known().null.value() || receiver == heap.known().undefined.value() {
+        if receiver == nogc.known().null.value() || receiver == nogc.known().undefined.value() {
             return Err(VmError::Type);
         }
-        match receiver.lookup(nogc, heap, name) {
+        match receiver.lookup(nogc, name) {
             Lookup::Data {
                 slot,
                 holder,
@@ -79,7 +78,7 @@ impl Value {
                     }
                     return Ok(StoreOutcome::Transition { receiver, name });
                 }
-                slot.set(heap, host, Tagged::from_value(value));
+                slot.set(nogc.heap(), host, Tagged::from_value(value));
                 Ok(StoreOutcome::Done)
             }
             Lookup::NotFound => {
@@ -89,13 +88,11 @@ impl Value {
                 }
                 Ok(StoreOutcome::Transition { receiver, name })
             }
-            // const is never writable
-            Lookup::Const { .. } => Err(VmError::Type),
             Lookup::Accessor { pair, .. } => {
                 let setter = pair.set.inner();
                 // no setter (undefined sentinel): sloppy-mode writes to a
                 // setter-less accessor are silently ignored
-                if setter == heap.known().undefined.value() {
+                if setter == nogc.known().undefined.value() {
                     return Ok(StoreOutcome::Done);
                 }
                 Ok(StoreOutcome::CallSetter { setter })
@@ -114,30 +111,23 @@ fn transition_target(
     let lock = heap.transition_lock();
     let guard = lock.acquire();
 
-    let existing = heap.no_gc(|nogc, heap| {
-        parent(nogc)
-            .find_transition_locked(nogc, heap, name.into(), flags, &guard)
-            .map(|target| target.into_tagged())
-    });
-    if let Some(target) = existing {
-        return target;
-    }
-
-    let (descriptor_count, value_slot_count, kind, pairs_len, prototype) =
-        heap.no_gc(|nogc, heap| {
-            let parent = parent(nogc);
-            let pairs_len = parent
+    let (descriptor_count, value_slot_count, kind, pairs_len, prototype) = {
+        let nogc = heap.no_gc_guard();
+        let parent_ref = parent(&nogc);
+        if let Some(target) = parent_ref.find_transition_locked(&nogc, name.into(), flags, &guard) {
+            return target.into_tagged();
+        }
+        (
+            parent_ref.descriptor_count(),
+            parent_ref.value_slot_count(),
+            parent_ref.kind(),
+            parent_ref
                 .transitions
-                .heap_ref(nogc, heap)
-                .map_or(0, |a| a.len());
-            (
-                parent.descriptor_count(),
-                parent.value_slot_count(),
-                parent.kind(),
-                pairs_len,
-                parent.prototype.inner(),
-            )
-        });
+                .heap_ref(&nogc)
+                .map_or(0, |a| a.len()),
+            parent_ref.prototype.inner(),
+        )
+    };
     let prototype = scope
         .create_handle(Tagged::from_value(prototype))
         .expect("map prototype is a strong pointer");
@@ -149,7 +139,7 @@ fn transition_target(
         .expect("transition layout")
         .0;
 
-    heap.allocate_token_enter_nogc(total, |token, nogc, heap| {
+    heap.allocate_token_enter_nogc(total, |token, nogc| {
         let parent_ref = parent(nogc);
 
         let mut descriptors: Vec<(SlotName, SlotFlags, Value)> = parent_ref
@@ -170,7 +160,7 @@ fn transition_target(
         });
 
         let mut pairs: Vec<Value> = Vec::with_capacity(pairs_len + 2);
-        if let Some(old) = parent_ref.transitions.heap_ref(nogc, heap) {
+        if let Some(old) = parent_ref.transitions.heap_ref(nogc) {
             pairs.extend(old.as_slice().iter().map(|slot| slot.inner()));
         }
         pairs.push(name.value());
@@ -178,7 +168,7 @@ fn transition_target(
         let pairs = token.allocate::<FixedArray>(&pairs);
         parent_ref
             .transitions
-            .set(heap, parent_ref.erase(), pairs.into_tagged());
+            .set(nogc.heap(), parent_ref.erase(), pairs.into_tagged());
 
         child.into_tagged()
     })
@@ -212,34 +202,23 @@ fn redefine_target(
     let lock = heap.transition_lock();
     let guard = lock.acquire();
 
-    let existing = heap.no_gc(|nogc, heap| {
-        receiver
-            .heap_ref(nogc)
-            .header
-            .map
-            .heap_ref(nogc)
-            .find_transition_locked(nogc, heap, name.into(), new_flags, &guard)
-            .map(|target| target.into_tagged())
-    });
-    if existing.is_some() {
-        return;
-    }
-
-    let (kind, descriptor_count, value_slot_count, pairs_len, prototype) =
-        heap.no_gc(|nogc, heap| {
-            let parent = receiver.heap_ref(nogc).header.map.heap_ref(nogc);
-            let pairs_len = parent
-                .transitions
-                .heap_ref(nogc, heap)
-                .map_or(0, |a| a.len());
-            (
-                parent.kind(),
-                parent.descriptor_count(),
-                parent.value_slot_count(),
-                pairs_len,
-                parent.prototype.inner(),
-            )
-        });
+    let (kind, descriptor_count, value_slot_count, pairs_len, prototype) = {
+        let nogc = heap.no_gc_guard();
+        let parent = receiver.heap_ref(&nogc).map_ref(&nogc);
+        if parent
+            .find_transition_locked(&nogc, name.into(), new_flags, &guard)
+            .is_some()
+        {
+            return;
+        }
+        (
+            parent.kind(),
+            parent.descriptor_count(),
+            parent.value_slot_count(),
+            parent.transitions.heap_ref(&nogc).map_or(0, |a| a.len()),
+            parent.prototype.inner(),
+        )
+    };
     let prototype = scope
         .create_handle(Tagged::from_value(prototype))
         .expect("map prototype is a strong pointer");
@@ -251,8 +230,8 @@ fn redefine_target(
         .expect("redefine transition layout")
         .0;
 
-    heap.allocate_token_enter_nogc(total, |token, nogc, heap| {
-        let parent_ref = receiver.heap_ref(nogc).header.map.heap_ref(nogc);
+    heap.allocate_token_enter_nogc(total, |token, nogc| {
+        let parent_ref = receiver.heap_ref(nogc).map_ref(nogc);
 
         let mut descriptors: Vec<(SlotName, SlotFlags, Value)> = parent_ref
             .descriptors()
@@ -277,7 +256,7 @@ fn redefine_target(
         });
 
         let mut pairs: Vec<Value> = Vec::with_capacity(pairs_len + 2);
-        if let Some(old) = parent_ref.transitions.heap_ref(nogc, heap) {
+        if let Some(old) = parent_ref.transitions.heap_ref(nogc) {
             pairs.extend(old.as_slice().iter().map(|slot| slot.inner()));
         }
         pairs.push(name.value());
@@ -285,7 +264,7 @@ fn redefine_target(
         let pairs = token.allocate::<FixedArray>(&pairs);
         parent_ref
             .transitions
-            .set(heap, parent_ref.erase(), pairs.into_tagged());
+            .set(nogc.heap(), parent_ref.erase(), pairs.into_tagged());
     });
 }
 
@@ -391,28 +370,20 @@ impl Object {
         name: Handle<SlotName>,
         desc: PropertyDescriptor,
     ) -> Result<bool, VmError> {
-        debug_assert!(
-            heap.no_gc(|nogc, _| !receiver
-                .heap_ref(nogc)
-                .header
-                .map
-                .heap_ref(nogc)
-                .descriptors()
-                .iter()
-                .any(|d| d.name() == name.into())),
-            "add_own_property requires the name to be absent from the receiver's own map"
-        );
-        let extensible = heap.no_gc(|nogc, _| {
-            receiver
-                .heap_ref(nogc)
-                .header
-                .map
-                .heap_ref(nogc)
-                .kind()
-                .is_extendable()
-        });
-        if !extensible {
-            return Ok(false);
+        {
+            let nogc = heap.no_gc_guard();
+            debug_assert!(
+                !receiver
+                    .heap_ref(&nogc)
+                    .map_ref(&nogc)
+                    .descriptors()
+                    .iter()
+                    .any(|d| d.name() == name.into()),
+                "add_own_property requires the name to be absent from the receiver's own map"
+            );
+            if !receiver.heap_ref(&nogc).is_extendable(&nogc) {
+                return Ok(false);
+            }
         }
         define_absent(heap, scope, receiver, name, desc)?;
         Ok(true)
@@ -430,29 +401,27 @@ impl Object {
         name: Handle<SlotName>,
         desc: PropertyDescriptor,
     ) -> Result<bool, VmError> {
-        let current = heap.no_gc(|nogc, _| {
-            let map = receiver.heap_ref(nogc).header.map.heap_ref(nogc);
-            map.descriptors()
-                .iter()
-                .enumerate()
-                .find(|(_, d)| d.name() == name.into())
-                .map(|(index, d)| (index, d.flags(), d.value.inner()))
-        });
+        let nogc = heap.no_gc_guard();
+        let current = receiver
+            .heap_ref(&nogc)
+            .map_ref(&nogc)
+            .descriptors()
+            .iter()
+            .enumerate()
+            .find(|(_, d)| d.name() == name.into())
+            .map(|(index, d)| (index, d.flags(), d.value.inner()));
         let Some((index, cur_flags, cur_desc_value)) = current else {
             return Self::add_own_property(heap, scope, receiver, name, desc);
         };
 
         // 3. ValidateAndApplyPropertyDescriptor
-        let action = heap.no_gc(|nogc, heap| {
-            validate_define(
-                nogc,
-                heap,
-                receiver.heap_ref(nogc),
-                cur_flags,
-                cur_desc_value,
-                desc,
-            )
-        });
+        let action = validate_define(
+            &nogc,
+            receiver.heap_ref(&nogc),
+            cur_flags,
+            cur_desc_value,
+            desc,
+        );
         match action {
             Some(DefineAction::Nothing) => Ok(true),
             Some(action) => {
@@ -469,128 +438,107 @@ impl Object {
 /// the change is forbidden.
 fn validate_define<'a>(
     nogc: &'a NoGc<'a>,
-    heap: &Heap,
     receiver: HeapRef<'a, Object>,
     cur_flags: SlotFlags,
     cur_desc_value: Value,
     desc: PropertyDescriptor,
 ) -> Option<DefineAction> {
-    let cur_kind = cur_flags.kind();
     let cur_configurable = cur_flags.is_configurable();
-    let cur_enumerable = cur_flags.is_enumerable();
-    let known = heap.known();
 
-    // The current value: from the object's slot (Value kind) or the
-    // descriptor itself (Const).
-    let current_value = |nogc: &'a NoGc<'a>, offset: Value| -> Value {
-        if cur_kind == SlotKind::Value {
-            let offset = Smi::decode(offset).unwrap().value() as usize;
-            receiver
-                .as_ref()
-                .slots
-                .heap_ref(nogc)
-                .element_slot(offset)
-                .inner()
-        } else {
-            offset
-        }
-    };
-
-    match (cur_kind, desc) {
-        // both data: attributes may change only within the non-configurable
-        // constraints; the value is writable or must be SameValue
-        (
-            SlotKind::Value | SlotKind::Const,
-            PropertyDescriptor::Data {
-                value,
-                writable,
-                enumerable,
-                configurable,
-            },
-        ) => {
-            let cur_writable = cur_flags.is_writable();
-            if !cur_configurable {
-                if configurable || enumerable != cur_enumerable {
-                    return None;
-                }
-                if !cur_writable {
-                    if writable {
-                        return None;
-                    }
-                    if !Compare::same_value(nogc, heap, value, current_value(nogc, cur_desc_value))
-                    {
-                        return None;
-                    }
-                    return Some(DefineAction::Nothing);
-                }
-            }
-            if desc.flags() == cur_flags {
-                // plain value update: no shape change
-                return Some(DefineAction::WriteDataSlot { value });
-            }
-            Some(DefineAction::RedefineData {
-                value,
-                flags: desc.flags(),
-                // Const descriptors carry their value in the descriptor and
-                // have no slot to reuse
-                reuse_slot: cur_kind == SlotKind::Value,
-            })
-        }
-        // data → accessor: only configurable properties can convert
-        (SlotKind::Value | SlotKind::Const, PropertyDescriptor::Accessor { get, set, .. }) => {
-            if !cur_configurable {
-                return None;
-            }
-            Some(DefineAction::RedefineAccessor {
-                get,
-                set,
-                flags: desc.flags(),
-            })
-        }
-        // accessor → accessor: pair replacement (configurable) or exact
-        // identity (non-configurable)
-        (
-            SlotKind::Accessor,
-            PropertyDescriptor::Accessor {
-                get,
-                set,
-                enumerable,
-                configurable,
-            },
-        ) => {
-            if !cur_configurable {
-                if configurable || enumerable != cur_enumerable {
-                    return None;
-                }
-                let cur_pair = cur_desc_value
-                    .get_as::<AccessorPair>(nogc, known.accessor_pair_map)
-                    .expect("accessor descriptor must hold a pair");
-                if !Compare::same_value(nogc, heap, get, cur_pair.get.inner())
-                    || !Compare::same_value(nogc, heap, set, cur_pair.set.inner())
-                {
-                    return None;
-                }
-                return Some(DefineAction::Nothing);
-            }
-            Some(DefineAction::RedefineAccessor {
-                get,
-                set,
-                flags: desc.flags(),
-            })
-        }
+    if cur_flags.is_accessor() {
         // accessor → data: only configurable properties can convert; the
         // new value gets a fresh slot
-        (SlotKind::Accessor, PropertyDescriptor::Data { value, .. }) => {
+        if let PropertyDescriptor::Data { value, .. } = desc {
             if !cur_configurable {
                 return None;
             }
-            Some(DefineAction::RedefineData {
+            return Some(DefineAction::RedefineData {
                 value,
                 flags: desc.flags(),
                 reuse_slot: false,
-            })
+            });
+        }
+        // accessor → accessor: pair replacement when configurable; a
+        // non-configurable pair must match exactly (then it's a no-op)
+        let PropertyDescriptor::Accessor {
+            get,
+            set,
+            enumerable,
+            configurable,
+        } = desc
+        else {
+            unreachable!("descriptor kind checked above")
+        };
+        if cur_configurable {
+            return Some(DefineAction::RedefineAccessor {
+                get,
+                set,
+                flags: desc.flags(),
+            });
+        }
+        if configurable || enumerable != cur_flags.is_enumerable() {
+            return None;
+        }
+        let cur_pair = cur_desc_value
+            .get_as::<AccessorPair>(nogc, nogc.known().accessor_pair_map)
+            .expect("accessor descriptor must hold a pair");
+        if !Compare::same_value(nogc, get, cur_pair.get.inner())
+            || !Compare::same_value(nogc, set, cur_pair.set.inner())
+        {
+            return None;
+        }
+        return Some(DefineAction::Nothing);
+    }
+
+    // data → accessor: only configurable properties can convert
+    if let PropertyDescriptor::Accessor { get, set, .. } = desc {
+        if !cur_configurable {
+            return None;
+        }
+        return Some(DefineAction::RedefineAccessor {
+            get,
+            set,
+            flags: desc.flags(),
+        });
+    }
+
+    // both data: attributes may change only within the non-configurable
+    // constraints; the value is writable or must be SameValue
+    let PropertyDescriptor::Data {
+        value,
+        writable,
+        enumerable,
+        configurable,
+    } = desc
+    else {
+        unreachable!("descriptor kind checked above")
+    };
+    if !cur_configurable {
+        if configurable || enumerable != cur_flags.is_enumerable() {
+            return None;
+        }
+        if !cur_flags.is_writable() {
+            if writable {
+                return None;
+            }
+            // the descriptor holds the Smi slot offset; read the current
+            // value from the object's slot
+            let offset = Smi::decode(cur_desc_value).unwrap().value() as usize;
+            if !Compare::same_value(nogc, value, receiver.slot(nogc, offset).inner()) {
+                return None;
+            }
+            return Some(DefineAction::Nothing);
         }
     }
+    if desc.flags() == cur_flags {
+        // plain value update: no shape change
+        return Some(DefineAction::WriteDataSlot { value });
+    }
+    Some(DefineAction::RedefineData {
+        value,
+        flags: desc.flags(),
+        reuse_slot: true,
+    })
 }
 
 /// Absent property on an extensible receiver: transition to a new map and
@@ -609,15 +557,10 @@ fn define_absent(
             let value = scope
                 .create_handle(Tagged::from_value(value))
                 .expect("value must be strong");
-            let slot_count = heap.no_gc(|nogc, _| {
-                receiver
-                    .heap_ref(nogc)
-                    .header
-                    .map
-                    .heap_ref(nogc)
-                    .value_slot_count()
-                    + 1
-            });
+            let slot_count = {
+                let nogc = heap.no_gc_guard();
+                receiver.heap_ref(&nogc).map_ref(&nogc).value_slot_count() + 1
+            };
             transition_target(
                 heap,
                 scope,
@@ -625,36 +568,33 @@ fn define_absent(
                 name,
                 flags,
             );
-            heap.allocate_token_enter_nogc(
-                FixedArray::layout_for(slot_count),
-                |token, nogc, heap| {
-                    let receiver_ref = receiver.heap_ref(nogc);
-                    let target = receiver_ref
-                        .header
-                        .map
-                        .heap_ref(nogc)
-                        .find_transition(nogc, heap, name.into(), flags)
-                        .expect("transition recorded above");
-                    let mut values: Vec<Value> = Vec::with_capacity(slot_count);
-                    values.extend(
-                        receiver_ref
-                            .slots
-                            .heap_ref(nogc)
-                            .as_slice()
-                            .iter()
-                            .map(|slot| slot.inner()),
-                    );
-                    values.push(value.value());
-                    debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
-                    let slots = token.allocate::<FixedArray>(&values);
-                    let host = receiver.value();
-                    receiver_ref.slots.set(heap, host, slots.into_tagged());
+            heap.allocate_token_enter_nogc(FixedArray::layout_for(slot_count), |token, nogc| {
+                let receiver_ref = receiver.heap_ref(nogc);
+                let target = receiver_ref
+                    .map_ref(nogc)
+                    .find_transition(nogc, name.into(), flags)
+                    .expect("transition recorded above");
+                let mut values: Vec<Value> = Vec::with_capacity(slot_count);
+                values.extend(
                     receiver_ref
-                        .header
-                        .map
-                        .set(heap, host, target.into_tagged());
-                },
-            );
+                        .slots
+                        .heap_ref(nogc)
+                        .as_slice()
+                        .iter()
+                        .map(|slot| slot.inner()),
+                );
+                values.push(value.value());
+                debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
+                let slots = token.allocate::<FixedArray>(&values);
+                let host = receiver.value();
+                receiver_ref
+                    .slots
+                    .set(nogc.heap(), host, slots.into_tagged());
+                receiver_ref
+                    .header
+                    .map
+                    .set(nogc.heap(), host, target.into_tagged());
+            });
             Ok(())
         }
         PropertyDescriptor::Accessor { get, set, .. } => {
@@ -665,15 +605,16 @@ fn define_absent(
             let set = scope
                 .create_handle(Tagged::from_value(set))
                 .expect("set must be strong");
-            let (kind, descriptor_count, value_slot_count, prototype) = heap.no_gc(|nogc, _| {
-                let map = receiver.heap_ref(nogc).header.map.heap_ref(nogc);
+            let (kind, descriptor_count, value_slot_count, prototype) = {
+                let nogc = heap.no_gc_guard();
+                let map = receiver.heap_ref(&nogc).map_ref(&nogc);
                 (
                     map.kind(),
                     map.descriptor_count(),
                     map.value_slot_count(),
                     map.prototype.inner(),
                 )
-            });
+            };
             let prototype = scope
                 .create_handle(Tagged::from_value(prototype))
                 .expect("map prototype is a strong pointer");
@@ -681,13 +622,11 @@ fn define_absent(
                 .extend(Map::layout_for(descriptor_count + 1))
                 .expect("accessor layout")
                 .0;
-            heap.allocate_token_enter_nogc(layout, |token, nogc, heap| {
+            heap.allocate_token_enter_nogc(layout, |token, nogc| {
                 let pair = token.allocate::<AccessorPair>((get.value(), set.value()));
                 let receiver_ref = receiver.heap_ref(nogc);
                 let mut descriptors: Vec<(SlotName, SlotFlags, Value)> = receiver_ref
-                    .header
-                    .map
-                    .heap_ref(nogc)
+                    .map_ref(nogc)
                     .descriptors()
                     .iter()
                     .map(|d| (d.name(), d.flags(), d.value.inner()))
@@ -700,7 +639,10 @@ fn define_absent(
                     prototype,
                 });
                 let host = receiver.value();
-                receiver_ref.header.map.set(heap, host, map.into_tagged());
+                receiver_ref
+                    .header
+                    .map
+                    .set(nogc.heap(), host, map.into_tagged());
             });
             Ok(())
         }
@@ -722,29 +664,26 @@ fn apply_define(
 ) -> Result<(), VmError> {
     // the in-place data write needs no map change
     if let DefineAction::WriteDataSlot { value } = action {
-        heap.no_gc(|nogc, heap| {
-            let receiver_ref = receiver.heap_ref(nogc);
-            let map = receiver_ref.header.map.heap_ref(nogc);
-            let descriptor = &map.descriptors()[index];
-            let offset = Smi::decode(descriptor.value.inner()).unwrap().value() as usize;
-            receiver_ref.slots.heap_ref(nogc).element_slot(offset).set(
-                heap,
-                receiver.value(),
-                Tagged::from_value(value),
-            );
-        });
+        let nogc = heap.no_gc_guard();
+        let offset = receiver.heap_ref(&nogc).map_ref(&nogc).descriptors()[index].offset();
+        receiver.heap_ref(&nogc).slot(&nogc, offset).set(
+            nogc.heap(),
+            receiver.value(),
+            Tagged::from_value(value),
+        );
         return Ok(());
     }
 
-    let (kind, descriptor_count, value_slot_count, prototype) = heap.no_gc(|nogc, _| {
-        let map = receiver.heap_ref(nogc).header.map.heap_ref(nogc);
+    let (kind, descriptor_count, value_slot_count, prototype) = {
+        let nogc = heap.no_gc_guard();
+        let map = receiver.heap_ref(&nogc).map_ref(&nogc);
         (
             map.kind(),
             map.descriptor_count(),
             map.value_slot_count(),
             map.prototype.inner(),
         )
-    });
+    };
     let prototype = scope
         .create_handle(Tagged::from_value(prototype))
         .expect("map prototype is a strong pointer");
@@ -765,40 +704,33 @@ fn apply_define(
             redefine_target(heap, scope, receiver, name, index, flags, !reuse_slot);
             if reuse_slot {
                 // attributes-only: swap the map, keep the slot offset
-                heap.no_gc(|nogc, heap| {
-                    let receiver_ref = receiver.heap_ref(nogc);
-                    let target = receiver_ref
-                        .header
-                        .map
-                        .heap_ref(nogc)
-                        .find_transition(nogc, heap, name.into(), flags)
-                        .expect("transition recorded above");
-                    let offset = Smi::decode(target.descriptors()[index].value.inner())
-                        .unwrap()
-                        .value() as usize;
-                    let host = receiver.value();
-                    receiver_ref.slots.heap_ref(nogc).element_slot(offset).set(
-                        heap,
-                        host,
-                        Tagged::from_value(value.value()),
-                    );
-                    receiver_ref
-                        .header
-                        .map
-                        .set(heap, host, target.into_tagged());
-                });
+                let nogc = heap.no_gc_guard();
+                let receiver_ref = receiver.heap_ref(&nogc);
+                let target = receiver_ref
+                    .map_ref(&nogc)
+                    .find_transition(&nogc, name.into(), flags)
+                    .expect("transition recorded above");
+                let offset = target.descriptors()[index].offset();
+                let host = receiver.value();
+                receiver_ref.slot(&nogc, offset).set(
+                    nogc.heap(),
+                    host,
+                    Tagged::from_value(value.value()),
+                );
+                receiver_ref
+                    .header
+                    .map
+                    .set(nogc.heap(), host, target.into_tagged());
             } else {
                 // accessor → data: the target map appends a fresh slot
                 let slot_count = value_slot_count + 1;
                 heap.allocate_token_enter_nogc(
                     FixedArray::layout_for(slot_count),
-                    |token, nogc, heap| {
+                    |token, nogc| {
                         let receiver_ref = receiver.heap_ref(nogc);
                         let target = receiver_ref
-                            .header
-                            .map
-                            .heap_ref(nogc)
-                            .find_transition(nogc, heap, name.into(), flags)
+                            .map_ref(nogc)
+                            .find_transition(nogc, name.into(), flags)
                             .expect("transition recorded above")
                             .into_tagged();
                         let mut values: Vec<Value> = Vec::with_capacity(slot_count);
@@ -814,8 +746,10 @@ fn apply_define(
                         debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
                         let slots = token.allocate::<FixedArray>(&values);
                         let host = receiver.value();
-                        receiver_ref.slots.set(heap, host, slots.into_tagged());
-                        receiver_ref.header.map.set(heap, host, target);
+                        receiver_ref
+                            .slots
+                            .set(nogc.heap(), host, slots.into_tagged());
+                        receiver_ref.header.map.set(nogc.heap(), host, target);
                     },
                 );
             }
@@ -834,9 +768,9 @@ fn apply_define(
                 .extend(Layout::new::<AccessorPair>())
                 .expect("redefine layout")
                 .0;
-            heap.allocate_token_enter_nogc(layout, |token, nogc, heap| {
+            heap.allocate_token_enter_nogc(layout, |token, nogc| {
                 let receiver_ref = receiver.heap_ref(nogc);
-                let map = receiver_ref.header.map.heap_ref(nogc);
+                let map = receiver_ref.map_ref(nogc);
                 let mut descriptors: Vec<(SlotName, SlotFlags, Value)> = map
                     .descriptors()
                     .iter()
@@ -854,7 +788,7 @@ fn apply_define(
                 receiver_ref
                     .header
                     .map
-                    .set(heap, host, new_map.into_tagged());
+                    .set(nogc.heap(), host, new_map.into_tagged());
             });
         }
         DefineAction::WriteDataSlot { .. } => unreachable!("handled above"),
@@ -921,59 +855,58 @@ pub fn set_prototype(
         return Ok(());
     }
 
-    let (extendable, unchanged) = heap.no_gc(|nogc, _heap| {
-        let map = receiver_handle.heap_ref(nogc).header.map.heap_ref(nogc);
-        (map.kind().is_extendable(), map.prototype.inner() == proto)
-    });
-    if unchanged {
-        return Ok(());
-    }
-    if !extendable {
-        return Err(VmError::NotExtensible);
+    {
+        let nogc = heap.no_gc_guard();
+        let map = receiver_handle.heap_ref(&nogc).map_ref(&nogc);
+        if map.prototype.inner() == proto {
+            return Ok(());
+        }
+        if !map.kind().is_extendable() {
+            return Err(VmError::NotExtensible);
+        }
     }
 
     // cycle check: the receiver must not appear in any proposed chain
     // (FixedArray prototypes contribute one chain per element)
-    heap.no_gc(|nogc, heap| {
+    {
+        let nogc = heap.no_gc_guard();
         let walk = |p: Value| -> Result<(), VmError> {
             let mut p = p;
-            while p.is_strong_ptr() && p != heap.known().null.value() {
+            while p.is_strong_ptr() && p != nogc.known().null.value() {
                 if p == receiver {
                     return Err(VmError::Type);
                 }
-                let ValueRef::Object(o) = p.value_ref(nogc) else {
+                let ValueRef::Object(o) = p.value_ref(&nogc) else {
                     break;
                 };
-                p = o.as_ref().header.map.heap_ref(nogc).prototype.inner();
+                p = o.as_ref().map_ref(&nogc).prototype.inner();
             }
             Ok(())
         };
-        if let Some(parents) = proto.get_as::<FixedArray>(nogc, heap.known().array_map) {
+        if let Some(parents) = proto.get_as::<FixedArray>(&nogc, nogc.known().array_map) {
             for i in 0..parents.len() {
                 walk(parents.at(i))?;
             }
         } else {
             walk(proto)?;
         }
-        Ok(())
-    })?;
+    }
 
     let proto_handle = scope
         .create_handle(Tagged::from_value(proto))
         .expect("prototype must be a strong pointer");
 
-    let descriptor_count = heap.no_gc(|nogc, _| {
+    let descriptor_count = {
+        let nogc = heap.no_gc_guard();
         receiver_handle
-            .heap_ref(nogc)
-            .header
-            .map
-            .heap_ref(nogc)
+            .heap_ref(&nogc)
+            .map_ref(&nogc)
             .descriptor_count()
-    });
+    };
 
-    heap.allocate_token_enter_nogc(Map::layout_for(descriptor_count), |token, nogc, heap| {
+    heap.allocate_token_enter_nogc(Map::layout_for(descriptor_count), |token, nogc| {
         let obj = receiver_handle.heap_ref(nogc);
-        let map = obj.header.map.heap_ref(nogc);
+        let map = obj.map_ref(nogc);
         let kind = map.kind();
         let value_slot_count = map.value_slot_count();
         let descriptors: Vec<(SlotName, SlotFlags, Value)> = map
@@ -990,7 +923,7 @@ pub fn set_prototype(
         // the raw `receiver` param may be stale after the token entry
         // allocated: re-read through the handle for the write barrier
         let host = receiver_handle.value();
-        obj.header.map.set(heap, host, new_map.into_tagged());
+        obj.header.map.set(nogc.heap(), host, new_map.into_tagged());
         Ok(())
     })
 }
