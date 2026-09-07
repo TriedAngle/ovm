@@ -103,24 +103,22 @@ impl Map {
     pub fn find_transition<'a>(
         &self,
         nogc: &'a NoGc<'a>,
-        heap: &Heap,
         name: SlotName,
         flags: SlotFlags,
     ) -> Option<HeapRef<'a, Map>> {
-        let lock = heap.transition_lock();
+        let lock = nogc.transition_lock();
         let guard = lock.acquire();
-        self.find_transition_locked(nogc, heap, name, flags, &guard)
+        self.find_transition_locked(nogc, name, flags, &guard)
     }
 
     pub fn find_transition_locked<'a>(
         &self,
         nogc: &'a NoGc<'a>,
-        heap: &Heap,
         name: SlotName,
         flags: SlotFlags,
         _guard: &TransitionGuard<'_>,
     ) -> Option<HeapRef<'a, Map>> {
-        let array = self.transitions.heap_ref(nogc, heap)?;
+        let array = self.transitions.heap_ref(nogc)?;
         let pairs = array.as_slice();
         debug_assert!(
             pairs.len() % 2 == 0,
@@ -133,7 +131,7 @@ impl Map {
 
             let target = pair[1]
                 .inner()
-                .get_as::<Map>(nogc, heap.known().map_map)
+                .get_as::<Map>(nogc, nogc.known().map_map)
                 .expect("transition target must be a map");
 
             // adds append the property (last descriptor), redefines keep
@@ -335,29 +333,20 @@ impl MapKind {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum SlotKind {
-    Value,
-    Const,
-    Accessor,
-}
-
+/// Descriptor flags. Data values live in the object's slots (the descriptor
+/// holds a Smi offset); accessors embed the `AccessorPair` in the descriptor.
+/// Writability is the WRITABLE attribute bit — there is no separate const kind.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct SlotFlags(u64);
 
 impl SlotFlags {
-    const KIND_MASK: u64 = 0b11;
-    const KIND_VALUE: u64 = 0b00;
-    const KIND_CONST: u64 = 0b01;
-    const KIND_ACCESSOR: u64 = 0b10;
+    pub const ACCESSOR: SlotFlags = SlotFlags(1 << 0);
+    pub const WRITABLE: SlotFlags = SlotFlags(1 << 1);
+    pub const CONFIGURABLE: SlotFlags = SlotFlags(1 << 2);
+    pub const ENUMERABLE: SlotFlags = SlotFlags(1 << 3);
 
-    pub const WRITABLE: SlotFlags = SlotFlags(1 << 3);
-    pub const CONFIGURABLE: SlotFlags = SlotFlags(1 << 4);
-    pub const ENUMERABLE: SlotFlags = SlotFlags(1 << 5);
-
-    pub const VALUE: SlotFlags = SlotFlags(Self::KIND_VALUE);
-    pub const CONST: SlotFlags = SlotFlags(Self::KIND_CONST);
-    pub const ACCESSOR: SlotFlags = SlotFlags(Self::KIND_ACCESSOR);
+    /// The plain data slot: no flags set.
+    pub const VALUE: SlotFlags = SlotFlags(0);
 
     pub const fn new(bits: u64) -> Self {
         Self(bits)
@@ -371,13 +360,8 @@ impl SlotFlags {
         Self(self.0 | other.0)
     }
 
-    pub const fn kind(self) -> SlotKind {
-        match self.0 & Self::KIND_MASK {
-            Self::KIND_VALUE => SlotKind::Value,
-            Self::KIND_CONST => SlotKind::Const,
-            Self::KIND_ACCESSOR => SlotKind::Accessor,
-            _ => panic!("invalid slot kind"),
-        }
+    pub const fn is_accessor(self) -> bool {
+        self.0 & Self::ACCESSOR.0 != 0
     }
 
     pub const fn is_writable(self) -> bool {
@@ -432,27 +416,22 @@ impl Object {
     pub fn callable_info<'a>(
         &'a self,
         guard: &'a NoGc<'a>,
-        heap: &Heap,
     ) -> Option<HeapRef<'a, CallableInfoObject>> {
         if !self.header.map.heap_ref(guard).kind().is_callable() {
             return None;
         }
         let info = self.slots.heap_ref(guard).at(0);
-        info.get_as(guard, heap.known().callable_map)
+        info.get_as(guard, guard.known().callable_map)
     }
 
-    pub fn closure_context<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-        heap: &'a Heap,
-    ) -> Option<HeapRef<'a, Context>> {
+    pub fn closure_context<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<HeapRef<'a, Context>> {
         if !self.header.map.heap_ref(guard).kind().is_callable() {
             return None;
         }
         self.slots
             .heap_ref(guard)
             .at(1)
-            .get_as(guard, heap.known().context_map)
+            .get_as(guard, guard.known().context_map)
     }
 
     pub fn native_index<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<usize> {
@@ -467,18 +446,29 @@ impl Object {
         self.header.map.heap_ref(nogc).kind().kind() == ObjectKind::Array
     }
 
+    /// The object's map (shape).
+    pub fn map_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, Map> {
+        self.header.map.heap_ref(nogc)
+    }
+
+    /// Whether the object's map allows adding new properties.
+    pub fn is_extendable<'a>(&self, nogc: &'a NoGc<'a>) -> bool {
+        self.map_ref(nogc).kind().is_extendable()
+    }
+
+    /// The slot holding the value of the data slot at `offset`.
+    pub fn slot<'a>(&self, nogc: &'a NoGc<'a>, offset: usize) -> &'a GcSlot {
+        self.slots.heap_ref(nogc).as_ref().element_slot(offset)
+    }
+
     pub fn length(&self) -> usize {
         self.length.to_smi().value() as usize
     }
 
-    pub fn elements_array<'a>(
-        &'a self,
-        nogc: &'a NoGc<'a>,
-        heap: &'a Heap,
-    ) -> Option<HeapRef<'a, FixedArray>> {
+    pub fn elements_array<'a>(&'a self, nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, FixedArray>> {
         self.elements
             .inner()
-            .get_as::<FixedArray>(nogc, heap.known().array_map)
+            .get_as::<FixedArray>(nogc, nogc.known().array_map)
     }
 }
 
@@ -488,7 +478,7 @@ pub enum CallTarget {
     Native(usize),
 }
 
-pub fn call_target<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, f: Value) -> Option<CallTarget> {
+pub fn call_target<'a>(nogc: &'a NoGc<'a>, f: Value) -> Option<CallTarget> {
     let ValueRef::Object(obj) = f.value_ref(nogc) else {
         return None;
     };
@@ -499,7 +489,7 @@ pub fn call_target<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, f: Value) -> Option<C
     if kind.is_native() {
         return Some(CallTarget::Native(obj.as_ref().native_index(nogc)?));
     }
-    let info = obj.as_ref().callable_info(nogc, heap)?;
+    let info = obj.as_ref().callable_info(nogc)?;
     let register_count = info.register_count.to_smi().value() as usize;
     Some(CallTarget::Bytecode(obj.into_tagged(), register_count))
 }
@@ -518,7 +508,7 @@ pub fn store_array_element(
         .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
         .expect("receiver must be strong");
 
-    let grows = heap.no_gc(|nogc, _heap| {
+    let grows = heap.no_gc(|nogc| {
         let obj = receiver.heap_ref(nogc);
         if !obj.as_ref().is_array(nogc) {
             return Err(VmError::Type);
@@ -527,37 +517,35 @@ pub fn store_array_element(
     })?;
 
     if grows {
-        let mut values = heap.no_gc(|nogc, heap| {
+        let mut values = heap.no_gc(|nogc| {
             let obj = receiver.heap_ref(nogc);
-            let elements = obj
-                .as_ref()
-                .elements_array(nogc, heap)
-                .ok_or(VmError::Type)?;
+            let elements = obj.as_ref().elements_array(nogc).ok_or(VmError::Type)?;
             // values beyond `length` are logically truncated
             let keep = obj.as_ref().length().min(elements.len());
             let mut values = Vec::with_capacity(new_len);
             for k in 0..keep {
                 values.push(elements.at(k));
             }
-            values.resize(new_len, heap.known().void.value());
+            values.resize(new_len, nogc.known().void.value());
             Ok::<_, VmError>(values)
         })?;
         values[i] = value;
         let elements = heap.allocate_handle::<FixedArray>(&values, scope);
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = receiver.heap_ref(nogc);
-            obj.elements
-                .set(heap, obj.erase(), elements.as_tagged().erase_tagged());
-            obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
+            obj.elements.set(
+                nogc.heap(),
+                obj.erase(),
+                elements.as_tagged().erase_tagged(),
+            );
+            obj.length
+                .set(nogc.heap(), obj.erase(), Smi::new(new_len as i64));
         });
     } else {
-        heap.no_gc(|nogc, heap| {
+        heap.no_gc(|nogc| {
             let obj = receiver.heap_ref(nogc);
-            let elements = obj
-                .as_ref()
-                .elements_array(nogc, heap)
-                .ok_or(VmError::Type)?;
-            elements.set(heap, i, value);
+            let elements = obj.as_ref().elements_array(nogc).ok_or(VmError::Type)?;
+            elements.set(nogc.heap(), i, value);
             Ok::<_, VmError>(())
         })?;
     }
@@ -799,8 +787,8 @@ impl VMString {
         a: Value,
         b: Value,
     ) -> Handle<'s, VMString> {
-        let bytes = heap.no_gc(|nogc, heap| {
-            let known = heap.known();
+        let bytes = heap.no_gc(|nogc| {
+            let known = nogc.known();
             let sa = a
                 .get_as::<VMString>(nogc, known.string_map)
                 .expect("concat operand must be a string");
@@ -1123,15 +1111,10 @@ impl EdgeVisitable for CallableInfoObject {
 impl CallableInfoObject {
     /// Decode a constant-pool property name.
     // TODO: this must handle also non constants and non interned strings and symbols
-    pub fn constant_slot_name<'a>(
-        &self,
-        nogc: &'a NoGc<'a>,
-        heap: &'a Heap,
-        idx: usize,
-    ) -> SlotName {
+    pub fn constant_slot_name<'a>(&self, nogc: &'a NoGc<'a>, idx: usize) -> SlotName {
         let v = self.constants.heap_ref(nogc).at(idx);
         let name = v
-            .get_as::<InternedString>(nogc, heap.known().string_map)
+            .get_as::<InternedString>(nogc, nogc.known().string_map)
             .expect("property name constant must be an interned string");
         SlotName::from(name.into_tagged())
     }

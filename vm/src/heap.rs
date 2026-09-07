@@ -243,12 +243,12 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             prototype: roots.create_handle(Tagged::from_value(Smi::new(0).encode())),
         })
         .into_global(roots);
-    heap.no_gc(|nogc, heap| {
+    heap.no_gc(|nogc| {
         map_map
             .heap_ref(nogc)
             .header
             .map
-            .set(heap, map_map.value(), map_map.as_tagged());
+            .set(nogc.heap(), map_map.value(), map_map.as_tagged());
     });
     known.map_map = map_map;
     heap.set_known(known);
@@ -294,17 +294,17 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         })
         .into_global(roots);
 
-    heap.no_gc(|nogc, heap| {
+    heap.no_gc(|nogc| {
         map_map.heap_ref(nogc).transitions.clear(void.value());
         void_map.heap_ref(nogc).transitions.clear(void.value());
         null_map.heap_ref(nogc).transitions.clear(void.value());
         void_map.heap_ref(nogc).prototype.set(
-            heap,
+            nogc.heap(),
             void_map.value(),
             Tagged::from_value(null.value()),
         );
         null_map.heap_ref(nogc).prototype.set(
-            heap,
+            nogc.heap(),
             null_map.value(),
             Tagged::from_value(null.value()),
         );
@@ -541,31 +541,48 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     heap.set_known(known);
 
     let null = known.null;
-    heap.no_gc(|nogc, heap| {
+    heap.no_gc(|nogc| {
         let empty = known.empty_fixed_array.as_tagged();
         let o = null.heap_ref(nogc);
-        o.slots.set(heap, null.value(), empty);
+        o.slots.set(nogc.heap(), null.value(), empty);
         o.elements
-            .set(heap, null.value(), Tagged::from_value(empty.erase()));
+            .set(nogc.heap(), null.value(), Tagged::from_value(empty.erase()));
         // ordinary function objects' [[Prototype]] is %Function.prototype%
         // (ES 19.2.3.1): function_map was created with a null placeholder
         // in bootstrap_basics
         known.function_map.heap_ref(nogc).prototype.set(
-            heap,
+            nogc.heap(),
             known.function_map.value(),
             Tagged::from_value(function_prototype.value()),
         );
     });
 }
 pub struct NoGc<'a> {
+    heap: &'a Heap,
     _phantom: PhantomData<&'a mut &'a ()>,
 }
 
-impl NoGc<'_> {
-    pub(crate) fn new() -> Self {
+impl<'a> NoGc<'a> {
+    pub(crate) fn new(heap: &'a Heap) -> Self {
         Self {
+            heap,
             _phantom: PhantomData,
         }
+    }
+
+    /// The heap this guard protects, for read access and slot writes.
+    pub fn heap(&self) -> &'a Heap {
+        self.heap
+    }
+}
+
+/// Non-allocating heap calls go through the guard: while it is alive the
+/// heap is borrowed, so no collection can happen.
+impl core::ops::Deref for NoGc<'_> {
+    type Target = Heap;
+
+    fn deref(&self) -> &Heap {
+        self.heap
     }
 }
 
@@ -719,11 +736,9 @@ impl<'heap> AllocToken<'heap> {
         }
     }
 
-    pub fn enter_no_gc<R>(&self, f: impl for<'a> FnOnce(&'a mut NoGc<'a>, &'a Heap) -> R) -> R {
-        let mut guard = NoGc {
-            _phantom: PhantomData,
-        };
-        f(&mut guard, &*self.heap)
+    pub fn enter_no_gc<R>(&self, f: impl for<'a> FnOnce(&'a mut NoGc<'a>) -> R) -> R {
+        let mut guard = NoGc::new(&*self.heap);
+        f(&mut guard)
     }
 
     pub fn remaining(&self) -> usize {
@@ -933,8 +948,8 @@ impl<T> OptionGcSlot<T> {
 }
 
 impl<T: HeapObject> OptionGcSlot<T> {
-    pub fn heap_ref<'a>(&self, nogc: &'a NoGc<'a>, heap: &Heap) -> Option<HeapRef<'a, T>> {
-        if self.inner() == heap.known().void.value() {
+    pub fn heap_ref<'a>(&self, nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
+        if self.inner() == nogc.known().void.value() {
             return None;
         }
         Some(self.slot.heap_ref(nogc))
@@ -1111,12 +1126,12 @@ impl Heap {
     pub fn allocate_enter_nogc<T: HeapObject, R>(
         &mut self,
         config: T::Init<'_>,
-        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a mut NoGc<'a>, &'a Self) -> R,
+        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a mut NoGc<'a>) -> R,
     ) -> R {
         let ptr = self.allocate(config).into_ptr();
-        self.no_gc(move |nogc, heap| {
+        self.no_gc(move |nogc| {
             let r = unsafe { HeapRef::from_ptr(ptr) };
-            f(r, nogc, heap)
+            f(r, nogc)
         })
     }
 
@@ -1130,15 +1145,23 @@ impl Heap {
     pub fn allocate_token_enter_nogc<R>(
         &mut self,
         total: Layout,
-        f: impl for<'a> FnOnce(&AllocToken<'_>, &'a mut NoGc<'a>, &Self) -> R,
+        f: impl for<'a> FnOnce(&AllocToken<'_>, &'a mut NoGc<'a>) -> R,
     ) -> R {
         let token = self.allocate_token(total);
-        token.enter_no_gc(|nogc, heap| f(&token, nogc, heap))
+        token.enter_no_gc(|nogc| f(&token, nogc))
     }
 
-    pub fn no_gc<R>(&mut self, f: impl for<'a> FnOnce(&'a mut NoGc<'a>, &'a Self) -> R) -> R {
-        let mut guard = NoGc::new();
-        f(&mut guard, self)
+    /// Non-closure form of [`Heap::no_gc`] for scopes that only read the
+    /// heap or write existing slots: the returned guard holds the heap
+    /// borrow, so no allocation can happen while it is alive. The heap is
+    /// reachable through it (`Deref<Target = Heap>` / [`NoGc::heap`]).
+    pub fn no_gc_guard(&mut self) -> NoGc<'_> {
+        NoGc::new(self)
+    }
+
+    pub fn no_gc<R>(&mut self, f: impl for<'a> FnOnce(&'a mut NoGc<'a>) -> R) -> R {
+        let mut guard = NoGc::new(self);
+        f(&mut guard)
     }
 }
 

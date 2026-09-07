@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, FixedArray, GcSlot, Heap, HeapPtr, HeapRef, InternedString, Map, NoGc, Object,
-    SlotFlags, SlotKind, SlotName, Smi, Symbol, Tagged, VMString, Value, ValueRef, VmError,
+    AccessorPair, FixedArray, GcSlot, HeapPtr, HeapRef, InternedString, Map, NoGc, Object,
+    SlotFlags, SlotName, Smi, Symbol, Tagged, VMString, Value, ValueRef, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -10,11 +10,6 @@ pub enum Lookup<'a> {
         holder_index: usize,
         slot: &'a GcSlot,
         flags: SlotFlags,
-    },
-    Const {
-        holder: ValueRef<'a>,
-        map_index: usize,
-        slot: &'a GcSlot,
     },
     Accessor {
         holder: ValueRef<'a>,
@@ -30,7 +25,7 @@ pub enum Key {
     Name(SlotName),
 }
 
-pub fn classify_key<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, key: Value) -> Result<Key, VmError> {
+pub fn classify_key<'a>(nogc: &'a NoGc<'a>, key: Value) -> Result<Key, VmError> {
     if let Some(smi) = Smi::decode(key) {
         // ES 6.1.7: an array index is 0 ≤ i < 2^32−1; anything else (incl.
         // 4294967295 itself) is an ordinary named property
@@ -41,10 +36,10 @@ pub fn classify_key<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, key: Value) -> Resul
         }
         return Ok(Key::Name(SlotName::from(Tagged::from_smi(smi))));
     }
-    if let Some(s) = key.get_as::<InternedString>(nogc, heap.known().string_map) {
+    if let Some(s) = key.get_as::<InternedString>(nogc, nogc.known().string_map) {
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
-    if let Some(s) = key.get_as::<Symbol>(nogc, heap.known().symbol_map) {
+    if let Some(s) = key.get_as::<Symbol>(nogc, nogc.known().symbol_map) {
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
     Err(VmError::Type)
@@ -53,12 +48,7 @@ pub fn classify_key<'a>(nogc: &'a NoGc<'a>, heap: &'a Heap, key: Value) -> Resul
 /// Fast element read for array objects: `None` if the receiver is not an
 /// array, the index is past the end, or the slot is a hole — the caller must
 /// fall back to a named property lookup.
-pub fn element_value<'a>(
-    nogc: &'a NoGc<'a>,
-    heap: &'a Heap,
-    receiver: Value,
-    i: usize,
-) -> Option<Value> {
+pub fn element_value<'a>(nogc: &'a NoGc<'a>, receiver: Value, i: usize) -> Option<Value> {
     let ValueRef::Object(obj) = receiver.value_ref(nogc) else {
         return None;
     };
@@ -66,13 +56,13 @@ pub fn element_value<'a>(
     if !obj.is_array(nogc) || i >= obj.length() {
         return None;
     }
-    let elements = obj.elements_array(nogc, heap)?;
+    let elements = obj.elements_array(nogc)?;
     if i >= elements.len() {
         // `length` can exceed the backing store: those indices are holes
         return None;
     }
     let v = elements.at(i);
-    if v == heap.known().void.value() {
+    if v == nogc.known().void.value() {
         return None;
     }
     Some(v)
@@ -86,11 +76,10 @@ pub enum LoadOutcome {
 
 pub fn load_outcome<'a>(
     nogc: &'a NoGc<'a>,
-    heap: &'a Heap,
     receiver: Value,
     name: SlotName,
 ) -> Result<LoadOutcome, VmError> {
-    let known = heap.known();
+    let known = nogc.known();
     if receiver == known.null.value() || receiver == known.undefined.value() {
         return Err(VmError::Type);
     }
@@ -104,10 +93,8 @@ pub fn load_outcome<'a>(
             return Ok(LoadOutcome::Value(obj.length.inner()));
         }
     }
-    match receiver.lookup(nogc, heap, name) {
-        Lookup::Data { slot, .. } | Lookup::Const { slot, .. } => {
-            Ok(LoadOutcome::Value(slot.inner()))
-        }
+    match receiver.lookup(nogc, name) {
+        Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.inner())),
         Lookup::Accessor { pair, .. } => {
             let getter = pair.get.inner();
             if getter == known.undefined.value() {
@@ -125,8 +112,8 @@ impl Value {
         value_ref(*self, guard)
     }
 
-    pub fn lookup<'a>(&self, guard: &'a NoGc<'a>, heap: &Heap, name: SlotName) -> Lookup<'a> {
-        lookup_value(*self, guard, heap, name)
+    pub fn lookup<'a>(&self, guard: &'a NoGc<'a>, name: SlotName) -> Lookup<'a> {
+        lookup_value(*self, guard, name)
     }
 }
 
@@ -138,61 +125,43 @@ fn value_ref<'a>(v: Value, _guard: &'a NoGc<'a>) -> ValueRef<'a> {
     ValueRef::Object(unsafe { HeapRef::from_ptr(ptr.cast()) })
 }
 
-fn lookup_value<'a>(
-    receiver: Value,
-    guard: &'a NoGc<'a>,
-    heap: &Heap,
-    name: SlotName,
-) -> Lookup<'a> {
+fn lookup_value<'a>(receiver: Value, guard: &'a NoGc<'a>, name: SlotName) -> Lookup<'a> {
     let receiver = value_ref(receiver, guard);
     let map = match &receiver {
-        ValueRef::Smi(_) => heap.known().smi_map.heap_ref(guard),
+        ValueRef::Smi(_) => guard.known().smi_map.heap_ref(guard),
         ValueRef::Object(obj) => obj.as_ref().header.map.heap_ref(guard),
     };
-    map.as_ref().lookup(guard, heap, receiver, name)
+    map.as_ref().lookup(guard, receiver, name)
 }
 
 impl Map {
     pub fn lookup<'a>(
         &'a self,
         guard: &'a NoGc<'a>,
-        heap: &Heap,
         receiver: ValueRef<'a>,
         name: SlotName,
     ) -> Lookup<'a> {
         for (index, d) in self.descriptors().iter().enumerate() {
             if d.name() == name {
-                return match d.flags().kind() {
-                    SlotKind::Value => {
-                        // TODO: smis have no value slots not sure if we need to protect from this?
-                        // the same should be true for floats too !
-                        // find case where this happens or remove this
-                        let ValueRef::Object(obj) = &receiver else {
-                            panic!("value slot on the smi map")
-                        };
-                        Lookup::Data {
-                            map_index: index,
-                            holder_index: d.offset(),
-                            slot: obj
-                                .as_ref()
-                                .slots
-                                .heap_ref(guard)
-                                .as_ref()
-                                .element_slot(d.offset()),
-                            holder: receiver,
-                            flags: d.flags(),
-                        }
-                    }
-                    SlotKind::Const => Lookup::Const {
-                        map_index: index,
-                        slot: &d.value,
-                        holder: receiver,
-                    },
-                    SlotKind::Accessor => Lookup::Accessor {
+                if d.flags().is_accessor() {
+                    return Lookup::Accessor {
                         holder: receiver,
                         map_index: index,
                         pair: unsafe { HeapRef::from_ptr(d.value.get().cast().into()) },
-                    },
+                    };
+                }
+                // TODO: smis have no value slots not sure if we need to protect from this?
+                // the same should be true for floats too !
+                // find case where this happens or remove this
+                let ValueRef::Object(obj) = &receiver else {
+                    panic!("value slot on the smi map")
+                };
+                return Lookup::Data {
+                    map_index: index,
+                    holder_index: d.offset(),
+                    slot: obj.as_ref().slot(guard, d.offset()),
+                    holder: receiver,
+                    flags: d.flags(),
                 };
             }
         }
@@ -202,27 +171,26 @@ impl Map {
         // - object: single parent (JS [[Prototype]])
         // - FixedArray: multiple parents in priority order (Self parent*)
         let proto = self.prototype.inner();
-        if proto == heap.known().null.value() {
+        if proto == guard.known().null.value() {
             return Lookup::NotFound;
         }
-        if let Some(parents) = proto.get_as::<FixedArray>(guard, heap.known().array_map) {
+        if let Some(parents) = proto.get_as::<FixedArray>(guard, guard.known().array_map) {
             for i in 0..parents.len() {
-                let result = parents.at(i).lookup(guard, heap, name);
+                let result = parents.at(i).lookup(guard, name);
                 if !matches!(result, Lookup::NotFound) {
                     return result;
                 }
             }
             return Lookup::NotFound;
         }
-        proto.lookup(guard, heap, name)
+        proto.lookup(guard, name)
     }
 }
 
 impl Object {
-    pub fn lookup<'a>(&'a self, guard: &'a NoGc<'a>, heap: &Heap, name: SlotName) -> Lookup<'a> {
+    pub fn lookup<'a>(&'a self, guard: &'a NoGc<'a>, name: SlotName) -> Lookup<'a> {
         self.header.map.heap_ref(guard).as_ref().lookup(
             guard,
-            heap,
             ValueRef::Object(HeapRef::from_ref(self)),
             name,
         )

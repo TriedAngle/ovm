@@ -645,8 +645,8 @@ fn eval_native(
     let text = nctx.handle_scope(|nctx, scope| {
         let (vm, heap, _) = nctx.split();
         let s = Convert::to_string(heap, &scope, vm.interner(), src)?;
-        heap.no_gc(|nogc, heap| {
-            s.get_as::<VMString>(nogc, heap.known().string_map)
+        heap.no_gc(|nogc| {
+            s.get_as::<VMString>(nogc, nogc.known().string_map)
                 .and_then(|s| s.as_str(nogc).map(|s| s.to_owned()))
                 .ok_or(VmError::Type)
         })
@@ -732,7 +732,7 @@ fn number_to_string(
 
 /// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver.
 fn wrapper_value(heap: &mut Heap, receiver: Value) -> Result<Value, VmError> {
-    heap.no_gc(|nogc, _heap| {
+    heap.no_gc(|nogc| {
         let ValueRef::Object(obj) = receiver.value_ref(nogc) else {
             return Err(VmError::Type);
         };
@@ -749,9 +749,7 @@ fn boolean_constructor(
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     let arg = args.get(1).unwrap_or(nctx.heap().known().undefined.value());
-    let b = nctx
-        .heap()
-        .no_gc(|nogc, heap| Convert::is_truthy(nogc, heap, arg));
+    let b = nctx.heap().no_gc(|nogc| Convert::is_truthy(nogc, arg));
     let value = Convert::boolean(nctx.heap(), b);
     if !nctx.is_construct() {
         return Ok(value);
@@ -965,7 +963,7 @@ fn object_constructor(
     let arg = args.get(1).unwrap_or(nctx.heap().known().undefined.value());
     if nctx
         .heap()
-        .no_gc(|nogc, heap| vm::Convert::is_primitive(nogc, heap, arg))
+        .no_gc(|nogc| vm::Convert::is_primitive(nogc, arg))
     {
         // TODO: box primitives (String/Symbol wrappers)
         return Err(VmError::Type);
@@ -981,7 +979,7 @@ fn object_get_prototype_of(
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     let arg = args.get(1).ok_or(VmError::Arity)?;
-    nctx.heap().no_gc(|nogc, _heap| {
+    nctx.heap().no_gc(|nogc| {
         let vm::ValueRef::Object(obj) = arg.value_ref(nogc) else {
             return Err(VmError::Type);
         };

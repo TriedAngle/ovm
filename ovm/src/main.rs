@@ -60,7 +60,7 @@ fn main() {
     thread.handle_scope(|thread, scope| {
         let interned = thread.intern(&scope, "hello, ovm");
         let again = thread.intern(&scope, "hello, ovm");
-        thread.heap().no_gc(|nogc, _| {
+        thread.heap().no_gc(|nogc| {
             let s = interned.heap_ref(nogc);
             println!(
                 "interned: {:?} (hash {}, deduped: {})",
@@ -90,9 +90,9 @@ fn main() {
     let result = thread
         .run_native(vm.native(NativeIndex::FLOAT_ADD), &[receiver, fa, fb])
         .expect("float_add failed");
-    let out = thread.heap().no_gc(|nogc, heap| {
+    let out = thread.heap().no_gc(|nogc| {
         result
-            .get_as::<Float>(nogc, heap.known().float_map)
+            .get_as::<Float>(nogc, nogc.known().float_map)
             .expect("float_add returned a float")
             .value
             .get()
