@@ -4,8 +4,7 @@ use vm::{
     CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, FixedArray, Float,
     GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object, ObjectSlotsInit,
     PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
-    Value, ValueRef, add_own_property_values, call_target, classify_key, element_value,
-    load_outcome, set_prototype, store_array_element,
+    Value, ValueRef, call_target, classify_key, element_value, load_outcome, store_array_element,
 };
 
 use crate::{
@@ -354,8 +353,14 @@ fn apply_store_outcome(
         StoreOutcome::Transition { receiver, name } => {
             cache.spill_acc(acc);
             let result = state.handle_scope(|scope| {
-                add_own_property_values(heap, &scope, receiver, name, PropertyDescriptor::data(acc))
-                    .map(|_| ())
+                Object::add_own_property_values(
+                    heap,
+                    &scope,
+                    receiver,
+                    name,
+                    PropertyDescriptor::data(acc),
+                )
+                .map(|_| ())
             });
             let _ = cache.take_acc();
             result
@@ -1285,7 +1290,8 @@ fn step(
         Opcode::SetPrototype => {
             let proto = stack.reg(&meta, ops.reg(0));
             cache.spill_acc(*acc);
-            let result = state.handle_scope(|scope| set_prototype(heap, &scope, *acc, proto));
+            let result =
+                state.handle_scope(|scope| Object::set_prototype(heap, &scope, *acc, proto));
             let _ = cache.take_acc();
             step_try!(result);
             Step::Next
@@ -1333,7 +1339,7 @@ fn step(
                     .heap_ref(nogc)
                     .as_ref()
                     .element_slot(ops.idx(0))
-                    .set(nogc.heap(), host, Tagged::from_value(*acc));
+                    .set(nogc, host, Tagged::from_value(*acc));
                 Ok(())
             }));
             Step::Next
@@ -1386,7 +1392,7 @@ fn step(
                             .ok_or(VmError::Type)?;
                         let target = dynamic_slot(nogc, &mut context, name)?;
                         let host = context.into_tagged().erase();
-                        target.set(nogc.heap(), host, Tagged::from_value(*acc));
+                        target.set(nogc, host, Tagged::from_value(*acc));
                         Ok(())
                     }));
                 }
