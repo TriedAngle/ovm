@@ -1,10 +1,11 @@
-use bytecode::{Opcode, Operands, decode, jump_target};
+use bytecode::{Opcode, Operands, PropertyFlags, decode, jump_target};
 
 use vm::{
-    CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, FixedArray, Float,
-    GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object, ObjectSlotsInit,
-    PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
-    Value, ValueRef, call_target, classify_key, element_value, load_outcome, store_array_element,
+    AccessorPair, CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert,
+    FixedArray, Float, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
+    ObjectSlotsInit, PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics,
+    Tagged, VMString, Value, ValueRef, call_target, classify_key, element_value, load_outcome,
+    store_array_element,
 };
 
 use crate::{
@@ -943,10 +944,10 @@ fn step(
             }
             Step::Next
         }
-        Opcode::StoreNamedProperty | Opcode::StoreNamedPropertyShadow => {
+        Opcode::StoreNamedProperty | Opcode::StoreNamedPropertyNoShadow => {
             let semantics = match op {
-                Opcode::StoreNamedPropertyShadow => StoreSemantics::Shadow,
-                _ => StoreSemantics::WriteThrough,
+                Opcode::StoreNamedPropertyNoShadow => StoreSemantics::WriteThrough,
+                _ => StoreSemantics::Shadow,
             };
             let receiver = stack.reg(&meta, ops.reg(0));
             let outcome = step_try!(heap.no_gc(|nogc| {
@@ -994,10 +995,10 @@ fn step(
             }
             Step::Next
         }
-        Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyShadow => {
+        Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyNoShadow => {
             let semantics = match op {
-                Opcode::StoreKeyedPropertyShadow => StoreSemantics::Shadow,
-                _ => StoreSemantics::WriteThrough,
+                Opcode::StoreKeyedPropertyNoShadow => StoreSemantics::WriteThrough,
+                _ => StoreSemantics::Shadow,
             };
             let receiver = stack.reg(&meta, ops.reg(0));
             let key = stack.reg(&meta, ops.reg(1));
@@ -1037,6 +1038,66 @@ fn step(
                         heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
                     ));
                 }
+            }
+            Step::Next
+        }
+        Opcode::CreateAccessorPair => {
+            cache.spill_acc(*acc);
+            let get = stack.reg(&meta, ops.reg(0));
+            let set = stack.reg(&meta, ops.reg(1));
+            let pair = state.handle_scope(|scope| {
+                heap.allocate_handle::<AccessorPair>((get, set), &scope)
+                    .value()
+            });
+            let _ = cache.take_acc();
+            *acc = pair;
+            Step::Next
+        }
+        Opcode::DefineNamedOwnProperty | Opcode::DefineKeyedOwnProperty => {
+            let receiver = stack.reg(&meta, ops.reg(0));
+            let (name, desc) = step_try!(heap.no_gc(|nogc| {
+                if !matches!(receiver.value_ref(nogc), ValueRef::Object(_)) {
+                    return Err(VmError::Type);
+                }
+                let name = match op {
+                    Opcode::DefineNamedOwnProperty => callable_name(nogc, stack, &meta, ops.idx(1)),
+                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(1)))? {
+                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                        Key::Name(name) => name,
+                    },
+                };
+                let flags = ops.uimm(2);
+                let enumerable = flags & PropertyFlags::DontEnum.bits() == 0;
+                let configurable = flags & PropertyFlags::DontDelete.bits() == 0;
+                let desc = if flags & PropertyFlags::Accessor.bits() != 0 {
+                    let pair = (*acc)
+                        .get_as::<AccessorPair>(nogc, nogc.known().accessor_pair_map)
+                        .ok_or(VmError::Type)?;
+                    let pair = pair.as_ref();
+                    PropertyDescriptor::Accessor {
+                        get: pair.get.inner(),
+                        set: pair.set.inner(),
+                        enumerable,
+                        configurable,
+                    }
+                } else {
+                    PropertyDescriptor::Data {
+                        value: *acc,
+                        writable: flags & PropertyFlags::ReadOnly.bits() == 0,
+                        enumerable,
+                        configurable,
+                    }
+                };
+                Ok((name, desc))
+            }));
+            cache.spill_acc(*acc);
+            let defined = state.handle_scope(|scope| {
+                Object::define_own_property_values(heap, &scope, receiver, name, desc)
+            });
+            let _ = cache.take_acc();
+            let defined = step_try!(defined);
+            if !defined {
+                return Step::Error(VmError::Type);
             }
             Step::Next
         }
