@@ -67,6 +67,7 @@ pub struct BuiltinIndices {
 /// Requires `register_builtin_natives` to have run first.
 pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError> {
     let mut thread = vm.attach();
+    let wks = thread.heap().known().strings;
     let roots = &vm.shared.roots;
     thread.handle_scope(|thread, scope| {
         // ---- Number ----------------------------------------------------------
@@ -225,23 +226,21 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Error / TypeError / ReferenceError ---------------------------------
         let (_, error_proto) =
             install_constructor(thread, &scope, roots, idx.error, "Error", object_prototype)?;
-        let name_str = thread.intern(&scope, "name");
-        let message_str = thread.intern(&scope, "message");
+        let known = thread.heap().known();
         let error_name = thread.intern(&scope, "Error");
-        let empty = thread.intern(&scope, "");
         define_data(
             thread.heap(),
             &scope,
             error_proto,
-            SlotName::from(name_str.as_tagged()),
+            known.strings.name,
             error_name.value(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             error_proto,
-            SlotName::from(message_str.as_tagged()),
-            empty.value(),
+            known.strings.message,
+            known.strings.empty.value(),
         )?;
         install_method(
             thread,
@@ -277,15 +276,15 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             type_error_proto,
-            SlotName::from(name_str.as_tagged()),
+            wks.name,
             type_error_name.value(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             type_error_proto,
-            SlotName::from(message_str.as_tagged()),
-            empty.value(),
+            wks.message,
+            wks.empty.value(),
         )?;
         let mut known = *thread.heap().known();
         known.type_error_map = alloc_map(
@@ -310,15 +309,15 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             reference_error_proto,
-            SlotName::from(name_str.as_tagged()),
+            wks.name,
             reference_error_name.value(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             reference_error_proto,
-            SlotName::from(message_str.as_tagged()),
-            empty.value(),
+            wks.message,
+            wks.empty.value(),
         )?;
         let mut known = *thread.heap().known();
         known.reference_error_map = alloc_map(
@@ -369,20 +368,18 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // constructor to it (like Array below)
         let object_prototype = thread.heap().known().object_prototype;
         let object_fn = make_native_function(thread, &scope, roots, idx.object)?;
-        let constructor_name = thread.intern(&scope, "constructor");
-        let prototype_name = thread.intern(&scope, "prototype");
         define_data(
             thread.heap(),
             &scope,
             object_prototype,
-            SlotName::from(constructor_name.as_tagged()),
+            wks.constructor,
             object_fn.value(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             object_fn,
-            SlotName::from(prototype_name.as_tagged()),
+            wks.prototype,
             object_prototype.value(),
         )?;
         let object_name = thread.intern(&scope, "Object");
@@ -407,20 +404,18 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // whose prototype is %Object.prototype%); just link the constructor
         let array_fn = make_native_function(thread, &scope, roots, idx.array)?;
         let array_prototype = thread.heap().known().array_prototype;
-        let constructor_name = thread.intern(&scope, "constructor");
-        let prototype_name = thread.intern(&scope, "prototype");
         define_data(
             thread.heap(),
             &scope,
             array_prototype,
-            SlotName::from(constructor_name.as_tagged()),
+            wks.constructor,
             array_fn.value(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             array_fn,
-            SlotName::from(prototype_name.as_tagged()),
+            wks.prototype,
             array_prototype.value(),
         )?;
         let array_name = thread.intern(&scope, "Array");
@@ -620,11 +615,11 @@ fn define_data(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     object: vm::Global<Object>,
-    name: SlotName,
+    name: impl Into<SlotName>,
     value: Value,
 ) -> Result<(), VmError> {
     let obj = scope.handle(object.as_tagged());
-    let name = scope.handle(name.tagged());
+    let name = scope.handle(name.into().tagged());
     Object::define_own_property(heap, scope, obj, name, PropertyDescriptor::data(value))?;
     Ok(())
 }
@@ -639,8 +634,8 @@ fn eval_native(
     let context = nctx.current_context().ok_or(VmError::Type)?;
 
     let text = nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, _) = nctx.split();
-        let s = Convert::to_string(heap, &scope, vm.interner(), src)?;
+        let (_vm, heap, _) = nctx.split();
+        let s = Convert::to_string(heap, &scope, src)?;
         heap.no_gc(|nogc| {
             s.get_as::<VMString>(nogc)
                 .and_then(|s| s.as_str(nogc).map(|s| s.to_owned()))
@@ -719,8 +714,8 @@ fn number_to_string(
     let receiver = args.get(0).ok_or(VmError::Arity)?;
     let v = wrapper_value(nctx.heap(), receiver)?;
     nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, _) = nctx.split();
-        Convert::to_string(heap, &scope, vm.interner(), v)
+        let (_vm, heap, _) = nctx.split();
+        Convert::to_string(heap, &scope, v)
     })
 }
 
@@ -782,8 +777,8 @@ fn boolean_to_string(
     let receiver = args.get(0).ok_or(VmError::Arity)?;
     let v = wrapper_value(nctx.heap(), receiver)?;
     nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, _) = nctx.split();
-        Convert::to_string(heap, &scope, vm.interner(), v)
+        let (_vm, heap, _) = nctx.split();
+        Convert::to_string(heap, &scope, v)
     })
 }
 
@@ -814,8 +809,8 @@ fn string_constructor(
 ) -> Result<Value, VmError> {
     let arg = args.get(1).unwrap_or(nctx.heap().known().undefined.value());
     nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, _) = nctx.split();
-        let s = Convert::to_string(heap, &scope, vm.interner(), arg)?;
+        let (_vm, heap, _) = nctx.split();
+        let s = Convert::to_string(heap, &scope, arg)?;
         if !nctx.is_construct() {
             return Ok(s);
         }
@@ -883,7 +878,7 @@ fn make_error(
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, _) = nctx.split();
         let message = match args.get(1) {
-            Some(v) => Convert::to_string(heap, &scope, vm.interner(), v)?,
+            Some(v) => Convert::to_string(heap, &scope, v)?,
             None => vm.interner().intern(heap, &scope, "").as_tagged().erase(),
         };
         let map = match class {
@@ -903,12 +898,8 @@ fn make_error(
                 },
             )
             .into_handle(&scope);
-        let name = scope.handle(
-            SlotName::from(vm.interner().intern(heap, &scope, "name").as_tagged()).tagged(),
-        );
-        let message_key = scope.handle(
-            SlotName::from(vm.interner().intern(heap, &scope, "message").as_tagged()).tagged(),
-        );
+        let name = heap.known().strings.name;
+        let message_key = heap.known().strings.message;
         let class_value = vm.interner().intern(heap, &scope, class);
         let message_value = scope.handle(Tagged::from_value(message));
         Object::define_own_property(
@@ -1040,8 +1031,8 @@ fn error_to_string(
     let message = message?;
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, _) = nctx.split();
-        let a = Convert::to_string(heap, &scope, vm.interner(), name)?;
-        let b = Convert::to_string(heap, &scope, vm.interner(), message)?;
+        let a = Convert::to_string(heap, &scope, name)?;
+        let b = Convert::to_string(heap, &scope, message)?;
         let colon = vm.interner().intern(heap, &scope, ": ");
         let ab = VMString::concat(heap, &scope, a, colon.value());
         Ok(VMString::concat(heap, &scope, ab.value(), b).value())

@@ -456,8 +456,8 @@ fn step(
                     });
                     if is_string.0 || is_string.1 {
                         let s = step_try!(state.handle_scope(|scope| {
-                            let a = Convert::to_string(heap, &scope, vm.interner(), lhs)?;
-                            let b = Convert::to_string(heap, &scope, vm.interner(), rhs)?;
+                            let a = Convert::to_string(heap, &scope, lhs)?;
+                            let b = Convert::to_string(heap, &scope, rhs)?;
                             Ok::<_, VmError>(VMString::concat(heap, &scope, a, b).value())
                         }));
                         cache.set_acc(s);
@@ -694,7 +694,7 @@ fn step(
             Step::Next
         }
         Opcode::TestTypeof => {
-            cache.set_acc(Runtime::type_of(vm, heap, state, cache.acc()));
+            cache.set_acc(Runtime::type_of(heap, cache.acc()));
             Step::Next
         }
         Opcode::Negate => {
@@ -1186,7 +1186,7 @@ fn step(
             let context = step_try!(frame_context(heap, stack, &meta));
             let obj = state.handle_scope(|scope| {
                 let info = unsafe { scope.handle_value::<CallableInfoObject>(info) };
-                Runtime::create_closure(vm, heap, &scope, info, context)
+                Runtime::create_closure(heap, &scope, info, context)
             });
             let obj = step_try!(obj);
             cache.set_acc(obj);

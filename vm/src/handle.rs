@@ -302,6 +302,15 @@ impl HandleSet for HandleScope<'_> {
     }
 }
 
+impl HandleSet for RootHandles {
+    fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+        // Slots in the root table are stable and never reclaimed, so the
+        // returned handle is valid for the borrow of `self` (in practice:
+        // pseudo-static, see `Global<T>`).
+        RootHandles::create_handle(self, value)
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct GcSlice<'a> {
     slice: &'a [Value],
