@@ -27,10 +27,10 @@ pub fn execute(
 
     let saved_top = stack.top();
     let was_active = cache.is_active();
-    let was_acc_spilled = cache.is_acc_spilled();
+    // a nested run reuses the cache; the caller's accumulator is dead across
+    // the call (the call result overwrites it), so it needs no save/restore
     if was_active {
         stack.suspend_frame(cache.frame_meta());
-        cache.reset_acc_spill();
     }
     let base_depth = stack.frame_depth();
 
@@ -40,7 +40,6 @@ pub fn execute(
     if was_active {
         let outer = stack.pop_frame(saved_top).expect("suspended caller frame");
         cache.load(stack, outer, heap);
-        cache.restore_acc_spill(was_acc_spilled);
     } else {
         stack.set_top(saved_top);
         cache.deactivate();
@@ -57,16 +56,12 @@ fn start(
     new_target: Option<Handle<'_, Object>>,
     base_depth: usize,
 ) -> Result<Value, VmError> {
-    match heap.no_gc(|nogc| call_target(nogc, callable.value())) {
+    match call_target(&heap.guard(), callable.value()) {
         Some(CallTarget::Native(idx)) => {
             let f = vm.native(NativeIndex(idx));
-            let void = heap.known().void.value();
             let (saved_top, fargs) = state.stack.stage_args(args)?;
             let mut nctx = NativeContext::with_new_target(vm, heap, state, new_target);
-            let cache = &state.cache;
-            cache.spill_acc(void);
             let result = f(&mut nctx, fargs);
-            let _ = cache.take_acc();
             state.stack.set_top(saved_top);
             result
         }
@@ -76,7 +71,7 @@ fn start(
             }
             // TODO: update once we have classes
             let stack = &state.stack;
-            let context = heap.no_gc(|nogc| closure_context(nogc, target));
+            let context = closure_context(&heap.guard(), target);
             let frame = stack.push_initial_frame(target, register_count, context, args)?;
             state.cache.enter(stack, frame, heap);
             dispatch(vm, heap, state, base_depth)
@@ -192,7 +187,7 @@ fn call_value(
     f: Value,
     args: &[Value],
 ) -> Result<bool, VmError> {
-    let target = heap.no_gc(|nogc| call_target(nogc, f));
+    let target = call_target(&heap.guard(), f);
     // TODO: native getters/setters invoke in place instead of pushing a frame
     let Some(CallTarget::Bytecode(target, register_count, kind)) = target else {
         return Ok(false);
@@ -200,7 +195,7 @@ fn call_value(
     if kind.is_class_constructor() {
         return Err(VmError::Type);
     }
-    let context = heap.no_gc(|nogc| closure_context(nogc, target));
+    let context = closure_context(&heap.guard(), target);
     let callee =
         stack.push_frame_with_args(meta, handler_pc, target, register_count, context, args)?;
     cache.load(stack, callee, heap);
@@ -264,15 +259,11 @@ fn raise(
     heap: &mut Heap,
     state: &ContextState,
     base_depth: usize,
-    acc: Value,
     err: VmError,
     pc: usize,
 ) -> Unwind {
-    let cache = &state.cache;
-    cache.spill_acc(acc);
     let ex =
         error_from_vm_error(vm, heap, state, err).expect("error materialization must not fail");
-    let _ = cache.take_acc();
     state.set_pending_exception(ex);
     exception_dispatch(heap, state, base_depth, pc)
 }
@@ -301,7 +292,6 @@ fn dispatch(
     base_depth: usize,
 ) -> Result<Value, VmError> {
     let cache = &state.cache;
-    let mut acc = heap.known().undefined.value();
     let mut trace = 0;
     loop {
         let pc = cache.pc();
@@ -311,31 +301,32 @@ fn dispatch(
                 panic!("trace limit");
             }
             eprintln!(
-                "pc={pc} rc={} acc={acc:?}",
-                cache.frame_meta().register_count
+                "pc={pc} rc={} acc={:?}",
+                cache.frame_meta().register_count,
+                cache.acc(),
             );
         }
-        let (op, ops, next_pc) = heap.no_gc(|nogc| decode(cache.code_ref(nogc).as_slice(), pc));
+        let (op, ops, next_pc) = decode(cache.code_ref(&heap.guard()).as_slice(), pc);
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
-        let result = step(vm, heap, state, base_depth, &mut acc, op, ops, meta, pc);
+        let result = step(vm, heap, state, base_depth, op, ops, meta, pc);
         match result {
             Step::Next => {}
             Step::Return(v) => return Ok(v),
             Step::Throw(v) => {
                 state.set_pending_exception(v);
                 match exception_dispatch(heap, state, base_depth, pc) {
-                    Unwind::Caught(ex) => acc = ex,
+                    Unwind::Caught(ex) => cache.set_acc(ex),
                     Unwind::Escaped => return Ok(heap.known().exception.value()),
                 }
             }
             Step::PendingThrow => match exception_dispatch(heap, state, base_depth, pc) {
-                Unwind::Caught(ex) => acc = ex,
+                Unwind::Caught(ex) => cache.set_acc(ex),
                 Unwind::Escaped => return Ok(heap.known().exception.value()),
             },
-            Step::Error(err) => match raise(vm, heap, state, base_depth, acc, err, pc) {
-                Unwind::Caught(ex) => acc = ex,
+            Step::Error(err) => match raise(vm, heap, state, base_depth, err, pc) {
+                Unwind::Caught(ex) => cache.set_acc(ex),
                 Unwind::Escaped => return Ok(heap.known().exception.value()),
             },
         }
@@ -350,29 +341,34 @@ fn apply_store_outcome(
     meta: FrameMeta,
     pc: usize,
     receiver: Value,
-    acc: Value,
     outcome: StoreOutcome,
 ) -> Result<(), VmError> {
     match outcome {
         StoreOutcome::Transition { receiver, name } => {
-            cache.spill_acc(acc);
             let result = state.handle_scope(|scope| {
                 Object::add_own_property_values(
                     heap,
                     &scope,
                     receiver,
                     name,
-                    PropertyDescriptor::data(acc),
+                    PropertyDescriptor::data(cache.acc()),
                 )
                 // TODO(strict-mode): a false result must throw in strict code;
                 // the current store path preserves its existing sloppy result.
                 .map(|_| ())
             });
-            let _ = cache.take_acc();
             result
         }
         StoreOutcome::CallSetter { setter } => {
-            call_value(heap, stack, cache, meta, pc, setter, &[receiver, acc])?;
+            call_value(
+                heap,
+                stack,
+                cache,
+                meta,
+                pc,
+                setter,
+                &[receiver, cache.acc()],
+            )?;
             Ok(())
         }
         StoreOutcome::Done => Ok(()),
@@ -384,7 +380,6 @@ fn step(
     heap: &mut Heap,
     state: &ContextState,
     base_depth: usize,
-    acc: &mut Value,
     op: Opcode,
     ops: Operands,
     meta: FrameMeta,
@@ -397,7 +392,7 @@ fn step(
         Opcode::Return => {
             // a nested run stops above the frame suspended on its entry
             if stack.frame_depth() == base_depth {
-                return Step::Return(*acc);
+                return Step::Return(cache.acc());
             }
             let caller = stack
                 .pop_frame(meta.base)
@@ -406,11 +401,11 @@ fn step(
             Step::Next
         }
         Opcode::Load => {
-            *acc = stack.reg(&meta, ops.reg(0));
+            cache.set_acc(stack.reg(&meta, ops.reg(0)));
             Step::Next
         }
         Opcode::Store => {
-            stack.set_reg(&meta, ops.reg(0), *acc);
+            stack.set_reg(&meta, ops.reg(0), cache.acc());
             Step::Next
         }
         Opcode::Move => {
@@ -419,18 +414,18 @@ fn step(
             Step::Next
         }
         Opcode::LoadSmi => {
-            *acc = Smi::new(ops.imm(0) as i64).encode();
+            cache.set_acc(Smi::new(ops.imm(0) as i64).encode());
             Step::Next
         }
         Opcode::LoadConstant => {
-            let v = heap.no_gc(|nogc| cache.constants_ref(nogc).at(ops.idx(0)));
-            *acc = v;
+            let v = cache.constants_ref(&heap.guard()).at(ops.idx(0));
+            cache.set_acc(v);
             Step::Next
         }
         Opcode::Add => {
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
                 if let Some(r) = a.value().checked_add(b.value()) {
                     if Smi::in_range(r) {
                         result = Some(Smi::new(r).encode());
@@ -438,10 +433,15 @@ fn step(
                 }
             }
             match result {
-                Some(v) => *acc = v,
+                Some(v) => cache.set_acc(v),
                 None => {
-                    let lhs =
-                        step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Default));
+                    let lhs = step_try!(Runtime::to_primitive(
+                        vm,
+                        heap,
+                        state,
+                        cache.acc(),
+                        Hint::Default
+                    ));
                     let lhs = match lhs {
                         Coercion::Threw => return Step::PendingThrow,
                         Coercion::Value(v) => v,
@@ -465,7 +465,7 @@ fn step(
                             let b = Convert::to_string(heap, &scope, vm.interner(), rhs)?;
                             Ok::<_, VmError>(VMString::concat(heap, &scope, a, b).value())
                         }));
-                        *acc = s;
+                        cache.set_acc(s);
                     } else {
                         let r = step_try!(heap.no_gc(|nogc| {
                             let a = Convert::to_number(nogc, lhs)?;
@@ -480,7 +480,7 @@ fn step(
                             Ok::<_, VmError>(r)
                         }));
                         let v = state.handle_scope(|scope| Convert::to_value(heap, &scope, r));
-                        *acc = v;
+                        cache.set_acc(v);
                     }
                 }
             }
@@ -489,7 +489,7 @@ fn step(
         Opcode::Sub => {
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
                 if let Some(r) = a.value().checked_sub(b.value()) {
                     if Smi::in_range(r) {
                         result = Some(Smi::new(r).encode());
@@ -497,14 +497,20 @@ fn step(
                 }
             }
             match result {
-                Some(v) => *acc = v,
+                Some(v) => cache.set_acc(v),
                 None => {
-                    let v =
-                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a - b));
+                    let v = step_try!(Runtime::numeric_op(
+                        vm,
+                        heap,
+                        state,
+                        cache.acc(),
+                        other,
+                        |a, b| a - b
+                    ));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
-                    *acc = v;
+                    cache.set_acc(v);
                 }
             }
             Step::Next
@@ -512,7 +518,7 @@ fn step(
         Opcode::Mul => {
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
                 if let Some(r) = a.value().checked_mul(b.value()) {
                     if Smi::in_range(r) {
                         result = Some(Smi::new(r).encode());
@@ -520,14 +526,20 @@ fn step(
                 }
             }
             match result {
-                Some(v) => *acc = v,
+                Some(v) => cache.set_acc(v),
                 None => {
-                    let v =
-                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a * b));
+                    let v = step_try!(Runtime::numeric_op(
+                        vm,
+                        heap,
+                        state,
+                        cache.acc(),
+                        other,
+                        |a, b| a * b
+                    ));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
-                    *acc = v;
+                    cache.set_acc(v);
                 }
             }
             Step::Next
@@ -537,7 +549,7 @@ fn step(
             // or NaN, MIN/-1 overflows to a double.
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
                 if b.value() != 0 && a.value() % b.value() == 0 {
                     if let Some(r) = a.value().checked_div(b.value()) {
                         result = Some(Smi::new(r).encode());
@@ -545,14 +557,20 @@ fn step(
                 }
             }
             match result {
-                Some(v) => *acc = v,
+                Some(v) => cache.set_acc(v),
                 None => {
-                    let v =
-                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a / b));
+                    let v = step_try!(Runtime::numeric_op(
+                        vm,
+                        heap,
+                        state,
+                        cache.acc(),
+                        other,
+                        |a, b| a / b
+                    ));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
-                    *acc = v;
+                    cache.set_acc(v);
                 }
             }
             Step::Next
@@ -561,20 +579,26 @@ fn step(
             // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(*acc), Smi::decode(other)) {
+            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
                 if b.value() != 0 {
                     result = Some(Smi::new(a.value() % b.value()).encode());
                 }
             }
             match result {
-                Some(v) => *acc = v,
+                Some(v) => cache.set_acc(v),
                 None => {
-                    let v =
-                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a % b));
+                    let v = step_try!(Runtime::numeric_op(
+                        vm,
+                        heap,
+                        state,
+                        cache.acc(),
+                        other,
+                        |a, b| a % b
+                    ));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
-                    *acc = v;
+                    cache.set_acc(v);
                 }
             }
             Step::Next
@@ -583,57 +607,64 @@ fn step(
             // JS exponentiation is always IEEE double math; the result only
             // needs a Smi tag when it is an in-range integer.
             let other = stack.reg(&meta, ops.reg(0));
-            let v = step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a.powf(b)));
+            let v = step_try!(Runtime::numeric_op(
+                vm,
+                heap,
+                state,
+                cache.acc(),
+                other,
+                |a, b| a.powf(b)
+            ));
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
-            *acc = v;
+            cache.set_acc(v);
             Step::Next
         }
         Opcode::BitwiseOr => {
             // ToInt32 semantics on the (integer) smi inputs
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
             let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
                 .value() as i32;
-            *acc = Smi::new((a | b) as i64).encode();
+            cache.set_acc(Smi::new((a | b) as i64).encode());
             Step::Next
         }
         Opcode::BitwiseXor => {
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
             let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
                 .value() as i32;
-            *acc = Smi::new((a ^ b) as i64).encode();
+            cache.set_acc(Smi::new((a ^ b) as i64).encode());
             Step::Next
         }
         Opcode::BitwiseAnd => {
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
             let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
                 .value() as i32;
-            *acc = Smi::new((a & b) as i64).encode();
+            cache.set_acc(Smi::new((a & b) as i64).encode());
             Step::Next
         }
         Opcode::ShiftLeft => {
             // ToInt32(lhs) << (ToUint32(rhs) & 31), truncated to int32
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
             let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
                 .value() as u32;
-            *acc = Smi::new((a.wrapping_shl(b & 31) as i32) as i64).encode();
+            cache.set_acc(Smi::new((a.wrapping_shl(b & 31) as i32) as i64).encode());
             Step::Next
         }
         Opcode::ShiftRight => {
             // ToInt32(lhs) >> (ToUint32(rhs) & 31), sign-extending
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as i32;
+            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
             let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
                 .value() as u32;
-            *acc = Smi::new((a.wrapping_shr(b & 31) as i32) as i64).encode();
+            cache.set_acc(Smi::new((a.wrapping_shr(b & 31) as i32) as i64).encode());
             Step::Next
         }
         Opcode::ShiftRightLogical => {
             // ToUint32(lhs) >>> (ToUint32(rhs) & 31): always non-negative
-            let a = step_try!(Smi::decode(*acc).ok_or(VmError::Type)).value() as u32;
+            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as u32;
             let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
                 .value() as u32;
-            *acc = Smi::new(a.wrapping_shr(b & 31) as i64).encode();
+            cache.set_acc(Smi::new(a.wrapping_shr(b & 31) as i64).encode());
             Step::Next
         }
         Opcode::Jump => {
@@ -641,20 +672,18 @@ fn step(
             Step::Next
         }
         Opcode::JumpLoop => {
-            cache.spill_acc(*acc);
             heap.safepoint_poll();
-            *acc = cache.take_acc();
             cache.set_pc(jump_target(pc, ops.imm(0)));
             Step::Next
         }
         Opcode::JumpIfTruthy => {
-            if heap.no_gc(|nogc| Convert::is_truthy(nogc, *acc)) {
+            if Convert::is_truthy(&heap.guard(), cache.acc()) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
         }
         Opcode::JumpIfFalsy => {
-            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, *acc)) {
+            if !Convert::is_truthy(&heap.guard(), cache.acc()) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
@@ -662,33 +691,33 @@ fn step(
         Opcode::TestReferenceEqual => {
             let other = stack.reg(&meta, ops.reg(0));
             let known = heap.known();
-            *acc = if other == *acc {
+            cache.set_acc(if other == cache.acc() {
                 known.true_object.value()
             } else {
                 known.false_object.value()
-            };
+            });
             Step::Next
         }
         Opcode::TestTypeof => {
-            *acc = Runtime::type_of(vm, heap, state, *acc);
+            cache.set_acc(Runtime::type_of(vm, heap, state, cache.acc()));
             Step::Next
         }
         Opcode::Negate => {
-            if let Some(smi) = Smi::decode(*acc) {
+            if let Some(smi) = Smi::decode(cache.acc()) {
                 let v = smi.value();
-                *acc = if v == 0 {
+                cache.set_acc(if v == 0 {
                     state.handle_scope(|scope| heap.allocate_handle::<Float>(-0.0, &scope).value())
                 } else if v == Smi::MIN {
                     state.handle_scope(|scope| Convert::to_value(heap, &scope, -(v as f64)))
                 } else {
                     Smi::new(-v).encode()
-                };
+                });
             } else {
-                let n = step_try!(Runtime::to_numeric(vm, heap, state, *acc));
+                let n = step_try!(Runtime::to_numeric(vm, heap, state, cache.acc()));
                 let Some(n) = n else {
                     return Step::PendingThrow;
                 };
-                *acc = state.handle_scope(|scope| {
+                cache.set_acc(state.handle_scope(|scope| {
                     let r = -n;
                     // preserve -0.0: `-0` must not fold into Smi 0
                     if r == 0.0 && r.is_sign_negative() {
@@ -696,17 +725,17 @@ fn step(
                     } else {
                         Convert::to_value(heap, &scope, r)
                     }
-                });
+                }));
             }
             Step::Next
         }
         Opcode::InstanceOf => {
             let other = stack.reg(&meta, ops.reg(0));
-            let r = step_try!(Runtime::instance_of(vm, heap, state, *acc, other));
+            let r = step_try!(Runtime::instance_of(vm, heap, state, cache.acc(), other));
             let Some(r) = r else {
                 return Step::PendingThrow;
             };
-            *acc = Convert::boolean(heap, r);
+            cache.set_acc(Convert::boolean(heap, r));
             Step::Next
         }
         Opcode::Construct => {
@@ -761,24 +790,30 @@ fn step(
                 if result == heap.known().exception.value() {
                     return Step::PendingThrow;
                 }
-                *acc = if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
+                cache.set_acc(if Convert::is_primitive(&heap.guard(), result) {
                     receiver.value()
                 } else {
                     result
-                };
+                });
                 Step::Next
             })
         }
         Opcode::EqualStrict => {
             let other = stack.reg(&meta, ops.reg(0));
-            let r = heap.no_gc(|nogc| Compare::strict_equal(nogc, *acc, other));
-            *acc = Convert::boolean(heap, r);
+            let r = Compare::strict_equal(&heap.guard(), cache.acc(), other);
+            cache.set_acc(Convert::boolean(heap, r));
             Step::Next
         }
         Opcode::Equal => {
             // IsLooselyEqual: objects are ToPrimitive'd (hint default) first
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Default));
+            let x = step_try!(Runtime::to_primitive(
+                vm,
+                heap,
+                state,
+                cache.acc(),
+                Hint::Default
+            ));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -788,14 +823,20 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc| Compare::equal(nogc, x, y)));
-            *acc = Convert::boolean(heap, r);
+            let r = step_try!(Compare::equal(&heap.guard(), x, y));
+            cache.set_acc(Convert::boolean(heap, r));
             Step::Next
         }
         Opcode::LessThan => {
             // Abstract Relational Comparison: objects ToPrimitive'd with hint Number
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(
+                vm,
+                heap,
+                state,
+                cache.acc(),
+                Hint::Number
+            ));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -805,13 +846,19 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc| Compare::less_than(nogc, x, y)));
-            *acc = Convert::boolean(heap, r);
+            let r = step_try!(Compare::less_than(&heap.guard(), x, y));
+            cache.set_acc(Convert::boolean(heap, r));
             Step::Next
         }
         Opcode::LessThanOrEqual => {
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(
+                vm,
+                heap,
+                state,
+                cache.acc(),
+                Hint::Number
+            ));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -821,13 +868,19 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc| Compare::less_than_or_equal(nogc, x, y)));
-            *acc = Convert::boolean(heap, r);
+            let r = step_try!(Compare::less_than_or_equal(&heap.guard(), x, y));
+            cache.set_acc(Convert::boolean(heap, r));
             Step::Next
         }
         Opcode::GreaterThan => {
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(
+                vm,
+                heap,
+                state,
+                cache.acc(),
+                Hint::Number
+            ));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -837,13 +890,19 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc| Compare::greater_than(nogc, x, y)));
-            *acc = Convert::boolean(heap, r);
+            let r = step_try!(Compare::greater_than(&heap.guard(), x, y));
+            cache.set_acc(Convert::boolean(heap, r));
             Step::Next
         }
         Opcode::GreaterThanOrEqual => {
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(
+                vm,
+                heap,
+                state,
+                cache.acc(),
+                Hint::Number
+            ));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -853,22 +912,20 @@ fn step(
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let r = step_try!(heap.no_gc(|nogc| Compare::greater_than_or_equal(nogc, x, y)));
-            *acc = Convert::boolean(heap, r);
+            let r = step_try!(Compare::greater_than_or_equal(&heap.guard(), x, y));
+            cache.set_acc(Convert::boolean(heap, r));
             Step::Next
         }
-        Opcode::Throw | Opcode::ReThrow => Step::Throw(*acc),
+        Opcode::Throw | Opcode::ReThrow => Step::Throw(cache.acc()),
         Opcode::CallNative => {
             let f = vm.native(NativeIndex(ops.idx(0)));
             let count = ops.reg_count(2);
             let mut nctx = NativeContext::new(vm, heap, state);
-            cache.spill_acc(*acc);
             let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
-            let _ = cache.take_acc();
             match result {
                 Ok(v) if v == heap.known().exception.value() => Step::PendingThrow,
                 Ok(v) => {
-                    *acc = v;
+                    cache.set_acc(v);
                     Step::Next
                 }
                 Err(err) => Step::Error(err),
@@ -879,7 +936,7 @@ fn step(
             // TODO(strict-mode): ordinary sloppy functions still need nullish
             // receiver substitution and primitive receiver boxing.
             let count = ops.reg_count(2);
-            let target = heap.no_gc(|nogc| call_target(nogc, stack.reg(&meta, ops.reg(0))));
+            let target = call_target(&heap.guard(), stack.reg(&meta, ops.reg(0)));
             let Some(target) = target else {
                 return Step::Error(VmError::Type);
             };
@@ -887,13 +944,11 @@ fn step(
                 CallTarget::Native(idx) => {
                     let f = vm.native(NativeIndex(idx));
                     let mut nctx = NativeContext::new(vm, heap, state);
-                    cache.spill_acc(*acc);
                     let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
-                    let _ = cache.take_acc();
                     match result {
                         Ok(v) if v == heap.known().exception.value() => Step::PendingThrow,
                         Ok(v) => {
-                            *acc = v;
+                            cache.set_acc(v);
                             Step::Next
                         }
                         Err(err) => Step::Error(err),
@@ -903,7 +958,7 @@ fn step(
                     if kind.is_class_constructor() {
                         return Step::Error(VmError::Type);
                     }
-                    let context = heap.no_gc(|nogc| closure_context(nogc, target));
+                    let context = closure_context(&heap.guard(), target);
                     let callee = step_try!(stack.push_frame(
                         meta,
                         pc,
@@ -924,7 +979,7 @@ fn step(
                 load_outcome(nogc, stack.reg(&meta, ops.reg(0)), name)
             }));
             match outcome {
-                LoadOutcome::Value(v) => *acc = v,
+                LoadOutcome::Value(v) => cache.set_acc(v),
                 LoadOutcome::Getter(getter) => {
                     let receiver = stack.reg(&meta, ops.reg(0));
                     let called = step_try!(call_value(
@@ -938,7 +993,7 @@ fn step(
                     ));
                     if !called {
                         // non-callable getter: the load yields undefined
-                        *acc = heap.known().undefined.value();
+                        cache.set_acc(heap.known().undefined.value());
                     }
                 }
             }
@@ -952,17 +1007,17 @@ fn step(
             let receiver = stack.reg(&meta, ops.reg(0));
             let outcome = step_try!(heap.no_gc(|nogc| {
                 let name = callable_name(nogc, stack, &meta, ops.idx(1));
-                receiver.store_lookup(nogc, name, *acc, semantics)
+                receiver.store_lookup(nogc, name, cache.acc(), semantics)
             }));
             step_try!(apply_store_outcome(
-                heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
+                heap, state, stack, cache, meta, pc, receiver, outcome,
             ));
             Step::Next
         }
         Opcode::LoadKeyedProperty => {
             let receiver = stack.reg(&meta, ops.reg(0));
             let outcome = step_try!(heap.no_gc(|nogc| {
-                match classify_key(nogc, *acc)? {
+                match classify_key(nogc, cache.acc())? {
                     Key::Element(i) => match element_value(nogc, receiver, i) {
                         Some(v) => Ok(LoadOutcome::Value(v)),
                         // past the end, a hole, or a non-array receiver:
@@ -977,7 +1032,7 @@ fn step(
                 }
             }));
             match outcome {
-                LoadOutcome::Value(v) => *acc = v,
+                LoadOutcome::Value(v) => cache.set_acc(v),
                 LoadOutcome::Getter(getter) => {
                     let called = step_try!(call_value(
                         heap,
@@ -989,7 +1044,7 @@ fn step(
                         &[receiver]
                     ));
                     if !called {
-                        *acc = heap.known().undefined.value();
+                        cache.set_acc(heap.known().undefined.value());
                     }
                 }
             }
@@ -1002,7 +1057,7 @@ fn step(
             };
             let receiver = stack.reg(&meta, ops.reg(0));
             let key = stack.reg(&meta, ops.reg(1));
-            let key = step_try!(heap.no_gc(|nogc| classify_key(nogc, key)));
+            let key = step_try!(classify_key(&heap.guard(), key));
             match key {
                 Key::Element(i) => {
                     let is_array = heap.no_gc(|nogc| {
@@ -1013,7 +1068,7 @@ fn step(
                     });
                     if is_array {
                         step_try!(state.handle_scope(|scope| {
-                            store_array_element(heap, &scope, receiver, i, *acc)
+                            store_array_element(heap, &scope, receiver, i, cache.acc())
                         }));
                     } else {
                         // numeric property on a non-array receiver
@@ -1021,36 +1076,34 @@ fn step(
                             receiver.store_lookup(
                                 nogc,
                                 SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                                *acc,
+                                cache.acc(),
                                 semantics,
                             )
                         }));
                         step_try!(apply_store_outcome(
-                            heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
+                            heap, state, stack, cache, meta, pc, receiver, outcome,
                         ));
                     }
                 }
                 Key::Name(name) => {
-                    let outcome = step_try!(
-                        heap.no_gc(|nogc| { receiver.store_lookup(nogc, name, *acc, semantics) })
-                    );
+                    let outcome = step_try!(heap.no_gc(|nogc| {
+                        receiver.store_lookup(nogc, name, cache.acc(), semantics)
+                    }));
                     step_try!(apply_store_outcome(
-                        heap, state, stack, cache, meta, pc, receiver, *acc, outcome,
+                        heap, state, stack, cache, meta, pc, receiver, outcome,
                     ));
                 }
             }
             Step::Next
         }
         Opcode::CreateAccessorPair => {
-            cache.spill_acc(*acc);
             let get = stack.reg(&meta, ops.reg(0));
             let set = stack.reg(&meta, ops.reg(1));
             let pair = state.handle_scope(|scope| {
                 heap.allocate_handle::<AccessorPair>((get, set), &scope)
                     .value()
             });
-            let _ = cache.take_acc();
-            *acc = pair;
+            cache.set_acc(pair);
             Step::Next
         }
         Opcode::DefineNamedOwnProperty | Opcode::DefineKeyedOwnProperty => {
@@ -1070,7 +1123,8 @@ fn step(
                 let enumerable = flags & PropertyFlags::DontEnum.bits() == 0;
                 let configurable = flags & PropertyFlags::DontDelete.bits() == 0;
                 let desc = if flags & PropertyFlags::Accessor.bits() != 0 {
-                    let pair = (*acc)
+                    let pair = cache
+                        .acc()
                         .get_as::<AccessorPair>(nogc, nogc.known().accessor_pair_map)
                         .ok_or(VmError::Type)?;
                     let pair = pair.as_ref();
@@ -1082,7 +1136,7 @@ fn step(
                     }
                 } else {
                     PropertyDescriptor::Data {
-                        value: *acc,
+                        value: cache.acc(),
                         writable: flags & PropertyFlags::ReadOnly.bits() == 0,
                         enumerable,
                         configurable,
@@ -1090,11 +1144,9 @@ fn step(
                 };
                 Ok((name, desc))
             }));
-            cache.spill_acc(*acc);
             let defined = state.handle_scope(|scope| {
                 Object::define_own_property_values(heap, &scope, receiver, name, desc)
             });
-            let _ = cache.take_acc();
             let defined = step_try!(defined);
             if !defined {
                 return Step::Error(VmError::Type);
@@ -1102,7 +1154,6 @@ fn step(
             Step::Next
         }
         Opcode::CreateEmptyObjectLiteral => {
-            cache.spill_acc(*acc);
             let obj = state.handle_scope(|scope| {
                 let map = scope
                     .create_handle(heap.known().object_initial_map.as_tagged())
@@ -1117,12 +1168,10 @@ fn step(
                     },
                 )
             });
-            let _ = cache.take_acc();
-            *acc = obj.erase();
+            cache.set_acc(obj.erase());
             Step::Next
         }
         Opcode::CreateEmptyArrayLiteral => {
-            cache.spill_acc(*acc);
             let obj = state.handle_scope(|scope| {
                 let map = scope
                     .create_handle(heap.known().js_array_map.as_tagged())
@@ -1139,8 +1188,7 @@ fn step(
                 .into_tagged()
                 .erase()
             });
-            let _ = cache.take_acc();
-            *acc = obj;
+            cache.set_acc(obj);
             Step::Next
         }
         Opcode::CreateClosure => {
@@ -1153,7 +1201,6 @@ fn step(
                     .ok_or(VmError::Type)
             }));
             let context = step_try!(frame_context(heap, stack, &meta));
-            cache.spill_acc(*acc);
             let obj = state.handle_scope(|scope| {
                 let info = scope
                     .create_handle(unsafe {
@@ -1163,8 +1210,7 @@ fn step(
                 Runtime::create_closure(vm, heap, &scope, info, context)
             });
             let obj = step_try!(obj);
-            let _ = cache.take_acc();
-            *acc = obj;
+            cache.set_acc(obj);
             Step::Next
         }
         Opcode::LoadGlobal | Opcode::LoadGlobalNoThrow => {
@@ -1183,15 +1229,15 @@ fn step(
                 }
             });
             match lookup {
-                GlobalLoad::Data(v) => *acc = v,
+                GlobalLoad::Data(v) => cache.set_acc(v),
                 GlobalLoad::Getter(getter) => {
                     if getter == heap.known().undefined.value() {
-                        *acc = heap.known().undefined.value();
+                        cache.set_acc(heap.known().undefined.value());
                     } else {
                         let called =
                             step_try!(call_value(heap, stack, cache, meta, pc, getter, &[global]));
                         if !called {
-                            *acc = heap.known().undefined.value();
+                            cache.set_acc(heap.known().undefined.value());
                         }
                     }
                 }
@@ -1200,7 +1246,7 @@ fn step(
                         // unresolvable reference: GetValue throws ReferenceError
                         return Step::Error(VmError::Reference);
                     }
-                    *acc = heap.known().undefined.value();
+                    cache.set_acc(heap.known().undefined.value());
                 }
             }
             // TODO: full semantics: lookup the script-context table first
@@ -1212,10 +1258,10 @@ fn step(
             let global = heap.known().global_object.value();
             let outcome = step_try!(heap.no_gc(|nogc| {
                 let name = callable_name(nogc, stack, &meta, ops.idx(0));
-                global.store_lookup(nogc, name, *acc, StoreSemantics::WriteThrough)
+                global.store_lookup(nogc, name, cache.acc(), StoreSemantics::WriteThrough)
             }));
             step_try!(apply_store_outcome(
-                heap, state, stack, cache, meta, pc, global, *acc, outcome,
+                heap, state, stack, cache, meta, pc, global, outcome,
             ));
             Step::Next
         }
@@ -1239,7 +1285,6 @@ fn step(
             let hole = heap.known().void.value();
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
-            cache.spill_acc(*acc);
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
                     .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
@@ -1254,8 +1299,7 @@ fn step(
                     scope_info,
                 })
             });
-            let _ = cache.take_acc();
-            *acc = ctx.erase();
+            cache.set_acc(ctx.erase());
             Step::Next
         }
         Opcode::CreateBlockContext => {
@@ -1263,7 +1307,6 @@ fn step(
             let hole = heap.known().void.value();
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
-            cache.spill_acc(*acc);
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
                     .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
@@ -1275,14 +1318,12 @@ fn step(
                     scope_info: heap.known().empty_scope_info,
                 })
             });
-            let _ = cache.take_acc();
-            *acc = ctx.erase();
+            cache.set_acc(ctx.erase());
             Step::Next
         }
         Opcode::CreateCatchContext => {
             let exception = stack.reg(&meta, ops.reg(0));
             let outer = step_try!(frame_context(heap, stack, &meta));
-            cache.spill_acc(*acc);
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
                     .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
@@ -1294,14 +1335,13 @@ fn step(
                     scope_info: heap.known().empty_scope_info,
                 })
             });
-            let _ = cache.take_acc();
-            *acc = ctx.erase();
+            cache.set_acc(ctx.erase());
             Step::Next
         }
         Opcode::PushContext => {
             let old = step_try!(frame_context(heap, stack, &meta));
             stack.set_reg(&meta, ops.reg(0), old);
-            step_try!(set_frame_context(heap, stack, &meta, *acc));
+            step_try!(set_frame_context(heap, stack, &meta, cache.acc()));
             Step::Next
         }
         Opcode::PopContext => {
@@ -1311,15 +1351,13 @@ fn step(
         }
         Opcode::SetPrototype => {
             let proto = stack.reg(&meta, ops.reg(0));
-            cache.spill_acc(*acc);
             let result =
-                state.handle_scope(|scope| Object::set_prototype(heap, &scope, *acc, proto));
-            let _ = cache.take_acc();
+                state.handle_scope(|scope| Object::set_prototype(heap, &scope, cache.acc(), proto));
             step_try!(result);
             Step::Next
         }
         Opcode::ThrowReferenceErrorIfHole => {
-            if *acc == heap.known().void.value() {
+            if cache.acc() == heap.known().void.value() {
                 return Step::Error(VmError::Reference);
             }
             Step::Next
@@ -1342,7 +1380,7 @@ fn step(
                     .element_slot(ops.idx(0))
                     .inner())
             }));
-            *acc = v;
+            cache.set_acc(v);
             Step::Next
         }
         Opcode::StoreContextSlot => {
@@ -1361,16 +1399,16 @@ fn step(
                     .heap_ref(nogc)
                     .as_ref()
                     .element_slot(ops.idx(0))
-                    .set(nogc, host, Tagged::from_value(*acc));
+                    .set(nogc, host, Tagged::from_value(cache.acc()));
                 Ok(())
             }));
             Step::Next
         }
         Opcode::LoadDynamicName => {
-            let name = heap.no_gc(|nogc| cache.constants_ref(nogc).at(ops.idx(0)));
-            let found = step_try!(heap.no_gc(|nogc| { dynamic_lookup(nogc, stack, &meta, name) }));
+            let name = cache.constants_ref(&heap.guard()).at(ops.idx(0));
+            let found = step_try!(dynamic_lookup(&heap.guard(), stack, &meta, name));
             match found {
-                Some(v) if v != heap.known().void.value() => *acc = v,
+                Some(v) if v != heap.known().void.value() => cache.set_acc(v),
                 Some(_) => return Step::Error(VmError::Reference),
                 None => {
                     // unresolved: fall back to a global object property
@@ -1380,7 +1418,7 @@ fn step(
                             load_outcome(nogc, global, SlotName::from_value(name))
                         }));
                     match outcome {
-                        LoadOutcome::Value(v) => *acc = v,
+                        LoadOutcome::Value(v) => cache.set_acc(v),
                         LoadOutcome::Getter(getter) => {
                             let called = step_try!(call_value(
                                 heap,
@@ -1392,7 +1430,7 @@ fn step(
                                 &[global],
                             ));
                             if !called {
-                                *acc = heap.known().undefined.value();
+                                cache.set_acc(heap.known().undefined.value());
                             }
                         }
                     }
@@ -1401,8 +1439,8 @@ fn step(
             Step::Next
         }
         Opcode::StoreDynamicName => {
-            let name = heap.no_gc(|nogc| cache.constants_ref(nogc).at(ops.idx(0)));
-            let found = step_try!(heap.no_gc(|nogc| { dynamic_lookup(nogc, stack, &meta, name) }));
+            let name = cache.constants_ref(&heap.guard()).at(ops.idx(0));
+            let found = step_try!(dynamic_lookup(&heap.guard(), stack, &meta, name));
             match found {
                 Some(v) if v != heap.known().void.value() => {
                     // write through to the found slot
@@ -1414,7 +1452,7 @@ fn step(
                             .ok_or(VmError::Type)?;
                         let target = dynamic_slot(nogc, &mut context, name)?;
                         let host = context.into_tagged().erase();
-                        target.set(nogc, host, Tagged::from_value(*acc));
+                        target.set(nogc, host, Tagged::from_value(cache.acc()));
                         Ok(())
                     }));
                 }
@@ -1425,12 +1463,12 @@ fn step(
                         global.store_lookup(
                             nogc,
                             SlotName::from_value(name),
-                            *acc,
+                            cache.acc(),
                             StoreSemantics::WriteThrough,
                         )
                     }));
                     step_try!(apply_store_outcome(
-                        heap, state, stack, cache, meta, pc, global, *acc, outcome,
+                        heap, state, stack, cache, meta, pc, global, outcome,
                     ));
                 }
             }

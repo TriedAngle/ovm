@@ -14,8 +14,9 @@ use crate::{FrameMeta, Stack};
 pub struct StackCache(UnsafeCell<StackCacheImpl>);
 
 struct StackCacheImpl {
+    /// The interpreter accumulator: permanently rooted (visited by the GC),
+    /// so it stays valid across allocations without spill/take bookkeeping.
     acc: Register,
-    acc_spilled: bool,
     code: Register,
     constants: Register,
     pc: usize,
@@ -29,7 +30,6 @@ impl StackCache {
     pub fn new(void: Value) -> Self {
         Self(UnsafeCell::new(StackCacheImpl {
             acc: unsafe { Register::from_value(void) },
-            acc_spilled: false,
             code: unsafe { Register::from_value(void) },
             constants: unsafe { Register::from_value(void) },
             pc: 0,
@@ -50,7 +50,10 @@ impl StackCache {
 
     pub fn enter(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
         self.load(stack, frame, heap);
-        self.get().active = true;
+        let cache = self.get();
+        cache.active = true;
+        // the accumulator is undefined on frame entry
+        cache.acc.store(heap.known().undefined.value());
     }
 
     pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
@@ -61,7 +64,7 @@ impl StackCache {
             let info = obj
                 .as_ref()
                 .callable_info(nogc)
-                .expect("frame callable must have a callable info");
+                .expect("frame callable must have callable info");
             let cache = self.get();
             cache.code.store(info.bytecode.get().erase());
             cache.constants.store(info.constants.get().erase());
@@ -75,7 +78,6 @@ impl StackCache {
         let cache = self.get();
         let void = cache.void;
         cache.acc.store(void);
-        cache.acc_spilled = false;
         cache.code.store(void);
         cache.constants.store(void);
         cache.active = false;
@@ -110,49 +112,19 @@ impl StackCache {
         self.get().constants.heap_ref(nogc)
     }
 
-    pub fn spill_acc(&self, acc: Value) {
-        let cache = self.get();
-        debug_assert!(!cache.acc_spilled, "accumulator spilled twice");
-        cache.acc.store(acc);
-        cache.acc_spilled = true;
+    pub fn acc(&self) -> Value {
+        self.get().acc.inner()
     }
 
-    pub fn take_acc(&self) -> Value {
-        let cache = self.get();
-        debug_assert!(cache.acc_spilled, "accumulator taken without spill");
-        cache.acc_spilled = false;
-        cache.acc.inner()
-    }
-
-    pub fn is_acc_spilled(&self) -> bool {
-        self.get().acc_spilled
-    }
-
-    pub fn reset_acc_spill(&self) {
-        let cache = self.get();
-        let void = cache.void;
-        cache.acc.store(void);
-        cache.acc_spilled = false;
-    }
-
-    pub fn restore_acc_spill(&self, was_spilled: bool) {
-        let cache = self.get();
-        let void = cache.void;
-        cache.acc.store(void);
-        cache.acc_spilled = was_spilled;
+    pub fn set_acc(&self, v: Value) {
+        self.get().acc.store(v);
     }
 }
 
 impl EdgeVisitable for StackCache {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         let cache = self.get();
-        debug_assert!(
-            !cache.active || cache.acc_spilled,
-            "GC visited an active cache with an unspilled accumulator"
-        );
-        if cache.acc_spilled {
-            visitor.visit(cache.acc.as_raw());
-        }
+        visitor.visit(cache.acc.as_raw());
         visitor.visit(cache.code.as_raw());
         visitor.visit(cache.constants.as_raw());
     }
