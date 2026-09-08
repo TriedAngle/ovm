@@ -4,9 +4,9 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 use vm::{
-    AllocError, EdgeVisitable, GcSlice, GlobalHeap, Handle, HandleData, HandleScope, Heap,
-    HeapBackend, InternedString, Object, Register, RootHandles, RootVisitor, Smi, StringInterner,
-    Value, Visitor, bootstrap_basics, bootstrap_well_known, intern_well_known_strings,
+    AllocError, EdgeVisitable, GlobalHeap, Handle, HandleData, HandleScope, Heap, HeapBackend,
+    InternedString, Object, Register, RootHandles, RootVisitor, Smi, StringInterner, Value,
+    Visitor, bootstrap_basics, bootstrap_well_known, intern_well_known_strings,
 };
 
 pub mod builtins;
@@ -165,8 +165,10 @@ impl Thread {
 
         // don't leak pending exception if it exists
         let _ = self.state.take_pending_exception();
-        let args = unsafe { GcSlice::from_slice(args) };
-        interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args, None)
+        self.state.handle_scope(|scope| {
+            let args = scope.stage(args);
+            interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args, None)
+        })
     }
 
     pub fn error_object(&mut self, err: VmError) -> Result<Value, VmError> {
@@ -175,9 +177,10 @@ impl Thread {
 
     pub fn run_native(&mut self, f: NativeFn, args: &[Value]) -> Result<Value, VmError> {
         let mut nctx = NativeContext::new(&self.vm, &mut self.heap, &self.state);
-        // TODO: fix this somehow;  the native must not read it after move
-        let args = unsafe { GcSlice::from_slice(args) };
-        f(&mut nctx, args)
+        // stage a rooted copy: the native may keep reading it across its
+        // own allocations
+        self.state
+            .handle_scope(|scope| f(&mut nctx, scope.stage(args)))
     }
 
     /// Parse + compile + materialize + run a script to completion.

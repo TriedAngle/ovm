@@ -6,8 +6,8 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, HeapRef, NoGc, RawCell,
-    Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, HeapObject, HeapPtr, HeapRef, Map,
+    NoGc, RawCell, Tagged, Value, Visitor,
 };
 
 /// A rooted reference to a `T` that survives relocation by the GC.
@@ -122,6 +122,21 @@ impl HandleDataImpl {
         self.blocks.push(block);
     }
 
+    /// Reserve `n` contiguous slots in the current block, extending first
+    /// when the remainder is too small.
+    fn allocate_block(&mut self, n: usize) -> *mut Value {
+        assert!(
+            n <= HANDLE_BLOCK_SIZE,
+            "cannot stage more values than one handle block"
+        );
+        if self.next.addr() + n > self.limit.addr() {
+            self.extend();
+        }
+        let start = self.next;
+        self.next = unsafe { start.add(n) };
+        start
+    }
+
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         for block in &self.blocks {
             let start = block.as_ptr() as *mut Value;
@@ -202,9 +217,24 @@ impl<'d> HandleScope<'d> {
         Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
     }
 
-    // TODO: get rid of this
-    pub unsafe fn handle_value<T>(&self, value: Value) -> Handle<'_, T> {
-        self.handle(unsafe { Tagged::from_value_unchecked(value) })
+    pub fn stage(&self, args: &[Value]) -> GcSlice<'_> {
+        let inner = unsafe { &*self.data.as_ptr() }.inner();
+        let start = inner.allocate_block(args.len());
+        for (i, v) in args.iter().enumerate() {
+            debug_assert!(!v.is_weak_ptr(), "weak value staged for a call");
+            unsafe { *start.add(i) = *v };
+        }
+        unsafe { GcSlice::from_slice(core::slice::from_raw_parts(start, args.len())) }
+    }
+
+    pub fn cast<T: HeapObject>(&self, value: Value) -> Option<Handle<'_, T>> {
+        let ptr = HeapPtr::decode_strong(value)?;
+        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.get();
+        let kind = unsafe { HeapPtr::<Map>::from(map).as_ref() }.kind().kind();
+        if !T::matches_kind(kind) {
+            return None;
+        }
+        Some(self.handle(unsafe { Tagged::from_value_unchecked(value) }))
     }
 
     pub fn escapable_scope<'a>(&'a mut self) -> EscapableHandleScope<'a, 'd> {
@@ -334,6 +364,15 @@ pub struct GcSlice<'a> {
 }
 
 impl<'a> GcSlice<'a> {
+    /// The empty argument list.
+    pub const EMPTY: GcSlice<'static> = GcSlice { slice: &[] };
+
+    /// # Safety
+    /// The slice must point at memory the GC visits for as long as it is
+    /// alive: rooted scope slots ([`HandleScope::stage`]), the register
+    /// file, or caller-owned memory that the callee stages into the frame
+    /// before allocating. Raw unrooted copies must be consumed before any
+    /// GC can run.
     pub unsafe fn from_slice(slice: &'a [Value]) -> Self {
         Self { slice }
     }

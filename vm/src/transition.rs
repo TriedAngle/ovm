@@ -540,7 +540,7 @@ impl Object {
         receiver: Value,
         proto: Value,
     ) -> Result<(), VmError> {
-        let receiver_handle = unsafe { scope.handle_value::<Object>(receiver) };
+        let receiver_handle = scope.cast::<Object>(receiver).ok_or(VmError::Type)?;
 
         let is_null = proto == heap.known().null.value();
         if !is_null && !proto.is_strong_ptr() {
@@ -623,7 +623,10 @@ fn root_define_inputs<'s>(
     receiver: Value,
     name: SlotName,
 ) -> (Handle<'s, Object>, Handle<'s, SlotName>) {
-    let receiver = unsafe { scope.handle_value::<Object>(receiver) };
+    // store paths only reach here for object receivers (lookup dispatch)
+    let receiver = scope
+        .cast::<Object>(receiver)
+        .expect("store receiver is an object");
     let name = scope.handle(name.tagged());
     (receiver, name)
 }

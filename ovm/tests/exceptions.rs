@@ -78,7 +78,7 @@ fn throw_is_caught_in_same_function() {
             1,
             Some(&[HandlerEntryInit::new(0, 3, 4)]),
         );
-        thread.execute(unsafe { scope.handle_value::<vm::Object>(f) }, &[])
+        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 99);
     // catching consumes the pending exception
@@ -98,7 +98,7 @@ fn throw_any_value_escapes_as_sentinel() {
 
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &program, &[], 0, None);
-        thread.execute(unsafe { scope.handle_value::<vm::Object>(f) }, &[])
+        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
     });
     assert_eq!(result, Ok(thread.heap().known().exception.value()));
     assert_eq!(
@@ -132,7 +132,7 @@ fn innermost_handler_wins() {
     ];
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &program, &[], 0, Some(&entries));
-        thread.execute(unsafe { scope.handle_value::<vm::Object>(f) }, &[])
+        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 100);
 }
@@ -171,7 +171,7 @@ fn exception_unwinds_to_caller() {
             1,
             Some(&[HandlerEntryInit::new(0, 9, 9)]),
         );
-        let result = thread.execute(unsafe { scope.handle_value::<vm::Object>(caller) }, &[]);
+        let result = thread.execute(scope.cast::<vm::Object>(caller).unwrap(), &[]);
         assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
     });
 }
@@ -200,7 +200,7 @@ fn rethrow_from_finally_escapes_past_its_own_handler() {
             0,
             Some(&[HandlerEntryInit::new(0, 4, 4)]),
         );
-        thread.execute(unsafe { scope.handle_value::<vm::Object>(f) }, &[])
+        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
     });
     assert_eq!(result, Ok(thread.heap().known().exception.value()));
     assert_eq!(thread.take_pending_exception(), Some(smi(3)));
@@ -221,7 +221,7 @@ fn stack_overflow_during_call_is_throwable() {
 
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &program, &[], 1, None);
-        let handle = unsafe { scope.handle_value::<vm::Object>(f) };
+        let handle = scope.cast::<vm::Object>(f).unwrap();
         thread.execute(handle, &[f])
     });
     assert_eq!(result, Ok(thread.heap().known().exception.value()));
@@ -248,7 +248,7 @@ fn stack_overflow_during_call_is_throwable() {
     emit(&mut good, Opcode::Return, &[]);
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &good, &[], 0, None);
-        thread.execute(unsafe { scope.handle_value::<vm::Object>(f) }, &[])
+        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 5);
 }
