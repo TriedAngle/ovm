@@ -12,7 +12,7 @@ use vm::{
 };
 
 use crate::natives::NativeIndex;
-use crate::{ContextState, VM, materialize::materialize_closure_vm, runtime::to_numeric};
+use crate::{ContextState, VM, materialize::materialize_closure_vm, runtime::Runtime};
 
 /// Register the builtin natives.
 pub fn register_builtin_natives(vm: &mut VM) -> BuiltinIndices {
@@ -681,7 +681,7 @@ fn number_constructor(
 ) -> Result<Value, VmError> {
     let arg = args.get(1).unwrap_or(Smi::new(0).encode());
     let (vm, heap, state) = nctx.split();
-    let n = match to_numeric(vm, heap, state, arg)? {
+    let n = match Runtime::to_numeric(vm, heap, state, arg)? {
         Some(n) => n,
         None => return Ok(nctx.heap().known().exception.value()),
     };
@@ -1042,7 +1042,7 @@ fn is_nan(
 ) -> Result<Value, VmError> {
     let arg = args.get(1).unwrap_or(nctx.heap().known().undefined.value());
     let (vm, heap, state) = nctx.split();
-    let n = match to_numeric(vm, heap, state, arg)? {
+    let n = match Runtime::to_numeric(vm, heap, state, arg)? {
         Some(n) => n,
         None => return Ok(heap.known().exception.value()),
     };
@@ -1079,7 +1079,7 @@ fn get_property(
     name: &str,
 ) -> Result<Value, VmError> {
     let name = state.handle_scope(|scope| vm.interner().intern(heap, &scope, name).value());
-    match crate::runtime::get_property(vm, heap, state, receiver, name)? {
+    match Runtime::get_property(vm, heap, state, receiver, name)? {
         crate::runtime::Coercion::Value(v) => Ok(v),
         crate::runtime::Coercion::Threw => Ok(heap.known().exception.value()),
     }

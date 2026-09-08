@@ -1,7 +1,8 @@
 use crate::token::{Span, Token, TokenKind};
 use crate::{
     Ast, Bookmark, CharStream, ClassId, ClassInfo, ClassMember, DeclKind, FunctionId, FunctionInfo,
-    Node, NodeId, NodeList, PropKind, Scanner, ScopeId, ScopeKind, Symbol, SymbolTable, VarKind,
+    FunctionKind, Node, NodeId, NodeList, PropKind, Scanner, ScopeId, ScopeKind, Symbol,
+    SymbolTable, VarKind,
 };
 
 #[derive(Debug, Clone)]
@@ -38,8 +39,7 @@ fn is_identifier_like(kind: TokenKind) -> bool {
 #[derive(Clone, Copy, Default)]
 struct FnFlags {
     declaration: bool,
-    generator: bool,
-    arrow: bool,
+    kind: FunctionKind,
 }
 
 fn starts_property_key(kind: TokenKind) -> bool {
@@ -124,8 +124,7 @@ impl<S: CharStream> Parser<S> {
             body: None,
             literal_id,
             is_declaration: false,
-            is_generator: false,
-            is_arrow: false,
+            kind: FunctionKind::Normal,
             strict: false,
             lazy_data: None,
         });
@@ -747,8 +746,11 @@ impl<S: CharStream> Parser<S> {
             name,
             FnFlags {
                 declaration: is_declaration,
-                generator,
-                arrow: false,
+                kind: if generator {
+                    FunctionKind::Generator
+                } else {
+                    FunctionKind::Normal
+                },
             },
         )
     }
@@ -812,8 +814,7 @@ impl<S: CharStream> Parser<S> {
             body: None,
             literal_id,
             is_declaration: flags.declaration,
-            is_generator: flags.generator,
-            is_arrow: flags.arrow,
+            kind: flags.kind,
             strict,
             lazy_data: None,
         })
@@ -865,7 +866,7 @@ impl<S: CharStream> Parser<S> {
             None,
             params,
             FnFlags {
-                arrow: true,
+                kind: FunctionKind::Arrow,
                 ..Default::default()
             },
         );
@@ -1007,9 +1008,24 @@ impl<S: CharStream> Parser<S> {
                 Some(false) => PropKind::Set,
                 None => PropKind::Method,
             };
+            let function_kind = if is_constructor_name {
+                if superclass.is_some() {
+                    FunctionKind::DerivedClassConstructor
+                } else {
+                    FunctionKind::BaseClassConstructor
+                }
+            } else {
+                function_kind_for_property(kind)
+            };
             // class members are always strict
-            let (value, _) =
-                self.parse_method_value(member_start, key_sym, kind, true, key_span)?;
+            let (value, _) = self.parse_method_value(
+                member_start,
+                key_sym,
+                kind,
+                function_kind,
+                true,
+                key_span,
+            )?;
             members.push(ClassMember {
                 key,
                 value,
@@ -1446,8 +1462,14 @@ impl<S: CharStream> Parser<S> {
         if let Some(is_get) = self.eat_accessor_prefix()? {
             let (key, key_sym, computed) = self.parse_property_key()?;
             let kind = if is_get { PropKind::Get } else { PropKind::Set };
-            let (value, vspan) =
-                self.parse_method_value(t.span.start, key_sym, kind, false, t.span)?;
+            let (value, vspan) = self.parse_method_value(
+                t.span.start,
+                key_sym,
+                kind,
+                function_kind_for_property(kind),
+                false,
+                t.span,
+            )?;
             return Ok(self.ast.add(
                 Node::ObjectProperty {
                     key,
@@ -1466,6 +1488,7 @@ impl<S: CharStream> Parser<S> {
                 key_span.start,
                 shorthand,
                 PropKind::Method,
+                FunctionKind::Method,
                 false,
                 key_span,
             )?;
@@ -1532,10 +1555,18 @@ impl<S: CharStream> Parser<S> {
         start: u32,
         name: Option<Symbol>,
         kind: PropKind,
+        function_kind: FunctionKind,
         force_strict: bool,
         err_span: Span,
     ) -> Result<(NodeId, Span), ParseError> {
-        let fid = self.parse_function_rest(start, name, FnFlags::default())?;
+        let fid = self.parse_function_rest(
+            start,
+            name,
+            FnFlags {
+                kind: function_kind,
+                ..Default::default()
+            },
+        )?;
         if force_strict {
             self.ast.function_mut(fid).strict = true;
         }
@@ -1607,6 +1638,15 @@ impl<S: CharStream> Parser<S> {
                 "invalid assignment target",
             )),
         }
+    }
+}
+
+fn function_kind_for_property(kind: PropKind) -> FunctionKind {
+    match kind {
+        PropKind::Method => FunctionKind::Method,
+        PropKind::Get => FunctionKind::Getter,
+        PropKind::Set => FunctionKind::Setter,
+        PropKind::Init => unreachable!("data properties do not contain method functions"),
     }
 }
 

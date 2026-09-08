@@ -25,7 +25,7 @@ pub use interner::StringInterner;
 pub use lookup::{Key, LoadOutcome, Lookup, classify_key, element_value, load_outcome};
 pub use object::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
-    FixedArray, FixedByteArray, Float, HandlerEntry, HandlerEntryInit, HandlerTable,
+    FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry, HandlerEntryInit, HandlerTable,
     HandlerTableInit, Header, HeapObject, InternedString, Map, MapInit, MapKind, Object,
     ObjectInit, ObjectKind, ObjectSlotsInit, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags,
     SlotName, Symbol, VMString, call_target, store_array_element, string_content_hash,

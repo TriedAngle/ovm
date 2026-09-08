@@ -263,13 +263,33 @@ pub struct FunctionInfo {
     /// stable across a skipping (pre)parse and a later full re-parse
     pub literal_id: u32,
     pub is_declaration: bool,
-    /// `function*` — yields an iterator, body can suspend via `yield`
-    pub is_generator: bool,
-    /// `=>` — no own `this`/`arguments` binding, not constructible
-    pub is_arrow: bool,
+    pub kind: FunctionKind,
     pub strict: bool,
     /// preparse data slot for lazy body skipping
     pub lazy_data: Option<Box<[u8]>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FunctionKind {
+    #[default]
+    Normal,
+    Generator,
+    Arrow,
+    Method,
+    Getter,
+    Setter,
+    BaseClassConstructor,
+    DerivedClassConstructor,
+}
+
+impl FunctionKind {
+    pub const fn is_generator(self) -> bool {
+        matches!(self, Self::Generator)
+    }
+
+    pub const fn is_arrow(self) -> bool {
+        matches!(self, Self::Arrow)
+    }
 }
 
 pub struct ClassMember {

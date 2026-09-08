@@ -2,7 +2,7 @@
 
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{ScriptError, Thread, VM};
-use vm::{Float, Smi, VMString, Value};
+use vm::{Float, FunctionKind, Lookup, SlotName, Smi, VMString, Value, ValueRef};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
     let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
@@ -257,6 +257,90 @@ fn constructors_without_builtins_still_evaluate() {
     );
     // an object result wins over the receiver
     assert_eq!(run_smi("function C() { return {y: 2}; } new C().y;"), 2);
+}
+
+#[test]
+fn function_metadata_and_public_properties_survive_materialization() {
+    let (function, mut thread) = run_value("(function named(a, b) { 'use strict'; });");
+    thread.handle_scope(|thread, scope| {
+        let name = thread.intern(&scope, "name").value();
+        let length = thread.intern(&scope, "length").value();
+        let prototype = thread.intern(&scope, "prototype").value();
+        let constructor = thread.intern(&scope, "constructor").value();
+        let expected_name = thread.intern(&scope, "named").value();
+        thread.heap().no_gc(|nogc| {
+            let function_value = function;
+            let ValueRef::Object(function) = function.value_ref(nogc) else {
+                panic!("result must be a function object")
+            };
+            let function = function.as_ref();
+            let info = function
+                .callable_info(nogc)
+                .expect("function must carry callable info");
+            assert_eq!(info.function_kind(), FunctionKind::Normal);
+            assert_eq!(info.formal_parameter_count(), 2);
+            assert!(info.is_strict());
+            assert_eq!(info.name(nogc), Some(expected_name));
+
+            match function.lookup(nogc, SlotName::from_value(name)) {
+                Lookup::Data { slot, flags, .. } => {
+                    assert_eq!(slot.inner(), expected_name);
+                    assert!(!flags.is_writable());
+                    assert!(!flags.is_enumerable());
+                    assert!(flags.is_configurable());
+                }
+                _ => panic!("function must have a data name property"),
+            }
+            match function.lookup(nogc, SlotName::from_value(length)) {
+                Lookup::Data { slot, flags, .. } => {
+                    assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 2);
+                    assert!(!flags.is_writable());
+                    assert!(!flags.is_enumerable());
+                    assert!(flags.is_configurable());
+                }
+                _ => panic!("function must have a data length property"),
+            }
+            match function.lookup(nogc, SlotName::from_value(prototype)) {
+                Lookup::Data { slot, flags, .. } => {
+                    assert!(flags.is_writable());
+                    assert!(!flags.is_enumerable());
+                    assert!(!flags.is_configurable());
+                    let ValueRef::Object(prototype) = slot.inner().value_ref(nogc) else {
+                        panic!("function prototype must be an object")
+                    };
+                    match prototype
+                        .as_ref()
+                        .lookup(nogc, SlotName::from_value(constructor))
+                    {
+                        Lookup::Data { slot, flags, .. } => {
+                            assert_eq!(slot.inner(), function_value);
+                            assert!(flags.is_writable());
+                            assert!(!flags.is_enumerable());
+                            assert!(flags.is_configurable());
+                        }
+                        _ => panic!("prototype must have a constructor property"),
+                    }
+                }
+                _ => panic!("ordinary function must have a prototype property"),
+            }
+        });
+    });
+}
+
+#[test]
+fn arrows_and_methods_are_not_constructible() {
+    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+    let result = thread
+        .run_script("var arrow = () => 1; var method = ({ m() { return 2; } }).m; new arrow();")
+        .unwrap();
+    assert_eq!(result, thread.heap().known().exception.value());
+    assert!(thread.has_pending_exception());
+    let _ = thread.take_pending_exception();
+
+    let result = thread.run_script("new ({ m() {} }).m();").unwrap();
+    assert_eq!(result, thread.heap().known().exception.value());
+    assert!(thread.has_pending_exception());
 }
 
 #[test]

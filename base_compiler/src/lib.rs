@@ -47,6 +47,12 @@ pub struct HandlerEntry {
 pub struct CompiledFunction {
     pub bytecode: Vec<u8>,
     pub constants: Vec<Constant>,
+    pub name: Option<Vec<u8>>,
+    pub formal_parameter_count: u32,
+    pub kind: parser::FunctionKind,
+    /// Preserved for strict-sensitive runtime operations. Enforcement is
+    /// intentionally deferred until the VM has language-mode-aware stores.
+    pub strict: bool,
     /// Frame size in stack slots: resolver locals + context-save slot +
     /// temporaries.
     pub register_count: u32,

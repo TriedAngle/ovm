@@ -3,9 +3,10 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
-    FixedByteArray, Float, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map, MapInit, MapKind,
-    Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit, SlotFlags, SlotName,
-    Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, ValueRef, string_content_hash,
+    FixedByteArray, Float, FunctionKind, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map,
+    MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit,
+    SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, ValueRef,
+    string_content_hash,
 };
 
 fn smi(v: i64) -> Value {
@@ -86,6 +87,46 @@ fn run_program(
         );
         let callable = callable_object(thread, &scope, callable);
         thread.execute(callable, args)
+    })
+}
+
+fn create_closure_of_kind(
+    thread: &mut Thread,
+    body: &[u8],
+    name: &str,
+    formal_parameter_count: usize,
+    kind: FunctionKind,
+    strict: bool,
+) -> Value {
+    thread.handle_scope(|thread, scope| {
+        let bytecode = thread
+            .heap()
+            .allocate_handle::<FixedByteArray>(body, &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let info = thread.heap().allocate_handle::<CallableInfoObject>(
+            CallableInfoInit {
+                bytecode,
+                constants,
+                register_count: 0,
+                handlers: None,
+            },
+            &scope,
+        );
+        let name = thread.intern(&scope, name).value();
+        thread.heap().no_gc(|nogc| {
+            info.heap_ref(nogc).set_metadata(
+                nogc,
+                Some(name),
+                formal_parameter_count,
+                kind,
+                strict,
+            );
+        });
+
+        let mut program = Vec::new();
+        emit(&mut program, Opcode::CreateClosure, &[0]);
+        emit(&mut program, Opcode::Return, &[]);
+        run_program_consts(&mut *thread, program, 0, &[], &[info.as_tagged().erase()]).unwrap()
     })
 }
 
@@ -2508,6 +2549,105 @@ fn create_closure_shares_callable_info_template() {
             nogc.known().empty_context.as_tagged().erase()
         );
     });
+}
+
+#[test]
+fn create_closure_function_kind_controls_call_and_construct() {
+    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let mut method_body = Vec::new();
+    emit(&mut method_body, Opcode::LoadSmi, &[7]);
+    emit(&mut method_body, Opcode::Return, &[]);
+    let method = create_closure_of_kind(
+        &mut thread,
+        &method_body,
+        "method",
+        1,
+        FunctionKind::Method,
+        true,
+    );
+
+    let prototype = thread.handle_scope(|thread, scope| thread.intern(&scope, "prototype").value());
+    thread.heap().no_gc(|nogc| {
+        let ValueRef::Object(method) = method.value_ref(nogc) else {
+            panic!("method must be an object")
+        };
+        let method = method.as_ref();
+        assert!(method.map_ref(nogc).kind().is_callable());
+        assert!(!method.map_ref(nogc).kind().is_constructor());
+        assert!(matches!(
+            method.lookup(nogc, SlotName::from_value(prototype)),
+            Lookup::NotFound
+        ));
+    });
+
+    let undefined = thread.heap().known().undefined.value();
+    let mut call = Vec::new();
+    emit(&mut call, Opcode::LoadConstant, &[0]);
+    emit(&mut call, Opcode::Store, &[0]);
+    emit(&mut call, Opcode::LoadConstant, &[1]);
+    emit(&mut call, Opcode::Store, &[1]);
+    emit(&mut call, Opcode::CallNoFeedback, &[0, 1, 1]);
+    emit(&mut call, Opcode::Return, &[]);
+    let result = run_program_consts(&mut thread, call, 2, &[], &[method, undefined]).unwrap();
+    assert_eq!(Smi::decode(result).unwrap().value(), 7);
+
+    let mut construct = Vec::new();
+    emit(&mut construct, Opcode::LoadConstant, &[0]);
+    emit(&mut construct, Opcode::Store, &[0]);
+    emit(&mut construct, Opcode::Construct, &[0, 0, 0]);
+    emit(&mut construct, Opcode::Return, &[]);
+    let result = run_program_consts(&mut thread, construct, 1, &[], &[method]);
+    expect_escaped(&mut thread, result, "TypeError");
+
+    let mut constructor_body = Vec::new();
+    emit(&mut constructor_body, Opcode::LoadSmi, &[1]);
+    emit(&mut constructor_body, Opcode::Return, &[]);
+    let class_constructor = create_closure_of_kind(
+        &mut thread,
+        &constructor_body,
+        "C",
+        0,
+        FunctionKind::BaseClassConstructor,
+        true,
+    );
+    thread.heap().no_gc(|nogc| {
+        let ValueRef::Object(constructor) = class_constructor.value_ref(nogc) else {
+            panic!("class constructor must be an object")
+        };
+        let kind = constructor.as_ref().map_ref(nogc).kind();
+        assert!(kind.is_callable());
+        assert!(kind.is_constructor());
+        assert!(kind.is_class_constructor());
+        assert!(matches!(
+            constructor
+                .as_ref()
+                .lookup(nogc, SlotName::from_value(prototype)),
+            Lookup::NotFound
+        ));
+    });
+
+    let mut call = Vec::new();
+    emit(&mut call, Opcode::LoadConstant, &[0]);
+    emit(&mut call, Opcode::Store, &[0]);
+    emit(&mut call, Opcode::LoadConstant, &[1]);
+    emit(&mut call, Opcode::Store, &[1]);
+    emit(&mut call, Opcode::CallNoFeedback, &[0, 1, 1]);
+    emit(&mut call, Opcode::Return, &[]);
+    let result = run_program_consts(&mut thread, call, 2, &[], &[class_constructor, undefined]);
+    expect_escaped(&mut thread, result, "TypeError");
+
+    let mut construct = Vec::new();
+    emit(&mut construct, Opcode::LoadConstant, &[0]);
+    emit(&mut construct, Opcode::Store, &[0]);
+    emit(&mut construct, Opcode::Construct, &[0, 0, 0]);
+    emit(&mut construct, Opcode::Return, &[]);
+    let result = run_program_consts(&mut thread, construct, 1, &[], &[class_constructor]).unwrap();
+    assert!(
+        result.is_strong_ptr(),
+        "construction must return a receiver"
+    );
 }
 
 #[test]

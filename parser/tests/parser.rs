@@ -909,6 +909,10 @@ fn class_declaration() {
         panic!()
     };
     assert_eq!(ast.function(function).params.len(), 2);
+    assert_eq!(
+        ast.function(function).kind,
+        parser::FunctionKind::DerivedClassConstructor
+    );
     // class bodies are always strict
     assert!(ast.function(function).strict);
 }
@@ -934,6 +938,18 @@ fn class_expression_and_members() {
     assert_eq!(c.members[1].kind, parser::PropKind::Get);
     assert_eq!(c.members[2].kind, parser::PropKind::Set);
     assert!(c.members[3].computed);
+    let expected = [
+        parser::FunctionKind::Method,
+        parser::FunctionKind::Getter,
+        parser::FunctionKind::Setter,
+        parser::FunctionKind::Method,
+    ];
+    for (member, expected) in c.members.iter().zip(expected) {
+        let FunctionExpr { function } = *ast.node(member.value) else {
+            panic!()
+        };
+        assert_eq!(ast.function(function).kind, expected);
+    }
 }
 
 #[test]
@@ -961,8 +977,8 @@ fn generator_functions() {
     let FunctionDecl { function } = *stmt(&ast, 0) else {
         panic!()
     };
-    assert!(ast.function(function).is_generator);
-    assert!(!ast.function(function).is_arrow);
+    assert!(ast.function(function).kind.is_generator());
+    assert!(!ast.function(function).kind.is_arrow());
     let VarDecl { decls, .. } = *stmt(&ast, 1) else {
         panic!()
     };
@@ -972,14 +988,14 @@ fn generator_functions() {
     let FunctionExpr { function } = *ast.node(init.unwrap()) else {
         panic!()
     };
-    assert!(ast.function(function).is_generator);
+    assert!(ast.function(function).kind.is_generator());
 
     // plain functions are unaffected
     let ast = parse("function f() {}");
     let FunctionDecl { function } = *stmt(&ast, 0) else {
         panic!()
     };
-    assert!(!ast.function(function).is_generator);
+    assert!(!ast.function(function).kind.is_generator());
 }
 
 #[test]
@@ -990,7 +1006,7 @@ fn arrow_functions() {
         panic!()
     };
     let f = ast.function(function);
-    assert!(f.is_arrow);
+    assert!(f.kind.is_arrow());
     assert_eq!(f.params.len(), 1);
     let Block { stmts } = ast.node(f.body.unwrap()) else {
         panic!()
