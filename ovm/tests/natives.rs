@@ -18,7 +18,7 @@ fn smi_add_adds_and_checks_types() {
     let add = vm.native(NativeIndex::SMI_ADD);
 
     let r = thread.run_native(add, &[smi(0), smi(6), smi(7)]).unwrap();
-    assert_eq!(Smi::decode(r).unwrap().value(), 13);
+    assert_eq!(r.to_i64().unwrap(), 13);
 
     assert_eq!(
         thread.run_native(add, &[smi(0), smi(1)]),
@@ -76,7 +76,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
         let name = thread.intern(&scope, "name").value();
         let type_error = thread.intern(&scope, "TypeError").value();
         thread.heap().no_gc(|nogc| {
-            let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
+            let Some(o) = ex.as_heap_object(nogc) else {
                 panic!("pending exception must be an object");
             };
             match o.as_ref().lookup(nogc, vm::SlotName::from_value(name)) {
@@ -114,5 +114,5 @@ fn register_native_appends_after_well_known() {
     let r = thread
         .run_native(vm.native(idx), &[smi(0), smi(21)])
         .unwrap();
-    assert_eq!(Smi::decode(r).unwrap().value(), 42);
+    assert_eq!(r.to_i64().unwrap(), 42);
 }

@@ -4,7 +4,7 @@ use core::alloc::Layout;
 
 use crate::{
     AccessorPair, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef, Lookup, Map,
-    MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, ValueRef, VmError,
+    MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
 };
 
 #[derive(Clone)]
@@ -68,10 +68,7 @@ impl Value {
                 if !flags.is_writable() {
                     return Err(VmError::Type);
                 }
-                let ValueRef::Object(host) = holder else {
-                    return Err(VmError::Type);
-                };
-                let host = host.as_ref().erase();
+                let host = holder.as_ref().erase();
                 if semantics == StoreSemantics::Shadow && host != receiver {
                     // inherited writable data property: JS creates an own
                     // property on the receiver
@@ -80,7 +77,7 @@ impl Value {
                     }
                     return Ok(StoreOutcome::Transition { receiver, name });
                 }
-                slot.set(nogc, host, Tagged::from_value(value));
+                slot.set(nogc, host, value);
                 Ok(StoreOutcome::Done)
             }
             Lookup::NotFound => {
@@ -155,7 +152,7 @@ impl Transition {
                 old_row,
             )
         };
-        let prototype = scope.handle(Tagged::from_value(prototype));
+        let prototype = scope.handle(prototype);
 
         let grow = !flags.is_accessor()
             && match change {
@@ -285,11 +282,10 @@ impl Transition {
     fn write_slot(heap: &mut Heap, receiver: Handle<Object>, index: usize, value: Value) {
         let nogc = heap.guard();
         let offset = receiver.heap_ref(&nogc).map_ref(&nogc).descriptors()[index].offset();
-        receiver.heap_ref(&nogc).slot(&nogc, offset).set(
-            &nogc,
-            receiver.value(),
-            Tagged::from_value(value),
-        );
+        receiver
+            .heap_ref(&nogc)
+            .slot(&nogc, offset)
+            .set(&nogc, receiver.value(), value);
     }
 
     fn define(
@@ -303,7 +299,7 @@ impl Transition {
         let flags = desc.flags();
         match desc {
             PropertyDescriptor::Data { value, .. } => {
-                let value = scope.handle(Tagged::from_value(value));
+                let value = scope.handle(value);
 
                 let grow = match change {
                     Change::Append => true,
@@ -334,8 +330,8 @@ impl Transition {
                 }
             }
             PropertyDescriptor::Accessor { get, set, .. } => {
-                let get = scope.handle(Tagged::from_value(get));
-                let set = scope.handle(Tagged::from_value(set));
+                let get = scope.handle(get);
+                let set = scope.handle(set);
                 Self::target(
                     heap,
                     scope,
@@ -573,7 +569,7 @@ impl Object {
                     if p == receiver {
                         return Err(VmError::Type);
                     }
-                    let ValueRef::Object(o) = p.value_ref(&nogc) else {
+                    let Some(o) = p.as_heap_object(&nogc) else {
                         break;
                     };
                     p = o.as_ref().map_ref(&nogc).prototype.inner();
@@ -589,7 +585,7 @@ impl Object {
             }
         }
 
-        let proto_handle = scope.handle(Tagged::from_value(proto));
+        let proto_handle = scope.handle(proto);
 
         let descriptor_count = {
             let nogc = heap.guard();
@@ -693,7 +689,7 @@ fn validate_define<'a>(
                 return None;
             }
 
-            let offset = Smi::decode(cur_desc_value).unwrap().value() as usize;
+            let offset = cur_desc_value.to_i64().unwrap() as usize;
             if !Compare::same_value(nogc, value, receiver.slot(nogc, offset).inner()) {
                 return None;
             }

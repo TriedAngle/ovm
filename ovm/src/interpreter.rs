@@ -4,7 +4,7 @@ use vm::{
     AccessorPair, CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert,
     FixedArray, Float, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
     ObjectSlotsInit, PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics,
-    Tagged, VMString, Value, ValueRef, call_target, classify_key, element_value, load_outcome,
+    Tagged, VMString, Value, call_target, classify_key, element_value, load_outcome,
     store_array_element,
 };
 
@@ -82,7 +82,7 @@ fn start(
 
 fn callable_name<'a>(nogc: &'a NoGc<'a>, stack: &Stack, meta: &FrameMeta, idx: usize) -> SlotName {
     let callable = stack.callable_slot(meta).inner();
-    let ValueRef::Object(callable) = callable.value_ref(nogc) else {
+    let Some(callable) = callable.as_heap_object(nogc) else {
         panic!("frame callable must be an object");
     };
     let info = callable
@@ -116,7 +116,7 @@ fn set_frame_context(
 /// The closure context a freshly pushed frame starts with: the callee's
 /// immutable captured context (its closure slot).
 fn closure_context<'a>(nogc: &'a NoGc<'a>, callable: Tagged<Object>) -> Value {
-    let ValueRef::Object(obj) = callable.erase().value_ref(nogc) else {
+    let Some(obj) = callable.erase().as_heap_object(nogc) else {
         panic!("callable must be an object");
     };
     obj.as_ref()
@@ -219,10 +219,10 @@ fn exception_dispatch(
     let cache = &state.cache;
     loop {
         let handled = heap.no_gc(|nogc| {
-            let ValueRef::Object(obj) = stack
+            let Some(obj) = stack
                 .callable_slot(&cache.frame_meta())
                 .inner()
-                .value_ref(nogc)
+                .as_heap_object(nogc)
             else {
                 return None;
             };
@@ -421,8 +421,8 @@ fn step(
         Opcode::Add => {
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
-                if let Some(r) = a.value().checked_add(b.value()) {
+            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
+                if let Some(r) = a.checked_add(b) {
                     if Smi::in_range(r) {
                         result = Some(Smi::new(r).encode());
                     }
@@ -484,8 +484,8 @@ fn step(
         Opcode::Sub => {
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
-                if let Some(r) = a.value().checked_sub(b.value()) {
+            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
+                if let Some(r) = a.checked_sub(b) {
                     if Smi::in_range(r) {
                         result = Some(Smi::new(r).encode());
                     }
@@ -513,8 +513,8 @@ fn step(
         Opcode::Mul => {
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
-                if let Some(r) = a.value().checked_mul(b.value()) {
+            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
+                if let Some(r) = a.checked_mul(b) {
                     if Smi::in_range(r) {
                         result = Some(Smi::new(r).encode());
                     }
@@ -544,9 +544,9 @@ fn step(
             // or NaN, MIN/-1 overflows to a double.
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
-                if b.value() != 0 && a.value() % b.value() == 0 {
-                    if let Some(r) = a.value().checked_div(b.value()) {
+            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
+                if b != 0 && a % b == 0 {
+                    if let Some(r) = a.checked_div(b) {
                         result = Some(Smi::new(r).encode());
                     }
                 }
@@ -574,9 +574,9 @@ fn step(
             // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.
             let other = stack.reg(&meta, ops.reg(0));
             let mut result = None;
-            if let (Some(a), Some(b)) = (Smi::decode(cache.acc()), Smi::decode(other)) {
-                if b.value() != 0 {
-                    result = Some(Smi::new(a.value() % b.value()).encode());
+            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
+                if b != 0 {
+                    result = Some(Smi::new(a % b).encode());
                 }
             }
             match result {
@@ -618,23 +618,20 @@ fn step(
         }
         Opcode::BitwiseOr => {
             // ToInt32 semantics on the (integer) smi inputs
-            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
-            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
-                .value() as i32;
+            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as i32;
+            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as i32;
             cache.set_acc(Smi::new((a | b) as i64).encode());
             Step::Next
         }
         Opcode::BitwiseXor => {
-            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
-            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
-                .value() as i32;
+            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as i32;
+            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as i32;
             cache.set_acc(Smi::new((a ^ b) as i64).encode());
             Step::Next
         }
         Opcode::BitwiseAnd => {
-            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
-            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
-                .value() as i32;
+            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as i32;
+            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as i32;
             cache.set_acc(Smi::new((a & b) as i64).encode());
             Step::Next
         }
@@ -656,9 +653,8 @@ fn step(
         }
         Opcode::ShiftRightLogical => {
             // ToUint32(lhs) >>> (ToUint32(rhs) & 31): always non-negative
-            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as u32;
-            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
-                .value() as u32;
+            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as u32;
+            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as u32;
             cache.set_acc(Smi::new(a.wrapping_shr(b & 31) as i64).encode());
             Step::Next
         }
@@ -698,8 +694,7 @@ fn step(
             Step::Next
         }
         Opcode::Negate => {
-            if let Some(smi) = Smi::decode(cache.acc()) {
-                let v = smi.value();
+            if let Some(v) = cache.acc().to_i64() {
                 cache.set_acc(if v == 0 {
                     state.handle_scope(|scope| heap.allocate_handle::<Float>(-0.0, &scope).value())
                 } else if v == Smi::MIN {
@@ -741,7 +736,7 @@ fn step(
             // result wins over the receiver.
             let constructible = heap.no_gc(|nogc| {
                 let callee = stack.reg(&meta, ops.reg(0));
-                let ValueRef::Object(obj) = callee.value_ref(nogc) else {
+                let Some(obj) = callee.as_heap_object(nogc) else {
                     return false;
                 };
                 obj.as_ref()
@@ -1050,7 +1045,7 @@ fn step(
             match key {
                 Key::Element(i) => {
                     let is_array = heap.no_gc(|nogc| {
-                        let ValueRef::Object(obj) = receiver.value_ref(nogc) else {
+                        let Some(obj) = receiver.as_heap_object(nogc) else {
                             return false;
                         };
                         obj.as_ref().is_array(nogc)
@@ -1098,7 +1093,7 @@ fn step(
         Opcode::DefineNamedOwnProperty | Opcode::DefineKeyedOwnProperty => {
             let receiver = stack.reg(&meta, ops.reg(0));
             let (name, desc) = step_try!(heap.no_gc(|nogc| {
-                if !matches!(receiver.value_ref(nogc), ValueRef::Object(_)) {
+                if !receiver.as_heap_object(nogc).is_some() {
                     return Err(VmError::Type);
                 }
                 let name = match op {
@@ -1370,7 +1365,7 @@ fn step(
                     .heap_ref(nogc)
                     .as_ref()
                     .element_slot(ops.idx(0))
-                    .set(nogc, host, Tagged::from_value(cache.acc()));
+                    .set(nogc, host, cache.acc());
                 Ok(())
             }));
             Step::Next
@@ -1423,7 +1418,7 @@ fn step(
                             .ok_or(VmError::Type)?;
                         let target = dynamic_slot(nogc, &mut context, name)?;
                         let host = context.into_tagged().erase();
-                        target.set(nogc, host, Tagged::from_value(cache.acc()));
+                        target.set(nogc, host, cache.acc());
                         Ok(())
                     }));
                 }

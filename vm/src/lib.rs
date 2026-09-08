@@ -34,9 +34,7 @@ pub use transition::{
     Change, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition, TransitionGuard,
     TransitionLock,
 };
-pub use value::{
-    HeapPtr, MaybeWeak, STRONG_PTR, Smi, Tagged, Value, ValueRef, WEAK_PTR, Word, encode_smi,
-};
+pub use value::{HeapPtr, MaybeWeak, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR, Word, encode_smi};
 
 pub type Local<'scope, T> = Handle<'scope, T>;
 // pseudo-static

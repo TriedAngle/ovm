@@ -59,7 +59,7 @@ pub fn materialize_closure_vm<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.as_tagged().erase(), context.as_tagged().erase()],
+                values: &[info.value(), context.value()],
                 elements: empty_elements,
                 length: 0,
             },
@@ -94,7 +94,7 @@ fn materialize_function<'s>(
             Constant::Null => heap.known().null.value(),
             Constant::Callable(child) => {
                 let info = materialize_function(vm, heap, state, scope, script, infos, *child)?;
-                info.as_tagged().erase()
+                info.value()
             }
             Constant::ContextNames(names) => {
                 let interned: Vec<vm::Value> = names
@@ -169,5 +169,5 @@ fn intern(
 ) -> vm::Value {
     // constant strings are WTF-8 (lone surrogates as the 3-byte pattern);
     // the interner is byte-based, so they round-trip without loss
-    vm.interner().intern(heap, scope, s).as_tagged().erase()
+    vm.interner().intern(heap, scope, s).value()
 }
