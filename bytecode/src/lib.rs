@@ -1,3 +1,41 @@
+/// Attribute bits for the define-own-property opcodes (negated-attribute
+/// form). Combinations are raw `u32`
+/// bit-ors of the discriminants (see the `BitOr` impls), which is the
+/// operand encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum PropertyFlags {
+    /// the data value is not writable
+    ReadOnly = 1 << 0,
+    /// the property is not enumerable
+    DontEnum = 1 << 1,
+    /// the property is not configurable
+    DontDelete = 1 << 2,
+    /// acc holds an `AccessorPair` (get/set) instead of a data value
+    Accessor = 1 << 3,
+}
+
+impl PropertyFlags {
+    /// The operand encoding of this attribute.
+    pub const fn bits(self) -> u32 {
+        self as u32
+    }
+}
+
+impl core::ops::BitOr for PropertyFlags {
+    type Output = u32;
+    fn bitor(self, rhs: Self) -> u32 {
+        self.bits() | rhs.bits()
+    }
+}
+
+impl core::ops::BitOr<PropertyFlags> for u32 {
+    type Output = u32;
+    fn bitor(self, rhs: PropertyFlags) -> u32 {
+        self | rhs.bits()
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
@@ -36,13 +74,22 @@ pub enum Opcode {
 
     LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
     StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
-    // JS semantics: a writable inherited data property is shadowed with a new
-    // own property on the receiver instead of written through to the holder.
-    StoreNamedPropertyShadow, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
+    // write-through variant: inherited data properties are written at the
+    // holder, never shadowed on the receiver
+    StoreNamedPropertyNoShadow, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
 
-    LoadKeyedProperty,        // reg (obj) idx (feedback); key in acc -> acc
-    StoreKeyedProperty,       // acc -> reg (obj) reg (key) idx (feedback)
-    StoreKeyedPropertyShadow, // acc -> reg (obj) reg (key) idx (feedback)
+    LoadKeyedProperty,          // reg (obj) idx (feedback); key in acc -> acc
+    StoreKeyedProperty,         // acc -> reg (obj) reg (key) idx (feedback)
+    StoreKeyedPropertyNoShadow, // acc -> reg (obj) reg (key) idx (feedback)
+
+    // [[DefineOwnProperty]] with exact attributes (class member
+    // installation): the value in acc is a plain value or, with
+    // PropertyFlags::Accessor, an AccessorPair produced by
+    // CreateAccessorPair. Define sites are strict-mode code: a rejected
+    // define throws a TypeError.
+    CreateAccessorPair,     // reg (get) reg (set) -> acc (AccessorPair)
+    DefineNamedOwnProperty, // acc -> reg (obj) idx (constant pool name) uimm (PropertyFlags bits) idx (feedback)
+    DefineKeyedOwnProperty, // acc -> reg (obj) reg (key) uimm (PropertyFlags bits) idx (feedback)
 
     // for methods the `self` is the first element in the reglist
     Call,           // reg (callee) reglist (base) regcount (count) idx (feedback) -> acc
@@ -196,10 +243,13 @@ impl Opcode {
             b if b == StoreDynamicName as u8 => StoreDynamicName,
             b if b == LoadNamedProperty as u8 => LoadNamedProperty,
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
-            b if b == StoreNamedPropertyShadow as u8 => StoreNamedPropertyShadow,
+            b if b == StoreNamedPropertyNoShadow as u8 => StoreNamedPropertyNoShadow,
             b if b == LoadKeyedProperty as u8 => LoadKeyedProperty,
             b if b == StoreKeyedProperty as u8 => StoreKeyedProperty,
-            b if b == StoreKeyedPropertyShadow as u8 => StoreKeyedPropertyShadow,
+            b if b == StoreKeyedPropertyNoShadow as u8 => StoreKeyedPropertyNoShadow,
+            b if b == CreateAccessorPair as u8 => CreateAccessorPair,
+            b if b == DefineNamedOwnProperty as u8 => DefineNamedOwnProperty,
+            b if b == DefineKeyedOwnProperty as u8 => DefineKeyedOwnProperty,
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
             b if b == CallNative as u8 => CallNative,
@@ -268,12 +318,18 @@ impl Opcode {
             Self::LoadDynamicName | Self::StoreDynamicName => &[Index],
 
             Self::LoadNamedProperty => &[Register, Index, Index],
-            Self::StoreNamedProperty => &[Register, Index, Index],
-            Self::StoreNamedPropertyShadow => &[Register, Index, Index],
+            Self::StoreNamedProperty | Self::StoreNamedPropertyNoShadow => {
+                &[Register, Index, Index]
+            }
 
             Self::LoadKeyedProperty => &[Register, Index],
-            Self::StoreKeyedProperty => &[Register, Register, Index],
-            Self::StoreKeyedPropertyShadow => &[Register, Register, Index],
+            Self::StoreKeyedProperty | Self::StoreKeyedPropertyNoShadow => {
+                &[Register, Register, Index]
+            }
+
+            Self::CreateAccessorPair => &[Register, Register],
+            Self::DefineNamedOwnProperty => &[Register, Index, UImmediate, Index],
+            Self::DefineKeyedOwnProperty => &[Register, Register, UImmediate, Index],
 
             Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
