@@ -1,160 +1,128 @@
-use bytecode::{Opcode, emit};
-use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::natives::NativeIndex;
-use ovm::{Thread, VM};
-use vm::{
-    CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, Float, Handle, HandleScope,
-    HandlerEntryInit, HandlerTable, HandlerTableInit, Object, ObjectSlotsInit, Smi,
-};
+//! ovm command-line front end.
+//!
+//! `ovm <file.js>...` runs script files in order; `ovm` with no files starts
+//! a REPL. Each script runs in its own global scope. `--repl` drops into the
+//! REPL after the files have run.
 
-/// Build a bytecode function object (empty constants table).
-fn callable<'s>(
-    thread: &mut Thread,
-    scope: &'s HandleScope<'_>,
-    program: &[u8],
-    register_count: usize,
-    handlers: Option<&[HandlerEntryInit]>,
-) -> Handle<'s, Object> {
-    let empty_context = thread.heap().known().empty_context;
-    let bytecode = thread
-        .heap()
-        .allocate_handle::<FixedByteArray>(program, scope);
-    let constants = thread.heap().allocate_handle::<FixedArray>(&[], scope);
-    let handlers = handlers.map(|entries| {
-        thread
-            .heap()
-            .allocate_handle::<HandlerTable>(HandlerTableInit { entries }, scope)
-    });
-    let callable = thread.heap().allocate_handle::<CallableInfoObject>(
-        CallableInfoInit {
-            bytecode,
-            constants,
-            register_count,
-            handlers,
-        },
-        scope,
-    );
-    let map = thread.heap().known().function_map;
-    let empty_elements = thread.heap().known().empty_fixed_array.erase();
-    thread
-        .heap()
-        .allocate_object(
-            scope,
-            ObjectSlotsInit {
-                map,
-                values: &[
-                    callable.as_tagged().erase(),
-                    empty_context.as_tagged().erase(),
-                ],
-                elements: empty_elements,
-                length: 0,
-            },
-        )
-        .into_handle(scope)
-}
+use std::io::Write;
+
+use dummy_heap::{DummyHeap, DummyHeapConfig};
+use ovm::{Thread, VM};
+use vm::{Float, Smi, VMString, Value};
 
 fn main() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).expect("failed to create heap");
+    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default())
+        .expect("failed to create heap");
     let mut thread = vm.attach();
 
-    thread.handle_scope(|thread, scope| {
-        let interned = thread.intern(&scope, "hello, ovm");
-        let again = thread.intern(&scope, "hello, ovm");
-        thread.heap().no_gc(|nogc| {
-            let s = interned.heap_ref(nogc);
-            println!(
-                "interned: {:?} (hash {}, deduped: {})",
-                s.string().as_str(nogc).expect("utf8"),
-                s.string().hash(),
-                interned.value().to_bits() == again.value().to_bits()
-            );
-        });
-    });
-    println!(
-        "heap initialized: {} bytes ({} used)",
-        vm.heap().stats().capacity,
-        vm.heap().stats().used
-    );
-
-    let receiver = Smi::new(0).encode();
-    let result = thread
-        .run_native(
-            vm.native(NativeIndex::SMI_ADD),
-            &[receiver, Smi::new(6).encode(), Smi::new(7).encode()],
-        )
-        .expect("smi_add failed");
-    println!("smi_add(6, 7) = {}", Smi::decode(result).unwrap().value());
-
-    let fa = thread.heap().allocate::<Float>(1.5).erase();
-    let fb = thread.heap().allocate::<Float>(2.25).erase();
-    let result = thread
-        .run_native(vm.native(NativeIndex::FLOAT_ADD), &[receiver, fa, fb])
-        .expect("float_add failed");
-    let out = thread.heap().no_gc(|nogc| {
-        result
-            .get_as::<Float>(nogc, nogc.known().float_map)
-            .expect("float_add returned a float")
-            .value
-            .get()
-    });
-    println!("float_add(1.5, 2.25) = {}", out);
-
-    // return 6 + 7
-    let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[6]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::LoadSmi, &[7]);
-    emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::Load, &[0]);
-    emit(&mut program, Opcode::Add, &[1]);
-    emit(&mut program, Opcode::Return, &[]);
-
-    let result = thread.handle_scope(|thread, scope| {
-        let callable = callable(thread, &scope, &program, 2, None);
-        thread.execute(callable, &[])
-    });
-    println!("6 + 7 = {}", Smi::decode(result.unwrap()).unwrap().value());
-
-    // try { throw 42 } catch (e) { return e }
-    // 0: LoadSmi 42 | 2: Throw | 3: Return | 4: Store r0 | 6: Load r0 | 8: Return
-    let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[42]);
-    emit(&mut program, Opcode::Throw, &[]);
-    emit(&mut program, Opcode::Return, &[]);
-    emit(&mut program, Opcode::Store, &[0]); // handler: bind e in r0
-    emit(&mut program, Opcode::Load, &[0]);
-    emit(&mut program, Opcode::Return, &[]);
-
-    let result = thread.handle_scope(|thread, scope| {
-        let callable = callable(
-            thread,
-            &scope,
-            &program,
-            1,
-            Some(&[HandlerEntryInit::new(0, 3, 4)]),
-        );
-        thread.execute(callable, &[])
-    });
-    println!(
-        "try {{ throw 42 }} catch (e) => e = {}",
-        Smi::decode(result.unwrap()).unwrap().value()
-    );
-
-    // throw 7 with no handler: escapes the run as the exception sentinel
-    let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[7]);
-    emit(&mut program, Opcode::Throw, &[]);
-    emit(&mut program, Opcode::Return, &[]);
-
-    let result = thread.handle_scope(|thread, scope| {
-        let callable = callable(thread, &scope, &program, 0, None);
-        thread.execute(callable, &[])
-    });
-    match result {
-        Ok(v) if v == thread.heap().known().exception.value() => {
-            let ex = thread.take_pending_exception().expect("pending exception");
-            println!("throw 7 (uncaught): escaped, pending exception = {ex:?}");
+    let mut files = Vec::new();
+    let mut then_repl = false;
+    for arg in std::env::args().skip(1) {
+        if arg == "--repl" {
+            then_repl = true;
+        } else {
+            files.push(arg);
         }
-        other => panic!("expected uncaught escape, got {other:?}"),
     }
+    for path in &files {
+        run_file(&mut thread, path);
+    }
+    if files.is_empty() || then_repl {
+        repl(&mut thread);
+    }
+}
+
+fn run_file(thread: &mut Thread, path: &str) {
+    let src = match std::fs::read_to_string(path) {
+        Ok(src) => src,
+        Err(e) => {
+            eprintln!("ovm: cannot read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    match thread.run_script(&src) {
+        Ok(_) => {
+            if report_uncaught(thread) {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn repl(thread: &mut Thread) {
+    let stdin = std::io::stdin();
+    loop {
+        print!("> ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("ovm: read error: {e}");
+                break;
+            }
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == ".exit" {
+            break;
+        }
+        match thread.run_script(line) {
+            Ok(v) => {
+                if report_uncaught(thread) {
+                    continue;
+                }
+                println!("{}", show_value(thread, v));
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+}
+
+/// Print and clear an uncaught exception, if one escaped. Returns whether
+/// there was one.
+fn report_uncaught(thread: &mut Thread) -> bool {
+    match thread.take_pending_exception() {
+        Some(ex) => {
+            eprintln!("uncaught exception: {}", show_value(thread, ex));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Best-effort display of a result value.
+fn show_value(thread: &mut Thread, v: Value) -> String {
+    if let Some(smi) = Smi::decode(v) {
+        return smi.value().to_string();
+    }
+    let known = thread.heap().known();
+    if v == known.undefined.value() {
+        return "undefined".into();
+    }
+    if v == known.null.value() {
+        return "null".into();
+    }
+    if v == known.true_object.value() {
+        return "true".into();
+    }
+    if v == known.false_object.value() {
+        return "false".into();
+    }
+    thread.heap().no_gc(|nogc| {
+        if let Some(f) = v.get_as::<Float>(nogc, nogc.known().float_map) {
+            return f.value.get().to_string();
+        }
+        if let Some(s) = v.get_as::<VMString>(nogc, nogc.known().string_map) {
+            return String::from_utf8_lossy(s.as_slice(nogc)).into_owned();
+        }
+        format!("{v:?}")
+    })
 }
