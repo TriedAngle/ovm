@@ -2,10 +2,9 @@ use bytecode::{Opcode, Operands, PropertyFlags, decode, jump_target};
 
 use vm::{
     AccessorPair, CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert,
-    FixedArray, Float, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
-    ObjectSlotsInit, PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics,
-    Tagged, VMString, Value, call_target, classify_key, element_value, load_outcome,
-    store_array_element,
+    FixedArray, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
+    PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
+    Value, call_target, classify_key, element_value, load_outcome, store_array_element,
 };
 
 use crate::{
@@ -474,7 +473,7 @@ fn step(
                             };
                             Ok::<_, VmError>(r)
                         }));
-                        let v = state.handle_scope(|scope| Convert::to_value(heap, &scope, r));
+                        let v = state.handle_scope(|scope| heap.new_number(&scope, r));
                         cache.set_acc(v);
                     }
                 }
@@ -696,9 +695,9 @@ fn step(
         Opcode::Negate => {
             if let Some(v) = cache.acc().to_i64() {
                 cache.set_acc(if v == 0 {
-                    state.handle_scope(|scope| heap.allocate_handle::<Float>(-0.0, &scope).value())
+                    state.handle_scope(|scope| heap.new_number(&scope, -0.0))
                 } else if v == Smi::MIN {
-                    state.handle_scope(|scope| Convert::to_value(heap, &scope, -(v as f64)))
+                    state.handle_scope(|scope| heap.new_number(&scope, -(v as f64)))
                 } else {
                     Smi::new(-v).encode()
                 });
@@ -711,9 +710,9 @@ fn step(
                     let r = -n;
                     // preserve -0.0: `-0` must not fold into Smi 0
                     if r == 0.0 && r.is_sign_negative() {
-                        heap.allocate_handle::<Float>(-0.0, &scope).value()
+                        heap.new_number(&scope, -0.0)
                     } else {
-                        Convert::to_value(heap, &scope, r)
+                        heap.new_number(&scope, r)
                     }
                 }));
             }
@@ -1139,32 +1138,16 @@ fn step(
         }
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
-                heap.allocate_object(
-                    &scope,
-                    ObjectSlotsInit {
-                        map: heap.known().object_initial_map,
-                        values: &[],
-                        elements: heap.known().empty_fixed_array.erase(),
-                        length: 0,
-                    },
-                )
+                heap.new_object(&scope, heap.known().object_initial_map, &[])
             });
             cache.set_acc(obj.erase());
             Step::Next
         }
         Opcode::CreateEmptyArrayLiteral => {
             let obj = state.handle_scope(|scope| {
-                heap.allocate_object(
-                    &scope,
-                    ObjectSlotsInit {
-                        map: heap.known().js_array_map,
-                        values: &[],
-                        elements: heap.known().empty_fixed_array.erase(),
-                        length: 0,
-                    },
-                )
-                .into_tagged()
-                .erase()
+                heap.new_object(&scope, heap.known().js_array_map, &[])
+                    .into_tagged()
+                    .erase()
             });
             cache.set_acc(obj);
             Step::Next
