@@ -82,8 +82,10 @@ enum Pending {
 
 struct Resolver<'a> {
     ast: &'a Ast,
-    /// direct eval source: unresolved names must resolve dynamically
-    for_eval: bool,
+    mode: ResolveMode,
+    /// the scope owned by the script function: in REPL mode its bindings
+    /// are global object properties
+    script_scope: ScopeId,
     /// per scope: name → index into ScopeInfo.decls
     decl_maps: Vec<HashMap<Symbol, u32>>,
     /// per scope: owning function
@@ -99,16 +101,29 @@ struct Resolver<'a> {
 }
 
 pub fn resolve(ast: &Ast) -> Resolved {
-    resolve_with_mode(ast, false)
+    resolve_with_mode(ast, ResolveMode::Script)
 }
 
 /// Resolve with all unresolved names marked `Dynamic` (direct eval source:
 /// free names must resolve through the caller's context chain at runtime).
 pub fn resolve_for_eval(ast: &Ast) -> Resolved {
-    resolve_with_mode(ast, true)
+    resolve_with_mode(ast, ResolveMode::Eval)
 }
 
-fn resolve_with_mode(ast: &Ast, for_eval: bool) -> Resolved {
+/// Resolve a REPL entry: script-scope (top-level) bindings live on the
+/// global object, so they persist across entries and can be redeclared.
+pub fn resolve_repl(ast: &Ast) -> Resolved {
+    resolve_with_mode(ast, ResolveMode::Repl)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolveMode {
+    Script,
+    Eval,
+    Repl,
+}
+
+fn resolve_with_mode(ast: &Ast, mode: ResolveMode) -> Resolved {
     let n_scopes = ast.scope_count();
     let mut decl_maps = vec![HashMap::new(); n_scopes];
     let mut fn_owner = vec![FunctionId(0); n_scopes];
@@ -136,7 +151,8 @@ fn resolve_with_mode(ast: &Ast, for_eval: bool) -> Resolved {
 
     let mut r = Resolver {
         ast,
-        for_eval,
+        mode,
+        script_scope: fn_scope[0],
         decl_maps,
         fn_owner,
         fn_scope,
@@ -165,13 +181,18 @@ impl<'a> Resolver<'a> {
 
     fn resolve_reference(&mut self, node: NodeId, name: Symbol) {
         let current_fn = *self.fn_stack.last().unwrap();
-        let mut pending = if self.for_eval {
+        let mut pending = if self.mode == ResolveMode::Eval {
             Pending::Dynamic
         } else {
             Pending::GlobalObject
         };
         for &scope in self.scope_stack.iter().rev() {
             if let Some(&decl) = self.decl_maps[scope.0 as usize].get(&name) {
+                if self.mode == ResolveMode::Repl && scope == self.script_scope {
+                    // REPL mode: script-scope bindings live on the global
+                    // object; never captured into a context
+                    break;
+                }
                 if self.fn_owner[scope.0 as usize] != current_fn {
                     // captured across a function boundary → context-allocated
                     self.captured.insert((scope, decl));
@@ -399,6 +420,12 @@ impl<'a> Resolver<'a> {
                 }
                 for (d, decl) in ast.scope(scope).decls.iter().enumerate() {
                     let key = (scope, d as u32);
+                    if self.mode == ResolveMode::Repl && scope == self.script_scope {
+                        // REPL mode: top-level bindings are global object
+                        // properties, not locals or context slots
+                        slots.insert(key, Resolution::GlobalObject);
+                        continue;
+                    }
                     let hole_check =
                         matches!(decl.kind, DeclKind::Let | DeclKind::Const | DeclKind::Class);
                     let forced = calls_eval || self.captured.contains(&key);

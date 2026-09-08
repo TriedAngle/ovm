@@ -94,3 +94,10 @@ pub fn compile_eval(ast: &Ast) -> Result<CompiledScript, CompileError> {
     let resolved = parser::resolver::resolve_for_eval(ast);
     codegen::generate(ast, &resolved)
 }
+
+/// Resolve + compile a REPL entry: top-level declarations become global
+/// object properties so they persist across entries
+pub fn compile_repl(ast: &Ast) -> Result<CompiledScript, CompileError> {
+    let resolved = parser::resolver::resolve_repl(ast);
+    codegen::generate(ast, &resolved)
+}

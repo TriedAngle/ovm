@@ -357,6 +357,60 @@ fn unused_let_without_init_is_still_tdz() {
 }
 
 #[test]
+fn repl_mode_persists_top_level_bindings() {
+    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+    thread.run_script_repl("let x = 10;").unwrap();
+    thread.run_script_repl("var y = 2;").unwrap();
+    thread.run_script_repl("const z = 3;").unwrap();
+    let v = thread.run_script_repl("x * y + z;").unwrap();
+    assert_eq!(Smi::decode(v).unwrap().value(), 23);
+}
+
+#[test]
+fn repl_mode_functions_persist_and_read_globals() {
+    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+    thread.run_script_repl("let x = 10;").unwrap();
+    thread
+        .run_script_repl("function get() { return x; }")
+        .unwrap();
+    thread.run_script_repl("x = 20;").unwrap();
+    let v = thread.run_script_repl("get();").unwrap();
+    assert_eq!(Smi::decode(v).unwrap().value(), 20);
+}
+
+#[test]
+fn repl_mode_allows_redeclaration_across_entries() {
+    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+    thread.run_script_repl("let x = 1;").unwrap();
+    let v = thread.run_script_repl("let x = 2; x;").unwrap();
+    assert_eq!(Smi::decode(v).unwrap().value(), 2);
+}
+
+#[test]
+fn repl_mode_keeps_nested_scopes_local() {
+    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+    thread.run_script_repl("{ let inner = 5; }").unwrap();
+    // `inner` was block-scoped: gone with the block, this throws
+    let result = thread.run_script_repl("inner;").unwrap();
+    assert_eq!(result, thread.heap().known().exception.value());
+    thread.take_pending_exception();
+}
+
+#[test]
+fn script_mode_top_level_bindings_do_not_persist() {
+    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut thread = vm.attach();
+    thread.run_script("let x = 10;").unwrap();
+    let result = thread.run_script("x;").unwrap();
+    assert_eq!(result, thread.heap().known().exception.value());
+    thread.take_pending_exception();
+}
+
+#[test]
 fn smi_result_helpers() {
     let _ = smi(0); // silence dead-code lint for the helper
 }
