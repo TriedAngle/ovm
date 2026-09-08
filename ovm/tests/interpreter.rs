@@ -4011,7 +4011,7 @@ fn shadow_setup<'s>(
                 length: 0,
             },
         )
-        .into_handle(&scope);
+        .into_handle(scope);
     let parents = thread
         .heap()
         .allocate_handle::<FixedArray>(&[parent.as_tagged().erase()], &scope);
@@ -4039,7 +4039,7 @@ fn shadow_setup<'s>(
                 length: 0,
             },
         )
-        .into_handle(&scope);
+        .into_handle(scope);
     (child, parent, p.value())
 }
 

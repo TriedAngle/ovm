@@ -23,7 +23,6 @@ pub struct Runtime;
 
 impl Runtime {
     pub fn create_closure(
-        vm: &VM,
         heap: &mut Heap,
         scope: &HandleScope<'_>,
         info: Handle<'_, CallableInfoObject>,
@@ -39,9 +38,7 @@ impl Runtime {
         });
         let function_name = match source_name {
             Some(name) => scope.handle(Tagged::from_value(name)),
-            None => scope.handle(Tagged::from_value(
-                vm.interner().intern(heap, scope, "").value(),
-            )),
+            None => scope.handle(Tagged::from_value(heap.known().strings.empty.value())),
         };
         let map = match kind {
             kind if kind.is_class_constructor() => heap.known().class_constructor_map,
@@ -61,11 +58,8 @@ impl Runtime {
             )
             .into_handle(scope);
 
-        let length_key = scope.handle(
-            SlotName::from(vm.interner().intern(heap, scope, "length").as_tagged()).tagged(),
-        );
-        let name_key = scope
-            .handle(SlotName::from(vm.interner().intern(heap, scope, "name").as_tagged()).tagged());
+        let length_key = heap.known().strings.length;
+        let name_key = heap.known().strings.name;
         let defined = Object::define_own_property(
             heap,
             scope,
@@ -109,13 +103,8 @@ impl Runtime {
                     },
                 )
                 .into_handle(scope);
-            let constructor = scope.handle(
-                SlotName::from(vm.interner().intern(heap, scope, "constructor").as_tagged())
-                    .tagged(),
-            );
-            let prototype = scope.handle(
-                SlotName::from(vm.interner().intern(heap, scope, "prototype").as_tagged()).tagged(),
-            );
+            let constructor = heap.known().strings.constructor;
+            let prototype = heap.known().strings.prototype;
             let defined = Object::define_own_property(
                 heap,
                 scope,
@@ -176,13 +165,11 @@ impl Runtime {
                 // GetMethod: a non-callable, non-nullish method is a TypeError
                 return Err(VmError::Type);
             }
-            let hint_name = match hint {
-                Hint::Default => "default",
-                Hint::Number => "number",
-                Hint::String => "string",
+            let hint_string = match hint {
+                Hint::Default => known.strings.default.value(),
+                Hint::Number => known.strings.number.value(),
+                Hint::String => known.strings.string.value(),
             };
-            let hint_string =
-                state.handle_scope(|scope| vm.interner().intern(heap, &scope, hint_name).value());
             let args = [hint_string];
             // SAFETY: hint_string was interned immediately above; the snapshot
             // is consumed (staged/copied into the frame) before any GC
@@ -201,13 +188,13 @@ impl Runtime {
         // 2. OrdinaryToPrimitive: hint string → toString first, else valueOf first
         let method_names: [Value; 2] = if hint == Hint::String {
             [
-                Self::intern_value(vm, heap, state, "toString"),
-                Self::intern_value(vm, heap, state, "valueOf"),
+                known.strings.to_string.value(),
+                known.strings.value_of.value(),
             ]
         } else {
             [
-                Self::intern_value(vm, heap, state, "valueOf"),
-                Self::intern_value(vm, heap, state, "toString"),
+                known.strings.value_of.value(),
+                known.strings.to_string.value(),
             ]
         };
         for name in method_names {
@@ -305,38 +292,35 @@ impl Runtime {
         })
     }
 
-    pub fn intern_value(vm: &VM, heap: &mut Heap, state: &ContextState, s: &str) -> Value {
-        state.handle_scope(|scope| vm.interner().intern(heap, &scope, s).value())
-    }
-
-    /// ES 13.5.3 typeof: the interned type string for a value. `null` reports
-    /// `"object"`; callables report `"function"`.
-    pub fn type_of(vm: &VM, heap: &mut Heap, state: &ContextState, v: Value) -> Value {
-        let name = heap.no_gc(|nogc| {
-            let known = nogc.known();
+    /// ES 13.5.3 typeof: the well-known type string for a value. `null`
+    /// reports `"object"`; callables report `"function"`.
+    pub fn type_of(heap: &mut Heap, v: Value) -> Value {
+        heap.no_gc(|nogc| {
+            let strings = nogc.known().strings;
             if v.is_smi() || v.get_as::<Float>(nogc).is_some() {
-                "number"
-            } else if v == known.undefined.value() || v == known.void.value() {
-                "undefined"
-            } else if v == known.null.value() {
-                "object"
-            } else if v == known.true_object.value() || v == known.false_object.value() {
-                "boolean"
+                strings.number.value()
+            } else if v == nogc.known().undefined.value() || v == nogc.known().void.value() {
+                strings.undefined.value()
+            } else if v == nogc.known().null.value() {
+                strings.object.value()
+            } else if v == nogc.known().true_object.value()
+                || v == nogc.known().false_object.value()
+            {
+                strings.boolean.value()
             } else if v.get_as::<VMString>(nogc).is_some() {
-                "string"
+                strings.string.value()
             } else if v.get_as::<Symbol>(nogc).is_some() {
-                "symbol"
+                strings.symbol.value()
             } else if let ValueRef::Object(obj) = v.value_ref(nogc) {
                 if obj.as_ref().header.map.heap_ref(nogc).kind().is_callable() {
-                    "function"
+                    strings.function.value()
                 } else {
-                    "object"
+                    strings.object.value()
                 }
             } else {
-                "object"
+                strings.object.value()
             }
-        });
-        Self::intern_value(vm, heap, state, name)
+        })
     }
 
     /// ES 13.10.2 instanceof / 7.3.20 OrdinaryHasInstance: `Get(C, "prototype")`
@@ -353,7 +337,7 @@ impl Runtime {
             return Err(VmError::Type);
         }
         // 4. P = Get(C, "prototype") — full [[Get]], getters may run user code
-        let proto_name = Self::intern_value(vm, heap, state, "prototype");
+        let proto_name = heap.known().strings.prototype.value();
         let proto = Self::get_property(vm, heap, state, callable, proto_name)?;
         let proto = match proto {
             Coercion::Threw => return Ok(None),
@@ -402,7 +386,7 @@ impl Runtime {
         state: &ContextState,
         new_target: Handle<'_, Object>,
     ) -> Result<Option<Value>, VmError> {
-        let proto_name = Self::intern_value(vm, heap, state, "prototype");
+        let proto_name = heap.known().strings.prototype.value();
         state.handle_scope(|scope| {
             let proto = Self::get_property(vm, heap, state, new_target.value(), proto_name)?;
             let proto = match proto {

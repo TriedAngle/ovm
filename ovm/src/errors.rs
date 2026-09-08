@@ -1,4 +1,4 @@
-use vm::{Heap, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Tagged, Value, VmError};
+use vm::{Heap, Object, ObjectSlotsInit, PropertyDescriptor, Tagged, Value, VmError};
 
 use crate::{ContextState, VM};
 
@@ -12,8 +12,6 @@ pub fn error_from_vm_error(
     err: VmError,
 ) -> Result<Value, VmError> {
     state.handle_scope(|scope| {
-        let name_string = vm.interner().intern(heap, &scope, "name");
-        let message_string = vm.interner().intern(heap, &scope, "message");
         let name_value = vm.interner().intern(heap, &scope, err.name());
         let message_value = vm.interner().intern(heap, &scope, err.message());
 
@@ -35,8 +33,8 @@ pub fn error_from_vm_error(
                 },
             )
             .into_handle(&scope);
-        let name = scope.handle(SlotName::from(name_string.as_tagged()).tagged());
-        let message = scope.handle(SlotName::from(message_string.as_tagged()).tagged());
+        let name = heap.known().strings.name;
+        let message = heap.known().strings.message;
         let name_value = scope.handle(Tagged::from_value(name_value.value()));
         let message_value = scope.handle(Tagged::from_value(message_value.value()));
         Object::define_own_property(

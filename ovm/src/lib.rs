@@ -245,10 +245,10 @@ impl VM {
     pub fn new<B: HeapBackend>(config: B::Config) -> Result<Self, AllocError> {
         let heap = B::new(config)?.into_global();
         let mut local = heap.new_local();
-        let roots = unsafe { RootHandles::new(128, Smi::new(0).encode()) };
+        let roots = unsafe { RootHandles::new(256, Smi::new(0).encode()) };
         let interner = StringInterner::new();
         bootstrap_basics(&mut local, &roots);
-        intern_well_known_strings(&mut local, &interner);
+        intern_well_known_strings(&mut local, &interner, &roots);
         bootstrap_well_known(&mut local, &roots);
         Ok(Self {
             shared: Arc::new(SharedVM {

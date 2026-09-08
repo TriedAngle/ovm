@@ -3,7 +3,7 @@ use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
 use crate::{
-    EdgeVisitable, FixedByteArray, Handle, HandleScope, Heap, InternedString, Visitor,
+    EdgeVisitable, FixedByteArray, Handle, HandleSet, Heap, InternedString, Visitor,
     heap::WeakGcCell, string_content_hash,
 };
 
@@ -23,7 +23,7 @@ impl StringInterner {
     pub fn intern<'s>(
         &self,
         heap: &mut Heap,
-        scope: &'s HandleScope<'_>,
+        scope: &'s impl HandleSet,
         s: impl AsRef<[u8]>,
     ) -> Handle<'s, InternedString> {
         let s = s.as_ref();
@@ -67,7 +67,7 @@ impl StringInterner {
 
 fn handle_from_entry<'s>(
     heap: &mut Heap,
-    scope: &'s HandleScope<'_>,
+    scope: &'s impl HandleSet,
     entry: &WeakGcCell<InternedString>,
 ) -> Option<Handle<'s, InternedString>> {
     heap.no_gc(|nogc| entry.upgrade(nogc).map(|r| r.into_handle(scope)))

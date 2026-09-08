@@ -1,6 +1,4 @@
-use crate::{
-    Float, HandleScope, Heap, NoGc, Smi, StringInterner, Symbol, VMString, Value, VmError,
-};
+use crate::{Float, HandleScope, Heap, NoGc, Smi, Symbol, VMString, Value, VmError};
 
 pub struct Convert;
 
@@ -137,12 +135,7 @@ impl Convert {
     /// ES ToString on a primitive (no ToPrimitive recursion: the input is
     /// already primitive). Numbers allocate a fresh string, symbols are a
     /// TypeError. The oddball identity strings come from the string table.
-    pub fn to_string(
-        heap: &mut Heap,
-        scope: &HandleScope<'_>,
-        interner: &StringInterner,
-        v: Value,
-    ) -> Result<Value, VmError> {
+    pub fn to_string(heap: &mut Heap, scope: &HandleScope<'_>, v: Value) -> Result<Value, VmError> {
         if let Some(smi) = Smi::decode(v) {
             return Ok(
                 VMString::from_bytes(heap, scope, smi.value().to_string().as_bytes()).value(),
@@ -150,16 +143,16 @@ impl Convert {
         }
         let known = heap.known();
         if v == known.undefined.value() {
-            return Ok(interner.intern(heap, scope, "undefined").value());
+            return Ok(known.strings.undefined.value());
         }
         if v == known.null.value() {
-            return Ok(interner.intern(heap, scope, "null").value());
+            return Ok(known.strings.null.value());
         }
         if v == known.true_object.value() {
-            return Ok(interner.intern(heap, scope, "true").value());
+            return Ok(known.strings.true_.value());
         }
         if v == known.false_object.value() {
-            return Ok(interner.intern(heap, scope, "false").value());
+            return Ok(known.strings.false_.value());
         }
         enum PrimitiveString {
             IsString,

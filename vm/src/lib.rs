@@ -18,8 +18,8 @@ pub use handle::{
 pub use heap::{
     AllocError, AllocToken, EdgeVisitable, Fresh, GcSlot, GlobalHeap, GlobalVtable, Heap,
     HeapBackend, HeapRef, HeapStats, HeapVtable, NoGc, OptionGcSlot, RawCell, Register,
-    RootVisitor, Visitor, WellKnown, WordType, bootstrap_basics, bootstrap_well_known,
-    intern_well_known_strings,
+    RootVisitor, Visitor, WellKnown, WellKnownStrings, WordType, bootstrap_basics,
+    bootstrap_well_known, intern_well_known_strings,
 };
 pub use interner::StringInterner;
 pub use lookup::{Key, LoadOutcome, Lookup, classify_key, element_value, load_outcome};
