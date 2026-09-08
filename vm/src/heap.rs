@@ -1,7 +1,7 @@
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
     Handle, HandleData, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapInit, MapKind, Object,
-    ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, ScopeInfo, ScopeInfoInit, Smi,
+    ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, ScopeInfo, ScopeInfoInit, SlotName, Smi,
     StringInterner, Symbol, Tagged, TransitionLock, Value, Word,
 };
 use core::{
@@ -111,6 +111,59 @@ pub struct WellKnown {
     pub class_constructor_map: Global<Map>,
     /// The `@@toPrimitive` well-known symbol
     pub to_primitive_symbol: Global<Symbol>,
+    pub strings: WellKnownStrings,
+}
+
+macro_rules! define_well_known_strings {
+    ($($field:ident => $text:literal),* $(,)?) => {
+        #[derive(Debug, Clone, Copy)]
+        pub struct WellKnownStrings {
+            $(pub $field: Global<SlotName>,)*
+        }
+
+        impl WellKnownStrings {
+            pub fn uninit(roots: &RootHandles) -> Self {
+                Self {
+                    $($field: unsafe { smi_handle::<SlotName>(roots) },)*
+                }
+            }
+
+            pub fn intern_all(
+                heap: &mut Heap,
+                interner: &StringInterner,
+                roots: &RootHandles,
+            ) -> Self {
+                Self {
+                    $($field: {
+                        let interned = interner.intern(heap, roots, $text);
+                        roots.create_handle(SlotName::from(interned.as_tagged()).tagged())
+                    },)*
+                }
+            }
+        }
+    };
+}
+
+define_well_known_strings! {
+    empty => "",
+    length => "length",
+    name => "name",
+    message => "message",
+    prototype => "prototype",
+    constructor => "constructor",
+    to_string => "toString",
+    value_of => "valueOf",
+    default => "default",
+    number => "number",
+    string => "string",
+    boolean => "boolean",
+    object => "object",
+    function => "function",
+    symbol => "symbol",
+    undefined => "undefined",
+    null => "null",
+    true_ => "true",
+    false_ => "false",
 }
 
 unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
@@ -167,6 +220,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         non_constructor_function_map: map,
         class_constructor_map: map,
         to_primitive_symbol: unsafe { smi_handle::<Symbol>(roots) },
+        strings: WellKnownStrings::uninit(roots),
     }
 }
 
@@ -379,28 +433,16 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     heap.set_known(known);
 }
 
-/// Second bootstrap phase: internalize the canonical well-known strings into
-/// the string table. The table owns them (strong entries for now; the GC
-/// walks the table), so consumers look them up through `interner.intern` —
-/// no separate rooting, no WellKnown fields. Must run after
-/// `bootstrap_basics` and before `bootstrap_well_known`.
-pub fn intern_well_known_strings(heap: &mut Heap, interner: &StringInterner) {
-    let data = HandleData::new(Smi::new(0).encode());
-    let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
-    for s in [
-        "",
-        "valueOf",
-        "toString",
-        "default",
-        "number",
-        "string",
-        "true",
-        "false",
-        "null",
-        "undefined",
-    ] {
-        let _ = interner.intern(heap, &scope, s);
-    }
+/// Second bootstrap phase: internalize the well-known strings and install
+/// the [`WellKnownStrings`] root table on `known()`. Consumers read
+/// `heap.known().strings` (a permanently rooted handle) instead of calling
+/// `interner.intern` per use. Must run after `bootstrap_basics` and before
+/// `bootstrap_well_known`.
+pub fn intern_well_known_strings(heap: &mut Heap, interner: &StringInterner, roots: &RootHandles) {
+    let strings = WellKnownStrings::intern_all(heap, interner, roots);
+    let mut known = *heap.known();
+    known.strings = strings;
+    heap.set_known(known);
 }
 
 pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
@@ -660,8 +702,8 @@ impl<'scope, T: HeapObject> HeapRef<'scope, T> {
         Tagged::from_ptr(self.ptr)
     }
 
-    pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
-        scope.handle(self.into_tagged())
+    pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T> {
+        scope.create_handle(self.into_tagged())
     }
 }
 
@@ -717,8 +759,8 @@ impl<'scope, T: HeapObject> Fresh<'scope, T> {
         self.into_tagged().erase()
     }
 
-    pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
-        scope.handle(self.into_tagged())
+    pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T> {
+        scope.create_handle(self.into_tagged())
     }
 
     pub fn into_global(self, roots: &RootHandles) -> Global<T> {
