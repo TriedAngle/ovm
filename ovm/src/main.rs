@@ -117,10 +117,10 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
         return "false".into();
     }
     thread.heap().no_gc(|nogc| {
-        if let Some(f) = v.get_as::<Float>(nogc, nogc.known().float_map) {
+        if let Some(f) = v.get_as::<Float>(nogc) {
             return f.value.get().to_string();
         }
-        if let Some(s) = v.get_as::<VMString>(nogc, nogc.known().string_map) {
+        if let Some(s) = v.get_as::<VMString>(nogc) {
             return String::from_utf8_lossy(s.as_slice(nogc)).into_owned();
         }
         format!("{v:?}")

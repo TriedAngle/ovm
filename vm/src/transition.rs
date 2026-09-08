@@ -155,9 +155,7 @@ impl Transition {
                 old_row,
             )
         };
-        let prototype = scope
-            .create_handle(Tagged::from_value(prototype))
-            .expect("map prototype is a strong pointer");
+        let prototype = scope.handle(Tagged::from_value(prototype));
 
         let grow = !flags.is_accessor()
             && match change {
@@ -305,9 +303,7 @@ impl Transition {
         let flags = desc.flags();
         match desc {
             PropertyDescriptor::Data { value, .. } => {
-                let value = scope
-                    .create_handle(Tagged::from_value(value))
-                    .expect("value must be strong");
+                let value = scope.handle(Tagged::from_value(value));
 
                 let grow = match change {
                     Change::Append => true,
@@ -338,12 +334,8 @@ impl Transition {
                 }
             }
             PropertyDescriptor::Accessor { get, set, .. } => {
-                let get = scope
-                    .create_handle(Tagged::from_value(get))
-                    .expect("get must be strong");
-                let set = scope
-                    .create_handle(Tagged::from_value(set))
-                    .expect("set must be strong");
+                let get = scope.handle(Tagged::from_value(get));
+                let set = scope.handle(Tagged::from_value(set));
                 Self::target(
                     heap,
                     scope,
@@ -552,9 +544,7 @@ impl Object {
         receiver: Value,
         proto: Value,
     ) -> Result<(), VmError> {
-        let receiver_handle = scope
-            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
-            .expect("receiver must be strong");
+        let receiver_handle = unsafe { scope.handle_value::<Object>(receiver) };
 
         let is_null = proto == heap.known().null.value();
         if !is_null && !proto.is_strong_ptr() {
@@ -590,7 +580,7 @@ impl Object {
                 }
                 Ok(())
             };
-            if let Some(parents) = proto.get_as::<FixedArray>(&nogc, nogc.known().array_map) {
+            if let Some(parents) = proto.get_as::<FixedArray>(&nogc) {
                 for i in 0..parents.len() {
                     walk(parents.at(i))?;
                 }
@@ -599,9 +589,7 @@ impl Object {
             }
         }
 
-        let proto_handle = scope
-            .create_handle(Tagged::from_value(proto))
-            .expect("prototype must be a strong pointer");
+        let proto_handle = scope.handle(Tagged::from_value(proto));
 
         let descriptor_count = {
             let nogc = heap.guard();
@@ -639,12 +627,8 @@ fn root_define_inputs<'s>(
     receiver: Value,
     name: SlotName,
 ) -> (Handle<'s, Object>, Handle<'s, SlotName>) {
-    let receiver = scope
-        .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
-        .expect("receiver must be strong");
-    let name = scope
-        .create_handle(name.tagged())
-        .expect("name must be strong");
+    let receiver = unsafe { scope.handle_value::<Object>(receiver) };
+    let name = scope.handle(name.tagged());
     (receiver, name)
 }
 
@@ -674,7 +658,7 @@ fn validate_define<'a>(
             return None;
         }
         let cur_pair = cur_desc_value
-            .get_as::<AccessorPair>(nogc, nogc.known().accessor_pair_map)
+            .get_as::<AccessorPair>(nogc)
             .expect("accessor descriptor must hold a pair");
         if !Compare::same_value(nogc, get, cur_pair.get.inner())
             || !Compare::same_value(nogc, set, cur_pair.set.inner())

@@ -579,21 +579,17 @@ mod tests {
 
     /// Root a freshly allocated object pointer in the scope.
     fn root_object<'s>(scope: &'s HandleScope<'_>, ptr: HeapPtr<Object>) -> vm::Handle<'s, Object> {
-        scope
-            .create_handle(Tagged::from_ptr(ptr))
-            .expect("object pointer is strong")
+        scope.handle(Tagged::from_ptr(ptr))
     }
 
     /// Root a slot name in the scope.
     fn root_name<'s>(scope: &'s HandleScope<'_>, name: SlotName) -> vm::Handle<'s, SlotName> {
-        scope.create_handle(name.tagged()).expect("name is strong")
+        scope.handle(name.tagged())
     }
 
     /// Root a value in the scope.
     fn root_value<'s>(scope: &'s HandleScope<'_>, value: Value) -> vm::Handle<'s, Value> {
-        scope
-            .create_handle(Tagged::from_value(value))
-            .expect("value is strong")
+        scope.handle(Tagged::from_value(value))
     }
 
     #[test]
@@ -614,7 +610,7 @@ mod tests {
             None,
             Change::Append,
         );
-        let child = scope.create_handle(child).expect("child map is strong");
+        let child = scope.handle(child);
 
         heap.no_gc(|nogc| {
             let child_ref = child.heap_ref(nogc);
@@ -684,42 +680,36 @@ mod tests {
         let name2 = root_name(&scope, smi_name(2));
 
         // two different properties off the same parent: sibling edges
-        let a = scope
-            .create_handle(Transition::target(
-                &mut heap,
-                &scope,
-                |nogc| parent.heap_ref(nogc),
-                name1,
-                flags,
-                None,
-                Change::Append,
-            ))
-            .expect("strong");
-        let b = scope
-            .create_handle(Transition::target(
-                &mut heap,
-                &scope,
-                |nogc| parent.heap_ref(nogc),
-                name2,
-                flags,
-                None,
-                Change::Append,
-            ))
-            .expect("strong");
+        let a = scope.handle(Transition::target(
+            &mut heap,
+            &scope,
+            |nogc| parent.heap_ref(nogc),
+            name1,
+            flags,
+            None,
+            Change::Append,
+        ));
+        let b = scope.handle(Transition::target(
+            &mut heap,
+            &scope,
+            |nogc| parent.heap_ref(nogc),
+            name2,
+            flags,
+            None,
+            Change::Append,
+        ));
         assert_ne!(a.value(), b.value());
 
         // and a chain: transition from a child map
-        let c = scope
-            .create_handle(Transition::target(
-                &mut heap,
-                &scope,
-                |nogc| a.heap_ref(nogc),
-                name2,
-                flags,
-                None,
-                Change::Append,
-            ))
-            .expect("strong");
+        let c = scope.handle(Transition::target(
+            &mut heap,
+            &scope,
+            |nogc| a.heap_ref(nogc),
+            name2,
+            flags,
+            None,
+            Change::Append,
+        ));
 
         heap.no_gc(|nogc| {
             let pairs = parent
@@ -1167,11 +1157,9 @@ mod tests {
             .into_handle(&scope);
 
         let undefined = heap.known().undefined.value();
-        let name = scope.create_handle(smi_name(5).tagged()).unwrap();
-        let get = scope
-            .create_handle(Tagged::from_value(Smi::new(111).encode()))
-            .unwrap();
-        let set = scope.create_handle(Tagged::from_value(undefined)).unwrap();
+        let name = scope.handle(smi_name(5).tagged());
+        let get = scope.handle(Tagged::from_value(Smi::new(111).encode()));
+        let set = scope.handle(Tagged::from_value(undefined));
         Object::define_own_property(
             &mut heap,
             &scope,
@@ -1223,9 +1211,9 @@ mod tests {
             .into_handle(&scope);
 
         let undefined = heap.known().undefined.value();
-        let name = scope.create_handle(smi_name(5).tagged()).unwrap();
-        let get = scope.create_handle(Tagged::from_value(undefined)).unwrap();
-        let set = scope.create_handle(Tagged::from_value(undefined)).unwrap();
+        let name = scope.handle(smi_name(5).tagged());
+        let get = scope.handle(Tagged::from_value(undefined));
+        let set = scope.handle(Tagged::from_value(undefined));
         let result = Object::define_own_property(
             &mut heap,
             &scope,
@@ -1476,9 +1464,7 @@ mod tests {
                     let mut local = global.new_local();
                     let data = HandleData::new(local.known().void.value());
                     let scope = scope(&data);
-                    let parent = scope
-                        .create_handle(Tagged::from_ptr(parent_ptr))
-                        .expect("parent is strong");
+                    let parent = scope.handle(Tagged::from_ptr(parent_ptr));
                     let name = root_name(&scope, smi_name(1));
                     Transition::target(
                         &mut local,

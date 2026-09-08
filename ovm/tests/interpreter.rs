@@ -356,9 +356,7 @@ fn array_literal_built_with_manual_stores() {
     let result = run_program(&mut thread, program, 5, &[]);
     let array = result.unwrap();
     thread.heap().no_gc(|nogc| {
-        let a = array
-            .get_as::<Object>(nogc, nogc.known().js_array_map)
-            .expect("array literal result");
+        let a = array.get_as::<Object>(nogc).expect("array literal result");
         let a = a.as_ref();
         assert!(a.is_array(nogc));
         assert_eq!(a.length(), 3);
@@ -381,9 +379,7 @@ fn create_empty_array_literal_starts_empty() {
     let result = run_program(&mut thread, program, 0, &[]);
     let array = result.unwrap();
     thread.heap().no_gc(|nogc| {
-        let a = array
-            .get_as::<Object>(nogc, nogc.known().js_array_map)
-            .expect("array literal result");
+        let a = array.get_as::<Object>(nogc).expect("array literal result");
         let a = a.as_ref();
         assert!(a.is_array(nogc));
         assert_eq!(a.length(), 0);
@@ -413,9 +409,7 @@ fn array_literal_with_holes_keeps_length() {
     let result = run_program(&mut thread, program, 5, &[]);
     let array = result.unwrap();
     thread.heap().no_gc(|nogc| {
-        let a = array
-            .get_as::<Object>(nogc, nogc.known().js_array_map)
-            .expect("array literal result");
+        let a = array.get_as::<Object>(nogc).expect("array literal result");
         let a = a.as_ref();
         assert_eq!(a.length(), 3);
         let elements = a.elements_array(nogc).expect("array elements");
@@ -1700,15 +1694,9 @@ fn store_new_accessor_property_defines_own_accessor() {
             );
             callable_object(thread, &scope, info)
         };
-        let name = scope
-            .create_handle(SlotName::from(x.as_tagged()).tagged())
-            .expect("name is strong");
-        let get = scope
-            .create_handle(Tagged::from_value(getter.value()))
-            .expect("getter is strong");
-        let set = scope
-            .create_handle(Tagged::from_value(thread.heap().known().undefined.value()))
-            .expect("undefined is strong");
+        let name = scope.handle(SlotName::from(x.as_tagged()).tagged());
+        let get = scope.handle(Tagged::from_value(getter.value()));
+        let set = scope.handle(Tagged::from_value(thread.heap().known().undefined.value()));
         Object::define_own_property(
             thread.heap(),
             &scope,
@@ -2006,7 +1994,7 @@ fn arithmetic_overflow_promotes_to_float() {
     let result = result.unwrap();
     let value = thread.heap().no_gc(|nogc| {
         result
-            .get_as::<Float>(nogc, nogc.known().float_map)
+            .get_as::<Float>(nogc)
             .expect("overflow must promote to float")
             .value
             .get()
@@ -2039,7 +2027,7 @@ fn run_binary_consts(
 
 fn float_value(thread: &mut Thread, v: Value) -> f64 {
     thread.heap().no_gc(|nogc| {
-        v.get_as::<Float>(nogc, nogc.known().float_map)
+        v.get_as::<Float>(nogc)
             .expect("expected float result")
             .value
             .get()
@@ -3445,7 +3433,7 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
         .unwrap();
         thread.heap().no_gc(|nogc| {
             let s = r
-                .get_as::<VMString>(nogc, nogc.known().string_map)
+                .get_as::<VMString>(nogc)
                 .expect("concat result must be a string");
             assert_eq!(s.as_str(nogc), Some("x1"));
         });
@@ -3471,7 +3459,7 @@ fn add_concatenates_strings() {
                 run_program(&mut *thread, binary_op_program(Opcode::Add), 0, &[lhs, rhs]).unwrap();
             thread.heap().no_gc(|nogc| {
                 let s = r
-                    .get_as::<VMString>(nogc, nogc.known().string_map)
+                    .get_as::<VMString>(nogc)
                     .expect("concat result must be a string");
                 assert_eq!(s.as_str(nogc), Some(expected), "{lhs:?} + {rhs:?}");
             });
@@ -3566,15 +3554,9 @@ fn to_primitive_calls_getter_accessors() {
             &[],
         );
         let getter = make_callable(thread, &scope, &program_return_constant(), &[inner]);
-        let name = scope
-            .create_handle(SlotName::from_value(value_of.value()).tagged())
-            .expect("name is strong");
-        let get = scope
-            .create_handle(Tagged::from_value(getter))
-            .expect("getter is strong");
-        let set = scope
-            .create_handle(Tagged::from_value(thread.heap().known().undefined.value()))
-            .expect("undefined is strong");
+        let name = scope.handle(SlotName::from_value(value_of.value()).tagged());
+        let get = scope.handle(Tagged::from_value(getter));
+        let set = scope.handle(Tagged::from_value(thread.heap().known().undefined.value()));
         Object::define_own_property(
             thread.heap(),
             &scope,
@@ -3738,7 +3720,7 @@ fn negate_arithmetic_rules() {
     // -0 must be the -0.0 HeapNumber (1 / -0 === -Infinity)
     let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(0)]).unwrap();
     let r = thread.heap().no_gc(|nogc| {
-        r.get_as::<Float>(nogc, nogc.known().float_map)
+        r.get_as::<Float>(nogc)
             .expect("-0 must stay a float")
             .value
             .get()

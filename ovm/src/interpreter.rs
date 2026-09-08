@@ -107,9 +107,7 @@ fn set_frame_context(
     context: Value,
 ) -> Result<(), VmError> {
     heap.no_gc(|nogc| {
-        context
-            .get_as::<Context>(nogc, nogc.known().context_map)
-            .ok_or(VmError::Type)?;
+        context.get_as::<Context>(nogc).ok_or(VmError::Type)?;
         stack.context_slot(meta).store(context);
         Ok(())
     })
@@ -135,9 +133,7 @@ fn dynamic_slot<'a>(
     context: &mut HeapRef<'a, Context>,
     name: Value,
 ) -> Result<&'a vm::GcSlot, VmError> {
-    let name_str = name
-        .get_as::<VMString>(nogc, nogc.known().string_map)
-        .ok_or(VmError::Type)?;
+    let name_str = name.get_as::<VMString>(nogc).ok_or(VmError::Type)?;
     let name_hash = name_str.hash();
     let name_bytes = name_str.as_slice(nogc);
     loop {
@@ -145,7 +141,7 @@ fn dynamic_slot<'a>(
         let names = ctx.scope_info.heap_ref(nogc).as_ref().names.heap_ref(nogc);
         for i in 0..names.len() {
             let candidate = names.at(i);
-            if let Some(s) = candidate.get_as::<VMString>(nogc, nogc.known().string_map) {
+            if let Some(s) = candidate.get_as::<VMString>(nogc) {
                 if s.hash() == name_hash && s.as_slice(nogc) == name_bytes {
                     return Ok(ctx.slots.heap_ref(nogc).as_ref().element_slot(i));
                 }
@@ -169,7 +165,7 @@ fn dynamic_lookup<'a>(
     let mut context = stack
         .context_slot(meta)
         .inner()
-        .get_as::<Context>(nogc, nogc.known().context_map)
+        .get_as::<Context>(nogc)
         .ok_or(VmError::Type)?;
     match dynamic_slot(nogc, &mut context, name) {
         Ok(slot) => Ok(Some(slot.inner())),
@@ -453,10 +449,9 @@ fn step(
                         Coercion::Value(v) => v,
                     };
                     let is_string = heap.no_gc(|nogc| {
-                        let known = nogc.known();
                         (
-                            lhs.get_as::<VMString>(nogc, known.string_map).is_some(),
-                            rhs.get_as::<VMString>(nogc, known.string_map).is_some(),
+                            lhs.get_as::<VMString>(nogc).is_some(),
+                            rhs.get_as::<VMString>(nogc).is_some(),
                         )
                     });
                     if is_string.0 || is_string.1 {
@@ -760,19 +755,13 @@ fn step(
                 return Step::Error(VmError::Type);
             }
             state.handle_scope(|scope| {
-                let callee = scope
-                    .create_handle(unsafe {
-                        Tagged::<Object>::from_value_unchecked(stack.reg(&meta, ops.reg(0)))
-                    })
-                    .expect("callee must be strong");
+                let callee = unsafe { scope.handle_value::<Object>(stack.reg(&meta, ops.reg(0))) };
                 let receiver = match Runtime::create_construct_receiver(vm, heap, state, callee) {
                     Ok(Some(r)) => r,
                     Ok(None) => return Step::PendingThrow,
                     Err(err) => return Step::Error(err),
                 };
-                let receiver = scope
-                    .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
-                    .expect("receiver is an object");
+                let receiver = unsafe { scope.handle_value::<Object>(receiver) };
                 // the register list holds only arguments; the receiver is
                 // synthesized and prepended
                 let count = ops.reg_count(2);
@@ -1125,7 +1114,7 @@ fn step(
                 let desc = if flags & PropertyFlags::Accessor.bits() != 0 {
                     let pair = cache
                         .acc()
-                        .get_as::<AccessorPair>(nogc, nogc.known().accessor_pair_map)
+                        .get_as::<AccessorPair>(nogc)
                         .ok_or(VmError::Type)?;
                     let pair = pair.as_ref();
                     PropertyDescriptor::Accessor {
@@ -1155,13 +1144,10 @@ fn step(
         }
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
-                let map = scope
-                    .create_handle(heap.known().object_initial_map.as_tagged())
-                    .expect("object initial map is strong");
                 heap.allocate_object(
                     &scope,
                     ObjectSlotsInit {
-                        map,
+                        map: heap.known().object_initial_map,
                         values: &[],
                         elements: heap.known().empty_fixed_array.erase(),
                         length: 0,
@@ -1173,13 +1159,10 @@ fn step(
         }
         Opcode::CreateEmptyArrayLiteral => {
             let obj = state.handle_scope(|scope| {
-                let map = scope
-                    .create_handle(heap.known().js_array_map.as_tagged())
-                    .expect("array object map is strong");
                 heap.allocate_object(
                     &scope,
                     ObjectSlotsInit {
-                        map,
+                        map: heap.known().js_array_map,
                         values: &[],
                         elements: heap.known().empty_fixed_array.erase(),
                         length: 0,
@@ -1196,17 +1179,13 @@ fn step(
             // the closure captures the current frame's context
             let info = step_try!(heap.no_gc(|nogc| {
                 let v = cache.constants_ref(nogc).at(ops.idx(0));
-                v.get_as::<CallableInfoObject>(nogc, nogc.known().callable_map)
+                v.get_as::<CallableInfoObject>(nogc)
                     .map(|r| r.into_tagged().erase())
                     .ok_or(VmError::Type)
             }));
             let context = step_try!(frame_context(heap, stack, &meta));
             let obj = state.handle_scope(|scope| {
-                let info = scope
-                    .create_handle(unsafe {
-                        Tagged::<CallableInfoObject>::from_value_unchecked(info)
-                    })
-                    .expect("callable info is strong");
+                let info = unsafe { scope.handle_value::<CallableInfoObject>(info) };
                 Runtime::create_closure(vm, heap, &scope, info, context)
             });
             let obj = step_try!(obj);
@@ -1272,13 +1251,13 @@ fn step(
                 cache
                     .constants_ref(nogc)
                     .at(ops.idx(0))
-                    .get_as::<ScopeInfo>(nogc, nogc.known().scope_info_map)
+                    .get_as::<ScopeInfo>(nogc)
                     .map(|r| r.into_tagged().erase())
                     .ok_or(VmError::Type)
             }));
             let count = step_try!(heap.no_gc(|nogc| {
                 scope_info
-                    .get_as::<ScopeInfo>(nogc, nogc.known().scope_info_map)
+                    .get_as::<ScopeInfo>(nogc)
                     .map(|r| r.as_ref().names.heap_ref(nogc).len())
                     .ok_or(VmError::Type)
             }));
@@ -1286,12 +1265,8 @@ fn step(
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
-                let outer = scope
-                    .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
-                    .expect("frame context is strong");
-                let scope_info = scope
-                    .create_handle(unsafe { Tagged::<ScopeInfo>::from_value_unchecked(scope_info) })
-                    .expect("scope info is strong");
+                let outer = unsafe { scope.handle_value::<Context>(outer) };
+                let scope_info = unsafe { scope.handle_value::<ScopeInfo>(scope_info) };
                 let slots = heap.allocate_handle::<FixedArray>(&values, &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
@@ -1308,9 +1283,7 @@ fn step(
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
-                let outer = scope
-                    .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
-                    .expect("frame context is strong");
+                let outer = unsafe { scope.handle_value::<Context>(outer) };
                 let slots = heap.allocate_handle::<FixedArray>(&values, &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
@@ -1325,9 +1298,7 @@ fn step(
             let exception = stack.reg(&meta, ops.reg(0));
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
-                let outer = scope
-                    .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(outer) })
-                    .expect("frame context is strong");
+                let outer = unsafe { scope.handle_value::<Context>(outer) };
                 let slots = heap.allocate_handle::<FixedArray>(&[exception], &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
@@ -1368,7 +1339,7 @@ fn step(
                 let mut context = stack
                     .context_slot(&meta)
                     .inner()
-                    .get_as::<Context>(nogc, nogc.known().context_map)
+                    .get_as::<Context>(nogc)
                     .ok_or(VmError::Type)?;
                 for _ in 0..depth {
                     context = context.as_ref().outer.heap_ref(nogc).ok_or(VmError::Type)?;
@@ -1388,7 +1359,7 @@ fn step(
                 let mut context = stack
                     .context_slot(&meta)
                     .inner()
-                    .get_as::<Context>(nogc, nogc.known().context_map)
+                    .get_as::<Context>(nogc)
                     .ok_or(VmError::Type)?;
                 for _ in 0..ops.uimm(1) {
                     context = context.as_ref().outer.heap_ref(nogc).ok_or(VmError::Type)?;
@@ -1448,7 +1419,7 @@ fn step(
                         let mut context = stack
                             .context_slot(&meta)
                             .inner()
-                            .get_as::<Context>(nogc, nogc.known().context_map)
+                            .get_as::<Context>(nogc)
                             .ok_or(VmError::Type)?;
                         let target = dynamic_slot(nogc, &mut context, name)?;
                         let host = context.into_tagged().erase();

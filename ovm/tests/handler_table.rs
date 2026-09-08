@@ -32,7 +32,7 @@ fn roundtrip_entries() {
         let out = thread.heap().no_gc(|nogc| {
             let table = t
                 .value()
-                .get_as::<HandlerTable>(nogc, nogc.known().handler_table_map)
+                .get_as::<HandlerTable>(nogc)
                 .expect("handler table value");
             (table.len(), table.entry(0), table.entry(1))
         });
@@ -50,10 +50,7 @@ fn lookup_finds_handler_inside_range() {
     thread.handle_scope(|thread, scope| {
         let t = table(thread, &scope, &[HandlerEntryInit::new(5, 15, 100)]);
         thread.heap().no_gc(|nogc| {
-            let table = t
-                .value()
-                .get_as::<HandlerTable>(nogc, nogc.known().handler_table_map)
-                .unwrap();
+            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
             // try_start is inside (inclusive) ...
             assert_eq!(table.lookup(5), Some(100));
             // ... as is any offset before try_end
@@ -70,10 +67,7 @@ fn lookup_returns_none_outside_range() {
     thread.handle_scope(|thread, scope| {
         let t = table(thread, &scope, &[HandlerEntryInit::new(5, 15, 100)]);
         thread.heap().no_gc(|nogc| {
-            let table = t
-                .value()
-                .get_as::<HandlerTable>(nogc, nogc.known().handler_table_map)
-                .unwrap();
+            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
             // before the region ...
             assert_eq!(table.lookup(4), None);
             // ... try_end is exclusive ...
@@ -101,10 +95,7 @@ fn lookup_returns_innermost_of_nested_ranges() {
             ],
         );
         thread.heap().no_gc(|nogc| {
-            let table = t
-                .value()
-                .get_as::<HandlerTable>(nogc, nogc.known().handler_table_map)
-                .unwrap();
+            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
             // inside both ranges: the innermost (largest try_start) wins
             assert_eq!(table.lookup(5), Some(300));
             // inside the outer range only
@@ -122,10 +113,7 @@ fn lookup_on_empty_table_returns_none() {
     thread.handle_scope(|thread, scope| {
         let t = table(thread, &scope, &[]);
         thread.heap().no_gc(|nogc| {
-            let table = t
-                .value()
-                .get_as::<HandlerTable>(nogc, nogc.known().handler_table_map)
-                .unwrap();
+            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
             assert_eq!(table.len(), 0);
             assert_eq!(table.lookup(0), None);
         });

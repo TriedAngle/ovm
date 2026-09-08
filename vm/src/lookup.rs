@@ -36,10 +36,10 @@ pub fn classify_key<'a>(nogc: &'a NoGc<'a>, key: Value) -> Result<Key, VmError> 
         }
         return Ok(Key::Name(SlotName::from(Tagged::from_smi(smi))));
     }
-    if let Some(s) = key.get_as::<InternedString>(nogc, nogc.known().string_map) {
+    if let Some(s) = key.get_as::<InternedString>(nogc) {
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
-    if let Some(s) = key.get_as::<Symbol>(nogc, nogc.known().symbol_map) {
+    if let Some(s) = key.get_as::<Symbol>(nogc) {
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
     Err(VmError::Type)
@@ -87,7 +87,7 @@ pub fn load_outcome<'a>(
     if let ValueRef::Object(obj) = receiver.value_ref(nogc) {
         let obj = obj.as_ref();
         if obj.is_array(nogc)
-            && let Some(s) = name.value().get_as::<VMString>(nogc, known.string_map)
+            && let Some(s) = name.value().get_as::<VMString>(nogc)
             && s.as_slice(nogc) == b"length"
         {
             return Ok(LoadOutcome::Value(obj.length.inner()));
@@ -174,7 +174,7 @@ impl Map {
         if proto == guard.known().null.value() {
             return Lookup::NotFound;
         }
-        if let Some(parents) = proto.get_as::<FixedArray>(guard, guard.known().array_map) {
+        if let Some(parents) = proto.get_as::<FixedArray>(guard) {
             for i in 0..parents.len() {
                 let result = parents.at(i).lookup(guard, name);
                 if !matches!(result, Lookup::NotFound) {

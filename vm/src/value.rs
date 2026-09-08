@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{Global, Header, HeapObject, HeapRef, Map, NoGc, Object, VmError};
+use crate::{Header, HeapObject, HeapRef, Map, NoGc, Object, VmError};
 
 /// Word Size inside the heap
 /// if we add compressed pointers we may need to duplicate this
@@ -56,20 +56,20 @@ impl Value {
         self.0 == WEAK_PTR
     }
 
-    /// If this is a strong pointer to an object whose map is `expected`,
-    /// returns it as a heap reference valid for the no-GC scope.
-    /// TODO: this function is kinda ugly, and is also unsafe with its type cast
-    pub fn get_as<'a, T: HeapObject>(
-        &self,
-        _nogc: &'a NoGc<'a>,
-        expected: Global<Map>,
-    ) -> Option<HeapRef<'a, T>> {
+    /// If this is a strong pointer to an object whose map's kind is `T`'s,
+    /// returns it as a heap reference valid for the no-GC scope. Smis and
+    /// weak pointers yield `None`. The check reads the kind byte from the
+    /// object's map, so it survives map transitions (unlike exact
+    /// well-known-map comparison).
+    pub fn get_as<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
         let ptr = HeapPtr::decode_strong(*self)?;
-        // TODO: make better api for getting object's map
+        // Safety: strong pointer; reads only the header's map slot.
         let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.get();
-        if !map.ptr_eq(expected.as_tagged()) {
+        let kind = unsafe { HeapPtr::<Map>::from(map).as_ref() }.kind().kind();
+        if !T::matches_kind(kind) {
             return None;
         }
+        // Safety: the map-kind check above is the type witness.
         Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
     }
 }
@@ -197,18 +197,11 @@ impl<T: HeapObject> HeapPtr<T> {
     pub fn encode_strong(self) -> Value {
         Value(self.as_ptr() as Word | STRONG_PTR)
     }
-
-    pub fn encode_weak(self) -> Value {
-        Value(self.as_ptr() as Word | WEAK_PTR)
-    }
 }
 
-pub trait PointerStrength {}
-pub struct Strong;
-pub struct Weak;
-
-impl PointerStrength for Strong {}
-impl PointerStrength for Weak {}
+/// Phantom marker for maybe-weak references: `Tagged<MaybeWeak<T>>` may
+/// carry the weak bit, `Tagged<T>` never does.
+pub struct MaybeWeak<T>(PhantomData<fn() -> T>);
 
 /// Tagged is a typed Value
 #[repr(transparent)]
@@ -242,7 +235,13 @@ impl Tagged<Value> {
 }
 
 impl<T> Tagged<T> {
+    /// # Safety: for pointer values the word must be strong-tagged (never
+    /// weak); weak references go through [`Tagged<MaybeWeak<T>>`].
     pub unsafe fn from_value_unchecked(value: Value) -> Self {
+        debug_assert!(
+            !value.is_weak_ptr(),
+            "weak value in a strong Tagged: use Tagged<MaybeWeak<T>>"
+        );
         Self {
             raw: value,
             _phantom: PhantomData,
@@ -329,6 +328,41 @@ impl<T: HeapObject> Tagged<T> {
 impl<T: HeapObject> From<Tagged<T>> for HeapPtr<T> {
     fn from(v: Tagged<T>) -> Self {
         unsafe { HeapPtr::new(v.erase().raw_addr() as *mut T) }
+    }
+}
+
+impl<T: HeapObject> Tagged<T> {
+    /// Widen to a maybe-weak reference with the weak bit set.
+    pub fn make_weak(self) -> Tagged<MaybeWeak<T>> {
+        Tagged {
+            raw: Value(self.raw.to_bits() | WEAK_PTR),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T: HeapObject> Tagged<MaybeWeak<T>> {
+    /// Widen a strong reference without setting the weak bit.
+    pub fn from_strong(strong: Tagged<T>) -> Self {
+        Tagged {
+            raw: strong.raw,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Narrow to a strong reference; `None` while the weak bit is set
+    /// (cleared or still-weak).
+    pub fn strengthen(self) -> Option<Tagged<T>> {
+        if self.raw.is_weak_ptr() {
+            None
+        } else {
+            // SAFETY: the weak bit is clear.
+            Some(unsafe { Tagged::from_value_unchecked(self.raw) })
+        }
+    }
+
+    pub fn is_cleared(self) -> bool {
+        self.raw.is_cleared()
     }
 }
 
