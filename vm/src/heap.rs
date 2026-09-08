@@ -180,9 +180,7 @@ fn alloc_map(
         kind,
         value_slot_count: 0,
         descriptors: &[],
-        prototype: scope
-            .create_handle(Tagged::from_value(heap.known().null.value()))
-            .expect("null is a strong pointer"),
+        prototype: scope.handle(Tagged::from_value(heap.known().null.value())),
     })
     .into_global(roots)
 }
@@ -209,9 +207,7 @@ fn alloc_parent_map_with_slots(
         kind,
         value_slot_count,
         descriptors: &[],
-        prototype: scope
-            .create_handle(Tagged::from_value(parent.value()))
-            .expect("prototype is a strong pointer"),
+        prototype: scope.handle(Tagged::from_value(parent.value())),
     })
     .into_global(roots)
 }
@@ -268,9 +264,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             kind: MapKind::OBJECT,
             value_slot_count: 0,
             descriptors: &[],
-            prototype: scope
-                .create_handle(Tagged::from_value(Smi::new(0).encode()))
-                .expect("smi is a strong pointer"),
+            prototype: scope.handle(Tagged::from_value(Smi::new(0).encode())),
         })
         .into_global(roots);
     let void = heap
@@ -287,9 +281,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             kind: MapKind::OBJECT,
             value_slot_count: 0,
             descriptors: &[],
-            prototype: scope
-                .create_handle(Tagged::from_value(Smi::new(0).encode()))
-                .expect("smi is a strong pointer"),
+            prototype: scope.handle(Tagged::from_value(Smi::new(0).encode())),
         })
         .into_global(roots);
     let null = heap
@@ -345,9 +337,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .union(MapKind::EXTENDABLE),
             value_slot_count: 2,
             descriptors: &[],
-            prototype: scope
-                .create_handle(Tagged::from_value(known.null.value()))
-                .expect("null is a strong pointer"),
+            prototype: scope.handle(Tagged::from_value(known.null.value())),
         })
         .into_global(roots);
     let non_constructor_function_map = heap
@@ -357,9 +347,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .union(MapKind::EXTENDABLE),
             value_slot_count: 2,
             descriptors: &[],
-            prototype: scope
-                .create_handle(Tagged::from_value(known.null.value()))
-                .expect("null is a strong pointer"),
+            prototype: scope.handle(Tagged::from_value(known.null.value())),
         })
         .into_global(roots);
     let class_constructor_map = heap
@@ -371,9 +359,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .union(MapKind::CLASS_CONSTRUCTOR),
             value_slot_count: 2,
             descriptors: &[],
-            prototype: scope
-                .create_handle(Tagged::from_value(known.null.value()))
-                .expect("null is a strong pointer"),
+            prototype: scope.handle(Tagged::from_value(known.null.value())),
         })
         .into_global(roots);
     known.smi_map = smi_map;
@@ -523,13 +509,10 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         2, // [callable info, context], like function_map
     );
     let empty_code = heap.allocate::<FixedByteArray>(&[1]).into_handle(&scope);
-    let empty_constants = scope
-        .create_handle(known.empty_fixed_array.as_tagged())
-        .expect("empty fixed array is a strong pointer");
     let empty_info = heap
         .allocate::<CallableInfoObject>(CallableInfoInit {
             bytecode: empty_code,
-            constants: empty_constants,
+            constants: known.empty_fixed_array,
             register_count: 0,
             handlers: None,
         })
@@ -678,7 +661,7 @@ impl<'scope, T: HeapObject> HeapRef<'scope, T> {
     }
 
     pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
-        unsafe { scope.create_handle_unchecked(self.into_tagged()) }
+        scope.handle(self.into_tagged())
     }
 }
 
@@ -735,7 +718,7 @@ impl<'scope, T: HeapObject> Fresh<'scope, T> {
     }
 
     pub fn into_handle<'s>(self, scope: &'s HandleScope<'_>) -> Handle<'s, T> {
-        unsafe { scope.create_handle_unchecked(self.into_tagged()) }
+        scope.handle(self.into_tagged())
     }
 
     pub fn into_global(self, roots: &RootHandles) -> Global<T> {
@@ -862,7 +845,7 @@ unsafe impl<T: HeapObject> Sync for WeakGcCell<T> {}
 impl<T: HeapObject> WeakGcCell<T> {
     pub fn new(ptr: HeapPtr<T>) -> Self {
         Self {
-            cell: unsafe { RawCell::from_value(ptr.encode_weak()) },
+            cell: unsafe { RawCell::from_value(Tagged::from_ptr(ptr).make_weak().erase()) },
             _phantom: PhantomData,
         }
     }
@@ -871,7 +854,7 @@ impl<T: HeapObject> WeakGcCell<T> {
     /// it as reachable until we decide to weaken selected entries.
     pub fn new_strong(ptr: HeapPtr<T>) -> Self {
         Self {
-            cell: unsafe { RawCell::from_value(ptr.encode_strong()) },
+            cell: unsafe { RawCell::from_value(Tagged::from_ptr(ptr).erase()) },
             _phantom: PhantomData,
         }
     }
@@ -1163,7 +1146,7 @@ impl Heap {
         config: ObjectSlotsInit<'a, '_>,
     ) -> Fresh<'_, Object> {
         let slots = if config.values.is_empty() {
-            handles.create_handle(self.known().empty_fixed_array.as_tagged())
+            self.known().empty_fixed_array
         } else {
             handles.create_handle(self.allocate::<FixedArray>(config.values).into_tagged())
         };

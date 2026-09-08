@@ -115,7 +115,7 @@ fn exception_name(thread: &mut ovm::Thread) -> String {
             match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
                 vm::Lookup::Data { slot, .. } => slot
                     .inner()
-                    .get_as::<vm::VMString>(nogc, nogc.known().string_map)
+                    .get_as::<vm::VMString>(nogc)
                     .map(|s| String::from_utf8_lossy(s.as_slice(nogc)).into_owned())
                     .unwrap_or_else(|| "exception".into()),
                 _ => "exception".into(),

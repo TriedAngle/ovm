@@ -152,15 +152,9 @@ fn error_objects_are_extendable() {
     match outcome {
         Ok(StoreOutcome::Transition { receiver, name }) => {
             thread.handle_scope(|thread, scope| {
-                let receiver = scope
-                    .create_handle(unsafe {
-                        vm::Tagged::<vm::Object>::from_value_unchecked(receiver)
-                    })
-                    .expect("receiver is strong");
-                let name = scope.create_handle(name.tagged()).expect("name is strong");
-                let value = scope
-                    .create_handle(vm::Tagged::from_value(extra_val))
-                    .expect("value is strong");
+                let receiver = unsafe { scope.handle_value::<vm::Object>(receiver) };
+                let name = scope.handle(name.tagged());
+                let value = scope.handle(vm::Tagged::from_value(extra_val));
                 vm::Object::define_own_property(
                     thread.heap(),
                     &scope,

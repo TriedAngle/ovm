@@ -44,7 +44,7 @@ fn run_num(src: &str) -> f64 {
             return smi.value() as f64;
         }
         result
-            .get_as::<Float>(nogc, nogc.known().float_map)
+            .get_as::<Float>(nogc)
             .expect("number result")
             .value
             .get()
@@ -54,9 +54,7 @@ fn run_num(src: &str) -> f64 {
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
     thread.heap().no_gc(|nogc| {
-        let s = result
-            .get_as::<VMString>(nogc, nogc.known().string_map)
-            .expect("string result");
+        let s = result.get_as::<VMString>(nogc).expect("string result");
         String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
     })
 }
