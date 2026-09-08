@@ -377,6 +377,19 @@ impl<'a> FunctionGen<'a> {
         }
     }
 
+    /// Store the accumulator into a declaration's slot. Unlike
+    /// [`Self::store_resolution`] this can target the global object, which
+    /// needs the name (REPL mode puts script-scope decls there).
+    fn store_decl(&mut self, res: Resolution, name: Symbol) {
+        match res {
+            Resolution::GlobalObject => {
+                let idx = self.add_constant(Constant::String(self.ast.symbol(name).to_vec()));
+                emit(&mut self.code, Opcode::StoreGlobal, &[idx, 0]);
+            }
+            other => self.store_resolution(other),
+        }
+    }
+
     fn store_name(&mut self, node: NodeId, name: Symbol) -> Result<(), CompileError> {
         let res = self
             .resolved
@@ -1268,18 +1281,8 @@ impl<'a> FunctionGen<'a> {
                     .resolved
                     .resolution_for_decl(scope, name)
                     .expect("declared");
-                match res {
-                    Resolution::GlobalObject => {
-                        let nidx =
-                            self.add_constant(Constant::String(self.ast.symbol(name).to_vec()));
-                        emit(&mut self.code, Opcode::StoreGlobal, &[nidx, 0]);
-                        Ok(())
-                    }
-                    other => {
-                        self.store_resolution(other);
-                        Ok(())
-                    }
-                }
+                self.store_decl(res, name);
+                Ok(())
             }
             Node::Labeled { label, body } => self.emit_labeled(node, label, body),
             Node::Break { label } => self.emit_break_continue(node, label, true),
@@ -1309,14 +1312,14 @@ impl<'a> FunctionGen<'a> {
             match init {
                 Some(init) => {
                     self.expr(init)?;
-                    self.store_resolution(res);
+                    self.store_decl(res, name);
                 }
-                None if kind == VarKind::Var => {
+                None if kind == VarKind::Var || res == Resolution::GlobalObject => {
+                    // `var` (and REPL globals) initialize to undefined;
+                    // local let/const without init stay the hole (TDZ)
                     self.emit_load_constant(Constant::Undefined);
-                    self.store_resolution(res);
+                    self.store_decl(res, name);
                 }
-                // let/const without init: the hole (TDZ) — frame registers
-                // are born as the hole
                 None => {}
             }
         }
