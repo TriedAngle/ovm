@@ -1207,7 +1207,7 @@ impl Heap {
     /// heap or write existing slots: the returned guard holds the heap
     /// borrow, so no allocation can happen while it is alive. The heap is
     /// reachable through it (`Deref<Target = Heap>` / [`NoGc::heap`]).
-    pub fn no_gc_guard(&mut self) -> NoGc<'_> {
+    pub fn guard(&mut self) -> NoGc<'_> {
         NoGc::new(self)
     }
 
