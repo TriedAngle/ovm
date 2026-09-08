@@ -56,11 +56,11 @@ impl Value {
         self.0 == WEAK_PTR
     }
 
-    /// If this is a strong pointer to an object whose map's kind is `T`'s,
-    /// returns it as a heap reference valid for the no-GC scope. Smis and
-    /// weak pointers yield `None`. The check reads the kind byte from the
-    /// object's map, so it survives map transitions (unlike exact
-    /// well-known-map comparison).
+    /// The Smi payload as an `i64`; `None` for pointers (incl. weak).
+    pub fn to_i64(self) -> Option<i64> {
+        Smi::decode(self).map(|s| s.value())
+    }
+
     pub fn get_as<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
         let ptr = HeapPtr::decode_strong(*self)?;
         // Safety: strong pointer; reads only the header's map slot.
@@ -72,12 +72,17 @@ impl Value {
         // Safety: the map-kind check above is the type witness.
         Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
     }
+
+    pub fn as_heap_object<'a>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, Object>> {
+        let ptr = HeapPtr::decode_strong(*self)?;
+        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
+    }
 }
 
 impl core::fmt::Debug for Value {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.is_smi() {
-            write!(f, "Value(Smi({}))", Smi::decode(*self).unwrap().value())
+            write!(f, "Value(Smi({}))", self.to_i64().unwrap())
         } else if self.is_weak_ptr() {
             write!(f, "Value(Weak({:#x}))", self.raw_addr())
         } else {
@@ -199,8 +204,6 @@ impl<T: HeapObject> HeapPtr<T> {
     }
 }
 
-/// Phantom marker for maybe-weak references: `Tagged<MaybeWeak<T>>` may
-/// carry the weak bit, `Tagged<T>` never does.
 pub struct MaybeWeak<T>(PhantomData<fn() -> T>);
 
 /// Tagged is a typed Value
@@ -225,8 +228,8 @@ impl<T> core::fmt::Debug for Tagged<T> {
     }
 }
 
-impl Tagged<Value> {
-    pub fn from_ereased(value: Value) -> Self {
+impl From<Value> for Tagged<Value> {
+    fn from(value: Value) -> Self {
         Self {
             raw: value,
             _phantom: PhantomData,
@@ -234,9 +237,19 @@ impl Tagged<Value> {
     }
 }
 
+impl From<Smi> for Value {
+    fn from(smi: Smi) -> Self {
+        smi.encode()
+    }
+}
+
+impl From<Smi> for Tagged<Value> {
+    fn from(smi: Smi) -> Self {
+        Self::from(smi.encode())
+    }
+}
+
 impl<T> Tagged<T> {
-    /// # Safety: for pointer values the word must be strong-tagged (never
-    /// weak); weak references go through [`Tagged<MaybeWeak<T>>`].
     pub unsafe fn from_value_unchecked(value: Value) -> Self {
         debug_assert!(
             !value.is_weak_ptr(),
@@ -250,10 +263,6 @@ impl<T> Tagged<T> {
 
     pub fn erase(self) -> Value {
         self.raw
-    }
-
-    pub fn erase_tagged(self) -> Tagged<Value> {
-        Tagged::<Value>::from_ereased(self.raw)
     }
 
     pub unsafe fn cast<U>(self) -> Tagged<U> {
@@ -281,12 +290,6 @@ impl<T> Tagged<T> {
     }
 }
 
-impl Tagged<Value> {
-    pub fn from_value(v: Value) -> Self {
-        unsafe { Self::from_value_unchecked(v) }
-    }
-}
-
 impl Tagged<Smi> {
     pub fn from_smi(smi: Smi) -> Self {
         unsafe { Self::from_value_unchecked(smi.encode()) }
@@ -302,12 +305,6 @@ impl Tagged<Smi> {
 
     pub fn to_smi(self) -> Option<Smi> {
         Smi::decode(self.raw)
-    }
-}
-
-impl From<Smi> for Tagged<Smi> {
-    fn from(smi: Smi) -> Self {
-        Self::from_smi(smi)
     }
 }
 
@@ -331,8 +328,19 @@ impl<T: HeapObject> From<Tagged<T>> for HeapPtr<T> {
     }
 }
 
+impl<T> From<Tagged<T>> for Value {
+    fn from(tagged: Tagged<T>) -> Self {
+        tagged.erase()
+    }
+}
+
+impl From<Smi> for Tagged<Smi> {
+    fn from(smi: Smi) -> Self {
+        Self::from_smi(smi)
+    }
+}
+
 impl<T: HeapObject> Tagged<T> {
-    /// Widen to a maybe-weak reference with the weak bit set.
     pub fn make_weak(self) -> Tagged<MaybeWeak<T>> {
         Tagged {
             raw: Value(self.raw.to_bits() | WEAK_PTR),
@@ -342,7 +350,6 @@ impl<T: HeapObject> Tagged<T> {
 }
 
 impl<T: HeapObject> Tagged<MaybeWeak<T>> {
-    /// Widen a strong reference without setting the weak bit.
     pub fn from_strong(strong: Tagged<T>) -> Self {
         Tagged {
             raw: strong.raw,
@@ -350,8 +357,6 @@ impl<T: HeapObject> Tagged<MaybeWeak<T>> {
         }
     }
 
-    /// Narrow to a strong reference; `None` while the weak bit is set
-    /// (cleared or still-weak).
     pub fn strengthen(self) -> Option<Tagged<T>> {
         if self.raw.is_weak_ptr() {
             None
@@ -364,9 +369,4 @@ impl<T: HeapObject> Tagged<MaybeWeak<T>> {
     pub fn is_cleared(self) -> bool {
         self.raw.is_cleared()
     }
-}
-
-pub enum ValueRef<'a> {
-    Smi(Smi),
-    Object(HeapRef<'a, Object>),
 }

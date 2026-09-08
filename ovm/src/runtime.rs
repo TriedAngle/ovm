@@ -1,7 +1,7 @@
 use vm::{
     CallableInfoObject, Context, Convert, FixedArray, Float, GcSlice, Handle, HandleScope, Heap,
-    LoadOutcome, NoGc, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, Symbol, Tagged,
-    VMString, Value, ValueRef, VmError, load_outcome,
+    LoadOutcome, NoGc, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, Symbol,
+    VMString, Value, VmError, load_outcome,
 };
 
 use crate::{ContextState, NativeContext, VM};
@@ -37,8 +37,8 @@ impl Runtime {
             )
         });
         let function_name = match source_name {
-            Some(name) => scope.handle(Tagged::from_value(name)),
-            None => scope.handle(Tagged::from_value(heap.known().strings.empty.value())),
+            Some(name) => scope.handle(name),
+            None => scope.handle(heap.known().strings.empty.value()),
         };
         let map = match kind {
             kind if kind.is_class_constructor() => heap.known().class_constructor_map,
@@ -51,7 +51,7 @@ impl Runtime {
                 scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[info.as_tagged().erase(), context.as_tagged().erase()],
+                    values: &[info.value(), context.value()],
                     elements: heap.known().empty_fixed_array.erase(),
                     length: 0,
                 },
@@ -285,7 +285,7 @@ impl Runtime {
 
     pub fn is_callable(heap: &mut Heap, v: Value) -> bool {
         heap.no_gc(|nogc| {
-            let ValueRef::Object(obj) = v.value_ref(nogc) else {
+            let Some(obj) = v.as_heap_object(nogc) else {
                 return false;
             };
             obj.as_ref().header.map.heap_ref(nogc).kind().is_callable()
@@ -311,7 +311,7 @@ impl Runtime {
                 strings.string.value()
             } else if v.get_as::<Symbol>(nogc).is_some() {
                 strings.symbol.value()
-            } else if let ValueRef::Object(obj) = v.value_ref(nogc) {
+            } else if let Some(obj) = v.as_heap_object(nogc) {
                 if obj.as_ref().header.map.heap_ref(nogc).kind().is_callable() {
                     strings.function.value()
                 } else {
@@ -354,7 +354,7 @@ impl Runtime {
 
     /// OrdinaryHasInstance step 6: walk the prototype chain of `object`.
     pub fn has_proto_in_chain<'a>(nogc: &'a NoGc<'a>, object: Value, target: Value) -> bool {
-        let ValueRef::Object(obj) = object.value_ref(nogc) else {
+        let Some(obj) = object.as_heap_object(nogc) else {
             return false;
         };
         let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();

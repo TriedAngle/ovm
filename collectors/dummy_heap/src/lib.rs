@@ -439,7 +439,7 @@ mod tests {
                 kind,
                 value_slot_count: value_slots,
                 descriptors: &descriptors,
-                prototype: roots.create_handle(Tagged::from_value(heap.known().null.value())),
+                prototype: roots.create_handle(heap.known().null),
             })
             .into_tagged();
         roots.create_handle(map)
@@ -463,7 +463,7 @@ mod tests {
                 kind,
                 value_slot_count: value_slots,
                 descriptors: &descriptors,
-                prototype: roots.create_handle(Tagged::from_value(proto)),
+                prototype: roots.create_handle(proto),
             })
             .into_tagged();
         roots.create_handle(map)
@@ -554,7 +554,7 @@ mod tests {
 
         heap.no_gc(|nogc| {
             let parent_ref = parent.heap_ref(nogc);
-            parent_ref.transitions.set(nogc, parent.value(), pairs);
+            parent_ref.transitions.set(nogc, parent, pairs);
 
             let found = parent_ref
                 .find_transition(nogc, smi_name(1), flags, None)
@@ -589,7 +589,7 @@ mod tests {
 
     /// Root a value in the scope.
     fn root_value<'s>(scope: &'s HandleScope<'_>, value: Value) -> vm::Handle<'s, Value> {
-        scope.handle(Tagged::from_value(value))
+        scope.handle(value)
     }
 
     #[test]
@@ -1091,7 +1091,7 @@ mod tests {
                 .unwrap();
             match outcome {
                 StoreOutcome::CallSetter { setter } => {
-                    assert_eq!(Smi::decode(setter).unwrap().value(), 222)
+                    assert_eq!(setter.to_i64().unwrap(), 222)
                 }
                 _ => panic!("expected CallSetter outcome"),
             }
@@ -1158,8 +1158,8 @@ mod tests {
 
         let undefined = heap.known().undefined.value();
         let name = scope.handle(smi_name(5).tagged());
-        let get = scope.handle(Tagged::from_value(Smi::new(111).encode()));
-        let set = scope.handle(Tagged::from_value(undefined));
+        let get = scope.handle::<Value>(Smi::new(111));
+        let set = scope.handle(undefined);
         Object::define_own_property(
             &mut heap,
             &scope,
@@ -1212,8 +1212,8 @@ mod tests {
 
         let undefined = heap.known().undefined.value();
         let name = scope.handle(smi_name(5).tagged());
-        let get = scope.handle(Tagged::from_value(undefined));
-        let set = scope.handle(Tagged::from_value(undefined));
+        let get = scope.handle(undefined);
+        let set = scope.handle(undefined);
         let result = Object::define_own_property(
             &mut heap,
             &scope,
@@ -1686,7 +1686,7 @@ mod tests {
         );
 
         let parents = heap
-            .allocate::<FixedArray>(&[parent_a.as_tagged().erase(), parent_b.as_tagged().erase()])
+            .allocate::<FixedArray>(&[parent_a.value(), parent_b.value()])
             .into_handle(&scope);
         let child_map = alloc_map_proto(
             &mut heap,
@@ -1694,7 +1694,7 @@ mod tests {
             MapKind::OBJECT.union(MapKind::EXTENDABLE),
             0,
             &[],
-            parents.as_tagged().erase(),
+            parents.value(),
         );
         let child = root_object(&scope, alloc_object(&mut heap, child_map, &[]));
         let name = root_name(&scope, smi_name(1));

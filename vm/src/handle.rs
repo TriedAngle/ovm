@@ -76,6 +76,21 @@ impl<'s, T> From<Handle<'s, T>> for Tagged<T> {
     }
 }
 
+/// Typed handles erase into value slots (`GcSlot<Value>`). Disjoint from
+/// the typed impl above: `Value` is not a `HeapObject`.
+impl<'s, T: HeapObject> From<Handle<'s, T>> for Tagged<Value> {
+    fn from(h: Handle<'s, T>) -> Self {
+        Self::from(h.value())
+    }
+}
+
+/// Reading a handle at a value boundary (e.g. `GcSlot::set`'s host argument).
+impl<'s, T> From<Handle<'s, T>> for Value {
+    fn from(h: Handle<'s, T>) -> Self {
+        h.value()
+    }
+}
+
 pub struct HandleData {
     inner: UnsafeCell<HandleDataImpl>,
 }
@@ -176,7 +191,8 @@ impl<'d> HandleScope<'d> {
         }
     }
 
-    pub fn handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+    pub fn handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T> {
+        let value = value.into();
         debug_assert!(
             !value.erase().is_weak_ptr(),
             "weak value cannot be rooted in a handle"
@@ -275,7 +291,8 @@ impl RootHandles {
         }
     }
 
-    pub fn create_handle<T>(&self, value: Tagged<T>) -> Global<T> {
+    pub fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Global<T> {
+        let value = value.into();
         let i = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(i < self.slots.len(), "root handle table exhausted");
         let slot = GcSlot::raw_get(&self.slots[i]);
@@ -293,17 +310,17 @@ impl EdgeVisitable for RootHandles {
 }
 
 pub trait HandleSet {
-    fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T>;
+    fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T>;
 }
 
 impl HandleSet for HandleScope<'_> {
-    fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+    fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T> {
         self.handle(value)
     }
 }
 
 impl HandleSet for RootHandles {
-    fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+    fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T> {
         // Slots in the root table are stable and never reclaimed, so the
         // returned handle is valid for the borrow of `self` (in practice:
         // pseudo-static, see `Global<T>`).

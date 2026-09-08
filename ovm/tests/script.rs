@@ -2,7 +2,7 @@
 
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{ScriptError, Thread, VM};
-use vm::{Float, FunctionKind, Lookup, SlotName, Smi, VMString, Value, ValueRef};
+use vm::{Float, FunctionKind, Lookup, SlotName, Smi, VMString, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
     let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
@@ -268,7 +268,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
         let expected_name = thread.intern(&scope, "named").value();
         thread.heap().no_gc(|nogc| {
             let function_value = function;
-            let ValueRef::Object(function) = function.value_ref(nogc) else {
+            let Some(function) = function.as_heap_object(nogc) else {
                 panic!("result must be a function object")
             };
             let function = function.as_ref();
@@ -303,7 +303,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                     assert!(flags.is_writable());
                     assert!(!flags.is_enumerable());
                     assert!(!flags.is_configurable());
-                    let ValueRef::Object(prototype) = slot.inner().value_ref(nogc) else {
+                    let Some(prototype) = slot.inner().as_heap_object(nogc) else {
                         panic!("function prototype must be an object")
                     };
                     match prototype
@@ -355,7 +355,7 @@ fn tdz_throws_on_let_before_init() {
         let name_key = thread.intern(&scope, "name").value();
         let expected = thread.intern(&scope, "ReferenceError").value();
         thread.heap().no_gc(|nogc| {
-            let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
+            let Some(o) = ex.as_heap_object(nogc) else {
                 panic!("pending exception must be an object");
             };
             match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
@@ -435,7 +435,7 @@ fn unused_let_without_init_is_still_tdz() {
     let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script("let x = 1, y; y = x; x;").unwrap();
-    assert_eq!(Smi::decode(result).unwrap().value(), 1);
+    assert_eq!(result.to_i64().unwrap(), 1);
 }
 
 #[test]
@@ -446,7 +446,7 @@ fn repl_mode_persists_top_level_bindings() {
     thread.run_script_repl("var y = 2;").unwrap();
     thread.run_script_repl("const z = 3;").unwrap();
     let v = thread.run_script_repl("x * y + z;").unwrap();
-    assert_eq!(Smi::decode(v).unwrap().value(), 23);
+    assert_eq!(v.to_i64().unwrap(), 23);
 }
 
 #[test]
@@ -459,7 +459,7 @@ fn repl_mode_functions_persist_and_read_globals() {
         .unwrap();
     thread.run_script_repl("x = 20;").unwrap();
     let v = thread.run_script_repl("get();").unwrap();
-    assert_eq!(Smi::decode(v).unwrap().value(), 20);
+    assert_eq!(v.to_i64().unwrap(), 20);
 }
 
 #[test]
@@ -468,7 +468,7 @@ fn repl_mode_allows_redeclaration_across_entries() {
     let mut thread = vm.attach();
     thread.run_script_repl("let x = 1;").unwrap();
     let v = thread.run_script_repl("let x = 2; x;").unwrap();
-    assert_eq!(Smi::decode(v).unwrap().value(), 2);
+    assert_eq!(v.to_i64().unwrap(), 2);
 }
 
 #[test]

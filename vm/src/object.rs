@@ -5,20 +5,14 @@ use core::{
 
 use crate::{
     Compare, EdgeVisitable, GcSlot, Handle, HandleScope, Heap, HeapRef, NoGc, OptionGcSlot,
-    STRONG_PTR, Smi, Tagged, TransitionGuard, Value, ValueRef, Visitor, VmError, WEAK_PTR, Word,
+    STRONG_PTR, Smi, Tagged, TransitionGuard, Value, Visitor, VmError, WEAK_PTR, Word,
 };
 
 pub trait HeapObject: 'static {
     type Init<'a>;
 
-    /// The `ObjectKind` this type's map carries: the type tag used for
-    /// checked casts (`Value::get_as`). Unlike map-pointer equality it
-    /// survives map transitions.
     const KIND: ObjectKind;
 
-    /// Whether a map's kind byte denotes a `T`. Defaults to exact `KIND`
-    /// equality; the any-heap-object [`Object`] overrides it with the
-    /// JS-object range check.
     fn matches_kind(kind: ObjectKind) -> bool {
         kind == Self::KIND
     }
@@ -210,14 +204,13 @@ impl HeapObject for Map {
             .set(nogc, host, Smi::new(config.descriptors.len() as i64));
         self.kind
             .set(nogc, host, Smi::new(config.kind.bits() as i64));
-        self.prototype
-            .set(nogc, host, Tagged::from_value(config.prototype.value()));
+        self.prototype.set(nogc, host, config.prototype.value());
         self.transitions.clear(nogc.known().void.value());
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
             d.name.set(nogc, host, name.tagged());
             d.flags.set(nogc, host, Smi::new(flags.bits() as i64));
-            d.value.set(nogc, host, Tagged::from_value(*value));
+            d.value.set(nogc, host, *value);
         }
     }
 
@@ -512,9 +505,7 @@ pub enum CallTarget {
 }
 
 pub fn call_target<'a>(nogc: &'a NoGc<'a>, f: Value) -> Option<CallTarget> {
-    let ValueRef::Object(obj) = f.value_ref(nogc) else {
-        return None;
-    };
+    let obj = f.as_heap_object(nogc)?;
     let kind = obj.as_ref().header.map.heap_ref(nogc).kind();
     if !kind.is_callable() {
         return None;
@@ -568,7 +559,7 @@ pub fn store_array_element(
         heap.no_gc(|nogc| {
             let obj = receiver.heap_ref(nogc);
             obj.elements
-                .set(nogc, obj.erase(), elements.as_tagged().erase_tagged());
+                .set(nogc, obj.erase(), elements.as_tagged().erase());
             obj.length.set(nogc, obj.erase(), Smi::new(new_len as i64));
         });
     } else {
@@ -674,8 +665,7 @@ impl FixedArray {
     }
 
     pub fn set(&self, nogc: &NoGc<'_>, i: usize, v: Value) {
-        self.element_slot(i)
-            .set(nogc, self.erase(), Tagged::from_value(v));
+        self.element_slot(i).set(nogc, self.erase(), v);
     }
 }
 
@@ -694,7 +684,7 @@ impl HeapObject for FixedArray {
             .set(nogc, host, nogc.known().array_map.as_tagged());
         self.size.set(nogc, host, Smi::new(config.len() as i64));
         for (i, v) in config.iter().enumerate() {
-            self.element_slot(i).set(nogc, host, Tagged::from_value(*v));
+            self.element_slot(i).set(nogc, host, *v);
         }
     }
 
@@ -978,7 +968,7 @@ impl HeapObject for Symbol {
         self.header
             .map
             .set(nogc, host, nogc.known().symbol_map.as_tagged());
-        self.backing.set(nogc, host, config.as_tagged());
+        self.backing.set(nogc, host, *config);
     }
 
     fn header(&self) -> &Header {
@@ -1074,8 +1064,8 @@ impl HeapObject for AccessorPair {
         self.header
             .map
             .set(nogc, host, nogc.known().accessor_pair_map.as_tagged());
-        self.get.set(nogc, host, Tagged::from_value(config.0));
-        self.set.set(nogc, host, Tagged::from_value(config.1));
+        self.get.set(nogc, host, config.0);
+        self.set.set(nogc, host, config.1);
     }
 
     fn header(&self) -> &Header {
@@ -1183,11 +1173,10 @@ impl HeapObject for CallableInfoObject {
         self.register_count
             .set(nogc, host, Smi::new(config.register_count as i64));
         match config.handlers {
-            Some(handlers) => self.handlers.set(nogc, host, handlers.as_tagged()),
+            Some(handlers) => self.handlers.set(nogc, host, handlers),
             None => self.handlers.clear(nogc.known().void.value()),
         }
-        self.name
-            .set(nogc, host, Tagged::from_value(nogc.known().void.value()));
+        self.name.set(nogc, host, nogc.known().void.value());
         self.formal_parameter_count.set(nogc, host, Smi::new(0));
         self.kind
             .set(nogc, host, Smi::new(FunctionKind::Normal as i64));
@@ -1226,7 +1215,7 @@ impl CallableInfoObject {
         self.name.set(
             nogc,
             host,
-            Tagged::from_value(name.unwrap_or_else(|| nogc.known().void.value())),
+            name.unwrap_or_else(|| nogc.known().void.value()),
         );
         self.formal_parameter_count
             .set(nogc, host, Smi::new(formal_parameter_count as i64));
@@ -1452,7 +1441,7 @@ impl HeapObject for Context {
             .map
             .set(nogc, host, nogc.known().context_map.as_tagged());
         match config.outer {
-            Some(outer) => self.outer.set(nogc, host, outer.as_tagged()),
+            Some(outer) => self.outer.set(nogc, host, outer),
             None => self.outer.clear(nogc.known().void.value()),
         }
         self.slots.set(nogc, host, config.slots.as_tagged());

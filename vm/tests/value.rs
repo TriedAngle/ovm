@@ -317,14 +317,13 @@ mod tagged {
     }
 
     #[test]
-    fn erase_tagged_and_cast_preserve_bits() {
+    fn erase_and_into_preserve_bits() {
         let tagged = Tagged::<Smi>::smi(7).unwrap();
 
-        let erased = tagged.erase_tagged();
-        assert_eq!(erased.erase().to_bits(), tagged.erase().to_bits());
-
-        let cast = unsafe { erased.cast::<Smi>() };
-        assert_eq!(cast.to_smi().unwrap().value(), 7);
+        let erased: Value = tagged.erase();
+        let re_tagged = Tagged::<Value>::from(erased);
+        assert_eq!(re_tagged.erase().to_bits(), tagged.erase().to_bits());
+        assert!(re_tagged.is_smi());
     }
 
     #[test]

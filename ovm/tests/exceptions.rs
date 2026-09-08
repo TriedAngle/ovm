@@ -47,7 +47,7 @@ fn callable<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.as_tagged().erase(), empty_context.as_tagged().erase()],
+                values: &[info.value(), empty_context.value()],
                 elements: void.erase(),
                 length: 0,
             },
@@ -230,7 +230,7 @@ fn stack_overflow_during_call_is_throwable() {
     thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
         thread.heap().no_gc(|nogc| {
-            let vm::ValueRef::Object(o) = ex.value_ref(nogc) else {
+            let Some(o) = ex.as_heap_object(nogc) else {
                 panic!("pending exception must be an object");
             };
             match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {

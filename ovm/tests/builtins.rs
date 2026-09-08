@@ -2,7 +2,7 @@
 
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::VM;
-use vm::{Smi, Value};
+use vm::Value;
 
 fn vm() -> VM {
     VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap()
@@ -11,7 +11,7 @@ fn vm() -> VM {
 fn run_smi(vm: &VM, src: &str) -> i64 {
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
-    Smi::decode(result).unwrap().value()
+    result.to_i64().unwrap()
 }
 
 fn run_str(vm: &VM, src: &str) -> String {
@@ -87,7 +87,7 @@ fn eval_returns_last_statement_value() {
 fn eval_thrown_exceptions_propagate() {
     let vm = vm();
     let (result, thread) = run_value(&vm, "try { eval('throw 7;'); } catch (e) { e; }");
-    assert_eq!(Smi::decode(result).unwrap().value(), 7);
+    assert_eq!(result.to_i64().unwrap(), 7);
     assert!(!thread.has_pending_exception());
 }
 
@@ -95,7 +95,7 @@ fn eval_thrown_exceptions_propagate() {
 fn eval_syntax_error_throws() {
     let vm = vm();
     let (result, thread) = run_value(&vm, "try { eval('var = ;'); } catch (e) { 1; }");
-    assert_eq!(Smi::decode(result).unwrap().value(), 1);
+    assert_eq!(result.to_i64().unwrap(), 1);
     assert!(!thread.has_pending_exception());
 }
 

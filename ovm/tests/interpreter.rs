@@ -5,8 +5,7 @@ use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
     FixedByteArray, Float, FunctionKind, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map,
     MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit,
-    SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, ValueRef,
-    string_content_hash,
+    SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, VMString, Value, string_content_hash,
 };
 
 fn smi(v: i64) -> Value {
@@ -27,7 +26,7 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
     thread.handle_scope(|thread, scope| {
         let name_key = thread.intern(&scope, "name").value();
         thread.heap().no_gc(|nogc| {
-            let ValueRef::Object(o) = ex.value_ref(nogc) else {
+            let Some(o) = ex.as_heap_object(nogc) else {
                 panic!("pending exception must be an object");
             };
             match o.as_ref().lookup(nogc, SlotName::from_value(name_key)) {
@@ -57,7 +56,7 @@ fn callable_object<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.as_tagged().erase(), empty_context.as_tagged().erase()],
+                values: &[info.value(), empty_context.value()],
                 elements: void.erase(),
                 length: 0,
             },
@@ -126,7 +125,7 @@ fn create_closure_of_kind(
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateClosure, &[0]);
         emit(&mut program, Opcode::Return, &[]);
-        run_program_consts(&mut *thread, program, 0, &[], &[info.as_tagged().erase()]).unwrap()
+        run_program_consts(&mut *thread, program, 0, &[], &[info.value()]).unwrap()
     })
 }
 
@@ -143,7 +142,7 @@ fn run_program_ctx(
     thread.handle_scope(|thread, scope| {
         let dummy: Vec<vm::Value> = (0..slot_count)
             .map(|i| thread.intern(&scope, format!("slot{i}")))
-            .map(|h| h.as_tagged().erase())
+            .map(|h| h.value())
             .collect();
         let names = thread.heap().allocate_handle::<FixedArray>(&dummy, &scope);
         let scope_info = thread
@@ -154,7 +153,7 @@ fn run_program_ctx(
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[scope_info.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[scope_info.value()], &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -309,7 +308,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
         // caller: r0 = callee object; CallNoFeedback r0, r0, 1 -> acc
         let receiver_consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[callee_obj.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[callee_obj.value()], &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -432,10 +431,9 @@ fn object_literal_built_with_manual_stores() {
         thread.handle_scope(|thread, scope| {
             let x = thread.intern(&scope, "x");
             let y = thread.intern(&scope, "y");
-            let consts = thread.heap().allocate_handle::<FixedArray>(
-                &[x.as_tagged().erase(), y.as_tagged().erase()],
-                &scope,
-            );
+            let consts = thread
+                .heap()
+                .allocate_handle::<FixedArray>(&[x.value(), y.value()], &scope);
 
             // r0 = {}; r0.x = 7; r0.y = 9; return r0
             let mut program = Vec::new();
@@ -483,7 +481,7 @@ fn object_literal_built_with_manual_stores() {
         (
             read(obj1),
             read(obj2),
-            _nogc.known().object_initial_map.as_tagged().erase(),
+            _nogc.known().object_initial_map.value(),
         )
     });
     assert_eq!((x1, y1), (7, 9));
@@ -508,7 +506,7 @@ fn define_named_own_property_attributes_and_value() {
             let m = thread.intern(&scope, "m");
             let consts = thread
                 .heap()
-                .allocate_handle::<FixedArray>(&[m.as_tagged().erase()], &scope);
+                .allocate_handle::<FixedArray>(&[m.value()], &scope);
             let mut program = Vec::new();
             emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
             emit(&mut program, Opcode::Store, &[0]);
@@ -895,7 +893,7 @@ fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Resu
         let y = thread.intern(&scope, "y");
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[x.as_tagged().erase(), y.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[x.value(), y.value()], &scope);
 
         // r2 = {}; r2.x = 7; r2.y = 9
         let mut program = Vec::new();
@@ -988,15 +986,9 @@ fn transition_object_program(
                 },
             )
             .into_handle(&scope);
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[
-                obj.as_tagged().erase(),
-                x.as_tagged().erase(),
-                z.as_tagged().erase(),
-                w.as_tagged().erase(),
-            ],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[obj.value(), x.value(), z.value(), w.value()], &scope);
 
         // r2 = object
         let mut program = Vec::new();
@@ -1150,7 +1142,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
         // parents in priority order; here a single one)
         let parents = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[parent.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[parent.value()], &scope);
         let child_map = thread.heap().allocate_handle::<Map>(
             MapInit {
                 kind: EXTENDABLE,
@@ -1172,14 +1164,9 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 },
             )
             .into_handle(&scope);
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[
-                child.as_tagged().erase(),
-                p.as_tagged().erase(),
-                parent.as_tagged().erase(),
-            ],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[child.value(), p.value(), parent.value()], &scope);
 
         // r2 = child; r2.p = 2 (via `store_op`); acc = r2.p + parent.p
         let mut program = Vec::new();
@@ -1258,7 +1245,7 @@ fn jump_skips_instructions() {
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 0, &[]).unwrap();
-    assert_eq!(Smi::decode(result).unwrap().value(), 1);
+    assert_eq!(result.to_i64().unwrap(), 1);
 }
 
 #[test]
@@ -1286,7 +1273,7 @@ fn jump_loop_counts_down_to_zero() {
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 2, &[]).unwrap();
-    assert_eq!(Smi::decode(result).unwrap().value(), 0);
+    assert_eq!(result.to_i64().unwrap(), 0);
 }
 
 #[test]
@@ -1365,19 +1352,11 @@ fn jump_if_truthy_follows_toboolean() {
 
         for v in falsey {
             let result = run_program(thread, program.clone(), 0, &[v]).unwrap();
-            assert_eq!(
-                Smi::decode(result).unwrap().value(),
-                0,
-                "{v:?} must be falsey"
-            );
+            assert_eq!(result.to_i64().unwrap(), 0, "{v:?} must be falsey");
         }
         for v in truthy {
             let result = run_program(thread, program.clone(), 0, &[v]).unwrap();
-            assert_eq!(
-                Smi::decode(result).unwrap().value(),
-                1,
-                "{v:?} must be truthy"
-            );
+            assert_eq!(result.to_i64().unwrap(), 1, "{v:?} must be truthy");
         }
     });
 }
@@ -1460,7 +1439,7 @@ fn accessor_object_program(
                 .allocate_handle::<FixedByteArray>(program, &scope);
             let constants = thread
                 .heap()
-                .allocate_handle::<FixedArray>(&[y.as_tagged().erase()], &scope);
+                .allocate_handle::<FixedArray>(&[y.value()], &scope);
             let info = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
                     bytecode,
@@ -1510,15 +1489,9 @@ fn accessor_object_program(
                 },
             )
             .into_handle(&scope);
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[
-                obj.as_tagged().erase(),
-                x.as_tagged().erase(),
-                y.as_tagged().erase(),
-                z.as_tagged().erase(),
-            ],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[obj.value(), x.value(), y.value(), z.value()], &scope);
 
         // r2 = object
         let mut program = Vec::new();
@@ -1682,7 +1655,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 .allocate_handle::<FixedByteArray>(&getter_program(), &scope);
             let constants = thread
                 .heap()
-                .allocate_handle::<FixedArray>(&[y.as_tagged().erase()], &scope);
+                .allocate_handle::<FixedArray>(&[y.value()], &scope);
             let info = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
                     bytecode,
@@ -1695,8 +1668,8 @@ fn store_new_accessor_property_defines_own_accessor() {
             callable_object(thread, &scope, info)
         };
         let name = scope.handle(SlotName::from(x.as_tagged()).tagged());
-        let get = scope.handle(Tagged::from_value(getter.value()));
-        let set = scope.handle(Tagged::from_value(thread.heap().known().undefined.value()));
+        let get = scope.handle(getter.value());
+        let set = scope.handle(thread.heap().known().undefined.value());
         Object::define_own_property(
             thread.heap(),
             &scope,
@@ -1714,7 +1687,7 @@ fn store_new_accessor_property_defines_own_accessor() {
         // program: acc = param0.x
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[x.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[x.value()], &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -1802,7 +1775,7 @@ fn bytecode_fn(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.value(), empty_context.as_tagged().erase()],
+                values: &[info.value(), empty_context.value()],
                 elements: void.erase(),
                 length: 0,
             },
@@ -2462,7 +2435,7 @@ fn arithmetic_coerces_primitives_to_number() {
         let s2 = thread.intern(&scope, "2").value();
         run_binary_consts(thread, Opcode::Mul, s2, smi(3)).unwrap()
     });
-    assert_eq!(Smi::decode(r).unwrap().value(), 6);
+    assert_eq!(r.to_i64().unwrap(), 6);
 }
 
 /// Like `run_program` but with a non-empty constants table.
@@ -2651,17 +2624,13 @@ fn create_closure_inherits_current_context_and_is_callable() {
         let slot_name = thread.intern(&scope, "slot0");
         let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[slot_name.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[slot_name.value()], &scope);
         let scope_info = thread
             .heap()
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[
-                scope_info.as_tagged().erase(),
-                callee_info.as_tagged().erase(),
-            ],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[scope_info.value(), callee_info.value()], &scope);
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -2693,7 +2662,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[caller_info.as_tagged().erase(), context.as_tagged().erase()],
+                    values: &[caller_info.value(), context.value()],
                     elements: void.erase(),
                     length: 0,
                 },
@@ -2726,18 +2695,12 @@ fn create_closure_shares_callable_info_template() {
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateClosure, &[0]);
         emit(&mut program, Opcode::Return, &[]);
-        let result = run_program_consts(
-            &mut *thread,
-            program,
-            0,
-            &[],
-            &[callee_info.as_tagged().erase()],
-        );
-        (result.unwrap(), callee_info.as_tagged().erase())
+        let result = run_program_consts(&mut *thread, program, 0, &[], &[callee_info.value()]);
+        (result.unwrap(), callee_info.value())
     });
 
     thread.heap().no_gc(|nogc| {
-        let ValueRef::Object(o) = result.value_ref(nogc) else {
+        let Some(o) = result.as_heap_object(nogc) else {
             panic!("closure must be an object");
         };
         let info = o
@@ -2753,7 +2716,7 @@ fn create_closure_shares_callable_info_template() {
             .expect("closure carries a context");
         assert_eq!(
             context.into_tagged().erase(),
-            nogc.known().empty_context.as_tagged().erase()
+            nogc.known().empty_context.value()
         );
     });
 }
@@ -2777,7 +2740,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
 
     let prototype = thread.handle_scope(|thread, scope| thread.intern(&scope, "prototype").value());
     thread.heap().no_gc(|nogc| {
-        let ValueRef::Object(method) = method.value_ref(nogc) else {
+        let Some(method) = method.as_heap_object(nogc) else {
             panic!("method must be an object")
         };
         let method = method.as_ref();
@@ -2798,7 +2761,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
     emit(&mut call, Opcode::CallNoFeedback, &[0, 1, 1]);
     emit(&mut call, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, call, 2, &[], &[method, undefined]).unwrap();
-    assert_eq!(Smi::decode(result).unwrap().value(), 7);
+    assert_eq!(result.to_i64().unwrap(), 7);
 
     let mut construct = Vec::new();
     emit(&mut construct, Opcode::LoadConstant, &[0]);
@@ -2820,7 +2783,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
         true,
     );
     thread.heap().no_gc(|nogc| {
-        let ValueRef::Object(constructor) = class_constructor.value_ref(nogc) else {
+        let Some(constructor) = class_constructor.as_heap_object(nogc) else {
             panic!("class constructor must be an object")
         };
         let kind = constructor.as_ref().map_ref(nogc).kind();
@@ -2887,11 +2850,11 @@ fn push_context_saves_previous_context_to_register() {
 
     // PushContext must save the old frame context (empty_context) into r0
     let result = thread.handle_scope(|thread, scope| {
-        let empty = thread.heap().known().empty_context.as_tagged().erase();
+        let empty = thread.heap().known().empty_context.value();
         let slot_name = thread.intern(&scope, "slot0");
         let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[slot_name.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[slot_name.value()], &scope);
         let scope_info = thread
             .heap()
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
@@ -2903,13 +2866,7 @@ fn push_context_saves_previous_context_to_register() {
         emit(&mut program, Opcode::LoadConstant, &[1]); // acc = empty_context
         emit(&mut program, Opcode::TestReferenceEqual, &[1]);
         emit(&mut program, Opcode::Return, &[]);
-        run_program_consts(
-            &mut *thread,
-            program,
-            2,
-            &[],
-            &[scope_info.as_tagged().erase(), empty],
-        )
+        run_program_consts(&mut *thread, program, 2, &[], &[scope_info.value(), empty])
     });
     assert_eq!(result.unwrap(), thread.heap().known().true_object.value());
 }
@@ -3039,17 +2996,13 @@ fn closure_captures_function_context_end_to_end() {
         let slot_name = thread.intern(&scope, "slot0");
         let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[slot_name.as_tagged().erase()], &scope);
+            .allocate_handle::<FixedArray>(&[slot_name.value()], &scope);
         let scope_info = thread
             .heap()
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[
-                scope_info.as_tagged().erase(),
-                callee_info.as_tagged().erase(),
-            ],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[scope_info.value(), callee_info.value()], &scope);
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -3108,10 +3061,9 @@ fn set_prototype_changes_property_lookup_chain() {
     let result = thread.handle_scope(|thread, scope| {
         let p = thread.intern(&scope, "p");
         let obj_b = proto_object(&mut *thread, &scope, p);
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[p.as_tagged().erase(), obj_b.as_tagged().erase()],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[p.value(), obj_b.value()], &scope);
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
@@ -3151,14 +3103,9 @@ fn set_prototype_survives_property_transitions() {
         let p = thread.intern(&scope, "p");
         let x = thread.intern(&scope, "x");
         let obj_b = proto_object(&mut *thread, &scope, p);
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[
-                p.as_tagged().erase(),
-                obj_b.as_tagged().erase(),
-                x.as_tagged().erase(),
-            ],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[p.value(), obj_b.value(), x.value()], &scope);
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
@@ -3240,10 +3187,9 @@ fn set_prototype_on_non_extensible_throws_type_error() {
             )
             .into_handle(&scope);
 
-        let consts = thread.heap().allocate_handle::<FixedArray>(
-            &[frozen.as_tagged().erase(), obj_b.as_tagged().erase()],
-            &scope,
-        );
+        let consts = thread
+            .heap()
+            .allocate_handle::<FixedArray>(&[frozen.value(), obj_b.value()], &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -3371,7 +3317,7 @@ fn to_primitive_calls_value_of_in_numeric_contexts() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         let value_of = thread.intern(&scope, "valueOf").value();
         set_property_fn(thread, &scope, obj, value_of, &program_return_1(), &[]);
 
@@ -3383,7 +3329,7 @@ fn to_primitive_calls_value_of_in_numeric_contexts() {
             &[obj, smi(1)],
         )
         .unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 2);
+        assert_eq!(r.to_i64().unwrap(), 2);
         let r = run_program(
             &mut *thread,
             binary_op_program(Opcode::Mul),
@@ -3391,7 +3337,7 @@ fn to_primitive_calls_value_of_in_numeric_contexts() {
             &[obj, smi(3)],
         )
         .unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 3);
+        assert_eq!(r.to_i64().unwrap(), 3);
     });
 }
 
@@ -3401,7 +3347,7 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         let value_of = thread.intern(&scope, "valueOf").value();
         let to_string = thread.intern(&scope, "toString").value();
         let x = thread.intern(&scope, "x").value();
@@ -3473,7 +3419,7 @@ fn to_primitive_uses_to_primitive_symbol_first() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         // @@toPrimitive = () => 1: wins over valueOf, called with hint "default"
         let sym = thread.heap().known().to_primitive_symbol.value();
         let value_of = thread.intern(&scope, "valueOf").value();
@@ -3500,7 +3446,7 @@ fn to_primitive_uses_to_primitive_symbol_first() {
             &[obj, smi(1)],
         )
         .unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 2);
+        assert_eq!(r.to_i64().unwrap(), 2);
     });
 }
 
@@ -3510,7 +3456,7 @@ fn to_primitive_symbol_returning_object_throws() {
     let mut thread = vm.attach();
 
     let obj = thread.handle_scope(|thread, scope| {
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         let sym = thread.heap().known().to_primitive_symbol.value();
         set_property_fn(
             thread,
@@ -3555,8 +3501,8 @@ fn to_primitive_calls_getter_accessors() {
         );
         let getter = make_callable(thread, &scope, &program_return_constant(), &[inner]);
         let name = scope.handle(SlotName::from_value(value_of.value()).tagged());
-        let get = scope.handle(Tagged::from_value(getter));
-        let set = scope.handle(Tagged::from_value(thread.heap().known().undefined.value()));
+        let get = scope.handle(getter);
+        let set = scope.handle(thread.heap().known().undefined.value());
         Object::define_own_property(
             thread.heap(),
             &scope,
@@ -3575,10 +3521,10 @@ fn to_primitive_calls_getter_accessors() {
             &mut *thread,
             binary_op_program(Opcode::Add),
             0,
-            &[obj.as_tagged().erase(), smi(1)],
+            &[obj.value(), smi(1)],
         )
         .unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 3);
+        assert_eq!(r.to_i64().unwrap(), 3);
     });
 }
 
@@ -3589,7 +3535,7 @@ fn relational_and_equality_operators_coerce_objects() {
 
     thread.handle_scope(|thread, scope| {
         let true_v = thread.heap().known().true_object.value();
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         let value_of = thread.intern(&scope, "valueOf").value();
         // valueOf = () => 2
         set_property_fn(
@@ -3639,7 +3585,7 @@ fn value_of_exception_propagates() {
     let mut thread = vm.attach();
 
     let obj = thread.handle_scope(|thread, scope| {
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         let value_of = thread.intern(&scope, "valueOf").value();
         set_property_fn(
             thread,
@@ -3683,7 +3629,7 @@ fn typeof_reports_spec_types() {
         let function = thread.intern(&scope, "function").value();
 
         let f = make_callable(thread, &scope, &program_return_1(), &[]);
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         let float = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
         let s = thread.intern(&scope, "x").value();
         let known = thread.heap().known();
@@ -3713,9 +3659,9 @@ fn negate_arithmetic_rules() {
 
     // smi fast paths
     let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(5)]).unwrap();
-    assert_eq!(Smi::decode(r).unwrap().value(), -5);
+    assert_eq!(r.to_i64().unwrap(), -5);
     let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(-7)]).unwrap();
-    assert_eq!(Smi::decode(r).unwrap().value(), 7);
+    assert_eq!(r.to_i64().unwrap(), 7);
 
     // -0 must be the -0.0 HeapNumber (1 / -0 === -Infinity)
     let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(0)]).unwrap();
@@ -3748,7 +3694,7 @@ fn negate_arithmetic_rules() {
         let s3 = thread.intern(&scope, "3").value();
         run_program(&mut *thread, unary_program(Opcode::Negate), 0, &[s3]).unwrap()
     });
-    assert_eq!(Smi::decode(r).unwrap().value(), -3);
+    assert_eq!(r.to_i64().unwrap(), -3);
 }
 
 #[test]
@@ -3764,7 +3710,7 @@ fn instance_of_walks_prototype_chain() {
 
         // F with a .prototype object
         let f = make_callable(thread, &scope, &program_return_1(), &[]);
-        let f_proto = empty_object(thread, &scope).as_tagged().erase();
+        let f_proto = empty_object(thread, &scope).value();
         Object::define_own_property_values(
             thread.heap(),
             &scope,
@@ -3775,9 +3721,9 @@ fn instance_of_walks_prototype_chain() {
         .expect("defining a fresh own property must succeed");
 
         // obj inherits F.prototype; plain {} does not
-        let obj = empty_object(thread, &scope).as_tagged().erase();
+        let obj = empty_object(thread, &scope).value();
         Object::set_prototype(thread.heap(), &scope, obj, f_proto).unwrap();
-        let plain = empty_object(thread, &scope).as_tagged().erase();
+        let plain = empty_object(thread, &scope).value();
 
         let r = run_program(
             &mut *thread,
@@ -3847,7 +3793,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
             },
             &[],
         );
-        let g_proto = empty_object(thread, &scope).as_tagged().erase();
+        let g_proto = empty_object(thread, &scope).value();
         Object::define_own_property_values(
             thread.heap(),
             &scope,
@@ -3891,7 +3837,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         assert!(r.is_strong_ptr(), "object result must win");
 
         // constructing a non-constructible value is a TypeError
-        let plain = empty_object(thread, &scope).as_tagged().erase();
+        let plain = empty_object(thread, &scope).value();
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -3948,7 +3894,7 @@ fn construct_sets_native_construct_flag() {
 
     thread.handle_scope(|thread, scope| {
         let f = native_function(thread, &scope, idx);
-        let f = f.as_tagged().erase();
+        let f = f.value();
         let name = thread.intern(&scope, "constructProbe").value();
 
         // Construct: flag is 1, and the probe's primitive result loses to
@@ -3962,7 +3908,7 @@ fn construct_sets_native_construct_flag() {
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 2, &[], &[f, name]).unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 1);
+        assert_eq!(r.to_i64().unwrap(), 1);
 
         // plain Call: flag is 0
         let mut program = Vec::new();
@@ -3974,7 +3920,7 @@ fn construct_sets_native_construct_flag() {
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 2, &[], &[f, name]).unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 0);
+        assert_eq!(r.to_i64().unwrap(), 0);
     });
 }
 
@@ -4014,7 +3960,7 @@ fn shadow_setup<'s>(
         .into_handle(scope);
     let parents = thread
         .heap()
-        .allocate_handle::<FixedArray>(&[parent.as_tagged().erase()], &scope);
+        .allocate_handle::<FixedArray>(&[parent.value()], &scope);
     let child_map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: if child_extendable {
@@ -4069,16 +4015,16 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
             shadow_store_program(Opcode::StoreNamedProperty),
             3,
             &[],
-            &[child.as_tagged().erase(), p, parent.as_tagged().erase()],
+            &[child.value(), p, parent.value()],
         )
         .unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 2, "acc keeps the value");
+        assert_eq!(r.to_i64().unwrap(), 2, "acc keeps the value");
 
         thread.heap().no_gc(|nogc| {
             // no own property appeared on the child, the parent is untouched
             let child_ref = child.heap_ref(nogc);
             assert_eq!(child_ref.header.map.heap_ref(nogc).descriptor_count(), 0);
-            let ValueRef::Object(parent_ref) = parent.as_tagged().erase().value_ref(nogc) else {
+            let Some(parent_ref) = parent.value().as_heap_object(nogc) else {
                 panic!("parent must be an object");
             };
             match parent_ref.as_ref().lookup(nogc, SlotName::from_value(p)) {
@@ -4103,10 +4049,10 @@ fn shadow_store_defines_default_attributes() {
             shadow_store_program(Opcode::StoreNamedProperty),
             3,
             &[],
-            &[child.as_tagged().erase(), p, parent.as_tagged().erase()],
+            &[child.value(), p, parent.value()],
         )
         .unwrap();
-        assert_eq!(Smi::decode(r).unwrap().value(), 2);
+        assert_eq!(r.to_i64().unwrap(), 2);
 
         thread.heap().no_gc(|nogc| {
             let child_ref = child.heap_ref(nogc);
@@ -4126,7 +4072,7 @@ fn shadow_store_defines_default_attributes() {
                 }
                 _ => panic!("expected own data property"),
             }
-            let ValueRef::Object(parent_ref) = parent.as_tagged().erase().value_ref(nogc) else {
+            let Some(parent_ref) = parent.value().as_heap_object(nogc) else {
                 panic!("parent must be an object");
             };
             match parent_ref.as_ref().lookup(nogc, SlotName::from_value(p)) {

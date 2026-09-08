@@ -2,7 +2,7 @@ use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
-    HandlerTable, HandlerTableInit, ObjectSlotsInit, ValueRef,
+    HandlerTable, HandlerTableInit, ObjectSlotsInit,
 };
 
 fn table<'s>(
@@ -150,7 +150,7 @@ fn callable_info_carries_handler_table() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[info.as_tagged().erase(), empty_context.as_tagged().erase()],
+                    values: &[info.value(), empty_context.value()],
                     elements: void.erase(),
                     length: 0,
                 },
@@ -158,7 +158,7 @@ fn callable_info_carries_handler_table() {
             .into_handle(&scope);
 
         let result = thread.heap().no_gc(|nogc| {
-            let ValueRef::Object(o) = obj.value().value_ref(nogc) else {
+            let Some(o) = obj.value().as_heap_object(nogc) else {
                 panic!("callable must be an object");
             };
             let info = o.as_ref().callable_info(nogc).unwrap();

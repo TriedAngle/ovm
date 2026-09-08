@@ -1,7 +1,3 @@
-/// Attribute bits for the define-own-property opcodes (negated-attribute
-/// form). Combinations are raw `u32`
-/// bit-ors of the discriminants (see the `BitOr` impls), which is the
-/// operand encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum PropertyFlags {
