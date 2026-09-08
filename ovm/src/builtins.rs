@@ -8,7 +8,7 @@
 use base_compiler::compile_eval;
 use vm::{
     Convert, FixedArray, GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object,
-    ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, VMString, Value, VmError,
+    PropertyDescriptor, SlotName, Smi, VMString, Value, VmError,
 };
 
 use crate::natives::NativeIndex;
@@ -510,14 +510,10 @@ fn make_native_function<'s>(
     let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
     let empty_context = heap.known().empty_context;
     let obj = heap
-        .allocate_object(
+        .new_object(
             scope,
-            ObjectSlotsInit {
-                map,
-                values: &[Smi::new(index.0 as i64).encode(), empty_context.value()],
-                elements: heap.known().empty_fixed_array.erase(),
-                length: 0,
-            },
+            map,
+            &[Smi::new(index.0 as i64).encode(), empty_context.value()],
         )
         .into_global(roots);
     Ok(obj)
@@ -544,19 +540,7 @@ fn install_constructor<'s>(
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         proto_parent,
     )?;
-    let empty_elements = thread.heap().known().empty_fixed_array.erase();
-    let proto = thread
-        .heap()
-        .allocate_object(
-            scope,
-            ObjectSlotsInit {
-                map,
-                values: &[],
-                elements: empty_elements,
-                length: 0,
-            },
-        )
-        .into_global(roots);
+    let proto = thread.heap().new_object(scope, map, &[]).into_global(roots);
 
     // proto.constructor = fn; fn.prototype = proto
     let constructor_str = thread.intern(scope, "constructor");
@@ -674,25 +658,13 @@ fn number_constructor(
         None => return Ok(nctx.heap().known().exception.value()),
     };
     if !nctx.is_construct() {
-        return nctx.handle_scope(|nctx, scope| Ok(Convert::to_value(nctx.heap(), &scope, n)));
+        return nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, n)));
     }
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let value = Convert::to_value(heap, &scope, n);
+        let value = heap.new_number(&scope, n);
         let map = heap.known().number_wrapper_map;
-        let empty_elements = heap.known().empty_fixed_array.erase();
-        Ok(heap
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map,
-                    values: &[value],
-                    elements: empty_elements,
-                    length: 0,
-                },
-            )
-            .into_tagged()
-            .erase())
+        Ok(heap.new_object(&scope, map, &[value]).into_tagged().erase())
     })
 }
 
@@ -743,19 +715,7 @@ fn boolean_constructor(
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
         let map = heap.known().boolean_wrapper_map;
-        let empty_elements = heap.known().empty_fixed_array.erase();
-        Ok(heap
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map,
-                    values: &[value],
-                    elements: empty_elements,
-                    length: 0,
-                },
-            )
-            .into_tagged()
-            .erase())
+        Ok(heap.new_object(&scope, map, &[value]).into_tagged().erase())
     })
 }
 
@@ -813,19 +773,7 @@ fn string_constructor(
         }
         let (_, heap, _) = nctx.split();
         let map = heap.known().string_wrapper_map;
-        let empty_elements = heap.known().empty_fixed_array.erase();
-        Ok(heap
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map,
-                    values: &[s],
-                    elements: empty_elements,
-                    length: 0,
-                },
-            )
-            .into_tagged()
-            .erase())
+        Ok(heap.new_object(&scope, map, &[s]).into_tagged().erase())
     })
 }
 
@@ -883,18 +831,7 @@ fn make_error(
             "ReferenceError" => heap.known().reference_error_map,
             _ => heap.known().error_map,
         };
-        let empty_elements = heap.known().empty_fixed_array.erase();
-        let obj = heap
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map,
-                    values: &[],
-                    elements: empty_elements,
-                    length: 0,
-                },
-            )
-            .into_handle(&scope);
+        let obj = heap.new_object(&scope, map, &[]).into_handle(&scope);
         let name = heap.known().strings.name;
         let message_key = heap.known().strings.message;
         let class_value = vm.interner().intern(heap, &scope, class);

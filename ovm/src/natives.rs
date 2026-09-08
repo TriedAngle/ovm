@@ -220,5 +220,5 @@ fn float_add(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, V
         let fb = b.get_as::<Float>(nogc).ok_or(VmError::Type)?;
         Ok(fa.value.get() + fb.value.get())
     })?;
-    Ok(nctx.heap().allocate::<Float>(sum).erase())
+    nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum)))
 }

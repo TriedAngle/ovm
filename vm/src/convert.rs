@@ -93,19 +93,6 @@ impl Convert {
 
     /// Inverse of `to_number` for computed results: a Smi when the double is
     /// an in-range integer, a freshly allocated Float otherwise.
-    pub fn to_value(heap: &mut Heap, scope: &HandleScope<'_>, f: f64) -> Value {
-        let r = f as i64; // saturating cast; the round-trip check rejects out-of-range values
-        if f.is_finite()
-            && f.fract() == 0.0
-            && Smi::in_range(r)
-            && (r as f64) == f
-            && !(f == 0.0 && f.is_sign_negative())
-        {
-            return Smi::new(r).encode();
-        }
-        heap.allocate_handle::<Float>(f, scope).value()
-    }
-
     /// The true/false singleton for a Rust bool.
     pub fn boolean(heap: &Heap, b: bool) -> Value {
         let known = heap.known();

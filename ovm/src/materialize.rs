@@ -8,9 +8,9 @@
 use base_compiler::{CompiledScript, Constant};
 use parser::FunctionId;
 use vm::{
-    CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, Float, FunctionKind,
-    Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object,
-    ObjectSlotsInit, ScopeInfo, ScopeInfoInit, VmError,
+    CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
+    Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ScopeInfo,
+    ScopeInfoInit, VmError,
 };
 
 use crate::{ContextState, Thread, VM};
@@ -53,17 +53,8 @@ pub fn materialize_closure_vm<'s>(
 
     let map = heap.known().function_map;
     let context = unsafe { scope.handle_value::<Context>(context) };
-    let empty_elements = heap.known().empty_fixed_array.erase();
     let object = heap
-        .allocate_object(
-            scope,
-            ObjectSlotsInit {
-                map,
-                values: &[info.value(), context.value()],
-                elements: empty_elements,
-                length: 0,
-            },
-        )
+        .new_object(scope, map, &[info.value(), context.value()])
         .into_handle(scope);
     Ok(object)
 }
@@ -87,7 +78,7 @@ fn materialize_function<'s>(
         let value = match constant {
             Constant::String(bytes) => intern(heap, state, scope, vm, bytes),
             Constant::Smi(v) => vm::Smi::new(*v).encode(),
-            Constant::Float(f) => heap.allocate_handle::<Float>(*f, scope).value(),
+            Constant::Float(f) => heap.new_number(scope, *f),
             Constant::Boolean(true) => heap.known().true_object.value(),
             Constant::Boolean(false) => heap.known().false_object.value(),
             Constant::Undefined => heap.known().undefined.value(),
