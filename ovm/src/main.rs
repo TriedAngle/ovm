@@ -11,8 +11,8 @@ use ovm::{Thread, VM};
 use vm::{Float, Smi, VMString, Value};
 
 fn main() {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default())
-        .expect("failed to create heap");
+    let vm =
+        VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).expect("failed to create heap");
     let mut thread = vm.attach();
 
     let mut files = Vec::new();
@@ -74,7 +74,7 @@ fn repl(thread: &mut Thread) {
         if line == ".exit" {
             break;
         }
-        match thread.run_script(line) {
+        match thread.run_script_repl(line) {
             Ok(v) => {
                 if report_uncaught(thread) {
                     continue;

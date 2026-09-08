@@ -184,10 +184,27 @@ impl Thread {
     /// The VM must have the builtin library installed (see
     /// [`VM::with_builtins`]).
     pub fn run_script(&mut self, src: &str) -> Result<Value, ScriptError> {
+        self.run_compiled(src, base_compiler::compile_script)
+    }
+
+    /// Like [`Thread::run_script`], but compiled in REPL mode: top-level
+    /// declarations become global object properties, so bindings persist
+    /// across calls (and can be redeclared).
+    pub fn run_script_repl(&mut self, src: &str) -> Result<Value, ScriptError> {
+        self.run_compiled(src, base_compiler::compile_repl)
+    }
+
+    fn run_compiled(
+        &mut self,
+        src: &str,
+        compile: fn(
+            &parser::Ast,
+        ) -> Result<base_compiler::CompiledScript, base_compiler::CompileError>,
+    ) -> Result<Value, ScriptError> {
         let mut p = parser::Parser::new(parser::Utf8SliceStream::new(src));
         p.parse_script().map_err(ScriptError::Parse)?;
         let ast = p.into_ast();
-        let compiled = base_compiler::compile_script(&ast).map_err(ScriptError::Compile)?;
+        let compiled = compile(&ast).map_err(ScriptError::Compile)?;
         self.handle_scope(|thread, scope| {
             let closure = materialize::materialize_script(thread, &scope, &compiled)
                 .map_err(ScriptError::Vm)?;
