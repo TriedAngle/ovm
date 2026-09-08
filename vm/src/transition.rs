@@ -51,6 +51,8 @@ impl Value {
         value: Value,
         semantics: StoreSemantics,
     ) -> Result<StoreOutcome, VmError> {
+        // TODO(strict-mode): take the active function's language mode and
+        // distinguish throwing strict failures from ignored sloppy failures.
         let receiver = *self;
         // null/undefined have no [[Prototype]]: property access throws
         if receiver == nogc.known().null.value() || receiver == nogc.known().undefined.value() {

@@ -225,7 +225,7 @@ impl<'a> Resolver<'a> {
                     .iter()
                     .rev()
                     .copied()
-                    .find(|&f| !self.ast.function(f).is_arrow)
+                    .find(|&f| !self.ast.function(f).kind.is_arrow())
                     .expect("script function is never an arrow");
                 self.captures_this.insert(owner);
                 self.pending[id.0 as usize] = Some(Pending::This(owner));

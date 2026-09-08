@@ -279,9 +279,14 @@ impl<'a> FunctionGen<'a> {
     }
 
     fn finish(self) -> CompiledFunction {
+        let info = self.ast.function(self.fid);
         CompiledFunction {
             bytecode: self.code,
             constants: self.constants,
+            name: info.name.map(|name| self.ast.symbol(name).to_vec()),
+            formal_parameter_count: info.params.len() as u32,
+            kind: info.kind,
+            strict: info.strict,
             register_count: self.reg_base + self.max_temps,
             handlers: self.handlers,
         }
@@ -1670,7 +1675,7 @@ impl<'a> FunctionGen<'a> {
 
     fn emit_function_body(&mut self) -> Result<(), CompileError> {
         let info = self.ast.function(self.fid);
-        if info.is_generator {
+        if info.kind.is_generator() {
             let span = self.ast.span(info.body.expect("parsed"));
             return Err(CompileError::new(span, "generator functions"));
         }

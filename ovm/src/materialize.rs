@@ -8,9 +8,9 @@
 use base_compiler::{CompiledScript, Constant};
 use parser::FunctionId;
 use vm::{
-    CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, Float, Handle,
-    HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ObjectSlotsInit,
-    ScopeInfo, ScopeInfoInit, Tagged, VmError,
+    CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, Float, FunctionKind,
+    Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object,
+    ObjectSlotsInit, ScopeInfo, ScopeInfoInit, Tagged, VmError,
 };
 
 use crate::{ContextState, Thread, VM};
@@ -137,6 +137,29 @@ fn materialize_function<'s>(
         },
         scope,
     );
+    let name = function
+        .name
+        .as_deref()
+        .map(|name| intern(heap, state, scope, vm, name));
+    let kind = match function.kind {
+        parser::FunctionKind::Normal => FunctionKind::Normal,
+        parser::FunctionKind::Generator => FunctionKind::Generator,
+        parser::FunctionKind::Arrow => FunctionKind::Arrow,
+        parser::FunctionKind::Method => FunctionKind::Method,
+        parser::FunctionKind::Getter => FunctionKind::Getter,
+        parser::FunctionKind::Setter => FunctionKind::Setter,
+        parser::FunctionKind::BaseClassConstructor => FunctionKind::BaseClassConstructor,
+        parser::FunctionKind::DerivedClassConstructor => FunctionKind::DerivedClassConstructor,
+    };
+    heap.no_gc(|nogc| {
+        info.heap_ref(nogc).set_metadata(
+            nogc,
+            name,
+            function.formal_parameter_count as usize,
+            kind,
+            function.strict,
+        );
+    });
     infos[fid.0 as usize] = Some(info);
     Ok(info)
 }

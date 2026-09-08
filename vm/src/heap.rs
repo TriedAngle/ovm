@@ -104,6 +104,11 @@ pub struct WellKnown {
     /// Function object map
     /// slots[0] = shared CallableInfoObject, slots[1] = closure context.
     pub function_map: Global<Map>,
+    /// Callable function objects without [[Construct]] (arrows, methods,
+    /// getters and setters).
+    pub non_constructor_function_map: Global<Map>,
+    /// Constructible class functions whose ordinary [[Call]] path throws.
+    pub class_constructor_map: Global<Map>,
     /// The `@@toPrimitive` well-known symbol
     pub to_primitive_symbol: Global<Symbol>,
 }
@@ -159,6 +164,8 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         global_object: obj,
         object_initial_map: map,
         function_map: map,
+        non_constructor_function_map: map,
+        class_constructor_map: map,
         to_primitive_symbol: unsafe { smi_handle::<Symbol>(roots) },
     }
 }
@@ -343,6 +350,32 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .expect("null is a strong pointer"),
         })
         .into_global(roots);
+    let non_constructor_function_map = heap
+        .allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT
+                .union(MapKind::CALLABLE)
+                .union(MapKind::EXTENDABLE),
+            value_slot_count: 2,
+            descriptors: &[],
+            prototype: scope
+                .create_handle(Tagged::from_value(known.null.value()))
+                .expect("null is a strong pointer"),
+        })
+        .into_global(roots);
+    let class_constructor_map = heap
+        .allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT
+                .union(MapKind::CALLABLE)
+                .union(MapKind::CONSTRUCTOR)
+                .union(MapKind::EXTENDABLE)
+                .union(MapKind::CLASS_CONSTRUCTOR),
+            value_slot_count: 2,
+            descriptors: &[],
+            prototype: scope
+                .create_handle(Tagged::from_value(known.null.value()))
+                .expect("null is a strong pointer"),
+        })
+        .into_global(roots);
     known.smi_map = smi_map;
     known.float_map = float_map;
     known.array_map = array_map;
@@ -355,6 +388,8 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.context_map = context_map;
     known.scope_info_map = scope_info_map;
     known.function_map = function_map;
+    known.non_constructor_function_map = non_constructor_function_map;
+    known.class_constructor_map = class_constructor_map;
     heap.set_known(known);
 }
 
@@ -553,6 +588,20 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         known.function_map.heap_ref(nogc).prototype.set(
             nogc,
             known.function_map.value(),
+            Tagged::from_value(function_prototype.value()),
+        );
+        known
+            .non_constructor_function_map
+            .heap_ref(nogc)
+            .prototype
+            .set(
+                nogc,
+                known.non_constructor_function_map.value(),
+                Tagged::from_value(function_prototype.value()),
+            );
+        known.class_constructor_map.heap_ref(nogc).prototype.set(
+            nogc,
+            known.class_constructor_map.value(),
             Tagged::from_value(function_prototype.value()),
         );
     });
