@@ -8,7 +8,7 @@
 use base_compiler::compile_eval;
 use vm::{
     Convert, FixedArray, GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object,
-    ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, Tagged, VMString, Value, ValueRef, VmError,
+    ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, VMString, Value, VmError,
 };
 
 use crate::natives::NativeIndex;
@@ -482,7 +482,7 @@ fn alloc_map_with_slots<'s>(
     prototype: vm::Global<Object>,
     value_slot_count: usize,
 ) -> Result<vm::Global<Map>, VmError> {
-    let proto = scope.handle(Tagged::from_value(prototype.value()));
+    let proto = scope.handle(prototype.value());
     Ok(heap
         .allocate::<Map>(MapInit {
             kind,
@@ -514,10 +514,7 @@ fn make_native_function<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[
-                    Smi::new(index.0 as i64).encode(),
-                    empty_context.as_tagged().erase(),
-                ],
+                values: &[Smi::new(index.0 as i64).encode(), empty_context.value()],
                 elements: heap.known().empty_fixed_array.erase(),
                 length: 0,
             },
@@ -722,7 +719,7 @@ fn number_to_string(
 /// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver.
 fn wrapper_value(heap: &mut Heap, receiver: Value) -> Result<Value, VmError> {
     heap.no_gc(|nogc| {
-        let ValueRef::Object(obj) = receiver.value_ref(nogc) else {
+        let Some(obj) = receiver.as_heap_object(nogc) else {
             return Err(VmError::Type);
         };
         let map = obj.as_ref().header.map.heap_ref(nogc);
@@ -867,7 +864,7 @@ fn object_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     _args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| Ok(nctx.intern(&scope, "[object Object]").as_tagged().erase()))
+    nctx.handle_scope(|nctx, scope| Ok(nctx.intern(&scope, "[object Object]").value()))
 }
 
 fn make_error(
@@ -879,7 +876,7 @@ fn make_error(
         let (vm, heap, _) = nctx.split();
         let message = match args.get(1) {
             Some(v) => Convert::to_string(heap, &scope, v)?,
-            None => vm.interner().intern(heap, &scope, "").as_tagged().erase(),
+            None => vm.interner().intern(heap, &scope, "").value(),
         };
         let map = match class {
             "TypeError" => heap.known().type_error_map,
@@ -901,7 +898,7 @@ fn make_error(
         let name = heap.known().strings.name;
         let message_key = heap.known().strings.message;
         let class_value = vm.interner().intern(heap, &scope, class);
-        let message_value = scope.handle(Tagged::from_value(message));
+        let message_value = scope.handle(message);
         Object::define_own_property(
             heap,
             &scope,
@@ -950,7 +947,7 @@ fn object_get_prototype_of(
 ) -> Result<Value, VmError> {
     let arg = args.get(1).ok_or(VmError::Arity)?;
     nctx.heap().no_gc(|nogc| {
-        let vm::ValueRef::Object(obj) = arg.value_ref(nogc) else {
+        let Some(obj) = arg.as_heap_object(nogc) else {
             return Err(VmError::Type);
         };
         Ok(obj.as_ref().header.map.heap_ref(nogc).prototype.inner())

@@ -224,34 +224,27 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     }
 }
 
-fn alloc_map(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    roots: &RootHandles,
-    kind: MapKind,
-) -> Global<Map> {
+fn alloc_map(heap: &mut Heap, roots: &RootHandles, kind: MapKind) -> Global<Map> {
     heap.allocate::<Map>(MapInit {
         kind,
         value_slot_count: 0,
         descriptors: &[],
-        prototype: scope.handle(Tagged::from_value(heap.known().null.value())),
+        prototype: heap.known().null.erase(),
     })
     .into_global(roots)
 }
 
 fn alloc_parent_map(
     heap: &mut Heap,
-    scope: &HandleScope<'_>,
     roots: &RootHandles,
     kind: MapKind,
     parent: Global<Object>,
 ) -> Global<Map> {
-    alloc_parent_map_with_slots(heap, scope, roots, kind, parent, 0)
+    alloc_parent_map_with_slots(heap, roots, kind, parent, 0)
 }
 
 fn alloc_parent_map_with_slots(
     heap: &mut Heap,
-    scope: &HandleScope<'_>,
     roots: &RootHandles,
     kind: MapKind,
     parent: Global<Object>,
@@ -261,7 +254,7 @@ fn alloc_parent_map_with_slots(
         kind,
         value_slot_count,
         descriptors: &[],
-        prototype: scope.handle(Tagged::from_value(parent.value())),
+        prototype: parent.erase(),
     })
     .into_global(roots)
 }
@@ -297,7 +290,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             kind: MapKind::MAP,
             value_slot_count: 0,
             descriptors: &[],
-            prototype: roots.create_handle(Tagged::from_value(Smi::new(0).encode())),
+            prototype: roots.create_handle(Smi::new(0).encode()),
         })
         .into_global(roots);
     heap.no_gc(|nogc| {
@@ -305,7 +298,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             .heap_ref(nogc)
             .header
             .map
-            .set(nogc, map_map.value(), map_map.as_tagged());
+            .set(nogc, map_map, map_map);
     });
     known.map_map = map_map;
     heap.set_known(known);
@@ -318,7 +311,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             kind: MapKind::OBJECT,
             value_slot_count: 0,
             descriptors: &[],
-            prototype: scope.handle(Tagged::from_value(Smi::new(0).encode())),
+            prototype: scope.handle(Smi::new(0)),
         })
         .into_global(roots);
     let void = heap
@@ -335,7 +328,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             kind: MapKind::OBJECT,
             value_slot_count: 0,
             descriptors: &[],
-            prototype: scope.handle(Tagged::from_value(Smi::new(0).encode())),
+            prototype: scope.handle(Smi::new(0)),
         })
         .into_global(roots);
     let null = heap
@@ -351,16 +344,8 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         map_map.heap_ref(nogc).transitions.clear(void.value());
         void_map.heap_ref(nogc).transitions.clear(void.value());
         null_map.heap_ref(nogc).transitions.clear(void.value());
-        void_map.heap_ref(nogc).prototype.set(
-            nogc,
-            void_map.value(),
-            Tagged::from_value(null.value()),
-        );
-        null_map.heap_ref(nogc).prototype.set(
-            nogc,
-            null_map.value(),
-            Tagged::from_value(null.value()),
-        );
+        void_map.heap_ref(nogc).prototype.set(nogc, void_map, null);
+        null_map.heap_ref(nogc).prototype.set(nogc, null_map, null);
     });
     known.void = void;
     known.null = null;
@@ -369,17 +354,17 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
 
     // builtin maps: every allocation init path looks these up, so they must
     // exist before any other object is created (incl. interned strings)
-    let smi_map = alloc_map(heap, &scope, roots, MapKind::OBJECT);
-    let float_map = alloc_map(heap, &scope, roots, MapKind::FLOAT);
-    let array_map = alloc_map(heap, &scope, roots, MapKind::FIXED_ARRAY);
-    let byte_array_map = alloc_map(heap, &scope, roots, MapKind::FIXED_BYTE_ARRAY);
-    let string_map = alloc_map(heap, &scope, roots, MapKind::VM_STRING);
-    let symbol_map = alloc_map(heap, &scope, roots, MapKind::SYMBOL);
-    let accessor_pair_map = alloc_map(heap, &scope, roots, MapKind::ACCESSOR_PAIR);
-    let callable_map = alloc_map(heap, &scope, roots, MapKind::CALLABLE_INFO);
-    let handler_table_map = alloc_map(heap, &scope, roots, MapKind::HANDLER_TABLE);
-    let context_map = alloc_map(heap, &scope, roots, MapKind::CONTEXT);
-    let scope_info_map = alloc_map(heap, &scope, roots, MapKind::SCOPE_INFO);
+    let smi_map = alloc_map(heap, roots, MapKind::OBJECT);
+    let float_map = alloc_map(heap, roots, MapKind::FLOAT);
+    let array_map = alloc_map(heap, roots, MapKind::FIXED_ARRAY);
+    let byte_array_map = alloc_map(heap, roots, MapKind::FIXED_BYTE_ARRAY);
+    let string_map = alloc_map(heap, roots, MapKind::VM_STRING);
+    let symbol_map = alloc_map(heap, roots, MapKind::SYMBOL);
+    let accessor_pair_map = alloc_map(heap, roots, MapKind::ACCESSOR_PAIR);
+    let callable_map = alloc_map(heap, roots, MapKind::CALLABLE_INFO);
+    let handler_table_map = alloc_map(heap, roots, MapKind::HANDLER_TABLE);
+    let context_map = alloc_map(heap, roots, MapKind::CONTEXT);
+    let scope_info_map = alloc_map(heap, roots, MapKind::SCOPE_INFO);
 
     let function_map = heap
         .allocate::<Map>(MapInit {
@@ -391,7 +376,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .union(MapKind::EXTENDABLE),
             value_slot_count: 2,
             descriptors: &[],
-            prototype: scope.handle(Tagged::from_value(known.null.value())),
+            prototype: known.null.erase(),
         })
         .into_global(roots);
     let non_constructor_function_map = heap
@@ -401,7 +386,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .union(MapKind::EXTENDABLE),
             value_slot_count: 2,
             descriptors: &[],
-            prototype: scope.handle(Tagged::from_value(known.null.value())),
+            prototype: known.null.erase(),
         })
         .into_global(roots);
     let class_constructor_map = heap
@@ -413,7 +398,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .union(MapKind::CLASS_CONSTRUCTOR),
             value_slot_count: 2,
             descriptors: &[],
-            prototype: scope.handle(Tagged::from_value(known.null.value())),
+            prototype: known.null.erase(),
         })
         .into_global(roots);
     known.smi_map = smi_map;
@@ -457,12 +442,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let data = HandleData::new(void.value());
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
-    let object_prototype_map = alloc_map(
-        heap,
-        &scope,
-        roots,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-    );
+    let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
     let empty_slots = heap.allocate::<FixedArray>(&[]).into_global(roots);
     known.empty_fixed_array = heap.allocate::<FixedArray>(&[]).into_global(roots);
     heap.set_known(known);
@@ -470,7 +450,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
 
     let array_prototype_map = alloc_parent_map(
         heap,
-        &scope,
         roots,
         MapKind::ARRAY.union(MapKind::EXTENDABLE),
         object_prototype,
@@ -478,7 +457,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let array_prototype = alloc_object(heap, &scope, roots, array_prototype_map);
     let js_array_map = alloc_parent_map(
         heap,
-        &scope,
         roots,
         MapKind::ARRAY.union(MapKind::EXTENDABLE),
         array_prototype,
@@ -486,7 +464,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
 
     let error_prototype_map = alloc_parent_map(
         heap,
-        &scope,
         roots,
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         object_prototype,
@@ -495,7 +472,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
 
     let error_map = alloc_parent_map(
         heap,
-        &scope,
         roots,
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         error_prototype,
@@ -503,21 +479,20 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
 
     let object_initial_map = alloc_parent_map(
         heap,
-        &scope,
         roots,
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         object_prototype,
     );
     let global_object = alloc_object(heap, &scope, roots, object_initial_map);
 
-    let undefined_map = alloc_parent_map(heap, &scope, roots, MapKind::OBJECT, object_prototype);
-    let boolean_map = alloc_parent_map(heap, &scope, roots, MapKind::OBJECT, object_prototype);
+    let undefined_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
+    let boolean_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
 
     let undefined = alloc_object(heap, &scope, roots, undefined_map);
     let false_object = alloc_object(heap, &scope, roots, boolean_map);
     let true_object = alloc_object(heap, &scope, roots, boolean_map);
 
-    let exception_map = alloc_parent_map(heap, &scope, roots, MapKind::OBJECT, object_prototype);
+    let exception_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
     let exception = alloc_object(heap, &scope, roots, exception_map);
 
     let to_primitive_symbol =
@@ -542,7 +517,6 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     // undefined.
     let function_prototype_map = alloc_parent_map_with_slots(
         heap,
-        &scope,
         roots,
         MapKind::OBJECT
             .union(MapKind::CALLABLE)
@@ -564,7 +538,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
             &scope,
             ObjectSlotsInit {
                 map: function_prototype_map,
-                values: &[empty_info.value(), empty_context.as_tagged().erase()],
+                values: &[empty_info.value(), empty_context.value()],
                 elements: known.empty_fixed_array.erase(),
                 length: 0,
             },
@@ -602,32 +576,26 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
 
     let null = known.null;
     heap.no_gc(|nogc| {
-        let empty = known.empty_fixed_array.as_tagged();
         let o = null.heap_ref(nogc);
-        o.slots.set(nogc, null.value(), empty);
-        o.elements
-            .set(nogc, null.value(), Tagged::from_value(empty.erase()));
+        o.slots.set(nogc, null, known.empty_fixed_array);
+        o.elements.set(nogc, null, known.empty_fixed_array);
         // ordinary function objects' [[Prototype]] is %Function.prototype%
         // (ES 19.2.3.1): function_map was created with a null placeholder
         // in bootstrap_basics
         known.function_map.heap_ref(nogc).prototype.set(
             nogc,
-            known.function_map.value(),
-            Tagged::from_value(function_prototype.value()),
+            known.function_map,
+            function_prototype,
         );
         known
             .non_constructor_function_map
             .heap_ref(nogc)
             .prototype
-            .set(
-                nogc,
-                known.non_constructor_function_map.value(),
-                Tagged::from_value(function_prototype.value()),
-            );
+            .set(nogc, known.non_constructor_function_map, function_prototype);
         known.class_constructor_map.heap_ref(nogc).prototype.set(
             nogc,
-            known.class_constructor_map.value(),
-            Tagged::from_value(function_prototype.value()),
+            known.class_constructor_map,
+            function_prototype,
         );
     });
 }
@@ -958,7 +926,8 @@ impl<T> GcSlot<T> {
         self.cell.load()
     }
 
-    pub fn set(&self, nogc: &NoGc<'_>, host: Value, value: impl Into<Tagged<T>>) {
+    pub fn set(&self, nogc: &NoGc<'_>, host: impl Into<Value>, value: impl Into<Tagged<T>>) {
+        let host = host.into();
         let v = value.into().erase();
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         if v.is_ptr() {
@@ -1014,7 +983,7 @@ impl<T> OptionGcSlot<T> {
         self.slot.as_raw()
     }
 
-    pub fn set(&self, nogc: &NoGc<'_>, host: Value, value: impl Into<Tagged<T>>) {
+    pub fn set(&self, nogc: &NoGc<'_>, host: impl Into<Value>, value: impl Into<Tagged<T>>) {
         self.slot.set(nogc, host, value);
     }
 

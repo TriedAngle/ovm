@@ -1,11 +1,11 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use ovm::{Thread, VM, VmError};
-use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Value, ValueRef};
+use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Value};
 
 /// Read a data property by interned name value.
 fn get_prop(thread: &mut Thread, obj: Value, name: Value) -> Value {
     thread.heap().no_gc(|nogc| {
-        let ValueRef::Object(o) = obj.value_ref(nogc) else {
+        let Some(o) = obj.as_heap_object(nogc) else {
             panic!("expected object");
         };
         match o.as_ref().lookup(nogc, SlotName::from_value(name)) {
@@ -87,10 +87,10 @@ fn error_objects_are_distinct_but_share_shapes() {
     // properties in the same order: the transition cache must yield one
     // shared final shape
     let maps = thread.heap().no_gc(|nogc| {
-        let ValueRef::Object(a) = a.value_ref(nogc) else {
+        let Some(a) = a.as_heap_object(nogc) else {
             panic!("expected object");
         };
-        let ValueRef::Object(b) = b.value_ref(nogc) else {
+        let Some(b) = b.as_heap_object(nogc) else {
             panic!("expected object");
         };
         (
@@ -154,7 +154,7 @@ fn error_objects_are_extendable() {
             thread.handle_scope(|thread, scope| {
                 let receiver = unsafe { scope.handle_value::<vm::Object>(receiver) };
                 let name = scope.handle(name.tagged());
-                let value = scope.handle(vm::Tagged::from_value(extra_val));
+                let value = scope.handle(extra_val);
                 vm::Object::define_own_property(
                     thread.heap(),
                     &scope,
@@ -173,7 +173,7 @@ fn error_objects_are_extendable() {
 /// The object this object's map links to via its `prototype` slot.
 fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
     thread.heap().no_gc(|nogc| {
-        let ValueRef::Object(o) = obj.value_ref(nogc) else {
+        let Some(o) = obj.as_heap_object(nogc) else {
             panic!("expected object");
         };
         let map = o.as_ref().header.map.heap_ref(nogc).as_ref();

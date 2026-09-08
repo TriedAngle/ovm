@@ -14,7 +14,7 @@ impl Compare {
             }
             let number_value = |v: Value| match v.get_as::<Float>(nogc) {
                 Some(f) => f.value.get(),
-                None => Smi::decode(v).unwrap().value() as f64,
+                None => v.to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);
@@ -84,7 +84,7 @@ impl Compare {
         if x_num && y_num {
             let number_value = |v: Value| match v.get_as::<Float>(nogc) {
                 Some(f) => f.value.get(),
-                None => Smi::decode(v).unwrap().value() as f64,
+                None => v.to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);

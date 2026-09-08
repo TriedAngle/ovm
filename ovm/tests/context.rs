@@ -74,8 +74,8 @@ fn contexts_chain_through_outer() {
                     .at(0),
             )
         });
-        assert_eq!(Smi::decode(own).unwrap().value(), 7);
-        assert_eq!(Smi::decode(via_outer).unwrap().value(), 42);
+        assert_eq!(own.to_i64().unwrap(), 7);
+        assert_eq!(via_outer.to_i64().unwrap(), 42);
     });
 }
 
@@ -118,7 +118,7 @@ fn closure_object_carries_typed_context() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[info.as_tagged().erase(), context.as_tagged().erase()],
+                    values: &[info.value(), context.value()],
                     elements: void.erase(),
                     length: 0,
                 },
@@ -126,7 +126,7 @@ fn closure_object_carries_typed_context() {
             .into_handle(&scope);
 
         let slot0 = thread.heap().no_gc(|nogc| {
-            let vm::ValueRef::Object(o) = obj.value().value_ref(nogc) else {
+            let Some(o) = obj.value().as_heap_object(nogc) else {
                 panic!("callable must be an object");
             };
             let context = o
@@ -135,6 +135,6 @@ fn closure_object_carries_typed_context() {
                 .expect("context must be typed as Context");
             context.slots.heap_ref(nogc).at(0)
         });
-        assert_eq!(Smi::decode(slot0).unwrap().value(), 9);
+        assert_eq!(slot0.to_i64().unwrap(), 9);
     });
 }
