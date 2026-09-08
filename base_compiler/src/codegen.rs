@@ -800,16 +800,12 @@ impl<'a> FunctionGen<'a> {
             StoreTarget::Named { obj, name_idx } => {
                 emit(
                     &mut self.code,
-                    Opcode::StoreNamedPropertyShadow,
+                    Opcode::StoreNamedProperty,
                     &[*obj, *name_idx, 0],
                 );
             }
             StoreTarget::Keyed { obj, key } => {
-                emit(
-                    &mut self.code,
-                    Opcode::StoreKeyedPropertyShadow,
-                    &[*obj, *key, 0],
-                );
+                emit(&mut self.code, Opcode::StoreKeyedProperty, &[*obj, *key, 0]);
             }
         }
     }
@@ -1134,7 +1130,11 @@ impl<'a> FunctionGen<'a> {
                     emit(&mut self.code, Opcode::LoadSmi, &[i as u32]);
                     let idx = self.push_value();
                     self.expr(el)?;
-                    emit(&mut self.code, Opcode::StoreKeyedProperty, &[arr, idx, 0]);
+                    emit(
+                        &mut self.code,
+                        Opcode::StoreKeyedPropertyNoShadow,
+                        &[arr, idx, 0],
+                    );
                     self.pop_value();
                 }
             }
@@ -1166,18 +1166,14 @@ impl<'a> FunctionGen<'a> {
                         self.expr(key)?;
                         let k = self.push_value();
                         self.expr(value)?;
-                        emit(
-                            &mut self.code,
-                            Opcode::StoreKeyedPropertyShadow,
-                            &[obj, k, 0],
-                        );
+                        emit(&mut self.code, Opcode::StoreKeyedProperty, &[obj, k, 0]);
                         self.pop_value();
                     } else {
                         let name_idx = self.name_constant(key)?;
                         self.expr(value)?;
                         emit(
                             &mut self.code,
-                            Opcode::StoreNamedPropertyShadow,
+                            Opcode::StoreNamedProperty,
                             &[obj, name_idx, 0],
                         );
                     }
