@@ -277,6 +277,7 @@ impl MapKind {
     pub const CONSTRUCTOR: MapKind = MapKind(1 << 10);
     pub const NATIVE: MapKind = MapKind(1 << 11);
     pub const PRIMITIVE_WRAPPER: MapKind = MapKind(1 << 12);
+    pub const CLASS_CONSTRUCTOR: MapKind = MapKind(1 << 13);
 
     pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
     pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
@@ -351,6 +352,10 @@ impl MapKind {
 
     pub const fn is_constructor(self) -> bool {
         self.0 & Self::CONSTRUCTOR.0 != 0
+    }
+
+    pub const fn is_class_constructor(self) -> bool {
+        self.0 & Self::CLASS_CONSTRUCTOR.0 != 0
     }
 }
 
@@ -495,7 +500,7 @@ impl Object {
 
 /// What kind of callable a value refers to.
 pub enum CallTarget {
-    Bytecode(Tagged<Object>, usize),
+    Bytecode(Tagged<Object>, usize, FunctionKind),
     Native(usize),
 }
 
@@ -512,7 +517,11 @@ pub fn call_target<'a>(nogc: &'a NoGc<'a>, f: Value) -> Option<CallTarget> {
     }
     let info = obj.as_ref().callable_info(nogc)?;
     let register_count = info.register_count.to_smi().value() as usize;
-    Some(CallTarget::Bytecode(obj.into_tagged(), register_count))
+    Some(CallTarget::Bytecode(
+        obj.into_tagged(),
+        register_count,
+        info.function_kind(),
+    ))
 }
 
 /// Store `value` at element index `i` of an array object, growing the
@@ -1075,6 +1084,60 @@ pub struct CallableInfoObject {
     pub constants: GcSlot<FixedArray>,
     pub register_count: GcSlot<Smi>,
     pub handlers: OptionGcSlot<HandlerTable>,
+    pub name: GcSlot,
+    pub formal_parameter_count: GcSlot<Smi>,
+    pub kind: GcSlot<Smi>,
+    /// Language mode is preserved now; strict-sensitive call/store/delete
+    /// branches are intentionally deferred.
+    pub strict: GcSlot<Smi>,
+}
+
+#[repr(i64)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FunctionKind {
+    #[default]
+    Normal,
+    Generator,
+    Arrow,
+    Method,
+    Getter,
+    Setter,
+    BaseClassConstructor,
+    DerivedClassConstructor,
+}
+
+impl FunctionKind {
+    pub const fn is_constructible(self) -> bool {
+        matches!(
+            self,
+            Self::Normal | Self::BaseClassConstructor | Self::DerivedClassConstructor
+        )
+    }
+
+    pub const fn is_class_constructor(self) -> bool {
+        matches!(
+            self,
+            Self::BaseClassConstructor | Self::DerivedClassConstructor
+        )
+    }
+
+    pub const fn needs_prototype(self) -> bool {
+        matches!(self, Self::Normal)
+    }
+
+    fn decode(value: i64) -> Self {
+        match value {
+            x if x == Self::Normal as i64 => Self::Normal,
+            x if x == Self::Generator as i64 => Self::Generator,
+            x if x == Self::Arrow as i64 => Self::Arrow,
+            x if x == Self::Method as i64 => Self::Method,
+            x if x == Self::Getter as i64 => Self::Getter,
+            x if x == Self::Setter as i64 => Self::Setter,
+            x if x == Self::BaseClassConstructor as i64 => Self::BaseClassConstructor,
+            x if x == Self::DerivedClassConstructor as i64 => Self::DerivedClassConstructor,
+            _ => panic!("invalid function kind"),
+        }
+    }
 }
 
 pub struct CallableInfoInit<'a> {
@@ -1104,6 +1167,12 @@ impl HeapObject for CallableInfoObject {
             Some(handlers) => self.handlers.set(nogc, host, handlers.as_tagged()),
             None => self.handlers.clear(nogc.known().void.value()),
         }
+        self.name
+            .set(nogc, host, Tagged::from_value(nogc.known().void.value()));
+        self.formal_parameter_count.set(nogc, host, Smi::new(0));
+        self.kind
+            .set(nogc, host, Smi::new(FunctionKind::Normal as i64));
+        self.strict.set(nogc, host, Smi::new(0));
     }
 
     fn header(&self) -> &Header {
@@ -1121,10 +1190,49 @@ impl EdgeVisitable for CallableInfoObject {
         visitor.visit(self.bytecode.as_raw());
         visitor.visit(self.constants.as_raw());
         visitor.visit(self.handlers.as_raw());
+        visitor.visit(self.name.as_raw());
     }
 }
 
 impl CallableInfoObject {
+    pub fn set_metadata(
+        &self,
+        nogc: &NoGc<'_>,
+        name: Option<Value>,
+        formal_parameter_count: usize,
+        kind: FunctionKind,
+        strict: bool,
+    ) {
+        let host = self.erase();
+        self.name.set(
+            nogc,
+            host,
+            Tagged::from_value(name.unwrap_or_else(|| nogc.known().void.value())),
+        );
+        self.formal_parameter_count
+            .set(nogc, host, Smi::new(formal_parameter_count as i64));
+        self.kind.set(nogc, host, Smi::new(kind as i64));
+        self.strict.set(nogc, host, Smi::new(i64::from(strict)));
+    }
+
+    pub fn name<'a>(&self, nogc: &'a NoGc<'a>) -> Option<Value> {
+        let name = self.name.inner();
+        name.get_as::<VMString>(nogc, nogc.known().string_map)
+            .map(|_| name)
+    }
+
+    pub fn formal_parameter_count(&self) -> usize {
+        self.formal_parameter_count.to_smi().value() as usize
+    }
+
+    pub fn function_kind(&self) -> FunctionKind {
+        FunctionKind::decode(self.kind.to_smi().value())
+    }
+
+    pub fn is_strict(&self) -> bool {
+        self.strict.to_smi().value() != 0
+    }
+
     /// Decode a constant-pool property name.
     // TODO: this must handle also non constants and non interned strings and symbols
     pub fn constant_slot_name<'a>(&self, nogc: &'a NoGc<'a>, idx: usize) -> SlotName {

@@ -10,10 +10,7 @@ use vm::{
 use crate::{
     ContextState, FrameMeta, NativeContext, NativeIndex, Stack, StackCache, VM, VmError,
     error_from_vm_error,
-    runtime::{
-        Coercion, Hint, create_construct_receiver, instance_of, numeric_op, to_numeric,
-        to_primitive, type_of,
-    },
+    runtime::{Coercion, Hint, Runtime},
 };
 
 pub fn execute(
@@ -72,7 +69,10 @@ fn start(
             state.stack.set_top(saved_top);
             result
         }
-        Some(CallTarget::Bytecode(target, register_count)) => {
+        Some(CallTarget::Bytecode(target, register_count, kind)) => {
+            if new_target.is_none() && kind.is_class_constructor() {
+                return Err(VmError::Type);
+            }
             // TODO: update once we have classes
             let stack = &state.stack;
             let context = heap.no_gc(|nogc| closure_context(nogc, target));
@@ -193,9 +193,12 @@ fn call_value(
 ) -> Result<bool, VmError> {
     let target = heap.no_gc(|nogc| call_target(nogc, f));
     // TODO: native getters/setters invoke in place instead of pushing a frame
-    let Some(CallTarget::Bytecode(target, register_count)) = target else {
+    let Some(CallTarget::Bytecode(target, register_count, kind)) = target else {
         return Ok(false);
     };
+    if kind.is_class_constructor() {
+        return Err(VmError::Type);
+    }
     let context = heap.no_gc(|nogc| closure_context(nogc, target));
     let callee =
         stack.push_frame_with_args(meta, handler_pc, target, register_count, context, args)?;
@@ -360,6 +363,8 @@ fn apply_store_outcome(
                     name,
                     PropertyDescriptor::data(acc),
                 )
+                // TODO(strict-mode): a false result must throw in strict code;
+                // the current store path preserves its existing sloppy result.
                 .map(|_| ())
             });
             let _ = cache.take_acc();
@@ -434,12 +439,14 @@ fn step(
             match result {
                 Some(v) => *acc = v,
                 None => {
-                    let lhs = step_try!(to_primitive(vm, heap, state, *acc, Hint::Default));
+                    let lhs =
+                        step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Default));
                     let lhs = match lhs {
                         Coercion::Threw => return Step::PendingThrow,
                         Coercion::Value(v) => v,
                     };
-                    let rhs = step_try!(to_primitive(vm, heap, state, other, Hint::Default));
+                    let rhs =
+                        step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Default));
                     let rhs = match rhs {
                         Coercion::Threw => return Step::PendingThrow,
                         Coercion::Value(v) => v,
@@ -491,7 +498,8 @@ fn step(
             match result {
                 Some(v) => *acc = v,
                 None => {
-                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a - b));
+                    let v =
+                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a - b));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
@@ -513,7 +521,8 @@ fn step(
             match result {
                 Some(v) => *acc = v,
                 None => {
-                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a * b));
+                    let v =
+                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a * b));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
@@ -537,7 +546,8 @@ fn step(
             match result {
                 Some(v) => *acc = v,
                 None => {
-                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a / b));
+                    let v =
+                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a / b));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
@@ -558,7 +568,8 @@ fn step(
             match result {
                 Some(v) => *acc = v,
                 None => {
-                    let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a % b));
+                    let v =
+                        step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a % b));
                     let Some(v) = v else {
                         return Step::PendingThrow;
                     };
@@ -571,7 +582,7 @@ fn step(
             // JS exponentiation is always IEEE double math; the result only
             // needs a Smi tag when it is an in-range integer.
             let other = stack.reg(&meta, ops.reg(0));
-            let v = step_try!(numeric_op(vm, heap, state, *acc, other, |a, b| a.powf(b)));
+            let v = step_try!(Runtime::numeric_op(vm, heap, state, *acc, other, |a, b| a.powf(b)));
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
@@ -658,7 +669,7 @@ fn step(
             Step::Next
         }
         Opcode::TestTypeof => {
-            *acc = type_of(vm, heap, state, *acc);
+            *acc = Runtime::type_of(vm, heap, state, *acc);
             Step::Next
         }
         Opcode::Negate => {
@@ -672,7 +683,7 @@ fn step(
                     Smi::new(-v).encode()
                 };
             } else {
-                let n = step_try!(to_numeric(vm, heap, state, *acc));
+                let n = step_try!(Runtime::to_numeric(vm, heap, state, *acc));
                 let Some(n) = n else {
                     return Step::PendingThrow;
                 };
@@ -690,7 +701,7 @@ fn step(
         }
         Opcode::InstanceOf => {
             let other = stack.reg(&meta, ops.reg(0));
-            let r = step_try!(instance_of(vm, heap, state, *acc, other));
+            let r = step_try!(Runtime::instance_of(vm, heap, state, *acc, other));
             let Some(r) = r else {
                 return Step::PendingThrow;
             };
@@ -724,7 +735,7 @@ fn step(
                         Tagged::<Object>::from_value_unchecked(stack.reg(&meta, ops.reg(0)))
                     })
                     .expect("callee must be strong");
-                let receiver = match create_construct_receiver(vm, heap, state, callee) {
+                let receiver = match Runtime::create_construct_receiver(vm, heap, state, callee) {
                     Ok(Some(r)) => r,
                     Ok(None) => return Step::PendingThrow,
                     Err(err) => return Step::Error(err),
@@ -766,12 +777,12 @@ fn step(
         Opcode::Equal => {
             // IsLooselyEqual: objects are ToPrimitive'd (hint default) first
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Default));
+            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Default));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Default));
+            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Default));
             let y = match y {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -783,12 +794,12 @@ fn step(
         Opcode::LessThan => {
             // Abstract Relational Comparison: objects ToPrimitive'd with hint Number
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
             let y = match y {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -799,12 +810,12 @@ fn step(
         }
         Opcode::LessThanOrEqual => {
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
             let y = match y {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -815,12 +826,12 @@ fn step(
         }
         Opcode::GreaterThan => {
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
             let y = match y {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -831,12 +842,12 @@ fn step(
         }
         Opcode::GreaterThanOrEqual => {
             let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(to_primitive(vm, heap, state, *acc, Hint::Number));
+            let x = step_try!(Runtime::to_primitive(vm, heap, state, *acc, Hint::Number));
             let x = match x {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
             };
-            let y = step_try!(to_primitive(vm, heap, state, other, Hint::Number));
+            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
             let y = match y {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => v,
@@ -864,6 +875,8 @@ fn step(
         }
         // TODO: feedback vectors and separation once they are there
         Opcode::Call | Opcode::CallNoFeedback => {
+            // TODO(strict-mode): ordinary sloppy functions still need nullish
+            // receiver substitution and primitive receiver boxing.
             let count = ops.reg_count(2);
             let target = heap.no_gc(|nogc| call_target(nogc, stack.reg(&meta, ops.reg(0))));
             let Some(target) = target else {
@@ -885,7 +898,10 @@ fn step(
                         Err(err) => Step::Error(err),
                     }
                 }
-                CallTarget::Bytecode(target, register_count) => {
+                CallTarget::Bytecode(target, register_count, kind) => {
+                    if kind.is_class_constructor() {
+                        return Step::Error(VmError::Type);
+                    }
                     let context = heap.no_gc(|nogc| closure_context(nogc, target));
                     let callee = step_try!(stack.push_frame(
                         meta,
@@ -1078,67 +1094,12 @@ fn step(
             let context = step_try!(frame_context(heap, stack, &meta));
             cache.spill_acc(*acc);
             let obj = state.handle_scope(|scope| {
-                let map = scope
-                    .create_handle(heap.known().function_map.as_tagged())
-                    .expect("function map is strong");
-                let function = heap
-                    .allocate_object(
-                        &scope,
-                        ObjectSlotsInit {
-                            map,
-                            values: &[info, context],
-                            elements: heap.known().empty_fixed_array.erase(),
-                            length: 0,
-                        },
-                    )
-                    .into_handle(&scope);
-                // ordinary functions get a fresh `prototype` object whose
-                // `constructor` points back (ES 9.2.4, 19.2.4.3)
-                let proto_map = scope
-                    .create_handle(heap.known().object_initial_map.as_tagged())
-                    .expect("object initial map is strong");
-                let proto = heap
-                    .allocate_object(
-                        &scope,
-                        ObjectSlotsInit {
-                            map: proto_map,
-                            values: &[],
-                            elements: heap.known().empty_fixed_array.erase(),
-                            length: 0,
-                        },
-                    )
-                    .into_handle(&scope);
-                let constructor = scope
-                    .create_handle(
-                        SlotName::from(
-                            vm.interner()
-                                .intern(heap, &scope, "constructor")
-                                .as_tagged(),
-                        )
-                        .tagged(),
-                    )
-                    .expect("name is strong");
-                let prototype = scope
-                    .create_handle(
-                        SlotName::from(vm.interner().intern(heap, &scope, "prototype").as_tagged())
-                            .tagged(),
-                    )
-                    .expect("name is strong");
-                Object::define_own_property(
-                    heap,
-                    &scope,
-                    proto,
-                    constructor,
-                    PropertyDescriptor::data(function.value()),
-                )?;
-                Object::define_own_property(
-                    heap,
-                    &scope,
-                    function,
-                    prototype,
-                    PropertyDescriptor::data(proto.value()),
-                )?;
-                Ok::<_, VmError>(function.value())
+                let info = scope
+                    .create_handle(unsafe {
+                        Tagged::<CallableInfoObject>::from_value_unchecked(info)
+                    })
+                    .expect("callable info is strong");
+                Runtime::create_closure(vm, heap, &scope, info, context)
             });
             let obj = step_try!(obj);
             let _ = cache.take_acc();
