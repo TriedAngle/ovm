@@ -81,7 +81,9 @@ impl<'a> NativeContext<'a> {
 
     pub fn call<'s>(&mut self, callable: Value, args: GcSlice<'s>) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
-        let callable = unsafe { scope.handle_value::<Object>(callable) };
+        let Some(callable) = scope.cast::<Object>(callable) else {
+            return Err(VmError::Type);
+        };
         crate::interpreter::execute(self.vm, self.heap, self.state, callable, args, None)
     }
 
@@ -95,8 +97,12 @@ impl<'a> NativeContext<'a> {
         args: GcSlice<'s>,
     ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
-        let callable = unsafe { scope.handle_value::<Object>(callable) };
-        let new_target = unsafe { scope.handle_value::<Object>(new_target) };
+        let Some(callable) = scope.cast::<Object>(callable) else {
+            return Err(VmError::Type);
+        };
+        let Some(new_target) = scope.cast::<Object>(new_target) else {
+            return Err(VmError::Type);
+        };
         crate::interpreter::execute(
             self.vm,
             self.heap,

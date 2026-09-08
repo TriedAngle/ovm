@@ -532,7 +532,7 @@ pub fn store_array_element(
     value: Value,
 ) -> Result<(), VmError> {
     let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
-    let receiver = unsafe { scope.handle_value::<Object>(receiver) };
+    let receiver = scope.cast::<Object>(receiver).ok_or(VmError::Type)?;
 
     let grows = heap.no_gc(|nogc| {
         let obj = receiver.heap_ref(nogc);

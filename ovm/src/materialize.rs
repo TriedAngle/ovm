@@ -52,7 +52,7 @@ pub fn materialize_closure_vm<'s>(
     let info = materialize_function(vm, heap, state, scope, script, &mut infos, FunctionId(0))?;
 
     let map = heap.known().function_map;
-    let context = unsafe { scope.handle_value::<Context>(context) };
+    let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
     let object = heap
         .new_object(scope, map, &[info.value(), context.value()])
         .into_handle(scope);

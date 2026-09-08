@@ -749,13 +749,17 @@ fn step(
                 return Step::Error(VmError::Type);
             }
             state.handle_scope(|scope| {
-                let callee = unsafe { scope.handle_value::<Object>(stack.reg(&meta, ops.reg(0))) };
+                let Some(callee) = scope.cast::<Object>(stack.reg(&meta, ops.reg(0))) else {
+                    return Step::Error(VmError::Type);
+                };
                 let receiver = match Runtime::create_construct_receiver(vm, heap, state, callee) {
                     Ok(Some(r)) => r,
                     Ok(None) => return Step::PendingThrow,
                     Err(err) => return Step::Error(err),
                 };
-                let receiver = unsafe { scope.handle_value::<Object>(receiver) };
+                let Some(receiver) = scope.cast::<Object>(receiver) else {
+                    return Step::Error(VmError::Type);
+                };
                 // the register list holds only arguments; the receiver is
                 // synthesized and prepended
                 let count = ops.reg_count(2);
@@ -765,7 +769,7 @@ fn step(
                 let result = match NativeContext::new(vm, heap, state).call_construct(
                     callee.value(),
                     callee.value(),
-                    unsafe { GcSlice::from_slice(&args) },
+                    scope.stage(&args),
                 ) {
                     Ok(r) => r,
                     Err(err) => return Step::Error(err),
@@ -1163,7 +1167,9 @@ fn step(
             }));
             let context = step_try!(frame_context(heap, stack, &meta));
             let obj = state.handle_scope(|scope| {
-                let info = unsafe { scope.handle_value::<CallableInfoObject>(info) };
+                let Some(info) = scope.cast::<CallableInfoObject>(info) else {
+                    return Err(VmError::Type);
+                };
                 Runtime::create_closure(heap, &scope, info, context)
             });
             let obj = step_try!(obj);
@@ -1243,8 +1249,12 @@ fn step(
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
-                let outer = unsafe { scope.handle_value::<Context>(outer) };
-                let scope_info = unsafe { scope.handle_value::<ScopeInfo>(scope_info) };
+                let outer = scope
+                    .cast::<Context>(outer)
+                    .expect("frame context slot holds a Context");
+                let scope_info = scope
+                    .cast::<ScopeInfo>(scope_info)
+                    .expect("constants slot holds a ScopeInfo");
                 let slots = heap.allocate_handle::<FixedArray>(&values, &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
@@ -1261,7 +1271,9 @@ fn step(
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
-                let outer = unsafe { scope.handle_value::<Context>(outer) };
+                let outer = scope
+                    .cast::<Context>(outer)
+                    .expect("frame context slot holds a Context");
                 let slots = heap.allocate_handle::<FixedArray>(&values, &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
@@ -1276,7 +1288,9 @@ fn step(
             let exception = stack.reg(&meta, ops.reg(0));
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
-                let outer = unsafe { scope.handle_value::<Context>(outer) };
+                let outer = scope
+                    .cast::<Context>(outer)
+                    .expect("frame context slot holds a Context");
                 let slots = heap.allocate_handle::<FixedArray>(&[exception], &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),

@@ -1849,8 +1849,7 @@ fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result
         emit(&mut program, Opcode::Return, &[]);
         let caller = bytecode_fn(nctx, &scope, &program, &[callee], 1);
 
-        // SAFETY: empty snapshot; consumed before any GC in the call
-        match nctx.call(caller, unsafe { GcSlice::from_slice(&[]) }) {
+        match nctx.call(caller, GcSlice::EMPTY) {
             Ok(exc) if exc == nctx.heap().known().exception.value() => {
                 // the exception escapes the nested run as the sentinel with
                 // the pending exception set; the native recovers by
@@ -3844,9 +3843,7 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
                 )?;
             }
             StoreOutcome::CallSetter { setter } => {
-                let args = [global, flag];
-                // SAFETY: fresh snapshots; consumed before any GC in the call
-                nctx.call(setter, unsafe { GcSlice::from_slice(&args) })?;
+                nctx.handle_scope(|nctx, scope| nctx.call(setter, scope.stage(&[global, flag])))?;
             }
         }
         Ok(())
