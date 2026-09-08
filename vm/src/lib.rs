@@ -35,13 +35,12 @@ pub use transition::{
     TransitionLock,
 };
 pub use value::{
-    HeapPtr, PointerStrength, STRONG_PTR, Smi, Strong, Tagged, Value, ValueRef, WEAK_PTR, Weak,
-    Word, encode_smi,
+    HeapPtr, MaybeWeak, STRONG_PTR, Smi, Tagged, Value, ValueRef, WEAK_PTR, Word, encode_smi,
 };
 
-pub type Local<'scope, T> = Handle<'scope, T, Strong>;
+pub type Local<'scope, T> = Handle<'scope, T>;
 // pseudo-static
-pub type Global<T> = Handle<'static, T, Strong>;
+pub type Global<T> = Handle<'static, T>;
 
 /// Number of slots per handle block.
 pub const HANDLE_BLOCK_SIZE: usize = 1024;

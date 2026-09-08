@@ -38,26 +38,17 @@ impl Runtime {
             )
         });
         let function_name = match source_name {
-            Some(name) => scope
-                .create_handle(Tagged::from_value(name))
-                .expect("function name is strong"),
-            None => scope
-                .create_handle(Tagged::from_value(
-                    vm.interner().intern(heap, scope, "").value(),
-                ))
-                .expect("empty function name is strong"),
+            Some(name) => scope.handle(Tagged::from_value(name)),
+            None => scope.handle(Tagged::from_value(
+                vm.interner().intern(heap, scope, "").value(),
+            )),
         };
         let map = match kind {
             kind if kind.is_class_constructor() => heap.known().class_constructor_map,
             kind if kind.is_constructible() => heap.known().function_map,
             _ => heap.known().non_constructor_function_map,
         };
-        let map = scope
-            .create_handle(map.as_tagged())
-            .expect("function map is strong");
-        let context = scope
-            .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(context) })
-            .expect("closure context is strong");
+        let context = unsafe { scope.handle_value::<Context>(context) };
         let function = heap
             .allocate_object(
                 scope,
@@ -70,16 +61,11 @@ impl Runtime {
             )
             .into_handle(scope);
 
-        let length_key = scope
-            .create_handle(
-                SlotName::from(vm.interner().intern(heap, scope, "length").as_tagged()).tagged(),
-            )
-            .expect("length name is strong");
+        let length_key = scope.handle(
+            SlotName::from(vm.interner().intern(heap, scope, "length").as_tagged()).tagged(),
+        );
         let name_key = scope
-            .create_handle(
-                SlotName::from(vm.interner().intern(heap, scope, "name").as_tagged()).tagged(),
-            )
-            .expect("name is strong");
+            .handle(SlotName::from(vm.interner().intern(heap, scope, "name").as_tagged()).tagged());
         let defined = Object::define_own_property(
             heap,
             scope,
@@ -112,32 +98,24 @@ impl Runtime {
         }
 
         if kind.needs_prototype() {
-            let proto_map = scope
-                .create_handle(heap.known().object_initial_map.as_tagged())
-                .expect("object initial map is strong");
             let proto = heap
                 .allocate_object(
                     scope,
                     ObjectSlotsInit {
-                        map: proto_map,
+                        map: heap.known().object_initial_map,
                         values: &[],
                         elements: heap.known().empty_fixed_array.erase(),
                         length: 0,
                     },
                 )
                 .into_handle(scope);
-            let constructor = scope
-                .create_handle(
-                    SlotName::from(vm.interner().intern(heap, scope, "constructor").as_tagged())
-                        .tagged(),
-                )
-                .expect("constructor name is strong");
-            let prototype = scope
-                .create_handle(
-                    SlotName::from(vm.interner().intern(heap, scope, "prototype").as_tagged())
-                        .tagged(),
-                )
-                .expect("prototype name is strong");
+            let constructor = scope.handle(
+                SlotName::from(vm.interner().intern(heap, scope, "constructor").as_tagged())
+                    .tagged(),
+            );
+            let prototype = scope.handle(
+                SlotName::from(vm.interner().intern(heap, scope, "prototype").as_tagged()).tagged(),
+            );
             let defined = Object::define_own_property(
                 heap,
                 scope,
@@ -336,7 +314,7 @@ impl Runtime {
     pub fn type_of(vm: &VM, heap: &mut Heap, state: &ContextState, v: Value) -> Value {
         let name = heap.no_gc(|nogc| {
             let known = nogc.known();
-            if v.is_smi() || v.get_as::<Float>(nogc, known.float_map).is_some() {
+            if v.is_smi() || v.get_as::<Float>(nogc).is_some() {
                 "number"
             } else if v == known.undefined.value() || v == known.void.value() {
                 "undefined"
@@ -344,9 +322,9 @@ impl Runtime {
                 "object"
             } else if v == known.true_object.value() || v == known.false_object.value() {
                 "boolean"
-            } else if v.get_as::<VMString>(nogc, known.string_map).is_some() {
+            } else if v.get_as::<VMString>(nogc).is_some() {
                 "string"
-            } else if v.get_as::<Symbol>(nogc, known.symbol_map).is_some() {
+            } else if v.get_as::<Symbol>(nogc).is_some() {
                 "symbol"
             } else if let ValueRef::Object(obj) = v.value_ref(nogc) {
                 if obj.as_ref().header.map.heap_ref(nogc).kind().is_callable() {
@@ -402,7 +380,7 @@ impl Runtime {
         if proto == nogc.known().null.value() {
             return false;
         }
-        if let Some(parents) = proto.get_as::<FixedArray>(nogc, nogc.known().array_map) {
+        if let Some(parents) = proto.get_as::<FixedArray>(nogc) {
             for i in 0..parents.len() {
                 if Self::has_proto_in_chain(nogc, parents.at(i), target) {
                     return true;
@@ -435,11 +413,7 @@ impl Runtime {
             let proto = if heap.no_gc(|nogc| Convert::is_primitive(nogc, proto)) {
                 None
             } else {
-                Some(
-                    scope
-                        .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(proto) })
-                        .expect("object prototype must be strong"),
-                )
+                Some(unsafe { scope.handle_value::<Object>(proto) })
             };
             let known = heap.known();
             let obj = heap

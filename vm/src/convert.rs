@@ -8,10 +8,10 @@ impl Convert {
     /// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN,
     /// everything else is truthy.
     pub fn is_truthy<'a>(nogc: &'a NoGc<'a>, v: Value) -> bool {
+        let known = nogc.known();
         if let Some(smi) = Smi::decode(v) {
             return smi.value() != 0;
         }
-        let known = nogc.known();
         if v == known.false_object.value()
             || v == known.undefined.value()
             || v == known.null.value()
@@ -22,22 +22,22 @@ impl Convert {
         if v == known.true_object.value() {
             return true;
         }
-        if let Some(f) = v.get_as::<Float>(nogc, known.float_map) {
+        if let Some(f) = v.get_as::<Float>(nogc) {
             let x = f.value.get();
             // -0.0 compares equal to 0.0; NaN compares unequal to everything
             return x != 0.0 && !x.is_nan();
         }
-        if let Some(s) = v.get_as::<VMString>(nogc, known.string_map) {
+        if let Some(s) = v.get_as::<VMString>(nogc) {
             return s.len(nogc) != 0;
         }
         true
     }
 
     pub fn to_number<'a>(nogc: &'a NoGc<'a>, v: Value) -> Result<f64, VmError> {
+        let known = nogc.known();
         if let Some(smi) = Smi::decode(v) {
             return Ok(smi.value() as f64);
         }
-        let known = nogc.known();
         if v == known.undefined.value() || v == known.void.value() {
             return Ok(f64::NAN);
         }
@@ -50,10 +50,10 @@ impl Convert {
         if v == known.true_object.value() {
             return Ok(1.0);
         }
-        if let Some(f) = v.get_as::<Float>(nogc, known.float_map) {
+        if let Some(f) = v.get_as::<Float>(nogc) {
             return Ok(f.value.get());
         }
-        if let Some(s) = v.get_as::<VMString>(nogc, known.string_map) {
+        if let Some(s) = v.get_as::<VMString>(nogc) {
             return Ok(Self::string_to_number(s.as_slice(nogc)).unwrap_or(f64::NAN));
         }
         Err(VmError::Type)
@@ -121,17 +121,17 @@ impl Convert {
     /// ES Type check: numbers, strings, symbols, booleans, null, undefined
     /// are primitives; everything else is an object.
     pub fn is_primitive<'a>(nogc: &'a NoGc<'a>, v: Value) -> bool {
+        let known = nogc.known();
         if v.is_smi() {
             return true;
         }
-        let known = nogc.known();
         v == known.undefined.value()
             || v == known.null.value()
             || v == known.true_object.value()
             || v == known.false_object.value()
-            || v.get_as::<Float>(nogc, known.float_map).is_some()
-            || v.get_as::<VMString>(nogc, known.string_map).is_some()
-            || v.get_as::<Symbol>(nogc, known.symbol_map).is_some()
+            || v.get_as::<Float>(nogc).is_some()
+            || v.get_as::<VMString>(nogc).is_some()
+            || v.get_as::<Symbol>(nogc).is_some()
     }
 
     /// ES ToString on a primitive (no ToPrimitive recursion: the input is
@@ -167,10 +167,9 @@ impl Convert {
             Other,
         }
         let kind = heap.no_gc(|nogc| {
-            let known = nogc.known();
-            if v.get_as::<VMString>(nogc, known.string_map).is_some() {
+            if v.get_as::<VMString>(nogc).is_some() {
                 PrimitiveString::IsString
-            } else if let Some(f) = v.get_as::<Float>(nogc, known.float_map) {
+            } else if let Some(f) = v.get_as::<Float>(nogc) {
                 PrimitiveString::Float(f.value.get())
             } else {
                 PrimitiveString::Other

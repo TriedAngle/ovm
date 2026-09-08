@@ -6,32 +6,34 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, HeapRef, NoGc,
-    PointerStrength, RawCell, Strong, Tagged, Value, Visitor, Weak,
+    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, HeapObject, HeapPtr, HeapRef, NoGc, RawCell,
+    Tagged, Value, Visitor,
 };
 
-pub struct Handle<'scope, T, R: PointerStrength = Strong> {
+/// A rooted reference to a `T` that survives relocation by the GC.
+/// Weak references cannot be rooted: they live in `WeakGcCell`s as
+/// `Tagged<MaybeWeak<T>>` words.
+pub struct Handle<'scope, T> {
     location: NonNull<Value>,
-    _phantom: PhantomData<(&'scope (), T, R)>,
+    _phantom: PhantomData<(&'scope (), T)>,
 }
 
-impl<'s, T, R: PointerStrength> Clone for Handle<'s, T, R> {
+impl<'s, T> Clone for Handle<'s, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<'s, T, R: PointerStrength> Copy for Handle<'s, T, R> {}
+impl<'s, T> Copy for Handle<'s, T> {}
 
-impl<'s, T, R: PointerStrength> core::fmt::Debug for Handle<'s, T, R> {
+impl<'s, T> core::fmt::Debug for Handle<'s, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Handle")
-            .field("kind", &core::any::type_name::<R>())
             .field("value", &self.value())
             .finish()
     }
 }
 
-impl<'s, T, R: PointerStrength> Handle<'s, T, R> {
+impl<'s, T> Handle<'s, T> {
     pub fn from_location(location: NonNull<Value>) -> Self {
         Handle {
             location,
@@ -43,7 +45,7 @@ impl<'s, T, R: PointerStrength> Handle<'s, T, R> {
         unsafe { *self.location.as_ptr() }
     }
 
-    pub fn erase(self) -> Handle<'s, Value, R> {
+    pub fn erase(self) -> Handle<'s, Value> {
         Handle {
             location: self.location,
             _phantom: PhantomData,
@@ -51,7 +53,7 @@ impl<'s, T, R: PointerStrength> Handle<'s, T, R> {
     }
 }
 
-impl<'s, T: HeapObject> Handle<'s, T, Strong> {
+impl<'s, T: HeapObject> Handle<'s, T> {
     pub fn get(self) -> HeapPtr<T> {
         self.as_tagged()
             .as_ptr()
@@ -67,10 +69,9 @@ impl<'s, T: HeapObject> Handle<'s, T, Strong> {
     }
 }
 
-impl<'s, T: HeapObject> Handle<'s, T, Weak> {}
-
-impl<'s, T, R: PointerStrength> From<Handle<'s, T, R>> for Tagged<T> {
-    fn from(h: Handle<'s, T, R>) -> Self {
+impl<'s, T> From<Handle<'s, T>> for Tagged<T> {
+    fn from(h: Handle<'s, T>) -> Self {
+        // SAFETY: handle slots only ever hold strong values.
         unsafe { Self::from_value_unchecked(h.value()) }
     }
 }
@@ -175,17 +176,19 @@ impl<'d> HandleScope<'d> {
         }
     }
 
-    pub fn create_handle<T>(&self, value: Tagged<T>) -> Option<Handle<'_, T>> {
-        if value.is_weak_ptr() {
-            return None;
-        }
-        Some(unsafe { self.create_handle_unchecked(value) })
-    }
-
-    pub unsafe fn create_handle_unchecked<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+    pub fn handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
+        debug_assert!(
+            !value.erase().is_weak_ptr(),
+            "weak value cannot be rooted in a handle"
+        );
         let slot = unsafe { &*self.data.as_ptr() }.inner().allocate_slot();
         unsafe { *slot = value.erase() };
         Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
+    }
+
+    // TODO: get rid of this
+    pub unsafe fn handle_value<T>(&self, value: Value) -> Handle<'_, T> {
+        self.handle(unsafe { Tagged::from_value_unchecked(value) })
     }
 
     pub fn escapable_scope<'a>(&'a mut self) -> EscapableHandleScope<'a, 'd> {
@@ -295,8 +298,7 @@ pub trait HandleSet {
 
 impl HandleSet for HandleScope<'_> {
     fn create_handle<T>(&self, value: Tagged<T>) -> Handle<'_, T> {
-        self.create_handle(value)
-            .expect("weak value cannot be rooted in a handle")
+        self.handle(value)
     }
 }
 

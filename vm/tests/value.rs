@@ -1,6 +1,6 @@
 use core::alloc::Layout;
 
-use vm::{Header, HeapObject, HeapPtr, NoGc, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
+use vm::{Header, HeapObject, HeapPtr, MaybeWeak, NoGc, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
 
 /// Stand-in heap object, aligned like a real heap allocation.
 #[repr(align(8))]
@@ -8,6 +8,8 @@ struct TestObj(u64);
 
 impl HeapObject for TestObj {
     type Init<'a> = ();
+
+    const KIND: vm::ObjectKind = vm::ObjectKind::VMString;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -133,7 +135,7 @@ mod heap_ptr {
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::new(raw) };
 
-        let v = ptr.encode_weak();
+        let v = Tagged::from_ptr(ptr).make_weak().erase();
         assert!(v.is_weak_ptr());
         assert!(v.is_ptr());
         assert!(!v.is_smi());
@@ -267,10 +269,40 @@ mod tagged {
 
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let weak = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_weak()) };
-        assert!(weak.as_ptr().is_none());
+        // weak references live in MaybeWeak: strengthening fails, so a weak
+        // word can never reach `as_ptr` on a strong Tagged
+        let weak = Tagged::from_ptr(ptr).make_weak();
+        assert!(weak.strengthen().is_none());
 
         unsafe { free_test_obj(raw) };
+    }
+
+    #[test]
+    fn maybe_weak_roundtrip() {
+        let raw = alloc_test_obj();
+        let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
+        let strong = Tagged::from_ptr(ptr);
+
+        let weak = strong.make_weak();
+        assert!(weak.erase().is_weak_ptr());
+        assert!(!weak.erase().is_strong_ptr());
+        assert_eq!(weak.erase().raw_addr(), raw as u64);
+        assert!(weak.strengthen().is_none());
+
+        let maybe = Tagged::<MaybeWeak<TestObj>>::from_strong(strong);
+        assert!(!maybe.is_cleared());
+        assert_eq!(maybe.strengthen().unwrap().erase(), strong.erase());
+        assert_eq!(maybe.erase(), strong.erase());
+
+        unsafe { free_test_obj(raw) };
+    }
+
+    #[test]
+    #[should_panic(expected = "weak value in a strong Tagged")]
+    fn strong_tagged_rejects_weak_bits() {
+        // Safety: bit-level test; the value is never dereferenced.
+        let weak = unsafe { Value::from_bits(0x1000 | WEAK_PTR) };
+        let _ = unsafe { Tagged::<TestObj>::from_value_unchecked(weak) };
     }
 
     #[test]

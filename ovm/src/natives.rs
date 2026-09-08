@@ -1,8 +1,6 @@
 use core::ptr::NonNull;
 
-use vm::{
-    Float, GcSlice, Handle, HandleScope, Heap, InternedString, Object, Smi, Tagged, Value, VmError,
-};
+use vm::{Float, GcSlice, Handle, HandleScope, Heap, InternedString, Object, Smi, Value, VmError};
 
 use crate::{ContextState, Thread, VM};
 
@@ -83,9 +81,7 @@ impl<'a> NativeContext<'a> {
 
     pub fn call<'s>(&mut self, callable: Value, args: GcSlice<'s>) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
-        let callable = scope
-            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(callable) })
-            .expect("callable must be strong");
+        let callable = unsafe { scope.handle_value::<Object>(callable) };
         crate::interpreter::execute(self.vm, self.heap, self.state, callable, args, None)
     }
 
@@ -99,12 +95,8 @@ impl<'a> NativeContext<'a> {
         args: GcSlice<'s>,
     ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
-        let callable = scope
-            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(callable) })
-            .expect("callable must be strong");
-        let new_target = scope
-            .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(new_target) })
-            .expect("new.target must be strong");
+        let callable = unsafe { scope.handle_value::<Object>(callable) };
+        let new_target = unsafe { scope.handle_value::<Object>(new_target) };
         crate::interpreter::execute(
             self.vm,
             self.heap,
@@ -224,9 +216,8 @@ fn float_add(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, V
         _ => return Err(VmError::Arity),
     };
     let sum = nctx.heap().no_gc(|nogc| {
-        let float_map = nogc.known().float_map;
-        let fa = a.get_as::<Float>(nogc, float_map).ok_or(VmError::Type)?;
-        let fb = b.get_as::<Float>(nogc, float_map).ok_or(VmError::Type)?;
+        let fa = a.get_as::<Float>(nogc).ok_or(VmError::Type)?;
+        let fb = b.get_as::<Float>(nogc).ok_or(VmError::Type)?;
         Ok(fa.value.get() + fb.value.get())
     })?;
     Ok(nctx.heap().allocate::<Float>(sum).erase())

@@ -10,7 +10,7 @@ use parser::FunctionId;
 use vm::{
     CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, Float, FunctionKind,
     Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object,
-    ObjectSlotsInit, ScopeInfo, ScopeInfoInit, Tagged, VmError,
+    ObjectSlotsInit, ScopeInfo, ScopeInfoInit, VmError,
 };
 
 use crate::{ContextState, Thread, VM};
@@ -51,12 +51,8 @@ pub fn materialize_closure_vm<'s>(
         (0..script.functions.len()).map(|_| None).collect();
     let info = materialize_function(vm, heap, state, scope, script, &mut infos, FunctionId(0))?;
 
-    let map = scope
-        .create_handle(heap.known().function_map.as_tagged())
-        .expect("function map is strong");
-    let context = scope
-        .create_handle(unsafe { Tagged::<Context>::from_value_unchecked(context) })
-        .expect("context is strong");
+    let map = heap.known().function_map;
+    let context = unsafe { scope.handle_value::<Context>(context) };
     let empty_elements = heap.known().empty_fixed_array.erase();
     let object = heap
         .allocate_object(

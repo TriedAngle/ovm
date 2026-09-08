@@ -5,12 +5,23 @@ use core::{
 
 use crate::{
     Compare, EdgeVisitable, GcSlot, Handle, HandleScope, Heap, HeapRef, NoGc, OptionGcSlot,
-    PointerStrength, STRONG_PTR, Smi, Tagged, TransitionGuard, Value, ValueRef, Visitor, VmError,
-    WEAK_PTR, Word,
+    STRONG_PTR, Smi, Tagged, TransitionGuard, Value, ValueRef, Visitor, VmError, WEAK_PTR, Word,
 };
 
 pub trait HeapObject: 'static {
     type Init<'a>;
+
+    /// The `ObjectKind` this type's map carries: the type tag used for
+    /// checked casts (`Value::get_as`). Unlike map-pointer equality it
+    /// survives map transitions.
+    const KIND: ObjectKind;
+
+    /// Whether a map's kind byte denotes a `T`. Defaults to exact `KIND`
+    /// equality; the any-heap-object [`Object`] overrides it with the
+    /// JS-object range check.
+    fn matches_kind(kind: ObjectKind) -> bool {
+        kind == Self::KIND
+    }
 
     fn layout_for(config: &Self::Init<'_>) -> Layout;
 
@@ -134,7 +145,7 @@ impl Map {
 
             let target = entry[1]
                 .inner()
-                .get_as::<Map>(nogc, nogc.known().map_map)
+                .get_as::<Map>(nogc)
                 .expect("transition target must be a map");
 
             // adds append the property (last descriptor), redefines keep
@@ -156,7 +167,7 @@ impl Map {
                 let matches = row
                     .value
                     .inner()
-                    .get_as::<AccessorPair>(nogc, nogc.known().accessor_pair_map)
+                    .get_as::<AccessorPair>(nogc)
                     .is_some_and(|p| {
                         Compare::same_value(nogc, get, p.get.inner())
                             && Compare::same_value(nogc, set, p.set.inner())
@@ -181,6 +192,7 @@ pub struct MapInit<'a> {
 }
 
 impl HeapObject for Map {
+    const KIND: ObjectKind = ObjectKind::Map;
     type Init<'a> = MapInit<'a>;
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
@@ -447,17 +459,14 @@ impl Object {
             return None;
         }
         let info = self.slots.heap_ref(guard).at(0);
-        info.get_as(guard, guard.known().callable_map)
+        info.get_as(guard)
     }
 
     pub fn closure_context<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<HeapRef<'a, Context>> {
         if !self.header.map.heap_ref(guard).kind().is_callable() {
             return None;
         }
-        self.slots
-            .heap_ref(guard)
-            .at(1)
-            .get_as(guard, guard.known().context_map)
+        self.slots.heap_ref(guard).at(1).get_as(guard)
     }
 
     pub fn native_index<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<usize> {
@@ -492,9 +501,7 @@ impl Object {
     }
 
     pub fn elements_array<'a>(&'a self, nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, FixedArray>> {
-        self.elements
-            .inner()
-            .get_as::<FixedArray>(nogc, nogc.known().array_map)
+        self.elements.inner().get_as::<FixedArray>(nogc)
     }
 }
 
@@ -534,9 +541,7 @@ pub fn store_array_element(
     value: Value,
 ) -> Result<(), VmError> {
     let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
-    let receiver = scope
-        .create_handle(unsafe { Tagged::<Object>::from_value_unchecked(receiver) })
-        .expect("receiver must be strong");
+    let receiver = unsafe { scope.handle_value::<Object>(receiver) };
 
     let grows = heap.no_gc(|nogc| {
         let obj = receiver.heap_ref(nogc);
@@ -592,6 +597,14 @@ pub struct ObjectSlotsInit<'m, 'v> {
 }
 
 impl HeapObject for Object {
+    const KIND: ObjectKind = ObjectKind::Object;
+
+    fn matches_kind(kind: ObjectKind) -> bool {
+        matches!(
+            kind,
+            ObjectKind::Object | ObjectKind::Array | ObjectKind::ByteArray | ObjectKind::String
+        )
+    }
     type Init<'a> = ObjectInit<'a>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -667,6 +680,7 @@ impl FixedArray {
 }
 
 impl HeapObject for FixedArray {
+    const KIND: ObjectKind = ObjectKind::FixedArray;
     type Init<'a> = &'a [Value];
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
@@ -746,6 +760,7 @@ impl FixedByteArray {
 }
 
 impl HeapObject for FixedByteArray {
+    const KIND: ObjectKind = ObjectKind::FixedByteArray;
     type Init<'a> = &'a [u8];
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
@@ -813,12 +828,11 @@ impl VMString {
         b: Value,
     ) -> Handle<'s, VMString> {
         let bytes = heap.no_gc(|nogc| {
-            let known = nogc.known();
             let sa = a
-                .get_as::<VMString>(nogc, known.string_map)
+                .get_as::<VMString>(nogc)
                 .expect("concat operand must be a string");
             let sb = b
-                .get_as::<VMString>(nogc, known.string_map)
+                .get_as::<VMString>(nogc)
                 .expect("concat operand must be a string");
             let mut out = Vec::with_capacity(sa.len(nogc) + sb.len(nogc));
             out.extend_from_slice(sa.as_slice(nogc));
@@ -850,6 +864,7 @@ impl VMString {
 }
 
 impl HeapObject for VMString {
+    const KIND: ObjectKind = ObjectKind::VMString;
     type Init<'a> = (Handle<'a, FixedByteArray>, i64);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -891,6 +906,7 @@ impl InternedString {
 }
 
 impl HeapObject for InternedString {
+    const KIND: ObjectKind = ObjectKind::VMString;
     type Init<'a> = (Handle<'a, FixedByteArray>, i64);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -950,6 +966,7 @@ impl Symbol {
 }
 
 impl HeapObject for Symbol {
+    const KIND: ObjectKind = ObjectKind::Symbol;
     type Init<'a> = Handle<'a, FixedByteArray>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -1023,8 +1040,8 @@ impl From<Tagged<Smi>> for SlotName {
     }
 }
 
-impl<R: PointerStrength> From<Handle<'_, SlotName, R>> for SlotName {
-    fn from(name: Handle<'_, SlotName, R>) -> Self {
+impl From<Handle<'_, SlotName>> for SlotName {
+    fn from(name: Handle<'_, SlotName>) -> Self {
         Self::from_value(name.value())
     }
 }
@@ -1045,6 +1062,7 @@ pub struct AccessorPair {
 }
 
 impl HeapObject for AccessorPair {
+    const KIND: ObjectKind = ObjectKind::AccessorPair;
     type Init<'a> = (Value, Value);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -1148,6 +1166,7 @@ pub struct CallableInfoInit<'a> {
 }
 
 impl HeapObject for CallableInfoObject {
+    const KIND: ObjectKind = ObjectKind::CallableInfo;
     type Init<'a> = CallableInfoInit<'a>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -1217,8 +1236,7 @@ impl CallableInfoObject {
 
     pub fn name<'a>(&self, nogc: &'a NoGc<'a>) -> Option<Value> {
         let name = self.name.inner();
-        name.get_as::<VMString>(nogc, nogc.known().string_map)
-            .map(|_| name)
+        name.get_as::<VMString>(nogc).map(|_| name)
     }
 
     pub fn formal_parameter_count(&self) -> usize {
@@ -1238,7 +1256,7 @@ impl CallableInfoObject {
     pub fn constant_slot_name<'a>(&self, nogc: &'a NoGc<'a>, idx: usize) -> SlotName {
         let v = self.constants.heap_ref(nogc).at(idx);
         let name = v
-            .get_as::<InternedString>(nogc, nogc.known().string_map)
+            .get_as::<InternedString>(nogc)
             .expect("property name constant must be an interned string");
         SlotName::from(name.into_tagged())
     }
@@ -1324,6 +1342,7 @@ impl HandlerTable {
 }
 
 impl HeapObject for HandlerTable {
+    const KIND: ObjectKind = ObjectKind::HandlerTable;
     type Init<'a> = HandlerTableInit<'a>;
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
@@ -1374,6 +1393,7 @@ pub struct ScopeInfoInit<'a> {
 }
 
 impl HeapObject for ScopeInfo {
+    const KIND: ObjectKind = ObjectKind::ScopeInfo;
     type Init<'a> = ScopeInfoInit<'a>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -1419,6 +1439,7 @@ pub struct ContextInit<'a> {
 }
 
 impl HeapObject for Context {
+    const KIND: ObjectKind = ObjectKind::Context;
     type Init<'a> = ContextInit<'a>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -1464,6 +1485,7 @@ pub struct Float {
 }
 
 impl HeapObject for Float {
+    const KIND: ObjectKind = ObjectKind::Float;
     type Init<'a> = f64;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {

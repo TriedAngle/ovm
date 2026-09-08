@@ -24,9 +24,6 @@ pub fn error_from_vm_error(
             "RangeError" => heap.known().range_error_map,
             _ => heap.known().error_map,
         };
-        let map = scope
-            .create_handle(map.as_tagged())
-            .expect("error map is strong");
         let obj = heap
             .allocate_object(
                 &scope,
@@ -38,18 +35,10 @@ pub fn error_from_vm_error(
                 },
             )
             .into_handle(&scope);
-        let name = scope
-            .create_handle(SlotName::from(name_string.as_tagged()).tagged())
-            .expect("name is strong");
-        let message = scope
-            .create_handle(SlotName::from(message_string.as_tagged()).tagged())
-            .expect("message is strong");
-        let name_value = scope
-            .create_handle(Tagged::from_value(name_value.value()))
-            .expect("name value is strong");
-        let message_value = scope
-            .create_handle(Tagged::from_value(message_value.value()))
-            .expect("message value is strong");
+        let name = scope.handle(SlotName::from(name_string.as_tagged()).tagged());
+        let message = scope.handle(SlotName::from(message_string.as_tagged()).tagged());
+        let name_value = scope.handle(Tagged::from_value(name_value.value()));
+        let message_value = scope.handle(Tagged::from_value(message_value.value()));
         Object::define_own_property(
             heap,
             &scope,

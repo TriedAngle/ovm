@@ -18,9 +18,7 @@ fn run_str(vm: &VM, src: &str) -> String {
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
     thread.heap().no_gc(|nogc| {
-        let s = result
-            .get_as::<vm::VMString>(nogc, nogc.known().string_map)
-            .expect("string result");
+        let s = result.get_as::<vm::VMString>(nogc).expect("string result");
         String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
     })
 }

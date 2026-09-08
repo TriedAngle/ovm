@@ -487,9 +487,7 @@ fn alloc_map_with_slots<'s>(
     prototype: vm::Global<Object>,
     value_slot_count: usize,
 ) -> Result<vm::Global<Map>, VmError> {
-    let proto = scope
-        .create_handle(Tagged::from_value(prototype.value()))
-        .expect("prototype is strong");
+    let proto = scope.handle(Tagged::from_value(prototype.value()));
     Ok(heap
         .allocate::<Map>(MapInit {
             kind,
@@ -625,10 +623,8 @@ fn define_data(
     name: SlotName,
     value: Value,
 ) -> Result<(), VmError> {
-    let obj = scope
-        .create_handle(object.as_tagged())
-        .expect("object is strong");
-    let name = scope.create_handle(name.tagged()).expect("name is strong");
+    let obj = scope.handle(object.as_tagged());
+    let name = scope.handle(name.tagged());
     Object::define_own_property(heap, scope, obj, name, PropertyDescriptor::data(value))?;
     Ok(())
 }
@@ -646,7 +642,7 @@ fn eval_native(
         let (vm, heap, _) = nctx.split();
         let s = Convert::to_string(heap, &scope, vm.interner(), src)?;
         heap.no_gc(|nogc| {
-            s.get_as::<VMString>(nogc, nogc.known().string_map)
+            s.get_as::<VMString>(nogc)
                 .and_then(|s| s.as_str(nogc).map(|s| s.to_owned()))
                 .ok_or(VmError::Type)
         })
@@ -691,9 +687,7 @@ fn number_constructor(
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
         let value = Convert::to_value(heap, &scope, n);
-        let map = scope
-            .create_handle(heap.known().number_wrapper_map.as_tagged())
-            .expect("wrapper map is strong");
+        let map = heap.known().number_wrapper_map;
         let empty_elements = heap.known().empty_fixed_array.erase();
         Ok(heap
             .allocate_object(
@@ -756,9 +750,7 @@ fn boolean_constructor(
     }
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let map = scope
-            .create_handle(heap.known().boolean_wrapper_map.as_tagged())
-            .expect("wrapper map is strong");
+        let map = heap.known().boolean_wrapper_map;
         let empty_elements = heap.known().empty_fixed_array.erase();
         Ok(heap
             .allocate_object(
@@ -828,9 +820,7 @@ fn string_constructor(
             return Ok(s);
         }
         let (_, heap, _) = nctx.split();
-        let map = scope
-            .create_handle(heap.known().string_wrapper_map.as_tagged())
-            .expect("wrapper map is strong");
+        let map = heap.known().string_wrapper_map;
         let empty_elements = heap.known().empty_fixed_array.erase();
         Ok(heap
             .allocate_object(
@@ -901,9 +891,6 @@ fn make_error(
             "ReferenceError" => heap.known().reference_error_map,
             _ => heap.known().error_map,
         };
-        let map = scope
-            .create_handle(map.as_tagged())
-            .expect("error map is strong");
         let empty_elements = heap.known().empty_fixed_array.erase();
         let obj = heap
             .allocate_object(
@@ -916,22 +903,14 @@ fn make_error(
                 },
             )
             .into_handle(&scope);
-        let name = scope
-            .create_handle(
-                SlotName::from(vm.interner().intern(heap, &scope, "name").as_tagged()).tagged(),
-            )
-            .expect("name is strong");
-        let message_key = scope
-            .create_handle(
-                SlotName::from(vm.interner().intern(heap, &scope, "message").as_tagged()).tagged(),
-            )
-            .expect("message is strong");
-        let class_value = scope
-            .create_handle(vm.interner().intern(heap, &scope, class).as_tagged())
-            .expect("class name is strong");
-        let message_value = scope
-            .create_handle(Tagged::from_value(message))
-            .expect("message value is strong");
+        let name = scope.handle(
+            SlotName::from(vm.interner().intern(heap, &scope, "name").as_tagged()).tagged(),
+        );
+        let message_key = scope.handle(
+            SlotName::from(vm.interner().intern(heap, &scope, "message").as_tagged()).tagged(),
+        );
+        let class_value = vm.interner().intern(heap, &scope, class);
+        let message_value = scope.handle(Tagged::from_value(message));
         Object::define_own_property(
             heap,
             &scope,
@@ -1016,9 +995,7 @@ fn array_constructor(
                 (argv, n)
             }
         };
-        let map = scope
-            .create_handle(heap.known().js_array_map.as_tagged())
-            .expect("array map is strong");
+        let map = heap.known().js_array_map;
         let elements = heap.allocate_handle::<FixedArray>(&values, &scope);
         Ok(heap
             .allocate_object(

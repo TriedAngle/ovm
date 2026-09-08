@@ -23,7 +23,7 @@ fn handle_scope(data: &HandleData) -> HandleScope<'_> {
 }
 
 fn smi_handle(scope: &HandleScope<'_>, v: i64) -> i64 {
-    let handle = scope.create_handle(Tagged::smi(v).unwrap()).unwrap();
+    let handle = scope.handle(Tagged::smi(v).unwrap());
     Smi::decode(handle.value()).unwrap().value()
 }
 
@@ -32,8 +32,8 @@ fn handles_read_back_their_values() {
     let data = HandleData::new(Smi::new(0).encode());
     let scope = handle_scope(&data);
 
-    let a = scope.create_handle(Tagged::smi(42).unwrap()).unwrap();
-    let b = scope.create_handle(Tagged::smi(-7).unwrap()).unwrap();
+    let a = scope.handle(Tagged::smi(42).unwrap());
+    let b = scope.handle(Tagged::smi(-7).unwrap());
 
     assert_eq!(Smi::decode(a.value()).unwrap().value(), 42);
     assert_eq!(Smi::decode(b.value()).unwrap().value(), -7);
@@ -59,7 +59,7 @@ fn scope_tracks_nesting_level() {
 fn closed_scope_unroots_its_handles() {
     let data = HandleData::new(Smi::new(0).encode());
     let outer = handle_scope(&data);
-    let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
+    let keep = outer.handle(Tagged::smi(1).unwrap());
 
     {
         let inner = handle_scope(&data);
@@ -90,7 +90,7 @@ fn reclaimed_slots_are_reused() {
         smi_handle(&scope, i * 100);
     }
     assert_eq!(root_count(&data), 5);
-    let fourth = scope.create_handle(Tagged::smi(400).unwrap()).unwrap();
+    let fourth = scope.handle(Tagged::smi(400).unwrap());
     assert_eq!(Smi::decode(fourth.value()).unwrap().value(), 400);
 }
 
@@ -101,7 +101,7 @@ fn blocks_extend_when_full() {
 
     let mut handles = Vec::new();
     for i in 0..1030 {
-        handles.push(scope.create_handle(Tagged::smi(i).unwrap()).unwrap());
+        handles.push(scope.handle(Tagged::smi(i).unwrap()));
     }
 
     assert_eq!(root_count(&data), 1030);
@@ -114,13 +114,13 @@ fn blocks_extend_when_full() {
 fn escaped_handle_survives_inner_scope() {
     let data = HandleData::new(Smi::new(0).encode());
     let mut outer = handle_scope(&data);
-    let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
+    let keep = outer.handle(Tagged::smi(1).unwrap());
     assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
 
     let escaped = {
         let escapable = outer.escapable_scope();
-        let h = escapable.create_handle(Tagged::smi(2).unwrap()).unwrap();
-        escapable.create_handle(Tagged::smi(3).unwrap()).unwrap();
+        let h = escapable.handle(Tagged::smi(2).unwrap());
+        escapable.handle(Tagged::smi(3).unwrap());
         escapable.escape(h)
     };
 
@@ -132,30 +132,42 @@ fn escaped_handle_survives_inner_scope() {
 fn escapable_scope_closed_without_escape_reclaims() {
     let data = HandleData::new(Smi::new(0).encode());
     let mut outer = handle_scope(&data);
-    let keep = outer.create_handle(Tagged::smi(1).unwrap()).unwrap();
+    let keep = outer.handle(Tagged::smi(1).unwrap());
     assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
 
     {
         let escapable = outer.escapable_scope();
-        escapable.create_handle(Tagged::smi(2).unwrap()).unwrap();
+        escapable.handle(Tagged::smi(2).unwrap());
     }
 
     assert_eq!(root_count(&data), 2);
 }
 
 #[test]
-fn weak_pointers_cannot_be_handle_rooted() {
-    use vm::{STRONG_PTR, Tagged, Value, WEAK_PTR};
+fn strong_handles_are_infallible() {
+    use vm::{Object, Tagged};
 
     let data = HandleData::new(Smi::new(0).encode());
     let scope = handle_scope(&data);
 
-    // a weak-tagged pointer must not become a strong root
-    let weak = unsafe { Tagged::<Smi>::from_value_unchecked(Value::from_bits(0x1000 | WEAK_PTR)) };
-    assert!(scope.create_handle(weak).is_none());
+    // smis root without ceremony
+    let smi = scope.handle(Tagged::smi(7).unwrap());
+    assert_eq!(Smi::decode(smi.value()).unwrap().value(), 7);
 
-    // strong pointers and smis are fine
-    let strong =
-        unsafe { Tagged::<Smi>::from_value_unchecked(Value::from_bits(0x1000 | STRONG_PTR)) };
-    assert!(scope.create_handle(strong).is_some());
+    // strong-tagged values root without ceremony
+    let _ = scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(Smi::new(0).encode()) });
+}
+
+#[test]
+#[should_panic(expected = "weak value in a strong Tagged")]
+fn weak_bits_rejected_by_the_type_system() {
+    use vm::{Object, Tagged, Value, WEAK_PTR};
+
+    let data = HandleData::new(Smi::new(0).encode());
+    let scope = handle_scope(&data);
+    // Safety: bit-level test; the value is never dereferenced.
+    let weak = unsafe { Value::from_bits(0x1000 | WEAK_PTR) };
+    // A weak word can no longer be smuggled into the strong-Handle path:
+    // the debug invariant on strong `Tagged` fires before rooting.
+    let _ = scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(weak) });
 }

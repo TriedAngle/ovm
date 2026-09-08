@@ -41,12 +41,9 @@ fn float_add_adds_and_boxes_result() {
     let fa = float(&mut thread, 1.5);
     let fb = float(&mut thread, 2.25);
     let r = thread.run_native(add, &[smi(0), fa, fb]).unwrap();
-    let out = thread.heap().no_gc(|nogc| {
-        r.get_as::<Float>(nogc, nogc.known().float_map)
-            .unwrap()
-            .value
-            .get()
-    });
+    let out = thread
+        .heap()
+        .no_gc(|nogc| r.get_as::<Float>(nogc).unwrap().value.get());
     assert_eq!(out, 3.75);
 
     assert_eq!(
