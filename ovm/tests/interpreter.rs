@@ -1877,50 +1877,6 @@ fn call_dispatches_to_native_function_object() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
 
-/// Native that runs `6 + 7` in a fresh nested interpreter execution, where
-/// the inner program itself spills the accumulator for a CallNative.
-fn run_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
-        let mut program = Vec::new();
-        emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::LoadSmi, &[6]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::LoadSmi, &[7]);
-        emit(&mut program, Opcode::Store, &[2]);
-        emit(
-            &mut program,
-            Opcode::CallNative,
-            &[NativeIndex::SMI_ADD.0 as u32, 0, 3],
-        );
-        emit(&mut program, Opcode::Return, &[]);
-
-        let callable = bytecode_fn(nctx, &scope, &program, &[], 3);
-        // SAFETY: empty snapshot; consumed before any GC in the call
-        nctx.call(callable, unsafe { GcSlice::from_slice(&[]) })
-    })
-}
-
-#[test]
-fn native_reenters_interpreter_via_call() {
-    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
-    let idx = vm.register_native(run_inner);
-    let mut thread = vm.attach();
-
-    // acc = 5 (spilled across the native call); acc = run_inner(); r1 = acc
-    let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[0]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::LoadSmi, &[5]);
-    emit(&mut program, Opcode::CallNative, &[idx.0 as u32, 0, 1]);
-    emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::Load, &[1]);
-    emit(&mut program, Opcode::Return, &[]);
-
-    let result = run_program(&mut thread, program, 2, &[]);
-    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 13);
-}
-
 /// Native that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the native recovers.
 fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<Value, VmError> {

@@ -129,7 +129,7 @@ impl Transition {
         let pair_values = pair.map(|(get, set)| (get.value(), set.value()));
 
         let (kind, descriptor_count, value_slot_count, pairs_len, prototype, old_row) = {
-            let nogc = heap.no_gc_guard();
+            let nogc = heap.guard();
             let parent_ref = parent(&nogc);
             if let Some(target) =
                 parent_ref.find_transition_locked(&nogc, name.into(), flags, pair_values, &guard)
@@ -235,7 +235,7 @@ impl Transition {
         value: Handle<Value>,
     ) {
         let slot_count = {
-            let nogc = heap.no_gc_guard();
+            let nogc = heap.guard();
             receiver.heap_ref(&nogc).map_ref(&nogc).value_slot_count() + 1
         };
         heap.allocate_token_enter_nogc(FixedArray::layout_for(slot_count), |token, nogc| {
@@ -272,7 +272,7 @@ impl Transition {
         flags: SlotFlags,
         pair: Option<(Value, Value)>,
     ) {
-        let nogc = heap.no_gc_guard();
+        let nogc = heap.guard();
         let receiver_ref = receiver.heap_ref(&nogc);
         let target = receiver_ref
             .map_ref(&nogc)
@@ -285,7 +285,7 @@ impl Transition {
     }
 
     fn write_slot(heap: &mut Heap, receiver: Handle<Object>, index: usize, value: Value) {
-        let nogc = heap.no_gc_guard();
+        let nogc = heap.guard();
         let offset = receiver.heap_ref(&nogc).map_ref(&nogc).descriptors()[index].offset();
         receiver.heap_ref(&nogc).slot(&nogc, offset).set(
             &nogc,
@@ -312,7 +312,7 @@ impl Transition {
                 let grow = match change {
                     Change::Append => true,
                     Change::Replace { index } => {
-                        let nogc = heap.no_gc_guard();
+                        let nogc = heap.guard();
                         receiver.heap_ref(&nogc).map_ref(&nogc).descriptors()[index]
                             .flags()
                             .is_accessor()
@@ -447,7 +447,7 @@ impl Object {
         desc: PropertyDescriptor,
     ) -> Result<bool, VmError> {
         {
-            let nogc = heap.no_gc_guard();
+            let nogc = heap.guard();
             debug_assert!(
                 !receiver
                     .heap_ref(&nogc)
@@ -472,7 +472,7 @@ impl Object {
         name: Handle<SlotName>,
         desc: PropertyDescriptor,
     ) -> Result<bool, VmError> {
-        let nogc = heap.no_gc_guard();
+        let nogc = heap.guard();
         let current = receiver
             .heap_ref(&nogc)
             .map_ref(&nogc)
@@ -563,7 +563,7 @@ impl Object {
         }
 
         {
-            let nogc = heap.no_gc_guard();
+            let nogc = heap.guard();
             let map = receiver_handle.heap_ref(&nogc).map_ref(&nogc);
             if map.prototype.inner() == proto {
                 return Ok(());
@@ -576,7 +576,7 @@ impl Object {
         // cycle check: the receiver must not appear in any proposed chain
         // (FixedArray prototypes contribute one chain per element)
         {
-            let nogc = heap.no_gc_guard();
+            let nogc = heap.guard();
             let walk = |p: Value| -> Result<(), VmError> {
                 let mut p = p;
                 while p.is_strong_ptr() && p != nogc.known().null.value() {
@@ -604,7 +604,7 @@ impl Object {
             .expect("prototype must be a strong pointer");
 
         let descriptor_count = {
-            let nogc = heap.no_gc_guard();
+            let nogc = heap.guard();
             receiver_handle
                 .heap_ref(&nogc)
                 .map_ref(&nogc)
