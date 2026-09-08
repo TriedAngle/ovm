@@ -220,15 +220,7 @@ fn failed_run_does_not_leak_frames_into_next_run() {
         let known = thread.heap().known();
         thread
             .heap()
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map: known.object_initial_map,
-                    values: &[],
-                    elements: known.empty_fixed_array.erase(),
-                    length: 0,
-                },
-            )
+            .new_object(&scope, known.object_initial_map, &[])
             .into_handle(&scope)
             .as_tagged()
             .erase()
@@ -2039,29 +2031,13 @@ fn equal_strict_compares_numbers_strings_and_objects() {
         let object_init = thread.heap().known();
         let obj = thread
             .heap()
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map: object_init.object_initial_map,
-                    values: &[],
-                    elements: object_init.empty_fixed_array.erase(),
-                    length: 0,
-                },
-            )
+            .new_object(&scope, object_init.object_initial_map, &[])
             .into_handle(&scope)
             .as_tagged()
             .erase();
         let obj2 = thread
             .heap()
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map: object_init.object_initial_map,
-                    values: &[],
-                    elements: object_init.empty_fixed_array.erase(),
-                    length: 0,
-                },
-            )
+            .new_object(&scope, object_init.object_initial_map, &[])
             .into_handle(&scope)
             .as_tagged()
             .erase();
@@ -3247,15 +3223,7 @@ fn empty_object<'s>(thread: &mut Thread, scope: &'s HandleScope<'_>) -> Handle<'
     let known = thread.heap().known();
     thread
         .heap()
-        .allocate_object(
-            scope,
-            ObjectSlotsInit {
-                map: known.object_initial_map,
-                values: &[],
-                elements: known.empty_fixed_array.erase(),
-                length: 0,
-            },
-        )
+        .new_object(scope, known.object_initial_map, &[])
         .into_handle(scope)
 }
 

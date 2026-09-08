@@ -1,8 +1,8 @@
 use crate::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
-    Handle, HandleData, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapInit, MapKind, Object,
-    ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, ScopeInfo, ScopeInfoInit, SlotName, Smi,
-    StringInterner, Symbol, Tagged, TransitionLock, Value, Word,
+    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Float,
+    Global, Handle, HandleData, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapInit, MapKind,
+    Object, ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, ScopeInfo, ScopeInfoInit,
+    SlotName, Smi, StringInterner, Symbol, Tagged, TransitionLock, Value, Word,
 };
 use core::{
     alloc::Layout,
@@ -265,16 +265,7 @@ fn alloc_object(
     roots: &RootHandles,
     map: Global<Map>,
 ) -> Global<Object> {
-    heap.allocate_object(
-        scope,
-        ObjectSlotsInit {
-            map,
-            values: &[],
-            elements: heap.known().empty_fixed_array.erase(),
-            length: 0,
-        },
-    )
-    .into_global(roots)
+    heap.new_object(scope, map, &[]).into_global(roots)
 }
 
 /// First bootstrap phase: the internal sentinels (`void`, `null`, the
@@ -534,14 +525,10 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         })
         .into_handle(&scope);
     let function_prototype = heap
-        .allocate_object(
+        .new_object(
             &scope,
-            ObjectSlotsInit {
-                map: function_prototype_map,
-                values: &[empty_info.value(), empty_context.value()],
-                elements: known.empty_fixed_array.erase(),
-                length: 0,
-            },
+            function_prototype_map,
+            &[empty_info.value(), empty_context.value()],
         )
         .into_global(roots);
 
@@ -1167,6 +1154,41 @@ impl Heap {
             elements: config.elements,
             length: config.length,
         })
+    }
+
+    /// Fresh ordinary object: `map`, optional inline values, empty elements,
+    /// length 0.
+    pub fn new_object<'a>(
+        &mut self,
+        handles: &'a impl HandleSet,
+        map: Handle<'a, Map>,
+        values: &'a [Value],
+    ) -> Fresh<'_, Object> {
+        self.allocate_object(
+            handles,
+            ObjectSlotsInit {
+                map,
+                values,
+                elements: self.known().empty_fixed_array.erase(),
+                length: 0,
+            },
+        )
+    }
+
+    /// A number value: a Smi when the double is an in-range integer, a
+    /// freshly boxed Float otherwise. `-0.0` always boxes (it must not
+    /// collapse into `+0`).
+    pub fn new_number(&mut self, scope: &HandleScope<'_>, f: f64) -> Value {
+        let r = f as i64; // saturating cast; the round-trip check rejects out-of-range values
+        if f.is_finite()
+            && f.fract() == 0.0
+            && Smi::in_range(r)
+            && (r as f64) == f
+            && !(f == 0.0 && f.is_sign_negative())
+        {
+            return Smi::new(r).encode();
+        }
+        self.allocate_handle::<Float>(f, scope).value()
     }
 
     pub fn allocate_enter_nogc<T: HeapObject, R>(

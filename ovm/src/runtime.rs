@@ -1,7 +1,7 @@
 use vm::{
     CallableInfoObject, Context, Convert, FixedArray, Float, GcSlice, Handle, HandleScope, Heap,
-    LoadOutcome, NoGc, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, Symbol,
-    VMString, Value, VmError, load_outcome,
+    LoadOutcome, NoGc, Object, PropertyDescriptor, SlotName, Smi, Symbol, VMString, Value, VmError,
+    load_outcome,
 };
 
 use crate::{ContextState, NativeContext, VM};
@@ -47,15 +47,7 @@ impl Runtime {
         };
         let context = unsafe { scope.handle_value::<Context>(context) };
         let function = heap
-            .allocate_object(
-                scope,
-                ObjectSlotsInit {
-                    map,
-                    values: &[info.value(), context.value()],
-                    elements: heap.known().empty_fixed_array.erase(),
-                    length: 0,
-                },
-            )
+            .new_object(scope, map, &[info.value(), context.value()])
             .into_handle(scope);
 
         let length_key = heap.known().strings.length;
@@ -93,15 +85,7 @@ impl Runtime {
 
         if kind.needs_prototype() {
             let proto = heap
-                .allocate_object(
-                    scope,
-                    ObjectSlotsInit {
-                        map: heap.known().object_initial_map,
-                        values: &[],
-                        elements: heap.known().empty_fixed_array.erase(),
-                        length: 0,
-                    },
-                )
+                .new_object(scope, heap.known().object_initial_map, &[])
                 .into_handle(scope);
             let constructor = heap.known().strings.constructor;
             let prototype = heap.known().strings.prototype;
@@ -249,9 +233,7 @@ impl Runtime {
         let b = Self::to_numeric(vm, heap, state, b)?;
         let Some(b) = b else { return Ok(None) };
         let r = op(a, b);
-        Ok(Some(
-            state.handle_scope(|scope| Convert::to_value(heap, &scope, r)),
-        ))
+        Ok(Some(state.handle_scope(|scope| heap.new_number(&scope, r))))
     }
 
     /// Get a property value with full [[Get]] semantics: accessor getters are
@@ -401,15 +383,7 @@ impl Runtime {
             };
             let known = heap.known();
             let obj = heap
-                .allocate_object(
-                    &scope,
-                    ObjectSlotsInit {
-                        map: known.object_initial_map,
-                        values: &[],
-                        elements: known.empty_fixed_array.erase(),
-                        length: 0,
-                    },
-                )
+                .new_object(&scope, known.object_initial_map, &[])
                 .into_handle(&scope)
                 .as_tagged()
                 .erase();
