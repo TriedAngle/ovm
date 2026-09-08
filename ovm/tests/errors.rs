@@ -152,7 +152,7 @@ fn error_objects_are_extendable() {
     match outcome {
         Ok(StoreOutcome::Transition { receiver, name }) => {
             thread.handle_scope(|thread, scope| {
-                let receiver = unsafe { scope.handle_value::<vm::Object>(receiver) };
+                let receiver = scope.cast::<vm::Object>(receiver).unwrap();
                 let name = scope.handle(name.tagged());
                 let value = scope.handle(extra_val);
                 vm::Object::define_own_property(

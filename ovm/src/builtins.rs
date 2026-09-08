@@ -643,7 +643,7 @@ fn eval_native(
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
-        nctx.call(closure.value(), unsafe { GcSlice::from_slice(&[]) })
+        nctx.call(closure.value(), GcSlice::EMPTY)
     })
 }
 

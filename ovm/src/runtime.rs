@@ -1,5 +1,5 @@
 use vm::{
-    CallableInfoObject, Context, Convert, FixedArray, Float, GcSlice, Handle, HandleScope, Heap,
+    CallableInfoObject, Context, Convert, FixedArray, Float, Handle, HandleScope, Heap,
     LoadOutcome, NoGc, Object, PropertyDescriptor, SlotName, Smi, Symbol, VMString, Value, VmError,
     load_outcome,
 };
@@ -45,7 +45,7 @@ impl Runtime {
             kind if kind.is_constructible() => heap.known().function_map,
             _ => heap.known().non_constructor_function_map,
         };
-        let context = unsafe { scope.handle_value::<Context>(context) };
+        let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
         let function = heap
             .new_object(scope, map, &[info.value(), context.value()])
             .into_handle(scope);
@@ -154,11 +154,9 @@ impl Runtime {
                 Hint::Number => known.strings.number.value(),
                 Hint::String => known.strings.string.value(),
             };
-            let args = [hint_string];
-            // SAFETY: hint_string was interned immediately above; the snapshot
-            // is consumed (staged/copied into the frame) before any GC
-            let args = unsafe { GcSlice::from_slice(&args) };
-            let result = NativeContext::new(vm, heap, state).call(exotic, args)?;
+            let result = state.handle_scope(|scope| {
+                NativeContext::new(vm, heap, state).call(exotic, scope.stage(&[hint_string]))
+            })?;
             if result == exception {
                 return Ok(Coercion::Threw);
             }
@@ -190,11 +188,9 @@ impl Runtime {
             if !Self::is_callable(heap, method) {
                 continue;
             }
-            let args = [value];
-            // SAFETY: `value` is a fresh snapshot read above; consumed
-            // (staged/copied into the frame) before any GC in the call
-            let args = unsafe { GcSlice::from_slice(&args) };
-            let result = NativeContext::new(vm, heap, state).call(method, args)?;
+            let result = state.handle_scope(|scope| {
+                NativeContext::new(vm, heap, state).call(method, scope.stage(&[value]))
+            })?;
             if result == exception {
                 return Ok(Coercion::Threw);
             }
@@ -251,11 +247,9 @@ impl Runtime {
             LoadOutcome::Value(v) => Ok(Coercion::Value(v)),
             LoadOutcome::Getter(getter) => {
                 let exception = heap.known().exception.value();
-                let args = [receiver];
-                // SAFETY: `receiver` is a fresh snapshot read above; consumed
-                // (staged/copied into the frame) before any GC in the call
-                let args = unsafe { GcSlice::from_slice(&args) };
-                let result = NativeContext::new(vm, heap, state).call(getter, args)?;
+                let result = state.handle_scope(|scope| {
+                    NativeContext::new(vm, heap, state).call(getter, scope.stage(&[receiver]))
+                })?;
                 if result == exception {
                     Ok(Coercion::Threw)
                 } else {
@@ -376,11 +370,8 @@ impl Runtime {
                 Coercion::Value(v) => v,
             };
             // root the prototype before allocating below (GC may move it)
-            let proto = if heap.no_gc(|nogc| Convert::is_primitive(nogc, proto)) {
-                None
-            } else {
-                Some(unsafe { scope.handle_value::<Object>(proto) })
-            };
+            // non-object prototypes fall back to the ordinary prototype
+            let proto = scope.cast::<Object>(proto);
             let known = heap.known();
             let obj = heap
                 .new_object(&scope, known.object_initial_map, &[])
