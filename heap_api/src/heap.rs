@@ -55,10 +55,6 @@ impl<V: Visitor + ?Sized> Visitor for &mut V {
     }
 }
 
-pub trait RootVisitor: Visitor {}
-
-impl<R: RootVisitor + ?Sized> RootVisitor for &mut R {}
-
 /// Statistics reported by a global heap for introspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeapStats {
@@ -66,8 +62,36 @@ pub struct HeapStats {
     pub capacity: usize,
 }
 
+/// VM services a collector needs, registered once via
+/// `GlobalVtable::set_host`. Plain function pointers in the crate's
+/// vtable style; `ctx` is opaque VM state passed back to `visit_roots`.
+///
+/// Contract: the host (and everything `ctx` points to) must outlive the
+/// heap.
+pub struct GcHost {
+    pub ctx: *const (),
+    /// Enumerate every root: handle blocks, stacks, caches, interner,
+    /// well-known table. Called once per cycle, at quiescence.
+    pub visit_roots: unsafe fn(ctx: *const (), visitor: &mut dyn Visitor),
+    /// Size and alignment of the object starting at `addr` (reads its map).
+    ///
+    /// # Safety: `addr` must be the start of a live object.
+    pub layout_of: unsafe fn(addr: NonNull<()>) -> Layout,
+    /// Trace the object at `addr` (read its map, dispatch its edges).
+    ///
+    /// # Safety: `addr` must be the start of a live object.
+    pub visit_object: unsafe fn(addr: NonNull<()>, visitor: &mut dyn Visitor),
+}
+
 /// Function table of per-thread (local) heap operations.
 pub struct HeapVtable {
+    /// Allocate `layout` bytes. Implementations may run a full collection
+    /// cycle (stopping the world via `collection_requested`/
+    /// `park_for_collection` and marking through the registered
+    /// [`GcHost`]) before failing with [`AllocError::OutOfMemory`].
+    ///
+    /// Contract: called only where the caller holds no unrooted objects
+    /// (guaranteed by the `&mut Heap` / no-GC-scope discipline).
     pub allocate_raw: fn(local: *mut (), layout: Layout) -> Result<NonNull<u8>, AllocError>,
     pub write_barrier: fn(local: *const (), host: Word, slot: &RawCell, value: Word),
     pub collection_requested: fn(local: *const ()) -> bool,
@@ -82,8 +106,8 @@ pub struct GlobalVtable {
     /// Vtable used for local heaps created by the global heap.
     pub local_vtable: &'static HeapVtable,
     pub new_local: fn(shared: *const ()) -> *mut (),
-    pub iterate_roots: fn(shared: *const (), roots: &mut dyn RootVisitor),
-    pub collect: fn(shared: *const ()),
+    pub set_host: fn(shared: *const (), host: GcHost),
+    pub iterate_roots: fn(shared: *const (), roots: &mut dyn Visitor),
     pub should_collect: fn(shared: *const ()) -> bool,
     pub gc_in_progress: fn(shared: *const ()) -> bool,
     pub contains: fn(shared: *const (), addr: Word) -> bool,

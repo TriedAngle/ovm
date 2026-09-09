@@ -1,6 +1,6 @@
 use core::ptr::NonNull;
 
-use vm::{EdgeVisitable, HandleData, HandleScope, RawCell, RootVisitor, Smi, Tagged, Visitor};
+use vm::{EdgeVisitable, HandleData, HandleScope, RawCell, Smi, Tagged, Visitor};
 
 struct Counter(usize);
 
@@ -9,8 +9,6 @@ impl Visitor for Counter {
         self.0 += 1;
     }
 }
-
-impl RootVisitor for Counter {}
 
 fn root_count(data: &HandleData) -> usize {
     let mut counter = Counter(0);

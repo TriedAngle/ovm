@@ -5,7 +5,7 @@ members = [
     "bytecode",
     "collectors/dummy_heap",
     "collectors/mark_sweep",
-    "heap",
+    "heap_api",
     "parser",
     "vm",
 ]

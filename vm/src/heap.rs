@@ -1,15 +1,13 @@
 use crate::{
-    AllocError, FixedArray, Float, Global, GlobalVtable, Handle, HandleScope, HandleSet,
+    AllocError, FixedArray, Float, GcHost, Global, GlobalVtable, Handle, HandleScope, HandleSet,
     HeapBackend, HeapObject, HeapPtr, HeapStats, HeapVtable, Map, Object, ObjectInit,
-    ObjectSlotsInit, RawCell, RootHandles, RootVisitor, STRONG_PTR, Smi, TAG_MASK, Tagged,
-    TransitionLock, Value, Visitor, Word,
+    ObjectSlotsInit, RawCell, RootHandles, STRONG_PTR, Smi, TAG_MASK, Tagged, TransitionLock,
+    Value, Visitor, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
 
-use core::{
-    alloc::Layout, cell::Cell, marker::PhantomData, ops::FnOnce, ptr::NonNull,
-};
+use core::{alloc::Layout, cell::Cell, marker::PhantomData, ops::FnOnce, ptr::NonNull};
 pub struct NoGc<'a> {
     heap: &'a Heap,
     _phantom: PhantomData<&'a mut &'a ()>,
@@ -416,9 +414,8 @@ impl Register {
 }
 
 pub trait EdgeVisitable {
-    fn visit_edges(&self, visitor: &mut impl Visitor);
+    fn visit_edges(&self, visitor: &mut dyn Visitor);
 }
-
 
 /// Type-erased per-thread heap.
 pub struct Heap {
@@ -630,12 +627,12 @@ impl GlobalHeap {
         }
     }
 
-    pub fn iterate_roots(&self, roots: &mut impl RootVisitor) {
+    pub fn iterate_roots(&self, roots: &mut dyn Visitor) {
         (self.vtable.iterate_roots)(self.state, roots)
     }
 
-    pub fn collect(&self) {
-        (self.vtable.collect)(self.state)
+    pub fn set_host(&self, host: GcHost) {
+        (self.vtable.set_host)(self.state, host)
     }
 
     pub fn should_collect(&self) -> bool {

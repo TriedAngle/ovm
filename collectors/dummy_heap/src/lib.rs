@@ -3,8 +3,8 @@ use core::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use heap::{
-    AllocError, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell, RootVisitor, Word,
+use heap_api::{
+    AllocError, GcHost, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell, Visitor, Word,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +131,10 @@ fn erased_gc_in_progress(_local: *const ()) -> bool {
     false
 }
 
+/// The dummy heap never collects: it accepts the host registration and
+/// drops it.
+fn erased_set_host(_shared: *const (), _host: GcHost) {}
+
 fn erased_drop_local(local: *mut ()) {
     unsafe { drop(Box::from_raw(local.cast::<DummyLocalHeap>())) };
 }
@@ -144,9 +148,7 @@ fn erased_global_new_local(shared: *const ()) -> *mut () {
     })) as *mut ()
 }
 
-fn erased_global_iterate_roots(_shared: *const (), _roots: &mut dyn RootVisitor) {}
-
-fn erased_global_collect(_shared: *const ()) {}
+fn erased_global_iterate_roots(_shared: *const (), _roots: &mut dyn Visitor) {}
 
 fn erased_global_should_collect(_shared: *const ()) -> bool {
     false
@@ -189,8 +191,8 @@ static DUMMY_HEAP_VTABLE: HeapVtable = HeapVtable {
 static DUMMY_GLOBAL_VTABLE: GlobalVtable = GlobalVtable {
     local_vtable: &DUMMY_HEAP_VTABLE,
     new_local: erased_global_new_local,
+    set_host: erased_set_host,
     iterate_roots: erased_global_iterate_roots,
-    collect: erased_global_collect,
     should_collect: erased_global_should_collect,
     gc_in_progress: erased_global_gc_in_progress,
     contains: erased_global_contains,
@@ -254,20 +256,20 @@ mod tests {
         }
     }
 
-/// Fixture with the well-known maps installed — required for allocating
-/// object kinds whose map comes from `known()`.
-fn local_with_maps(size: usize) -> Fixture {
-    let fx = Fixture::new(size);
-    fx.install_well_known();
-    fx
-}
+    /// Fixture with the well-known maps installed — required for allocating
+    /// object kinds whose map comes from `known()`.
+    fn local_with_maps(size: usize) -> Fixture {
+        let fx = Fixture::new(size);
+        fx.install_well_known();
+        fx
+    }
 
-/// Keeps the fixture (and its well-known cell) alive next to the heap.
-fn local(size: usize) -> (Fixture, vm::Heap) {
-    let fx = Fixture::new(size);
-    let heap = fx.local();
-    (fx, heap)
-}
+    /// Keeps the fixture (and its well-known cell) alive next to the heap.
+    fn local(size: usize) -> (Fixture, vm::Heap) {
+        let fx = Fixture::new(size);
+        let heap = fx.local();
+        (fx, heap)
+    }
 
     #[test]
     fn bump_allocates_forward_and_aligned() {

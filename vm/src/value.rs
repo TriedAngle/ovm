@@ -4,7 +4,7 @@ use crate::{Header, HeapObject, HeapRef, Map, NoGc, Object, VmError};
 
 // The word/tag representation is shared with the heap ABI crate; the VM
 // layers the typed Value/Tagged/HeapPtr wrappers on top of it.
-pub use heap::{PTR_BIT, STRONG_PTR, TAG_MASK, TAG_SMI, WEAK_BIT, WEAK_PTR, Word};
+pub use heap_api::{PTR_BIT, STRONG_PTR, TAG_MASK, TAG_SMI, WEAK_BIT, WEAK_PTR, Word};
 
 /// Generic Value
 /// Either SMI or Pointer
