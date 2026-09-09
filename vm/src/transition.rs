@@ -7,6 +7,8 @@ use crate::{
     MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
 };
 
+/// Serializes map-transition tree mutations across threads. VM-internal:
+/// to the heap, transition arrays are ordinary traced objects.
 #[derive(Clone)]
 pub struct TransitionLock(Arc<Mutex<()>>);
 

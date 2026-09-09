@@ -6,12 +6,12 @@
 //! Feature-gated tests whose features the VM lacks (BigInt, Symbol, ...)
 //! are counted separately as skipped.
 //!
-//! Usage: cargo run -p ovm --example test262 -- <harness...> <test-file-or-dir>...
+//! Usage: cargo run -p vm --example test262 -- <harness...> <test-file-or-dir>...
 
 use std::path::{Path, PathBuf};
 
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{ScriptError, VM};
+use vm::{ScriptError, VM};
 
 const UNSUPPORTED_FEATURES: &[&str] = &["BigInt", "Symbol", "Temporal", "regexp-modifiers"];
 /// Tests exercising runtime objects the VM does not have yet.
@@ -102,7 +102,7 @@ fn run_test(harness: &str, path: &Path, stats: &mut Stats) {
 
 /// The pending exception's `name` property (error class), for categorizing
 /// uncaught exceptions in the stats.
-fn exception_name(thread: &mut ovm::Thread) -> String {
+fn exception_name(thread: &mut vm::Thread) -> String {
     thread.handle_scope(|thread, scope| {
         let Some(ex) = thread.take_pending_exception() else {
             return "exception".into();

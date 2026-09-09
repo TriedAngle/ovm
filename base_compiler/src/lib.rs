@@ -3,14 +3,14 @@
 //! A single naive pass over a resolved parser AST, in the Ignition style:
 //! one walk, an implicit register file, temporaries stacked above the
 //! resolver's per-function layout. Output is a heap-free
-//! [`CompiledScript`]; the `ovm` crate owns converting that to VM objects.
+//! [`CompiledScript`]; the `vm` crate owns converting that to VM objects.
 
 pub mod codegen;
 mod label;
 
 use parser::{Ast, FunctionId};
 
-/// Value table entries. Materialization (in `ovm`) converts these into
+/// Value table entries. Materialization (in `vm`) converts these into
 /// heap objects: interned strings, `Float`s, oddball singletons, and
 /// shared `CallableInfoObject` templates for closures.
 #[derive(Debug, Clone, PartialEq)]

@@ -5,13 +5,13 @@
 //! table. Constants are converted to heap values: interned strings,
 //! `Float`s, oddball singletons, and child callable infos.
 
-use base_compiler::{CompiledScript, Constant};
-use parser::FunctionId;
-use vm::{
+use crate::{
     CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
     Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ScopeInfo,
     ScopeInfoInit, VmError,
 };
+use base_compiler::{CompiledScript, Constant};
+use parser::FunctionId;
 
 use crate::{ContextState, Thread, VM};
 
@@ -32,7 +32,7 @@ pub fn materialize_closure<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
     script: &CompiledScript,
-    context: vm::Value,
+    context: crate::Value,
 ) -> Result<Handle<'s, Object>, VmError> {
     let (vm, heap, state) = thread.split();
     materialize_closure_vm(vm, heap, state, scope, script, context)
@@ -45,7 +45,7 @@ pub fn materialize_closure_vm<'s>(
     state: &ContextState,
     scope: &'s HandleScope<'_>,
     script: &CompiledScript,
-    context: vm::Value,
+    context: crate::Value,
 ) -> Result<Handle<'s, Object>, VmError> {
     let mut infos: Vec<Option<Handle<'s, CallableInfoObject>>> =
         (0..script.functions.len()).map(|_| None).collect();
@@ -77,7 +77,7 @@ fn materialize_function<'s>(
     for constant in &function.constants {
         let value = match constant {
             Constant::String(bytes) => intern(heap, state, scope, vm, bytes),
-            Constant::Smi(v) => vm::Smi::new(*v).encode(),
+            Constant::Smi(v) => crate::Smi::new(*v).encode(),
             Constant::Float(f) => heap.new_number(scope, *f),
             Constant::Boolean(true) => heap.known().true_object.value(),
             Constant::Boolean(false) => heap.known().false_object.value(),
@@ -88,7 +88,7 @@ fn materialize_function<'s>(
                 info.value()
             }
             Constant::ContextNames(names) => {
-                let interned: Vec<vm::Value> = names
+                let interned: Vec<crate::Value> = names
                     .iter()
                     .map(|n| intern(heap, state, scope, vm, n))
                     .collect();
@@ -157,7 +157,7 @@ fn intern(
     scope: &HandleScope<'_>,
     vm: &VM,
     s: &[u8],
-) -> vm::Value {
+) -> crate::Value {
     // constant strings are WTF-8 (lone surrogates as the 3-byte pattern);
     // the interner is byte-based, so they round-trip without loss
     vm.interner().intern(heap, scope, s).value()
