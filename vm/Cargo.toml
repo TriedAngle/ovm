@@ -8,7 +8,7 @@ name = "ovm"
 path = "src/main.rs"
 
 [dependencies]
-heap = { path = "../heap" }
+heap_api = { path = "../heap_api" }
 bytecode = { path = "../bytecode" }
 base_compiler = { path = "../base_compiler" }
 parser = { path = "../parser" }

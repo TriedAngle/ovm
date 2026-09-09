@@ -121,7 +121,7 @@ impl StackCache {
 }
 
 impl EdgeVisitable for StackCache {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         let cache = self.get();
         visitor.visit(cache.acc.as_raw());
         visitor.visit(cache.code.as_raw());

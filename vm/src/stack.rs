@@ -250,7 +250,7 @@ impl Stack {
 }
 
 impl EdgeVisitable for Stack {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         for slot in &self.slots[..self.top()] {
             visitor.visit(slot.as_raw());
         }

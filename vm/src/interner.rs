@@ -74,7 +74,7 @@ fn handle_from_entry<'s>(
 }
 
 impl EdgeVisitable for StringInterner {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         for cell in self.table.lock().unwrap().values() {
             visitor.visit(cell.as_raw());
         }

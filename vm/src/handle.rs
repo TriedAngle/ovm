@@ -137,7 +137,7 @@ impl HandleDataImpl {
         start
     }
 
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         for block in &self.blocks {
             let start = block.as_ptr() as *mut Value;
             let end = unsafe { start.add(block.len()) };
@@ -180,7 +180,7 @@ impl HandleData {
 }
 
 impl EdgeVisitable for HandleData {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         self.inner().visit_edges(visitor)
     }
 }
@@ -332,7 +332,7 @@ impl RootHandles {
 }
 
 impl EdgeVisitable for RootHandles {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         for slot in &self.slots[..self.next.load(Ordering::Relaxed)] {
             visitor.visit(slot.as_raw());
         }
