@@ -3,3 +3,4 @@ target/
 
 # Lockfile, at any depth
 Cargo.lock
+tmp/
