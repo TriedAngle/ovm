@@ -1,6 +1,6 @@
 use core::cell::{Cell, RefCell};
 
-use vm::{EdgeVisitable, GcSlice, Object, Register, Smi, Tagged, Value, Visitor};
+use crate::{EdgeVisitable, GcSlice, Object, Register, Smi, Tagged, Value, Visitor};
 
 use crate::VmError;
 

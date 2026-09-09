@@ -2,18 +2,9 @@ use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::{Header, HeapObject, HeapRef, Map, NoGc, Object, VmError};
 
-/// Word Size inside the heap
-/// if we add compressed pointers we may need to duplicate this
-/// maybe putting it to u32 is enough
-pub type Word = u64;
-
-pub const TAG_MASK: Word = 0b11;
-pub const PTR_BIT: Word = 0b01;
-pub const WEAK_BIT: Word = 0b10;
-
-pub const TAG_SMI: Word = 0b0;
-pub const STRONG_PTR: Word = 0b01;
-pub const WEAK_PTR: Word = 0b11;
+// The word/tag representation is shared with the heap ABI crate; the VM
+// layers the typed Value/Tagged/HeapPtr wrappers on top of it.
+pub use heap::{PTR_BIT, STRONG_PTR, TAG_MASK, TAG_SMI, WEAK_BIT, WEAK_PTR, Word};
 
 /// Generic Value
 /// Either SMI or Pointer
@@ -22,7 +13,7 @@ pub const WEAK_PTR: Word = 0b11;
 pub struct Value(Word);
 
 impl Value {
-    pub const unsafe fn from_bits(bits: Word) -> Self {
+    pub const fn from_bits(bits: Word) -> Self {
         Self(bits)
     }
 

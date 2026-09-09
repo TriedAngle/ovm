@@ -4,7 +4,8 @@ members = [
     "base_compiler",
     "bytecode",
     "collectors/dummy_heap",
-    "ovm",
+    "collectors/mark_sweep",
+    "heap",
     "parser",
     "vm",
 ]

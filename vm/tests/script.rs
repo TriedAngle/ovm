@@ -1,8 +1,8 @@
 //! End-to-end: parse → resolve → compile → materialize → run.
 
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{ScriptError, Thread, VM};
 use vm::{Float, FunctionKind, Lookup, SlotName, Smi, VMString, Value};
+use vm::{ScriptError, Thread, VM};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
     let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();

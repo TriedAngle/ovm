@@ -1,4 +1,4 @@
-use vm::{Heap, Object, PropertyDescriptor, Value, VmError};
+use crate::{Heap, Object, PropertyDescriptor, Value, VmError};
 
 use crate::{ContextState, VM};
 

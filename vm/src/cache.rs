@@ -1,6 +1,6 @@
 use core::cell::UnsafeCell;
 
-use vm::{
+use crate::{
     EdgeVisitable, FixedArray, FixedByteArray, Heap, HeapRef, NoGc, Register, Value, Visitor,
 };
 

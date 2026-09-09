@@ -1,5 +1,5 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::VM;
+use vm::VM;
 
 #[test]
 fn interning_deduplicates_and_preserves_content() {

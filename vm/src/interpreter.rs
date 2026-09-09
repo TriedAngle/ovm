@@ -1,6 +1,6 @@
 use bytecode::{Opcode, Operands, PropertyFlags, decode, jump_target};
 
-use vm::{
+use crate::{
     AccessorPair, CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert,
     FixedArray, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
     PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
@@ -131,7 +131,7 @@ fn dynamic_slot<'a>(
     nogc: &'a NoGc<'a>,
     context: &mut HeapRef<'a, Context>,
     name: Value,
-) -> Result<&'a vm::GcSlot, VmError> {
+) -> Result<&'a crate::GcSlot, VmError> {
     let name_str = name.get_as::<VMString>(nogc).ok_or(VmError::Type)?;
     let name_hash = name_str.hash();
     let name_bytes = name_str.as_slice(nogc);

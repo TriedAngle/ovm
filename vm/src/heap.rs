@@ -1,591 +1,15 @@
 use crate::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Float,
-    Global, Handle, HandleData, HandleScope, HandleSet, HeapObject, HeapPtr, Map, MapInit, MapKind,
-    Object, ObjectInit, ObjectSlotsInit, RootHandles, STRONG_PTR, ScopeInfo, ScopeInfoInit,
-    SlotName, Smi, StringInterner, Symbol, Tagged, TransitionLock, Value, Word,
+    AllocError, FixedArray, Float, Global, GlobalVtable, Handle, HandleScope, HandleSet,
+    HeapBackend, HeapObject, HeapPtr, HeapStats, HeapVtable, Map, Object, ObjectInit,
+    ObjectSlotsInit, RawCell, RootHandles, RootVisitor, STRONG_PTR, Smi, TAG_MASK, Tagged,
+    TransitionLock, Value, Visitor, Word,
 };
+
+use crate::bootstrap::{KnownCell, WellKnown};
+
 use core::{
-    alloc::Layout,
-    cell::{Cell, UnsafeCell},
-    marker::PhantomData,
-    ops::FnOnce,
-    ptr::NonNull,
+    alloc::Layout, cell::Cell, marker::PhantomData, ops::FnOnce, ptr::NonNull,
 };
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AllocError {
-    OutOfMemory(Layout),
-}
-
-impl core::fmt::Display for AllocError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::OutOfMemory(layout) => write!(
-                f,
-                "out of memory: failed to allocate {} bytes (align {})",
-                layout.size(),
-                layout.align()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AllocError {}
-
-#[derive(Clone, Copy)]
-pub struct WellKnown {
-    // vm internal machinery: sentinels, canonical empties, builtin maps
-    pub map_map: Global<Map>,
-    /// "hole"
-    pub void: Global<Object>,
-    /// Never user-visible: a call returning it signals a pending exception.
-    pub exception: Global<Object>,
-    /// exception map
-    pub exception_map: Global<Map>,
-    /// Shared empty backing for objects without data slots (never written in
-    /// place; the first property store swaps in a fresh array).
-    pub empty_fixed_array: Global<FixedArray>,
-    /// TODO: Placeholder for now
-    pub empty_context: Global<Context>,
-    pub smi_map: Global<Map>,
-    pub float_map: Global<Map>,
-    pub array_map: Global<Map>,
-    pub byte_array_map: Global<Map>,
-    pub string_map: Global<Map>,
-    pub symbol_map: Global<Map>,
-    pub accessor_pair_map: Global<Map>,
-    pub callable_map: Global<Map>,
-    pub handler_table_map: Global<Map>,
-    pub context_map: Global<Map>,
-    pub scope_info_map: Global<Map>,
-    /// Shared immutable scope description for contexts without named slots
-    /// (block/catch contexts, the empty context)
-    pub empty_scope_info: Global<ScopeInfo>,
-    // js userspace primitives and object base maps
-    pub undefined: Global<Object>,
-    pub undefined_map: Global<Map>,
-    pub null: Global<Object>,
-    pub null_map: Global<Map>,
-    pub false_object: Global<Object>,
-    pub true_object: Global<Object>,
-    pub boolean_map: Global<Map>,
-    /// Base map for ECMAScript array objects (elements + length, prototype
-    /// %Array.prototype%).
-    pub js_array_map: Global<Map>,
-    /// Base map for ECMAScript error objects
-    pub error_map: Global<Map>,
-    /// Per-class error maps (prototype chain carries `.constructor`);
-    /// installed by the builtins bootstrap.
-    pub type_error_map: Global<Map>,
-    pub reference_error_map: Global<Map>,
-    pub range_error_map: Global<Map>,
-    /// Wrapper maps for boxed primitives (slots[0] = the primitive value);
-    /// installed by the builtins bootstrap.
-    pub number_wrapper_map: Global<Map>,
-    pub boolean_wrapper_map: Global<Map>,
-    pub string_wrapper_map: Global<Map>,
-    // prototypes
-    /// `%Object.prototype%`: root of the ordinary-object prototype hierarchy.
-    pub object_prototype: Global<Object>,
-    /// `%Array.prototype%`: an array object, parent of all array instance maps.
-    pub array_prototype: Global<Object>,
-    /// `%Error.prototype%`: parent of all error instance maps.
-    pub error_prototype: Global<Object>,
-    /// `%Function.prototype%` (ES 19.2.3): the canonical empty function — a
-    /// callable, non-constructable function whose `[[Prototype]]` is
-    /// `%Object.prototype%`; the `[[Prototype]]` of ordinary function objects.
-    pub function_prototype: Global<Object>,
-    /// The realm global object: global variables are properties on it
-    /// (top-level `var`/assignments; lexical script-context globals later).
-    pub global_object: Global<Object>,
-    /// Initial map of `%Object.prototype%`: every fresh `{}` gets it
-    /// (extendable, parent = object_prototype). Shared with `global_object`.
-    pub object_initial_map: Global<Map>,
-    /// Function object map
-    /// slots[0] = shared CallableInfoObject, slots[1] = closure context.
-    pub function_map: Global<Map>,
-    /// Callable function objects without [[Construct]] (arrows, methods,
-    /// getters and setters).
-    pub non_constructor_function_map: Global<Map>,
-    /// Constructible class functions whose ordinary [[Call]] path throws.
-    pub class_constructor_map: Global<Map>,
-    /// The `@@toPrimitive` well-known symbol
-    pub to_primitive_symbol: Global<Symbol>,
-    pub strings: WellKnownStrings,
-}
-
-macro_rules! define_well_known_strings {
-    ($($field:ident => $text:literal),* $(,)?) => {
-        #[derive(Debug, Clone, Copy)]
-        pub struct WellKnownStrings {
-            $(pub $field: Global<SlotName>,)*
-        }
-
-        impl WellKnownStrings {
-            pub fn uninit(roots: &RootHandles) -> Self {
-                Self {
-                    $($field: unsafe { smi_handle::<SlotName>(roots) },)*
-                }
-            }
-
-            pub fn intern_all(
-                heap: &mut Heap,
-                interner: &StringInterner,
-                roots: &RootHandles,
-            ) -> Self {
-                Self {
-                    $($field: {
-                        let interned = interner.intern(heap, roots, $text);
-                        roots.create_handle(SlotName::from(interned.as_tagged()).tagged())
-                    },)*
-                }
-            }
-        }
-    };
-}
-
-define_well_known_strings! {
-    empty => "",
-    length => "length",
-    name => "name",
-    message => "message",
-    prototype => "prototype",
-    constructor => "constructor",
-    to_string => "toString",
-    value_of => "valueOf",
-    default => "default",
-    number => "number",
-    string => "string",
-    boolean => "boolean",
-    object => "object",
-    function => "function",
-    symbol => "symbol",
-    undefined => "undefined",
-    null => "null",
-    true_ => "true",
-    false_ => "false",
-}
-
-unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
-    roots.create_handle(unsafe { Tagged::from_value_unchecked(Smi::new(0).encode()) })
-}
-
-fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
-    let map = unsafe { smi_handle::<Map>(roots) };
-    let obj = unsafe { smi_handle::<Object>(roots) };
-    let array = unsafe { smi_handle::<FixedArray>(roots) };
-    let context = unsafe { smi_handle::<Context>(roots) };
-    let scope_info = unsafe { smi_handle::<ScopeInfo>(roots) };
-    WellKnown {
-        map_map: map,
-        void: obj,
-        exception: obj,
-        exception_map: map,
-        empty_fixed_array: array,
-        empty_context: context,
-        smi_map: map,
-        float_map: map,
-        array_map: map,
-        byte_array_map: map,
-        string_map: map,
-        symbol_map: map,
-        accessor_pair_map: map,
-        callable_map: map,
-        handler_table_map: map,
-        context_map: map,
-        scope_info_map: map,
-        empty_scope_info: scope_info,
-        undefined: obj,
-        undefined_map: map,
-        null: obj,
-        null_map: map,
-        false_object: obj,
-        true_object: obj,
-        boolean_map: map,
-        js_array_map: map,
-        error_map: map,
-        type_error_map: map,
-        reference_error_map: map,
-        range_error_map: map,
-        number_wrapper_map: map,
-        boolean_wrapper_map: map,
-        string_wrapper_map: map,
-        object_prototype: obj,
-        array_prototype: obj,
-        error_prototype: obj,
-        function_prototype: obj,
-        global_object: obj,
-        object_initial_map: map,
-        function_map: map,
-        non_constructor_function_map: map,
-        class_constructor_map: map,
-        to_primitive_symbol: unsafe { smi_handle::<Symbol>(roots) },
-        strings: WellKnownStrings::uninit(roots),
-    }
-}
-
-fn alloc_map(heap: &mut Heap, roots: &RootHandles, kind: MapKind) -> Global<Map> {
-    heap.allocate::<Map>(MapInit {
-        kind,
-        value_slot_count: 0,
-        descriptors: &[],
-        prototype: heap.known().null.erase(),
-    })
-    .into_global(roots)
-}
-
-fn alloc_parent_map(
-    heap: &mut Heap,
-    roots: &RootHandles,
-    kind: MapKind,
-    parent: Global<Object>,
-) -> Global<Map> {
-    alloc_parent_map_with_slots(heap, roots, kind, parent, 0)
-}
-
-fn alloc_parent_map_with_slots(
-    heap: &mut Heap,
-    roots: &RootHandles,
-    kind: MapKind,
-    parent: Global<Object>,
-    value_slot_count: usize,
-) -> Global<Map> {
-    heap.allocate::<Map>(MapInit {
-        kind,
-        value_slot_count,
-        descriptors: &[],
-        prototype: parent.erase(),
-    })
-    .into_global(roots)
-}
-
-fn alloc_object(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    roots: &RootHandles,
-    map: Global<Map>,
-) -> Global<Object> {
-    heap.new_object(scope, map, &[]).into_global(roots)
-}
-
-/// First bootstrap phase: the internal sentinels (`void`, `null`, the
-/// exception singleton) and every builtin map. Every allocation init path
-/// reads `known()` maps, so this must run before anything else is created.
-/// Follow with `intern_well_known_strings` and `bootstrap_well_known`.
-pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
-    let mut known = uninited_wellknown(roots);
-    heap.set_known(known);
-
-    let map_map = heap
-        .allocate::<Map>(MapInit {
-            kind: MapKind::MAP,
-            value_slot_count: 0,
-            descriptors: &[],
-            prototype: roots.create_handle(Smi::new(0).encode()),
-        })
-        .into_global(roots);
-    heap.no_gc(|nogc| {
-        map_map
-            .heap_ref(nogc)
-            .header
-            .map
-            .set(nogc, map_map, map_map);
-    });
-    known.map_map = map_map;
-    heap.set_known(known);
-
-    let data = HandleData::new(Smi::new(0).encode());
-    let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
-
-    let void_map = heap
-        .allocate::<Map>(MapInit {
-            kind: MapKind::OBJECT,
-            value_slot_count: 0,
-            descriptors: &[],
-            prototype: scope.handle(Smi::new(0)),
-        })
-        .into_global(roots);
-    let void = heap
-        .allocate::<Object>(ObjectInit {
-            map: void_map,
-            slots: unsafe { smi_handle::<FixedArray>(roots) },
-            elements: unsafe { smi_handle::<Value>(roots) },
-            length: 0,
-        })
-        .into_global(roots);
-
-    let null_map: Handle<'_, Map> = heap
-        .allocate::<Map>(MapInit {
-            kind: MapKind::OBJECT,
-            value_slot_count: 0,
-            descriptors: &[],
-            prototype: scope.handle(Smi::new(0)),
-        })
-        .into_global(roots);
-    let null = heap
-        .allocate::<Object>(ObjectInit {
-            map: null_map,
-            slots: unsafe { smi_handle::<FixedArray>(roots) },
-            elements: unsafe { smi_handle::<Value>(roots) },
-            length: 0,
-        })
-        .into_global(roots);
-
-    heap.no_gc(|nogc| {
-        map_map.heap_ref(nogc).transitions.clear(void.value());
-        void_map.heap_ref(nogc).transitions.clear(void.value());
-        null_map.heap_ref(nogc).transitions.clear(void.value());
-        void_map.heap_ref(nogc).prototype.set(nogc, void_map, null);
-        null_map.heap_ref(nogc).prototype.set(nogc, null_map, null);
-    });
-    known.void = void;
-    known.null = null;
-    known.null_map = null_map;
-    heap.set_known(known);
-
-    // builtin maps: every allocation init path looks these up, so they must
-    // exist before any other object is created (incl. interned strings)
-    let smi_map = alloc_map(heap, roots, MapKind::OBJECT);
-    let float_map = alloc_map(heap, roots, MapKind::FLOAT);
-    let array_map = alloc_map(heap, roots, MapKind::FIXED_ARRAY);
-    let byte_array_map = alloc_map(heap, roots, MapKind::FIXED_BYTE_ARRAY);
-    let string_map = alloc_map(heap, roots, MapKind::VM_STRING);
-    let symbol_map = alloc_map(heap, roots, MapKind::SYMBOL);
-    let accessor_pair_map = alloc_map(heap, roots, MapKind::ACCESSOR_PAIR);
-    let callable_map = alloc_map(heap, roots, MapKind::CALLABLE_INFO);
-    let handler_table_map = alloc_map(heap, roots, MapKind::HANDLER_TABLE);
-    let context_map = alloc_map(heap, roots, MapKind::CONTEXT);
-    let scope_info_map = alloc_map(heap, roots, MapKind::SCOPE_INFO);
-
-    let function_map = heap
-        .allocate::<Map>(MapInit {
-            // TODO: arrow/generator functions get a non-constructor map
-            // once the compiler distinguishes them
-            kind: MapKind::OBJECT
-                .union(MapKind::CALLABLE)
-                .union(MapKind::CONSTRUCTOR)
-                .union(MapKind::EXTENDABLE),
-            value_slot_count: 2,
-            descriptors: &[],
-            prototype: known.null.erase(),
-        })
-        .into_global(roots);
-    let non_constructor_function_map = heap
-        .allocate::<Map>(MapInit {
-            kind: MapKind::OBJECT
-                .union(MapKind::CALLABLE)
-                .union(MapKind::EXTENDABLE),
-            value_slot_count: 2,
-            descriptors: &[],
-            prototype: known.null.erase(),
-        })
-        .into_global(roots);
-    let class_constructor_map = heap
-        .allocate::<Map>(MapInit {
-            kind: MapKind::OBJECT
-                .union(MapKind::CALLABLE)
-                .union(MapKind::CONSTRUCTOR)
-                .union(MapKind::EXTENDABLE)
-                .union(MapKind::CLASS_CONSTRUCTOR),
-            value_slot_count: 2,
-            descriptors: &[],
-            prototype: known.null.erase(),
-        })
-        .into_global(roots);
-    known.smi_map = smi_map;
-    known.float_map = float_map;
-    known.array_map = array_map;
-    known.byte_array_map = byte_array_map;
-    known.string_map = string_map;
-    known.symbol_map = symbol_map;
-    known.accessor_pair_map = accessor_pair_map;
-    known.callable_map = callable_map;
-    known.handler_table_map = handler_table_map;
-    known.context_map = context_map;
-    known.scope_info_map = scope_info_map;
-    known.function_map = function_map;
-    known.non_constructor_function_map = non_constructor_function_map;
-    known.class_constructor_map = class_constructor_map;
-    heap.set_known(known);
-}
-
-/// Second bootstrap phase: internalize the well-known strings and install
-/// the [`WellKnownStrings`] root table on `known()`. Consumers read
-/// `heap.known().strings` (a permanently rooted handle) instead of calling
-/// `interner.intern` per use. Must run after `bootstrap_basics` and before
-/// `bootstrap_well_known`.
-pub fn intern_well_known_strings(heap: &mut Heap, interner: &StringInterner, roots: &RootHandles) {
-    let strings = WellKnownStrings::intern_all(heap, interner, roots);
-    let mut known = *heap.known();
-    known.strings = strings;
-    heap.set_known(known);
-}
-
-pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
-    // sentinels and builtin maps were installed by bootstrap_basics
-    let mut known = *heap.known();
-    let void = known.void;
-    debug_assert!(
-        !void.value().is_smi(),
-        "bootstrap_basics must run before bootstrap_well_known"
-    );
-
-    let data = HandleData::new(void.value());
-    let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
-
-    let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
-    let empty_slots = heap.allocate::<FixedArray>(&[]).into_global(roots);
-    known.empty_fixed_array = heap.allocate::<FixedArray>(&[]).into_global(roots);
-    heap.set_known(known);
-    let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map);
-
-    let array_prototype_map = alloc_parent_map(
-        heap,
-        roots,
-        MapKind::ARRAY.union(MapKind::EXTENDABLE),
-        object_prototype,
-    );
-    let array_prototype = alloc_object(heap, &scope, roots, array_prototype_map);
-    let js_array_map = alloc_parent_map(
-        heap,
-        roots,
-        MapKind::ARRAY.union(MapKind::EXTENDABLE),
-        array_prototype,
-    );
-
-    let error_prototype_map = alloc_parent_map(
-        heap,
-        roots,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-        object_prototype,
-    );
-    let error_prototype = alloc_object(heap, &scope, roots, error_prototype_map);
-
-    let error_map = alloc_parent_map(
-        heap,
-        roots,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-        error_prototype,
-    );
-
-    let object_initial_map = alloc_parent_map(
-        heap,
-        roots,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-        object_prototype,
-    );
-    let global_object = alloc_object(heap, &scope, roots, object_initial_map);
-
-    let undefined_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
-    let boolean_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
-
-    let undefined = alloc_object(heap, &scope, roots, undefined_map);
-    let false_object = alloc_object(heap, &scope, roots, boolean_map);
-    let true_object = alloc_object(heap, &scope, roots, boolean_map);
-
-    let exception_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
-    let exception = alloc_object(heap, &scope, roots, exception_map);
-
-    let to_primitive_symbol =
-        roots.create_handle(Symbol::new(heap, &scope, b"Symbol.toPrimitive").as_tagged());
-
-    let empty_scope_info = heap
-        .allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots })
-        .into_global(roots);
-    let empty_context = heap
-        .allocate::<Context>(ContextInit {
-            outer: None,
-            slots: empty_slots,
-            scope_info: empty_scope_info,
-        })
-        .into_global(roots);
-
-    // %Function.prototype% (ES 19.2.3): the canonical empty function — a
-    // callable, non-constructable function whose [[Prototype]] is
-    // %Object.prototype%; the [[Prototype]] of ordinary function objects
-    // (patched onto function_map at the end). The body is a single
-    // `Return` (bytecode::Opcode::Return as u8) so calling it yields
-    // undefined.
-    let function_prototype_map = alloc_parent_map_with_slots(
-        heap,
-        roots,
-        MapKind::OBJECT
-            .union(MapKind::CALLABLE)
-            .union(MapKind::EXTENDABLE),
-        object_prototype,
-        2, // [callable info, context], like function_map
-    );
-    let empty_code = heap.allocate::<FixedByteArray>(&[1]).into_handle(&scope);
-    let empty_info = heap
-        .allocate::<CallableInfoObject>(CallableInfoInit {
-            bytecode: empty_code,
-            constants: known.empty_fixed_array,
-            register_count: 0,
-            handlers: None,
-        })
-        .into_handle(&scope);
-    let function_prototype = heap
-        .new_object(
-            &scope,
-            function_prototype_map,
-            &[empty_info.value(), empty_context.value()],
-        )
-        .into_global(roots);
-
-    known.undefined = undefined;
-    known.undefined_map = undefined_map;
-    known.false_object = false_object;
-    known.true_object = true_object;
-    known.boolean_map = boolean_map;
-    known.exception = exception;
-    known.to_primitive_symbol = to_primitive_symbol;
-    known.object_prototype = object_prototype;
-    known.array_prototype = array_prototype;
-    known.error_prototype = error_prototype;
-    known.function_prototype = function_prototype;
-    known.error_map = error_map;
-    // the per-class error maps and wrapper maps are placeholders until the
-    // builtins bootstrap installs their prototypes (they start pointing at
-    // the plain error map so no allocation ever reads a garbage map)
-    known.type_error_map = error_map;
-    known.reference_error_map = error_map;
-    known.range_error_map = error_map;
-    known.number_wrapper_map = error_map;
-    known.boolean_wrapper_map = error_map;
-    known.string_wrapper_map = error_map;
-    known.exception_map = exception_map;
-    known.js_array_map = js_array_map;
-    known.empty_context = empty_context;
-    known.empty_scope_info = empty_scope_info;
-    known.global_object = global_object;
-    known.object_initial_map = object_initial_map;
-    heap.set_known(known);
-
-    let null = known.null;
-    heap.no_gc(|nogc| {
-        let o = null.heap_ref(nogc);
-        o.slots.set(nogc, null, known.empty_fixed_array);
-        o.elements.set(nogc, null, known.empty_fixed_array);
-        // ordinary function objects' [[Prototype]] is %Function.prototype%
-        // (ES 19.2.3.1): function_map was created with a null placeholder
-        // in bootstrap_basics
-        known.function_map.heap_ref(nogc).prototype.set(
-            nogc,
-            known.function_map,
-            function_prototype,
-        );
-        known
-            .non_constructor_function_map
-            .heap_ref(nogc)
-            .prototype
-            .set(nogc, known.non_constructor_function_map, function_prototype);
-        known.class_constructor_map.heap_ref(nogc).prototype.set(
-            nogc,
-            known.class_constructor_map,
-            function_prototype,
-        );
-    });
-}
 pub struct NoGc<'a> {
     heap: &'a Heap,
     _phantom: PhantomData<&'a mut &'a ()>,
@@ -801,31 +225,6 @@ impl Drop for AllocToken<'_> {
     }
 }
 
-#[repr(transparent)]
-pub struct RawCell {
-    raw: UnsafeCell<Value>,
-}
-
-impl RawCell {
-    pub unsafe fn from_value(v: Value) -> Self {
-        Self {
-            raw: UnsafeCell::new(v),
-        }
-    }
-
-    pub fn load(&self) -> Value {
-        unsafe { *self.raw.get() }
-    }
-
-    pub fn store_raw(&self, v: Value) {
-        unsafe { *self.raw.get() = v };
-    }
-
-    pub unsafe fn heap_ref<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(self.load()).into()) }
-    }
-}
-
 /// A strong cell holding a weak reference: does not keep the target
 /// alive and is cleared by the GC once the target dies.
 /// TODO: potentially remove this in favor of weak collections (vm intern table)
@@ -842,7 +241,9 @@ unsafe impl<T: HeapObject> Sync for WeakGcCell<T> {}
 impl<T: HeapObject> WeakGcCell<T> {
     pub fn new(ptr: HeapPtr<T>) -> Self {
         Self {
-            cell: unsafe { RawCell::from_value(Tagged::from_ptr(ptr).make_weak().erase()) },
+            cell: unsafe {
+                RawCell::from_word(Tagged::from_ptr(ptr).make_weak().erase().to_bits())
+            },
             _phantom: PhantomData,
         }
     }
@@ -851,7 +252,7 @@ impl<T: HeapObject> WeakGcCell<T> {
     /// it as reachable until we decide to weaken selected entries.
     pub fn new_strong(ptr: HeapPtr<T>) -> Self {
         Self {
-            cell: unsafe { RawCell::from_value(Tagged::from_ptr(ptr).erase()) },
+            cell: unsafe { RawCell::from_word(Tagged::from_ptr(ptr).erase().to_bits()) },
             _phantom: PhantomData,
         }
     }
@@ -861,17 +262,17 @@ impl<T: HeapObject> WeakGcCell<T> {
     }
 
     pub fn is_cleared(&self) -> bool {
-        self.cell.load().is_cleared()
+        Value::from_bits(self.cell.load()).is_cleared()
     }
 
     // TODO: this maybe doens't make much sense
     // if a WeakGcCell is always weak, then upgrading it doesn't actually upgrade but only pretend
     pub fn upgrade<'a>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
         let word = self.cell.load();
-        if word.is_cleared() {
+        if word == crate::WEAK_PTR {
             return None;
         }
-        let strong = unsafe { Value::from_bits(word.raw_addr() | STRONG_PTR) };
+        let strong = Value::from_bits(word & !TAG_MASK | STRONG_PTR);
         Some(unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(strong).into()) })
     }
 }
@@ -900,17 +301,17 @@ pub struct GcSlot<T = Value> {
 impl<T> GcSlot<T> {
     pub unsafe fn from_value(v: Value) -> Self {
         Self {
-            cell: unsafe { RawCell::from_value(v) },
+            cell: unsafe { RawCell::from_word(v.to_bits()) },
             _phantom: PhantomData,
         }
     }
 
     pub fn get(&self) -> Tagged<T> {
-        unsafe { Tagged::from_value_unchecked(self.cell.load()) }
+        unsafe { Tagged::from_value_unchecked(self.inner()) }
     }
 
     pub fn inner(&self) -> Value {
-        self.cell.load()
+        Value::from_bits(self.cell.load())
     }
 
     pub fn set(&self, nogc: &NoGc<'_>, host: impl Into<Value>, value: impl Into<Tagged<T>>) {
@@ -920,7 +321,7 @@ impl<T> GcSlot<T> {
         if v.is_ptr() {
             nogc.write_barrier(host, self.as_raw(), v);
         }
-        self.cell.store_raw(v);
+        self.cell.store_raw(v.to_bits());
     }
 
     pub fn as_raw(&self) -> &RawCell {
@@ -940,9 +341,9 @@ impl GcSlot<Smi> {
 
 impl<T: HeapObject> GcSlot<T> {
     /// Reads the slot as a heap reference valid for the no-GC scope.
-    pub fn heap_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
+    pub fn heap_ref<'a>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
         // Safe: `T` is this slot's declared type.
-        unsafe { self.cell.heap_ref(nogc) }
+        unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(self.inner()).into()) }
     }
 }
 
@@ -975,7 +376,7 @@ impl<T> OptionGcSlot<T> {
     }
 
     pub fn clear(&self, void: Value) {
-        self.slot.cell.store_raw(void);
+        self.slot.cell.store_raw(void.to_bits());
     }
 }
 
@@ -993,20 +394,20 @@ pub struct Register(RawCell);
 
 impl Register {
     pub unsafe fn from_value(v: Value) -> Self {
-        Self(unsafe { RawCell::from_value(v) })
+        Self(unsafe { RawCell::from_word(v.to_bits()) })
     }
 
     pub fn inner(&self) -> Value {
-        self.0.load()
+        Value::from_bits(self.0.load())
     }
 
     pub fn store(&self, v: Value) {
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
-        self.0.store_raw(v);
+        self.0.store_raw(v.to_bits());
     }
 
-    pub fn heap_ref<'a, T: HeapObject>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        unsafe { self.0.heap_ref(nogc) }
+    pub fn heap_ref<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
+        unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(self.inner()).into()) }
     }
 
     pub fn as_raw(&self) -> &RawCell {
@@ -1014,65 +415,18 @@ impl Register {
     }
 }
 
-pub trait Visitor {
-    fn visit(&mut self, cell: &RawCell);
-}
-
-impl<V: Visitor + ?Sized> Visitor for &mut V {
-    fn visit(&mut self, cell: &RawCell) {
-        (**self).visit(cell)
-    }
-}
-
-pub trait RootVisitor: Visitor {}
-
-impl<R: RootVisitor + ?Sized> RootVisitor for &mut R {}
-
 pub trait EdgeVisitable {
     fn visit_edges(&self, visitor: &mut impl Visitor);
 }
 
-/// Statistics reported by a [`GlobalHeap`] for introspection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HeapStats {
-    pub used: usize,
-    pub capacity: usize,
-}
-
-/// Function table of per-thread (local) heap operations.
-pub struct HeapVtable {
-    pub allocate_raw: fn(local: *mut (), layout: Layout) -> Result<NonNull<u8>, AllocError>,
-    pub known: fn(local: *const ()) -> &'static WellKnown,
-    pub set_known: fn(shared: *const (), known: WellKnown),
-    pub transition_lock: fn(local: *const ()) -> TransitionLock,
-    pub write_barrier: fn(local: *const (), host: Value, slot: &RawCell, value: Value),
-    pub collection_requested: fn(local: *const ()) -> bool,
-    pub park_for_collection: fn(local: *const ()),
-    pub gc_in_progress: fn(local: *const ()) -> bool,
-    pub drop_local: fn(local: *mut ()),
-}
-
-/// Function table of shared (global) heap operations.
-pub struct GlobalVtable {
-    /// Vtable used for [`Heap`]s created by [`GlobalHeap::new_local`].
-    pub local_vtable: &'static HeapVtable,
-    pub new_local: fn(shared: *const ()) -> *mut (),
-    pub known: fn(shared: *const ()) -> &'static WellKnown,
-    pub iterate_roots: fn(shared: *const (), roots: &mut dyn RootVisitor),
-    pub collect: fn(shared: *const ()),
-    pub should_collect: fn(shared: *const ()) -> bool,
-    pub gc_in_progress: fn(shared: *const ()) -> bool,
-    pub contains: fn(shared: *const (), addr: Word) -> bool,
-    pub is_young: fn(shared: *const (), value: Value) -> bool,
-    pub stats: fn(shared: *const ()) -> HeapStats,
-    pub drop_shared: fn(shared: *mut ()),
-}
 
 /// Type-erased per-thread heap.
 pub struct Heap {
     shared: *const (),
     local: *mut (),
     vtable: &'static HeapVtable,
+    transition_lock: TransitionLock,
+    known: *const KnownCell,
 }
 
 unsafe impl Send for Heap {}
@@ -1084,21 +438,19 @@ impl Heap {
     }
 
     pub fn known(&self) -> &'static WellKnown {
-        (self.vtable.known)(self.local)
+        unsafe { (*self.known).get() }
     }
 
-    /// Install a patched `WellKnown` (builtins bootstrap only: run once,
-    /// before any thread executes user code).
     pub fn set_known(&self, known: WellKnown) {
-        (self.vtable.set_known)(self.shared, known)
+        unsafe { (*self.known).set(known) }
     }
 
     pub fn transition_lock(&self) -> TransitionLock {
-        (self.vtable.transition_lock)(self.local)
+        self.transition_lock.clone()
     }
 
     pub fn write_barrier(&self, host: Value, slot: &RawCell, value: Value) {
-        (self.vtable.write_barrier)(self.local, host, slot, value)
+        (self.vtable.write_barrier)(self.local, host.to_bits(), slot, value.to_bits())
     }
 
     pub fn collection_requested(&self) -> bool {
@@ -1219,10 +571,6 @@ impl Heap {
         token.enter_no_gc(|nogc| f(&token, nogc))
     }
 
-    /// Non-closure form of [`Heap::no_gc`] for scopes that only read the
-    /// heap or write existing slots: the returned guard holds the heap
-    /// borrow, so no allocation can happen while it is alive. The heap is
-    /// reachable through it (`Deref<Target = Heap>` / [`NoGc::heap`]).
     pub fn guard(&mut self) -> NoGc<'_> {
         NoGc::new(self)
     }
@@ -1247,34 +595,39 @@ impl core::fmt::Debug for Heap {
             .finish_non_exhaustive()
     }
 }
-
-/// Type-erased shared heap. The single owner of the shared heap state.
 pub struct GlobalHeap {
     state: *mut (),
     vtable: &'static GlobalVtable,
+    transition_lock: TransitionLock,
 }
 
-// SAFETY: the backend contract is that the pointed-to state is Send + Sync.
 unsafe impl Send for GlobalHeap {}
 unsafe impl Sync for GlobalHeap {}
 
 impl GlobalHeap {
     pub fn new(state: *mut (), vtable: &'static GlobalVtable) -> Self {
-        Self { state, vtable }
+        Self {
+            state,
+            vtable,
+            transition_lock: TransitionLock::new(),
+        }
     }
 
-    /// Create a per-thread local heap.
-    pub fn new_local(&self) -> Heap {
+    /// Build the shared heap from any backend configuration.
+    pub fn from_backend<B: HeapBackend>(config: B::Config) -> Result<Self, AllocError> {
+        let (state, vtable) = B::new(config)?.into_global();
+        Ok(Self::new(state, vtable))
+    }
+
+    pub fn new_local(&self, known: &KnownCell) -> Heap {
         let local = (self.vtable.new_local)(self.state);
         Heap {
             shared: self.state,
             local,
             vtable: self.vtable.local_vtable,
+            transition_lock: self.transition_lock.clone(),
+            known: known as *const KnownCell,
         }
-    }
-
-    pub fn known(&self) -> &'static WellKnown {
-        (self.vtable.known)(self.state)
     }
 
     pub fn iterate_roots(&self, roots: &mut impl RootVisitor) {
@@ -1298,7 +651,7 @@ impl GlobalHeap {
     }
 
     pub fn is_young(&self, value: Value) -> bool {
-        (self.vtable.is_young)(self.state, value)
+        (self.vtable.is_young)(self.state, value.to_bits())
     }
 
     pub fn stats(&self) -> HeapStats {
@@ -1318,13 +671,4 @@ impl core::fmt::Debug for GlobalHeap {
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
-}
-
-/// Construction trait for concrete heap backends.
-pub trait HeapBackend: Sized + Send + Sync {
-    type Config;
-
-    fn new(config: Self::Config) -> Result<Self, AllocError>;
-
-    fn into_global(self) -> GlobalHeap;
 }

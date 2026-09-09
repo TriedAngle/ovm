@@ -166,7 +166,7 @@ fn weak_bits_rejected_by_the_type_system() {
     let data = HandleData::new(Smi::new(0).encode());
     let scope = handle_scope(&data);
     // Safety: bit-level test; the value is never dereferenced.
-    let weak = unsafe { Value::from_bits(0x1000 | WEAK_PTR) };
+    let weak = Value::from_bits(0x1000 | WEAK_PTR);
     // A weak word can no longer be smuggled into the strong-Handle path:
     // the debug invariant on strong `Tagged` fires before rooting.
     let _ = scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(weak) });

@@ -1,4 +1,4 @@
-use vm::{
+use crate::{
     CallableInfoObject, Context, Convert, FixedArray, Float, Handle, HandleScope, Heap,
     LoadOutcome, NoGc, Object, PropertyDescriptor, SlotName, Smi, Symbol, VMString, Value, VmError,
     load_outcome,

@@ -2,3 +2,14 @@
 name = "vm"
 version = "0.1.0"
 edition.workspace = true
+
+[[bin]]
+name = "ovm"
+path = "src/main.rs"
+
+[dependencies]
+heap = { path = "../heap" }
+bytecode = { path = "../bytecode" }
+base_compiler = { path = "../base_compiler" }
+parser = { path = "../parser" }
+dummy_heap = { path = "../collectors/dummy_heap" }

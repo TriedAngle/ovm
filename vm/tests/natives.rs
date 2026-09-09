@@ -1,7 +1,7 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::natives::{NativeContext, NativeIndex, native_trampoline};
-use ovm::{Thread, VM, VmError};
+use vm::natives::{NativeContext, NativeIndex, native_trampoline};
 use vm::{Float, GcSlice, Smi, Value};
+use vm::{Thread, VM, VmError};
 
 fn float(thread: &mut Thread, v: f64) -> Value {
     thread.heap().allocate::<Float>(v).erase()
@@ -65,7 +65,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
         args.len() as u32,
     );
 
-    assert_eq!(result, vm.heap().known().exception.value());
+    assert_eq!(result, vm.known().exception.value());
     let ex = thread
         .take_pending_exception()
         .expect("pending exception set");
@@ -106,7 +106,7 @@ fn register_native_appends_after_well_known() {
     }
 
     let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
-    let idx = vm.register_native(double as ovm::NativeFn);
+    let idx = vm.register_native(double as vm::NativeFn);
     assert!(idx > NativeIndex::FLOAT_ADD);
     assert_eq!(vm.natives().len(), 3);
 

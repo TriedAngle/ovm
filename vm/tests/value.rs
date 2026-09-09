@@ -43,14 +43,14 @@ mod value {
     fn bits_roundtrip() {
         for bits in [0, 1, 2, 3, u64::MAX] {
             // Safety: bit-level test; the values are never dereferenced.
-            assert_eq!(unsafe { Value::from_bits(bits) }.to_bits(), bits);
+            assert_eq!(Value::from_bits(bits).to_bits(), bits);
         }
     }
 
     #[test]
     fn raw_addr_clears_tag_bits() {
         // Safety: bit-level test; the values are never dereferenced.
-        unsafe {
+        {
             assert_eq!(Value::from_bits(0x1000).raw_addr(), 0x1000);
             assert_eq!(Value::from_bits(0x1001).raw_addr(), 0x1000);
             assert_eq!(Value::from_bits(0x1002).raw_addr(), 0x1000);
@@ -98,12 +98,10 @@ mod smi {
     #[test]
     fn decode_rejects_pointers() {
         // Safety: bit-level test; the values are never dereferenced.
-        let (strong, weak) = unsafe {
-            (
-                Value::from_bits(0x1000 | STRONG_PTR),
-                Value::from_bits(0x1000 | WEAK_PTR),
-            )
-        };
+        let (strong, weak) = (
+            Value::from_bits(0x1000 | STRONG_PTR),
+            Value::from_bits(0x1000 | WEAK_PTR),
+        );
         assert_eq!(Smi::decode(strong), None);
         assert_eq!(Smi::decode(weak), None);
     }
@@ -191,12 +189,10 @@ mod debug {
     #[test]
     fn value_formats_pointers() {
         // Safety: bit-level test; the values are never dereferenced.
-        let (strong, weak) = unsafe {
-            (
-                Value::from_bits(0x1000 | STRONG_PTR),
-                Value::from_bits(0x1000 | WEAK_PTR),
-            )
-        };
+        let (strong, weak) = (
+            Value::from_bits(0x1000 | STRONG_PTR),
+            Value::from_bits(0x1000 | WEAK_PTR),
+        );
         assert_eq!(format!("{:?}", strong), "Value(Strong(0x1000))");
         assert_eq!(format!("{:?}", weak), "Value(Weak(0x1000))");
     }
@@ -301,7 +297,7 @@ mod tagged {
     #[should_panic(expected = "weak value in a strong Tagged")]
     fn strong_tagged_rejects_weak_bits() {
         // Safety: bit-level test; the value is never dereferenced.
-        let weak = unsafe { Value::from_bits(0x1000 | WEAK_PTR) };
+        let weak = Value::from_bits(0x1000 | WEAK_PTR);
         let _ = unsafe { Tagged::<TestObj>::from_value_unchecked(weak) };
     }
 

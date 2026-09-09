@@ -1,9 +1,9 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
     HandlerTable, HandlerTableInit, ObjectSlotsInit,
 };
+use vm::{Thread, VM};
 
 fn table<'s>(
     thread: &mut Thread,
