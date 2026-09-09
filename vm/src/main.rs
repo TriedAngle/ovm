@@ -1,14 +1,8 @@
-//! ovm command-line front end.
-//!
-//! `ovm <file.js>...` runs script files in order; `ovm` with no files starts
-//! a REPL. Each script runs in its own global scope. `--repl` drops into the
-//! REPL after the files have run.
-
 use std::io::Write;
 
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{Thread, VM};
 use vm::{Float, Smi, VMString, Value};
+use vm::{Thread, VM};
 
 fn main() {
     let vm =
@@ -86,8 +80,6 @@ fn repl(thread: &mut Thread) {
     }
 }
 
-/// Print and clear an uncaught exception, if one escaped. Returns whether
-/// there was one.
 fn report_uncaught(thread: &mut Thread) -> bool {
     match thread.take_pending_exception() {
         Some(ex) => {
@@ -98,7 +90,6 @@ fn report_uncaught(thread: &mut Thread) -> bool {
     }
 }
 
-/// Best-effort display of a result value.
 fn show_value(thread: &mut Thread, v: Value) -> String {
     if let Some(smi) = Smi::decode(v) {
         return smi.value().to_string();

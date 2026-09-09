@@ -1,6 +1,6 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{Thread, VM, VmError};
 use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Value};
+use vm::{Thread, VM, VmError};
 
 /// Read a data property by interned name value.
 fn get_prop(thread: &mut Thread, obj: Value, name: Value) -> Value {

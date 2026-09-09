@@ -1,6 +1,8 @@
 use core::ptr::NonNull;
 
-use vm::{Float, GcSlice, Handle, HandleScope, Heap, InternedString, Object, Smi, Value, VmError};
+use crate::{
+    Float, GcSlice, Handle, HandleScope, Heap, InternedString, Object, Smi, Value, VmError,
+};
 
 use crate::{ContextState, Thread, VM};
 

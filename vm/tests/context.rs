@@ -1,11 +1,11 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::VM;
+use vm::VM;
 use vm::{
     CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray,
     ObjectKind, ObjectSlotsInit, ScopeInfo, Smi,
 };
 
-fn empty_scope_info(thread: &mut ovm::Thread) -> vm::Global<ScopeInfo> {
+fn empty_scope_info(thread: &mut vm::Thread) -> vm::Global<ScopeInfo> {
     thread.heap().known().empty_scope_info
 }
 

@@ -5,11 +5,11 @@
 //! `WellKnown` and `.prototype`/`.constructor` plumbing for user
 //! functions (interpreter `CreateClosure`).
 
-use base_compiler::compile_eval;
-use vm::{
+use crate::{
     Convert, FixedArray, GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object,
     PropertyDescriptor, SlotName, Smi, VMString, Value, VmError,
 };
+use base_compiler::compile_eval;
 
 use crate::natives::NativeIndex;
 use crate::{ContextState, VM, materialize::materialize_closure_vm, runtime::Runtime};
@@ -99,23 +99,23 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // static data properties on the Number constructor
         let pos_inf = thread
             .heap()
-            .allocate::<vm::Float>(f64::INFINITY)
+            .allocate::<crate::Float>(f64::INFINITY)
             .into_global(roots);
         let neg_inf = thread
             .heap()
-            .allocate::<vm::Float>(f64::NEG_INFINITY)
+            .allocate::<crate::Float>(f64::NEG_INFINITY)
             .into_global(roots);
         let max_value = thread
             .heap()
-            .allocate::<vm::Float>(f64::MAX)
+            .allocate::<crate::Float>(f64::MAX)
             .into_global(roots);
         let min_value = thread
             .heap()
-            .allocate::<vm::Float>(f64::MIN_POSITIVE)
+            .allocate::<crate::Float>(f64::MIN_POSITIVE)
             .into_global(roots);
         let number_nan = thread
             .heap()
-            .allocate::<vm::Float>(f64::NAN)
+            .allocate::<crate::Float>(f64::NAN)
             .into_global(roots);
         for (name, value) in [
             ("POSITIVE_INFINITY", pos_inf.value()),
@@ -439,11 +439,11 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- value properties of the global object -----------------------------
         let infinity = thread
             .heap()
-            .allocate::<vm::Float>(f64::INFINITY)
+            .allocate::<crate::Float>(f64::INFINITY)
             .into_global(roots);
         let nan = thread
             .heap()
-            .allocate::<vm::Float>(f64::NAN)
+            .allocate::<crate::Float>(f64::NAN)
             .into_global(roots);
         let undefined = thread.heap().known().undefined;
         for (name, value) in [
@@ -467,21 +467,21 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
 fn alloc_map<'s>(
     heap: &mut Heap,
     scope: &'s HandleScope<'_>,
-    roots: &vm::RootHandles,
+    roots: &crate::RootHandles,
     kind: MapKind,
-    prototype: vm::Global<Object>,
-) -> Result<vm::Global<Map>, VmError> {
+    prototype: crate::Global<Object>,
+) -> Result<crate::Global<Map>, VmError> {
     alloc_map_with_slots(heap, scope, roots, kind, prototype, 0)
 }
 
 fn alloc_map_with_slots<'s>(
     heap: &mut Heap,
     scope: &'s HandleScope<'_>,
-    roots: &vm::RootHandles,
+    roots: &crate::RootHandles,
     kind: MapKind,
-    prototype: vm::Global<Object>,
+    prototype: crate::Global<Object>,
     value_slot_count: usize,
-) -> Result<vm::Global<Map>, VmError> {
+) -> Result<crate::Global<Map>, VmError> {
     let proto = scope.handle(prototype.value());
     Ok(heap
         .allocate::<Map>(MapInit {
@@ -498,9 +498,9 @@ fn alloc_map_with_slots<'s>(
 fn make_native_function<'s>(
     thread: &mut crate::Thread,
     scope: &'s HandleScope<'_>,
-    roots: &vm::RootHandles,
+    roots: &crate::RootHandles,
     index: NativeIndex,
-) -> Result<vm::Global<Object>, VmError> {
+) -> Result<crate::Global<Object>, VmError> {
     let heap = thread.heap();
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
@@ -524,11 +524,11 @@ fn make_native_function<'s>(
 fn install_constructor<'s>(
     thread: &mut crate::Thread,
     scope: &'s HandleScope<'_>,
-    roots: &vm::RootHandles,
+    roots: &crate::RootHandles,
     index: NativeIndex,
     name: &str,
-    proto_parent: vm::Global<Object>,
-) -> Result<(vm::Global<Object>, vm::Global<Object>), VmError> {
+    proto_parent: crate::Global<Object>,
+) -> Result<(crate::Global<Object>, crate::Global<Object>), VmError> {
     let name_str = thread.intern(scope, name);
     let fn_obj = make_native_function(thread, scope, roots, index)?;
 
@@ -575,8 +575,8 @@ fn install_constructor<'s>(
 fn install_method<'s>(
     thread: &mut crate::Thread,
     scope: &'s HandleScope<'_>,
-    roots: &vm::RootHandles,
-    receiver: vm::Global<Object>,
+    roots: &crate::RootHandles,
+    receiver: crate::Global<Object>,
     name: &str,
     index: NativeIndex,
 ) -> Result<(), VmError> {
@@ -595,7 +595,7 @@ fn install_method<'s>(
 fn define_data(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    object: vm::Global<Object>,
+    object: crate::Global<Object>,
     name: impl Into<SlotName>,
     value: Value,
 ) -> Result<(), VmError> {
@@ -867,7 +867,7 @@ fn object_constructor(
     let arg = args.get(1).unwrap_or(nctx.heap().known().undefined.value());
     if nctx
         .heap()
-        .no_gc(|nogc| vm::Convert::is_primitive(nogc, arg))
+        .no_gc(|nogc| crate::Convert::is_primitive(nogc, arg))
     {
         // TODO: box primitives (String/Symbol wrappers)
         return Err(VmError::Type);
@@ -925,7 +925,7 @@ fn array_constructor(
         Ok(heap
             .allocate_object(
                 &scope,
-                vm::ObjectSlotsInit {
+                crate::ObjectSlotsInit {
                     map,
                     values: &[],
                     elements: elements.erase(),

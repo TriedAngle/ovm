@@ -1,12 +1,12 @@
 use bytecode::{Opcode, PropertyFlags, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{NativeContext, NativeIndex, Thread, VM, VmError};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
     FixedByteArray, Float, FunctionKind, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map,
     MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit,
     SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, VMString, Value, string_content_hash,
 };
+use vm::{NativeContext, NativeIndex, Thread, VM, VmError};
 
 fn smi(v: i64) -> Value {
     Smi::new(v).encode()

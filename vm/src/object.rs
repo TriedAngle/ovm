@@ -1,11 +1,13 @@
 use core::{
     alloc::Layout,
     cell::{Cell, UnsafeCell},
+    ptr::NonNull,
 };
 
 use crate::{
-    Compare, EdgeVisitable, GcSlot, Handle, HandleScope, Heap, HeapRef, NoGc, OptionGcSlot,
-    STRONG_PTR, Smi, Tagged, TransitionGuard, Value, Visitor, VmError, WEAK_PTR, Word,
+    Compare, EdgeVisitable, GcSlot, Handle, HandleScope, Heap, HeapPtr, HeapRef, NoGc,
+    OptionGcSlot, STRONG_PTR, Smi, Tagged, TransitionGuard, Value, Visitor, VmError, WEAK_PTR,
+    Word,
 };
 
 pub trait HeapObject: 'static {
@@ -30,7 +32,7 @@ pub trait HeapObject: 'static {
         Self: Sized,
     {
         let addr = self as *const Self as *const Word as Word;
-        unsafe { Value::from_bits(addr | STRONG_PTR) }
+        Value::from_bits(addr | STRONG_PTR)
     }
 
     fn erase_weak(&self) -> Value
@@ -38,7 +40,7 @@ pub trait HeapObject: 'static {
         Self: Sized,
     {
         let addr = self as *const Self as *const Word as Word;
-        unsafe { Value::from_bits(addr | WEAK_PTR) }
+        Value::from_bits(addr | WEAK_PTR)
     }
 }
 
@@ -1502,5 +1504,70 @@ impl HeapObject for Float {
 impl EdgeVisitable for Float {
     fn visit_edges(&self, visitor: &mut impl Visitor) {
         visitor.visit(self.header.map.as_raw());
+    }
+}
+
+pub unsafe fn object_kind(addr: NonNull<()>) -> ObjectKind {
+    let header = unsafe { &*addr.cast::<Header>().as_ptr() };
+    let map = header.map.get();
+    let map_ref = unsafe { HeapPtr::<Map>::from(map).as_ref() };
+    map_ref.kind().kind()
+}
+
+pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
+    let kind = unsafe { object_kind(addr) };
+    unsafe {
+        match kind {
+            ObjectKind::Map => (*addr.cast::<Map>().as_ptr()).layout(),
+            ObjectKind::FixedArray => (*addr.cast::<FixedArray>().as_ptr()).layout(),
+            ObjectKind::FixedByteArray => (*addr.cast::<FixedByteArray>().as_ptr()).layout(),
+            ObjectKind::VMString => (*addr.cast::<VMString>().as_ptr()).layout(),
+            ObjectKind::AccessorPair => (*addr.cast::<AccessorPair>().as_ptr()).layout(),
+            ObjectKind::CallableInfo => (*addr.cast::<CallableInfoObject>().as_ptr()).layout(),
+            ObjectKind::Float => (*addr.cast::<Float>().as_ptr()).layout(),
+            ObjectKind::Symbol => (*addr.cast::<Symbol>().as_ptr()).layout(),
+            ObjectKind::HandlerTable => (*addr.cast::<HandlerTable>().as_ptr()).layout(),
+            ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).layout(),
+            ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).layout(),
+            ObjectKind::Object | ObjectKind::Array | ObjectKind::ByteArray | ObjectKind::String => {
+                (*addr.cast::<Object>().as_ptr()).layout()
+            }
+            ObjectKind::BuiltinStart | ObjectKind::BuiltinEnd => {
+                unreachable!("sentinel kind in object header")
+            }
+        }
+    }
+}
+
+pub unsafe fn visit_object<V: Visitor>(addr: NonNull<()>, visitor: &mut V) {
+    let kind = unsafe { object_kind(addr) };
+    unsafe {
+        match kind {
+            ObjectKind::Map => (*addr.cast::<Map>().as_ptr()).visit_edges(visitor),
+            ObjectKind::FixedArray => (*addr.cast::<FixedArray>().as_ptr()).visit_edges(visitor),
+            ObjectKind::FixedByteArray => {
+                (*addr.cast::<FixedByteArray>().as_ptr()).visit_edges(visitor)
+            }
+            ObjectKind::VMString => (*addr.cast::<VMString>().as_ptr()).visit_edges(visitor),
+            ObjectKind::AccessorPair => {
+                (*addr.cast::<AccessorPair>().as_ptr()).visit_edges(visitor)
+            }
+            ObjectKind::CallableInfo => {
+                (*addr.cast::<CallableInfoObject>().as_ptr()).visit_edges(visitor)
+            }
+            ObjectKind::Float => (*addr.cast::<Float>().as_ptr()).visit_edges(visitor),
+            ObjectKind::Symbol => (*addr.cast::<Symbol>().as_ptr()).visit_edges(visitor),
+            ObjectKind::HandlerTable => {
+                (*addr.cast::<HandlerTable>().as_ptr()).visit_edges(visitor)
+            }
+            ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).visit_edges(visitor),
+            ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).visit_edges(visitor),
+            ObjectKind::Object | ObjectKind::Array | ObjectKind::ByteArray | ObjectKind::String => {
+                (*addr.cast::<Object>().as_ptr()).visit_edges(visitor)
+            }
+            ObjectKind::BuiltinStart | ObjectKind::BuiltinEnd => {
+                unreachable!("sentinel kind in object header")
+            }
+        }
     }
 }

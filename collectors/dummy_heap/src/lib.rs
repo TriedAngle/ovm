@@ -1,11 +1,10 @@
 use core::alloc::Layout;
 use core::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use vm::{
-    AllocError, GlobalHeap, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell, RootVisitor,
-    TransitionLock, Value, WellKnown, Word,
+use heap::{
+    AllocError, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell, RootVisitor, Word,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -25,11 +24,6 @@ pub struct DummyHeapState {
     start: NonNull<u8>,
     layout: Layout,
     offset: AtomicUsize,
-    /// The currently installed well-known set. Every install leaks its
-    /// `WellKnown` (via `Box::into_raw`) so that `known()` references stay
-    /// valid at stable addresses for the lifetime of the heap.
-    known: AtomicPtr<WellKnown>,
-    transition_lock: TransitionLock,
 }
 
 unsafe impl Send for DummyHeapState {}
@@ -96,8 +90,6 @@ impl DummyHeap {
                 start,
                 layout,
                 offset: AtomicUsize::new(0),
-                known: AtomicPtr::new(core::ptr::null_mut()),
-                transition_lock: TransitionLock::new(),
             }),
         })
     }
@@ -127,26 +119,7 @@ fn erased_allocate_raw(local: *mut (), layout: Layout) -> Result<NonNull<u8>, Al
     local.shared.allocate(layout)
 }
 
-fn erased_known(local: *const ()) -> &'static WellKnown {
-    let local: &'static DummyLocalHeap = unsafe { &*local.cast::<DummyLocalHeap>() };
-    let ptr = local.shared.known.load(Ordering::Acquire);
-    assert!(!ptr.is_null(), "well-known maps not installed");
-    unsafe { &*ptr }
-}
-
-fn erased_set_known(shared: *const (), known: WellKnown) {
-    let state: &DummyHeapState = unsafe { &*shared.cast::<DummyHeapState>() };
-    state
-        .known
-        .store(Box::into_raw(Box::new(known)), Ordering::Release);
-}
-
-fn erased_transition_lock(local: *const ()) -> TransitionLock {
-    let local: &DummyLocalHeap = unsafe { &*local.cast::<DummyLocalHeap>() };
-    local.shared.transition_lock.clone()
-}
-
-fn erased_write_barrier(_local: *const (), _host: Value, _slot: &RawCell, _value: Value) {}
+fn erased_write_barrier(_local: *const (), _host: Word, _slot: &RawCell, _value: Word) {}
 
 fn erased_collection_requested(_local: *const ()) -> bool {
     false
@@ -171,13 +144,6 @@ fn erased_global_new_local(shared: *const ()) -> *mut () {
     })) as *mut ()
 }
 
-fn erased_global_known(shared: *const ()) -> &'static WellKnown {
-    let state: &'static DummyHeapState = unsafe { &*shared.cast::<DummyHeapState>() };
-    let ptr = state.known.load(Ordering::Acquire);
-    assert!(!ptr.is_null(), "well-known maps not installed");
-    unsafe { &*ptr }
-}
-
 fn erased_global_iterate_roots(_shared: *const (), _roots: &mut dyn RootVisitor) {}
 
 fn erased_global_collect(_shared: *const ()) {}
@@ -195,7 +161,7 @@ fn erased_global_contains(shared: *const (), addr: Word) -> bool {
     state.contains(addr)
 }
 
-fn erased_global_is_young(_shared: *const (), _value: Value) -> bool {
+fn erased_global_is_young(_shared: *const (), _value: Word) -> bool {
     false
 }
 
@@ -213,9 +179,6 @@ fn erased_global_drop_shared(shared: *mut ()) {
 
 static DUMMY_HEAP_VTABLE: HeapVtable = HeapVtable {
     allocate_raw: erased_allocate_raw,
-    known: erased_known,
-    set_known: erased_set_known,
-    transition_lock: erased_transition_lock,
     write_barrier: erased_write_barrier,
     collection_requested: erased_collection_requested,
     park_for_collection: erased_park_for_collection,
@@ -226,7 +189,6 @@ static DUMMY_HEAP_VTABLE: HeapVtable = HeapVtable {
 static DUMMY_GLOBAL_VTABLE: GlobalVtable = GlobalVtable {
     local_vtable: &DUMMY_HEAP_VTABLE,
     new_local: erased_global_new_local,
-    known: erased_global_known,
     iterate_roots: erased_global_iterate_roots,
     collect: erased_global_collect,
     should_collect: erased_global_should_collect,
@@ -244,9 +206,9 @@ impl HeapBackend for DummyHeap {
         DummyHeap::new(config)
     }
 
-    fn into_global(self) -> GlobalHeap {
+    fn into_global(self) -> (*mut (), &'static GlobalVtable) {
         let state = Arc::into_raw(self.inner) as *mut ();
-        GlobalHeap::new(state, &DUMMY_GLOBAL_VTABLE)
+        (state, &DUMMY_GLOBAL_VTABLE)
     }
 }
 
@@ -255,51 +217,72 @@ mod tests {
     use super::*;
     use vm::PropertyDescriptor;
 
-    fn local(size: usize) -> (GlobalHeap, Heap) {
-        let global = DummyHeap::new(DummyHeapConfig { heap_size: size })
-            .unwrap()
-            .into_global();
-        let heap = global.new_local();
-        (global, heap)
+    /// Heap + well-known-set fixture: mirrors how the VM wires a backend
+    /// (the known cell is VM state the local heap reads through).
+    struct Fixture {
+        global: vm::GlobalHeap,
+        known: vm::KnownCell,
+        roots: vm::RootHandles,
     }
 
-    /// A local heap with the well-known maps installed — required for
-    /// allocating object kinds whose map comes from `known()`.
-    fn install_well_known(global: &GlobalHeap) -> RootHandles {
-        let mut local = global.new_local();
-        let roots = unsafe { RootHandles::new(256, Smi::new(0).encode()) };
-        // throwaway string table: the interned well-known strings are kept
-        // alive by the table's strong entries while the table itself lives
-        let interner = vm::StringInterner::new();
-        vm::bootstrap_basics(&mut local, &roots);
-        vm::intern_well_known_strings(&mut local, &interner, &roots);
-        vm::bootstrap_well_known(&mut local, &roots);
-        roots
+    impl Fixture {
+        fn new(size: usize) -> Self {
+            let (state, vtable) = DummyHeap::new(DummyHeapConfig { heap_size: size })
+                .unwrap()
+                .into_global();
+            // same capacity the real VM uses (one bootstrap pass)
+            let roots = unsafe { vm::RootHandles::new(256, vm::Smi::new(0).encode()) };
+            Self {
+                global: vm::GlobalHeap::new(state, vtable),
+                known: vm::KnownCell::new(vm::WellKnown::uninit(&roots)),
+                roots,
+            }
+        }
+
+        fn local(&self) -> vm::Heap {
+            self.global.new_local(&self.known)
+        }
+
+        fn install_well_known(&self) {
+            let mut local = self.local();
+            // throwaway string table: the interned well-known strings are kept
+            // alive by the table's strong entries while the table itself lives
+            let interner = vm::StringInterner::new();
+            vm::bootstrap_basics(&mut local, &self.roots);
+            vm::intern_well_known_strings(&mut local, &interner, &self.roots);
+            vm::bootstrap_well_known(&mut local, &self.roots);
+        }
     }
 
-    fn local_with_maps(size: usize) -> (GlobalHeap, Heap, RootHandles) {
-        let global = DummyHeap::new(DummyHeapConfig { heap_size: size })
-            .unwrap()
-            .into_global();
-        let roots = install_well_known(&global);
-        let heap = global.new_local();
-        (global, heap, roots)
-    }
+/// Fixture with the well-known maps installed — required for allocating
+/// object kinds whose map comes from `known()`.
+fn local_with_maps(size: usize) -> Fixture {
+    let fx = Fixture::new(size);
+    fx.install_well_known();
+    fx
+}
+
+/// Keeps the fixture (and its well-known cell) alive next to the heap.
+fn local(size: usize) -> (Fixture, vm::Heap) {
+    let fx = Fixture::new(size);
+    let heap = fx.local();
+    (fx, heap)
+}
 
     #[test]
     fn bump_allocates_forward_and_aligned() {
-        let (global, mut heap) = local(1024);
+        let (fx, mut heap) = local(1024);
         let a = heap.allocate_raw(Layout::new::<u8>()).unwrap();
         let b = heap.allocate_raw(Layout::new::<u64>()).unwrap();
         assert!(b.as_ptr() > a.as_ptr());
         assert!((b.as_ptr() as usize) % 8 == 0);
-        assert!(global.contains(a.as_ptr() as Word));
-        assert!(global.contains(b.as_ptr() as Word));
+        assert!(fx.global.contains(a.as_ptr() as Word));
+        assert!(fx.global.contains(b.as_ptr() as Word));
     }
 
     #[test]
     fn out_of_memory_when_full() {
-        let (_global, mut heap) = local(16);
+        let (_fx, mut heap) = local(16);
         heap.allocate_raw(Layout::new::<[u8; 16]>()).unwrap();
         let err = heap.allocate_raw(Layout::new::<u8>()).unwrap_err();
         assert_eq!(err, AllocError::OutOfMemory(Layout::new::<u8>()));
@@ -307,10 +290,10 @@ mod tests {
 
     #[test]
     fn concurrent_allocation() {
-        let (global, mut heap) = local(1 << 20);
+        let (fx, mut heap) = local(1 << 20);
         let mut threads = Vec::new();
         for _ in 0..4 {
-            let mut heap = global.new_local();
+            let mut heap = fx.local();
             threads.push(std::thread::spawn(move || {
                 for _ in 0..1000 {
                     heap.allocate_raw(Layout::new::<u64>()).unwrap();
@@ -320,17 +303,15 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
-        assert_eq!(global.stats().used, 4 * 1000 * size_of::<u64>());
+        assert_eq!(fx.global.stats().used, 4 * 1000 * size_of::<u64>());
         heap.allocate_raw(Layout::new::<u64>()).unwrap();
     }
 
     #[test]
     fn well_known_has_no_smi_placeholders_after_install() {
-        let global = DummyHeap::new(DummyHeapConfig { heap_size: 1 << 20 })
-            .unwrap()
-            .into_global();
-        let _roots = install_well_known(&global);
-        let k = global.known();
+        let fx = Fixture::new(1 << 20);
+        fx.install_well_known();
+        let k = fx.known.get();
         let values = [
             k.map_map.value(),
             k.void.value(),
@@ -360,51 +341,107 @@ mod tests {
     }
 
     #[test]
-    fn install_well_known_maps_can_be_repeated() {
-        let global = DummyHeap::new(DummyHeapConfig { heap_size: 1 << 20 })
-            .unwrap()
-            .into_global();
-        let _roots = install_well_known(&global);
-        let first_void = global.known().void.value();
-        // a second install builds a fresh object graph and replaces the set
-        let _roots = install_well_known(&global);
-        let second_void = global.known().void.value();
-        assert_ne!(first_void, second_void, "rebuilds a fresh graph");
-        // both graphs stay rooted (old WellKnowns are intentionally leaked)
-        assert!(global.contains(first_void.raw_addr()));
-        assert!(global.contains(second_void.raw_addr()));
-        // the heap remains fully usable afterwards
-        let mut local = global.new_local();
-        let bytes = local.allocate::<FixedByteArray>(&[1u8, 2, 3]).into_ptr();
-        local.no_gc(|_nogc| {
-            assert_eq!(unsafe { bytes.as_ref() }.as_slice(), &[1, 2, 3]);
-        });
-    }
-
-    #[test]
     fn erased_heap_roundtrip() {
-        let global = DummyHeap::new(DummyHeapConfig { heap_size: 1 << 20 })
-            .unwrap()
-            .into_global();
-        let _roots = install_well_known(&global);
+        let fx = Fixture::new(1 << 20);
+        fx.install_well_known();
 
-        assert_eq!(global.stats().capacity, 1 << 20);
-        assert!(global.stats().used > 0);
-        let _ = global.known();
+        assert_eq!(fx.global.stats().capacity, 1 << 20);
+        assert!(fx.global.stats().used > 0);
+        let _ = fx.known.get();
 
-        let mut local = global.new_local();
-        let before = global.stats().used;
+        let mut local = fx.local();
+        let before = fx.global.stats().used;
         let layout = FixedByteArray::layout_for(4);
         let raw = local.allocate_raw(layout).unwrap();
-        assert!(global.contains(raw.as_ptr() as Word));
-        assert!(global.stats().used >= before + layout.size());
+        assert!(fx.global.contains(raw.as_ptr() as Word));
+        assert!(fx.global.stats().used >= before + layout.size());
 
         local.no_gc(|_nogc| {
             assert!(_nogc.known().void.value().is_strong_ptr());
             assert!(!_nogc.gc_in_progress());
         });
         drop(local);
-        let _ = global.stats();
+        let _ = fx.global.stats();
+    }
+
+    #[test]
+    fn vm_dispatch_helpers_report_kind_layout_and_edges() {
+        use core::alloc::Layout;
+        use core::ptr::NonNull;
+        use vm::{
+            Float, Map, ObjectKind, RawCell, STRONG_PTR, TAG_MASK, VMString, Visitor, Word,
+            object_kind, object_layout, visit_object,
+        };
+
+        /// Collects the raw addresses of every strong pointer a visit sees.
+        #[derive(Default)]
+        struct StrongAddrs(Vec<Word>);
+        impl Visitor for StrongAddrs {
+            fn visit(&mut self, cell: &RawCell) {
+                let v = cell.load();
+                if v & TAG_MASK == STRONG_PTR {
+                    self.0.push(v & !TAG_MASK);
+                }
+            }
+        }
+
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
+        let roots = &fx.roots;
+        let data = HandleData::new(heap.known().void.value());
+        let scope = scope(&data);
+        let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
+
+        let float = heap.allocate_handle::<Float>(1.5, &scope);
+        let bytes = heap.allocate_handle::<FixedByteArray>(&[1u8, 2, 3], &scope);
+        let string = VMString::from_bytes(&mut heap, &scope, b"ab");
+        let map = alloc_map(
+            &mut heap,
+            &roots,
+            MapKind::OBJECT,
+            0,
+            &[
+                (1, flags, Smi::new(0).encode()),
+                (2, flags, Smi::new(0).encode()),
+            ],
+        );
+        let arr = heap
+            .allocate::<FixedArray>(&[float.value(), Smi::new(7).encode()])
+            .into_ptr();
+
+        let float_addr = float.get().as_ptr() as *mut ();
+        let bytes_addr = bytes.get().as_ptr() as *mut ();
+        let string_addr = string.get().as_ptr() as *mut ();
+        let map_addr = map.get().as_ptr() as *mut ();
+        let arr_addr = arr.as_ptr() as *mut ();
+        let nn = |p: *mut ()| unsafe { NonNull::new_unchecked(p) };
+
+        heap.no_gc(|nogc| unsafe {
+            assert_eq!(object_kind(nn(float_addr)), ObjectKind::Float);
+            assert_eq!(object_kind(nn(bytes_addr)), ObjectKind::FixedByteArray);
+            assert_eq!(object_kind(nn(string_addr)), ObjectKind::VMString);
+            assert_eq!(object_kind(nn(map_addr)), ObjectKind::Map);
+            assert_eq!(object_kind(nn(arr_addr)), ObjectKind::FixedArray);
+
+            assert_eq!(object_layout(nn(float_addr)), Layout::new::<Float>());
+            assert_eq!(object_layout(nn(bytes_addr)), FixedByteArray::layout_for(3));
+            assert_eq!(object_layout(nn(string_addr)), Layout::new::<VMString>());
+            assert_eq!(object_layout(nn(map_addr)), Map::layout_for(2));
+            assert_eq!(object_layout(nn(arr_addr)), FixedArray::layout_for(2));
+
+            // the array traces its map and the boxed float, not the smi
+            let mut visitor = StrongAddrs::default();
+            visit_object(nn(arr_addr), &mut visitor);
+            assert_eq!(visitor.0.len(), 2);
+            let array_map = nogc.known().array_map.get().as_ptr() as Word;
+            assert!(visitor.0.contains(&array_map));
+            assert!(visitor.0.contains(&(float.get().as_ptr() as Word)));
+
+            // a float traces only its map
+            let mut visitor = StrongAddrs::default();
+            visit_object(nn(float_addr), &mut visitor);
+            assert_eq!(visitor.0.len(), 1);
+        });
     }
 
     use vm::{
@@ -500,7 +537,8 @@ mod tests {
 
     #[test]
     fn bootstrap_maps_have_void_transitions() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         heap.no_gc(|nogc| {
             let known = nogc.known();
             let void = known.void.value();
@@ -522,8 +560,9 @@ mod tests {
 
     #[test]
     fn fresh_map_has_no_transitions() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
-        let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
+        let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         heap.no_gc(|nogc| {
             let map = map.heap_ref(nogc);
             assert_eq!(map.transitions.inner(), nogc.known().void.value());
@@ -536,13 +575,14 @@ mod tests {
 
     #[test]
     fn find_transition_matches_name_and_derived_flags() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         // parent {}, child {smi(1) -> slot 0}
-        let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let parent = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let child = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(1, flags, Smi::new(0).encode())],
@@ -594,11 +634,12 @@ mod tests {
 
     #[test]
     fn transition_target_appends_descriptor_and_records_edge() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let parent = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
 
         let child = Transition::target(
@@ -632,11 +673,12 @@ mod tests {
 
     #[test]
     fn transition_target_reuses_existing_child() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let parent = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
 
         let a = Transition::target(
@@ -671,11 +713,12 @@ mod tests {
 
     #[test]
     fn transition_target_grows_pairs_for_siblings_and_chains() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let parent = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let parent = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let name1 = root_name(&scope, smi_name(1));
         let name2 = root_name(&scope, smi_name(2));
 
@@ -733,14 +776,15 @@ mod tests {
 
     #[test]
     fn store_new_data_property_grows_object_and_writes() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             kind,
             1,
             &[(1, flags, Smi::new(0).encode())],
@@ -778,11 +822,12 @@ mod tests {
 
     #[test]
     fn store_new_data_property_converges_maps() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let b = root_object(&scope, alloc_object(&mut heap, map, &[]));
 
@@ -814,11 +859,12 @@ mod tests {
 
     #[test]
     fn define_own_property_returns_false_on_non_extensible() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         // plain OBJECT: not extendable
-        let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
 
         let result = Object::define_own_property(
@@ -842,10 +888,11 @@ mod tests {
 
     #[test]
     fn empty_objects_share_the_well_known_empty_fixed_array() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let b = root_object(&scope, alloc_object(&mut heap, map, &[]));
 
@@ -864,7 +911,7 @@ mod tests {
         // a real data slot swaps in a fresh array
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(
@@ -888,12 +935,13 @@ mod tests {
 
     #[test]
     fn lookup_resolves_own_values_and_parent_chain() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
         // parent: smi(3) = value slot 0 (99)
         let parent_map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(
@@ -911,7 +959,7 @@ mod tests {
             .into_ptr();
         let child_map = alloc_map_proto(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             2,
             &[
@@ -945,11 +993,12 @@ mod tests {
 
     #[test]
     fn slot_lookup_dispatches_smi_and_object() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(
@@ -972,12 +1021,13 @@ mod tests {
 
     #[test]
     fn lookup_multiple_parents_follow_priority_order() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
         // parent A: smi(3) = value slot 0 (10); parent B: smi(3) = slot 0 (20)
         let map_a = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(
@@ -989,7 +1039,7 @@ mod tests {
         let parent_a = alloc_object(&mut heap, map_a, &[Smi::new(10).encode()]);
         let map_b = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(
@@ -1006,7 +1056,7 @@ mod tests {
             .into_ptr();
         let child_ab_map = alloc_map_proto(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             0,
             &[],
@@ -1021,7 +1071,7 @@ mod tests {
             .into_ptr();
         let child_b_map = alloc_map_proto(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             0,
             &[],
@@ -1038,7 +1088,8 @@ mod tests {
 
     #[test]
     fn lookup_returns_accessor_pair() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
         let pair_ptr = heap
             .allocate::<AccessorPair>((Smi::new(111).encode(), Smi::new(222).encode()))
@@ -1046,7 +1097,7 @@ mod tests {
 
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             0,
             &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
@@ -1065,14 +1116,15 @@ mod tests {
 
     #[test]
     fn store_lookup_on_accessor_with_setter_calls_setter() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
         let pair_ptr = heap
             .allocate::<AccessorPair>((Smi::new(111).encode(), Smi::new(222).encode()))
             .into_ptr();
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             0,
             &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
@@ -1100,7 +1152,8 @@ mod tests {
 
     #[test]
     fn store_lookup_on_accessor_without_setter_is_ignored() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
         let undefined = heap.known().undefined.value();
         let pair_ptr = heap
@@ -1108,7 +1161,7 @@ mod tests {
             .into_ptr();
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             0,
             &[(5, SlotFlags::ACCESSOR, pair_ptr.encode_strong())],
@@ -1128,11 +1181,12 @@ mod tests {
 
     #[test]
     fn store_new_accessor_property_adds_descriptor_without_slot() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT.union(MapKind::EXTENDABLE),
             1,
             &[(
@@ -1193,9 +1247,10 @@ mod tests {
 
     #[test]
     fn define_accessor_on_non_extensible_returns_false() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
 
-        let map = alloc_map(&mut heap, &_roots, MapKind::OBJECT, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let obj = heap
@@ -1231,11 +1286,12 @@ mod tests {
 
     #[test]
     fn define_own_property_redefines_existing_data_in_place() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let name = root_name(&scope, smi_name(1));
 
@@ -1268,11 +1324,12 @@ mod tests {
 
     #[test]
     fn define_own_property_respects_non_configurable_guards() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let name = root_name(&scope, smi_name(1));
 
@@ -1332,11 +1389,12 @@ mod tests {
 
     #[test]
     fn define_own_property_converts_between_data_and_accessor() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let name = root_name(&scope, smi_name(1));
         let undefined = heap.known().undefined.value();
@@ -1392,7 +1450,8 @@ mod tests {
 
     #[test]
     fn same_value_matches_spec() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
 
@@ -1445,23 +1504,20 @@ mod tests {
 
     #[test]
     fn concurrent_transition_target_converges() {
-        let global = DummyHeap::new(DummyHeapConfig { heap_size: 1 << 20 })
-            .unwrap()
-            .into_global();
-        let _roots = install_well_known(&global);
-        let mut local = global.new_local();
+        let fx = local_with_maps(1 << 20);
+        let mut local = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
-        let parent = alloc_map(&mut local, &_roots, MapKind::OBJECT, 0, &[]);
+        let parent = alloc_map(&mut local, &fx.roots, MapKind::OBJECT, 0, &[]);
         let parent_ptr = parent.get();
 
         // N threads race to add the same property transition to one map;
         // all must converge to the same child map
-        let global = &global;
+        let fx = &fx;
         std::thread::scope(|s| {
             let mut threads = Vec::new();
             for _ in 0..8 {
                 threads.push(s.spawn(move || {
-                    let mut local = global.new_local();
+                    let mut local = fx.local();
                     let data = HandleData::new(local.known().void.value());
                     let scope = scope(&data);
                     let parent = scope.handle(Tagged::from_ptr(parent_ptr));
@@ -1497,11 +1553,12 @@ mod tests {
 
     #[test]
     fn token_bulk_allocates_and_tracks_remaining() {
-        let (global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let la = FixedArray::layout_for(2);
         let lb = FixedByteArray::layout_for(8);
         let total = Layout::from_size_align(la.size() + lb.size(), 16).unwrap();
-        let before = global.stats().used;
+        let before = fx.global.stats().used;
         {
             let tok = heap.allocate_token(total);
             assert_eq!(tok.remaining(), la.size() + lb.size());
@@ -1512,12 +1569,13 @@ mod tests {
         }
         // the token region starts 16-aligned, so account for the padding
         let start = before.next_multiple_of(16);
-        assert_eq!(global.stats().used, start + la.size() + lb.size());
+        assert_eq!(fx.global.stats().used, start + la.size() + lb.size());
     }
 
     #[test]
     fn token_handles_outlive_the_token() {
-        let (global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let la = FixedArray::layout_for(2);
@@ -1537,13 +1595,14 @@ mod tests {
 
         // the handles stay rooted and point into the heap
         assert_ne!(ha.value().to_bits(), hb.value().to_bits());
-        assert!(global.contains(ha.value().raw_addr()));
-        assert!(global.contains(hb.value().raw_addr()));
+        assert!(fx.global.contains(ha.value().raw_addr()));
+        assert!(fx.global.contains(hb.value().raw_addr()));
     }
 
     #[test]
     fn token_fresh_allocations_coexist_and_promote() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let la = FixedArray::layout_for(1);
@@ -1560,7 +1619,8 @@ mod tests {
 
     #[test]
     fn token_enter_no_gc_allocates_refs() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let lb = FixedByteArray::layout_for(8);
         let total = Layout::from_size_align(2 * lb.size(), 16).unwrap();
 
@@ -1579,7 +1639,8 @@ mod tests {
 
     #[test]
     fn allocate_token_enter_no_gc_combines_both() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let lb = FixedByteArray::layout_for(4);
         let total = Layout::from_size_align(lb.size(), 16).unwrap();
         heap.allocate_token_enter_nogc(total, |tok, nogc| {
@@ -1591,7 +1652,8 @@ mod tests {
 
     #[test]
     fn allocate_enter_no_gc_gives_ref_instantly() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         heap.allocate_enter_nogc::<FixedByteArray, _>(&[1u8, 2, 3, 4], |bytes, _nogc| {
             assert_eq!(bytes.as_slice(), &[1, 2, 3, 4]);
         });
@@ -1600,7 +1662,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "allocation token dropped")]
     fn token_drop_requires_full_use() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let total = Layout::from_size_align(4096, 16).unwrap();
         let tok = heap.allocate_token(total);
         let _ = tok.allocate::<FixedByteArray>(&[0u8; 4]);
@@ -1610,7 +1673,8 @@ mod tests {
     #[test]
     #[should_panic(expected = "allocation token exhausted")]
     fn token_allocate_checks_capacity() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let total = Layout::from_size_align(64, 16).unwrap();
         let tok = heap.allocate_token(total);
         let _ = tok.allocate::<FixedByteArray>(&[0u8; 4096]);
@@ -1618,11 +1682,12 @@ mod tests {
 
     #[test]
     fn define_same_attributes_reuses_the_map() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let name = root_name(&scope, smi_name(1));
 
@@ -1656,7 +1721,8 @@ mod tests {
 
     #[test]
     fn shadow_store_defines_own_property_above_multiple_parents() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let writable = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
@@ -1664,7 +1730,7 @@ mod tests {
         // parent A (priority): writable smi(1) = 10; parent B: writable = 20
         let map_a = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(1, writable, Smi::new(0).encode())],
@@ -1675,7 +1741,7 @@ mod tests {
         );
         let map_b = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT,
             1,
             &[(1, writable, Smi::new(0).encode())],
@@ -1690,7 +1756,7 @@ mod tests {
             .into_handle(&scope);
         let child_map = alloc_map_proto(
             &mut heap,
-            &_roots,
+            &fx.roots,
             MapKind::OBJECT.union(MapKind::EXTENDABLE),
             0,
             &[],
@@ -1741,7 +1807,8 @@ mod tests {
     }
     #[test]
     fn redefine_attributes_share_cached_transition() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
@@ -1749,7 +1816,7 @@ mod tests {
         let writable = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         let map = alloc_map(
             &mut heap,
-            &_roots,
+            &fx.roots,
             kind,
             1,
             &[(1, writable, Smi::new(0).encode())],
@@ -1805,11 +1872,12 @@ mod tests {
 
     #[test]
     fn accessor_to_data_redefine_appends_slot() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
-        let map = alloc_map(&mut heap, &_roots, kind, 0, &[]);
+        let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
         let name = root_name(&scope, smi_name(1));
 
@@ -1851,7 +1919,8 @@ mod tests {
     }
     #[test]
     fn bootstrap_wires_function_prototype() {
-        let (_global, mut heap, _roots) = local_with_maps(1 << 16);
+        let fx = local_with_maps(1 << 16);
+        let mut heap = fx.local();
         heap.no_gc(|nogc| {
             let known = nogc.known();
             let fp = known.function_prototype.heap_ref(nogc);

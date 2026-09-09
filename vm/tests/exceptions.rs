@@ -1,10 +1,10 @@
 use bytecode::{Opcode, emit};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::{Thread, VM};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
     HandlerTable, HandlerTableInit, ObjectSlotsInit, Smi, Value,
 };
+use vm::{Thread, VM};
 
 fn smi(v: i64) -> Value {
     Smi::new(v).encode()

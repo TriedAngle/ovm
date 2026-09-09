@@ -1,7 +1,7 @@
 //! Builtins + direct eval end-to-end.
 
 use dummy_heap::{DummyHeap, DummyHeapConfig};
-use ovm::VM;
+use vm::VM;
 use vm::Value;
 
 fn vm() -> VM {
@@ -35,7 +35,7 @@ fn run_bool(vm: &VM, src: &str) -> bool {
     }
 }
 
-fn run_value(vm: &VM, src: &str) -> (Value, ovm::Thread) {
+fn run_value(vm: &VM, src: &str) -> (Value, vm::Thread) {
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
     (result, thread)
