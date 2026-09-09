@@ -2,11 +2,10 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
 use crate::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray,
-    Global, Handle, HandleData, HandleScope, Heap, Map, MapInit, MapKind, Object, ObjectInit,
-    RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged, Value,
+    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
+    Handle, HandleData, HandleScope, Heap, Map, MapInit, MapKind, Object, ObjectInit, RootHandles,
+    ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged, Value,
 };
-
 
 #[derive(Clone, Copy)]
 pub struct WellKnown {

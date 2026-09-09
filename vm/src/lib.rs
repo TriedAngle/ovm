@@ -60,10 +60,8 @@ pub use value::{
     WEAK_PTR, Word, encode_smi,
 };
 
-// Re-exports of the heap ABI crate (a crate-local `heap` module exists, so
-// `::heap` selects the dependency).
-pub use ::heap::{
-    AllocError, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell, RootVisitor, Visitor,
+pub use heap_api::{
+    AllocError, GcHost, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell, Visitor,
 };
 
 pub type Local<'scope, T> = Handle<'scope, T>;
@@ -152,8 +150,42 @@ unsafe impl Send for ContextState {}
 // in theory full isolation (and passing?) should be possible
 unsafe impl Sync for ContextState {}
 
+impl SharedVM {
+    fn visit_roots(&self, visitor: &mut dyn Visitor) {
+        self.interner.visit_edges(visitor);
+        self.roots.visit_edges(visitor);
+        self.heap.iterate_roots(visitor);
+        let threads = self.threads.lock().unwrap();
+        for state in threads.iter().filter_map(Weak::upgrade) {
+            state.visit_edges(visitor);
+        }
+    }
+
+    fn gc_host(&self) -> GcHost {
+        GcHost {
+            ctx: self as *const SharedVM as *const (),
+            visit_roots: host_visit_roots,
+            layout_of: host_layout_of,
+            visit_object: host_visit_object,
+        }
+    }
+}
+
+unsafe fn host_visit_roots(ctx: *const (), visitor: &mut dyn Visitor) {
+    let shared = unsafe { &*(ctx as *const SharedVM) };
+    shared.visit_roots(visitor);
+}
+
+unsafe fn host_layout_of(addr: NonNull<()>) -> core::alloc::Layout {
+    unsafe { object_layout(addr) }
+}
+
+unsafe fn host_visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
+    unsafe { visit_object(addr, visitor) }
+}
+
 impl EdgeVisitable for ContextState {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         self.handles.visit_edges(visitor);
         self.stack.visit_edges(visitor);
         self.cache.visit_edges(visitor);
@@ -312,6 +344,7 @@ impl VM {
             interner,
             natives: NativeRegistry::new(),
         });
+        shared.heap.set_host(shared.gc_host());
         let mut local = shared.heap.new_local(&shared.known);
         bootstrap_basics(&mut local, &shared.roots);
         intern_well_known_strings(&mut local, &shared.interner, &shared.roots);
@@ -349,14 +382,8 @@ impl VM {
             .insert(f)
     }
 
-    pub fn visit_roots(&self, visitor: &mut impl RootVisitor) {
-        self.shared.interner.visit_edges(visitor);
-        self.shared.roots.visit_edges(visitor);
-        self.shared.heap.iterate_roots(visitor);
-        let threads = self.shared.threads.lock().unwrap();
-        for state in threads.iter().filter_map(Weak::upgrade) {
-            state.visit_edges(visitor);
-        }
+    pub fn visit_roots(&self, visitor: &mut dyn Visitor) {
+        self.shared.visit_roots(visitor)
     }
 
     pub fn attach(&self) -> Thread {

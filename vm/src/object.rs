@@ -226,7 +226,7 @@ impl HeapObject for Map {
 }
 
 impl EdgeVisitable for Map {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.prototype.as_raw());
         visitor.visit(self.transitions.as_raw());
@@ -623,7 +623,7 @@ impl HeapObject for Object {
 }
 
 impl EdgeVisitable for Object {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.slots.as_raw());
         visitor.visit(self.elements.as_raw());
@@ -701,7 +701,7 @@ impl HeapObject for FixedArray {
 }
 
 impl EdgeVisitable for FixedArray {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         let size = self.size.to_smi().value() as usize;
         for i in 0..size {
@@ -781,7 +781,7 @@ impl HeapObject for FixedByteArray {
 }
 
 impl EdgeVisitable for FixedByteArray {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
     }
 }
@@ -883,7 +883,7 @@ impl HeapObject for VMString {
 }
 
 impl EdgeVisitable for VMString {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.backing.as_raw());
     }
@@ -920,7 +920,7 @@ impl HeapObject for InternedString {
 }
 
 impl EdgeVisitable for InternedString {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         self.0.visit_edges(visitor);
     }
 }
@@ -984,7 +984,7 @@ impl HeapObject for Symbol {
 }
 
 impl EdgeVisitable for Symbol {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.backing.as_raw());
     }
@@ -1081,7 +1081,7 @@ impl HeapObject for AccessorPair {
 }
 
 impl EdgeVisitable for AccessorPair {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.get.as_raw());
         visitor.visit(self.set.as_raw());
@@ -1196,7 +1196,7 @@ impl HeapObject for CallableInfoObject {
 }
 
 impl EdgeVisitable for CallableInfoObject {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.bytecode.as_raw());
         visitor.visit(self.constants.as_raw());
@@ -1367,7 +1367,7 @@ impl HeapObject for HandlerTable {
 }
 
 impl EdgeVisitable for HandlerTable {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
     }
 }
@@ -1410,7 +1410,7 @@ impl HeapObject for ScopeInfo {
 }
 
 impl EdgeVisitable for ScopeInfo {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.names.as_raw());
     }
@@ -1462,7 +1462,7 @@ impl HeapObject for Context {
 }
 
 impl EdgeVisitable for Context {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.outer.as_raw());
         visitor.visit(self.slots.as_raw());
@@ -1502,7 +1502,7 @@ impl HeapObject for Float {
 }
 
 impl EdgeVisitable for Float {
-    fn visit_edges(&self, visitor: &mut impl Visitor) {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
     }
 }
@@ -1539,7 +1539,7 @@ pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
     }
 }
 
-pub unsafe fn visit_object<V: Visitor>(addr: NonNull<()>, visitor: &mut V) {
+pub unsafe fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
     let kind = unsafe { object_kind(addr) };
     unsafe {
         match kind {
