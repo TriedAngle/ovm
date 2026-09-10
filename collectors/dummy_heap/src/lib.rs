@@ -31,10 +31,9 @@ unsafe impl Sync for DummyHeapState {}
 
 impl DummyHeapState {
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        let align = layout.align().max(4);
         let mut offset = self.offset.load(Ordering::Relaxed);
         loop {
-            let aligned = offset.next_multiple_of(align);
+            let aligned = offset.next_multiple_of(layout.align());
             let end = aligned
                 .checked_add(layout.size())
                 .ok_or(AllocError::OutOfMemory(layout))?;
