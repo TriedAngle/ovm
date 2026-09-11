@@ -205,10 +205,10 @@ fn sweep_coalesces_dead_block_with_surrounding_free_space() {
     // the tail merged with all trailing free space: everything but the two
     // live objects fits in one allocation
     let big = local
-        .allocate(Layout::from_size_align(state.capacity() - 3 * 16 * 1024, 8).unwrap())
+        .allocate(Layout::from_size_align(state.stats().capacity - 3 * 16 * 1024, 8).unwrap())
         .unwrap();
     assert_eq!(big.as_ptr() as usize, tail.as_ptr() as usize + 16 * 1024);
-    assert_eq!(state.stats().used, state.capacity());
+    assert_eq!(state.stats().used, state.stats().capacity);
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn used_plus_free_conserve_arena_after_cycles() {
     local.collect();
     local.collect();
 
-    assert_eq!(state.stats().used + state.free_bytes(), state.capacity());
+    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
     for ptr in keepers {
         assert!(state.contains(ptr.as_ptr() as usize));
     }
@@ -293,5 +293,34 @@ fn allocation_continues_across_external_cycles() {
 
     assert!(allocations.load(Ordering::Relaxed) > 0);
     state.collect_now();
-    assert_eq!(state.stats().used + state.free_bytes(), state.capacity());
+    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
+}
+
+#[test]
+fn heap_grows_and_shrinks_by_chunks() {
+    let (state, local, mut roots) = backend(1024 * 1024, Roots::empty());
+    let layout = Layout::from_size_align(16 * 1024, 8).unwrap();
+    assert_eq!(state.stats().capacity, 0);
+
+    let mut keepers = Vec::new();
+    for _ in 0..20 {
+        keepers.push(rooted(&local, &mut roots, layout));
+    }
+    // 20 x 16KB live spans two 256KB chunks
+    assert_eq!(state.active_chunks(), 2);
+    assert_eq!(state.stats().capacity, 512 * 1024);
+
+    roots.slots.clear();
+    drop(keepers);
+    local.collect();
+
+    // every chunk emptied: decommitted back to the pool
+    assert_eq!(state.active_chunks(), 0);
+    assert_eq!(state.stats().capacity, 0);
+    assert_eq!(state.stats().used, 0);
+
+    // allocation re-activates a pooled chunk
+    rooted(&local, &mut roots, layout);
+    assert_eq!(state.active_chunks(), 1);
+    assert_eq!(state.stats().capacity, 256 * 1024);
 }
