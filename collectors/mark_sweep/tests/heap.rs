@@ -486,3 +486,31 @@ fn parked_mutators_assist_marking() {
     assert_eq!(state.stats().used, CHAINS * CHAIN_LEN * 16);
     assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
 }
+
+#[test]
+fn background_sweeper_drains_pendings() {
+    let (state, local, _roots) = backend(8 * 1024 * 1024, Roots::empty());
+    let layout = Layout::from_size_align(16 * 1024, 8).unwrap();
+    for _ in 0..400 {
+        local.allocate(layout).unwrap();
+    }
+    assert!(state.active_chunks() >= 13);
+
+    // initiator and background sweeper race over ~26 pending chunks; the
+    // counter proves the background thread took part
+    let swept_before = state.background_sweeps();
+    local.collect();
+
+    assert_eq!(state.stats().used, 0);
+    assert!(state.background_sweeps() > swept_before);
+
+    // pooled chunks reactivate and the sweeper drains again
+    for _ in 0..200 {
+        local.allocate(layout).unwrap();
+    }
+    local.collect();
+
+    assert_eq!(state.stats().used, 0);
+    assert!(state.background_sweeps() > swept_before);
+    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
+}
