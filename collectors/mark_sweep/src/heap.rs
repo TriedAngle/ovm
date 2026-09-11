@@ -10,9 +10,10 @@ use heap_api::{
     STRONG_PTR, TAG_MASK, Visitor, WEAK_PTR, Word,
 };
 
-use heap_utils::{Bitmap, LocalNode, MMapBuffer, Safepoint};
+use heap_utils::{LocalNode, Safepoint};
 
-use crate::block::{ALIGN, FreeList};
+use crate::block::ALIGN;
+use crate::chunk::ChunkedHeap;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MarkSweepConfig {
@@ -22,15 +23,13 @@ pub struct MarkSweepConfig {
 impl Default for MarkSweepConfig {
     fn default() -> Self {
         Self {
-            heap_size: 256 * 1024 * 1024,
+            heap_size: 1024 * 1024 * 1024,
         }
     }
 }
 
 pub struct MarkSweepState {
-    buffer: MMapBuffer,
-    bitmap: Bitmap,
-    alloc: Mutex<FreeList>,
+    alloc: Mutex<ChunkedHeap>,
     safepoint: Safepoint,
     host: Mutex<Option<GcHost>>,
     cycles: AtomicUsize,
@@ -42,13 +41,8 @@ unsafe impl Sync for MarkSweepState {}
 
 impl MarkSweepState {
     pub fn new(config: MarkSweepConfig) -> Result<Arc<Self>, AllocError> {
-        let buffer = MMapBuffer::new(config.heap_size)?;
-        let base = buffer.start();
-        let size = buffer.size();
         Ok(Arc::new(Self {
-            bitmap: Bitmap::new(base.as_ptr() as usize, size, ALIGN),
-            alloc: Mutex::new(FreeList::covering(base, size)),
-            buffer,
+            alloc: Mutex::new(ChunkedHeap::new(config.heap_size)?),
             safepoint: Safepoint::new(),
             host: Mutex::new(None),
             cycles: AtomicUsize::new(0),
@@ -60,27 +54,23 @@ impl MarkSweepState {
         *self.host.lock().unwrap() = Some(host);
     }
 
-    pub fn base(&self) -> NonNull<u8> {
-        self.buffer.start()
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.buffer.size()
-    }
-
     pub fn cycles(&self) -> usize {
         self.cycles.load(Ordering::Relaxed)
     }
 
+    pub fn active_chunks(&self) -> usize {
+        self.alloc.lock().unwrap().active_chunks()
+    }
+
     pub fn contains(&self, addr: usize) -> bool {
-        self.buffer.contains(addr)
+        self.alloc.lock().unwrap().in_heap(addr)
     }
 
     pub fn stats(&self) -> HeapStats {
         let alloc = self.alloc.lock().unwrap();
         HeapStats {
             used: alloc.live_bytes(),
-            capacity: self.buffer.size(),
+            capacity: alloc.committed_bytes(),
         }
     }
 
@@ -97,16 +87,16 @@ impl MarkSweepState {
     }
 
     fn collect(&self) {
-        self.bitmap.clear_all();
-        self.mark();
-        self.clear_weaks();
         let host = self.host();
         let live = {
             let mut alloc = self.alloc.lock().unwrap();
-            alloc.sweep(self.buffer.start(), self.buffer.size(), &self.bitmap, &host);
-            alloc.live_bytes()
+            alloc.clear_bitmaps();
+            self.mark(&alloc, &host);
+            self.clear_weaks(&alloc, &host);
+            alloc.sweep(&host)
         };
-        let threshold = (live * 2).max(MIN_GC_THRESHOLD).min(self.buffer.size());
+        let reserve = self.alloc.lock().unwrap().reserve_size();
+        let threshold = (live * 2).max(MIN_GC_THRESHOLD).min(reserve);
         self.gc_threshold.store(threshold, Ordering::Relaxed);
         self.cycles.fetch_add(1, Ordering::Relaxed);
     }
@@ -124,10 +114,9 @@ impl MarkSweepState {
             .expect("host not registered before collection")
     }
 
-    fn mark(&self) {
-        let host = self.host();
+    fn mark(&self, heap: &ChunkedHeap, host: &GcHost) {
         let mut marker = Marker {
-            state: self,
+            heap,
             worklist: Vec::new(),
         };
         (host.visit_roots)(host.ctx, &mut marker);
@@ -137,19 +126,18 @@ impl MarkSweepState {
         }
     }
 
-    fn clear_weaks(&self) {
-        let host = self.host();
-        let mut clearer = WeakClearer { state: self };
+    fn clear_weaks(&self, heap: &ChunkedHeap, host: &GcHost) {
+        let mut clearer = WeakClearer { heap };
         (host.visit_roots)(host.ctx, &mut clearer);
-        for addr in self.bitmap.iter_set() {
+        heap.for_each_live(|addr| {
             let object = unsafe { NonNull::new_unchecked(addr as *mut ()) };
             (host.visit_object)(object, &mut clearer);
-        }
+        });
     }
 }
 
 struct Marker<'a> {
-    state: &'a MarkSweepState,
+    heap: &'a ChunkedHeap,
     worklist: Vec<usize>,
 }
 
@@ -158,7 +146,7 @@ impl Visitor for Marker<'_> {
         let word = cell.load();
         if word & TAG_MASK == STRONG_PTR {
             let addr = (word & !TAG_MASK) as usize;
-            if self.state.contains(addr) && self.state.bitmap.set(addr) {
+            if self.heap.in_heap(addr) && self.heap.chunk_of(addr).bitmap.set(addr) {
                 self.worklist.push(addr);
             }
         }
@@ -166,7 +154,7 @@ impl Visitor for Marker<'_> {
 }
 
 struct WeakClearer<'a> {
-    state: &'a MarkSweepState,
+    heap: &'a ChunkedHeap,
 }
 
 impl Visitor for WeakClearer<'_> {
@@ -174,7 +162,9 @@ impl Visitor for WeakClearer<'_> {
         let word = cell.load();
         if word & TAG_MASK == WEAK_PTR && word != CLEARED {
             let addr = (word & !TAG_MASK) as usize;
-            if !self.state.contains(addr) || !self.state.bitmap.is_set(addr) {
+            let dead = !self.heap.in_heap(addr)
+                || !self.heap.chunk_of(addr).bitmap.is_set(addr);
+            if dead {
                 cell.store_raw(CLEARED);
             }
         }
