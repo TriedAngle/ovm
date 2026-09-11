@@ -1,6 +1,6 @@
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 const PARKED: u8 = 0b01;
 const REQUESTED: u8 = 0b10;
@@ -43,6 +43,7 @@ struct BarrierState {
     armed: bool,
     stopped: usize,
     target: usize,
+    work_generation: usize,
 }
 
 pub struct Safepoint {
@@ -50,6 +51,7 @@ pub struct Safepoint {
     barrier: Mutex<BarrierState>,
     cond_stopped: Condvar,
     cond_resume: Condvar,
+    work: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 unsafe impl Send for Safepoint {}
@@ -72,14 +74,41 @@ impl Safepoint {
                 armed: false,
                 stopped: 0,
                 target: 0,
+                work_generation: 0,
             }),
             cond_stopped: Condvar::new(),
             cond_resume: Condvar::new(),
+            work: OnceLock::new(),
         }
     }
 
     pub fn is_armed(&self) -> bool {
         self.barrier.lock().unwrap().armed
+    }
+
+    /// Installs the closure parked threads run each time the armer publishes
+    /// work. Installed once, before any thread parks.
+    pub fn set_work(&self, work: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.work.set(work);
+    }
+
+    /// Wakes parked threads to run the installed work closure.
+    pub fn publish_work(&self) {
+        let mut barrier = self.barrier.lock().unwrap();
+        barrier.work_generation += 1;
+        self.cond_resume.notify_all();
+    }
+
+    fn work_pending(&self, barrier: &MutexGuard<'_, BarrierState>, serviced: &mut usize) -> bool {
+        if self.work.get().is_none() {
+            return false;
+        }
+        let generation = barrier.work_generation;
+        if generation == *serviced {
+            return false;
+        }
+        *serviced = generation;
+        true
     }
 
     pub fn attach(&self, node: &LocalNode) {
@@ -228,14 +257,30 @@ impl Safepoint {
         let mut barrier = self.barrier.lock().unwrap();
         barrier.stopped += 1;
         self.cond_stopped.notify_one();
+        let mut serviced = 0;
         while barrier.armed {
+            if self.work_pending(&barrier, &mut serviced) {
+                let work = self.work.get().unwrap();
+                drop(barrier);
+                work();
+                barrier = self.barrier.lock().unwrap();
+                continue;
+            }
             barrier = self.cond_resume.wait(barrier).unwrap();
         }
     }
 
     fn wait_disarmed(&self) {
         let mut barrier = self.barrier.lock().unwrap();
+        let mut serviced = 0;
         while barrier.armed {
+            if self.work_pending(&barrier, &mut serviced) {
+                let work = self.work.get().unwrap();
+                drop(barrier);
+                work();
+                barrier = self.barrier.lock().unwrap();
+                continue;
+            }
             barrier = self.cond_resume.wait(barrier).unwrap();
         }
     }

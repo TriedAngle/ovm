@@ -1,5 +1,5 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{FixedArray, HeapBackend, VM};
+use vm::{FixedArray, VM};
 
 fn vm() -> VM {
     heap_tests::vm::<MarkSweep>(MarkSweepConfig::default())

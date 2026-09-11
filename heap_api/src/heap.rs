@@ -63,6 +63,10 @@ pub struct HeapStats {
 }
 
 /// VM services a collector needs, registered once via `GlobalVtable::set_host`.
+///
+/// Callable from any thread: `visit_roots` runs once per cycle on the
+/// initiating thread while all mutators are stopped; `visit_object` may run
+/// concurrently on several marker threads and must only read.
 #[derive(Clone, Copy)]
 pub struct GcHost {
     pub ctx: *const (),
@@ -73,6 +77,9 @@ pub struct GcHost {
     /// Trace the object at `addr`
     pub visit_object: fn(addr: NonNull<()>, visitor: &mut dyn Visitor),
 }
+
+unsafe impl Send for GcHost {}
+unsafe impl Sync for GcHost {}
 
 pub struct HeapVtable {
     pub allocate_raw: fn(local: *mut (), layout: Layout) -> Result<NonNull<u8>, AllocError>,

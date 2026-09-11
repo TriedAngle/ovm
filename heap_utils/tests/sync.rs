@@ -148,9 +148,9 @@ fn panicking_gc_still_disarms() {
             sync.park_for_collection(&node);
         });
         let panicked = s.spawn(|| {
-            std::panic::catch_unwind(|| {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 sync.stop_the_world(None, || panic!("gc exploded"));
-            })
+            }))
             .unwrap_err();
         });
         assert!(panicked.join().is_ok());
