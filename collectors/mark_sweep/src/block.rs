@@ -52,20 +52,20 @@ impl FreeList {
         let mut run = self.head;
         while !run.is_null() {
             unsafe {
-                let avail = (*run).size;
-                if avail >= need {
-                    let remainder = avail - need;
+                let available = (*run).size;
+                if available >= need {
+                    let remainder = available - need;
                     let given = if remainder >= 2 * ALIGN {
-                        let rest = run.byte_add(need) as *mut FreeHeader;
-                        *rest = FreeHeader {
+                        let remainder_header = run.byte_add(need) as *mut FreeHeader;
+                        *remainder_header = FreeHeader {
                             size: remainder,
                             next: (*run).next,
                         };
-                        *link = rest;
+                        *link = remainder_header;
                         need
                     } else {
                         *link = (*run).next;
-                        avail
+                        available
                     };
                     self.free_bytes -= given;
                     self.live_bytes += given;

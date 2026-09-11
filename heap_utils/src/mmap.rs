@@ -46,6 +46,13 @@ impl MMapBuffer {
         let base = self.start.as_ptr() as usize;
         (base..base + self.size).contains(&addr)
     }
+    
+    pub fn decommit(&self, addr: NonNull<u8>, len: usize) {
+        debug_assert!(self.contains(addr.as_ptr() as usize));
+        unsafe {
+            libc::madvise(addr.as_ptr().cast(), len, libc::MADV_DONTNEED);
+        }
+    }
 }
 
 impl Drop for MMapBuffer {
