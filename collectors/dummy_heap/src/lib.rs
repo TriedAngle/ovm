@@ -126,6 +126,8 @@ fn erased_collection_requested(_local: *const ()) -> bool {
 
 fn erased_park_for_collection(_local: *const ()) {}
 
+fn erased_force_collect(_local: *const ()) {}
+
 fn erased_gc_in_progress(_local: *const ()) -> bool {
     false
 }
@@ -157,6 +159,8 @@ fn erased_global_gc_in_progress(_shared: *const ()) -> bool {
     false
 }
 
+fn erased_global_force_collect(_shared: *const ()) {}
+
 fn erased_global_contains(shared: *const (), addr: Word) -> bool {
     let state: &DummyHeapState = unsafe { &*shared.cast::<DummyHeapState>() };
     state.contains(addr)
@@ -183,6 +187,7 @@ static DUMMY_HEAP_VTABLE: HeapVtable = HeapVtable {
     write_barrier: erased_write_barrier,
     collection_requested: erased_collection_requested,
     park_for_collection: erased_park_for_collection,
+    force_collect: erased_force_collect,
     gc_in_progress: erased_gc_in_progress,
     drop_local: erased_drop_local,
 };
@@ -194,6 +199,7 @@ static DUMMY_GLOBAL_VTABLE: GlobalVtable = GlobalVtable {
     iterate_roots: erased_global_iterate_roots,
     should_collect: erased_global_should_collect,
     gc_in_progress: erased_global_gc_in_progress,
+    force_collect: erased_global_force_collect,
     contains: erased_global_contains,
     is_young: erased_global_is_young,
     stats: erased_global_stats,
@@ -1607,7 +1613,7 @@ mod tests {
         let data = HandleData::new(heap.known().void.value());
         let scope = scope(&data);
         let la = FixedArray::layout_for(1);
-        let total = Layout::from_size_align(2 * la.size(), 16).unwrap();
+        let total = vm::AllocToken::total_for(&[la, la]);
 
         let tok = heap.allocate_token(total);
         // multiple Fresh alive at once (shared borrows of the token)
@@ -1623,7 +1629,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let lb = FixedByteArray::layout_for(8);
-        let total = Layout::from_size_align(2 * lb.size(), 16).unwrap();
+        let total = vm::AllocToken::total_for(&[lb, lb]);
 
         let tok = heap.allocate_token(total);
         tok.enter_no_gc(|nogc| {

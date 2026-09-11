@@ -92,6 +92,9 @@ pub struct SharedVM {
     threads: Mutex<Vec<Weak<ContextState>>>,
     interner: StringInterner,
     natives: NativeRegistry,
+    /// Weak slots the GC clears when their targets die; used for tests and
+    /// the seed of a weak-registry feature.
+    weak_slots: Mutex<Vec<RawCell>>,
 }
 
 pub struct VM {
@@ -155,6 +158,9 @@ impl SharedVM {
         self.interner.visit_edges(visitor);
         self.roots.visit_edges(visitor);
         self.heap.iterate_roots(visitor);
+        for slot in self.weak_slots.lock().unwrap().iter() {
+            visitor.visit(slot);
+        }
         let threads = self.threads.lock().unwrap();
         for state in threads.iter().filter_map(Weak::upgrade) {
             state.visit_edges(visitor);
@@ -171,16 +177,16 @@ impl SharedVM {
     }
 }
 
-unsafe fn host_visit_roots(ctx: *const (), visitor: &mut dyn Visitor) {
+fn host_visit_roots(ctx: *const (), visitor: &mut dyn Visitor) {
     let shared = unsafe { &*(ctx as *const SharedVM) };
     shared.visit_roots(visitor);
 }
 
-unsafe fn host_layout_of(addr: NonNull<()>) -> core::alloc::Layout {
+fn host_layout_of(addr: NonNull<()>) -> core::alloc::Layout {
     unsafe { object_layout(addr) }
 }
 
-unsafe fn host_visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
+fn host_visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
     unsafe { visit_object(addr, visitor) }
 }
 
@@ -343,6 +349,7 @@ impl VM {
             threads: Mutex::new(Vec::new()),
             interner,
             natives: NativeRegistry::new(),
+            weak_slots: Mutex::new(Vec::new()),
         });
         shared.heap.set_host(shared.gc_host());
         let mut local = shared.heap.new_local(&shared.known);
@@ -384,6 +391,21 @@ impl VM {
 
     pub fn visit_roots(&self, visitor: &mut dyn Visitor) {
         self.shared.visit_roots(visitor)
+    }
+
+    /// Register a weak slot for `value` (must be a strong heap pointer);
+    /// returns its index. The GC clears the slot once the target dies.
+    pub fn track_weak(&self, value: Value) -> usize {
+        let weak = Value::from_bits(value.to_bits() | WEAK_BIT);
+        let mut slots = self.shared.weak_slots.lock().unwrap();
+        slots.push(unsafe { RawCell::from_word(weak.to_bits()) });
+        slots.len() - 1
+    }
+
+    /// Current contents of a tracked weak slot: the weak-tagged target, or
+    /// the cleared sentinel once the target died.
+    pub fn weak_value(&self, index: usize) -> Value {
+        Value::from_bits(self.shared.weak_slots.lock().unwrap()[index].load())
     }
 
     pub fn attach(&self) -> Thread {

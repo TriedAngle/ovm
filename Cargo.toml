@@ -6,6 +6,8 @@ members = [
     "collectors/dummy_heap",
     "collectors/mark_sweep",
     "heap_api",
+    "heap_tests",
+    "heap_utils",
     "parser",
     "vm",
 ]
