@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use core::alloc::Layout;
-use core::ptr::NonNull;
+use core::cell::Cell;
+use core::ptr::{self, NonNull};
 
 use heap_api::{
     AllocError, CLEARED, GcHost, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell,
@@ -11,7 +12,7 @@ use heap_api::{
 
 use heap_utils::{Bitmap, LocalNode, MMapBuffer, Safepoint};
 
-use crate::block::{self, ALIGN, BlockHeader, FreeList};
+use crate::block::{ALIGN, FreeList};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MarkSweepConfig {
@@ -33,6 +34,7 @@ pub struct MarkSweepState {
     safepoint: Safepoint,
     host: Mutex<Option<GcHost>>,
     cycles: AtomicUsize,
+    gc_threshold: AtomicUsize,
 }
 
 unsafe impl Send for MarkSweepState {}
@@ -50,6 +52,7 @@ impl MarkSweepState {
             safepoint: Safepoint::new(),
             host: Mutex::new(None),
             cycles: AtomicUsize::new(0),
+            gc_threshold: AtomicUsize::new(MIN_GC_THRESHOLD),
         }))
     }
 
@@ -81,6 +84,10 @@ impl MarkSweepState {
         }
     }
 
+    pub fn free_bytes(&self) -> usize {
+        self.alloc.lock().unwrap().free_bytes()
+    }
+
     pub fn collect_now(&self) {
         self.safepoint.stop_the_world(None, || self.collect());
     }
@@ -93,10 +100,19 @@ impl MarkSweepState {
         self.bitmap.clear_all();
         self.mark();
         self.clear_weaks();
-        let base = self.buffer.start();
-        let size = self.buffer.size();
-        self.alloc.lock().unwrap().sweep(base, size, &self.bitmap);
+        let host = self.host();
+        let live = {
+            let mut alloc = self.alloc.lock().unwrap();
+            alloc.sweep(self.buffer.start(), self.buffer.size(), &self.bitmap, &host);
+            alloc.live_bytes()
+        };
+        let threshold = (live * 2).max(MIN_GC_THRESHOLD).min(self.buffer.size());
+        self.gc_threshold.store(threshold, Ordering::Relaxed);
         self.cycles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn used_exceeds_threshold(&self) -> bool {
+        self.alloc.lock().unwrap().live_bytes() > self.gc_threshold.load(Ordering::Relaxed)
     }
 
     fn host(&self) -> GcHost {
@@ -125,15 +141,9 @@ impl MarkSweepState {
         let host = self.host();
         let mut clearer = WeakClearer { state: self };
         (host.visit_roots)(host.ctx, &mut clearer);
-        for block in block::blocks(self.buffer.start(), self.buffer.size()) {
-            let keep = !BlockHeader::is_free(block)
-                && self
-                    .bitmap
-                    .is_set(BlockHeader::payload(block).as_ptr() as usize);
-            if keep {
-                let object = BlockHeader::payload(block).cast::<()>();
-                (host.visit_object)(object, &mut clearer);
-            }
+        for addr in self.bitmap.iter_set() {
+            let object = unsafe { NonNull::new_unchecked(addr as *mut ()) };
+            (host.visit_object)(object, &mut clearer);
         }
     }
 }
@@ -175,14 +185,32 @@ impl Visitor for WeakClearer<'_> {
 pub struct MarkSweepLocal {
     state: Arc<MarkSweepState>,
     node: LocalNode,
+    tlab: Tlab,
+}
+
+struct Tlab {
+    cursor: Cell<*mut u8>,
+    end: Cell<*mut u8>,
+}
+
+const TLAB_SIZES: [usize; 2] = [32 * 1024, 8 * 1024];
+const MIN_GC_THRESHOLD: usize = 16 * 1024 * 1024;
+
+impl Tlab {
+    const fn empty() -> Self {
+        Self {
+            cursor: Cell::new(ptr::null_mut()),
+            end: Cell::new(ptr::null_mut()),
+        }
+    }
 }
 
 impl MarkSweepLocal {
-    /// Boxed: the intrusive safepoint node must not move after attach.
     pub fn new(state: Arc<MarkSweepState>) -> Box<Self> {
         let local = Box::new(Self {
             state,
             node: LocalNode::detached(),
+            tlab: Tlab::empty(),
         });
         local.state.safepoint.attach(&local.node);
         local
@@ -193,28 +221,93 @@ impl MarkSweepLocal {
     }
 
     pub fn collect(&self) {
+        self.invalidate_tlab();
         self.state
             .safepoint
             .stop_the_world(Some(&self.node), || self.state.collect());
     }
 
     pub fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        self.state.safepoint.park_for_collection(&self.node);
-        if let Some(block) = self.state.alloc_block(layout) {
-            return Ok(block);
+        self.park_if_requested();
+        let need = need_for(layout);
+        if let Some(ptr) = self.tlab_bump(need) {
+            return Ok(ptr);
         }
-        self.state
-            .safepoint
-            .stop_the_world(Some(&self.node), || self.state.collect());
-        if let Some(block) = self.state.alloc_block(layout) {
-            return Ok(block);
+        if self.state.used_exceeds_threshold() {
+            self.collect();
+        }
+        if let Some(ptr) = self.tlab_refill(need) {
+            return Ok(ptr);
+        }
+        if let Some(ptr) = self.state.alloc_block(layout) {
+            return Ok(ptr);
+        }
+        self.collect();
+        if let Some(ptr) = self.tlab_bump(need) {
+            return Ok(ptr);
+        }
+        if let Some(ptr) = self.tlab_refill(need) {
+            return Ok(ptr);
+        }
+        if let Some(ptr) = self.state.alloc_block(layout) {
+            return Ok(ptr);
         }
         Err(AllocError::OutOfMemory(layout))
     }
+
+    fn park_if_requested(&self) {
+        if self.node.requested() {
+            self.invalidate_tlab();
+            self.state.safepoint.park_for_collection(&self.node);
+        }
+    }
+
+    fn tlab_bump(&self, need: usize) -> Option<NonNull<u8>> {
+        let cursor = self.tlab.cursor.get();
+        if cursor.is_null() {
+            return None;
+        }
+        let next = cursor.wrapping_add(need);
+        if next > self.tlab.end.get() {
+            return None;
+        }
+        self.tlab.cursor.set(next);
+        Some(unsafe { NonNull::new_unchecked(cursor) })
+    }
+
+    fn tlab_refill(&self, need: usize) -> Option<NonNull<u8>> {
+        if need > *TLAB_SIZES.last().unwrap() {
+            return None;
+        }
+        self.invalidate_tlab();
+        for &size in &TLAB_SIZES {
+            let layout = Layout::from_size_align(size, ALIGN).unwrap();
+            if let Some(block) = self.state.alloc_block(layout) {
+                unsafe {
+                    self.tlab.cursor.set(block.as_ptr());
+                    self.tlab.end.set(block.as_ptr().add(size));
+                }
+                return self.tlab_bump(need);
+            }
+        }
+        None
+    }
+
+    fn invalidate_tlab(&self) {
+        self.tlab.cursor.set(ptr::null_mut());
+        self.tlab.end.set(ptr::null_mut());
+    }
+}
+
+fn need_for(layout: Layout) -> usize {
+    debug_assert!(layout.size() > 0, "zero-sized allocation");
+    debug_assert!(layout.align() <= ALIGN, "alignment above {ALIGN} unsupported");
+    layout.size().next_multiple_of(ALIGN)
 }
 
 impl Drop for MarkSweepLocal {
     fn drop(&mut self) {
+        self.invalidate_tlab();
         self.state.safepoint.detach(&self.node);
     }
 }
@@ -231,7 +324,7 @@ fn erased_collection_requested(local: *const ()) -> bool {
 
 fn erased_park_for_collection(local: *const ()) {
     let local = unsafe { &*local.cast::<MarkSweepLocal>() };
-    local.state.safepoint.park_for_collection(&local.node);
+    local.park_if_requested();
 }
 
 fn erased_force_collect(local: *const ()) {
