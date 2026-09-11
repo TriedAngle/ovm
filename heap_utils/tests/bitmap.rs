@@ -1,13 +1,13 @@
-use mark_sweep::bitmap::Bitmap;
+use heap_utils::Bitmap;
 use std::sync::Arc;
 
 const BASE: usize = 0x1000_0000;
 
 #[test]
-fn try_set_exactly_once() {
+fn set_exactly_once() {
     let bitmap = Bitmap::new(BASE, 4096, 8);
-    assert!(bitmap.try_set(BASE + 8));
-    assert!(!bitmap.try_set(BASE + 8));
+    assert!(bitmap.set(BASE + 8));
+    assert!(!bitmap.set(BASE + 8));
     assert!(bitmap.is_set(BASE + 8));
     assert!(!bitmap.is_set(BASE + 16));
 }
@@ -17,10 +17,10 @@ fn set_and_clear() {
     let bitmap = Bitmap::new(BASE, 4096, 8);
     bitmap.set(BASE + 16);
     assert!(bitmap.is_set(BASE + 16));
-    assert!(!bitmap.try_set(BASE + 16));
+    assert!(!bitmap.set(BASE + 16));
     bitmap.clear(BASE + 16);
     assert!(!bitmap.is_set(BASE + 16));
-    assert!(bitmap.try_set(BASE + 16));
+    assert!(bitmap.set(BASE + 16));
 }
 
 #[test]
@@ -47,16 +47,16 @@ fn iter_set_yields_ascending_addresses() {
 #[test]
 fn independent_granules() {
     let bitmap = Bitmap::new(BASE, 4096, 16);
-    assert!(bitmap.try_set(BASE + 32));
-    assert!(bitmap.try_set(BASE + 48));
-    assert!(!bitmap.try_set(BASE + 32));
+    assert!(bitmap.set(BASE + 32));
+    assert!(bitmap.set(BASE + 48));
+    assert!(!bitmap.set(BASE + 32));
     assert!(bitmap.is_set(BASE + 32));
     assert!(!bitmap.is_set(BASE + 64));
     assert_eq!(bitmap.granularity(), 16);
 }
 
 #[test]
-fn concurrent_try_set_claims_each_bit_once() {
+fn concurrent_set_claims_each_bit_once() {
     const BITS: usize = 512;
     let bitmap = Arc::new(Bitmap::new(BASE, BITS * 8, 8));
     let claimed = Arc::new(std::sync::Mutex::new(vec![0usize; BITS]));
@@ -67,7 +67,7 @@ fn concurrent_try_set_claims_each_bit_once() {
             let claimed = Arc::clone(&claimed);
             s.spawn(move || {
                 for i in 0..BITS {
-                    if bitmap.try_set(BASE + i * 8) {
+                    if bitmap.set(BASE + i * 8) {
                         claimed.lock().unwrap()[i] += 1;
                     }
                 }

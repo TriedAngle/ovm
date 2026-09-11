@@ -167,6 +167,16 @@ impl<'heap> AllocToken<'heap> {
         }
     }
 
+    /// Total layout for parts carved in order; matches the 16-byte minimum
+    /// alignment of [`AllocToken::allocate`].
+    pub fn total_for(parts: &[Layout]) -> Layout {
+        let mut end = 0usize;
+        for part in parts {
+            end = end.next_multiple_of(part.align().max(16)) + part.size();
+        }
+        Layout::from_size_align(end, 16).expect("token layout")
+    }
+
     pub fn allocate<T: HeapObject>(&self, config: T::Init<'_>) -> Fresh<'heap, T> {
         let mut ptr = self.bump(T::layout_for(&config)).cast::<T>();
         // the token's reservation already proves no GC can happen here
@@ -203,7 +213,7 @@ impl<'heap> AllocToken<'heap> {
     }
 
     fn bump(&self, layout: Layout) -> NonNull<u8> {
-        let aligned = (self.next.get() as usize).next_multiple_of(layout.align().max(4));
+        let aligned = (self.next.get() as usize).next_multiple_of(layout.align().max(16));
         let end = aligned + layout.size();
         assert!(end <= self.end as usize, "allocation token exhausted");
         self.next.set(end as *mut u8);
@@ -468,6 +478,12 @@ impl Heap {
         }
     }
 
+    /// Run one full collection cycle synchronously. The caller must hold no
+    /// unrooted objects.
+    pub fn collect(&mut self) {
+        (self.vtable.force_collect)(self.local);
+    }
+
     pub fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
         let raw = self
             .allocate_raw(T::layout_for(&config))
@@ -553,8 +569,10 @@ impl Heap {
     }
 
     pub fn allocate_token(&mut self, total: Layout) -> AllocToken<'_> {
+        let layout =
+            Layout::from_size_align(total.size(), total.align().max(16)).expect("token layout");
         let raw = self
-            .allocate_raw(total)
+            .allocate_raw(layout)
             .expect("heap allocation failed (out of memory)");
         AllocToken::new(self, raw, total)
     }
@@ -641,6 +659,12 @@ impl GlobalHeap {
 
     pub fn gc_in_progress(&self) -> bool {
         (self.vtable.gc_in_progress)(self.state)
+    }
+
+    /// Run one full collection cycle synchronously. Must not be called from
+    /// a thread that owns a local heap.
+    pub fn collect(&self) {
+        (self.vtable.force_collect)(self.state)
     }
 
     pub fn contains(&self, addr: Word) -> bool {
