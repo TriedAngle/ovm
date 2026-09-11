@@ -1,9 +1,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use core::alloc::Layout;
 use core::cell::Cell;
 use core::ptr::{self, NonNull};
+use std::thread::JoinHandle;
 
 use heap_api::{
     AllocError, CLEARED, GcHost, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell,
@@ -36,6 +37,15 @@ pub struct MarkSweepState {
     mark_assists: AtomicUsize,
     cycles: AtomicUsize,
     gc_threshold: AtomicUsize,
+    sweep_signal: Mutex<SweepSignal>,
+    sweep_cond: Condvar,
+    sweeper: Mutex<Option<JoinHandle<()>>>,
+    background_sweeps: AtomicUsize,
+}
+
+struct SweepSignal {
+    epoch: usize,
+    shutdown: bool,
 }
 
 unsafe impl Send for MarkSweepState {}
@@ -51,6 +61,13 @@ impl MarkSweepState {
             mark_assists: AtomicUsize::new(0),
             cycles: AtomicUsize::new(0),
             gc_threshold: AtomicUsize::new(MIN_GC_THRESHOLD),
+            sweep_signal: Mutex::new(SweepSignal {
+                epoch: 0,
+                shutdown: false,
+            }),
+            sweep_cond: Condvar::new(),
+            sweeper: Mutex::new(None),
+            background_sweeps: AtomicUsize::new(0),
         });
         let weak = Arc::downgrade(&this);
         this.safepoint.set_work(Box::new(move || {
@@ -63,6 +80,14 @@ impl MarkSweepState {
                 join_marking(&job, false);
             }
         }));
+        let sweeper = std::thread::Builder::new()
+            .name("mark-sweep-sweeper".into())
+            .spawn({
+                let state = Arc::as_ptr(&this) as usize;
+                move || sweeper_loop(state as *const MarkSweepState)
+            })
+            .ok();
+        *this.sweeper.lock().unwrap() = sweeper;
         Ok(this)
     }
 
@@ -78,8 +103,16 @@ impl MarkSweepState {
         self.mark_assists.load(Ordering::Relaxed)
     }
 
+    pub fn background_sweeps(&self) -> usize {
+        self.background_sweeps.load(Ordering::Relaxed)
+    }
+
     pub fn active_chunks(&self) -> usize {
         self.alloc.lock().unwrap().active_chunks()
+    }
+
+    pub fn pending_chunks(&self) -> usize {
+        self.alloc.lock().unwrap().pending_chunks()
     }
 
     pub fn contains(&self, addr: usize) -> bool {
@@ -137,24 +170,61 @@ impl MarkSweepState {
                 }
             });
         self.cycles.fetch_add(1, Ordering::Relaxed);
-        self.sweep_pending(&host, requester);
+        self.wake_sweeper();
+        self.sweep_to_completion(&host, requester);
     }
 
-    fn sweep_pending(&self, host: &GcHost, requester: Option<&MarkSweepLocal>) {
+    /// The initiating thread sweeps alongside the background sweeper (and
+    /// any lazy-sweeping mutators) until the cycle's pendings are drained.
+    fn sweep_to_completion(&self, host: &GcHost, requester: Option<&MarkSweepLocal>) {
         loop {
-            let claimed = self.alloc.lock().unwrap().claim_pending();
-            let Some(chunk) = claimed else { return };
-            let live = ChunkedHeap::sweep_claimed(&chunk, host);
+            if let Some(local) = requester {
+                local.park_if_requested();
+            }
+            let chunk = self.alloc.lock().unwrap().claim_pending();
+            if let Some(chunk) = chunk {
+                let live = ChunkedHeap::sweep_claimed(&chunk, host);
+                let completed = {
+                    let mut heap = self.alloc.lock().unwrap();
+                    heap.publish_swept(&chunk, live);
+                    heap.take_completed_live()
+                };
+                if let Some(live) = completed {
+                    self.update_threshold(live);
+                }
+                continue;
+            }
+            let drained = {
+                let heap = self.alloc.lock().unwrap();
+                heap.pending_chunks() == 0 && !heap.any_sweeping()
+            };
+            if drained {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    fn wake_sweeper(&self) {
+        let mut signal = self.sweep_signal.lock().unwrap();
+        signal.epoch += 1;
+        self.sweep_cond.notify_all();
+    }
+
+    fn drain_pending(&self) {
+        let Some(host) = self.try_host() else { return };
+        loop {
+            let chunk = self.alloc.lock().unwrap().claim_pending();
+            let Some(chunk) = chunk else { return };
+            let live = ChunkedHeap::sweep_claimed(&chunk, &host);
             let completed = {
                 let mut heap = self.alloc.lock().unwrap();
                 heap.publish_swept(&chunk, live);
                 heap.take_completed_live()
             };
+            self.background_sweeps.fetch_add(1, Ordering::Relaxed);
             if let Some(live) = completed {
                 self.update_threshold(live);
-            }
-            if let Some(local) = requester {
-                local.park_if_requested();
             }
         }
     }
@@ -266,6 +336,37 @@ impl MarkSweepState {
             let object = unsafe { NonNull::new_unchecked(addr as *mut ()) };
             (host.visit_object)(object, &mut clearer);
         });
+    }
+}
+
+fn sweeper_loop(state: *const MarkSweepState) {
+    let state = unsafe { &*state };
+    let mut seen_epoch = 0;
+    loop {
+        {
+            let mut signal = state.sweep_signal.lock().unwrap();
+            while signal.epoch == seen_epoch && !signal.shutdown {
+                signal = state.sweep_cond.wait(signal).unwrap();
+            }
+            if signal.shutdown {
+                return;
+            }
+            seen_epoch = signal.epoch;
+        }
+        state.drain_pending();
+    }
+}
+
+impl Drop for MarkSweepState {
+    fn drop(&mut self) {
+        {
+            let mut signal = self.sweep_signal.lock().unwrap();
+            signal.shutdown = true;
+            self.sweep_cond.notify_all();
+        }
+        if let Some(handle) = self.sweeper.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 }
 
