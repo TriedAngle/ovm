@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use core::alloc::Layout;
@@ -32,6 +32,8 @@ pub struct MarkSweepState {
     alloc: Mutex<ChunkedHeap>,
     safepoint: Safepoint,
     host: Mutex<Option<GcHost>>,
+    mark_job: Mutex<Option<Arc<MarkJob>>>,
+    mark_assists: AtomicUsize,
     cycles: AtomicUsize,
     gc_threshold: AtomicUsize,
 }
@@ -41,13 +43,27 @@ unsafe impl Sync for MarkSweepState {}
 
 impl MarkSweepState {
     pub fn new(config: MarkSweepConfig) -> Result<Arc<Self>, AllocError> {
-        Ok(Arc::new(Self {
+        let this = Arc::new(Self {
             alloc: Mutex::new(ChunkedHeap::new(config.heap_size)?),
             safepoint: Safepoint::new(),
             host: Mutex::new(None),
+            mark_job: Mutex::new(None),
+            mark_assists: AtomicUsize::new(0),
             cycles: AtomicUsize::new(0),
             gc_threshold: AtomicUsize::new(MIN_GC_THRESHOLD),
-        }))
+        });
+        let weak = Arc::downgrade(&this);
+        this.safepoint.set_work(Box::new(move || {
+            let Some(state) = weak.upgrade() else { return };
+            let Some(job) = state.mark_job.lock().unwrap().clone() else {
+                return;
+            };
+            if !job.done.load(Ordering::Acquire) {
+                state.mark_assists.fetch_add(1, Ordering::Relaxed);
+                join_marking(&job, false);
+            }
+        }));
+        Ok(this)
     }
 
     pub fn set_host(&self, host: GcHost) {
@@ -56,6 +72,10 @@ impl MarkSweepState {
 
     pub fn cycles(&self) -> usize {
         self.cycles.load(Ordering::Relaxed)
+    }
+
+    pub fn mark_assists(&self) -> usize {
+        self.mark_assists.load(Ordering::Relaxed)
     }
 
     pub fn active_chunks(&self) -> usize {
@@ -226,15 +246,17 @@ impl MarkSweepState {
     }
 
     fn mark(&self, heap: &ChunkedHeap, host: &GcHost) {
-        let mut marker = Marker {
-            heap,
-            worklist: Vec::new(),
-        };
-        (host.visit_roots)(host.ctx, &mut marker);
-        while let Some(addr) = marker.worklist.pop() {
-            let object = unsafe { NonNull::new_unchecked(addr as *mut ()) };
-            (host.visit_object)(object, &mut marker);
+        let job = Arc::new(MarkJob::new(heap, *host));
+        *self.mark_job.lock().unwrap() = Some(Arc::clone(&job));
+        self.safepoint.publish_work();
+        {
+            let mut scanner = RootScanner { job: &job };
+            (host.visit_roots)(host.ctx, &mut scanner);
         }
+        job.roots_scanned.store(true, Ordering::Release);
+        self.safepoint.publish_work();
+        join_marking(&job, true);
+        *self.mark_job.lock().unwrap() = None;
     }
 
     fn clear_weaks(&self, heap: &ChunkedHeap, host: &GcHost) {
@@ -247,21 +269,127 @@ impl MarkSweepState {
     }
 }
 
+const MARK_BATCH: usize = 32;
+const MARK_SPILL: usize = 512;
+const ASSIST_SPINS: usize = 256;
+
+struct MarkJob {
+    heap: *const ChunkedHeap,
+    host: GcHost,
+    worklist: Mutex<Vec<usize>>,
+    roots_scanned: AtomicBool,
+    active: AtomicUsize,
+    done: AtomicBool,
+}
+
+unsafe impl Send for MarkJob {}
+unsafe impl Sync for MarkJob {}
+
+impl MarkJob {
+    fn new(heap: &ChunkedHeap, host: GcHost) -> Self {
+        Self {
+            heap,
+            host,
+            worklist: Mutex::new(Vec::new()),
+            roots_scanned: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            done: AtomicBool::new(false),
+        }
+    }
+
+    fn heap(&self) -> &ChunkedHeap {
+        unsafe { &*self.heap }
+    }
+
+    fn claim(&self, cell: &RawCell) -> Option<usize> {
+        let word = cell.load();
+        if word & TAG_MASK != STRONG_PTR {
+            return None;
+        }
+        let addr = (word & !TAG_MASK) as usize;
+        let heap = self.heap();
+        (heap.in_heap(addr) && heap.chunk_of(addr).bitmap.set(addr)).then_some(addr)
+    }
+
+    fn steal(&self, local: &mut Vec<usize>) {
+        let mut worklist = self.worklist.lock().unwrap();
+        let take = MARK_BATCH.min(worklist.len());
+        if take > 0 {
+            let split = worklist.len() - take;
+            local.append(&mut worklist.split_off(split));
+        }
+    }
+
+    fn spill(&self, local: &mut Vec<usize>) {
+        let mut worklist = self.worklist.lock().unwrap();
+        let split = local.len() / 2;
+        worklist.append(&mut local.split_off(split));
+    }
+}
+
+struct RootScanner<'a> {
+    job: &'a MarkJob,
+}
+
+impl Visitor for RootScanner<'_> {
+    fn visit(&mut self, cell: &RawCell) {
+        if let Some(addr) = self.job.claim(cell) {
+            self.job.worklist.lock().unwrap().push(addr);
+        }
+    }
+}
+
 struct Marker<'a> {
-    heap: &'a ChunkedHeap,
-    worklist: Vec<usize>,
+    job: &'a MarkJob,
+    local: Vec<usize>,
 }
 
 impl Visitor for Marker<'_> {
     fn visit(&mut self, cell: &RawCell) {
-        let word = cell.load();
-        if word & TAG_MASK == STRONG_PTR {
-            let addr = (word & !TAG_MASK) as usize;
-            if self.heap.in_heap(addr) && self.heap.chunk_of(addr).bitmap.set(addr) {
-                self.worklist.push(addr);
+        if let Some(addr) = self.job.claim(cell) {
+            self.local.push(addr);
+            if self.local.len() > MARK_SPILL {
+                self.job.spill(&mut self.local);
             }
         }
     }
+}
+
+fn join_marking(job: &MarkJob, persistent: bool) {
+    let mut marker = Marker {
+        job,
+        local: Vec::new(),
+    };
+    let mut spins = 0;
+    job.active.fetch_add(1, Ordering::AcqRel);
+    loop {
+        if job.done.load(Ordering::Acquire) {
+            break;
+        }
+        if marker.local.is_empty() {
+            job.steal(&mut marker.local);
+        }
+        if marker.local.is_empty() {
+            if job.roots_scanned.load(Ordering::Acquire)
+                && job.active.load(Ordering::Acquire) == 1
+                && job.worklist.lock().unwrap().is_empty()
+            {
+                job.done.store(true, Ordering::Release);
+                break;
+            }
+            if !persistent && spins >= ASSIST_SPINS {
+                break;
+            }
+            spins += 1;
+            std::thread::yield_now();
+            continue;
+        }
+        spins = 0;
+        let addr = marker.local.pop().unwrap();
+        let object = unsafe { NonNull::new_unchecked(addr as *mut ()) };
+        (job.host.visit_object)(object, &mut marker);
+    }
+    job.active.fetch_sub(1, Ordering::Release);
 }
 
 struct WeakClearer<'a> {
