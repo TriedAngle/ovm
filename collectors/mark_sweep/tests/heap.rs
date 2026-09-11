@@ -2,21 +2,28 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 use heap_api::{
-    AllocError, GcHost, HeapBackend, RawCell, Visitor, Word, CLEARED, STRONG_PTR, WEAK_PTR,
+    AllocError, GcHost, HeapBackend, RawCell, TAG_MASK, Visitor, Word, CLEARED, STRONG_PTR,
+    WEAK_PTR,
 };
 
 use mark_sweep::heap::{MarkSweep, MarkSweepConfig, MarkSweepLocal, MarkSweepState};
 
-use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
-thread_local! {
-    static SIZES: RefCell<Vec<(usize, usize)>> = RefCell::new(Vec::new());
-}
+static SIZES: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn register(addr: NonNull<u8>, size: usize) {
-    SIZES.with(|sizes| sizes.borrow_mut().push((addr.as_ptr() as usize, size)));
+    SIZES.lock().unwrap().insert(addr.as_ptr() as usize, size);
+}
+
+fn registered_size(addr: usize) -> usize {
+    *SIZES.lock()
+        .unwrap()
+        .get(&addr)
+        .expect("layout requested for unregistered object")
 }
 
 struct Roots {
@@ -31,8 +38,20 @@ impl Roots {
     }
 
     fn install(self, state: &MarkSweepState) -> Box<Self> {
+        self.install_with(state, host_for)
+    }
+
+    fn install_linked(self, state: &MarkSweepState) -> Box<Self> {
+        self.install_with(state, linked_host_for)
+    }
+
+    fn install_with(
+        self,
+        state: &MarkSweepState,
+        host: fn(&Roots) -> GcHost,
+    ) -> Box<Self> {
         let boxed = Box::new(self);
-        state.set_host(host_for(boxed.as_ref()));
+        state.set_host(host(boxed.as_ref()));
         boxed
     }
 
@@ -61,19 +80,15 @@ fn rooted(
     ptr
 }
 
-fn host_for(roots: &Roots) -> GcHost {
+fn host_with(roots: &Roots, visit_object: fn(NonNull<()>, &mut dyn Visitor)) -> GcHost {
     fn visit_roots(ctx: *const (), visitor: &mut dyn Visitor) {
         let roots = unsafe { &*(ctx as *const Roots) };
         for slot in &roots.slots {
             visitor.visit(slot);
         }
     }
-    fn visit_object(_addr: NonNull<()>, _visitor: &mut dyn Visitor) {}
     fn layout_of(addr: NonNull<()>) -> Layout {
-        let addr = addr.as_ptr() as usize;
-        let size = SIZES
-            .with(|sizes| sizes.borrow().iter().find(|(a, _)| *a == addr).map(|(_, s)| *s))
-            .expect("layout requested for unregistered object");
+        let size = registered_size(addr.as_ptr() as usize);
         Layout::from_size_align(size, 8).unwrap()
     }
     GcHost {
@@ -82,6 +97,24 @@ fn host_for(roots: &Roots) -> GcHost {
         layout_of,
         visit_object,
     }
+}
+
+fn host_for(roots: &Roots) -> GcHost {
+    fn visit_object(_addr: NonNull<()>, _visitor: &mut dyn Visitor) {}
+    host_with(roots, visit_object)
+}
+
+/// Traces the first payload word as a tagged next pointer, so chains built
+/// by the test form a real object graph.
+fn linked_host_for(roots: &Roots) -> GcHost {
+    fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
+        let word = unsafe { *(addr.as_ptr() as *const Word) };
+        if word & TAG_MASK == STRONG_PTR {
+            let cell = unsafe { RawCell::from_word(word) };
+            visitor.visit(&cell);
+        }
+    }
+    host_with(roots, visit_object)
 }
 
 fn backend(
@@ -363,4 +396,93 @@ fn sweep_clears_its_own_chunk_bitmap() {
     // every sweep consumed and cleared its own chunk's bits
     assert!(chunk_bitmap_is_clear(&heap, objects[0]));
     assert_eq!(heap.live_bytes(), 2 * 48);
+}
+
+fn build_chain(local: &MarkSweepLocal, layout: Layout, len: usize) -> Word {
+    let mut head: Word = 0;
+    for _ in 0..len {
+        let node = local.allocate(layout).unwrap();
+        register(node, layout.size());
+        unsafe { *(node.as_ptr() as *mut Word) = head };
+        head = node.as_ptr() as Word | STRONG_PTR;
+    }
+    head
+}
+
+#[test]
+fn marking_traces_linked_chains_exactly() {
+    const CHAINS: usize = 512;
+    const CHAIN_LEN: usize = 256;
+    let state = MarkSweepState::new(MarkSweepConfig { heap_size: 8 * 1024 * 1024 }).unwrap();
+    let mut roots = Roots::empty();
+    let local = MarkSweepLocal::new(Arc::clone(&state));
+    let layout = Layout::from_size_align(16, 8).unwrap();
+
+    for _ in 0..CHAINS {
+        let head = build_chain(&local, layout, CHAIN_LEN);
+        roots.slots.push(unsafe { RawCell::from_word(head) });
+    }
+    let mut roots = roots.install_linked(&state);
+
+    local.collect();
+
+    assert_eq!(state.stats().used, CHAINS * CHAIN_LEN * 16);
+
+    roots.slots.clear();
+    local.collect();
+
+    assert_eq!(state.stats().used, 0);
+}
+
+#[test]
+fn parked_mutators_assist_marking() {
+    const CHAINS: usize = 512;
+    const CHAIN_LEN: usize = 256;
+    let state = MarkSweepState::new(MarkSweepConfig { heap_size: 8 * 1024 * 1024 }).unwrap();
+    let mut roots = Roots::empty();
+    let local = MarkSweepLocal::new(Arc::clone(&state));
+    let layout = Layout::from_size_align(16, 8).unwrap();
+
+    for _ in 0..CHAINS {
+        let head = build_chain(&local, layout, CHAIN_LEN);
+        roots.slots.push(unsafe { RawCell::from_word(head) });
+    }
+    let _roots = roots.install_linked(&state);
+    // the builder's node must not be part of upcoming cycles
+    drop(local);
+
+    // mutators poll the safepoint through allocation; their allocations
+    // are unrooted garbage, dropped the moment they are made
+    let running = Arc::new(AtomicBool::new(true));
+    let mut threads = Vec::new();
+    for _ in 0..3 {
+        let state = Arc::clone(&state);
+        let running = Arc::clone(&running);
+        threads.push(std::thread::spawn(move || {
+            let local = MarkSweepLocal::new(state);
+            let layout = Layout::from_size_align(16, 8).unwrap();
+            while running.load(Ordering::Relaxed) {
+                local.allocate(layout).unwrap();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    for _ in 0..3 {
+        state.collect_now();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    running.store(false, Ordering::Relaxed);
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    assert!(state.cycles() >= 3);
+    assert!(state.mark_assists() > 0);
+
+    state.collect_now();
+
+    assert_eq!(state.stats().used, CHAINS * CHAIN_LEN * 16);
+    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
 }

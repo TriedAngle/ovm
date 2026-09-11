@@ -1,6 +1,6 @@
 use heap_tests::for_each_backend;
 
-use vm::{FixedArray, HeapBackend, SlotName, Smi, VM, VMString, Value};
+use vm::{FixedArray, HeapBackend, SlotName, Smi, VMString};
 
 fn well_known_survive_cycles<B: HeapBackend>()
 where
