@@ -1,2 +1,4 @@
-pub mod bitmap;
-pub mod sync;
+pub mod block;
+pub mod heap;
+
+pub use heap::{MarkSweep, MarkSweepConfig};

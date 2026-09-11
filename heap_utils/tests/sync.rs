@@ -1,4 +1,4 @@
-use mark_sweep::sync::{LocalNode, Safepoint};
+use heap_utils::{LocalNode, Safepoint};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn spin_until(mut f: impl FnMut() -> bool) {

@@ -41,15 +41,10 @@ impl Bitmap {
 
     /// Sets the bit at `addr`. Returns `true` if this call set it, `false`
     /// if it was already set.
-    pub fn try_set(&self, addr: usize) -> bool {
+    pub fn set(&self, addr: usize) -> bool {
         let (word, bit) = self.index(addr);
         let mask = 1u64 << bit;
         self.words[word].fetch_or(mask, Ordering::AcqRel) & mask == 0
-    }
-
-    pub fn set(&self, addr: usize) {
-        let (word, bit) = self.index(addr);
-        self.words[word].fetch_or(1u64 << bit, Ordering::AcqRel);
     }
 
     pub fn clear(&self, addr: usize) {

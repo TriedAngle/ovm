@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 heap_api = { path = "../../heap_api" }
+heap_utils = { path = "../../heap_utils" }

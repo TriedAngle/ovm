@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use core::alloc::Layout;
 
 use crate::{
-    AccessorPair, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef, Lookup, Map,
-    MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
+    AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef,
+    Lookup, Map, MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
 };
 
 /// Serializes map-transition tree mutations across threads. VM-internal:
@@ -173,16 +173,12 @@ impl Transition {
 
         let map_layout = Map::layout_for(descriptor_count + appends);
         let pairs_layout = FixedArray::layout_for(pairs_len + 2);
-        let mut total = map_layout
-            .extend(pairs_layout)
-            .expect("transition layout")
-            .0;
-        if pair.is_some() {
-            total = Layout::new::<AccessorPair>()
-                .extend(total)
-                .expect("transition layout")
-                .0;
-        }
+        let total = match pair.is_some() {
+            true => {
+                AllocToken::total_for(&[Layout::new::<AccessorPair>(), map_layout, pairs_layout])
+            }
+            false => AllocToken::total_for(&[map_layout, pairs_layout]),
+        };
 
         heap.allocate_token_enter_nogc(total, |token, nogc| {
             let parent_ref = parent(nogc);
