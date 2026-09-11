@@ -6,6 +6,12 @@ use heap_utils::Bitmap;
 
 pub const ALIGN: usize = 16;
 
+pub fn need_for(layout: Layout) -> usize {
+    debug_assert!(layout.size() > 0, "zero-sized allocation");
+    debug_assert!(layout.align() <= ALIGN, "alignment above {ALIGN} unsupported");
+    layout.size().next_multiple_of(ALIGN)
+}
+
 /// Header of a free run
 #[repr(C)]
 pub struct FreeHeader {
@@ -45,9 +51,7 @@ impl FreeList {
 
     /// First-fit
     pub fn allocate(&mut self, layout: Layout) -> Option<NonNull<u8>> {
-        debug_assert!(layout.size() > 0, "zero-sized allocation");
-        debug_assert!(layout.align() <= ALIGN, "alignment above {ALIGN} unsupported");
-        let need = layout.size().next_multiple_of(ALIGN);
+        let need = need_for(layout);
         let mut link: *mut *mut FreeHeader = ptr::from_mut(&mut self.head);
         let mut run = self.head;
         while !run.is_null() {

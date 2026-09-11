@@ -324,3 +324,43 @@ fn heap_grows_and_shrinks_by_chunks() {
     assert_eq!(state.active_chunks(), 1);
     assert_eq!(state.stats().capacity, 256 * 1024);
 }
+
+#[test]
+fn sweep_clears_its_own_chunk_bitmap() {
+    use mark_sweep::chunk::ChunkedHeap;
+
+    fn chunk_bitmap_is_clear(heap: &ChunkedHeap, addr: usize) -> bool {
+        let chunk = heap.chunk_of(addr);
+        let base = chunk.base();
+        (base..base + chunk.size())
+            .step_by(16)
+            .all(|granule| !chunk.bitmap.is_set(granule))
+    }
+
+    let mut heap = ChunkedHeap::new(64 * 1024).unwrap();
+    let layout = Layout::from_size_align(48, 8).unwrap();
+    let host = host_for(&Roots::empty());
+    let mut objects = Vec::new();
+    for _ in 0..4 {
+        let (ptr, claimed) = heap.allocate(layout, None);
+        assert!(claimed.is_none());
+        let ptr = ptr.unwrap();
+        register(ptr, layout.size());
+        objects.push(ptr.as_ptr() as usize);
+    }
+
+    // simulate a mark phase: half the objects are live
+    for &addr in &objects[..2] {
+        assert!(heap.chunk_of(addr).bitmap.set(addr));
+    }
+
+    heap.flag_all_pending();
+    while let Some(chunk) = heap.claim_pending() {
+        let live_bytes = ChunkedHeap::sweep_claimed(&chunk, &host);
+        heap.publish_swept(&chunk, live_bytes);
+    }
+
+    // every sweep consumed and cleared its own chunk's bits
+    assert!(chunk_bitmap_is_clear(&heap, objects[0]));
+    assert_eq!(heap.live_bytes(), 2 * 48);
+}

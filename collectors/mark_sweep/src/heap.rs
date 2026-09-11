@@ -12,7 +12,7 @@ use heap_api::{
 
 use heap_utils::{LocalNode, Safepoint};
 
-use crate::block::ALIGN;
+use crate::block::{need_for, ALIGN};
 use crate::chunk::ChunkedHeap;
 
 #[derive(Debug, Clone, Copy)]
@@ -79,30 +79,141 @@ impl MarkSweepState {
     }
 
     pub fn collect_now(&self) {
-        self.safepoint.stop_the_world(None, || self.collect());
+        self.collect_internal(None);
     }
 
-    fn alloc_block(&self, layout: Layout) -> Option<NonNull<u8>> {
-        self.alloc.lock().unwrap().allocate(layout)
+    fn finish_sweeping(&self, host: &GcHost) {
+        {
+            let mut heap = self.alloc.lock().unwrap();
+            heap.set_sweep_block(true);
+        }
+        loop {
+            let ready = {
+                let mut heap = self.alloc.lock().unwrap();
+                heap.finish_pending(host)
+            };
+            if ready {
+                return;
+            }
+            std::thread::yield_now();
+        }
     }
 
-    fn collect(&self) {
+    fn collect_internal(&self, requester: Option<&MarkSweepLocal>) {
         let host = self.host();
-        let live = {
-            let mut alloc = self.alloc.lock().unwrap();
-            alloc.clear_bitmaps();
-            self.mark(&alloc, &host);
-            self.clear_weaks(&alloc, &host);
-            alloc.sweep(&host)
-        };
+        self.safepoint
+            .stop_the_world(requester.map(|local| &local.node), || {
+                self.finish_sweeping(&host);
+                let completed = {
+                    let mut heap = self.alloc.lock().unwrap();
+                    self.mark(&heap, &host);
+                    self.clear_weaks(&heap, &host);
+                    heap.flag_all_pending();
+                    heap.set_sweep_block(false);
+                    heap.take_completed_live()
+                };
+                if let Some(live) = completed {
+                    self.update_threshold(live);
+                }
+            });
+        self.cycles.fetch_add(1, Ordering::Relaxed);
+        self.sweep_pending(&host, requester);
+    }
+
+    fn sweep_pending(&self, host: &GcHost, requester: Option<&MarkSweepLocal>) {
+        loop {
+            let claimed = self.alloc.lock().unwrap().claim_pending();
+            let Some(chunk) = claimed else { return };
+            let live = ChunkedHeap::sweep_claimed(&chunk, host);
+            let completed = {
+                let mut heap = self.alloc.lock().unwrap();
+                heap.publish_swept(&chunk, live);
+                heap.take_completed_live()
+            };
+            if let Some(live) = completed {
+                self.update_threshold(live);
+            }
+            if let Some(local) = requester {
+                local.park_if_requested();
+            }
+        }
+    }
+
+    fn update_threshold(&self, live: usize) {
         let reserve = self.alloc.lock().unwrap().reserve_size();
         let threshold = (live * 2).max(MIN_GC_THRESHOLD).min(reserve);
         self.gc_threshold.store(threshold, Ordering::Relaxed);
-        self.cycles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn collect_terminal(
+        &self,
+        requester: Option<&LocalNode>,
+        layout: Layout,
+    ) -> TerminalAllocation {
+        let host = self.host();
+        let mut executed = false;
+        let mut allocated = None;
+        self.safepoint.stop_the_world(requester, || {
+            executed = true;
+            self.finish_sweeping(&host);
+            let (ptr, completed) = {
+                let mut heap = self.alloc.lock().unwrap();
+                self.mark(&heap, &host);
+                self.clear_weaks(&heap, &host);
+                heap.flag_all_pending();
+                heap.finish_pending(&host);
+                let (ptr, _) = heap.allocate(layout, Some(&host));
+                heap.set_sweep_block(false);
+                (ptr, heap.take_completed_live())
+            };
+            if let Some(live) = completed {
+                self.update_threshold(live);
+            }
+            allocated = ptr;
+        });
+        if executed {
+            self.cycles.fetch_add(1, Ordering::Relaxed);
+            TerminalAllocation::Done(allocated)
+        } else {
+            TerminalAllocation::Absorbed
+        }
     }
 
     fn used_exceeds_threshold(&self) -> bool {
         self.alloc.lock().unwrap().live_bytes() > self.gc_threshold.load(Ordering::Relaxed)
+    }
+
+    fn alloc_block(&self, layout: Layout) -> Option<NonNull<u8>> {
+        let host = self.try_host();
+        loop {
+            let (ptr, claimed, completed) = {
+                let mut heap = self.alloc.lock().unwrap();
+                let (ptr, claimed) = heap.allocate(layout, host.as_ref());
+                (ptr, claimed, heap.take_completed_live())
+            };
+            if let Some(live) = completed {
+                self.update_threshold(live);
+            }
+            let Some(ptr) = ptr else {
+                let Some(chunk) = claimed else { return None };
+                let host = host.expect("claimed pending chunk without host");
+                let live = ChunkedHeap::sweep_claimed(&chunk, &host);
+                let completed = {
+                    let mut heap = self.alloc.lock().unwrap();
+                    heap.publish_swept(&chunk, live);
+                    heap.take_completed_live()
+                };
+                if let Some(live) = completed {
+                    self.update_threshold(live);
+                }
+                continue;
+            };
+            return Some(ptr);
+        }
+    }
+
+    fn try_host(&self) -> Option<GcHost> {
+        self.host.lock().unwrap().as_ref().copied()
     }
 
     fn host(&self) -> GcHost {
@@ -185,6 +296,12 @@ struct Tlab {
 
 const TLAB_SIZES: [usize; 2] = [32 * 1024, 8 * 1024];
 const MIN_GC_THRESHOLD: usize = 16 * 1024 * 1024;
+const TRANSIENT_ATTEMPTS: usize = 2;
+
+enum TerminalAllocation {
+    Absorbed,
+    Done(Option<NonNull<u8>>),
+}
 
 impl Tlab {
     const fn empty() -> Self {
@@ -212,9 +329,7 @@ impl MarkSweepLocal {
 
     pub fn collect(&self) {
         self.invalidate_tlab();
-        self.state
-            .safepoint
-            .stop_the_world(Some(&self.node), || self.state.collect());
+        self.state.collect_internal(Some(self));
     }
 
     pub fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
@@ -229,20 +344,32 @@ impl MarkSweepLocal {
         if let Some(ptr) = self.tlab_refill(need) {
             return Ok(ptr);
         }
-        if let Some(ptr) = self.state.alloc_block(layout) {
-            return Ok(ptr);
+        // Contended slow path. A collect may be absorbed by another
+        // thread's cycle whose memory siblings consume before the retry
+        for _ in 0..TRANSIENT_ATTEMPTS {
+            if let Some(ptr) = self.state.alloc_block(layout) {
+                return Ok(ptr);
+            }
+            self.collect();
+            if let Some(ptr) = self.tlab_bump(need) {
+                return Ok(ptr);
+            }
+            if let Some(ptr) = self.tlab_refill(need) {
+                return Ok(ptr);
+            }
         }
-        self.collect();
-        if let Some(ptr) = self.tlab_bump(need) {
-            return Ok(ptr);
+        loop {
+            if let Some(ptr) = self.state.alloc_block(layout) {
+                return Ok(ptr);
+            }
+            match self.state.collect_terminal(Some(&self.node), layout) {
+                TerminalAllocation::Done(Some(ptr)) => return Ok(ptr),
+                TerminalAllocation::Done(None) => {
+                    return Err(AllocError::OutOfMemory(layout))
+                }
+                TerminalAllocation::Absorbed => continue,
+            }
         }
-        if let Some(ptr) = self.tlab_refill(need) {
-            return Ok(ptr);
-        }
-        if let Some(ptr) = self.state.alloc_block(layout) {
-            return Ok(ptr);
-        }
-        Err(AllocError::OutOfMemory(layout))
     }
 
     fn park_if_requested(&self) {
@@ -287,12 +414,6 @@ impl MarkSweepLocal {
         self.tlab.cursor.set(ptr::null_mut());
         self.tlab.end.set(ptr::null_mut());
     }
-}
-
-fn need_for(layout: Layout) -> usize {
-    debug_assert!(layout.size() > 0, "zero-sized allocation");
-    debug_assert!(layout.align() <= ALIGN, "alignment above {ALIGN} unsupported");
-    layout.size().next_multiple_of(ALIGN)
 }
 
 impl Drop for MarkSweepLocal {
