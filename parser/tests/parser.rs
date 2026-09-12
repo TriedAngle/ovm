@@ -955,8 +955,8 @@ fn class_expression_and_members() {
 #[test]
 fn class_early_errors() {
     parse_err("class C { constructor() {} constructor() {} }"); // duplicate
-    parse_err("class C { static constructor() {} }");
     parse_err("class C { get constructor() {} }");
+    parse_err("class C { static prototype() {} }"); // ES 15.7.1
     parse_err("class C { x = 1; }"); // fields not supported yet
     parse_err("class C { static { } }"); // static blocks not supported yet
     parse_err("class { }"); // declaration needs a name
@@ -964,6 +964,8 @@ fn class_early_errors() {
     parse_err("class C { set x() {} }");
     // `static` as a member name still works
     parse("class C { static() {} }");
+    // a static member named "constructor" is an ordinary method
+    parse("class C { static constructor() {} }");
     // class declarations are lexical
     parse_err("class C {} class C {}");
     parse_err("class C {} var C;");

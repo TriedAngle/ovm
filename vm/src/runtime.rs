@@ -268,6 +268,26 @@ impl Runtime {
         })
     }
 
+    pub fn canonical_key_value(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        v: Value,
+    ) -> Result<Value, VmError> {
+        let bytes = heap.no_gc(|nogc| {
+            v.get_as::<VMString>(nogc)
+                .map(|s| s.as_slice(nogc).to_vec())
+        });
+        match bytes {
+            Some(bytes) => {
+                let interned =
+                    state.handle_scope(|scope| vm.interner().intern(heap, &scope, bytes).value());
+                Ok(interned)
+            }
+            None => Ok(v),
+        }
+    }
+
     /// ES 13.5.3 typeof: the well-known type string for a value. `null`
     /// reports `"object"`; callables report `"function"`.
     pub fn type_of(heap: &mut Heap, v: Value) -> Value {
@@ -275,7 +295,7 @@ impl Runtime {
             let strings = nogc.known().strings;
             if v.is_smi() || v.get_as::<Float>(nogc).is_some() {
                 strings.number.value()
-            } else if v == nogc.known().undefined.value() || v == nogc.known().void.value() {
+            } else if v == nogc.known().undefined.value() || v == nogc.known().the_hole.value() {
                 strings.undefined.value()
             } else if v == nogc.known().null.value() {
                 strings.object.value()

@@ -13,7 +13,7 @@ impl Convert {
         if v == known.false_object.value()
             || v == known.undefined.value()
             || v == known.null.value()
-            || v == known.void.value()
+            || v == known.the_hole.value()
         {
             return false;
         }
@@ -36,7 +36,7 @@ impl Convert {
         if let Some(smi) = Smi::decode(v) {
             return Ok(smi.value() as f64);
         }
-        if v == known.undefined.value() || v == known.void.value() {
+        if v == known.undefined.value() || v == known.the_hole.value() {
             return Ok(f64::NAN);
         }
         if v == known.null.value() {

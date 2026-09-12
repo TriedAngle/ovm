@@ -6,15 +6,9 @@ use crate::{
 
 use crate::{FrameMeta, Stack};
 
-// TODO: consider finding a way to not need this.
-// the reason this needs an UnsafeCell is because the GC needs to be aware of this
-// to give the awareness this is attached to a SharedVMInstance and to access it mutably
-// we need exclusive borrow
 pub struct StackCache(UnsafeCell<StackCacheImpl>);
 
 struct StackCacheImpl {
-    /// The interpreter accumulator: permanently rooted (visited by the GC),
-    /// so it stays valid across allocations without spill/take bookkeeping.
     acc: Register,
     code: Register,
     constants: Register,
@@ -22,20 +16,21 @@ struct StackCacheImpl {
     base: usize,
     register_count: usize,
     active: bool,
-    void: Value,
+    /// The hole sentinel this cache resets its slots to when deactivated.
+    the_hole: Value,
 }
 
 impl StackCache {
-    pub fn new(void: Value) -> Self {
+    pub fn new(the_hole: Value) -> Self {
         Self(UnsafeCell::new(StackCacheImpl {
-            acc: unsafe { Register::from_value(void) },
-            code: unsafe { Register::from_value(void) },
-            constants: unsafe { Register::from_value(void) },
+            acc: unsafe { Register::from_value(the_hole) },
+            code: unsafe { Register::from_value(the_hole) },
+            constants: unsafe { Register::from_value(the_hole) },
             pc: 0,
             base: 0,
             register_count: 0,
             active: false,
-            void,
+            the_hole,
         }))
     }
 
@@ -75,10 +70,10 @@ impl StackCache {
 
     pub fn deactivate(&self) {
         let cache = self.get();
-        let void = cache.void;
-        cache.acc.store(void);
-        cache.code.store(void);
-        cache.constants.store(void);
+        let the_hole = cache.the_hole;
+        cache.acc.store(the_hole);
+        cache.code.store(the_hole);
+        cache.constants.store(the_hole);
         cache.active = false;
     }
 

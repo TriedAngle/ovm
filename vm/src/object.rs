@@ -65,7 +65,7 @@ pub struct Map {
     /// The prototype(s) for property lookup:
     /// - an object: single parent (JS `[[Prototype]]`)
     /// - a `FixedArray` of objects: multiple parents in priority order (Self-style `parent*`)
-    /// - `void`: no parents (null-proto root)
+    /// - the hole: no parents (null-proto root)
     pub prototype: GcSlot,
     /// Empty, or a `FixedArray` of flat `[name, target_map]` transition pairs.
     // TODO: make transition targets weak (V8 does this so unused shape subtrees die)
@@ -182,7 +182,7 @@ pub struct MapInit<'a> {
     pub kind: MapKind,
     pub value_slot_count: usize,
     pub descriptors: &'a [(SlotName, SlotFlags, Value)],
-    /// `void` = no prototype (null-proto for JS maps).
+    /// the hole = no prototype (null-proto for JS maps).
     /// Handled because `Map` allocation may move the prototype.
     pub prototype: Handle<'a, Value>,
 }
@@ -207,7 +207,7 @@ impl HeapObject for Map {
         self.kind
             .set(nogc, host, Smi::new(config.kind.bits() as i64));
         self.prototype.set(nogc, host, config.prototype.value());
-        self.transitions.clear(nogc.known().void.value());
+        self.transitions.clear(nogc.heap());
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
             d.name.set(nogc, host, name.tagged());
@@ -476,6 +476,17 @@ impl Object {
         self.header.map.heap_ref(nogc).kind().kind() == ObjectKind::Array
     }
 
+    /// The JSArray `length` internal slot, when `self` is an array named
+    /// `name`: it lives outside the map descriptors, so descriptor walks
+    /// must consult this first. `None` for any other name or non-array.
+    pub fn array_length<'a>(&'a self, nogc: &'a NoGc<'a>, name: SlotName) -> Option<Value> {
+        if !self.is_array(nogc) {
+            return None;
+        }
+        let s = name.value().get_as::<VMString>(nogc)?;
+        (s.as_slice(nogc) == b"length").then(|| self.length.inner())
+    }
+
     /// The object's map (shape).
     pub fn map_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, Map> {
         self.header.map.heap_ref(nogc)
@@ -497,6 +508,25 @@ impl Object {
 
     pub fn elements_array<'a>(&'a self, nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, FixedArray>> {
         self.elements.inner().get_as::<FixedArray>(nogc)
+    }
+
+    /// Fast element read for array objects: `None` if `self` is not an
+    /// array, the index is past the end, or the slot is a hole — the
+    /// caller must fall back to a named property lookup.
+    pub fn element_value<'a>(&'a self, nogc: &'a NoGc<'a>, i: usize) -> Option<Value> {
+        if !self.is_array(nogc) || i >= self.length() {
+            return None;
+        }
+        let elements = self.elements_array(nogc)?;
+        if i >= elements.len() {
+            // `length` can exceed the backing store: those indices are holes
+            return None;
+        }
+        let v = elements.at(i);
+        if v == nogc.known().the_hole.value() {
+            return None;
+        }
+        Some(v)
     }
 }
 
@@ -522,6 +552,13 @@ pub fn call_target<'a>(nogc: &'a NoGc<'a>, f: Value) -> Option<CallTarget> {
         register_count,
         info.function_kind(),
     ))
+}
+
+/// The callee's function kind, when it is a bytecode function.
+pub fn function_kind_of<'a>(nogc: &'a NoGc<'a>, v: Value) -> Option<FunctionKind> {
+    let obj = v.as_heap_object(nogc)?;
+    let info = obj.as_ref().callable_info(nogc)?;
+    Some(info.function_kind())
 }
 
 /// Store `value` at element index `i` of an array object, growing the
@@ -553,7 +590,7 @@ pub fn store_array_element(
             for k in 0..keep {
                 values.push(elements.at(k));
             }
-            values.resize(new_len, nogc.known().void.value());
+            values.resize(new_len, nogc.known().the_hole.value());
             Ok::<_, VmError>(values)
         })?;
         values[i] = value;
@@ -1114,20 +1151,35 @@ pub enum FunctionKind {
     Setter,
     BaseClassConstructor,
     DerivedClassConstructor,
+    /// synthesized default constructor of a derived class:
+    /// `constructor(...args) { super(...args) }`
+    DefaultDerivedConstructor,
 }
 
 impl FunctionKind {
     pub const fn is_constructible(self) -> bool {
         matches!(
             self,
-            Self::Normal | Self::BaseClassConstructor | Self::DerivedClassConstructor
+            Self::Normal
+                | Self::BaseClassConstructor
+                | Self::DerivedClassConstructor
+                | Self::DefaultDerivedConstructor
         )
     }
 
     pub const fn is_class_constructor(self) -> bool {
         matches!(
             self,
-            Self::BaseClassConstructor | Self::DerivedClassConstructor
+            Self::BaseClassConstructor
+                | Self::DerivedClassConstructor
+                | Self::DefaultDerivedConstructor
+        )
+    }
+
+    pub const fn is_derived_class_constructor(self) -> bool {
+        matches!(
+            self,
+            Self::DerivedClassConstructor | Self::DefaultDerivedConstructor
         )
     }
 
@@ -1145,6 +1197,7 @@ impl FunctionKind {
             x if x == Self::Setter as i64 => Self::Setter,
             x if x == Self::BaseClassConstructor as i64 => Self::BaseClassConstructor,
             x if x == Self::DerivedClassConstructor as i64 => Self::DerivedClassConstructor,
+            x if x == Self::DefaultDerivedConstructor as i64 => Self::DefaultDerivedConstructor,
             _ => panic!("invalid function kind"),
         }
     }
@@ -1176,9 +1229,9 @@ impl HeapObject for CallableInfoObject {
             .set(nogc, host, Smi::new(config.register_count as i64));
         match config.handlers {
             Some(handlers) => self.handlers.set(nogc, host, handlers),
-            None => self.handlers.clear(nogc.known().void.value()),
+            None => self.handlers.clear(nogc.heap()),
         }
-        self.name.set(nogc, host, nogc.known().void.value());
+        self.name.set(nogc, host, nogc.known().the_hole.value());
         self.formal_parameter_count.set(nogc, host, Smi::new(0));
         self.kind
             .set(nogc, host, Smi::new(FunctionKind::Normal as i64));
@@ -1217,7 +1270,7 @@ impl CallableInfoObject {
         self.name.set(
             nogc,
             host,
-            name.unwrap_or_else(|| nogc.known().void.value()),
+            name.unwrap_or_else(|| nogc.known().the_hole.value()),
         );
         self.formal_parameter_count
             .set(nogc, host, Smi::new(formal_parameter_count as i64));
@@ -1444,7 +1497,7 @@ impl HeapObject for Context {
             .set(nogc, host, nogc.known().context_map.as_tagged());
         match config.outer {
             Some(outer) => self.outer.set(nogc, host, outer),
-            None => self.outer.clear(nogc.known().void.value()),
+            None => self.outer.clear(nogc.heap()),
         }
         self.slots.set(nogc, host, config.slots.as_tagged());
         self.scope_info

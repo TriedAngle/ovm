@@ -40,15 +40,18 @@ pub use heap::{
     Register, WordType,
 };
 pub use interner::StringInterner;
-pub use lookup::{Key, LoadOutcome, Lookup, classify_key, element_value, load_outcome};
+pub use lookup::{
+    Key, LoadOutcome, Lookup, classify_key, load_outcome, lookup_in_parents, super_constructor,
+    super_lookup,
+};
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use object::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
     FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry, HandlerEntryInit, HandlerTable,
     HandlerTableInit, Header, HeapObject, InternedString, Map, MapInit, MapKind, Object,
     ObjectInit, ObjectKind, ObjectSlotsInit, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags,
-    SlotName, Symbol, VMString, call_target, object_kind, object_layout, store_array_element,
-    string_content_hash, visit_object,
+    SlotName, Symbol, VMString, call_target, function_kind_of, object_kind, object_layout,
+    store_array_element, string_content_hash, visit_object,
 };
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use transition::{
@@ -410,12 +413,12 @@ impl VM {
 
     pub fn attach(&self) -> Thread {
         let heap = self.shared.heap.new_local(&self.shared.known);
-        let void = heap.known().void.value();
+        let the_hole = heap.known().the_hole.value();
         let state = Arc::new(ContextState {
-            handles: HandleData::new(void),
-            stack: Stack::new(STACK_SLOTS, void),
-            cache: StackCache::new(void),
-            pending_exception: unsafe { Register::from_value(void) },
+            handles: HandleData::new(the_hole),
+            stack: Stack::new(STACK_SLOTS, the_hole),
+            cache: StackCache::new(the_hole),
+            pending_exception: unsafe { Register::from_value(the_hole) },
             has_pending_exception: Cell::new(false),
         });
         let mut threads = self.shared.threads.lock().unwrap();

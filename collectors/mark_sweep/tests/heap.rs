@@ -2,8 +2,8 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 use heap_api::{
-    AllocError, GcHost, HeapBackend, RawCell, TAG_MASK, Visitor, Word, CLEARED, STRONG_PTR,
-    WEAK_PTR,
+    AllocError, CLEARED, GcHost, HeapBackend, RawCell, STRONG_PTR, TAG_MASK, Visitor, WEAK_PTR,
+    Word,
 };
 
 use mark_sweep::heap::{MarkSweep, MarkSweepConfig, MarkSweepLocal, MarkSweepState};
@@ -12,15 +12,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-static SIZES: LazyLock<Mutex<HashMap<usize, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SIZES: LazyLock<Mutex<HashMap<usize, usize>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn register(addr: NonNull<u8>, size: usize) {
     SIZES.lock().unwrap().insert(addr.as_ptr() as usize, size);
 }
 
 fn registered_size(addr: usize) -> usize {
-    *SIZES.lock()
+    *SIZES
+        .lock()
         .unwrap()
         .get(&addr)
         .expect("layout requested for unregistered object")
@@ -32,9 +32,7 @@ struct Roots {
 
 impl Roots {
     fn empty() -> Self {
-        Self {
-            slots: Vec::new(),
-        }
+        Self { slots: Vec::new() }
     }
 
     fn install(self, state: &MarkSweepState) -> Box<Self> {
@@ -45,11 +43,7 @@ impl Roots {
         self.install_with(state, linked_host_for)
     }
 
-    fn install_with(
-        self,
-        state: &MarkSweepState,
-        host: fn(&Roots) -> GcHost,
-    ) -> Box<Self> {
+    fn install_with(self, state: &MarkSweepState, host: fn(&Roots) -> GcHost) -> Box<Self> {
         let boxed = Box::new(self);
         state.set_host(host(boxed.as_ref()));
         boxed
@@ -69,11 +63,7 @@ impl Roots {
 
 /// Allocates and roots; registered so the fake `layout_of` can size the
 /// object during the sweep.
-fn rooted(
-    local: &MarkSweepLocal,
-    roots: &mut Roots,
-    layout: Layout,
-) -> NonNull<u8> {
+fn rooted(local: &MarkSweepLocal, roots: &mut Roots, layout: Layout) -> NonNull<u8> {
     let ptr = local.allocate(layout).unwrap();
     register(ptr, layout.size());
     roots.strong(ptr);
@@ -129,7 +119,10 @@ fn backend(
 
 #[test]
 fn vtable_roundtrip_smoke() {
-    let ms = MarkSweep::new(MarkSweepConfig { heap_size: 64 * 1024 }).unwrap();
+    let ms = MarkSweep::new(MarkSweepConfig {
+        heap_size: 64 * 1024,
+    })
+    .unwrap();
     let (shared, vtable) = ms.into_global();
     let local = (vtable.new_local)(shared);
     let ptr = (vtable.local_vtable.allocate_raw)(local, Layout::new::<u64>()).unwrap();
@@ -145,7 +138,9 @@ fn vtable_roundtrip_smoke() {
 #[test]
 fn allocations_are_aligned_and_accounted() {
     let (state, local, _roots) = backend(64 * 1024, Roots::empty());
-    let a = local.allocate(Layout::from_size_align(5, 8).unwrap()).unwrap();
+    let a = local
+        .allocate(Layout::from_size_align(5, 8).unwrap())
+        .unwrap();
     let b = local.allocate(Layout::new::<u64>()).unwrap();
     assert_eq!(a.as_ptr() as usize % 16, 0);
     assert_eq!(b.as_ptr() as usize % 16, 0);
@@ -279,7 +274,10 @@ fn used_plus_free_conserve_arena_after_cycles() {
     local.collect();
     local.collect();
 
-    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
+    assert_eq!(
+        state.stats().used + state.free_bytes(),
+        state.stats().capacity
+    );
     for ptr in keepers {
         assert!(state.contains(ptr.as_ptr() as usize));
     }
@@ -287,7 +285,10 @@ fn used_plus_free_conserve_arena_after_cycles() {
 
 #[test]
 fn allocation_continues_across_external_cycles() {
-    let state = MarkSweepState::new(MarkSweepConfig { heap_size: 64 * 1024 }).unwrap();
+    let state = MarkSweepState::new(MarkSweepConfig {
+        heap_size: 64 * 1024,
+    })
+    .unwrap();
     let _roots = Roots::empty().install(&state);
     let running = Arc::new(AtomicBool::new(true));
     let allocations = Arc::new(AtomicUsize::new(0));
@@ -326,7 +327,10 @@ fn allocation_continues_across_external_cycles() {
 
     assert!(allocations.load(Ordering::Relaxed) > 0);
     state.collect_now();
-    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
+    assert_eq!(
+        state.stats().used + state.free_bytes(),
+        state.stats().capacity
+    );
 }
 
 #[test]
@@ -413,7 +417,10 @@ fn build_chain(local: &MarkSweepLocal, layout: Layout, len: usize) -> Word {
 fn marking_traces_linked_chains_exactly() {
     const CHAINS: usize = 512;
     const CHAIN_LEN: usize = 256;
-    let state = MarkSweepState::new(MarkSweepConfig { heap_size: 8 * 1024 * 1024 }).unwrap();
+    let state = MarkSweepState::new(MarkSweepConfig {
+        heap_size: 8 * 1024 * 1024,
+    })
+    .unwrap();
     let mut roots = Roots::empty();
     let local = MarkSweepLocal::new(Arc::clone(&state));
     let layout = Layout::from_size_align(16, 8).unwrap();
@@ -438,7 +445,10 @@ fn marking_traces_linked_chains_exactly() {
 fn parked_mutators_assist_marking() {
     const CHAINS: usize = 512;
     const CHAIN_LEN: usize = 256;
-    let state = MarkSweepState::new(MarkSweepConfig { heap_size: 8 * 1024 * 1024 }).unwrap();
+    let state = MarkSweepState::new(MarkSweepConfig {
+        heap_size: 8 * 1024 * 1024,
+    })
+    .unwrap();
     let mut roots = Roots::empty();
     let local = MarkSweepLocal::new(Arc::clone(&state));
     let layout = Layout::from_size_align(16, 8).unwrap();
@@ -484,7 +494,10 @@ fn parked_mutators_assist_marking() {
     state.collect_now();
 
     assert_eq!(state.stats().used, CHAINS * CHAIN_LEN * 16);
-    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
+    assert_eq!(
+        state.stats().used + state.free_bytes(),
+        state.stats().capacity
+    );
 }
 
 #[test]
@@ -512,5 +525,8 @@ fn background_sweeper_drains_pendings() {
 
     assert_eq!(state.stats().used, 0);
     assert!(state.background_sweeps() > swept_before);
-    assert_eq!(state.stats().used + state.free_bytes(), state.stats().capacity);
+    assert_eq!(
+        state.stats().used + state.free_bytes(),
+        state.stats().capacity
+    );
 }

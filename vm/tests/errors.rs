@@ -192,7 +192,7 @@ fn startup_prototype_hierarchy() {
     let mut thread = vm.attach();
 
     let (error_obj, _, _) = error_and_props(&mut thread, VmError::Type);
-    let (error_prototype, object_prototype, undefined, null, true_v, false_v, void) = {
+    let (error_prototype, object_prototype, undefined, null, true_v, false_v, the_hole) = {
         let k = thread.heap().known();
         (
             k.error_prototype.value(),
@@ -201,7 +201,7 @@ fn startup_prototype_hierarchy() {
             k.null.value(),
             k.true_object.value(),
             k.false_object.value(),
-            k.void.value(),
+            k.the_hole.value(),
         )
     };
 
@@ -228,5 +228,5 @@ fn startup_prototype_hierarchy() {
     assert_eq!(prototype_of(&mut thread, false_v), Some(object_prototype));
     // ... null (no prototype per spec) and the hole (internal) do not
     assert_eq!(prototype_of(&mut thread, null), None);
-    assert_eq!(prototype_of(&mut thread, void), None);
+    assert_eq!(prototype_of(&mut thread, the_hole), None);
 }

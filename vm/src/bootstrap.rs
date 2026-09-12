@@ -11,8 +11,7 @@ use crate::{
 pub struct WellKnown {
     // vm internal machinery: sentinels, canonical empties, builtin maps
     pub map_map: Global<Map>,
-    /// "hole"
-    pub void: Global<Object>,
+    pub the_hole: Global<Object>,
     /// Never user-visible: a call returning it signals a pending exception.
     pub exception: Global<Object>,
     /// exception map
@@ -161,7 +160,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     let scope_info = unsafe { smi_handle::<ScopeInfo>(roots) };
     WellKnown {
         map_map: map,
-        void: obj,
+        the_hole: obj,
         exception: obj,
         exception_map: map,
         empty_fixed_array: array,
@@ -276,7 +275,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let data = HandleData::new(Smi::new(0).encode());
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
-    let void_map = heap
+    let the_hole_map = heap
         .allocate::<Map>(MapInit {
             kind: MapKind::OBJECT,
             value_slot_count: 0,
@@ -284,9 +283,9 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
             prototype: scope.handle(Smi::new(0)),
         })
         .into_global(roots);
-    let void = heap
+    let the_hole = heap
         .allocate::<Object>(ObjectInit {
-            map: void_map,
+            map: the_hole_map,
             slots: unsafe { smi_handle::<FixedArray>(roots) },
             elements: unsafe { smi_handle::<Value>(roots) },
             length: 0,
@@ -310,17 +309,23 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         })
         .into_global(roots);
 
-    heap.no_gc(|nogc| {
-        map_map.heap_ref(nogc).transitions.clear(void.value());
-        void_map.heap_ref(nogc).transitions.clear(void.value());
-        null_map.heap_ref(nogc).transitions.clear(void.value());
-        void_map.heap_ref(nogc).prototype.set(nogc, void_map, null);
-        null_map.heap_ref(nogc).prototype.set(nogc, null_map, null);
-    });
-    known.void = void;
+    // publish the sentinels before anything reads them through `known()`
+    // (clear() takes the heap and fetches the hole from there)
+    known.the_hole = the_hole;
     known.null = null;
     known.null_map = null_map;
     heap.set_known(known);
+
+    heap.no_gc(|nogc| {
+        map_map.heap_ref(nogc).transitions.clear(nogc.heap());
+        the_hole_map.heap_ref(nogc).transitions.clear(nogc.heap());
+        null_map.heap_ref(nogc).transitions.clear(nogc.heap());
+        the_hole_map
+            .heap_ref(nogc)
+            .prototype
+            .set(nogc, the_hole_map, null);
+        null_map.heap_ref(nogc).prototype.set(nogc, null_map, null);
+    });
 
     // builtin maps: every allocation init path looks these up, so they must
     // exist before any other object is created (incl. interned strings)
@@ -397,13 +402,13 @@ pub fn intern_well_known_strings(heap: &mut Heap, interner: &StringInterner, roo
 
 pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let mut known = *heap.known();
-    let void = known.void;
+    let the_hole = known.the_hole;
     debug_assert!(
-        !void.value().is_smi(),
+        !the_hole.value().is_smi(),
         "bootstrap_basics must run before bootstrap_well_known"
     );
 
-    let data = HandleData::new(void.value());
+    let data = HandleData::new(the_hole.value());
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
     let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
