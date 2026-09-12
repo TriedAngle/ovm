@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::{Ast, DeclKind, FunctionId, Node, NodeId, ScopeId, Symbol};
+use crate::{Ast, DeclKind, FunctionId, Node, NodeId, ScopeId, ScopeKind, Symbol};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolution {
@@ -8,11 +8,12 @@ pub enum Resolution {
     Param(u32),
     /// local register
     Local { reg: u32, hole_check: bool },
-    /// captured: context slot in the context owned by `scope`'s function
-    /// (the materializer derives the chain depth from `scope`)
+    /// captured: context slot, at the precomputed chain depth from the use
+    /// site (each function and each context-creating class scope between
+    /// the use and the hosting scope is one hop)
     Context {
         slot: u32,
-        scope: ScopeId,
+        depth: u32,
         hole_check: bool,
     },
     /// no binding found in any scope: global object property
@@ -20,8 +21,18 @@ pub enum Resolution {
     /// a direct eval in the chain forced dynamic handling
     Dynamic,
     /// `this` in an arrow function: the enclosing non-arrow function's
-    /// receiver, stored in that function's hidden this-slot
-    This(FunctionId),
+    /// receiver, stored in that function's hidden this-slot, `depth` hops
+    /// from the arrow's own context
+    This { owner: FunctionId, depth: u32 },
+    /// `super.x`: the home-object slot in the enclosing class's context,
+    /// `depth` hops away. `this_owner` is the nearest enclosing non-arrow
+    /// function (the receiver), whose this-slot is `this_depth` hops away.
+    Super {
+        home_slot: u32,
+        depth: u32,
+        this_owner: FunctionId,
+        this_depth: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,10 +84,23 @@ enum Pending {
     GlobalObject,
     /// unresolved name compiled as a runtime chain walk (direct eval)
     Dynamic,
-    This(FunctionId),
+    This {
+        owner: FunctionId,
+        depth: u32,
+    },
+    Super {
+        scope: ScopeId,
+        decl: u32,
+        depth: u32,
+        this_owner: FunctionId,
+        this_depth: u32,
+    },
     Decl {
         scope: ScopeId,
         decl: u32,
+        /// precomputed context hops from this use site to the hosting
+        /// scope (used when the decl resolves to a Context slot)
+        depth: u32,
     },
 }
 
@@ -95,6 +119,9 @@ struct Resolver<'a> {
     captured: HashSet<(ScopeId, u32)>,
     /// functions whose receiver a nested arrow captures
     captures_this: HashSet<FunctionId>,
+    /// class scopes that create a context (named classes and classes
+    /// whose members use super): each adds one hop to context depths
+    ctx_classes: HashSet<ScopeId>,
     pending: Vec<Option<Pending>>,
     scope_stack: Vec<ScopeId>,
     fn_stack: Vec<FunctionId>,
@@ -158,10 +185,24 @@ fn resolve_with_mode(ast: &Ast, mode: ResolveMode) -> Resolved {
         fn_scope,
         captured: HashSet::new(),
         captures_this: HashSet::new(),
+        ctx_classes: HashSet::new(),
         pending: vec![None; ast.node_count()],
         scope_stack: Vec::new(),
         fn_stack: Vec::new(),
     };
+    // class scopes that create a context: named classes (the inner name
+    // binding) and classes whose members use super (home objects)
+    for n in 0..ast.node_count() {
+        let id = NodeId(n as u32);
+        if let Node::ClassExpr { class } | Node::ClassDecl { class } = ast.node(id) {
+            let info = ast.class(*class);
+            if (info.name.is_some() || info.uses_super)
+                && let Some(scope) = ast.node_scope(id)
+            {
+                r.ctx_classes.insert(scope);
+            }
+        }
+    }
     r.walk_function(FunctionId(0));
 
     r.allocate_all()
@@ -177,6 +218,61 @@ impl<'a> Resolver<'a> {
         self.fn_stack.push(fid);
         self.walk_node(body);
         self.fn_stack.pop();
+    }
+
+    /// Whether a scope introduces a context at runtime: every function
+    /// does, plus the context-creating class scopes.
+    fn creates_ctx(&self, scope: ScopeId) -> bool {
+        match self.ast.scope(scope).kind {
+            ScopeKind::Script | ScopeKind::Function => true,
+            ScopeKind::Class => self.ctx_classes.contains(&scope),
+            _ => false,
+        }
+    }
+
+    /// The innermost scope at-or-outside `scope` that introduces a context:
+    /// the one hosting any slot declared in `scope` (block scopes share
+    /// their function's context).
+    fn hosting_ctx(&self, scope: ScopeId) -> ScopeId {
+        let mut scope = scope;
+        loop {
+            if self.creates_ctx(scope) {
+                return scope;
+            }
+            scope = self
+                .ast
+                .scope(scope)
+                .parent
+                .expect("scope chain ends at script scope");
+        }
+    }
+
+    /// Context hops from the use site (the innermost context-creating
+    /// scope on the stack) to `hosting`, inclusive of `hosting`: the
+    /// runtime `LoadContextSlot` depth. Class scopes between the use and
+    /// the hosting scope each contribute a hop even though they do not
+    /// correspond to a function boundary.
+    fn context_hops(&self, hosting: ScopeId) -> u32 {
+        let mut depth = 0u32;
+        let mut passed_use = false;
+        for &scope in self.scope_stack.iter().rev() {
+            if !self.creates_ctx(scope) {
+                continue;
+            }
+            if !passed_use {
+                // the use site's own context: zero hops away from itself
+                passed_use = true;
+                if scope == hosting {
+                    return 0;
+                }
+                continue;
+            }
+            depth += 1;
+            if scope == hosting {
+                return depth;
+            }
+        }
+        unreachable!("hosting scope is on the resolver's scope stack")
     }
 
     fn resolve_reference(&mut self, node: NodeId, name: Symbol) {
@@ -197,11 +293,45 @@ impl<'a> Resolver<'a> {
                     // captured across a function boundary → context-allocated
                     self.captured.insert((scope, decl));
                 }
-                pending = Pending::Decl { scope, decl };
+                let depth = self.context_hops(self.hosting_ctx(scope));
+                pending = Pending::Decl { scope, decl, depth };
                 break;
             }
         }
         self.pending[node.0 as usize] = Some(pending);
+    }
+
+    /// Resolve a `super.x` use: find the hidden home-object binding in the
+    /// enclosing class scope on the scope stack.
+    fn resolve_super(&mut self, node: NodeId, owner: FunctionId) -> Pending {
+        let is_static = match *self.ast.node(node) {
+            Node::SuperProperty { is_static, .. } => is_static,
+            _ => unreachable!("super property node"),
+        };
+        let hidden: &[u8] = if is_static {
+            b".static_home_object"
+        } else {
+            b".home_object"
+        };
+        for &scope in self.scope_stack.iter().rev() {
+            if self.ast.scope(scope).kind != ScopeKind::Class {
+                continue;
+            }
+            for (decl, d) in self.ast.scope(scope).decls.iter().enumerate() {
+                if self.ast.symbol(d.name) == hidden {
+                    let depth = self.context_hops(scope);
+                    let this_depth = self.context_hops(self.fn_scope[owner.0 as usize]);
+                    return Pending::Super {
+                        scope,
+                        decl: decl as u32,
+                        depth,
+                        this_owner: owner,
+                        this_depth,
+                    };
+                }
+            }
+        }
+        unreachable!("parser guarantees a class scope with home slots around super")
     }
 
     fn walk_list(&mut self, list: crate::NodeList) {
@@ -228,8 +358,25 @@ impl<'a> Resolver<'a> {
                     .find(|&f| !self.ast.function(f).kind.is_arrow())
                     .expect("script function is never an arrow");
                 self.captures_this.insert(owner);
-                self.pending[id.0 as usize] = Some(Pending::This(owner));
+                let depth = self.context_hops(self.fn_scope[owner.0 as usize]);
+                self.pending[id.0 as usize] = Some(Pending::This { owner, depth });
             }
+            Node::SuperProperty { key, computed, .. } => {
+                if computed {
+                    self.walk_node(key);
+                }
+                // receiver: like `this` — owned by the nearest non-arrow
+                let owner = self
+                    .fn_stack
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&f| !self.ast.function(f).kind.is_arrow())
+                    .expect("script function is never an arrow");
+                self.captures_this.insert(owner);
+                self.pending[id.0 as usize] = Some(self.resolve_super(id, owner));
+            }
+            Node::SuperCall { args } => self.walk_list(args),
             Node::Unary { expr, .. } => self.walk_node(expr),
             Node::Update { target, .. } => self.walk_node(target),
             Node::Binary { lhs, rhs, .. } => {
@@ -418,6 +565,11 @@ impl<'a> Resolver<'a> {
                 if self.fn_owner[s] != fid {
                     continue;
                 }
+                // class scopes own a dedicated per-evaluation context with
+                // its own slot space (created by CreateBlockContext)
+                if ast.scope(scope).kind == ScopeKind::Class {
+                    continue;
+                }
                 for (d, decl) in ast.scope(scope).decls.iter().enumerate() {
                     let key = (scope, d as u32);
                     if self.mode == ResolveMode::Repl && scope == self.script_scope {
@@ -434,9 +586,11 @@ impl<'a> Resolver<'a> {
                         _ if forced => {
                             let slot = next_ctx;
                             next_ctx += 1;
+                            // declaration stores run with the hosting
+                            // context as the frame context: zero hops
                             Resolution::Context {
                                 slot,
-                                scope,
+                                depth: 0,
                                 hole_check,
                             }
                         }
@@ -456,13 +610,63 @@ impl<'a> Resolver<'a> {
             };
         }
 
+        // class inner scopes: every declaration is a context slot in the
+        // class's dedicated block context (created per class evaluation),
+        // numbered in declaration order regardless of capture analysis
+        for s in 0..ast.scope_count() {
+            let scope = ScopeId(s as u32);
+            if ast.scope(scope).kind != ScopeKind::Class {
+                continue;
+            }
+            for (d, decl) in ast.scope(scope).decls.iter().enumerate() {
+                let hole_check =
+                    matches!(decl.kind, DeclKind::Let | DeclKind::Const | DeclKind::Class);
+                slots.insert(
+                    (scope, d as u32),
+                    Resolution::Context {
+                        slot: d as u32,
+                        depth: 0,
+                        hole_check,
+                    },
+                );
+            }
+        }
+
         let mut resolutions = vec![None; ast.node_count()];
         for (node, pending) in self.pending.iter().enumerate() {
             resolutions[node] = pending.as_ref().map(|p| match *p {
                 Pending::GlobalObject => Resolution::GlobalObject,
                 Pending::Dynamic => Resolution::Dynamic,
-                Pending::This(owner) => Resolution::This(owner),
-                Pending::Decl { scope, decl } => slots[&(scope, decl)],
+                Pending::This { owner, depth } => Resolution::This { owner, depth },
+                Pending::Super {
+                    scope,
+                    decl,
+                    depth,
+                    this_owner: owner,
+                    this_depth,
+                } => {
+                    let Resolution::Context { slot, .. } = slots[&(scope, decl)] else {
+                        unreachable!("class-scope slots are context slots");
+                    };
+                    Resolution::Super {
+                        home_slot: slot,
+                        depth,
+                        this_owner: owner,
+                        this_depth,
+                    }
+                }
+                // keep the per-use depth: the shared slots entry carries
+                // the declaration-store depth (0), not this use site's
+                Pending::Decl { scope, decl, depth } => match slots[&(scope, decl)] {
+                    Resolution::Context {
+                        slot, hole_check, ..
+                    } => Resolution::Context {
+                        slot,
+                        depth,
+                        hole_check,
+                    },
+                    other => other,
+                },
             });
         }
 

@@ -198,6 +198,18 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
         }
         Node::ClassDecl { class } => dump_class(ast, class, "ClassDecl", pad, at, indent),
         Node::ClassExpr { class } => dump_class(ast, class, "ClassExpr", pad, at, indent),
+        Node::SuperProperty {
+            key,
+            computed,
+            is_static,
+        } => {
+            println!("{pad}SuperProperty(computed={computed} static={is_static}) {at}");
+            dump(ast, key, indent + 1);
+        }
+        Node::SuperCall { args } => {
+            println!("{pad}SuperCall {at}");
+            dump_list(ast, args, indent + 1);
+        }
         Node::Empty => println!("{pad}Empty {at}"),
     }
 }

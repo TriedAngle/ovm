@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, FixedArray, GcSlot, HeapRef, InternedString, Map, NoGc, Object, SlotFlags,
-    SlotName, Smi, Symbol, Tagged, VMString, Value, VmError,
+    AccessorPair, FixedArray, FrameMeta, GcSlot, HeapRef, InternedString, Map, NoGc, Object,
+    SlotFlags, SlotName, Smi, Stack, Symbol, Tagged, Value, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -45,29 +45,6 @@ pub fn classify_key<'a>(nogc: &'a NoGc<'a>, key: Value) -> Result<Key, VmError> 
     Err(VmError::Type)
 }
 
-/// Fast element read for array objects: `None` if the receiver is not an
-/// array, the index is past the end, or the slot is a hole — the caller must
-/// fall back to a named property lookup.
-pub fn element_value<'a>(nogc: &'a NoGc<'a>, receiver: Value, i: usize) -> Option<Value> {
-    let Some(obj) = receiver.as_heap_object(nogc) else {
-        return None;
-    };
-    let obj = obj.as_ref();
-    if !obj.is_array(nogc) || i >= obj.length() {
-        return None;
-    }
-    let elements = obj.elements_array(nogc)?;
-    if i >= elements.len() {
-        // `length` can exceed the backing store: those indices are holes
-        return None;
-    }
-    let v = elements.at(i);
-    if v == nogc.known().void.value() {
-        return None;
-    }
-    Some(v)
-}
-
 /// The result of a property load: a plain value or a getter that must be invoked.
 pub enum LoadOutcome {
     Value(Value),
@@ -83,15 +60,10 @@ pub fn load_outcome<'a>(
     if receiver == known.null.value() || receiver == known.undefined.value() {
         return Err(VmError::Type);
     }
-    // JSArray `length` is an internal slot, not a map descriptor
-    if let Some(obj) = receiver.as_heap_object(nogc) {
-        let obj = obj.as_ref();
-        if obj.is_array(nogc)
-            && let Some(s) = name.value().get_as::<VMString>(nogc)
-            && s.as_slice(nogc) == b"length"
-        {
-            return Ok(LoadOutcome::Value(obj.length.inner()));
-        }
+    if let Some(obj) = receiver.as_heap_object(nogc)
+        && let Some(v) = obj.as_ref().array_length(nogc, name)
+    {
+        return Ok(LoadOutcome::Value(v));
     }
     match receiver.lookup(nogc, name) {
         Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.inner())),
@@ -145,25 +117,99 @@ impl Map {
             }
         }
 
-        // Prototype walk:
-        // - null: no parents (null-proto root)
-        // - object: single parent (JS [[Prototype]])
-        // - FixedArray: multiple parents in priority order (Self parent*)
-        let proto = self.prototype.inner();
-        if proto == guard.known().null.value() {
-            return Lookup::NotFound;
+        lookup_in_parents(guard, self.prototype.inner(), name)
+    }
+}
+
+pub fn lookup_in_parents<'a>(nogc: &'a NoGc<'a>, proto: Value, name: SlotName) -> Lookup<'a> {
+    if proto == nogc.known().null.value() {
+        return Lookup::NotFound;
+    }
+    if let Some(parents) = proto.get_as::<FixedArray>(nogc) {
+        for i in 0..parents.len() {
+            let result = parents.at(i).lookup(nogc, name);
+            if !matches!(result, Lookup::NotFound) {
+                return result;
+            }
         }
-        if let Some(parents) = proto.get_as::<FixedArray>(guard) {
+        return Lookup::NotFound;
+    }
+    proto.lookup(nogc, name)
+}
+
+enum SuperStart<'a> {
+    End,
+    Object(Value),
+    Parents(HeapRef<'a, FixedArray>),
+}
+
+fn super_start<'a>(nogc: &'a NoGc<'a>, value: Value) -> Result<SuperStart<'a>, VmError> {
+    let Some(obj) = value.as_heap_object(nogc) else {
+        return Ok(SuperStart::End);
+    };
+    let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
+    if proto == nogc.known().null.value() || !proto.is_strong_ptr() {
+        return Ok(SuperStart::End);
+    }
+    if let Some(parents) = proto.get_as::<FixedArray>(nogc) {
+        return Ok(SuperStart::Parents(parents));
+    }
+    Ok(SuperStart::Object(proto))
+}
+
+pub fn super_lookup<'a>(
+    nogc: &'a NoGc<'a>,
+    value: Value,
+    name: SlotName,
+) -> Result<LoadOutcome, VmError> {
+    match super_start(nogc, value)? {
+        // single parent: full load semantics
+        SuperStart::Object(start) => load_outcome(nogc, start, name),
+        SuperStart::Parents(parents) => {
             for i in 0..parents.len() {
-                let result = parents.at(i).lookup(guard, name);
-                if !matches!(result, Lookup::NotFound) {
-                    return result;
+                let parent = parents.at(i);
+                if let Some(obj) = parent.as_heap_object(nogc)
+                    && let Some(v) = obj.as_ref().array_length(nogc, name)
+                {
+                    return Ok(LoadOutcome::Value(v));
+                }
+                match parent.lookup(nogc, name) {
+                    Lookup::Data { slot, .. } => {
+                        return Ok(LoadOutcome::Value(slot.inner()));
+                    }
+                    Lookup::Accessor { pair, .. } => {
+                        return Ok(LoadOutcome::Getter(pair.get.inner()));
+                    }
+                    Lookup::NotFound => continue,
                 }
             }
-            return Lookup::NotFound;
+            Ok(LoadOutcome::Value(nogc.known().undefined.value()))
         }
-        proto.lookup(guard, name)
+        SuperStart::End => Ok(LoadOutcome::Value(nogc.known().undefined.value())),
     }
+}
+
+/// The super constructor of the frame's running function: its own
+/// [[Prototype]] (ES 10.2.2.2 GetSuperConstructor). `None` when the
+/// prototype is absent or not a constructor. (Multiple prototypes are not
+/// supported here: construction is not a property lookup.)
+pub fn super_constructor<'a>(nogc: &'a NoGc<'a>, stack: &Stack, meta: &FrameMeta) -> Option<Value> {
+    let callable = stack.callable_slot(meta).inner();
+    let obj = callable.as_heap_object(nogc)?;
+    let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
+    // must be a real constructor
+    let proto_obj = proto.as_heap_object(nogc)?;
+    if !proto_obj
+        .as_ref()
+        .header
+        .map
+        .heap_ref(nogc)
+        .kind()
+        .is_constructor()
+    {
+        return None;
+    }
+    Some(proto)
 }
 
 impl Object {

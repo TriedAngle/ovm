@@ -321,7 +321,7 @@ mod tests {
         let k = fx.known.get();
         let values = [
             k.map_map.value(),
-            k.void.value(),
+            k.the_hole.value(),
             k.undefined.value(),
             k.null.value(),
             k.false_object.value(),
@@ -364,7 +364,7 @@ mod tests {
         assert!(fx.global.stats().used >= before + layout.size());
 
         local.no_gc(|_nogc| {
-            assert!(_nogc.known().void.value().is_strong_ptr());
+            assert!(_nogc.known().the_hole.value().is_strong_ptr());
             assert!(!_nogc.gc_in_progress());
         });
         drop(local);
@@ -395,7 +395,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let roots = &fx.roots;
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
 
@@ -514,7 +514,7 @@ mod tests {
     }
 
     fn alloc_object(heap: &mut Heap, map: Global<Map>, values: &[Value]) -> HeapPtr<Object> {
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let elements = heap.known().empty_fixed_array.erase();
         heap.allocate_object(
@@ -548,7 +548,7 @@ mod tests {
         let mut heap = fx.local();
         heap.no_gc(|nogc| {
             let known = nogc.known();
-            let void = known.void.value();
+            let the_hole = known.the_hole.value();
             for map in [
                 known.map_map,
                 known.smi_map,
@@ -560,7 +560,7 @@ mod tests {
                 known.accessor_pair_map,
                 known.callable_map,
             ] {
-                assert_eq!(map.heap_ref(nogc).transitions.inner(), void);
+                assert_eq!(map.heap_ref(nogc).transitions.inner(), the_hole);
             }
         });
     }
@@ -572,7 +572,7 @@ mod tests {
         let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         heap.no_gc(|nogc| {
             let map = map.heap_ref(nogc);
-            assert_eq!(map.transitions.inner(), nogc.known().void.value());
+            assert_eq!(map.transitions.inner(), nogc.known().the_hole.value());
             assert!(
                 map.find_transition(nogc, smi_name(1), SlotFlags::VALUE, None)
                     .is_none()
@@ -644,7 +644,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let parent = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
@@ -683,7 +683,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let parent = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let name = root_name(&scope, smi_name(1));
@@ -723,7 +723,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let parent = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let name1 = root_name(&scope, smi_name(1));
@@ -787,7 +787,7 @@ mod tests {
         let mut heap = fx.local();
         let flags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(
             &mut heap,
@@ -832,7 +832,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
@@ -868,7 +868,7 @@ mod tests {
     fn define_own_property_returns_false_on_non_extensible() {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         // plain OBJECT: not extendable
         let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
@@ -897,7 +897,7 @@ mod tests {
     fn empty_objects_share_the_well_known_empty_fixed_array() {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
         let a = root_object(&scope, alloc_object(&mut heap, map, &[]));
@@ -1203,7 +1203,7 @@ mod tests {
             )],
         );
 
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let obj = heap
             .allocate_object(
@@ -1211,7 +1211,7 @@ mod tests {
                 ObjectSlotsInit {
                     map,
                     values: &[Smi::new(7).encode()],
-                    elements: heap.known().void.erase(),
+                    elements: heap.known().the_hole.erase(),
                     length: 0,
                 },
             )
@@ -1258,7 +1258,7 @@ mod tests {
         let mut heap = fx.local();
 
         let map = alloc_map(&mut heap, &fx.roots, MapKind::OBJECT, 0, &[]);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let obj = heap
             .allocate_object(
@@ -1266,7 +1266,7 @@ mod tests {
                 ObjectSlotsInit {
                     map,
                     values: &[],
-                    elements: heap.known().void.erase(),
+                    elements: heap.known().the_hole.erase(),
                     length: 0,
                 },
             )
@@ -1296,7 +1296,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
@@ -1334,7 +1334,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
@@ -1399,7 +1399,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
@@ -1459,7 +1459,7 @@ mod tests {
     fn same_value_matches_spec() {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
 
         let nan1 = heap.allocate_handle::<Float>(f64::NAN, &scope).value();
@@ -1525,7 +1525,7 @@ mod tests {
             for _ in 0..8 {
                 threads.push(s.spawn(move || {
                     let mut local = fx.local();
-                    let data = HandleData::new(local.known().void.value());
+                    let data = HandleData::new(local.known().the_hole.value());
                     let scope = scope(&data);
                     let parent = scope.handle(Tagged::from_ptr(parent_ptr));
                     let name = root_name(&scope, smi_name(1));
@@ -1583,7 +1583,7 @@ mod tests {
     fn token_handles_outlive_the_token() {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let la = FixedArray::layout_for(2);
         let lb = FixedByteArray::layout_for(8);
@@ -1610,7 +1610,7 @@ mod tests {
     fn token_fresh_allocations_coexist_and_promote() {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let la = FixedArray::layout_for(1);
         let total = vm::AllocToken::total_for(&[la, la]);
@@ -1692,7 +1692,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));
@@ -1730,7 +1730,7 @@ mod tests {
     fn shadow_store_defines_own_property_above_multiple_parents() {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let writable = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
 
@@ -1817,7 +1817,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         // both objects start from the same map with one writable property
         let writable = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
@@ -1882,7 +1882,7 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
         let kind = MapKind::OBJECT.union(MapKind::EXTENDABLE);
-        let data = HandleData::new(heap.known().void.value());
+        let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
         let map = alloc_map(&mut heap, &fx.roots, kind, 0, &[]);
         let obj = root_object(&scope, alloc_object(&mut heap, map, &[]));

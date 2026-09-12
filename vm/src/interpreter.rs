@@ -4,7 +4,8 @@ use crate::{
     AccessorPair, CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert,
     FixedArray, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
     PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
-    Value, call_target, classify_key, element_value, load_outcome, store_array_element,
+    Value, call_target, classify_key, function_kind_of, load_outcome, store_array_element,
+    super_constructor, super_lookup,
 };
 
 use crate::{
@@ -68,10 +69,20 @@ fn start(
             if new_target.is_none() && kind.is_class_constructor() {
                 return Err(VmError::Type);
             }
-            // TODO: update once we have classes
+            // derived constructors receive TheHole as their receiver: `this`
+            // stays uninitialized until super() binds it (ES 10.2.2)
             let stack = &state.stack;
             let context = closure_context(&heap.guard(), target);
-            let frame = stack.push_initial_frame(target, register_count, context, args)?;
+            let new_target_value = new_target
+                .map(|nt| nt.value())
+                .unwrap_or_else(|| heap.known().undefined.value());
+            let frame = stack.push_initial_frame(
+                target,
+                register_count,
+                context,
+                new_target_value,
+                args,
+            )?;
             state.cache.enter(stack, frame, heap);
             dispatch(vm, heap, state, base_depth)
         }
@@ -191,8 +202,16 @@ fn call_value(
         return Err(VmError::Type);
     }
     let context = closure_context(&heap.guard(), target);
-    let callee =
-        stack.push_frame_with_args(meta, handler_pc, target, register_count, context, args)?;
+    let undefined = heap.known().undefined.value();
+    let callee = stack.push_frame_with_args(
+        meta,
+        handler_pc,
+        target,
+        register_count,
+        context,
+        args,
+        undefined,
+    )?;
     cache.load(stack, callee, heap);
     Ok(true)
 }
@@ -732,18 +751,18 @@ fn step(
             // `super()`/Reflect.construct thread a different target later)
             // decides the receiver's prototype via GetPrototypeFromConstructor,
             // the callee runs with the receiver as `this`, and an object
-            // result wins over the receiver.
-            let constructible = heap.no_gc(|nogc| {
+            // result wins over the receiver. Derived class constructors get
+            // TheHole instead: `this` is bound by their super() call.
+            let (constructible, derived) = heap.no_gc(|nogc| {
                 let callee = stack.reg(&meta, ops.reg(0));
                 let Some(obj) = callee.as_heap_object(nogc) else {
-                    return false;
+                    return (false, false);
                 };
-                obj.as_ref()
-                    .header
-                    .map
-                    .heap_ref(nogc)
-                    .kind()
-                    .is_constructor()
+                let kind = obj.as_ref().header.map.heap_ref(nogc).kind();
+                let derived = kind.is_class_constructor()
+                    && function_kind_of(nogc, callee)
+                        .is_some_and(|k| k.is_derived_class_constructor());
+                (kind.is_constructor(), derived)
             });
             if !constructible {
                 return Step::Error(VmError::Type);
@@ -752,19 +771,20 @@ fn step(
                 let Some(callee) = scope.cast::<Object>(stack.reg(&meta, ops.reg(0))) else {
                     return Step::Error(VmError::Type);
                 };
-                let receiver = match Runtime::create_construct_receiver(vm, heap, state, callee) {
-                    Ok(Some(r)) => r,
-                    Ok(None) => return Step::PendingThrow,
-                    Err(err) => return Step::Error(err),
-                };
-                let Some(receiver) = scope.cast::<Object>(receiver) else {
-                    return Step::Error(VmError::Type);
+                let (receiver, allocated) = if derived {
+                    (heap.known().the_hole.value(), false)
+                } else {
+                    match Runtime::create_construct_receiver(vm, heap, state, callee) {
+                        Ok(Some(r)) => (r, true),
+                        Ok(None) => return Step::PendingThrow,
+                        Err(err) => return Step::Error(err),
+                    }
                 };
                 // the register list holds only arguments; the receiver is
                 // synthesized and prepended
                 let count = ops.reg_count(2);
                 let mut args = Vec::with_capacity(count + 1);
-                args.push(receiver.value());
+                args.push(receiver);
                 args.extend_from_slice(stack.args(&meta, ops.reg_list(1), count).as_slice());
                 let result = match NativeContext::new(vm, heap, state).call_construct(
                     callee.value(),
@@ -778,7 +798,13 @@ fn step(
                     return Step::PendingThrow;
                 }
                 cache.set_acc(if Convert::is_primitive(&heap.guard(), result) {
-                    receiver.value()
+                    if allocated {
+                        receiver
+                    } else {
+                        // a derived constructor returned a primitive: only
+                        // reachable via `return <primitive>` (ES 9.2.2.1)
+                        return Step::Error(VmError::Type);
+                    }
                 } else {
                     result
                 });
@@ -946,6 +972,7 @@ fn step(
                         return Step::Error(VmError::Type);
                     }
                     let context = closure_context(&heap.guard(), target);
+                    let undefined = heap.known().undefined.value();
                     let callee = step_try!(stack.push_frame(
                         meta,
                         pc,
@@ -954,6 +981,7 @@ fn step(
                         context,
                         ops.reg_list(1),
                         count,
+                        undefined,
                     ));
                     cache.load(stack, callee, heap);
                     Step::Next
@@ -1003,9 +1031,15 @@ fn step(
         }
         Opcode::LoadKeyedProperty => {
             let receiver = stack.reg(&meta, ops.reg(0));
+            let raw_key = cache.acc();
+            let key = step_try!(Runtime::canonical_key_value(vm, heap, state, raw_key));
+            cache.set_acc(key);
             let outcome = step_try!(heap.no_gc(|nogc| {
                 match classify_key(nogc, cache.acc())? {
-                    Key::Element(i) => match element_value(nogc, receiver, i) {
+                    Key::Element(i) => match receiver
+                        .as_heap_object(nogc)
+                        .and_then(|obj| obj.as_ref().element_value(nogc, i))
+                    {
                         Some(v) => Ok(LoadOutcome::Value(v)),
                         // past the end, a hole, or a non-array receiver:
                         // fall back to an ordinary property lookup
@@ -1044,6 +1078,8 @@ fn step(
             };
             let receiver = stack.reg(&meta, ops.reg(0));
             let key = stack.reg(&meta, ops.reg(1));
+            let key = step_try!(Runtime::canonical_key_value(vm, heap, state, key));
+            stack.set_reg(&meta, ops.reg(1), key);
             let key = step_try!(classify_key(&heap.guard(), key));
             match key {
                 Key::Element(i) => {
@@ -1095,6 +1131,12 @@ fn step(
         }
         Opcode::DefineNamedOwnProperty | Opcode::DefineKeyedOwnProperty => {
             let receiver = stack.reg(&meta, ops.reg(0));
+            // canonicalize computed string keys before the no-GC readback
+            if op == Opcode::DefineKeyedOwnProperty {
+                let raw = stack.reg(&meta, ops.reg(1));
+                let key = step_try!(Runtime::canonical_key_value(vm, heap, state, raw));
+                stack.set_reg(&meta, ops.reg(1), key);
+            }
             let (name, desc) = step_try!(heap.no_gc(|nogc| {
                 if !receiver.as_heap_object(nogc).is_some() {
                     return Err(VmError::Type);
@@ -1245,7 +1287,7 @@ fn step(
                     .map(|r| r.as_ref().names.heap_ref(nogc).len())
                     .ok_or(VmError::Type)
             }));
-            let hole = heap.known().void.value();
+            let hole = heap.known().the_hole.value();
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
@@ -1267,7 +1309,7 @@ fn step(
         }
         Opcode::CreateBlockContext => {
             let count = ops.uimm(0) as usize;
-            let hole = heap.known().void.value();
+            let hole = heap.known().the_hole.value();
             let values = vec![hole; count];
             let outer = step_try!(frame_context(heap, stack, &meta));
             let ctx = state.handle_scope(|scope| {
@@ -1320,7 +1362,7 @@ fn step(
             Step::Next
         }
         Opcode::ThrowReferenceErrorIfHole => {
-            if cache.acc() == heap.known().void.value() {
+            if cache.acc() == heap.known().the_hole.value() {
                 return Step::Error(VmError::Reference);
             }
             Step::Next
@@ -1371,7 +1413,7 @@ fn step(
             let name = cache.constants_ref(&heap.guard()).at(ops.idx(0));
             let found = step_try!(dynamic_lookup(&heap.guard(), stack, &meta, name));
             match found {
-                Some(v) if v != heap.known().void.value() => cache.set_acc(v),
+                Some(v) if v != heap.known().the_hole.value() => cache.set_acc(v),
                 Some(_) => return Step::Error(VmError::Reference),
                 None => {
                     // unresolved: fall back to a global object property
@@ -1405,7 +1447,7 @@ fn step(
             let name = cache.constants_ref(&heap.guard()).at(ops.idx(0));
             let found = step_try!(dynamic_lookup(&heap.guard(), stack, &meta, name));
             match found {
-                Some(v) if v != heap.known().void.value() => {
+                Some(v) if v != heap.known().the_hole.value() => {
                     // write through to the found slot
                     step_try!(heap.no_gc(|nogc| {
                         let mut context = stack
@@ -1434,6 +1476,263 @@ fn step(
                         heap, state, stack, cache, meta, pc, global, outcome,
                     ));
                 }
+            }
+            Step::Next
+        }
+        Opcode::ThrowIfNotConstructorOrNull => {
+            // ES 15.7.14 step 15.e: the superclass must be null or a
+            // constructor ("Class extends value is not a constructor or null")
+            let ok = heap.no_gc(|nogc| {
+                let v = cache.acc();
+                if v == nogc.known().null.value() {
+                    return true;
+                }
+                let Some(obj) = v.as_heap_object(nogc) else {
+                    return false;
+                };
+                obj.as_ref()
+                    .header
+                    .map
+                    .heap_ref(nogc)
+                    .kind()
+                    .is_constructor()
+            });
+            if !ok {
+                return Step::Error(VmError::Type);
+            }
+            Step::Next
+        }
+        Opcode::ThrowIfNotObjectOrNull => {
+            // superCtor.prototype must be an Object or null
+            let ok = heap.no_gc(|nogc| {
+                let v = cache.acc();
+                v == nogc.known().null.value() || !Convert::is_primitive(nogc, v)
+            });
+            if !ok {
+                return Step::Error(VmError::Type);
+            }
+            Step::Next
+        }
+        Opcode::ThrowSuperNotCalledIfHole => {
+            if cache.acc() == heap.known().the_hole.value() {
+                // "Must call super constructor before accessing 'this'"
+                return Step::Error(VmError::Reference);
+            }
+            Step::Next
+        }
+        Opcode::ThrowSuperAlreadyCalledIfNotHole => {
+            if cache.acc() != heap.known().the_hole.value() {
+                // "Super constructor may only be called once"
+                return Step::Error(VmError::Reference);
+            }
+            Step::Next
+        }
+        Opcode::LoadNamedPropertyFromSuper | Opcode::LoadKeyedPropertyFromSuper => {
+            let recv = stack.reg(&meta, ops.reg(0));
+            if recv == heap.known().the_hole.value() {
+                // super.x before super() in a derived constructor
+                return Step::Error(VmError::Reference);
+            }
+            let value = cache.acc();
+            if op == Opcode::LoadKeyedPropertyFromSuper {
+                let raw = stack.reg(&meta, ops.reg(1));
+                let key = step_try!(Runtime::canonical_key_value(vm, heap, state, raw));
+                stack.set_reg(&meta, ops.reg(1), key);
+            }
+            let outcome = step_try!(heap.no_gc(|nogc| {
+                let name = match op {
+                    Opcode::LoadNamedPropertyFromSuper => {
+                        callable_name(nogc, stack, &meta, ops.idx(1))
+                    }
+                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(1)))? {
+                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                        Key::Name(name) => name,
+                    },
+                };
+                super_lookup(nogc, value, name)
+            }));
+            match outcome {
+                LoadOutcome::Value(v) => cache.set_acc(v),
+                LoadOutcome::Getter(getter) => {
+                    let called =
+                        step_try!(call_value(heap, stack, cache, meta, pc, getter, &[recv],));
+                    if !called {
+                        cache.set_acc(heap.known().undefined.value());
+                    }
+                }
+            }
+            Step::Next
+        }
+        Opcode::StoreNamedPropertyToSuper | Opcode::StoreKeyedPropertyToSuper => {
+            let value = stack.reg(&meta, ops.reg(0));
+            let recv = stack.reg(&meta, ops.reg(1));
+            if recv == heap.known().the_hole.value() {
+                return Step::Error(VmError::Reference);
+            }
+            if op == Opcode::StoreKeyedPropertyToSuper {
+                let raw = stack.reg(&meta, ops.reg(2));
+                let key = step_try!(Runtime::canonical_key_value(vm, heap, state, raw));
+                stack.set_reg(&meta, ops.reg(2), key);
+            }
+            let semantics = if ops.uimm(3) & bytecode::SUPER_STORE_WRITE_THROUGH != 0 {
+                StoreSemantics::WriteThrough
+            } else {
+                StoreSemantics::Shadow
+            };
+            let outcome = step_try!(heap.no_gc(|nogc| {
+                let name = match op {
+                    Opcode::StoreNamedPropertyToSuper => {
+                        callable_name(nogc, stack, &meta, ops.idx(2))
+                    }
+                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(2)))? {
+                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                        Key::Name(name) => name,
+                    },
+                };
+                value.super_store_lookup(nogc, recv, name, cache.acc(), semantics)
+            }));
+            step_try!(apply_store_outcome(
+                heap, state, stack, cache, meta, pc, recv, outcome,
+            ));
+            Step::Next
+        }
+        Opcode::ConstructSuper | Opcode::ConstructSuperAllArgs => {
+            // ES 15.4.3: construct GetSuperConstructor() with the current
+            // frame's new.target; derived parents get the hole receiver
+            let (callee, new_target) = heap.no_gc(|nogc| {
+                let Some(callee) = super_constructor(nogc, stack, &meta) else {
+                    return (None, None);
+                };
+                let nt = stack.new_target_slot(&meta).inner();
+                (Some(callee), Some(nt))
+            });
+            let Some(callee) = callee else {
+                return Step::Error(VmError::Type);
+            };
+            let new_target = new_target.unwrap();
+            if new_target == heap.known().undefined.value() {
+                // not inside a [[Construct]] (should be unreachable)
+                return Step::Error(VmError::Type);
+            }
+            let derived = heap.no_gc(|nogc| {
+                function_kind_of(nogc, callee).is_some_and(|k| k.is_derived_class_constructor())
+            });
+            let (args_base, count) = match op {
+                Opcode::ConstructSuperAllArgs => {
+                    // forward the current frame's whole argument list
+                    (-2i32, stack.argc(&meta).saturating_sub(1))
+                }
+                _ => (ops.reg_list(0), ops.reg_count(1)),
+            };
+            state.handle_scope(|scope| {
+                let Some(callee) = scope.cast::<Object>(callee) else {
+                    return Step::Error(VmError::Type);
+                };
+                let Some(new_target) = scope.cast::<Object>(new_target) else {
+                    return Step::Error(VmError::Type);
+                };
+                let (receiver, allocated) = if derived {
+                    (heap.known().the_hole.value(), false)
+                } else {
+                    match Runtime::create_construct_receiver(vm, heap, state, new_target) {
+                        Ok(Some(r)) => (r, true),
+                        Ok(None) => return Step::PendingThrow,
+                        Err(err) => return Step::Error(err),
+                    }
+                };
+                let mut args = Vec::with_capacity(count + 1);
+                args.push(receiver);
+                args.extend_from_slice(stack.args(&meta, args_base, count).as_slice());
+                let result = match NativeContext::new(vm, heap, state).call_construct(
+                    callee.value(),
+                    new_target.value(),
+                    scope.stage(&args),
+                ) {
+                    Ok(r) => r,
+                    Err(err) => return Step::Error(err),
+                };
+                if result == heap.known().exception.value() {
+                    return Step::PendingThrow;
+                }
+                cache.set_acc(if Convert::is_primitive(&heap.guard(), result) {
+                    if allocated {
+                        receiver
+                    } else {
+                        return Step::Error(VmError::Type);
+                    }
+                } else {
+                    result
+                });
+                Step::Next
+            })
+        }
+        Opcode::InstallNamedAccessor | Opcode::InstallKeyedAccessor => {
+            // ES 14.3.10: define one accessor half, merging with an existing
+            // accessor pair under the same key. acc holds the closure.
+            let target = stack.reg(&meta, ops.reg(0));
+            if op == Opcode::InstallKeyedAccessor {
+                let raw = stack.reg(&meta, ops.reg(1));
+                let key = step_try!(Runtime::canonical_key_value(vm, heap, state, raw));
+                stack.set_reg(&meta, ops.reg(1), key);
+            }
+            let flags = match op {
+                Opcode::InstallNamedAccessor => ops.uimm(2),
+                _ => ops.uimm(2),
+            };
+            let is_getter = flags & 1 != 0;
+            let enumerable = flags & PropertyFlags::DontEnum.bits() == 0;
+            let outcome = step_try!(heap.no_gc(|nogc| {
+                if target.as_heap_object(nogc).is_none() {
+                    return Err(VmError::Type);
+                }
+                let name = match op {
+                    Opcode::InstallNamedAccessor => callable_name(nogc, stack, &meta, ops.idx(1)),
+                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(1)))? {
+                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                        Key::Name(name) => name,
+                    },
+                };
+                // existing own accessor half, if any (own descriptors only)
+                let undefined = nogc.known().undefined.value();
+                let mut get = undefined;
+                let mut set = undefined;
+                if let Some(obj) = target.as_heap_object(nogc) {
+                    for d in obj.as_ref().header.map.heap_ref(nogc).descriptors() {
+                        if d.name() == name && d.flags().is_accessor() {
+                            let pair = d
+                                .value
+                                .inner()
+                                .get_as::<AccessorPair>(nogc)
+                                .expect("accessor descriptor holds a pair");
+                            let pair = pair.as_ref();
+                            get = pair.get.inner();
+                            set = pair.set.inner();
+                            break;
+                        }
+                    }
+                }
+                if is_getter {
+                    get = cache.acc();
+                } else {
+                    set = cache.acc();
+                }
+                Ok((
+                    name,
+                    PropertyDescriptor::Accessor {
+                        get,
+                        set,
+                        enumerable,
+                        configurable: true,
+                    },
+                ))
+            }));
+            let (name, desc) = outcome;
+            let defined = state.handle_scope(|scope| {
+                Object::define_own_property_values(heap, &scope, target, name, desc)
+            });
+            let defined = step_try!(defined);
+            if !defined {
+                return Step::Error(VmError::Type);
             }
             Step::Next
         }

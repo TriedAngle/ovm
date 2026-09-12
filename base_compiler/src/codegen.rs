@@ -11,10 +11,10 @@
 //! the lexical function-nesting distance between the use site and the
 //! declaration's owning function.
 
-use bytecode::{Opcode, emit};
+use bytecode::{Opcode, PropertyFlags, emit};
 use parser::{
-    Ast, FunctionId, Node, NodeId, PropKind, Resolution, Resolved, ScopeId, Symbol, TokenKind,
-    VarKind,
+    Ast, ClassId, FunctionId, Node, NodeId, PropKind, Resolution, Resolved, ScopeId, ScopeKind,
+    Symbol, TokenKind, VarKind,
 };
 
 use crate::label::Label;
@@ -44,17 +44,32 @@ struct Breakable {
 /// A store target ready for the final store: the object (and computed key)
 /// evaluated into live registers, plus the name constant index.
 enum StoreTarget {
-    Named { obj: u32, name_idx: u32 },
-    Keyed { obj: u32, key: u32 },
+    Named {
+        obj: u32,
+        name_idx: u32,
+    },
+    Keyed {
+        obj: u32,
+        key: u32,
+    },
+    /// `super.x = v` / `super[k] = v`: receiver (this) and home object in
+    /// live registers
+    SuperNamed {
+        recv: u32,
+        home: u32,
+        name_idx: u32,
+    },
+    SuperKeyed {
+        recv: u32,
+        home: u32,
+        key: u32,
+    },
 }
 
 struct FunctionGen<'a> {
     ast: &'a Ast,
     resolved: &'a Resolved,
-    /// lexical function nesting depths (parallel to the function table)
-    depths: &'a [u32],
     fid: FunctionId,
-    depth: u32,
     code: Vec<u8>,
     constants: Vec<Constant>,
     handlers: Vec<HandlerEntry>,
@@ -75,13 +90,10 @@ struct FunctionGen<'a> {
 }
 
 pub fn generate(ast: &Ast, resolved: &Resolved) -> Result<CompiledScript, CompileError> {
-    let mut depths = vec![0u32; ast.function_count()];
-    compute_depths(ast, FunctionId(0), 0, &mut depths);
-
     let mut functions = Vec::with_capacity(ast.function_count());
     for fid in 0..ast.function_count() {
         let fid = FunctionId(fid as u32);
-        let mut generator = FunctionGen::new(ast, resolved, &depths, fid);
+        let mut generator = FunctionGen::new(ast, resolved, fid);
         generator.emit_function_body()?;
         debug_assert!(generator.next_temp == 0, "unbalanced temp allocation");
         functions.push(generator.finish());
@@ -89,182 +101,12 @@ pub fn generate(ast: &Ast, resolved: &Resolved) -> Result<CompiledScript, Compil
     Ok(CompiledScript { functions })
 }
 
-/// Lexical nesting depth of every function (script = 0).
-fn compute_depths(ast: &Ast, fid: FunctionId, depth: u32, out: &mut [u32]) {
-    out[fid.0 as usize] = depth;
-    let body = ast.function(fid).body.expect("function must be parsed");
-    collect_functions(ast, body, depth, out);
-}
-
-fn collect_functions(ast: &Ast, node: NodeId, depth: u32, out: &mut [u32]) {
-    match *ast.node(node) {
-        Node::FunctionExpr { function } | Node::FunctionDecl { function } => {
-            compute_depths(ast, function, depth + 1, out);
-        }
-        Node::Unary { expr, .. } | Node::Update { target: expr, .. } => {
-            collect_functions(ast, expr, depth, out)
-        }
-        Node::Binary { lhs, rhs, .. } => {
-            collect_functions(ast, lhs, depth, out);
-            collect_functions(ast, rhs, depth, out);
-        }
-        Node::Assign { target, value, .. } => {
-            collect_functions(ast, target, depth, out);
-            collect_functions(ast, value, depth, out);
-        }
-        Node::Conditional { cond, then, else_ } => {
-            collect_functions(ast, cond, depth, out);
-            collect_functions(ast, then, depth, out);
-            collect_functions(ast, else_, depth, out);
-        }
-        Node::Call { callee, args } => {
-            collect_functions(ast, callee, depth, out);
-            for &arg in ast.list_items(args) {
-                collect_functions(ast, arg, depth, out);
-            }
-        }
-        Node::New { callee, args } => {
-            collect_functions(ast, callee, depth, out);
-            if let Some(args) = args {
-                for &arg in ast.list_items(args) {
-                    collect_functions(ast, arg, depth, out);
-                }
-            }
-        }
-        Node::Property {
-            object,
-            key,
-            computed,
-        } => {
-            collect_functions(ast, object, depth, out);
-            if computed {
-                collect_functions(ast, key, depth, out);
-            }
-        }
-        Node::ArrayLiteral { elements } => {
-            for &el in ast.list_items(elements) {
-                collect_functions(ast, el, depth, out);
-            }
-        }
-        Node::Spread { expr } | Node::ExprStmt { expr } | Node::Throw { expr } => {
-            collect_functions(ast, expr, depth, out)
-        }
-        Node::Return { value } => {
-            if let Some(v) = value {
-                collect_functions(ast, v, depth, out);
-            }
-        }
-        Node::ObjectLiteral { props } => {
-            for &p in ast.list_items(props) {
-                collect_functions(ast, p, depth, out);
-            }
-        }
-        Node::ObjectProperty {
-            key,
-            value,
-            computed,
-            ..
-        } => {
-            if computed {
-                collect_functions(ast, key, depth, out);
-            }
-            collect_functions(ast, value, depth, out);
-        }
-        Node::VarDecl { decls, .. } => {
-            for &d in ast.list_items(decls) {
-                collect_functions(ast, d, depth, out);
-            }
-        }
-        Node::VarDeclarator { init, .. } => {
-            if let Some(init) = init {
-                collect_functions(ast, init, depth, out);
-            }
-        }
-        Node::Block { stmts } => {
-            for &s in ast.list_items(stmts) {
-                collect_functions(ast, s, depth, out);
-            }
-        }
-        Node::If { cond, then, else_ } => {
-            collect_functions(ast, cond, depth, out);
-            collect_functions(ast, then, depth, out);
-            if let Some(e) = else_ {
-                collect_functions(ast, e, depth, out);
-            }
-        }
-        Node::While { cond, body } => {
-            collect_functions(ast, cond, depth, out);
-            collect_functions(ast, body, depth, out);
-        }
-        Node::For {
-            init,
-            cond,
-            next,
-            body,
-        } => {
-            if let Some(n) = init {
-                collect_functions(ast, n, depth, out);
-            }
-            if let Some(c) = cond {
-                collect_functions(ast, c, depth, out);
-            }
-            if let Some(n) = next {
-                collect_functions(ast, n, depth, out);
-            }
-            collect_functions(ast, body, depth, out);
-        }
-        Node::TryCatch {
-            try_block,
-            catch_block,
-            finally_block,
-            ..
-        } => {
-            collect_functions(ast, try_block, depth, out);
-            if let Some(c) = catch_block {
-                collect_functions(ast, c, depth, out);
-            }
-            if let Some(f) = finally_block {
-                collect_functions(ast, f, depth, out);
-            }
-        }
-        Node::Switch { disc, cases } => {
-            collect_functions(ast, disc, depth, out);
-            for &case in ast.list_items(cases) {
-                if let Node::SwitchCase { test, stmts } = *ast.node(case) {
-                    if let Some(t) = test {
-                        collect_functions(ast, t, depth, out);
-                    }
-                    for &s in ast.list_items(stmts) {
-                        collect_functions(ast, s, depth, out);
-                    }
-                }
-            }
-        }
-        Node::SwitchCase { .. } => unreachable!("switch cases handled by the switch walk"),
-        Node::Labeled { body, .. } => collect_functions(ast, body, depth, out),
-        Node::ClassExpr { .. } | Node::ClassDecl { .. } => {}
-        Node::Identifier { .. }
-        | Node::NumberLiteral(_)
-        | Node::StringLiteral(_)
-        | Node::BigIntLiteral(_)
-        | Node::BoolLiteral(_)
-        | Node::NullLiteral
-        | Node::This
-        | Node::Hole
-        | Node::Empty
-        | Node::Break { .. }
-        | Node::Continue { .. } => {}
-    }
-}
-
 impl<'a> FunctionGen<'a> {
-    fn new(ast: &'a Ast, resolved: &'a Resolved, depths: &'a [u32], fid: FunctionId) -> Self {
+    fn new(ast: &'a Ast, resolved: &'a Resolved, fid: FunctionId) -> Self {
         Self {
             ast,
             resolved,
-            depths,
             fid,
-            depth: depths[fid.0 as usize],
             code: Vec::new(),
             constants: Vec::new(),
             handlers: Vec::new(),
@@ -336,25 +178,6 @@ impl<'a> FunctionGen<'a> {
 
     // -- scopes / resolutions -------------------------------------------------
 
-    /// Chain depth from the current frame context to the context holding
-    /// `scope`'s slots: lexical function distance between use site and
-    /// the declaration's owning function.
-    fn context_depth(&self, scope: ScopeId) -> u32 {
-        let mut s = scope;
-        loop {
-            if let Some(fid) = self.ast.scope(s).function {
-                let owner = self.depths[fid.0 as usize];
-                debug_assert!(self.depth >= owner, "captures are lexically enclosing");
-                return self.depth - owner;
-            }
-            s = self
-                .ast
-                .scope(s)
-                .parent
-                .expect("scope chain ends at script scope");
-        }
-    }
-
     /// Innermost scope (from the current position) declaring `name`.
     fn find_decl_scope(&self, name: Symbol) -> Option<ScopeId> {
         self.scopes
@@ -370,15 +193,15 @@ impl<'a> FunctionGen<'a> {
                 emit(&mut self.code, Opcode::Store, &[(-(i as i32 + 2)) as u32])
             }
             Resolution::Local { reg, .. } => emit(&mut self.code, Opcode::Store, &[reg]),
-            Resolution::Context { slot, scope, .. } => {
-                let depth = self.context_depth(scope);
+            Resolution::Context { slot, depth, .. } => {
                 emit(&mut self.code, Opcode::StoreContextSlot, &[slot, depth])
             }
             Resolution::GlobalObject => {
                 unreachable!("global stores need the name; use store_global")
             }
             Resolution::Dynamic => unreachable!("dynamic resolutions are rejected on load"),
-            Resolution::This(_) => unreachable!("this has no store target"),
+            Resolution::This { .. } => unreachable!("this has no store target"),
+            Resolution::Super { .. } => unreachable!("super has no store target"),
         }
     }
 
@@ -439,10 +262,9 @@ impl<'a> FunctionGen<'a> {
             }
             Resolution::Context {
                 slot,
-                scope,
+                depth,
                 hole_check,
             } => {
-                let depth = self.context_depth(scope);
                 emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
                 if hole_check {
                     emit(&mut self.code, Opcode::ThrowReferenceErrorIfHole, &[]);
@@ -459,7 +281,8 @@ impl<'a> FunctionGen<'a> {
                 emit(&mut self.code, Opcode::LoadDynamicName, &[idx]);
                 Ok(())
             }
-            Resolution::This(_) => unreachable!("this is not an identifier load"),
+            Resolution::This { .. } => unreachable!("this is not an identifier load"),
+            Resolution::Super { .. } => unreachable!("super is not an identifier load"),
         }
     }
 
@@ -475,6 +298,25 @@ impl<'a> FunctionGen<'a> {
         self.emit_load_constant(Constant::Boolean(false));
         end.bind(&self.code);
         end.patch_all(&mut self.code);
+    }
+
+    /// Load `this` of `owner` (the nearest non-arrow function). Inside a
+    /// derived constructor the value may still be the uninitialized hole:
+    /// every access must throw "super not called" (ES 10.2.2).
+    fn emit_this_for(&mut self, owner: FunctionId, depth: u32) {
+        if owner != self.fid {
+            let slot = self
+                .resolved
+                .layout(owner)
+                .this_slot
+                .expect("owner captures this");
+            emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
+        } else {
+            emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+        }
+        if self.ast.function(owner).kind.is_derived_class_constructor() {
+            emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
+        }
     }
 
     // -- expressions ------------------------------------------------------------
@@ -512,16 +354,8 @@ impl<'a> FunctionGen<'a> {
             Node::Identifier { sym } => self.emit_identifier(node, sym),
             Node::This => {
                 match self.resolved.resolution(node) {
-                    Some(Resolution::This(owner)) if owner != self.fid => {
-                        let slot = self
-                            .resolved
-                            .layout(owner)
-                            .this_slot
-                            .expect("owner captures this");
-                        let depth = self.depth - self.depths[owner.0 as usize];
-                        emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
-                    }
-                    _ => emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]),
+                    Some(Resolution::This { owner, depth }) => self.emit_this_for(owner, depth),
+                    _ => self.emit_this_for(self.fid, 0),
                 }
                 Ok(())
             }
@@ -545,7 +379,11 @@ impl<'a> FunctionGen<'a> {
                 emit(&mut self.code, Opcode::CreateClosure, &[idx]);
                 Ok(())
             }
-            Node::ClassExpr { .. } => self.err(node, "classes"),
+            Node::ClassExpr { class } => self.emit_class(node, class),
+            Node::SuperProperty { key, computed, .. } => {
+                self.emit_super_property_load(node, key, computed)
+            }
+            Node::SuperCall { args } => self.emit_super_call(node, args),
             Node::Hole => self.err(node, "array elision outside array literals"),
             Node::ObjectProperty { .. } => unreachable!("handled by object literal codegen"),
             _ => self.err(node, "statement in expression position"),
@@ -781,7 +619,7 @@ impl<'a> FunctionGen<'a> {
                 self.expr(value)?;
                 self.store_name(target, sym)
             }
-            Node::Property { .. } => {
+            Node::Property { .. } | Node::SuperProperty { .. } => {
                 let store = self.prepare_property_store(target)?;
                 self.expr(value)?;
                 self.emit_property_store(&store);
@@ -807,6 +645,62 @@ impl<'a> FunctionGen<'a> {
             StoreTarget::Keyed { obj, key } => {
                 emit(&mut self.code, Opcode::StoreKeyedProperty, &[*obj, *key, 0]);
             }
+            StoreTarget::SuperNamed {
+                recv,
+                home,
+                name_idx,
+            } => {
+                emit(
+                    &mut self.code,
+                    Opcode::StoreNamedPropertyToSuper,
+                    &[*home, *recv, *name_idx, 0, 0],
+                );
+            }
+            StoreTarget::SuperKeyed { recv, home, key } => {
+                emit(
+                    &mut self.code,
+                    Opcode::StoreKeyedPropertyToSuper,
+                    &[*home, *recv, *key, 0, 0],
+                );
+            }
+        }
+    }
+
+    /// Load the current value of a prepared store target into the
+    /// accumulator (compound assignment / update prefixes).
+    fn emit_property_load_of(&mut self, store: &StoreTarget) {
+        match store {
+            StoreTarget::Named { obj, name_idx } => {
+                emit(
+                    &mut self.code,
+                    Opcode::LoadNamedProperty,
+                    &[*obj, *name_idx, 0],
+                );
+            }
+            StoreTarget::Keyed { obj, key } => {
+                emit(&mut self.code, Opcode::Load, &[*key]);
+                emit(&mut self.code, Opcode::LoadKeyedProperty, &[*obj, 0]);
+            }
+            StoreTarget::SuperNamed {
+                recv,
+                home,
+                name_idx,
+            } => {
+                emit(&mut self.code, Opcode::Load, &[*home]);
+                emit(
+                    &mut self.code,
+                    Opcode::LoadNamedPropertyFromSuper,
+                    &[*recv, *name_idx, 0],
+                );
+            }
+            StoreTarget::SuperKeyed { recv, home, key } => {
+                emit(&mut self.code, Opcode::Load, &[*home]);
+                emit(
+                    &mut self.code,
+                    Opcode::LoadKeyedPropertyFromSuper,
+                    &[*recv, *key, 0],
+                );
+            }
         }
     }
 
@@ -817,6 +711,15 @@ impl<'a> FunctionGen<'a> {
             StoreTarget::Keyed { .. } => {
                 self.pop_value(); // key
                 self.pop_value(); // obj
+            }
+            StoreTarget::SuperNamed { .. } => {
+                self.pop_value(); // home
+                self.pop_value(); // recv
+            }
+            StoreTarget::SuperKeyed { .. } => {
+                self.pop_value(); // home
+                self.pop_value(); // key
+                self.pop_value(); // recv
             }
         }
     }
@@ -846,7 +749,58 @@ impl<'a> FunctionGen<'a> {
                 let k = self.push_value();
                 Ok(StoreTarget::Keyed { obj, key: k })
             }
+            Node::SuperProperty { key, computed, .. } => {
+                let Some(store) = self.prepare_super_parts(target, key, computed)? else {
+                    return self.err(target, "super assignment target");
+                };
+                Ok(store)
+            }
             _ => self.err(target, "assignment target"),
+        }
+    }
+
+    /// The receiver and home-object registers of a `super.x` reference
+    /// (assignment target or compound-access base).
+    fn prepare_super_parts(
+        &mut self,
+        node: NodeId,
+        key: NodeId,
+        computed: bool,
+    ) -> Result<Option<StoreTarget>, CompileError> {
+        let Some(Resolution::Super {
+            home_slot,
+            depth: home_depth,
+            this_owner,
+            this_depth,
+        }) = self.resolved.resolution(node)
+        else {
+            return Ok(None);
+        };
+        self.emit_this_for(this_owner, this_depth);
+        let recv = self.push_value();
+        if computed {
+            self.expr(key)?;
+            let k = self.push_value();
+            emit(
+                &mut self.code,
+                Opcode::LoadContextSlot,
+                &[home_slot, home_depth],
+            );
+            let home = self.push_value();
+            Ok(Some(StoreTarget::SuperKeyed { recv, home, key: k }))
+        } else {
+            let name_idx = self.name_constant(key)?;
+            emit(
+                &mut self.code,
+                Opcode::LoadContextSlot,
+                &[home_slot, home_depth],
+            );
+            let home = self.push_value();
+            Ok(Some(StoreTarget::SuperNamed {
+                recv,
+                home,
+                name_idx,
+            }))
         }
     }
 
@@ -867,23 +821,11 @@ impl<'a> FunctionGen<'a> {
             self.store_name(target, sym)?;
             return Ok(());
         }
-        if let Node::Property { .. } = *self.ast.node(target) {
+        if let Node::Property { .. } | Node::SuperProperty { .. } = *self.ast.node(target) {
             let store = self.prepare_property_store(target)?;
             self.expr(value)?;
             let v = self.push_value();
-            match &store {
-                StoreTarget::Named { obj, name_idx } => {
-                    emit(
-                        &mut self.code,
-                        Opcode::LoadNamedProperty,
-                        &[*obj, *name_idx, 0],
-                    );
-                }
-                StoreTarget::Keyed { obj, key } => {
-                    emit(&mut self.code, Opcode::Load, &[*key]);
-                    emit(&mut self.code, Opcode::LoadKeyedProperty, &[*obj, 0]);
-                }
-            }
+            self.emit_property_load_of(&store);
             emit(&mut self.code, op, &[v]);
             self.pop_value();
             self.emit_property_store(&store);
@@ -927,21 +869,9 @@ impl<'a> FunctionGen<'a> {
             self.pop_value(); // orig
             return Ok(());
         }
-        if let Node::Property { .. } = *self.ast.node(target) {
+        if let Node::Property { .. } | Node::SuperProperty { .. } = *self.ast.node(target) {
             let store = self.prepare_property_store(target)?;
-            match &store {
-                StoreTarget::Named { obj, name_idx } => {
-                    emit(
-                        &mut self.code,
-                        Opcode::LoadNamedProperty,
-                        &[*obj, *name_idx, 0],
-                    );
-                }
-                StoreTarget::Keyed { obj, key } => {
-                    emit(&mut self.code, Opcode::Load, &[*key]);
-                    emit(&mut self.code, Opcode::LoadKeyedProperty, &[*obj, 0]);
-                }
-            }
+            self.emit_property_load_of(&store);
             let orig = self.push_value();
             emit(&mut self.code, Opcode::LoadSmi, &[delta]);
             let d = self.push_value();
@@ -999,6 +929,60 @@ impl<'a> FunctionGen<'a> {
         // list, so the argument registers must immediately follow it. The
         // callee is stored in a fixed slot above the args (evaluation order:
         // receiver, property get, then arguments).
+        if let Node::SuperProperty { key, computed, .. } = *self.ast.node(callee) {
+            // super.m(...): the method comes from the home-object chain and
+            // runs with the current `this`
+            let argc = self.ast.list_items(args).len();
+            let Some(store) = self.prepare_super_parts(callee, key, computed)? else {
+                return self.err(callee, "super method call");
+            };
+            match &store {
+                StoreTarget::SuperNamed {
+                    recv,
+                    home,
+                    name_idx,
+                } => {
+                    let (recv, home, name_idx) = (*recv, *home, *name_idx);
+                    emit(&mut self.code, Opcode::Load, &[home]);
+                    emit(
+                        &mut self.code,
+                        Opcode::LoadNamedPropertyFromSuper,
+                        &[recv, name_idx, 0],
+                    );
+                }
+                StoreTarget::SuperKeyed { recv, home, key } => {
+                    let (recv, home, key) = (*recv, *home, *key);
+                    emit(&mut self.code, Opcode::Load, &[home]);
+                    emit(
+                        &mut self.code,
+                        Opcode::LoadKeyedPropertyFromSuper,
+                        &[recv, key, 0],
+                    );
+                }
+                _ => unreachable!("super store parts"),
+            }
+            let recv = match &store {
+                StoreTarget::SuperNamed { recv, .. } => *recv,
+                StoreTarget::SuperKeyed { recv, .. } => *recv,
+                _ => unreachable!(),
+            };
+            let callee_reg = self.reg_base + self.next_temp + argc as u32;
+            emit(&mut self.code, Opcode::Store, &[callee_reg]);
+            self.next_temp += argc as u32 + 1;
+            for (i, &arg) in self.ast.list_items(args).iter().enumerate() {
+                self.expr(arg)?;
+                emit(&mut self.code, Opcode::Store, &[recv + 1 + i as u32]);
+            }
+            self.max_temps = self.max_temps.max(self.next_temp);
+            emit(
+                &mut self.code,
+                Opcode::CallNoFeedback,
+                &[callee_reg, recv, (argc + 1) as u32],
+            );
+            self.next_temp -= argc as u32 + 1;
+            self.release_store(&store);
+            return Ok(());
+        }
         if let Node::Property {
             object,
             key,
@@ -1111,6 +1095,357 @@ impl<'a> FunctionGen<'a> {
             Opcode::Construct,
             &[callee_reg, arg_base, argc as u32],
         );
+        self.next_temp -= argc as u32 + 1;
+        Ok(())
+    }
+
+    // -- classes ---------------------------------------------------------------
+
+    /// Class definitions (ES 15.7.14 ClassDefinitionEvaluation) as inline
+    /// per-member emission: validate the superclass, create the class
+    /// context, build the prototype and constructor, install members with
+    /// class attributes, wire the prototype chain, and store the bindings.
+    /// Leaves the class constructor in the accumulator.
+    fn emit_class(&mut self, node: NodeId, class: ClassId) -> Result<(), CompileError> {
+        let info = self.ast.class(class);
+        let class_scope = self
+            .ast
+            .node_scope(node)
+            .expect("class node owns its scope");
+        let needs_ctx = info.name.is_some() || info.uses_super;
+
+        // class inner context: the name binding (TDZ until the class value
+        // exists) and the super home objects; captured by member closures.
+        // Pushed before the superclass evaluation: ClassHeritage sees the
+        // inner binding (in TDZ) per ES 15.7.14 step 8.
+        let ctx_save = if needs_ctx {
+            let slot_count = self.ast.scope(class_scope).decls.len() as u32;
+            emit(&mut self.code, Opcode::CreateBlockContext, &[slot_count]);
+            let save = self.reserve_temp();
+            emit(&mut self.code, Opcode::PushContext, &[save]);
+            Some(save)
+        } else {
+            None
+        };
+
+        // superclass: must be null or a constructor
+        let sup = if let Some(sup) = info.superclass {
+            self.expr(sup)?;
+            emit(&mut self.code, Opcode::ThrowIfNotConstructorOrNull, &[]);
+            Some(self.push_value())
+        } else {
+            None
+        };
+
+        // prototype/constructor parents; defaults are the no-extends case
+        self.emit_load_constant(Constant::ObjectPrototype);
+        let pp = self.push_value();
+        self.emit_load_constant(Constant::FunctionPrototype);
+        let cp = self.push_value();
+        if let Some(sup) = sup {
+            // null superclass → null-proto prototype; ctor parent stays
+            // %Function.prototype% (objects are always truthy, so the falsy
+            // test identifies null)
+            emit(&mut self.code, Opcode::Load, &[sup]);
+            let mut null_extends = Label::new();
+            emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut null_extends);
+            // protoParent = Get(superCtor, "prototype") (full [[Get]])
+            let proto_name = self.add_constant(Constant::String(b"prototype".to_vec()));
+            emit(
+                &mut self.code,
+                Opcode::LoadNamedProperty,
+                &[sup, proto_name, 0],
+            );
+            emit(&mut self.code, Opcode::ThrowIfNotObjectOrNull, &[]);
+            emit(&mut self.code, Opcode::Store, &[pp]);
+            emit(&mut self.code, Opcode::Load, &[sup]);
+            emit(&mut self.code, Opcode::Store, &[cp]);
+            let mut done = Label::new();
+            emit_jump(&mut self.code, Opcode::Jump, &mut done);
+            null_extends.bind(&self.code);
+            null_extends.patch_all(&mut self.code);
+            self.emit_load_constant(Constant::Null);
+            emit(&mut self.code, Opcode::Store, &[pp]);
+            done.bind(&self.code);
+            done.patch_all(&mut self.code);
+        }
+
+        // prototype: a fresh ordinary object with protoParent
+        emit(&mut self.code, Opcode::CreateEmptyObjectLiteral, &[]);
+        let proto = self.push_value();
+        emit(&mut self.code, Opcode::Load, &[proto]);
+        emit(&mut self.code, Opcode::SetPrototype, &[pp]);
+
+        // constructor closure
+        let ctor_idx = self.add_constant(Constant::Callable(info.ctor));
+        emit(&mut self.code, Opcode::CreateClosure, &[ctor_idx]);
+        let ctor = self.push_value();
+
+        // wiring before member installation (ES 15.7.14 steps 17–18 precede
+        // the element loop): computed `['constructor']` members overwrite
+        // proto.constructor, computed static `['prototype']` defines fail
+        // against the non-configurable ctor.prototype
+        // proto.constructor → the class {w+, e−, c+}
+        emit(&mut self.code, Opcode::Load, &[ctor]);
+        let ctor_name = self.add_constant(Constant::String(b"constructor".to_vec()));
+        emit(
+            &mut self.code,
+            Opcode::DefineNamedOwnProperty,
+            &[proto, ctor_name, PropertyFlags::DontEnum.bits(), 0],
+        );
+        // ctor.prototype → the prototype {w+, e−, c−}
+        emit(&mut self.code, Opcode::Load, &[proto]);
+        let proto_name = self.add_constant(Constant::String(b"prototype".to_vec()));
+        emit(
+            &mut self.code,
+            Opcode::DefineNamedOwnProperty,
+            &[
+                ctor,
+                proto_name,
+                PropertyFlags::DontEnum.bits() | PropertyFlags::DontDelete.bits(),
+                0,
+            ],
+        );
+        // the class itself inherits from the superclass constructor
+        emit(&mut self.code, Opcode::Load, &[ctor]);
+        emit(&mut self.code, Opcode::SetPrototype, &[cp]);
+
+        // members in declaration order; the constructor is already installed
+        for m in &info.members {
+            if m.is_constructor {
+                continue;
+            }
+            let target = if m.is_static { ctor } else { proto };
+            let function = match *self.ast.node(m.value) {
+                Node::FunctionExpr { function } => function,
+                _ => return self.err(m.value, "class member function"),
+            };
+            // non-computed keys are strings or numbers; numbers go through
+            // the keyed define with the literal loaded into a register
+            let numeric_key =
+                !m.computed && matches!(*self.ast.node(m.key), Node::NumberLiteral(_));
+            let key = if m.computed || numeric_key {
+                if m.computed {
+                    self.expr(m.key)?;
+                } else if let Node::NumberLiteral(f) = *self.ast.node(m.key) {
+                    if f.fract() == 0.0 && f.is_sign_positive() && f <= i16::MAX as f64 {
+                        emit(&mut self.code, Opcode::LoadSmi, &[f as i32 as u32]);
+                    } else {
+                        self.emit_load_constant(Constant::Float(f));
+                    }
+                } else {
+                    unreachable!("numeric key checked above");
+                }
+                Some(self.push_value())
+            } else {
+                None
+            };
+            let fn_idx = self.add_constant(Constant::Callable(function));
+            emit(&mut self.code, Opcode::CreateClosure, &[fn_idx]);
+            match m.kind {
+                PropKind::Method => {
+                    // {w+, e−, c+}
+                    match key {
+                        Some(k) => {
+                            emit(
+                                &mut self.code,
+                                Opcode::DefineKeyedOwnProperty,
+                                &[target, k, PropertyFlags::DontEnum.bits(), 0],
+                            );
+                        }
+                        None => {
+                            let name_idx = self.name_constant(m.key)?;
+                            emit(
+                                &mut self.code,
+                                Opcode::DefineNamedOwnProperty,
+                                &[target, name_idx, PropertyFlags::DontEnum.bits(), 0],
+                            );
+                        }
+                    }
+                }
+                PropKind::Get | PropKind::Set => {
+                    // one accessor half; merges with an existing pair
+                    let mut flags = PropertyFlags::DontEnum.bits();
+                    if m.kind == PropKind::Get {
+                        flags |= 1;
+                    }
+                    match key {
+                        Some(k) => {
+                            emit(
+                                &mut self.code,
+                                Opcode::InstallKeyedAccessor,
+                                &[target, k, flags],
+                            );
+                        }
+                        None => {
+                            let name_idx = self.name_constant(m.key)?;
+                            emit(
+                                &mut self.code,
+                                Opcode::InstallNamedAccessor,
+                                &[target, name_idx, flags],
+                            );
+                        }
+                    }
+                }
+                PropKind::Init => return self.err(m.value, "class field initializers"),
+            }
+            if key.is_some() {
+                self.pop_value();
+            }
+        }
+
+        // home objects and the inner class-name binding
+        if info.uses_super {
+            let home = info.home.expect("uses_super classes declare home slots");
+            let res = self
+                .resolved
+                .resolution_for_decl(class_scope, home)
+                .expect("home slot declared");
+            if let Resolution::Context { slot, .. } = res {
+                // the class context is pushed here: zero hops
+                emit(&mut self.code, Opcode::Load, &[proto]);
+                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            }
+            let static_home = info
+                .static_home
+                .expect("uses_super classes declare static home slots");
+            let res = self
+                .resolved
+                .resolution_for_decl(class_scope, static_home)
+                .expect("static home slot declared");
+            if let Resolution::Context { slot, .. } = res {
+                emit(&mut self.code, Opcode::Load, &[ctor]);
+                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            }
+        }
+        if let Some(name) = info.name {
+            if let Resolution::Context { slot, .. } = self
+                .resolved
+                .resolution_for_decl(class_scope, name)
+                .expect("class name declared in the class scope")
+            {
+                emit(&mut self.code, Opcode::Load, &[ctor]);
+                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            }
+        }
+
+        // pop the class context; member closures already captured it
+        if let Some(save) = ctx_save {
+            emit(&mut self.code, Opcode::PopContext, &[save]);
+            self.next_temp -= 1; // save
+        }
+
+        // outer binding for declarations (the class value in acc)
+        emit(&mut self.code, Opcode::Load, &[ctor]);
+        if let Node::ClassDecl { .. } = *self.ast.node(node)
+            && let Some(name) = info.name
+        {
+            let Some(scope) = self.find_decl_scope(name) else {
+                return self.err(node, "class declaration without a binding");
+            };
+            let res = self
+                .resolved
+                .resolution_for_decl(scope, name)
+                .expect("declared");
+            self.store_decl(res, name);
+        }
+
+        // LIFO: ctor, proto, cp, pp, superclass
+        self.pop_value(); // ctor
+        self.pop_value(); // proto
+        self.pop_value(); // cp
+        self.pop_value(); // pp
+        if sup.is_some() {
+            self.pop_value();
+        }
+        emit(&mut self.code, Opcode::Load, &[ctor]);
+        Ok(())
+    }
+
+    /// Reserve a temp register without storing the accumulator.
+    fn reserve_temp(&mut self) -> u32 {
+        let r = self.reg_base + self.next_temp;
+        self.next_temp += 1;
+        self.max_temps = self.max_temps.max(self.next_temp);
+        r
+    }
+
+    /// `super.x` / `super[key]` load.
+    fn emit_super_property_load(
+        &mut self,
+        node: NodeId,
+        key: NodeId,
+        computed: bool,
+    ) -> Result<(), CompileError> {
+        let Some(store) = self.prepare_super_parts(node, key, computed)? else {
+            return self.err(node, "super property");
+        };
+        match store {
+            StoreTarget::SuperNamed {
+                recv,
+                home,
+                name_idx,
+            } => {
+                emit(&mut self.code, Opcode::Load, &[home]);
+                emit(
+                    &mut self.code,
+                    Opcode::LoadNamedPropertyFromSuper,
+                    &[recv, name_idx, 0],
+                );
+            }
+            StoreTarget::SuperKeyed { recv, home, key } => {
+                emit(&mut self.code, Opcode::Load, &[home]);
+                emit(
+                    &mut self.code,
+                    Opcode::LoadKeyedPropertyFromSuper,
+                    &[recv, key, 0],
+                );
+            }
+            _ => unreachable!("super store parts"),
+        }
+        self.release_store(&store);
+        Ok(())
+    }
+
+    /// `super(...)`: construct the superclass with the frame's new.target and
+    /// initialize `this` with the result (ES 15.4.3). Evaluates to the new
+    /// `this`.
+    fn emit_super_call(
+        &mut self,
+        _node: NodeId,
+        args: parser::NodeList,
+    ) -> Result<(), CompileError> {
+        let items = self.ast.list_items(args).to_vec();
+        let argc = items.len();
+        let arg_base = self.reg_base + self.next_temp;
+        // reserve arguments + result so nested temps land above
+        self.next_temp += argc as u32 + 1;
+        for (i, &arg) in items.iter().enumerate() {
+            self.expr(arg)?;
+            emit(&mut self.code, Opcode::Store, &[arg_base + i as u32]);
+        }
+        self.max_temps = self.max_temps.max(self.next_temp);
+        emit(
+            &mut self.code,
+            Opcode::ConstructSuper,
+            &[arg_base, argc as u32],
+        );
+        let result = arg_base + argc as u32;
+        emit(&mut self.code, Opcode::Store, &[result]);
+        // InitializeThisBinding: this must still be uninitialized
+        emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+        emit(
+            &mut self.code,
+            Opcode::ThrowSuperAlreadyCalledIfNotHole,
+            &[],
+        );
+        emit(&mut self.code, Opcode::Load, &[result]);
+        emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
+        // keep a context-captured `this` (nested arrows) in sync
+        if let Some(slot) = self.resolved.layout(self.fid).this_slot {
+            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+        }
+        emit(&mut self.code, Opcode::Load, &[result]);
         self.next_temp -= argc as u32 + 1;
         Ok(())
     }
@@ -1247,6 +1582,12 @@ impl<'a> FunctionGen<'a> {
                 body,
             } => self.emit_for(node, init, cond, next, body, None),
             Node::Return { value } => {
+                // derived constructors: `return v` returns v only when it is
+                // an object; `undefined` (and fallthrough) return `this`,
+                // which must be initialized (ES 9.2.2.1)
+                if self.is_derived_ctor() {
+                    return self.emit_derived_return(value);
+                }
                 match value {
                     Some(v) => self.expr(v)?,
                     None => self.emit_load_constant(Constant::Undefined),
@@ -1289,7 +1630,7 @@ impl<'a> FunctionGen<'a> {
             Node::Break { label } => self.emit_break_continue(node, label, true),
             Node::Continue { label } => self.emit_break_continue(node, label, false),
             Node::Empty => Ok(()),
-            Node::ClassDecl { .. } => self.err(node, "classes"),
+            Node::ClassDecl { class } => self.emit_class(node, class),
             _ => self.err(node, "statement"),
         }
     }
@@ -1640,6 +1981,10 @@ impl<'a> FunctionGen<'a> {
         }
         for s in 0..self.ast.scope_count() {
             let scope = ScopeId(s as u32);
+            // class scopes own their own contexts, not this function's
+            if self.ast.scope(scope).kind == ScopeKind::Class {
+                continue;
+            }
             // owning function of this scope: nearest enclosing function scope
             let mut cur = scope;
             let owner = loop {
@@ -1667,6 +2012,49 @@ impl<'a> FunctionGen<'a> {
             .into_iter()
             .map(|n| n.expect("context slot must have a name"))
             .collect()
+    }
+
+    fn is_derived_ctor(&self) -> bool {
+        self.ast
+            .function(self.fid)
+            .kind
+            .is_derived_class_constructor()
+    }
+
+    /// `return [expr]` inside a derived constructor: an object result wins,
+    /// `undefined` (and missing) return `this` (initialization checked),
+    /// other primitives make the [[Construct]] throw (ES 9.2.2.1 — the
+    /// primitive escapes and the Construct opcode rejects it).
+    fn emit_derived_return(&mut self, value: Option<NodeId>) -> Result<(), CompileError> {
+        let Some(v) = value else {
+            // `return;` → return this
+            emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+            emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
+            emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+            emit(&mut self.code, Opcode::Return, &[]);
+            return Ok(());
+        };
+        self.expr(v)?;
+        let t = self.push_value();
+        // acc === undefined → return this
+        self.emit_load_constant(Constant::Undefined);
+        let u = self.push_value();
+        emit(&mut self.code, Opcode::Load, &[t]);
+        emit(&mut self.code, Opcode::EqualStrict, &[u]);
+        let mut is_obj = Label::new();
+        emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut is_obj);
+        emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+        emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
+        emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+        emit(&mut self.code, Opcode::Return, &[]);
+        is_obj.bind(&self.code);
+        is_obj.patch_all(&mut self.code);
+        emit(&mut self.code, Opcode::Load, &[t]);
+        emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+        emit(&mut self.code, Opcode::Return, &[]);
+        self.pop_value(); // u
+        self.pop_value(); // t
+        Ok(())
     }
 
     fn emit_function_body(&mut self) -> Result<(), CompileError> {
@@ -1718,6 +2106,17 @@ impl<'a> FunctionGen<'a> {
             emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
         }
 
+        // the synthesized default derived constructor forwards every
+        // argument to super() and returns the bound this (ES 15.7.13)
+        if info.kind == parser::FunctionKind::DefaultDerivedConstructor {
+            emit(&mut self.code, Opcode::ConstructSuperAllArgs, &[]);
+            emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
+            emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+            emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+            emit(&mut self.code, Opcode::Return, &[]);
+            return Ok(());
+        }
+
         // the script's completion value starts as undefined; only
         // value-producing statements overwrite it (see `stmt` → ExprStmt)
         if let Some(completion) = self.completion {
@@ -1728,10 +2127,15 @@ impl<'a> FunctionGen<'a> {
         self.stmt(body)?;
 
         // fallthrough: the script yields its completion value; ordinary
-        // functions return undefined
+        // functions return undefined; derived constructors return `this`
+        // (initialization checked — super() must have run)
         emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
         match self.completion {
             Some(completion) => emit(&mut self.code, Opcode::Load, &[completion]),
+            None if self.is_derived_ctor() => {
+                emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+                emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
+            }
             None => self.emit_load_constant(Constant::Undefined),
         }
         emit(&mut self.code, Opcode::Return, &[]);

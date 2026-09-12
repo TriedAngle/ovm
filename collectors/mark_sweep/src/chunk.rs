@@ -7,7 +7,7 @@ use core::ptr::NonNull;
 use heap_api::{AllocError, GcHost};
 use heap_utils::{Bitmap, MMapBuffer};
 
-use crate::block::{need_for, ALIGN, FreeList};
+use crate::block::{ALIGN, FreeList, need_for};
 
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
@@ -242,8 +242,7 @@ impl ChunkedHeap {
     }
 
     fn chunk_region(&self, index: usize) -> (NonNull<u8>, usize) {
-        let base =
-            unsafe { self.buffer.start().as_ptr().add(index * self.chunk_size) };
+        let base = unsafe { self.buffer.start().as_ptr().add(index * self.chunk_size) };
         let size = self
             .chunk_size
             .min(self.reserve_size() - index * self.chunk_size);

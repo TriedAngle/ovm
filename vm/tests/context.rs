@@ -25,7 +25,7 @@ fn empty_context_is_the_well_known_root() {
     assert_eq!(kind, ObjectKind::Context);
     assert_eq!(
         outer,
-        thread.heap().known().void.value(),
+        thread.heap().known().the_hole.value(),
         "no outer context"
     );
     assert_eq!(len, 0, "no context slots");
@@ -85,7 +85,7 @@ fn closure_object_carries_typed_context() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
         let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()
@@ -119,7 +119,7 @@ fn closure_object_carries_typed_context() {
                 ObjectSlotsInit {
                     map,
                     values: &[info.value(), context.value()],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )

@@ -18,7 +18,7 @@ fn callable<'s>(
     register_count: usize,
     handlers: Option<&[HandlerEntryInit]>,
 ) -> Value {
-    let void = thread.heap().known().void;
+    let the_hole = thread.heap().known().the_hole;
     let empty_context = thread.heap().known().empty_context;
     let bytecode = thread
         .heap()
@@ -48,7 +48,7 @@ fn callable<'s>(
             ObjectSlotsInit {
                 map,
                 values: &[info.value(), empty_context.value()],
-                elements: void.erase(),
+                elements: the_hole.erase(),
                 length: 0,
             },
         )

@@ -1,6 +1,6 @@
 use crate::token::{Span, Token, TokenKind};
 use crate::{
-    Ast, Bookmark, CharStream, ClassId, ClassInfo, ClassMember, DeclKind, FunctionId, FunctionInfo,
+    Ast, Bookmark, CharStream, ClassInfo, ClassMember, DeclKind, FunctionId, FunctionInfo,
     FunctionKind, Node, NodeId, NodeList, PropKind, Scanner, ScopeId, ScopeKind, Symbol,
     SymbolTable, VarKind,
 };
@@ -56,6 +56,16 @@ struct Scope {
     var_declared: Vec<Symbol>,
 }
 
+/// Parse-time class context: attributes `super` uses to the class owning
+/// the nearest enclosing non-arrow member function.
+struct ClassCtx {
+    /// fn_stack depth when the class body started: members live at depths
+    /// greater than this
+    entry_fn_depth: usize,
+    uses_super: bool,
+    is_static: bool,
+}
+
 pub struct Parser<S: CharStream> {
     scanner: Scanner<S>,
     ast: Ast,
@@ -66,6 +76,8 @@ pub struct Parser<S: CharStream> {
     switch_depth: u32,
     /// functions currently being parsed (ids into the Ast table); last = innermost
     fn_stack: Vec<FunctionId>,
+    /// classes currently being parsed; last = innermost
+    class_stack: Vec<ClassCtx>,
     next_literal_id: u32,
 }
 
@@ -79,6 +91,7 @@ impl<S: CharStream> Parser<S> {
             loop_depth: 0,
             switch_depth: 0,
             fn_stack: Vec::new(),
+            class_stack: Vec::new(),
             next_literal_id: 0,
         }
     }
@@ -372,11 +385,7 @@ impl<S: CharStream> Parser<S> {
                 let span = self.ast.function(function).span;
                 Ok(self.ast.add(Node::FunctionDecl { function }, span))
             }
-            TokenKind::Class => {
-                let class = self.parse_class(true)?;
-                let span = self.ast.class(class).span;
-                Ok(self.ast.add(Node::ClassDecl { class }, span))
-            }
+            TokenKind::Class => self.parse_class(true),
             TokenKind::If => self.parse_if(),
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
@@ -877,7 +886,12 @@ impl<S: CharStream> Parser<S> {
             let expr = self.parse_assignment()?;
             let span = self.ast.span(expr);
             let ret = self.ast.add(Node::Return { value: Some(expr) }, span);
-            self.add_block(vec![ret], span)
+            let block = self.add_block(vec![ret], span);
+            // link the expression body to the arrow's function scope so
+            // scope analysis (context depths) sees the function boundary
+            let scope = self.scopes.last().expect("arrow fn scope").id;
+            self.ast.set_node_scope(block, scope);
+            block
         };
         self.end_fn_body(fid, start, body, saved_loop_depth);
         let span = self.ast.function(fid).span;
@@ -920,9 +934,12 @@ impl<S: CharStream> Parser<S> {
 
     // -- classes --------------------------------------------------------------
 
-    /// Class declarations and expressions. Deferred: fields, private names,
-    /// static blocks (all get a clean error).
-    fn parse_class(&mut self, is_declaration: bool) -> Result<ClassId, ParseError> {
+    /// Class declarations and expressions (ES 15.7). Deferred: fields,
+    /// private names, static blocks (all get a clean error).
+    ///
+    /// Returns the ClassDecl/ClassExpr node; the class inner scope (name
+    /// binding + super home objects) is attached as the node's scope.
+    fn parse_class(&mut self, is_declaration: bool) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::Class)?.span.start;
         let t = self.peek()?;
         let name = if is_identifier_like(t.kind) {
@@ -938,6 +955,14 @@ impl<S: CharStream> Parser<S> {
         if let Some(name) = name.filter(|_| is_declaration) {
             self.declare_lexical(name, t.span, DeclKind::Class)?;
         }
+
+        // class inner scope: the immutable class-name binding (in TDZ during
+        // heritage/computed-key evaluation) plus the super home-object slots
+        let class_scope = self.push_scope(ScopeKind::Class);
+        if let Some(name) = name {
+            self.declare_lexical(name, t.span, DeclKind::Class)?;
+        }
+
         let superclass = if self.eat(TokenKind::Extends)? {
             Some(self.parse_assignment()?)
         } else {
@@ -946,6 +971,11 @@ impl<S: CharStream> Parser<S> {
         self.expect(TokenKind::LBrace)?;
         let mut members = Vec::new();
         let mut has_constructor = false;
+        self.class_stack.push(ClassCtx {
+            entry_fn_depth: self.fn_stack.len(),
+            uses_super: false,
+            is_static: false,
+        });
         let end = loop {
             let t = self.peek()?;
             match t.kind {
@@ -973,28 +1003,38 @@ impl<S: CharStream> Parser<S> {
                     self.next()?;
                 }
             }
+            self.class_stack.last_mut().unwrap().is_static = is_static;
 
             let accessor = self.eat_accessor_prefix()?;
             let (key, key_sym, computed) = self.parse_property_key()?;
             let key_span = self.ast.span(key);
 
-            // constructor rules
-            let is_constructor_name =
-                !computed && key_sym.is_some_and(|s| self.symbols().get(s) == b"constructor");
+            // early errors (ES 15.7.1)
+            let is_constructor_name = !computed
+                && !is_static
+                && key_sym.is_some_and(|s| self.symbols().get(s) == b"constructor");
+            if is_constructor_name && accessor.is_some() {
+                return Err(ParseError::new(
+                    key_span,
+                    "constructor can't be an accessor",
+                ));
+            }
             if is_constructor_name {
-                if is_static {
-                    return Err(ParseError::new(key_span, "constructor can't be static"));
-                }
-                if accessor.is_some() {
-                    return Err(ParseError::new(
-                        key_span,
-                        "constructor can't be an accessor",
-                    ));
-                }
                 if has_constructor {
                     return Err(ParseError::new(key_span, "duplicate constructor"));
                 }
                 has_constructor = true;
+            }
+            // a static member named "prototype" is a Syntax Error; a static
+            // member named "constructor" is an ordinary method
+            if is_static
+                && !computed
+                && key_sym.is_some_and(|s| self.symbols().get(s) == b"prototype")
+            {
+                return Err(ParseError::new(
+                    key_span,
+                    "class may not have a static method named 'prototype'",
+                ));
             }
 
             if self.peek()?.kind != TokenKind::LParen {
@@ -1035,12 +1075,180 @@ impl<S: CharStream> Parser<S> {
                 computed,
             });
         };
-        Ok(self.ast.add_class(ClassInfo {
+        let ctx = self.class_stack.pop().unwrap();
+
+        // default constructor for classes without an explicit one:
+        // base → empty body, derived → forward all arguments to super()
+        let ctor = if has_constructor {
+            members
+                .iter()
+                .find(|m| m.is_constructor)
+                .and_then(|m| match *self.ast.node(m.value) {
+                    Node::FunctionExpr { function } => Some(function),
+                    _ => None,
+                })
+                .expect("constructor member holds a function")
+        } else {
+            self.synthesize_default_ctor(start, end, name, superclass.is_some())?
+        };
+
+        // super home-object slots (hidden const bindings in the class scope)
+        let (home, static_home) = if ctx.uses_super {
+            let home = self.symbols_mut().intern(b".home_object");
+            self.declare_class_slot(class_scope, home, Span::new(start, start));
+            let static_home = self.symbols_mut().intern(b".static_home_object");
+            self.declare_class_slot(class_scope, static_home, Span::new(start, start));
+            (Some(home), Some(static_home))
+        } else {
+            (None, None)
+        };
+
+        self.scopes.pop();
+        let class = self.ast.add_class(ClassInfo {
             span: Span::new(start, end),
             name,
             superclass,
             members,
-        }))
+            ctor,
+            uses_super: ctx.uses_super,
+            home,
+            static_home,
+        });
+        let node = self.ast.add(
+            if is_declaration {
+                Node::ClassDecl { class }
+            } else {
+                Node::ClassExpr { class }
+            },
+            Span::new(start, end),
+        );
+        self.ast.set_node_scope(node, class_scope);
+        Ok(node)
+    }
+
+    fn declare_class_slot(&mut self, scope: ScopeId, sym: Symbol, span: Span) {
+        self.ast.declare(scope, sym, DeclKind::Const, span);
+        let s = self.scopes.last_mut().unwrap();
+        if !s.lexically_declared.contains(&sym) {
+            s.lexically_declared.push(sym);
+        }
+    }
+
+    /// `constructor() {}` (base) / `constructor(...args) { super(...args) }`
+    /// (derived) for classes without an explicit constructor (ES 15.7.13).
+    fn synthesize_default_ctor(
+        &mut self,
+        start: u32,
+        end: u32,
+        name: Option<Symbol>,
+        derived: bool,
+    ) -> Result<FunctionId, ParseError> {
+        let kind = if derived {
+            FunctionKind::DefaultDerivedConstructor
+        } else {
+            FunctionKind::BaseClassConstructor
+        };
+        let fid = self.add_function_info(
+            start,
+            name,
+            Vec::new(),
+            FnFlags {
+                declaration: false,
+                kind,
+            },
+        );
+        let scope_id = self.push_scope(ScopeKind::Function);
+        self.ast.scope_mut(scope_id).function = Some(fid);
+        let body = self.add_block(Vec::new(), Span::new(start, end));
+        self.ast.set_node_scope(body, scope_id);
+        self.scopes.pop();
+        let info = self.ast.function_mut(fid);
+        info.body = Some(body);
+        info.strict = true; // class bodies are strict
+        Ok(fid)
+    }
+
+    // -- super ------------------------------------------------------------------
+
+    /// Parse `super.x`, `super[key]`, or `super(...)` after validating the
+    /// syntactic context (ES 15.4).
+    fn parse_super(&mut self, span: Span) -> Result<NodeId, ParseError> {
+        // the nearest enclosing non-arrow function must be a class member
+        let fn_idx = self
+            .fn_stack
+            .iter()
+            .rposition(|&f| !self.ast.function(f).kind.is_arrow());
+        let member_kind = fn_idx.map(|i| self.ast.function(self.fn_stack[i]).kind);
+        let Some(kind) = member_kind.filter(|k| k.is_class_member()) else {
+            return Err(ParseError::new(span, "'super' outside of a class method"));
+        };
+        // attribute the use to the class owning that member function
+        let owning = match fn_idx {
+            Some(i) => self.class_stack.iter().rposition(|c| c.entry_fn_depth <= i),
+            None => None,
+        };
+        let Some(owning) = owning else {
+            return Err(ParseError::new(span, "'super' outside of a class method"));
+        };
+        let is_static = self.class_stack[owning].is_static;
+        self.next()?; // consume `super`
+
+        let t = self.peek()?;
+        match t.kind {
+            TokenKind::Period => {
+                self.next()?;
+                let name = self.next()?;
+                let sym = match name.kind {
+                    TokenKind::Identifier => Symbol(name.value.symbol().unwrap()),
+                    k if k.is_keyword() => self.symbols_mut().intern(k.text().as_bytes()),
+                    _ => return Err(ParseError::new(name.span, "expected property name")),
+                };
+                let key = self.ast.add(Node::StringLiteral(sym), name.span);
+                let span = Span::new(span.start, name.span.end);
+                self.class_stack[owning].uses_super = true;
+                Ok(self.ast.add(
+                    Node::SuperProperty {
+                        key,
+                        computed: false,
+                        is_static,
+                    },
+                    span,
+                ))
+            }
+            TokenKind::LBracket => {
+                self.next()?;
+                let key = self.parse_expression()?;
+                let end = self.expect(TokenKind::RBracket)?.span.end;
+                self.class_stack[owning].uses_super = true;
+                Ok(self.ast.add(
+                    Node::SuperProperty {
+                        key,
+                        computed: true,
+                        is_static,
+                    },
+                    Span::new(span.start, end),
+                ))
+            }
+            TokenKind::LParen => {
+                // super() is only valid directly inside a derived constructor
+                // body (nested-arrow delegation is not supported yet)
+                let directly = fn_idx == Some(self.fn_stack.len() - 1);
+                if !directly || kind != FunctionKind::DerivedClassConstructor {
+                    return Err(ParseError::new(
+                        span,
+                        "'super()' call outside a derived class constructor",
+                    ));
+                }
+                let (args, end) = self.parse_args()?;
+                Ok(self
+                    .ast
+                    .add(Node::SuperCall { args }, Span::new(span.start, end)))
+            }
+            _ => Err(ParseError::new(
+                t.span,
+                "expected '.', '[' or '(' after 'super'",
+            )),
+        }
     }
 
     // -- expressions ------------------------------------------------------------
@@ -1213,6 +1421,12 @@ impl<S: CharStream> Parser<S> {
                 self.parse_member_tail(base, false)?
             }
         };
+        if matches!(*self.ast.node(callee), Node::SuperCall { .. }) {
+            return Err(ParseError::new(
+                self.ast.span(callee),
+                "'super' is not a constructor",
+            ));
+        }
         let (args, end) = if self.peek()?.kind == TokenKind::LParen {
             let (args, end) = self.parse_args()?;
             (Some(args), end)
@@ -1373,11 +1587,8 @@ impl<S: CharStream> Parser<S> {
                 let span = self.ast.function(function).span;
                 Ok(self.ast.add(Node::FunctionExpr { function }, span))
             }
-            TokenKind::Class => {
-                let class = self.parse_class(false)?;
-                let span = self.ast.class(class).span;
-                Ok(self.ast.add(Node::ClassExpr { class }, span))
-            }
+            TokenKind::Class => self.parse_class(false),
+            TokenKind::Super => self.parse_super(t.span),
             _ => Err(ParseError::new(
                 t.span,
                 format!("unexpected token `{}`", kind_text(t)),
@@ -1632,7 +1843,7 @@ impl<S: CharStream> Parser<S> {
 
     fn check_assign_target(&self, node: NodeId) -> Result<(), ParseError> {
         match self.ast.node(node) {
-            Node::Identifier { .. } | Node::Property { .. } => Ok(()),
+            Node::Identifier { .. } | Node::Property { .. } | Node::SuperProperty { .. } => Ok(()),
             _ => Err(ParseError::new(
                 self.ast.span(node),
                 "invalid assignment target",

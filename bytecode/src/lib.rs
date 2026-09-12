@@ -27,10 +27,15 @@ impl core::ops::BitOr for PropertyFlags {
 
 impl core::ops::BitOr<PropertyFlags> for u32 {
     type Output = u32;
-    fn bitor(self, rhs: PropertyFlags) -> u32 {
+    fn bitor(self, rhs: PropertyFlags) -> Self::Output {
         self | rhs.bits()
     }
 }
+
+/// `Store*PropertyToSuper` semantics-flag operand: ES stores shadow
+/// inherited data properties on `this`; the alternative write-through
+/// variant writes at the holder (Self-style semantics).
+pub const SUPER_STORE_WRITE_THROUGH: u32 = 1;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +104,30 @@ pub enum Opcode {
 
     CreateClosure, // idx -> acc
 
+    // -- classes -----------------------------------------------------------
+
+    // ES 15.7.14 ClassDefinitionEvaluation: the extends value must be null
+    // or a constructor; the superclass's .prototype must be an object or null
+    ThrowIfNotConstructorOrNull, // acc -> throw TypeError otherwise
+    ThrowIfNotObjectOrNull,      // acc -> throw TypeError otherwise
+    // [[ThisBindingStatus]] guards of derived constructors (ES 10.2.2):
+    // `this` starts as the hole and super() initializes it exactly once
+    ThrowSuperNotCalledIfHole,        // acc -> ReferenceError if the hole
+    ThrowSuperAlreadyCalledIfNotHole, // acc -> ReferenceError if not the hole
+    // super property access: home object + split receiver/lookup-start
+    LoadNamedPropertyFromSuper, // reg (receiver) idx (name) idx (feedback); home object in acc -> acc
+    LoadKeyedPropertyFromSuper, // reg (receiver) reg (key) idx (feedback); home object in acc -> acc
+    StoreNamedPropertyToSuper, // acc (value) -> reg (home) reg (receiver) idx (name) uimm (semantics flags) idx (feedback)
+    StoreKeyedPropertyToSuper, // acc (value) -> reg (home) reg (receiver) reg (key) uimm (semantics flags) idx (feedback)
+    // super(...): construct the current function's [[Prototype]] with the
+    // current frame's new.target (ES 15.4.3); result in acc
+    ConstructSuper,        // reglist (args) regcount (count) -> acc
+    ConstructSuperAllArgs, // forward the current frame's full argument list -> acc
+    // accessor member installation: define an accessor half, merging with an
+    // existing pair under the same key (ES 14.3.10 MethodDefinitionEvaluation)
+    InstallNamedAccessor, // reg (target) idx (name) uimm (flags) ; closure in acc
+    InstallKeyedAccessor, // reg (target) reg (key) uimm (flags) ; closure in acc
+
     // binary arithmetic: acc = acc op reg
     Add, // reg
     Sub,
@@ -165,13 +194,17 @@ impl Operand {
 
 #[derive(Clone, Copy)]
 pub struct Operands {
-    raw: [u32; 4],
+    raw: [u32; 5],
     kinds: &'static [Operand],
 }
 
 impl Operands {
-    pub const fn new(raw: [u32; 4], kinds: &'static [Operand]) -> Self {
+    pub const fn new(raw: [u32; 5], kinds: &'static [Operand]) -> Self {
         Self { raw, kinds }
+    }
+
+    pub fn kinds(&self) -> &'static [Operand] {
+        self.kinds
     }
 
     #[inline]
@@ -253,6 +286,18 @@ impl Opcode {
             b if b == CreateEmptyObjectLiteral as u8 => CreateEmptyObjectLiteral,
             b if b == CreateEmptyArrayLiteral as u8 => CreateEmptyArrayLiteral,
             b if b == CreateClosure as u8 => CreateClosure,
+            b if b == ThrowIfNotConstructorOrNull as u8 => ThrowIfNotConstructorOrNull,
+            b if b == ThrowIfNotObjectOrNull as u8 => ThrowIfNotObjectOrNull,
+            b if b == ThrowSuperNotCalledIfHole as u8 => ThrowSuperNotCalledIfHole,
+            b if b == ThrowSuperAlreadyCalledIfNotHole as u8 => ThrowSuperAlreadyCalledIfNotHole,
+            b if b == LoadNamedPropertyFromSuper as u8 => LoadNamedPropertyFromSuper,
+            b if b == LoadKeyedPropertyFromSuper as u8 => LoadKeyedPropertyFromSuper,
+            b if b == StoreNamedPropertyToSuper as u8 => StoreNamedPropertyToSuper,
+            b if b == StoreKeyedPropertyToSuper as u8 => StoreKeyedPropertyToSuper,
+            b if b == ConstructSuper as u8 => ConstructSuper,
+            b if b == ConstructSuperAllArgs as u8 => ConstructSuperAllArgs,
+            b if b == InstallNamedAccessor as u8 => InstallNamedAccessor,
+            b if b == InstallKeyedAccessor as u8 => InstallKeyedAccessor,
             b if b == Add as u8 => Add,
             b if b == Sub as u8 => Sub,
             b if b == Mul as u8 => Mul,
@@ -334,6 +379,19 @@ impl Opcode {
 
             Self::CreateEmptyObjectLiteral | Self::CreateEmptyArrayLiteral => &[],
             Self::CreateClosure => &[Index],
+
+            Self::ThrowIfNotConstructorOrNull
+            | Self::ThrowIfNotObjectOrNull
+            | Self::ThrowSuperNotCalledIfHole
+            | Self::ThrowSuperAlreadyCalledIfNotHole
+            | Self::ConstructSuperAllArgs => &[],
+            Self::LoadNamedPropertyFromSuper => &[Register, Index, Index],
+            Self::LoadKeyedPropertyFromSuper => &[Register, Register, Index],
+            Self::StoreNamedPropertyToSuper => &[Register, Register, Index, UImmediate, Index],
+            Self::StoreKeyedPropertyToSuper => &[Register, Register, Register, UImmediate, Index],
+            Self::ConstructSuper => &[RegisterListStart, RegisterCount],
+            Self::InstallNamedAccessor => &[Register, Index, UImmediate],
+            Self::InstallKeyedAccessor => &[Register, Register, UImmediate],
 
             Self::Add
             | Self::Sub
@@ -427,7 +485,7 @@ pub fn decode(code: &[u8], mut pc: usize) -> (Opcode, Operands, usize) {
         op = read_opcode(code, &mut pc);
     }
 
-    let mut raw = [0u32; 4];
+    let mut raw = [0u32; 5];
     for (i, kind) in op.operands().iter().enumerate() {
         let size = kind.size_in_stream(scale);
         let bytes = code

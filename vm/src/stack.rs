@@ -8,20 +8,24 @@ use crate::VmError;
 pub const STACK_SLOTS: usize = 16 * 1024;
 
 /// Fixed header slots between the register file and the parameter region
-pub const HEADER_SLOTS: usize = 3;
+pub const HEADER_SLOTS: usize = 4;
 pub const CALLABLE_OFFSET: usize = 0;
 pub const ARGC_OFFSET: usize = 1;
 /// The frame's current context (the chain LoadContextSlot walks); unlike
 /// the function object's closure-context slot it is per-frame, so
 /// recursion cannot clobber a suspended frame's context.
 pub const CONTEXT_OFFSET: usize = 2;
+/// new.target of the active [[Construct]] (ES 9.2.2): the constructor, or
+/// undefined when the function was called. `super()` forwards this value.
+pub const NEW_TARGET_OFFSET: usize = 3;
 
 /// Frame layout:
 /// index                    content
 /// base + 0 .. +rc-1        register file (r0..rn)
 /// base + rc + 0            header: callable
-/// base + rc + 1            header: argc
+/// base + rc + 1            header: argc (receiver included)
 /// base + rc + 2            header: current context
+/// base + rc + 3            header: new.target (or undefined)
 /// base + rc + H .. +argc   parameters (param 0 = receiver)
 ///
 /// Parameters are addressed with negative register indices.
@@ -75,6 +79,18 @@ impl Stack {
         self.slot_unchecked(meta.base + meta.register_count + CONTEXT_OFFSET)
     }
 
+    pub fn new_target_slot(&self, meta: &FrameMeta) -> &Register {
+        self.slot_unchecked(meta.base + meta.register_count + NEW_TARGET_OFFSET)
+    }
+
+    /// The frame's actual argument count, receiver included.
+    pub fn argc(&self, meta: &FrameMeta) -> usize {
+        let raw = self
+            .slot_unchecked(meta.base + meta.register_count + ARGC_OFFSET)
+            .inner();
+        Smi::decode(raw).expect("argc header holds a Smi").value() as usize
+    }
+
     fn reg_index(meta: &FrameMeta, i: i32) -> usize {
         if i >= 0 {
             meta.base + i as usize
@@ -96,12 +112,14 @@ impl Stack {
     }
 
     /// `callable` slots[0] is the CallableInfoObject; `context` is the
-    /// closure context the frame starts executing with.
+    /// closure context the frame starts executing with; `new_target` is
+    /// new.target (undefined for plain calls).
     pub fn push_initial_frame(
         &self,
         callable: Tagged<Object>,
         register_count: usize,
         context: Value,
+        new_target: Value,
         args: GcSlice<'_>,
     ) -> Result<FrameMeta, VmError> {
         let base = self.reserve(register_count, args.len())?;
@@ -114,9 +132,17 @@ impl Stack {
                 args.len(),
             )
         }
-        Ok(self.init_frame_header(base, register_count, callable, context, args.len()))
+        Ok(self.init_frame_header(
+            base,
+            register_count,
+            callable,
+            context,
+            new_target,
+            args.len(),
+        ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push_frame(
         &self,
         caller: FrameMeta,
@@ -126,6 +152,7 @@ impl Stack {
         context: Value,
         src_reg_base: i32,
         count: usize,
+        new_target: Value,
     ) -> Result<FrameMeta, VmError> {
         let base = self.reserve(register_count, count)?;
         let src = Self::reg_index(&caller, src_reg_base);
@@ -142,13 +169,15 @@ impl Stack {
                 count,
             )
         }
-        let callee = self.init_frame_header(base, register_count, callable, context, count);
+        let callee =
+            self.init_frame_header(base, register_count, callable, context, new_target, count);
         let mut caller = caller;
         caller.handler_pc = handler_pc;
         self.frames.borrow_mut().push(caller);
         Ok(callee)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push_frame_with_args(
         &self,
         caller: FrameMeta,
@@ -157,6 +186,7 @@ impl Stack {
         register_count: usize,
         context: Value,
         args: &[Value],
+        new_target: Value,
     ) -> Result<FrameMeta, VmError> {
         let base = self.reserve(register_count, args.len())?;
         let dst = base + register_count + HEADER_SLOTS;
@@ -168,7 +198,14 @@ impl Stack {
                 args.len(),
             )
         }
-        let callee = self.init_frame_header(base, register_count, callable, context, args.len());
+        let callee = self.init_frame_header(
+            base,
+            register_count,
+            callable,
+            context,
+            new_target,
+            args.len(),
+        );
         let mut caller = caller;
         caller.handler_pc = handler_pc;
         self.frames.borrow_mut().push(caller);
@@ -232,6 +269,7 @@ impl Stack {
         register_count: usize,
         callable: Tagged<Object>,
         context: Value,
+        new_target: Value,
         argc: usize,
     ) -> FrameMeta {
         self.slot_unchecked(base + register_count + CALLABLE_OFFSET)
@@ -240,6 +278,8 @@ impl Stack {
             .store(Smi::new(argc as i64).encode());
         self.slot_unchecked(base + register_count + CONTEXT_OFFSET)
             .store(context);
+        self.slot_unchecked(base + register_count + NEW_TARGET_OFFSET)
+            .store(new_target);
         FrameMeta {
             base,
             pc: 0,

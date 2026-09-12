@@ -1,12 +1,12 @@
 use std::io::Write;
 
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Float, Smi, VMString, Value};
 use vm::{Thread, VM};
 
 fn main() {
     let vm =
-        VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).expect("failed to create heap");
+        VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).expect("failed to create heap");
     let mut thread = vm.attach();
 
     let mut files = Vec::new();

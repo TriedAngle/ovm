@@ -13,7 +13,22 @@ use std::path::{Path, PathBuf};
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use vm::{ScriptError, VM};
 
-const UNSUPPORTED_FEATURES: &[&str] = &["BigInt", "Symbol", "Temporal", "regexp-modifiers"];
+const UNSUPPORTED_FEATURES: &[&str] = &[
+    "BigInt",
+    "Symbol",
+    "Temporal",
+    "regexp-modifiers",
+    // class features beyond methods/accessors/super: fields, static blocks,
+    // private names are not implemented yet (clean parser errors)
+    "class-fields-public",
+    "class-fields-private",
+    "class-static-fields-public",
+    "class-static-fields-private",
+    "class-static-block",
+    "class-private-methods",
+    "class-private-fields",
+    "class-decorators",
+];
 /// Tests exercising runtime objects the VM does not have yet.
 const UNSUPPORTED_PATTERNS: &[&str] = &["new Date"];
 /// Tests under paths the VM cannot support yet: missing global namespaces,

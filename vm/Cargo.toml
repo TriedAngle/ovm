@@ -13,3 +13,4 @@ bytecode = { path = "../bytecode" }
 base_compiler = { path = "../base_compiler" }
 parser = { path = "../parser" }
 dummy_heap = { path = "../collectors/dummy_heap" }
+mark_sweep = { path = "../collectors/mark_sweep" }

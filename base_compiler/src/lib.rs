@@ -33,6 +33,10 @@ pub enum Constant {
     /// dynamic name resolution); materialized into a shared `ScopeInfo`
     /// referenced by `CreateFunctionContext`
     ContextNames(Vec<Vec<u8>>),
+    /// %Object.prototype% (base-class prototype parent)
+    ObjectPrototype,
+    /// %Function.prototype% (base-class constructor parent)
+    FunctionPrototype,
 }
 
 /// `layout [try_start, try_end, handler_pc]`: a half-open bytecode region.

@@ -5,6 +5,7 @@ use core::alloc::Layout;
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef,
     Lookup, Map, MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
+    lookup_in_parents,
 };
 
 /// Serializes map-transition tree mutations across threads. VM-internal:
@@ -93,6 +94,86 @@ impl Value {
                 let setter = pair.set.inner();
                 // no setter (undefined sentinel): sloppy-mode writes to a
                 // setter-less accessor are silently ignored
+                if setter == nogc.known().undefined.value() {
+                    return Ok(StoreOutcome::Done);
+                }
+                Ok(StoreOutcome::CallSetter { setter })
+            }
+        }
+    }
+
+    /// `super.x = v` (ES 15.4.4 PutValue on a super reference): the store
+    /// walks the chain starting at the home object's [[Prototype]] — in all
+    /// three prototype shapes (null, object, FixedArray of parents) — but
+    /// the receiver is `this`:
+    /// - `Shadow` (JS): inherited writable data properties create an own
+    ///   property on the receiver (OrdinarySet's receiver != O path),
+    ///   setters run with the receiver, misses define on the receiver
+    /// - `WriteThrough` (Self-style): inherited writable data properties
+    ///   are written at the holder instead of shadowing
+    pub fn super_store_lookup<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        recv: Value,
+        name: SlotName,
+        value: Value,
+        semantics: StoreSemantics,
+    ) -> Result<StoreOutcome, VmError> {
+        if recv == nogc.known().null.value() || recv == nogc.known().undefined.value() {
+            return Err(VmError::Type);
+        }
+        let Some(obj) = self.as_heap_object(nogc) else {
+            // non-object home: no parent chain, define on the receiver
+            if !recv.is_strong_ptr() {
+                return Err(VmError::Type);
+            }
+            return Ok(StoreOutcome::Transition {
+                receiver: recv,
+                name,
+            });
+        };
+        let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
+        match lookup_in_parents(nogc, proto, name) {
+            Lookup::Data {
+                slot,
+                holder,
+                flags,
+                ..
+            } => {
+                if !flags.is_writable() {
+                    return Err(VmError::Type);
+                }
+                match semantics {
+                    StoreSemantics::WriteThrough => {
+                        let host = holder.as_ref().erase();
+                        slot.set(nogc, host, value);
+                        Ok(StoreOutcome::Done)
+                    }
+                    // receiver (`this`) differs from the holder by
+                    // construction: OrdinarySet creates an own property on
+                    // the receiver
+                    StoreSemantics::Shadow => {
+                        if !recv.is_strong_ptr() {
+                            return Err(VmError::Type);
+                        }
+                        Ok(StoreOutcome::Transition {
+                            receiver: recv,
+                            name,
+                        })
+                    }
+                }
+            }
+            Lookup::NotFound => {
+                if !recv.is_strong_ptr() {
+                    return Err(VmError::Type);
+                }
+                Ok(StoreOutcome::Transition {
+                    receiver: recv,
+                    name,
+                })
+            }
+            Lookup::Accessor { pair, .. } => {
+                let setter = pair.set.inner();
                 if setter == nogc.known().undefined.value() {
                     return Ok(StoreOutcome::Done);
                 }
@@ -529,7 +610,7 @@ impl Object {
     /// - `proto` must be:
     /// - arbitrary normal `Object` for JS semantics
     /// - `FixedArray` of objects (Self-style multiple parents),
-    /// - the `void` sentinel; other values are
+    /// - the hole sentinel; other values are
     ///   silently ignored (sloppy `__proto__` semantics)
     /// - cycles and non-extensible receivers throw (TODO: make this optional for Self semantics)
     pub fn set_prototype(

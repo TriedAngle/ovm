@@ -15,7 +15,7 @@ where
     let known = vm.known();
     let values = [
         known.map_map.value(),
-        known.void.value(),
+        known.the_hole.value(),
         known.undefined.value(),
         known.null.value(),
         known.smi_map.value(),

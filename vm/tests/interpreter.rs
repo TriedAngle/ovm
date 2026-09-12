@@ -47,7 +47,7 @@ fn callable_object<'s>(
     scope: &'s HandleScope<'_>,
     info: Handle<'_, CallableInfoObject>,
 ) -> Handle<'s, Object> {
-    let void = thread.heap().known().void;
+    let the_hole = thread.heap().known().the_hole;
     let empty_context = thread.heap().known().empty_context;
     let map = thread.heap().known().function_map;
     thread
@@ -57,7 +57,7 @@ fn callable_object<'s>(
             ObjectSlotsInit {
                 map,
                 values: &[info.value(), empty_context.value()],
-                elements: void.erase(),
+                elements: the_hole.erase(),
                 length: 0,
             },
         )
@@ -407,7 +407,7 @@ fn array_literal_with_holes_keeps_length() {
         assert_eq!(Smi::decode(elements.at(0)).unwrap().value(), 1);
         assert_eq!(
             elements.at(1),
-            nogc.known().void.value(),
+            nogc.known().the_hole.value(),
             "elided index stays a hole"
         );
         assert_eq!(Smi::decode(elements.at(2)).unwrap().value(), 2);
@@ -953,7 +953,7 @@ fn transition_object_program(
     build: impl FnOnce(&mut Vec<u8>),
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
         let x = thread.intern(&scope, "x");
         let z = thread.intern(&scope, "z");
         let w = thread.intern(&scope, "w");
@@ -962,7 +962,7 @@ fn transition_object_program(
                 kind,
                 value_slot_count: 1,
                 descriptors: &[(SlotName::from(x.as_tagged()), x_flags, Smi::new(0).encode())],
-                prototype: void.erase(),
+                prototype: the_hole.erase(),
             },
             &scope,
         );
@@ -973,7 +973,7 @@ fn transition_object_program(
                 ObjectSlotsInit {
                     map,
                     values: &[smi(7)],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -1103,7 +1103,7 @@ fn named_store_to_non_writable_fails() {
 /// whose prototype (a FixedArray) points at it; interned "p" at 1.
 fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
         let p = thread.intern(&scope, "p");
         let parent_map = thread.heap().allocate_handle::<Map>(
             MapInit {
@@ -1114,7 +1114,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                     WRITABLE_VALUE,
                     Smi::new(0).encode(),
                 )],
-                prototype: void.erase(),
+                prototype: the_hole.erase(),
             },
             &scope,
         );
@@ -1125,7 +1125,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 ObjectSlotsInit {
                     map: parent_map,
                     values: &[Smi::new(1).encode()],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -1151,7 +1151,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 ObjectSlotsInit {
                     map: child_map,
                     values: &[],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -1291,7 +1291,7 @@ fn jump_if_truthy_follows_toboolean() {
                 k.null.value(),
                 k.true_object.value(),
                 k.false_object.value(),
-                k.void.value(),
+                k.the_hole.value(),
                 empty,
             )
         };
@@ -1304,13 +1304,13 @@ fn jump_if_truthy_follows_toboolean() {
             .value();
         let one_half = thread.heap().allocate_handle::<Float>(1.5, &scope).value();
         let object = {
-            let void = thread.heap().known().void;
+            let the_hole = thread.heap().known().the_hole;
             let map = thread.heap().allocate_handle::<Map>(
                 MapInit {
                     kind: MapKind::OBJECT,
                     value_slot_count: 0,
                     descriptors: &[],
-                    prototype: void.erase(),
+                    prototype: the_hole.erase(),
                 },
                 &scope,
             );
@@ -1321,7 +1321,7 @@ fn jump_if_truthy_follows_toboolean() {
                     ObjectSlotsInit {
                         map,
                         values: &[],
-                        elements: void.erase(),
+                        elements: the_hole.erase(),
                         length: 0,
                     },
                 )
@@ -1418,7 +1418,7 @@ fn accessor_object_program(
     build: impl FnOnce(&mut Vec<u8>),
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
         let undefined = thread.heap().known().undefined;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
@@ -1465,7 +1465,7 @@ fn accessor_object_program(
                         pair.value(),
                     ),
                 ],
-                prototype: void.erase(),
+                prototype: the_hole.erase(),
             },
             &scope,
         );
@@ -1476,7 +1476,7 @@ fn accessor_object_program(
                 ObjectSlotsInit {
                     map,
                     values: &[smi(7)],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -1609,7 +1609,7 @@ fn store_new_accessor_property_defines_own_accessor() {
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
         let x = thread.intern(&scope, "x");
         let y = thread.intern(&scope, "y");
 
@@ -1623,7 +1623,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                     WRITABLE_VALUE,
                     Smi::new(0).encode(),
                 )],
-                prototype: void.erase(),
+                prototype: the_hole.erase(),
             },
             &scope,
         );
@@ -1634,7 +1634,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 ObjectSlotsInit {
                     map,
                     values: &[smi(7)],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -1711,7 +1711,7 @@ fn native_function<'s>(
     scope: &'s HandleScope<'_>,
     idx: NativeIndex,
 ) -> Handle<'s, Object> {
-    let void = thread.heap().known().void;
+    let the_hole = thread.heap().known().the_hole;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: MapKind::OBJECT
@@ -1720,7 +1720,7 @@ fn native_function<'s>(
                 .union(MapKind::CONSTRUCTOR),
             value_slot_count: 1,
             descriptors: &[],
-            prototype: void.erase(),
+            prototype: the_hole.erase(),
         },
         scope,
     );
@@ -1731,7 +1731,7 @@ fn native_function<'s>(
             ObjectSlotsInit {
                 map,
                 values: &[Smi::new(idx.0 as i64).encode()],
-                elements: void.erase(),
+                elements: the_hole.erase(),
                 length: 0,
             },
         )
@@ -1746,7 +1746,7 @@ fn bytecode_fn(
     constants: &[Value],
     register_count: usize,
 ) -> Value {
-    let void = nctx.heap().known().void;
+    let the_hole = nctx.heap().known().the_hole;
     let empty_context = nctx.heap().known().empty_context;
     let bytecode = nctx
         .heap()
@@ -1768,7 +1768,7 @@ fn bytecode_fn(
             ObjectSlotsInit {
                 map,
                 values: &[info.value(), empty_context.value()],
-                elements: void.erase(),
+                elements: the_hole.erase(),
                 length: 0,
             },
         )
@@ -2567,7 +2567,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
 
         // callee info template: return context slot 0
         let mut callee_program = Vec::new();
@@ -2638,7 +2638,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
                 ObjectSlotsInit {
                     map,
                     values: &[caller_info.value(), context.value()],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -2999,7 +2999,7 @@ fn proto_object<'s>(
     scope: &'s HandleScope<'_>,
     p: vm::Handle<'s, vm::InternedString>,
 ) -> vm::Handle<'s, Object> {
-    let void = thread.heap().known().void;
+    let the_hole = thread.heap().known().the_hole;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: EXTENDABLE,
@@ -3009,7 +3009,7 @@ fn proto_object<'s>(
                 WRITABLE_VALUE,
                 Smi::new(0).encode(),
             )],
-            prototype: void.erase(),
+            prototype: the_hole.erase(),
         },
         scope,
     );
@@ -3020,7 +3020,7 @@ fn proto_object<'s>(
             ObjectSlotsInit {
                 map,
                 values: &[smi(7)],
-                elements: void.erase(),
+                elements: the_hole.erase(),
                 length: 0,
             },
         )
@@ -3139,13 +3139,13 @@ fn set_prototype_on_non_extensible_throws_type_error() {
         let obj_b = proto_object(&mut *thread, &scope, p);
 
         // host-side: a plain, non-extendable object
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
         let map = thread.heap().allocate_handle::<Map>(
             MapInit {
                 kind: MapKind::OBJECT,
                 value_slot_count: 0,
                 descriptors: &[],
-                prototype: void.erase(),
+                prototype: the_hole.erase(),
             },
             &scope,
         );
@@ -3156,7 +3156,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
                 ObjectSlotsInit {
                     map,
                     values: &[],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -3896,7 +3896,7 @@ fn shadow_setup<'s>(
     scope: &'s HandleScope<'_>,
     child_extendable: bool,
 ) -> (Handle<'s, Object>, Handle<'s, Object>, Value) {
-    let void = thread.heap().known().void;
+    let the_hole = thread.heap().known().the_hole;
     let p = thread.intern(&scope, "p");
     let parent_map = thread.heap().allocate_handle::<Map>(
         MapInit {
@@ -3907,7 +3907,7 @@ fn shadow_setup<'s>(
                 WRITABLE_VALUE,
                 Smi::new(0).encode(),
             )],
-            prototype: void.erase(),
+            prototype: the_hole.erase(),
         },
         &scope,
     );
@@ -3918,7 +3918,7 @@ fn shadow_setup<'s>(
             ObjectSlotsInit {
                 map: parent_map,
                 values: &[Smi::new(1).encode()],
-                elements: void.erase(),
+                elements: the_hole.erase(),
                 length: 0,
             },
         )
@@ -3946,7 +3946,7 @@ fn shadow_setup<'s>(
             ObjectSlotsInit {
                 map: child_map,
                 values: &[],
-                elements: void.erase(),
+                elements: the_hole.erase(),
                 length: 0,
             },
         )

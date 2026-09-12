@@ -126,7 +126,7 @@ fn callable_info_carries_handler_table() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread: &mut Thread, scope| {
-        let void = thread.heap().known().void;
+        let the_hole = thread.heap().known().the_hole;
         let empty_context = thread.heap().known().empty_context;
         let t = table(thread, &scope, &[HandlerEntryInit::new(2, 8, 33)]);
 
@@ -151,7 +151,7 @@ fn callable_info_carries_handler_table() {
                 ObjectSlotsInit {
                     map,
                     values: &[info.value(), empty_context.value()],
-                    elements: void.erase(),
+                    elements: the_hole.erase(),
                     length: 0,
                 },
             )
@@ -191,7 +191,7 @@ fn callable_info_without_handler_table() {
         );
         thread.heap().no_gc(|nogc| {
             let h = info.heap_ref(nogc).handlers.heap_ref(nogc);
-            assert!(h.is_none(), "void handlers slot must mean no table");
+            assert!(h.is_none(), "a hole handlers slot must mean no table");
         });
     });
 }
