@@ -47,12 +47,11 @@ fn captured_variables_go_to_context() {
         .map(FunctionId)
         .find(|&id| ast.function(id).name.is_some())
         .unwrap();
-    let fscope = ast.node_scope(ast.function(f).body.unwrap()).unwrap();
     assert_eq!(
         resolutions_of(&ast, &r, "x"),
         vec![Resolution::Context {
             slot: 0,
-            scope: fscope,
+            depth: 1, // one function hop from the arrow to f
             hole_check: false
         }]
     );

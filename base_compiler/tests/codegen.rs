@@ -66,6 +66,8 @@ fn render_constant(constants: &[Constant], idx: usize) -> String {
         Constant::Null => "#null".into(),
         Constant::Callable(fid) => format!("#fn[{}]", fid.0),
         Constant::ContextNames(names) => format!("#ctxnames[{names:?}]"),
+        Constant::ObjectPrototype => "#object-prototype".into(),
+        Constant::FunctionPrototype => "#function-prototype".into(),
     }
 }
 
@@ -692,9 +694,6 @@ fn unsupported_features_report_errors() {
 
     let err = compile("try {} finally {}").unwrap_err();
     assert_eq!(err.feature, "finally blocks");
-
-    let err = compile("class A {}").unwrap_err();
-    assert_eq!(err.feature, "classes");
 
     let err = compile("a ?? b;").unwrap_err();
     assert_eq!(err.feature, "nullish coalescing");

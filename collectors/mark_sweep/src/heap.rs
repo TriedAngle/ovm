@@ -13,7 +13,7 @@ use heap_api::{
 
 use heap_utils::{LocalNode, Safepoint};
 
-use crate::block::{need_for, ALIGN};
+use crate::block::{ALIGN, need_for};
 use crate::chunk::ChunkedHeap;
 
 #[derive(Debug, Clone, Copy)]
@@ -502,8 +502,7 @@ impl Visitor for WeakClearer<'_> {
         let word = cell.load();
         if word & TAG_MASK == WEAK_PTR && word != CLEARED {
             let addr = (word & !TAG_MASK) as usize;
-            let dead = !self.heap.in_heap(addr)
-                || !self.heap.chunk_of(addr).bitmap.is_set(addr);
+            let dead = !self.heap.in_heap(addr) || !self.heap.chunk_of(addr).bitmap.is_set(addr);
             if dead {
                 cell.store_raw(CLEARED);
             }
@@ -593,9 +592,7 @@ impl MarkSweepLocal {
             }
             match self.state.collect_terminal(Some(&self.node), layout) {
                 TerminalAllocation::Done(Some(ptr)) => return Ok(ptr),
-                TerminalAllocation::Done(None) => {
-                    return Err(AllocError::OutOfMemory(layout))
-                }
+                TerminalAllocation::Done(None) => return Err(AllocError::OutOfMemory(layout)),
                 TerminalAllocation::Absorbed => continue,
             }
         }

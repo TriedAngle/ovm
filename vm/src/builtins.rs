@@ -912,7 +912,7 @@ fn array_constructor(
     };
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let hole = heap.known().void.value();
+        let hole = heap.known().the_hole.value();
         let (values, length) = match single_len {
             Some(n) => (vec![hole; n], n),
             None => {

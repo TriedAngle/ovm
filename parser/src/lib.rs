@@ -34,6 +34,10 @@ pub enum ScopeKind {
     For,
     /// catch block scope; the param lives in it
     Catch,
+    /// class inner scope (ES 15.7.14 ClassDefinitionEvaluation): holds the
+    /// immutable class-name binding and the super home-object slots; owns a
+    /// dedicated block context created per class evaluation
+    Class,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +186,19 @@ pub enum Node {
     ClassExpr {
         class: ClassId,
     },
+    /// `super.x` / `super[key]` (ES 15.4.2). The home object is resolved
+    /// lexically from the enclosing class scope; `is_static` records which
+    /// home slot (prototype vs constructor) the enclosing member uses.
+    SuperProperty {
+        key: NodeId,
+        computed: bool,
+        is_static: bool,
+    },
+    /// `super(...)` (ES 15.4.3): construct the superclass with the current
+    /// frame's new.target and bind the result to `this`
+    SuperCall {
+        args: NodeList,
+    },
 
     // statements & declarations
     ExprStmt {
@@ -280,6 +297,10 @@ pub enum FunctionKind {
     Setter,
     BaseClassConstructor,
     DerivedClassConstructor,
+    /// synthesized `constructor(...args) { super(...args) }` for derived
+    /// classes without an explicit constructor; compiles to an implicit
+    /// forward-all-arguments super call
+    DefaultDerivedConstructor,
 }
 
 impl FunctionKind {
@@ -289,6 +310,25 @@ impl FunctionKind {
 
     pub const fn is_arrow(self) -> bool {
         matches!(self, Self::Arrow)
+    }
+
+    /// class-member function kinds: `super.x` is allowed inside these
+    pub const fn is_class_member(self) -> bool {
+        matches!(
+            self,
+            Self::Method
+                | Self::Getter
+                | Self::Setter
+                | Self::BaseClassConstructor
+                | Self::DerivedClassConstructor
+        )
+    }
+
+    pub const fn is_derived_class_constructor(self) -> bool {
+        matches!(
+            self,
+            Self::DerivedClassConstructor | Self::DefaultDerivedConstructor
+        )
     }
 }
 
@@ -307,6 +347,16 @@ pub struct ClassInfo {
     pub name: Option<Symbol>,
     pub superclass: Option<NodeId>,
     pub members: Vec<ClassMember>,
+    /// the constructor function: the explicit one, or the synthesized
+    /// default (`constructor() {}` / `constructor(...args){super(...args)}`)
+    pub ctor: FunctionId,
+    /// some member body (or nested computed key resolving here) uses
+    /// `super.x`: the class context carries home-object slots
+    pub uses_super: bool,
+    /// hidden class-scope declarations holding the home objects for
+    /// `super.x` resolution (the prototype and the constructor)
+    pub home: Option<Symbol>,
+    pub static_home: Option<Symbol>,
 }
 
 /// parse-local byte-slice interner; heap internalization at materialization

@@ -98,6 +98,8 @@ fn materialize_function<'s>(
                 heap.allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, scope)
                     .value()
             }
+            Constant::ObjectPrototype => heap.known().object_prototype.value(),
+            Constant::FunctionPrototype => heap.known().function_prototype.value(),
         };
         constants.push(value);
     }
@@ -137,6 +139,7 @@ fn materialize_function<'s>(
         parser::FunctionKind::Setter => FunctionKind::Setter,
         parser::FunctionKind::BaseClassConstructor => FunctionKind::BaseClassConstructor,
         parser::FunctionKind::DerivedClassConstructor => FunctionKind::DerivedClassConstructor,
+        parser::FunctionKind::DefaultDerivedConstructor => FunctionKind::DefaultDerivedConstructor,
     };
     heap.no_gc(|nogc| {
         info.heap_ref(nogc).set_metadata(

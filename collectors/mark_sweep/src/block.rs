@@ -8,7 +8,10 @@ pub const ALIGN: usize = 16;
 
 pub fn need_for(layout: Layout) -> usize {
     debug_assert!(layout.size() > 0, "zero-sized allocation");
-    debug_assert!(layout.align() <= ALIGN, "alignment above {ALIGN} unsupported");
+    debug_assert!(
+        layout.align() <= ALIGN,
+        "alignment above {ALIGN} unsupported"
+    );
     layout.size().next_multiple_of(ALIGN)
 }
 

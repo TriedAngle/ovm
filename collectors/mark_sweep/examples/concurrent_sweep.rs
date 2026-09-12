@@ -5,8 +5,8 @@ use heap_api::{GcHost, Visitor};
 
 use mark_sweep::heap::{MarkSweepConfig, MarkSweepLocal, MarkSweepState};
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn empty_host() -> GcHost {
@@ -24,7 +24,10 @@ fn empty_host() -> GcHost {
 }
 
 fn main() {
-    let state = MarkSweepState::new(MarkSweepConfig { heap_size: 64 * 1024 * 1024 }).unwrap();
+    let state = MarkSweepState::new(MarkSweepConfig {
+        heap_size: 64 * 1024 * 1024,
+    })
+    .unwrap();
     state.set_host(empty_host());
 
     let running = Arc::new(AtomicBool::new(true));
@@ -74,7 +77,10 @@ fn main() {
     state.collect_now();
 
     println!("cycles: {}", state.cycles());
-    println!("allocations: {} (16KB each)", allocations.load(Ordering::Relaxed));
+    println!(
+        "allocations: {} (16KB each)",
+        allocations.load(Ordering::Relaxed)
+    );
     println!(
         "allocations while sweeping was in flight: {}",
         during_sweeping.load(Ordering::Relaxed)

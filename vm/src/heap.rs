@@ -355,9 +355,9 @@ impl<T: HeapObject> GcSlot<T> {
     }
 }
 
-/// A slot that is either empty (`void`) or holds a strong reference to `T`.
+/// A slot that is either empty (the hole) or holds a strong reference to `T`.
 ///
-/// Empty is encoded as the well-known `void` object, so the slot is always a
+/// Empty is encoded as the well-known hole object, so the slot is always a
 /// valid strong value that the GC can trace.
 #[repr(transparent)]
 pub struct OptionGcSlot<T = Value> {
@@ -383,14 +383,16 @@ impl<T> OptionGcSlot<T> {
         self.slot.set(nogc, host, value);
     }
 
-    pub fn clear(&self, void: Value) {
-        self.slot.cell.store_raw(void.to_bits());
+    pub fn clear(&self, heap: &Heap) {
+        self.slot
+            .cell
+            .store_raw(heap.known().the_hole.value().to_bits());
     }
 }
 
 impl<T: HeapObject> OptionGcSlot<T> {
     pub fn heap_ref<'a>(&self, nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
-        if self.inner() == nogc.known().void.value() {
+        if self.inner() == nogc.known().the_hole.value() {
             return None;
         }
         Some(self.slot.heap_ref(nogc))
@@ -521,8 +523,6 @@ impl Heap {
         })
     }
 
-    /// Fresh ordinary object: `map`, optional inline values, empty elements,
-    /// length 0.
     pub fn new_object<'a>(
         &mut self,
         handles: &'a impl HandleSet,
