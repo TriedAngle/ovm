@@ -1057,10 +1057,16 @@ impl<S: CharStream> Parser<S> {
             } else {
                 function_kind_for_property(kind)
             };
-            // class members are always strict
+            // class members are always strict; accessors carry the
+            // "get x"/"set x" name (computed keys get theirs at runtime)
+            let fn_name = match kind {
+                PropKind::Get => self.accessor_name(key_sym, true),
+                PropKind::Set => self.accessor_name(key_sym, false),
+                _ => key_sym,
+            };
             let (value, _) = self.parse_method_value(
                 member_start,
-                key_sym,
+                fn_name,
                 kind,
                 function_kind,
                 true,
@@ -1230,10 +1236,9 @@ impl<S: CharStream> Parser<S> {
                 ))
             }
             TokenKind::LParen => {
-                // super() is only valid directly inside a derived constructor
-                // body (nested-arrow delegation is not supported yet)
-                let directly = fn_idx == Some(self.fn_stack.len() - 1);
-                if !directly || kind != FunctionKind::DerivedClassConstructor {
+                // super() is valid anywhere lexically inside a derived
+                // constructor body: directly, or delegated through arrows
+                if kind != FunctionKind::DerivedClassConstructor {
                     return Err(ParseError::new(
                         span,
                         "'super()' call outside a derived class constructor",
@@ -1409,10 +1414,20 @@ impl<S: CharStream> Parser<S> {
     fn parse_new(&mut self) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::New)?.span.start;
         if self.peek()?.kind == TokenKind::Period {
-            return Err(ParseError::new(
-                Span::new(start, start + 3),
-                "new.target is not supported",
-            ));
+            // `new.target` (ES 13.3.11): a member-style primary, NOT a
+            // construction — returned directly so member tails and calls
+            // apply to it (`new.target.x`, `new new.target()`)
+            let dot = self.next()?;
+            let t = self.peek()?;
+            let is_target = t.kind == TokenKind::Identifier
+                && t.value
+                    .symbol()
+                    .is_some_and(|sym| self.symbols().get(Symbol(sym)) == b"target");
+            if !is_target {
+                return Err(ParseError::new(dot.span, "expected property name after `new.`"));
+            }
+            self.next()?;
+            return Ok(self.ast.add(Node::NewTarget, Span::new(start, t.span.end)));
         }
         let callee = match self.peek()?.kind {
             TokenKind::New => self.parse_new()?,
@@ -1640,6 +1655,15 @@ impl<S: CharStream> Parser<S> {
 
     fn parse_object_literal(&mut self) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::LBrace)?.span.start;
+        // a class-style scope: holds the super home-object slot when any
+        // method of the literal uses `super` (the home object is the
+        // literal itself, ES 15.4.2)
+        let obj_scope = self.push_scope(ScopeKind::Class);
+        self.class_stack.push(ClassCtx {
+            entry_fn_depth: self.fn_stack.len(),
+            uses_super: false,
+            is_static: false,
+        });
         let mut props = Vec::new();
         let end = loop {
             let t = self.peek()?;
@@ -1660,10 +1684,18 @@ impl<S: CharStream> Parser<S> {
             }
             break self.expect(TokenKind::RBrace)?.span.end;
         };
+        let ctx = self.class_stack.pop().unwrap();
+        if ctx.uses_super {
+            let home = self.symbols_mut().intern(b".home_object");
+            self.declare_class_slot(obj_scope, home, Span::new(start, start));
+        }
+        self.scopes.pop();
         let props = self.ast.list(&props);
-        Ok(self
+        let node = self
             .ast
-            .add(Node::ObjectLiteral { props }, Span::new(start, end)))
+            .add(Node::ObjectLiteral { props }, Span::new(start, end));
+        self.ast.set_node_scope(node, obj_scope);
+        Ok(node)
     }
 
     /// One object literal entry: `k: v`, shorthand, method, accessor,
@@ -1673,9 +1705,10 @@ impl<S: CharStream> Parser<S> {
         if let Some(is_get) = self.eat_accessor_prefix()? {
             let (key, key_sym, computed) = self.parse_property_key()?;
             let kind = if is_get { PropKind::Get } else { PropKind::Set };
+            let fn_name = self.accessor_name(key_sym, is_get);
             let (value, vspan) = self.parse_method_value(
                 t.span.start,
-                key_sym,
+                fn_name,
                 kind,
                 function_kind_for_property(kind),
                 false,
@@ -1761,6 +1794,17 @@ impl<S: CharStream> Parser<S> {
     /// Parses `(params) { body }`, wraps it in a FunctionExpr node, and checks
     /// accessor arity. `force_strict`: class members are always strict.
     /// Returns the node and its span.
+
+    /// ES 8.4.4 SetFunctionName prefixes: accessors are named "get x"/"set x".
+    fn accessor_name(&mut self, key_sym: Option<Symbol>, is_get: bool) -> Option<Symbol> {
+        let key = key_sym?;
+        let text = self.symbols().get(key);
+        let prefix = if is_get { b"get " } else { b"set " };
+        let mut full = prefix.to_vec();
+        full.extend_from_slice(text);
+        Some(self.symbols_mut().intern(&full))
+    }
+
     fn parse_method_value(
         &mut self,
         start: u32,

@@ -143,18 +143,26 @@ enum SuperStart<'a> {
     Parents(HeapRef<'a, FixedArray>),
 }
 
-fn super_start<'a>(nogc: &'a NoGc<'a>, value: Value) -> Result<SuperStart<'a>, VmError> {
-    let Some(obj) = value.as_heap_object(nogc) else {
-        return Ok(SuperStart::End);
+/// The home object's [[Prototype]] slot, raw (null / object / FixedArray
+/// of parents / unset). Extracted before ToPropertyKey so key coercion
+/// cannot observe a different chain than the lookup uses (ES 15.4.2:
+/// GetSuperBase happens first).
+pub fn home_proto<'a>(nogc: &'a NoGc<'a>, value: Value) -> Option<Value> {
+    let obj = value.as_heap_object(nogc)?;
+    Some(obj.as_ref().header.map.heap_ref(nogc).prototype.inner())
+}
+
+fn super_start_from_proto<'a>(nogc: &'a NoGc<'a>, proto: Option<Value>) -> SuperStart<'a> {
+    let Some(proto) = proto else {
+        return SuperStart::End;
     };
-    let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
     if proto == nogc.known().null.value() || !proto.is_strong_ptr() {
-        return Ok(SuperStart::End);
+        return SuperStart::End;
     }
     if let Some(parents) = proto.get_as::<FixedArray>(nogc) {
-        return Ok(SuperStart::Parents(parents));
+        return SuperStart::Parents(parents);
     }
-    Ok(SuperStart::Object(proto))
+    SuperStart::Object(proto)
 }
 
 pub fn super_lookup<'a>(
@@ -162,7 +170,19 @@ pub fn super_lookup<'a>(
     value: Value,
     name: SlotName,
 ) -> Result<LoadOutcome, VmError> {
-    match super_start(nogc, value)? {
+    let proto = home_proto(nogc, value);
+    super_lookup_from_proto(nogc, proto, name)
+}
+
+/// Super lookup with a pre-resolved prototype link (ES 15.4.2): the
+/// prototype is read before the key is coerced, so user `toString` cannot
+/// change which chain is searched.
+pub fn super_lookup_from_proto<'a>(
+    nogc: &'a NoGc<'a>,
+    proto: Option<Value>,
+    name: SlotName,
+) -> Result<LoadOutcome, VmError> {
+    match super_start_from_proto(nogc, proto) {
         // single parent: full load semantics
         SuperStart::Object(start) => load_outcome(nogc, start, name),
         SuperStart::Parents(parents) => {

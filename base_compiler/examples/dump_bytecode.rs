@@ -1,6 +1,6 @@
 //! Disassemble a script: parse → compile → print per-function bytecode.
 
-use bytecode::{Opcode, decode};
+use bytecode::decode;
 use parser::Parser;
 
 fn main() {

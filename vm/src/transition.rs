@@ -102,18 +102,20 @@ impl Value {
         }
     }
 
+}
+
     /// `super.x = v` (ES 15.4.4 PutValue on a super reference): the store
-    /// walks the chain starting at the home object's [[Prototype]] — in all
-    /// three prototype shapes (null, object, FixedArray of parents) — but
-    /// the receiver is `this`:
+    /// walks the chain starting at the pre-resolved parent link (read
+    /// before ToPropertyKey; any of the three prototype shapes) but the
+    /// receiver is `this`:
     /// - `Shadow` (JS): inherited writable data properties create an own
     ///   property on the receiver (OrdinarySet's receiver != O path),
     ///   setters run with the receiver, misses define on the receiver
     /// - `WriteThrough` (Self-style): inherited writable data properties
     ///   are written at the holder instead of shadowing
     pub fn super_store_lookup<'a>(
-        &self,
         nogc: &'a NoGc<'a>,
+        proto: Option<Value>,
         recv: Value,
         name: SlotName,
         value: Value,
@@ -122,17 +124,13 @@ impl Value {
         if recv == nogc.known().null.value() || recv == nogc.known().undefined.value() {
             return Err(VmError::Type);
         }
-        let Some(obj) = self.as_heap_object(nogc) else {
+        let Some(proto) = proto else {
             // non-object home: no parent chain, define on the receiver
             if !recv.is_strong_ptr() {
                 return Err(VmError::Type);
             }
-            return Ok(StoreOutcome::Transition {
-                receiver: recv,
-                name,
-            });
+            return Ok(StoreOutcome::Transition { receiver: recv, name });
         };
-        let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
         match lookup_in_parents(nogc, proto, name) {
             Lookup::Data {
                 slot,
@@ -156,10 +154,7 @@ impl Value {
                         if !recv.is_strong_ptr() {
                             return Err(VmError::Type);
                         }
-                        Ok(StoreOutcome::Transition {
-                            receiver: recv,
-                            name,
-                        })
+                        Ok(StoreOutcome::Transition { receiver: recv, name })
                     }
                 }
             }
@@ -167,10 +162,7 @@ impl Value {
                 if !recv.is_strong_ptr() {
                     return Err(VmError::Type);
                 }
-                Ok(StoreOutcome::Transition {
-                    receiver: recv,
-                    name,
-                })
+                Ok(StoreOutcome::Transition { receiver: recv, name })
             }
             Lookup::Accessor { pair, .. } => {
                 let setter = pair.set.inner();
@@ -181,8 +173,6 @@ impl Value {
             }
         }
     }
-}
-
 pub struct Transition;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

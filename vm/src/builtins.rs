@@ -35,6 +35,7 @@ pub fn register_builtin_natives(vm: &mut VM) -> BuiltinIndices {
         error_to_string: vm.register_native(error_to_string),
         object: vm.register_native(object_constructor),
         object_get_prototype_of: vm.register_native(object_get_prototype_of),
+        object_set_prototype_of: vm.register_native(object_set_prototype_of),
         array: vm.register_native(array_constructor),
         is_nan: vm.register_native(is_nan),
     }
@@ -59,6 +60,7 @@ pub struct BuiltinIndices {
     pub error_to_string: NativeIndex,
     pub object: NativeIndex,
     pub object_get_prototype_of: NativeIndex,
+    pub object_set_prototype_of: NativeIndex,
     pub array: NativeIndex,
     pub is_nan: NativeIndex,
 }
@@ -397,6 +399,14 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             object_fn,
             "getPrototypeOf",
             idx.object_get_prototype_of,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
+            "setPrototypeOf",
+            idx.object_set_prototype_of,
         )?;
 
         // ---- Array ---------------------------------------------------------------
@@ -888,6 +898,41 @@ fn object_get_prototype_of(
             return Err(VmError::Type);
         };
         Ok(obj.as_ref().header.map.heap_ref(nogc).prototype.inner())
+    })
+}
+
+/// `Object.setPrototypeOf(O, proto)` (ES 20.1.2.20): primitives return O
+/// unchanged (after RequireObjectCoercible); proto must be an object or
+/// null; the underlying [[SetPrototypeOf]] may reject (non-extensible
+/// receiver, prototype cycles) with a TypeError.
+fn object_set_prototype_of(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    let proto = args.get(2).ok_or(VmError::Arity)?;
+    let (nullish, target_is_object, proto_ok) = nctx.heap().no_gc(|nogc| {
+        (
+            target == nogc.known().null.value()
+                || target == nogc.known().undefined.value(),
+            !crate::Convert::is_primitive(nogc, target),
+            proto == nogc.known().null.value() || !crate::Convert::is_primitive(nogc, proto),
+        )
+    });
+    // RequireObjectCoercible(O)
+    if nullish {
+        return Err(VmError::Type);
+    }
+    // primitives are returned unchanged
+    if !target_is_object {
+        return Ok(target);
+    }
+    if !proto_ok {
+        return Err(VmError::Type);
+    }
+    nctx.handle_scope(|nctx, scope| {
+        crate::Object::set_prototype(nctx.heap(), &scope, target, proto)?;
+        Ok(target)
     })
 }
 

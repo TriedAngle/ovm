@@ -41,8 +41,8 @@ pub use heap::{
 };
 pub use interner::StringInterner;
 pub use lookup::{
-    Key, LoadOutcome, Lookup, classify_key, load_outcome, lookup_in_parents, super_constructor,
-    super_lookup,
+    Key, LoadOutcome, Lookup, classify_key, home_proto, load_outcome, lookup_in_parents,
+    super_constructor, super_lookup, super_lookup_from_proto,
 };
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use object::{
@@ -56,7 +56,7 @@ pub use object::{
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use transition::{
     Change, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition, TransitionGuard,
-    TransitionLock,
+    TransitionLock, super_store_lookup,
 };
 pub use value::{
     HeapPtr, MaybeWeak, PTR_BIT, STRONG_PTR, Smi, TAG_MASK, TAG_SMI, Tagged, Value, WEAK_BIT,

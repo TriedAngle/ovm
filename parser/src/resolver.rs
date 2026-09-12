@@ -24,6 +24,12 @@ pub enum Resolution {
     /// receiver, stored in that function's hidden this-slot, `depth` hops
     /// from the arrow's own context
     This { owner: FunctionId, depth: u32 },
+    /// `new.target` (ES 13.3.11): the frame's own new.target when
+    /// `owner == use function`, otherwise the owner's context slot
+    NewTarget { owner: FunctionId, depth: u32 },
+    /// `super(...)`: the owning derived constructor (whose closure and
+    /// new.target are needed when the call is delegated through arrows)
+    SuperCall { owner: FunctionId, depth: u32 },
     /// `super.x`: the home-object slot in the enclosing class's context,
     /// `depth` hops away. `this_owner` is the nearest enclosing non-arrow
     /// function (the receiver), whose this-slot is `this_depth` hops away.
@@ -41,8 +47,14 @@ pub struct FunctionLayout {
     pub register_count: u32,
     pub context_slots: u32,
     /// hidden context slot holding the receiver, when a nested arrow
-    /// function uses `this` (allocated after the named slots)
+    /// function uses `this` (allocated first among the hidden slots)
     pub this_slot: Option<u32>,
+    /// hidden context slot holding new.target, when a nested arrow reads
+    /// it or delegates super()
+    pub new_target_slot: Option<u32>,
+    /// hidden context slot holding the running closure, for derived
+    /// constructors with an arrow-delegated super()
+    pub this_function_slot: Option<u32>,
 }
 
 pub struct Resolved {
@@ -88,6 +100,14 @@ enum Pending {
         owner: FunctionId,
         depth: u32,
     },
+    NewTarget {
+        owner: FunctionId,
+        depth: u32,
+    },
+    SuperCall {
+        owner: FunctionId,
+        depth: u32,
+    },
     Super {
         scope: ScopeId,
         decl: u32,
@@ -119,6 +139,12 @@ struct Resolver<'a> {
     captured: HashSet<(ScopeId, u32)>,
     /// functions whose receiver a nested arrow captures
     captures_this: HashSet<FunctionId>,
+    /// functions whose new.target a nested arrow reads (or whose arrow
+    /// super() needs it)
+    captures_new_target: HashSet<FunctionId>,
+    /// derived constructors with an arrow-delegated super(): their closure
+    /// is stored into a context slot (.this_function)
+    needs_this_function: HashSet<FunctionId>,
     /// class scopes that create a context (named classes and classes
     /// whose members use super): each adds one hop to context depths
     ctx_classes: HashSet<ScopeId>,
@@ -185,22 +211,23 @@ fn resolve_with_mode(ast: &Ast, mode: ResolveMode) -> Resolved {
         fn_scope,
         captured: HashSet::new(),
         captures_this: HashSet::new(),
+        captures_new_target: HashSet::new(),
+        needs_this_function: HashSet::new(),
         ctx_classes: HashSet::new(),
         pending: vec![None; ast.node_count()],
         scope_stack: Vec::new(),
         fn_stack: Vec::new(),
     };
-    // class scopes that create a context: named classes (the inner name
-    // binding) and classes whose members use super (home objects)
-    for n in 0..ast.node_count() {
-        let id = NodeId(n as u32);
-        if let Node::ClassExpr { class } | Node::ClassDecl { class } = ast.node(id) {
-            let info = ast.class(*class);
-            if (info.name.is_some() || info.uses_super)
-                && let Some(scope) = ast.node_scope(id)
-            {
-                r.ctx_classes.insert(scope);
-            }
+    // class-kind scopes that create a context: named classes (the inner
+    // name binding), classes whose members use super (home objects), and
+    // object literals with super-using methods — uniformly: every
+    // class-kind scope with at least one declaration
+    for s in 0..ast.scope_count() {
+        let scope = ScopeId(s as u32);
+        if ast.scope(scope).kind == ScopeKind::Class
+            && !ast.scope(scope).decls.is_empty()
+        {
+            r.ctx_classes.insert(scope);
         }
     }
     r.walk_function(FunctionId(0));
@@ -376,7 +403,41 @@ impl<'a> Resolver<'a> {
                 self.captures_this.insert(owner);
                 self.pending[id.0 as usize] = Some(self.resolve_super(id, owner));
             }
-            Node::SuperCall { args } => self.walk_list(args),
+            Node::SuperCall { args } => {
+                self.walk_list(args);
+                let owner = self
+                    .fn_stack
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&f| !self.ast.function(f).kind.is_arrow())
+                    .expect("script function is never an arrow");
+                if owner != *self.fn_stack.last().expect("fn stack") {
+                    // arrow-delegated super(): the constructor's closure
+                    // and new.target must be context-visible
+                    self.needs_this_function.insert(owner);
+                    self.captures_new_target.insert(owner);
+                    // `this` binding happens through the owner's slot too
+                    self.captures_this.insert(owner);
+                }
+                let depth = self.context_hops(self.fn_scope[owner.0 as usize]);
+                self.pending[id.0 as usize] = Some(Pending::SuperCall { owner, depth });
+            }
+            Node::NewTarget => {
+                let owner = self
+                    .fn_stack
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|&f| !self.ast.function(f).kind.is_arrow())
+                    .expect("script function is never an arrow");
+                if owner != *self.fn_stack.last().expect("fn stack") {
+                    // arrow-delegated new.target: read the owner's slot
+                    self.captures_new_target.insert(owner);
+                }
+                let depth = self.context_hops(self.fn_scope[owner.0 as usize]);
+                self.pending[id.0 as usize] = Some(Pending::NewTarget { owner, depth });
+            }
             Node::Unary { expr, .. } => self.walk_node(expr),
             Node::Update { target, .. } => self.walk_node(target),
             Node::Binary { lhs, rhs, .. } => {
@@ -560,6 +621,16 @@ impl<'a> Resolver<'a> {
                 this_slot = Some(next_ctx);
                 next_ctx += 1;
             }
+            let mut new_target_slot = None;
+            if self.captures_new_target.contains(&fid) {
+                new_target_slot = Some(next_ctx);
+                next_ctx += 1;
+            }
+            let mut this_function_slot = None;
+            if self.needs_this_function.contains(&fid) {
+                this_function_slot = Some(next_ctx);
+                next_ctx += 1;
+            }
             for s in 0..ast.scope_count() {
                 let scope = ScopeId(s as u32);
                 if self.fn_owner[s] != fid {
@@ -607,6 +678,8 @@ impl<'a> Resolver<'a> {
                 register_count: next_reg,
                 context_slots: next_ctx,
                 this_slot,
+                new_target_slot,
+                this_function_slot,
             };
         }
 
@@ -638,6 +711,8 @@ impl<'a> Resolver<'a> {
                 Pending::GlobalObject => Resolution::GlobalObject,
                 Pending::Dynamic => Resolution::Dynamic,
                 Pending::This { owner, depth } => Resolution::This { owner, depth },
+                Pending::NewTarget { owner, depth } => Resolution::NewTarget { owner, depth },
+                Pending::SuperCall { owner, depth } => Resolution::SuperCall { owner, depth },
                 Pending::Super {
                     scope,
                     decl,
