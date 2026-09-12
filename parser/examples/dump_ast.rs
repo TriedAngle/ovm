@@ -210,6 +210,7 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
             println!("{pad}SuperCall {at}");
             dump_list(ast, args, indent + 1);
         }
+        Node::NewTarget => println!("{pad}NewTarget {at}"),
         Node::Empty => println!("{pad}Empty {at}"),
     }
 }

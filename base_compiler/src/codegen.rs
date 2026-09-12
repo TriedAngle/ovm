@@ -176,6 +176,22 @@ impl<'a> FunctionGen<'a> {
         Ok(self.add_constant(Constant::String(self.ast.symbol(sym).to_vec())))
     }
 
+    /// ES 8.4.2 IsAnonymousFunctionDefinition: an unnamed function or
+    /// class expression in a NamedEvaluation position gets a name.
+    fn is_anon_function(&self, node: NodeId) -> bool {
+        match *self.ast.node(node) {
+            Node::FunctionExpr { function } => self.ast.function(function).name.is_none(),
+            Node::ClassExpr { class } => self.ast.class(class).name.is_none(),
+            _ => false,
+        }
+    }
+
+    /// ES 8.4.4 SetFunctionName with a static string (NamedEvaluation).
+    fn emit_set_name_const(&mut self, bytes: &[u8]) {
+        let idx = self.add_constant(Constant::String(bytes.to_vec()));
+        emit(&mut self.code, Opcode::SetFunctionNameConst, &[idx]);
+    }
+
     // -- scopes / resolutions -------------------------------------------------
 
     /// Innermost scope (from the current position) declaring `name`.
@@ -201,6 +217,8 @@ impl<'a> FunctionGen<'a> {
             }
             Resolution::Dynamic => unreachable!("dynamic resolutions are rejected on load"),
             Resolution::This { .. } => unreachable!("this has no store target"),
+            Resolution::NewTarget { .. } => unreachable!("new.target has no store target"),
+            Resolution::SuperCall { .. } => unreachable!("super() has no store target"),
             Resolution::Super { .. } => unreachable!("super has no store target"),
         }
     }
@@ -282,6 +300,8 @@ impl<'a> FunctionGen<'a> {
                 Ok(())
             }
             Resolution::This { .. } => unreachable!("this is not an identifier load"),
+            Resolution::NewTarget { .. } => unreachable!("new.target is not an identifier load"),
+            Resolution::SuperCall { .. } => unreachable!("super() is not an identifier load"),
             Resolution::Super { .. } => unreachable!("super is not an identifier load"),
         }
     }
@@ -311,6 +331,10 @@ impl<'a> FunctionGen<'a> {
                 .this_slot
                 .expect("owner captures this");
             emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
+        } else if let Some(slot) = self.resolved.layout(self.fid).this_slot {
+            // captured `this` lives in the context (arrows may rebind it
+            // through a delegated super()); the prologue seeded the slot
+            emit(&mut self.code, Opcode::LoadContextSlot, &[slot, 0]);
         } else {
             emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
         }
@@ -384,6 +408,21 @@ impl<'a> FunctionGen<'a> {
                 self.emit_super_property_load(node, key, computed)
             }
             Node::SuperCall { args } => self.emit_super_call(node, args),
+            Node::NewTarget => {
+                match self.resolved.resolution(node) {
+                    Some(Resolution::NewTarget { owner, depth }) if owner != self.fid => {
+                        // arrow-delegated: the owner's context slot
+                        let slot = self
+                            .resolved
+                            .layout(owner)
+                            .new_target_slot
+                            .expect("arrow new.target forces the slot");
+                        emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
+                    }
+                    _ => emit(&mut self.code, Opcode::LdaNewTarget, &[]),
+                }
+                Ok(())
+            }
             Node::Hole => self.err(node, "array elision outside array literals"),
             Node::ObjectProperty { .. } => unreachable!("handled by object literal codegen"),
             _ => self.err(node, "statement in expression position"),
@@ -617,11 +656,21 @@ impl<'a> FunctionGen<'a> {
         match *self.ast.node(target) {
             Node::Identifier { sym } => {
                 self.expr(value)?;
+                if self.is_anon_function(value) {
+                    self.emit_set_name_const(self.ast.symbol(sym));
+                }
                 self.store_name(target, sym)
             }
             Node::Property { .. } | Node::SuperProperty { .. } => {
                 let store = self.prepare_property_store(target)?;
                 self.expr(value)?;
+                // NamedEvaluation: `a.b = function () {}` names the closure "b"
+                if let StoreTarget::Named { name_idx, .. } = &store
+                    && self.is_anon_function(value)
+                {
+                    let name_idx = *name_idx;
+                    emit(&mut self.code, Opcode::SetFunctionNameConst, &[name_idx]);
+                }
                 self.emit_property_store(&store);
                 self.release_store(&store);
                 Ok(())
@@ -1242,6 +1291,15 @@ impl<'a> FunctionGen<'a> {
             };
             let fn_idx = self.add_constant(Constant::Callable(function));
             emit(&mut self.code, Opcode::CreateClosure, &[fn_idx]);
+            // computed keys name the member after their ToPropertyKey value
+            if let Some(k) = key {
+                let prefix = match m.kind {
+                    PropKind::Get => 1,
+                    PropKind::Set => 2,
+                    _ => 0,
+                };
+                emit(&mut self.code, Opcode::SetFunctionNameKey, &[k, prefix]);
+            }
             match m.kind {
                 PropKind::Method => {
                     // {w+, e−, c+}
@@ -1407,46 +1465,108 @@ impl<'a> FunctionGen<'a> {
         Ok(())
     }
 
-    /// `super(...)`: construct the superclass with the frame's new.target and
-    /// initialize `this` with the result (ES 15.4.3). Evaluates to the new
-    /// `this`.
-    fn emit_super_call(
-        &mut self,
-        _node: NodeId,
-        args: parser::NodeList,
-    ) -> Result<(), CompileError> {
+    /// `super(...)`: construct the superclass with the constructor's
+    /// new.target and initialize `this` with the result (ES 15.4.3).
+    /// Direct calls resolve the super constructor from the frame; calls
+    /// delegated through arrows use the constructor's threaded closure and
+    /// new.target. Evaluates to the new `this`.
+    fn emit_super_call(&mut self, node: NodeId, args: parser::NodeList) -> Result<(), CompileError> {
         let items = self.ast.list_items(args).to_vec();
         let argc = items.len();
+        let (owner, owner_depth) = match self.resolved.resolution(node) {
+            Some(Resolution::SuperCall { owner, depth }) => (owner, depth),
+            _ => (self.fid, 0),
+        };
+        let direct = owner == self.fid;
+        // where the constructor's `this` lives (the bind target)
+        let this_slot = if direct {
+            self.resolved.layout(self.fid).this_slot
+        } else {
+            Some(
+                self.resolved
+                    .layout(owner)
+                    .this_slot
+                    .expect("delegated super() forces the this slot"),
+            )
+        };
+
         let arg_base = self.reg_base + self.next_temp;
-        // reserve arguments + result so nested temps land above
-        self.next_temp += argc as u32 + 1;
+        // reserve arguments + result (+ closure/new.target registers for
+        // the delegated variant) so nested temps land above
+        let reserved = argc as u32 + 1 + if direct { 0 } else { 2 };
+        self.next_temp += reserved;
         for (i, &arg) in items.iter().enumerate() {
             self.expr(arg)?;
             emit(&mut self.code, Opcode::Store, &[arg_base + i as u32]);
         }
         self.max_temps = self.max_temps.max(self.next_temp);
-        emit(
-            &mut self.code,
-            Opcode::ConstructSuper,
-            &[arg_base, argc as u32],
-        );
+        if direct {
+            emit(
+                &mut self.code,
+                Opcode::ConstructSuper,
+                &[arg_base, argc as u32],
+            );
+        } else {
+            // .this_function and .new.target of the owning constructor
+            let layout = self.resolved.layout(owner);
+            let closure_reg = arg_base + argc as u32 + 1;
+            let new_target_reg = closure_reg + 1;
+            emit(
+                &mut self.code,
+                Opcode::LoadContextSlot,
+                &[
+                    layout
+                        .this_function_slot
+                        .expect("delegated super() forces the closure slot"),
+                    owner_depth,
+                ],
+            );
+            emit(&mut self.code, Opcode::Store, &[closure_reg]);
+            emit(
+                &mut self.code,
+                Opcode::LoadContextSlot,
+                &[
+                    layout
+                        .new_target_slot
+                        .expect("delegated super() forces the new.target slot"),
+                    owner_depth,
+                ],
+            );
+            emit(&mut self.code, Opcode::Store, &[new_target_reg]);
+            emit(
+                &mut self.code,
+                Opcode::ConstructSuperVia,
+                &[closure_reg, new_target_reg, arg_base, argc as u32],
+            );
+        }
         let result = arg_base + argc as u32;
         emit(&mut self.code, Opcode::Store, &[result]);
         // InitializeThisBinding: this must still be uninitialized
-        emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
-        emit(
-            &mut self.code,
-            Opcode::ThrowSuperAlreadyCalledIfNotHole,
-            &[],
-        );
-        emit(&mut self.code, Opcode::Load, &[result]);
-        emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
-        // keep a context-captured `this` (nested arrows) in sync
-        if let Some(slot) = self.resolved.layout(self.fid).this_slot {
-            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+        match this_slot {
+            Some(slot) => {
+                let depth = if direct { 0 } else { owner_depth };
+                emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
+                emit(
+                    &mut self.code,
+                    Opcode::ThrowSuperAlreadyCalledIfNotHole,
+                    &[],
+                );
+                emit(&mut self.code, Opcode::Load, &[result]);
+                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, depth]);
+            }
+            None => {
+                emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+                emit(
+                    &mut self.code,
+                    Opcode::ThrowSuperAlreadyCalledIfNotHole,
+                    &[],
+                );
+                emit(&mut self.code, Opcode::Load, &[result]);
+                emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
+            }
         }
         emit(&mut self.code, Opcode::Load, &[result]);
-        self.next_temp -= argc as u32 + 1;
+        self.next_temp -= reserved;
         Ok(())
     }
 
@@ -1481,9 +1601,22 @@ impl<'a> FunctionGen<'a> {
 
     fn emit_object_literal(
         &mut self,
-        _node: NodeId,
+        node: NodeId,
         props: parser::NodeList,
     ) -> Result<(), CompileError> {
+        // methods using `super` capture a per-literal home-object context
+        // (the literal itself), mirroring class scopes
+        let scope = self.ast.node_scope(node);
+        let slot_count = scope.map_or(0, |s| self.ast.scope(s).decls.len() as u32);
+        let ctx_save = if slot_count > 0 {
+            emit(&mut self.code, Opcode::CreateBlockContext, &[slot_count]);
+            let save = self.reserve_temp();
+            emit(&mut self.code, Opcode::PushContext, &[save]);
+            Some(save)
+        } else {
+            None
+        };
+
         emit(&mut self.code, Opcode::CreateEmptyObjectLiteral, &[]);
         let obj = self.push_value();
         for &prop in self.ast.list_items(props) {
@@ -1494,28 +1627,125 @@ impl<'a> FunctionGen<'a> {
                     kind,
                     computed,
                 } => {
-                    if kind != PropKind::Init && kind != PropKind::Method {
-                        return self.err(prop, "accessor properties in object literals");
-                    }
-                    if computed {
+                    let key_reg = if computed {
                         self.expr(key)?;
-                        let k = self.push_value();
-                        self.expr(value)?;
-                        emit(&mut self.code, Opcode::StoreKeyedProperty, &[obj, k, 0]);
-                        self.pop_value();
+                        Some(self.push_value())
                     } else {
-                        let name_idx = self.name_constant(key)?;
-                        self.expr(value)?;
-                        emit(
-                            &mut self.code,
-                            Opcode::StoreNamedProperty,
-                            &[obj, name_idx, 0],
-                        );
+                        None
+                    };
+                    match kind {
+                        PropKind::Init => {
+                            self.expr(value)?;
+                            if !computed {
+                                // NamedEvaluation: { m: function () {} }
+                                let name_idx = self.name_constant(key)?;
+                                if self.is_anon_function(value) {
+                                    emit(
+                                        &mut self.code,
+                                        Opcode::SetFunctionNameConst,
+                                        &[name_idx],
+                                    );
+                                }
+                                emit(
+                                    &mut self.code,
+                                    Opcode::StoreNamedProperty,
+                                    &[obj, name_idx, 0],
+                                );
+                            } else {
+                                let k = key_reg.unwrap();
+                                if self.is_anon_function(value) {
+                                    emit(&mut self.code, Opcode::SetFunctionNameKey, &[k, 0]);
+                                }
+                                emit(&mut self.code, Opcode::StoreKeyedProperty, &[obj, k, 0]);
+                            }
+                        }
+                        PropKind::Method | PropKind::Get | PropKind::Set => {
+                            let prefix = match kind {
+                                PropKind::Get => 1,
+                                PropKind::Set => 2,
+                                _ => 0,
+                            };
+                            // the closure is created by evaluating the
+                            // method value; name it afterwards
+                            self.expr(value)?;
+                            if let Some(k) = key_reg {
+                                emit(&mut self.code, Opcode::SetFunctionNameKey, &[k, prefix]);
+                            }
+                            match kind {
+                                PropKind::Get | PropKind::Set => {
+                                    // enumerable accessor halves, merged
+                                    // pairs; bit 0 marks the getter half
+                                    let flags = match kind {
+                                        PropKind::Get => 1,
+                                        _ => 0,
+                                    };
+                                    if let Some(k) = key_reg {
+                                        emit(
+                                            &mut self.code,
+                                            Opcode::InstallKeyedAccessor,
+                                            &[obj, k, flags],
+                                        );
+                                    } else {
+                                        let name_idx = self.name_constant(key)?;
+                                        emit(
+                                            &mut self.code,
+                                            Opcode::InstallNamedAccessor,
+                                            &[obj, name_idx, flags],
+                                        );
+                                    }
+                                }
+                                PropKind::Method => {
+                                    if let Some(k) = key_reg {
+                                        emit(
+                                            &mut self.code,
+                                            Opcode::StoreKeyedProperty,
+                                            &[obj, k, 0],
+                                        );
+                                    } else {
+                                        let name_idx = self.name_constant(key)?;
+                                        emit(
+                                            &mut self.code,
+                                            Opcode::StoreNamedProperty,
+                                            &[obj, name_idx, 0],
+                                        );
+                                    }
+                                }
+                                PropKind::Init => unreachable!(),
+                            }
+                        }
+                    }
+                    if let Some(k) = key_reg {
+                        let _ = k;
+                        self.pop_value();
                     }
                 }
                 Node::Spread { .. } => return self.err(prop, "spread in object literals"),
                 _ => return self.err(prop, "object literal property"),
             }
+        }
+        // the home object is the literal itself; methods already captured
+        // the context, so the store is visible to them
+        if let Some(scope) = scope
+            && slot_count > 0
+        {
+            let home = self
+                .ast
+                .scope(scope)
+                .decls
+                .first()
+                .expect("uses_super literals declare the home slot");
+            if let Resolution::Context { slot, .. } = self
+                .resolved
+                .resolution_for_decl(scope, home.name)
+                .expect("home slot declared")
+            {
+                emit(&mut self.code, Opcode::Load, &[obj]);
+                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            }
+        }
+        if let Some(save) = ctx_save {
+            emit(&mut self.code, Opcode::PopContext, &[save]);
+            self.next_temp -= 1;
         }
         emit(&mut self.code, Opcode::Load, &[obj]);
         self.pop_value();
@@ -1654,6 +1884,9 @@ impl<'a> FunctionGen<'a> {
             match init {
                 Some(init) => {
                     self.expr(init)?;
+                    if self.is_anon_function(init) {
+                        self.emit_set_name_const(self.ast.symbol(name));
+                    }
                     self.store_decl(res, name);
                 }
                 None if kind == VarKind::Var || res == Resolution::GlobalObject => {
@@ -1979,6 +2212,12 @@ impl<'a> FunctionGen<'a> {
         if let Some(slot) = layout.this_slot {
             names[slot as usize] = Some(b"this".to_vec());
         }
+        if let Some(slot) = layout.new_target_slot {
+            names[slot as usize] = Some(b".new.target".to_vec());
+        }
+        if let Some(slot) = layout.this_function_slot {
+            names[slot as usize] = Some(b".this_function".to_vec());
+        }
         for s in 0..self.ast.scope_count() {
             let scope = ScopeId(s as u32);
             // class scopes own their own contexts, not this function's
@@ -2021,14 +2260,25 @@ impl<'a> FunctionGen<'a> {
             .is_derived_class_constructor()
     }
 
+    /// Load this function's own `this`: the context slot when captured
+    /// (the bind target of super(), shared with nested arrows), else the
+    /// receiver register.
+    fn emit_this_load_own(&mut self) {
+        match self.resolved.layout(self.fid).this_slot {
+            Some(slot) => emit(&mut self.code, Opcode::LoadContextSlot, &[slot, 0]),
+            None => emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]),
+        }
+    }
+
     /// `return [expr]` inside a derived constructor: an object result wins,
     /// `undefined` (and missing) return `this` (initialization checked),
     /// other primitives make the [[Construct]] throw (ES 9.2.2.1 — the
     /// primitive escapes and the Construct opcode rejects it).
     fn emit_derived_return(&mut self, value: Option<NodeId>) -> Result<(), CompileError> {
         let Some(v) = value else {
-            // `return;` → return this
-            emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+            // `return;` → return this (loaded while the frame context is
+            // still pushed: the captured-this slot lives in it)
+            self.emit_this_load_own();
             emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
             emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
             emit(&mut self.code, Opcode::Return, &[]);
@@ -2043,7 +2293,8 @@ impl<'a> FunctionGen<'a> {
         emit(&mut self.code, Opcode::EqualStrict, &[u]);
         let mut is_obj = Label::new();
         emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut is_obj);
-        emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+        // undefined → return this (context still pushed for the slot read)
+        self.emit_this_load_own();
         emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
         emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
         emit(&mut self.code, Opcode::Return, &[]);
@@ -2105,6 +2356,16 @@ impl<'a> FunctionGen<'a> {
             emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
             emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
         }
+        // expose new.target / the running closure to nested arrows
+        // (arrow-delegated super() and arrow new.target reads)
+        if let Some(slot) = layout.new_target_slot {
+            emit(&mut self.code, Opcode::LdaNewTarget, &[]);
+            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+        }
+        if let Some(slot) = layout.this_function_slot {
+            emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
+            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+        }
 
         // the synthesized default derived constructor forwards every
         // argument to super() and returns the bound this (ES 15.7.13)
@@ -2128,15 +2389,23 @@ impl<'a> FunctionGen<'a> {
 
         // fallthrough: the script yields its completion value; ordinary
         // functions return undefined; derived constructors return `this`
-        // (initialization checked — super() must have run)
-        emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+        // (initialization checked — super() must have run; the this load
+        // happens while the frame context is still pushed, the captured
+        // this slot lives in it)
         match self.completion {
-            Some(completion) => emit(&mut self.code, Opcode::Load, &[completion]),
-            None if self.is_derived_ctor() => {
-                emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
-                emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
+            Some(completion) => {
+                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+                emit(&mut self.code, Opcode::Load, &[completion]);
             }
-            None => self.emit_load_constant(Constant::Undefined),
+            None if self.is_derived_ctor() => {
+                self.emit_this_load_own();
+                emit(&mut self.code, Opcode::ThrowSuperNotCalledIfHole, &[]);
+                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+            }
+            None => {
+                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+                self.emit_load_constant(Constant::Undefined);
+            }
         }
         emit(&mut self.code, Opcode::Return, &[]);
         Ok(())

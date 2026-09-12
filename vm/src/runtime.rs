@@ -268,23 +268,46 @@ impl Runtime {
         })
     }
 
-    pub fn canonical_key_value(
+    /// ToPropertyKey + canonicalization (ES 7.1.21): smis (element
+    /// indices) and symbols pass through; every other value is coerced —
+    /// ToString for primitives, ToPrimitive(hint String) first for objects
+    /// (user code may run) — and the resulting string is re-interned by
+    /// content so identity name comparison matches the interned constants
+    /// of named accesses (`o['a' + 'b']` ≡ `o.ab`, `class A { [1.5]() {} }`
+    /// installs "1.5"). `Ok(None)` means user code threw (pending
+    /// exception).
+    pub fn to_property_key(
         vm: &VM,
         heap: &mut Heap,
         state: &ContextState,
         v: Value,
-    ) -> Result<Value, VmError> {
+    ) -> Result<Option<Value>, VmError> {
+        if v.is_smi() || heap.no_gc(|nogc| v.get_as::<Symbol>(nogc).is_some()) {
+            return Ok(Some(v));
+        }
+        let is_string = heap.no_gc(|nogc| v.get_as::<VMString>(nogc).is_some());
+        let primitive = if is_string {
+            v
+        } else {
+            match Self::to_primitive(vm, heap, state, v, Hint::String)? {
+                Coercion::Threw => return Ok(None),
+                Coercion::Value(p) => p,
+            }
+        };
+        let stringified = state.handle_scope(|scope| Convert::to_string(heap, &scope, primitive))?;
         let bytes = heap.no_gc(|nogc| {
-            v.get_as::<VMString>(nogc)
+            stringified
+                .get_as::<VMString>(nogc)
                 .map(|s| s.as_slice(nogc).to_vec())
         });
         match bytes {
             Some(bytes) => {
                 let interned =
                     state.handle_scope(|scope| vm.interner().intern(heap, &scope, bytes).value());
-                Ok(interned)
+                Ok(Some(interned))
             }
-            None => Ok(v),
+            // ToString of a symbol primitive throws (ES 6.1.7.1)
+            None => Err(VmError::Type),
         }
     }
 

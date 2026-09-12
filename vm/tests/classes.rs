@@ -18,25 +18,6 @@ fn run_smi(src: &str) -> i64 {
     Smi::decode(run(src).unwrap()).unwrap().value()
 }
 
-fn run_num(src: &str) -> f64 {
-    let result = run(src).unwrap();
-    if let Some(smi) = Smi::decode(result) {
-        return smi.value() as f64;
-    }
-    run_value_strict(src)
-}
-
-fn run_value_strict(src: &str) -> f64 {
-    let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc| {
-        result
-            .get_as::<vm::Float>(nogc)
-            .expect("number result")
-            .value
-            .get()
-    })
-}
-
 fn run_value(src: &str) -> (Value, Thread) {
     let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
     let mut thread = vm.attach();
@@ -698,12 +679,51 @@ fn super_in_nested_arrows() {
         ),
         3
     );
-    // `super()` inside a nested arrow is not supported yet (it would need
-    // .this_function threading; spec allows it)
-    match run("class A {} class B extends A { constructor() { var f = () => super(); } }") {
-        Err(ScriptError::Parse(_)) => {}
-        other => panic!("expected parse error for arrow-wrapped super(), got {other:?}"),
-    }
+    // `super()` inside a nested arrow is delegated through the
+    // constructor's threaded closure and new.target
+    assert_eq!(
+        run_smi(
+            "class A { constructor(v) { this.v = v; } }
+             class B extends A { constructor() { var f = () => super(9); f(); } }
+             new B().v;"
+        ),
+        9
+    );
+    // the bound this is shared: the ctor sees it after the delegated call
+    assert_eq!(
+        run_smi(
+            "class A { constructor() { this.n = 1; } }
+             class B extends A { constructor() { (() => super())(); this.n += 5; } }
+             new B().n;"
+        ),
+        6
+    );
+    // new.target inside a nested arrow delegates to the constructor
+    assert!(run_bool(
+        "class A {}
+         class B extends A { constructor() { super(); var g = () => new.target; this.t = g(); } }
+         new B().t === B;"
+    ));
+}
+
+#[test]
+fn new_target_basic_forms() {
+    // undefined outside construction
+    assert!(run_bool("new.target === undefined;"));
+    assert!(run_bool("function f() { return new.target; } f() === undefined;"));
+    // the constructor itself
+    assert!(run_bool("function f() { return new.target; } new f() === f;"));
+    assert!(run_bool("class A { constructor() { this.t = new.target; } } new A().t === A;"));
+    // new.target threads through the default-ctor super chain
+    assert!(run_bool(
+        "class A { constructor() { this.q = new.target; } }
+         class B extends A {}
+         new B().q === B;"
+    ));
+    // arrow delegation in plain functions
+    assert!(run_bool(
+        "function f() { var g = () => new.target; return g(); } new f() === f;"
+    ));
 }
 
 // ---------------------------------------------------------------------------
