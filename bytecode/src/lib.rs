@@ -123,10 +123,21 @@ pub enum Opcode {
     // current frame's new.target (ES 15.4.3); result in acc
     ConstructSuper,        // reglist (args) regcount (count) -> acc
     ConstructSuperAllArgs, // forward the current frame's full argument list -> acc
+    // arrow-delegated super(): the constructor closure and its new.target
+    // come from context slots (threaded through .this_function)
+    ConstructSuperVia, // reg (closure) reg (new_target) reglist (args) regcount (count) -> acc
+    // new.target of the current frame (undefined for plain calls)
+    LdaNewTarget, // -> acc
+    // the currently executing closure (frame callable)
+    LdaCurrentClosure, // -> acc
     // accessor member installation: define an accessor half, merging with an
     // existing pair under the same key (ES 14.3.10 MethodDefinitionEvaluation)
     InstallNamedAccessor, // reg (target) idx (name) uimm (flags) ; closure in acc
     InstallKeyedAccessor, // reg (target) reg (key) uimm (flags) ; closure in acc
+    // ES 8.4.4 SetFunctionName: redefine the closure's `name` ({w−, e−, c+});
+    // the closure stays in the accumulator
+    SetFunctionNameConst, // idx (constant pool name) ; closure in acc
+    SetFunctionNameKey,   // reg (key) uimm (prefix: 0 none, 1 get, 2 set) ; closure in acc
 
     // binary arithmetic: acc = acc op reg
     Add, // reg
@@ -298,8 +309,13 @@ impl Opcode {
             b if b == StoreKeyedPropertyToSuper as u8 => StoreKeyedPropertyToSuper,
             b if b == ConstructSuper as u8 => ConstructSuper,
             b if b == ConstructSuperAllArgs as u8 => ConstructSuperAllArgs,
+            b if b == ConstructSuperVia as u8 => ConstructSuperVia,
+            b if b == LdaNewTarget as u8 => LdaNewTarget,
+            b if b == LdaCurrentClosure as u8 => LdaCurrentClosure,
             b if b == InstallNamedAccessor as u8 => InstallNamedAccessor,
             b if b == InstallKeyedAccessor as u8 => InstallKeyedAccessor,
+            b if b == SetFunctionNameConst as u8 => SetFunctionNameConst,
+            b if b == SetFunctionNameKey as u8 => SetFunctionNameKey,
             b if b == Add as u8 => Add,
             b if b == Sub as u8 => Sub,
             b if b == Mul as u8 => Mul,
@@ -386,14 +402,19 @@ impl Opcode {
             | Self::ThrowIfNotObjectOrNull
             | Self::ThrowSuperNotCalledIfHole
             | Self::ThrowSuperAlreadyCalledIfNotHole
-            | Self::ConstructSuperAllArgs => &[],
+            | Self::ConstructSuperAllArgs
+            | Self::LdaNewTarget
+            | Self::LdaCurrentClosure => &[],
             Self::LoadNamedPropertyFromSuper => &[Register, Index, Index],
             Self::LoadKeyedPropertyFromSuper => &[Register, Register, Index],
             Self::StoreNamedPropertyToSuper => &[Register, Register, Index, UImmediate, Index],
             Self::StoreKeyedPropertyToSuper => &[Register, Register, Register, UImmediate, Index],
             Self::ConstructSuper => &[RegisterListStart, RegisterCount],
+            Self::ConstructSuperVia => &[Register, Register, RegisterListStart, RegisterCount],
             Self::InstallNamedAccessor => &[Register, Index, UImmediate],
             Self::InstallKeyedAccessor => &[Register, Register, UImmediate],
+            Self::SetFunctionNameConst => &[Index],
+            Self::SetFunctionNameKey => &[Register, UImmediate],
 
             Self::Add
             | Self::Sub

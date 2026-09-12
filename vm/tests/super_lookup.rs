@@ -5,7 +5,8 @@
 use dummy_heap::{DummyHeap, DummyHeapConfig};
 use vm::{
     FixedArray, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi, StoreOutcome,
-    StoreSemantics, Thread, VM, Value, VmError, lookup_in_parents, super_lookup,
+    StoreSemantics, Thread, VM, Value, VmError, home_proto, lookup_in_parents, super_lookup,
+    super_store_lookup,
 };
 
 fn smi(v: i64) -> Value {
@@ -155,9 +156,15 @@ fn super_store_shadow_creates_own_property_on_this() {
     let x = slot_name(&mut thread, "x");
 
     thread.heap().no_gc(|nogc| {
-        match home
-            .super_store_lookup(nogc, this_, x, smi(42), StoreSemantics::Shadow)
-            .unwrap()
+        match super_store_lookup(
+            nogc,
+            home_proto(nogc, home),
+            this_,
+            x,
+            smi(42),
+            StoreSemantics::Shadow,
+        )
+        .unwrap()
         {
             StoreOutcome::Transition { receiver, name } => {
                 assert_eq!(receiver, this_);
@@ -181,9 +188,15 @@ fn super_store_write_through_updates_the_holder() {
     let x = slot_name(&mut thread, "x");
 
     thread.heap().no_gc(|nogc| {
-        let outcome = home
-            .super_store_lookup(nogc, this_, x, smi(42), StoreSemantics::WriteThrough)
-            .unwrap();
+        let outcome = super_store_lookup(
+            nogc,
+            home_proto(nogc, home),
+            this_,
+            x,
+            smi(42),
+            StoreSemantics::WriteThrough,
+        )
+        .unwrap();
         assert!(matches!(outcome, StoreOutcome::Done));
     });
     assert_eq!(get_smi(&mut thread, parent, "x"), 42);
@@ -205,9 +218,15 @@ fn super_store_write_through_hits_second_parent_holder() {
     let b = slot_name(&mut thread, "b");
 
     thread.heap().no_gc(|nogc| {
-        let outcome = home
-            .super_store_lookup(nogc, this_, b, smi(9), StoreSemantics::WriteThrough)
-            .unwrap();
+        let outcome = super_store_lookup(
+            nogc,
+            home_proto(nogc, home),
+            this_,
+            b,
+            smi(9),
+            StoreSemantics::WriteThrough,
+        )
+        .unwrap();
         assert!(matches!(outcome, StoreOutcome::Done));
     });
     // the holder (second parent) got the write
@@ -245,14 +264,14 @@ fn super_store_readonly_and_nullish_receiver_throw() {
     thread.heap().no_gc(|nogc| {
         for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
             assert_eq!(
-                home.super_store_lookup(nogc, this_, x, smi(2), semantics),
+                super_store_lookup(nogc, home_proto(nogc, home), this_, x, smi(2), semantics),
                 Err(VmError::Type)
             );
         }
         // nullish receivers are invalid property store receivers
         for bad in [null, undefined] {
             assert_eq!(
-                home.super_store_lookup(nogc, bad, x, smi(2), StoreSemantics::Shadow),
+                super_store_lookup(nogc, home_proto(nogc, home), bad, x, smi(2), StoreSemantics::Shadow),
                 Err(VmError::Type)
             );
         }
@@ -271,7 +290,7 @@ fn super_store_on_null_proto_chain_defines_on_this() {
         // no parent chain at all: both semantics define on the receiver
         for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
             assert!(matches!(
-                home.super_store_lookup(nogc, this_, x, smi(2), semantics).unwrap(),
+                super_store_lookup(nogc, home_proto(nogc, home), this_, x, smi(2), semantics).unwrap(),
                 StoreOutcome::Transition { receiver, .. } if receiver == this_
             ));
         }

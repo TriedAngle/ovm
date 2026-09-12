@@ -199,6 +199,10 @@ pub enum Node {
     SuperCall {
         args: NodeList,
     },
+    /// `new.target` (ES 13.3.11): the active [[Construct]] target, or
+    /// undefined outside construction; arrows delegate to the enclosing
+    /// non-arrow function
+    NewTarget,
 
     // statements & declarations
     ExprStmt {
