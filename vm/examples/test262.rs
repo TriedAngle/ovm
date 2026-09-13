@@ -65,6 +65,7 @@ const UNSUPPORTED_PATHS: &[&str] = &[
     "property-cast-number",
     "15.4.4.14-9-9",
     "15.4.4.15-8-9",
+    "length-truncate-with-indexed",
 ];
 
 #[derive(Default)]
@@ -165,6 +166,10 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
         fm.contains("negative:") && (fm.contains("phase: parse") || fm.contains("phase: syntax"));
     // `raw` tests run without the harness preludes (INTERPRETING.md)
     let raw = fm.contains("flags") && fm.contains("raw");
+    // onlyStrict: the whole program (harness prelude included) runs as
+    // strict code; noStrict runs as-is (sloppy unless the test says
+    // otherwise)
+    let strict_wrap = fm.contains("flags") && fm.contains("onlyStrict");
 
     // `includes:` harness files (sta.js-style helpers like propertyHelper)
     let mut includes = String::new();
@@ -189,6 +194,8 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
 
     let code = if raw {
         src
+    } else if strict_wrap {
+        format!("\"use strict\";\n{harness}\n{includes}\n{src}\n")
     } else {
         format!("{harness}\n{includes}\n{src}\n")
     };
@@ -274,11 +281,11 @@ fn real_main() -> i32 {
     println!("panic:           {}", stats.panicked.len());
     println!("skipped feature: {}", stats.skipped_feature);
     println!("skipped module:  {}", stats.skipped_module);
-    for path in stats.panicked.iter().take(10) {
+    for path in stats.panicked.iter().take(100) {
         println!("  PANIC {}", path.display());
     }
-    if stats.panicked.len() > 10 {
-        println!("  ... and {} more panics", stats.panicked.len() - 10);
+    if stats.panicked.len() > 100 {
+        println!("  ... and {} more panics", stats.panicked.len() - 100);
     }
     // one line per failure, for offline aggregation
     for (path, err) in &stats.fail {

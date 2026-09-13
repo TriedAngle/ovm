@@ -549,8 +549,89 @@ impl<'a> FunctionGen<'a> {
                 Ok(())
             }
             TokenKind::Tilde => self.err(node, "bitwise not"),
-            TokenKind::Delete => self.err(node, "delete"),
+            TokenKind::Delete => self.emit_delete(node, expr),
             _ => self.err(node, "unary operator"),
+        }
+    }
+
+    /// `delete` (ES 13.5.1.2). The operand's *reference* is what gets
+    /// deleted — never its value: member references evaluate only base
+    /// and key (no property load, so getters cannot run), unqualified
+    /// sloppy identifiers delete on the global object (declared bindings
+    /// are declarative and statically fold to `false`), and non-reference
+    /// operands evaluate for side effects and yield `true`.
+    fn emit_delete(&mut self, node: NodeId, expr: NodeId) -> Result<(), CompileError> {
+        match *self.ast.node(expr) {
+            Node::Property { object, key, computed } => {
+                self.expr(object)?;
+                let base = self.push_value();
+                if computed {
+                    self.expr(key)?;
+                } else {
+                    let idx = self.name_constant(key)?;
+                    emit(&mut self.code, Opcode::LoadConstant, &[idx]);
+                }
+                self.push_value();
+                let runtime_fn = if self.ast.function(self.fid).strict {
+                    bytecode::RuntimeFn::DeletePropertyStrict
+                } else {
+                    bytecode::RuntimeFn::DeletePropertySloppy
+                };
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[runtime_fn as u32, base, 2],
+                );
+                self.pop_value();
+                self.pop_value();
+                Ok(())
+            }
+            Node::SuperProperty { key, computed, .. } => {
+                // ReferenceError in both language modes (ES 13.5.1.2
+                // step 4.c). Reference evaluation runs first —
+                // GetThisBinding throws for an uninitialized `this`
+                // before the key expression evaluates (ES 13.3.7.1) —
+                // and the key is never coerced: delete-super fails
+                // before any ToPropertyKey
+                let Some(store) = self.prepare_super_parts(expr, key, computed)? else {
+                    return self.err(node, "super property");
+                };
+                self.release_store(&store);
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::DeleteSuperProperty as u32, 0, 0],
+                );
+                Ok(())
+            }
+            Node::Identifier { sym } => {
+                // strict sites are rejected at parse time; sloppy
+                // declarative bindings cannot be deleted (false), free
+                // names are global-object properties
+                match self.resolved.resolution(expr) {
+                    Some(Resolution::GlobalObject) | Some(Resolution::Dynamic) => {
+                        let idx =
+                            self.add_constant(Constant::String(self.ast.symbol(sym).to_vec()));
+                        emit(&mut self.code, Opcode::LoadConstant, &[idx]);
+                        let name = self.push_value();
+                        emit(
+                            &mut self.code,
+                            Opcode::CallRuntime,
+                            &[bytecode::RuntimeFn::DeleteIdentifierSloppy as u32, name, 1],
+                        );
+                        self.pop_value();
+                    }
+                    _ => self.emit_load_constant(Constant::Boolean(false)),
+                }
+                Ok(())
+            }
+            Node::PrivateName { .. } => self.err(node, "delete of a private name"),
+            _ => {
+                // not a reference: side effects only, the result is true
+                self.expr(expr)?;
+                self.emit_load_constant(Constant::Boolean(true));
+                Ok(())
+            }
         }
     }
 

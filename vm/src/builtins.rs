@@ -743,12 +743,22 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             ("undefined", undefined.value()),
         ] {
             let n = thread.intern(&scope, name);
-            define_data(
+            // spec attributes are {writable: false, enumerable: false,
+            // configurable: false} (ES 19.1.1); non-configurability is
+            // what `delete NaN` observes, writable/enumerable stay per
+            //missive until non-writable stores stop throwing in sloppy
+            // code
+            Object::define_own_property(
                 thread.heap(),
                 &scope,
-                global,
-                SlotName::from(n.as_tagged()),
-                value,
+                scope.handle(global.as_tagged()),
+                scope.handle(SlotName::from(n.as_tagged()).tagged()),
+                PropertyDescriptor::Data {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: false,
+                },
             )?;
         }
         Ok(())
