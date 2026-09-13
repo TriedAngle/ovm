@@ -4,9 +4,11 @@ use bytecode::decode;
 use parser::Parser;
 
 fn main() {
-    let src = std::env::args()
+    let path = std::env::args()
         .nth(1)
         .expect("usage: dump_bytecode <script.js>");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
     let mut p = Parser::new(parser::Utf8SliceStream::new(&src));
     p.parse_script().expect("parse");
     let ast = p.into_ast();

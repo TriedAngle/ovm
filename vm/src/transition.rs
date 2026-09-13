@@ -4,8 +4,8 @@ use core::alloc::Layout;
 
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef,
-    Lookup, Map, MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
-    lookup_in_parents,
+    Key, Lookup, Map, MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
+    classify_key, lookup_in_parents,
 };
 
 /// Serializes map-transition tree mutations across threads. VM-internal:
@@ -377,6 +377,129 @@ impl Transition {
             .set(&nogc, receiver.value(), value);
     }
 
+    /// Remove the own configurable property `name` (OrdinaryDelete
+    /// step 4, ES 10.1.10.1): `receiver` migrates to a child map that
+    /// lacks the descriptor and its slots compact. The child is shared
+    /// through the transition tree like adds and redefines, so
+    /// same-shaped deletions converge on one map.
+    ///
+    /// Slots below the descriptors' region survive untouched (they are
+    /// structural: function info and context); slots orphaned by
+    /// data→accessor redefines — no descriptor references them anymore —
+    /// are dropped.
+    ///
+    /// The caller has verified the descriptor exists and is configurable.
+    pub fn remove_property(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: Handle<Object>,
+        name: Handle<SlotName>,
+    ) {
+        let lock = heap.transition_lock();
+        let guard = lock.acquire();
+
+        let (existing, kind, prototype, surviving, values, pairs_len) = {
+            let nogc = heap.guard();
+            let obj = receiver.heap_ref(&nogc);
+            let parent = obj.map_ref(&nogc);
+            let descriptors = parent.descriptors();
+            let index = descriptors
+                .iter()
+                .position(|d| d.name() == name.into())
+                .expect("caller verified the descriptor exists");
+            // the structural region is everything below the first
+            // descriptor-owned slot (function info/context; empty for
+            // ordinary objects)
+            let base = descriptors
+                .iter()
+                .filter(|d| !d.flags().is_accessor())
+                .map(|d| d.offset())
+                .min()
+                .unwrap_or(parent.value_slot_count());
+            let existing = parent
+                .find_remove_transition_locked(&nogc, name.into(), &guard)
+                .map(|m| m.into_tagged());
+            let mut surviving: Vec<(SlotName, SlotFlags, Value)> =
+                Vec::with_capacity(descriptors.len() - 1);
+            let mut values: Vec<Value> = obj
+                .slots
+                .heap_ref(&nogc)
+                .as_slice()[..base]
+                .iter()
+                .map(|slot| slot.inner())
+                .collect();
+            for (i, d) in descriptors.iter().enumerate() {
+                if i == index {
+                    continue;
+                }
+                if d.flags().is_accessor() {
+                    // accessors embed their pair in the descriptor row
+                    surviving.push((d.name(), d.flags(), d.value.inner()));
+                } else {
+                    // data rows re-dense their offsets; the value rides
+                    // along in slot order
+                    values.push(obj.slot(&nogc, d.offset()).inner());
+                    surviving.push((
+                        d.name(),
+                        d.flags(),
+                        Smi::new(values.len() as i64 - 1).encode(),
+                    ));
+                }
+            }
+            let pairs_len = parent.transitions.heap_ref(&nogc).map_or(0, |a| a.len());
+            (
+                existing,
+                parent.kind(),
+                parent.prototype.inner(),
+                surviving,
+                values,
+                pairs_len,
+            )
+        };
+        let prototype = scope.handle(prototype);
+
+        if let Some(existing) = existing {
+            // shared child map: only this receiver's slots need compacting
+            heap.allocate_token_enter_nogc(FixedArray::layout_for(values.len()), |token, nogc| {
+                let obj = receiver.heap_ref(nogc);
+                let slots = token.allocate::<FixedArray>(&values);
+                let host = receiver.value();
+                obj.slots.set(nogc, host, slots.into_tagged());
+                obj.header.map.set(nogc, host, existing);
+            });
+            return;
+        }
+
+        let map_layout = Map::layout_for(surviving.len());
+        let pairs_layout = FixedArray::layout_for(pairs_len + 2);
+        let slots_layout = FixedArray::layout_for(values.len());
+        let total = AllocToken::total_for(&[map_layout, pairs_layout, slots_layout]);
+        heap.allocate_token_enter_nogc(total, |token, nogc| {
+            let obj = receiver.heap_ref(nogc);
+            let parent = obj.map_ref(nogc);
+            let child = token.allocate::<Map>(MapInit {
+                kind,
+                value_slot_count: values.len(),
+                descriptors: &surviving,
+                prototype,
+            });
+            let mut pairs: Vec<Value> = Vec::with_capacity(pairs_len + 2);
+            if let Some(old) = parent.transitions.heap_ref(nogc) {
+                pairs.extend(old.as_slice().iter().map(|slot| slot.inner()));
+            }
+            pairs.push(name.value());
+            pairs.push(child.erase());
+            let pairs = token.allocate::<FixedArray>(&pairs);
+            parent
+                .transitions
+                .set(nogc, parent.erase(), pairs.into_tagged());
+            let slots = token.allocate::<FixedArray>(&values);
+            let host = receiver.value();
+            obj.slots.set(nogc, host, slots.into_tagged());
+            obj.header.map.set(nogc, host, child.into_tagged());
+        });
+    }
+
     fn define(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
@@ -595,6 +718,81 @@ impl Object {
     ) -> Result<bool, VmError> {
         let (receiver, name) = root_define_inputs(scope, receiver, name);
         Self::define_own_property(heap, scope, receiver, name, desc)
+    }
+
+    /// `[[Delete]]` for ordinary and array-exotic objects (ES 10.1.10.1
+    /// OrdinaryDelete): absent properties and punched holes delete as
+    /// `true`, non-configurable ones as `false`, configurable ones are
+    /// removed. The caller has performed ToObject/ToPropertyKey.
+    pub fn delete_own_property(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: Handle<Object>,
+        key: Value,
+    ) -> Result<bool, VmError> {
+        match classify_key(&heap.guard(), key)? {
+            Key::Element(i) => {
+                // array elements live in the elements backing store,
+                // outside the descriptors: delete punches a hole
+                let is_array = heap.no_gc(|nogc| receiver.heap_ref(nogc).as_ref().is_array(nogc));
+                if is_array {
+                    heap.no_gc(|nogc| {
+                        let obj = receiver.heap_ref(nogc);
+                        // indices at/past `length` were never own properties
+                        if i < obj.as_ref().length()
+                            && let Some(elements) = obj.as_ref().elements_array(nogc)
+                            && i < elements.len()
+                        {
+                            elements.set(nogc, i, nogc.known().the_hole.value());
+                        }
+                        Ok(())
+                    })?;
+                    return Ok(true);
+                }
+                // other receivers hold numeric keys as named descriptors
+                let name = SlotName::from(Tagged::from_smi(Smi::new(i as i64)));
+                Self::delete_named_property(heap, scope, receiver, name)
+            }
+            Key::Name(name) => Self::delete_named_property(heap, scope, receiver, name),
+        }
+    }
+
+    fn delete_named_property(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: Handle<Object>,
+        name: SlotName,
+    ) -> Result<bool, VmError> {
+        // array `length` lives in a dedicated slot outside the
+        // descriptors and is non-configurable (ES 10.4.2)
+        {
+            let nogc = heap.guard();
+            if receiver
+                .heap_ref(&nogc)
+                .as_ref()
+                .array_length(&nogc, name)
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        // OrdinaryDelete: absent → true, non-configurable → false,
+        // configurable → remove
+        let configurable = heap.no_gc(|nogc| {
+            receiver
+                .heap_ref(nogc)
+                .map_ref(nogc)
+                .descriptors()
+                .iter()
+                .find(|d| d.name() == name)
+                .map(|d| d.flags().is_configurable())
+        });
+        if configurable != Some(true) {
+            return Ok(configurable.is_none());
+        }
+        let name = scope.handle(name.tagged());
+        Transition::remove_property(heap, scope, receiver, name);
+        Ok(true)
     }
 
     fn apply_define(

@@ -176,6 +176,40 @@ impl Map {
         }
         None
     }
+
+    /// Find the recorded remove-transition for `name`: a child map that
+    /// lacks the descriptor and holds exactly one fewer. Add and redefine
+    /// transitions key their pair by the target's own descriptor row for
+    /// `name`; a removal target has no such row, so the two pair
+    /// populations sharing one name never collide.
+    pub fn find_remove_transition_locked<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        name: SlotName,
+        _guard: &TransitionGuard<'_>,
+    ) -> Option<HeapRef<'a, Map>> {
+        let array = self.transitions.heap_ref(nogc)?;
+        let pairs = array.as_slice();
+        debug_assert!(
+            pairs.len() % 2 == 0,
+            "transition pairs are flat [name, map]"
+        );
+        for entry in pairs.chunks_exact(2) {
+            if entry[0].inner() != name.value() {
+                continue;
+            }
+            let target = entry[1]
+                .inner()
+                .get_as::<Map>(nogc)
+                .expect("transition target must be a map");
+            if target.descriptor_count() + 1 == self.descriptor_count()
+                && !target.descriptors().iter().any(|d| d.name() == name)
+            {
+                return Some(target);
+            }
+        }
+        None
+    }
 }
 
 pub struct MapInit<'a> {

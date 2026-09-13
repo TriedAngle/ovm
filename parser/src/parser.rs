@@ -2049,6 +2049,15 @@ impl<S: CharStream> Parser<S> {
         Ok(lhs)
     }
 
+    /// Whether the code being parsed is strict: a `"use strict"`
+    /// directive (or class-body force-strictness) has flagged the
+    /// innermost function being parsed.
+    fn in_strict_code(&self) -> bool {
+        self.fn_stack
+            .last()
+            .is_some_and(|&f| self.ast.function(f).strict)
+    }
+
     fn parse_unary(&mut self) -> Result<NodeId, ParseError> {
         let t = self.peek()?;
         match t.kind {
@@ -2062,6 +2071,36 @@ impl<S: CharStream> Parser<S> {
                 self.next()?;
                 let expr = self.parse_unary()?;
                 let span = Span::new(t.span.start, self.ast.span(expr).end);
+                // ES 13.5.1.1 early errors: strict code cannot delete an
+                // unqualified identifier or a private name. Parenthesized
+                // operands fold to the inner node, so `delete (((x)))` is
+                // caught here too.
+                if t.kind == TokenKind::Delete && self.in_strict_code() {
+                    match *self.ast.node(expr) {
+                        Node::Identifier { .. } => {
+                            return Err(ParseError::new(
+                                span,
+                                "cannot delete an unqualified identifier in strict mode",
+                            ));
+                        }
+                        Node::PrivateName { .. } => {
+                            return Err(ParseError::new(
+                                span,
+                                "cannot delete a private name in strict mode",
+                            ));
+                        }
+                        // `delete o.#x` (MemberExpression . PrivateIdentifier)
+                        Node::Property { key, computed: false, .. }
+                            if matches!(*self.ast.node(key), Node::PrivateName { .. }) =>
+                        {
+                            return Err(ParseError::new(
+                                span,
+                                "cannot delete a private name in strict mode",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
                 Ok(self.ast.add(Node::Unary { op: t.kind, expr }, span))
             }
             TokenKind::PlusPlus | TokenKind::MinusMinus => {

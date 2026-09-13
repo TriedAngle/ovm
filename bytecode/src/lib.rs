@@ -71,13 +71,26 @@ pub enum RuntimeFn {
     /// (value) -> value — RequireObjectCoercible (ES 7.2.2): TypeError on
     /// null/undefined (object destructuring sources)
     RequireObjectCoercible,
+    /// (obj, key) -> bool — `delete obj.key` in sloppy code (ES 13.5.1.2
+    /// step 4): OrdinaryDelete, false on non-configurable properties
+    DeletePropertySloppy,
+    /// (obj, key) -> bool — `delete obj.key` in strict code: OrdinaryDelete,
+    /// TypeError when the delete fails (ES 13.5.1.2 step 4.h)
+    DeletePropertyStrict,
+    /// (name) -> bool — sloppy `delete x` on an unresolved (global-object)
+    /// name: GlobalEnvironmentRecord.DeleteBinding; declared bindings are
+    /// statically known and never reach here
+    DeleteIdentifierSloppy,
+    /// (key) -> never returns — `delete super.x` (ES 13.5.1.2 step 4.c):
+    /// ReferenceError in both language modes; the key is coerced first
+    DeleteSuperProperty,
 }
 
 impl RuntimeFn {
     /// All variants in discriminant order. The array length is the
     /// variant count (type-checked), and the VM registers its table in
     /// this order so registry indices equal discriminants.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 17] = [
         Self::GetIterator,
         Self::IteratorNext,
         Self::IteratorDone,
@@ -91,6 +104,10 @@ impl RuntimeFn {
         Self::SetClassFields,
         Self::InitInstanceFields,
         Self::RequireObjectCoercible,
+        Self::DeletePropertySloppy,
+        Self::DeletePropertyStrict,
+        Self::DeleteIdentifierSloppy,
+        Self::DeleteSuperProperty,
     ];
 
     pub const COUNT: u16 = Self::ALL.len() as u16;
