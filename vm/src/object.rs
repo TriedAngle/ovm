@@ -578,7 +578,15 @@ pub fn store_array_element(
         if !obj.as_ref().is_array(nogc) {
             return Err(VmError::Type);
         }
-        Ok(i >= obj.as_ref().length())
+        // grow only when the store index is past the physical backing
+        // store (its capacity), not the logical length: sequential appends
+        // with headroom must not reallocate every time
+        let capacity = obj
+            .as_ref()
+            .elements_array(nogc)
+            .map(|e| e.len())
+            .unwrap_or(0);
+        Ok(i >= capacity)
     })?;
 
     if grows {
@@ -587,11 +595,14 @@ pub fn store_array_element(
             let elements = obj.as_ref().elements_array(nogc).ok_or(VmError::Type)?;
             // values beyond `length` are logically truncated
             let keep = obj.as_ref().length().min(elements.len());
-            let mut values = Vec::with_capacity(new_len);
+            // grow with headroom (V8-style ×1.5): sequential appends must
+            // not reallocate the backing store on every store
+            let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
+            let mut values = Vec::with_capacity(capacity);
             for k in 0..keep {
                 values.push(elements.at(k));
             }
-            values.resize(new_len, nogc.known().the_hole.value());
+            values.resize(capacity, nogc.known().the_hole.value());
             Ok::<_, VmError>(values)
         })?;
         values[i] = value;
@@ -607,6 +618,11 @@ pub fn store_array_element(
             let obj = receiver.heap_ref(nogc);
             let elements = obj.as_ref().elements_array(nogc).ok_or(VmError::Type)?;
             elements.set(nogc, i, value);
+            // a store inside the physical capacity but past the logical
+            // length still extends the array
+            if i >= obj.as_ref().length() {
+                obj.length.set(nogc, obj.erase(), Smi::new(new_len as i64));
+            }
             Ok::<_, VmError>(())
         })?;
     }
@@ -1134,6 +1150,9 @@ pub struct CallableInfoObject {
     pub handlers: OptionGcSlot<HandlerTable>,
     pub name: GcSlot,
     pub formal_parameter_count: GcSlot<Smi>,
+    /// JS-visible `length` (differs from `formal_parameter_count` when the
+    /// parameter list has defaults / patterns / a rest parameter)
+    pub formal_length: GcSlot<Smi>,
     pub kind: GcSlot<Smi>,
     /// Language mode is preserved now; strict-sensitive call/store/delete
     /// branches are intentionally deferred.
@@ -1234,6 +1253,7 @@ impl HeapObject for CallableInfoObject {
         }
         self.name.set(nogc, host, nogc.known().the_hole.value());
         self.formal_parameter_count.set(nogc, host, Smi::new(0));
+        self.formal_length.set(nogc, host, Smi::new(0));
         self.kind
             .set(nogc, host, Smi::new(FunctionKind::Normal as i64));
         self.strict.set(nogc, host, Smi::new(0));
@@ -1267,6 +1287,25 @@ impl CallableInfoObject {
         kind: FunctionKind,
         strict: bool,
     ) {
+        self.set_metadata_full(
+            nogc,
+            name,
+            formal_parameter_count,
+            formal_parameter_count,
+            kind,
+            strict,
+        )
+    }
+
+    pub fn set_metadata_full(
+        &self,
+        nogc: &NoGc<'_>,
+        name: Option<Value>,
+        formal_parameter_count: usize,
+        formal_length: usize,
+        kind: FunctionKind,
+        strict: bool,
+    ) {
         let host = self.erase();
         self.name.set(
             nogc,
@@ -1275,6 +1314,8 @@ impl CallableInfoObject {
         );
         self.formal_parameter_count
             .set(nogc, host, Smi::new(formal_parameter_count as i64));
+        self.formal_length
+            .set(nogc, host, Smi::new(formal_length as i64));
         self.kind.set(nogc, host, Smi::new(kind as i64));
         self.strict.set(nogc, host, Smi::new(i64::from(strict)));
     }
@@ -1286,6 +1327,11 @@ impl CallableInfoObject {
 
     pub fn formal_parameter_count(&self) -> usize {
         self.formal_parameter_count.to_smi().value() as usize
+    }
+
+    /// JS-visible `length`
+    pub fn formal_length(&self) -> usize {
+        self.formal_length.to_smi().value() as usize
     }
 
     pub fn function_kind(&self) -> FunctionKind {

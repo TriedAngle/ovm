@@ -28,13 +28,9 @@ impl Runtime {
         info: Handle<'_, CallableInfoObject>,
         context: Value,
     ) -> Result<Value, VmError> {
-        let (kind, source_name, formal_parameter_count) = heap.no_gc(|nogc| {
+        let (kind, source_name, formal_length) = heap.no_gc(|nogc| {
             let info = info.heap_ref(nogc);
-            (
-                info.function_kind(),
-                info.name(nogc),
-                info.formal_parameter_count(),
-            )
+            (info.function_kind(), info.name(nogc), info.formal_length())
         });
         let function_name = match source_name {
             Some(name) => scope.handle(name),
@@ -46,9 +42,23 @@ impl Runtime {
             _ => heap.known().non_constructor_function_map,
         };
         let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
-        let function = heap
-            .new_object(scope, map, &[info.value(), context.value()])
-            .into_handle(scope);
+        // class constructors carry a third hidden slot: the instance-field
+        // array ([key0, init0, ...]); undefined until SetClassFields
+        let function = if kind.is_class_constructor() {
+            heap.new_object(
+                scope,
+                map,
+                &[
+                    info.value(),
+                    context.value(),
+                    heap.known().undefined.value(),
+                ],
+            )
+            .into_handle(scope)
+        } else {
+            heap.new_object(scope, map, &[info.value(), context.value()])
+                .into_handle(scope)
+        };
 
         let length_key = heap.known().strings.length;
         let name_key = heap.known().strings.name;
@@ -58,7 +68,7 @@ impl Runtime {
             function,
             length_key,
             PropertyDescriptor::Data {
-                value: Smi::new(formal_parameter_count as i64).encode(),
+                value: Smi::new(formal_length as i64).encode(),
                 writable: false,
                 enumerable: false,
                 configurable: true,
@@ -294,7 +304,8 @@ impl Runtime {
                 Coercion::Value(p) => p,
             }
         };
-        let stringified = state.handle_scope(|scope| Convert::to_string(heap, &scope, primitive))?;
+        let stringified =
+            state.handle_scope(|scope| Convert::to_string(heap, &scope, primitive))?;
         let bytes = heap.no_gc(|nogc| {
             stringified
                 .get_as::<VMString>(nogc)

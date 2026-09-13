@@ -3,8 +3,8 @@ use bytecode::{Opcode, Operands, PropertyFlags, decode, jump_target};
 use crate::{
     AccessorPair, CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert,
     FixedArray, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
-    PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, VMString,
-    Value, call_target, classify_key, function_kind_of, home_proto, load_outcome,
+    ObjectSlotsInit, PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics,
+    Tagged, VMString, Value, call_target, classify_key, function_kind_of, home_proto, load_outcome,
     store_array_element, super_constructor, super_lookup_from_proto, super_store_lookup,
 };
 
@@ -73,6 +73,14 @@ fn start(
             // stays uninitialized until super() binds it (ES 10.2.2)
             let stack = &state.stack;
             let context = closure_context(&heap.guard(), target);
+            let formal_min = heap.no_gc(|nogc| {
+                callable
+                    .value()
+                    .as_heap_object(nogc)
+                    .and_then(|obj| obj.as_ref().callable_info(nogc))
+                    .map(|info| info.formal_parameter_count() + 1)
+                    .unwrap_or(1)
+            });
             let new_target_value = new_target
                 .map(|nt| nt.value())
                 .unwrap_or_else(|| heap.known().undefined.value());
@@ -82,6 +90,7 @@ fn start(
                 context,
                 new_target_value,
                 args,
+                formal_min,
             )?;
             state.cache.enter(stack, frame, heap);
             dispatch(vm, heap, state, base_depth)
@@ -203,6 +212,12 @@ fn call_value(
     }
     let context = closure_context(&heap.guard(), target);
     let undefined = heap.known().undefined.value();
+    let formal_min = heap.no_gc(|nogc| {
+        f.as_heap_object(nogc)
+            .and_then(|obj| obj.as_ref().callable_info(nogc))
+            .map(|info| info.formal_parameter_count() + 1)
+            .unwrap_or(1)
+    });
     let callee = stack.push_frame_with_args(
         meta,
         handler_pc,
@@ -211,6 +226,7 @@ fn call_value(
         context,
         args,
         undefined,
+        formal_min,
     )?;
     cache.load(stack, callee, heap);
     Ok(true)
@@ -930,7 +946,10 @@ fn step(
             Step::Next
         }
         Opcode::Throw | Opcode::ReThrow => Step::Throw(cache.acc()),
-        Opcode::CallNative => {
+        Opcode::CallRuntime => {
+            // operand 0 is a RuntimeFn discriminant: the fixed
+            // runtime-helper table (vm::natives::runtime_fn) registered at
+            // indices 0..RuntimeFn::COUNT
             let f = vm.native(NativeIndex(ops.idx(0)));
             let count = ops.reg_count(2);
             let mut nctx = NativeContext::new(vm, heap, state);
@@ -973,6 +992,14 @@ fn step(
                     }
                     let context = closure_context(&heap.guard(), target);
                     let undefined = heap.known().undefined.value();
+                    let formal_min = heap.no_gc(|nogc| {
+                        stack
+                            .reg(&meta, ops.reg(0))
+                            .as_heap_object(nogc)
+                            .and_then(|obj| obj.as_ref().callable_info(nogc))
+                            .map(|info| info.formal_parameter_count() + 1)
+                            .unwrap_or(1)
+                    });
                     let callee = step_try!(stack.push_frame(
                         meta,
                         pc,
@@ -982,6 +1009,7 @@ fn step(
                         ops.reg_list(1),
                         count,
                         undefined,
+                        formal_min,
                     ));
                     cache.load(stack, callee, heap);
                     Step::Next
@@ -1815,9 +1843,9 @@ fn step(
                     else {
                         return Step::PendingThrow;
                     };
-                    let text = step_try!(state.handle_scope(|scope| {
-                        Convert::to_string(heap, &scope, key)
-                    }));
+                    let text = step_try!(
+                        state.handle_scope(|scope| { Convert::to_string(heap, &scope, key) })
+                    );
                     let prefix: &[u8] = match ops.uimm(1) {
                         1 => b"get ",
                         2 => b"set ",
@@ -1832,9 +1860,8 @@ fn step(
                         );
                         full
                     });
-                    let name = state.handle_scope(|scope| {
-                        vm.interner().intern(heap, &scope, bytes).value()
-                    });
+                    let name = state
+                        .handle_scope(|scope| vm.interner().intern(heap, &scope, bytes).value());
                     (cache.acc(), name)
                 }
             };
@@ -1843,6 +1870,25 @@ fn step(
                     return Err(VmError::Type);
                 };
                 let name_key = heap.known().strings.name;
+                // Class members named `name` (methods, fields, accessors)
+                // define over the constructor after ClassDefinitionEvaluation
+                // set its name — and since our NamedEvaluation SetFunctionName
+                // runs after the whole class expression, an already-explicitly
+                // defined `name` must win (ES 15.7.14: SetFunctionName
+                // happens before element installation). The closure's own
+                // placeholder is never writable nor an accessor, so only
+                // explicit member defines match here.
+                let explicit = heap.no_gc(|nogc| {
+                    let plain = SlotName::from_value(name_key.value());
+                    match fn_obj.heap_ref(nogc).as_ref().lookup(nogc, plain) {
+                        Lookup::Data { flags, .. } => flags.is_writable(),
+                        Lookup::Accessor { .. } => true,
+                        Lookup::NotFound => false,
+                    }
+                });
+                if explicit {
+                    return Ok(true);
+                }
                 Object::define_own_property(
                     heap,
                     &scope,
@@ -1860,6 +1906,41 @@ fn step(
             if !defined {
                 return Step::Error(VmError::Type);
             }
+            Step::Next
+        }
+        Opcode::LdaHole => {
+            cache.set_acc(heap.known().the_hole.value());
+            Step::Next
+        }
+        Opcode::JumpIfNotUndefined => {
+            if cache.acc() != heap.known().undefined.value() {
+                cache.set_pc(jump_target(pc, ops.imm(0)));
+            }
+            Step::Next
+        }
+        Opcode::CreateRestParameter => {
+            // a fresh array of the frame's arguments from formal index `i`
+            let first = ops.uimm(0) as usize;
+            let argc = stack.argc(&meta); // receiver included
+            let count = argc.saturating_sub(1).saturating_sub(first);
+            let values: Vec<Value> = (0..count)
+                .map(|i| stack.reg(&meta, -((first + i + 2) as i32)))
+                .collect();
+            let arr = state.handle_scope(|scope| {
+                let elements = heap.allocate_handle::<FixedArray>(&values, &scope);
+                heap.allocate_object(
+                    &scope,
+                    ObjectSlotsInit {
+                        map: heap.known().js_array_map,
+                        values: &[],
+                        elements: elements.erase(),
+                        length: values.len(),
+                    },
+                )
+                .into_tagged()
+                .erase()
+            });
+            cache.set_acc(arr);
             Step::Next
         }
         Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),

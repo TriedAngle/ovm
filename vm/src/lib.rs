@@ -41,8 +41,8 @@ pub use heap::{
 };
 pub use interner::StringInterner;
 pub use lookup::{
-    Key, LoadOutcome, Lookup, classify_key, home_proto, load_outcome, lookup_in_parents,
-    super_constructor, super_lookup, super_lookup_from_proto,
+    Key, LoadOutcome, Lookup, classify_key, has_property, home_proto, load_outcome,
+    lookup_in_parents, private_find, super_constructor, super_lookup, super_lookup_from_proto,
 };
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use object::{
@@ -343,7 +343,7 @@ impl Clone for VM {
 impl VM {
     pub fn new<B: HeapBackend>(config: B::Config) -> Result<Self, AllocError> {
         let heap = GlobalHeap::from_backend::<B>(config)?;
-        let roots = unsafe { RootHandles::new(256, Smi::new(0).encode()) };
+        let roots = unsafe { RootHandles::new(512, Smi::new(0).encode()) };
         let interner = StringInterner::new();
         let shared = Arc::new(SharedVM {
             heap,
@@ -414,9 +414,10 @@ impl VM {
     pub fn attach(&self) -> Thread {
         let heap = self.shared.heap.new_local(&self.shared.known);
         let the_hole = heap.known().the_hole.value();
+        let undefined = heap.known().undefined.value();
         let state = Arc::new(ContextState {
             handles: HandleData::new(the_hole),
-            stack: Stack::new(STACK_SLOTS, the_hole),
+            stack: Stack::new(STACK_SLOTS, the_hole, undefined),
             cache: StackCache::new(the_hole),
             pending_exception: unsafe { Register::from_value(the_hole) },
             has_pending_exception: Cell::new(false),

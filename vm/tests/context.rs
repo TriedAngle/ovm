@@ -1,4 +1,4 @@
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::VM;
 use vm::{
     CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray,
@@ -11,7 +11,7 @@ fn empty_scope_info(thread: &mut vm::Thread) -> vm::Global<ScopeInfo> {
 
 #[test]
 fn empty_context_is_the_well_known_root() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (kind, outer, len) = thread.heap().no_gc(|nogc| {
@@ -33,7 +33,7 @@ fn empty_context_is_the_well_known_root() {
 
 #[test]
 fn contexts_chain_through_outer() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -81,7 +81,7 @@ fn contexts_chain_through_outer() {
 
 #[test]
 fn closure_object_carries_typed_context() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {

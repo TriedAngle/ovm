@@ -1,7 +1,7 @@
 use crate::token::{Span, Token, TokenKind};
 use crate::{
     Ast, Bookmark, CharStream, ClassInfo, ClassMember, DeclKind, FunctionId, FunctionInfo,
-    FunctionKind, Node, NodeId, NodeList, PropKind, Scanner, ScopeId, ScopeKind, Symbol,
+    FunctionKind, Node, NodeId, NodeList, Param, PropKind, Scanner, ScopeId, ScopeKind, Symbol,
     SymbolTable, VarKind,
 };
 
@@ -39,13 +39,20 @@ fn is_identifier_like(kind: TokenKind) -> bool {
 #[derive(Clone, Copy, Default)]
 struct FnFlags {
     declaration: bool,
+    /// class members (and other always-strict bodies): parameter name
+    /// uniqueness applies and the body is strict
+    force_strict: bool,
     kind: FunctionKind,
 }
 
 fn starts_property_key(kind: TokenKind) -> bool {
     matches!(
         kind,
-        TokenKind::Identifier | TokenKind::String | TokenKind::Number | TokenKind::LBracket
+        TokenKind::Identifier
+            | TokenKind::String
+            | TokenKind::Number
+            | TokenKind::LBracket
+            | TokenKind::PrivateName
     ) || kind.is_keyword()
 }
 
@@ -64,6 +71,22 @@ struct ClassCtx {
     entry_fn_depth: usize,
     uses_super: bool,
     is_static: bool,
+    /// private names declared by this class (hidden `.priv.#x` symbols)
+    privates: Vec<Symbol>,
+    /// `#name` references inside the body, validated at class end against
+    /// this class's and enclosing classes' privates (forward refs are legal)
+    private_uses: Vec<(Symbol, Span)>,
+}
+
+/// How a binding pattern declares its bound identifiers.
+#[derive(Clone, Copy)]
+enum PatCtx {
+    /// `var`/`let`/`const` declarator
+    VarDecl(VarKind),
+    /// catch parameter (declared in the catch scope)
+    Catch,
+    /// function parameter: names collected for `begin_fn_body`
+    CollectParams,
 }
 
 pub struct Parser<S: CharStream> {
@@ -79,6 +102,12 @@ pub struct Parser<S: CharStream> {
     /// classes currently being parsed; last = innermost
     class_stack: Vec<ClassCtx>,
     next_literal_id: u32,
+    /// bound names of the parameter list / pattern currently being parsed
+    pattern_names: Vec<(Symbol, Span)>,
+    /// unconverted CoverInitializedName nodes (`{a = 1}` outside a pattern):
+    /// a Syntax Error unless the enclosing literal is rewritten to a pattern
+    /// (validated at the end of each statement)
+    cover_init: Vec<NodeId>,
 }
 
 impl<S: CharStream> Parser<S> {
@@ -93,6 +122,8 @@ impl<S: CharStream> Parser<S> {
             fn_stack: Vec::new(),
             class_stack: Vec::new(),
             next_literal_id: 0,
+            pattern_names: Vec::new(),
+            cover_init: Vec::new(),
         }
     }
 
@@ -134,11 +165,13 @@ impl<S: CharStream> Parser<S> {
             span: Span::new(start, start),
             name: None,
             params: Vec::new(),
+            formal_length: 0,
             body: None,
             literal_id,
             is_declaration: false,
             kind: FunctionKind::Normal,
             strict: false,
+            field_key: None,
             lazy_data: None,
         });
         self.fn_stack.push(top_id);
@@ -303,6 +336,200 @@ impl<S: CharStream> Parser<S> {
         }
     }
 
+    // -- binding patterns ------------------------------------------------------
+
+    /// The hidden class-scope declaration symbol for a private name.
+    fn private_sym(&mut self, name: Symbol) -> Symbol {
+        let mut bytes = b".priv.#".to_vec();
+        bytes.extend_from_slice(self.symbols().get(name));
+        self.symbols_mut().intern(&bytes)
+    }
+
+    /// Declare one pattern-bound name (ES 14.13.1: no duplicates within a
+    /// pattern, regardless of `var` redeclaration leniency).
+    fn declare_pattern_name(
+        &mut self,
+        sym: Symbol,
+        span: Span,
+        ctx: PatCtx,
+    ) -> Result<(), ParseError> {
+        if self.pattern_names.iter().any(|&(s, _)| s == sym) {
+            return Err(ParseError::new(
+                span,
+                "duplicate name in destructuring pattern",
+            ));
+        }
+        self.pattern_names.push((sym, span));
+        match ctx {
+            PatCtx::VarDecl(VarKind::Var) => self.declare_var(sym, span, DeclKind::Var),
+            PatCtx::VarDecl(kind) => {
+                let kind = match kind {
+                    VarKind::Var => unreachable!(),
+                    VarKind::Let => DeclKind::Let,
+                    VarKind::Const => DeclKind::Const,
+                };
+                self.declare_lexical(sym, span, kind)
+            }
+            PatCtx::Catch => self.declare_lexical(sym, span, DeclKind::CatchParam),
+            PatCtx::CollectParams => Ok(()), // declared by `begin_fn_body`
+        }
+    }
+
+    /// Parse a binding pattern (or plain binding identifier). Callers reset
+    /// `pattern_names` to scope the duplicate-name check (one declarator /
+    /// one pattern / one parameter list).
+    fn parse_binding_pattern(&mut self, ctx: PatCtx) -> Result<NodeId, ParseError> {
+        self.parse_binding_pattern_inner(ctx)
+    }
+
+    fn parse_binding_pattern_inner(&mut self, ctx: PatCtx) -> Result<NodeId, ParseError> {
+        let t = self.peek()?;
+        match t.kind {
+            TokenKind::LBracket => self.parse_array_binding_pattern(ctx),
+            TokenKind::LBrace => self.parse_object_binding_pattern(ctx),
+            k if is_identifier_like(k) => {
+                let sym = self.ident_symbol(t)?;
+                self.next()?;
+                self.declare_pattern_name(sym, t.span, ctx)?;
+                Ok(self.ast.add(Node::Identifier { sym }, t.span))
+            }
+            _ => Err(ParseError::new(
+                t.span,
+                "expected identifier or destructuring pattern",
+            )),
+        }
+    }
+
+    fn parse_array_binding_pattern(&mut self, ctx: PatCtx) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::LBracket)?.span.start;
+        let mut elements = Vec::new();
+        let end;
+        loop {
+            let t = self.peek()?;
+            match t.kind {
+                TokenKind::RBracket => {
+                    end = self.next()?.span.end;
+                    break;
+                }
+                TokenKind::Comma => {
+                    let t = self.next()?;
+                    elements.push(self.ast.add(Node::Hole, t.span));
+                }
+                TokenKind::Ellipsis => {
+                    let t = self.next()?;
+                    let target = self.parse_binding_pattern_inner(ctx)?;
+                    let span = Span::new(t.span.start, self.ast.span(target).end);
+                    elements.push(self.ast.add(Node::PatternRest { target }, span));
+                    end = self.expect(TokenKind::RBracket)?.span.end;
+                    break;
+                }
+                _ => {
+                    let elem_start = t.span.start;
+                    let target = self.parse_binding_pattern_inner(ctx)?;
+                    let default = if self.eat(TokenKind::Assign)? {
+                        Some(self.parse_assignment()?)
+                    } else {
+                        None
+                    };
+                    let elem_end = default
+                        .map(|d| self.ast.span(d).end)
+                        .unwrap_or(self.ast.span(target).end);
+                    elements.push(self.ast.add(
+                        Node::PatternElement { target, default },
+                        Span::new(elem_start, elem_end),
+                    ));
+                    if self.eat(TokenKind::Comma)? {
+                        continue;
+                    }
+                    end = self.expect(TokenKind::RBracket)?.span.end;
+                    break;
+                }
+            }
+        }
+        let elements = self.ast.list(&elements);
+        Ok(self
+            .ast
+            .add(Node::ArrayPattern { elements }, Span::new(start, end)))
+    }
+
+    fn parse_object_binding_pattern(&mut self, ctx: PatCtx) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::LBrace)?.span.start;
+        let mut props = Vec::new();
+        let end = loop {
+            let t = self.peek()?;
+            if t.kind == TokenKind::RBrace {
+                break self.next()?.span.end;
+            }
+            if t.kind == TokenKind::Ellipsis {
+                let t = self.next()?;
+                let target = self.parse_binding_pattern_inner(ctx)?;
+                let span = Span::new(t.span.start, self.ast.span(target).end);
+                props.push(self.ast.add(Node::PatternRest { target }, span));
+                if self.eat(TokenKind::Comma)? {
+                    continue;
+                }
+                break self.expect(TokenKind::RBrace)?.span.end;
+            }
+            let prop_start = t.span.start;
+            let (key, shorthand, computed) = self.parse_property_key()?;
+            let key_span = self.ast.span(key);
+            let elem = if self.eat(TokenKind::Colon)? {
+                let target = self.parse_binding_pattern_inner(ctx)?;
+                let default = if self.eat(TokenKind::Assign)? {
+                    Some(self.parse_assignment()?)
+                } else {
+                    None
+                };
+                let end = default
+                    .map(|d| self.ast.span(d).end)
+                    .unwrap_or(self.ast.span(target).end);
+                self.ast.add(
+                    Node::PatternElement { target, default },
+                    Span::new(key_span.start, end),
+                )
+            } else {
+                // shorthand `{ a }` / `{ a = default }`: identifier key only
+                let Some(sym) = shorthand else {
+                    return Err(ParseError::new(
+                        key_span,
+                        "expected `:` after property name",
+                    ));
+                };
+                let target = self.ast.add(Node::Identifier { sym }, key_span);
+                self.declare_pattern_name(sym, key_span, ctx)?;
+                let default = if self.eat(TokenKind::Assign)? {
+                    Some(self.parse_assignment()?)
+                } else {
+                    None
+                };
+                let end = default
+                    .map(|d| self.ast.span(d).end)
+                    .unwrap_or(self.ast.span(target).end);
+                self.ast.add(
+                    Node::PatternElement { target, default },
+                    Span::new(key_span.start, end),
+                )
+            };
+            let end = self.ast.span(elem).end;
+            props.push(self.ast.add(
+                Node::PatternProperty {
+                    key,
+                    value: elem,
+                    computed,
+                },
+                Span::new(prop_start, end),
+            ));
+            if self.eat(TokenKind::Comma)? {
+                continue;
+            }
+            break self.expect(TokenKind::RBrace)?.span.end;
+        };
+        let props = self.ast.list(&props);
+        Ok(self
+            .ast
+            .add(Node::ObjectPattern { props }, Span::new(start, end)))
+    }
+
     // -- statements -----------------------------------------------------------
 
     /// Parse statements until `terminator` (not consumed). Detects the
@@ -340,15 +567,17 @@ impl<S: CharStream> Parser<S> {
         Ok(stmts)
     }
 
-    /// Peek for a declaration keyword; `let` only counts when a name follows
-    /// (`let = 5`, `let.x` are identifier uses in sloppy mode).
+    /// Peek for a declaration keyword; `let` only counts when a name or
+    /// pattern follows (`let = 5`, `let.x` are identifier uses in sloppy mode).
     fn peek_var_kind(&mut self) -> Result<Option<VarKind>, ParseError> {
         let kind = match self.peek()?.kind {
             TokenKind::Var => VarKind::Var,
             TokenKind::Const => VarKind::Const,
             TokenKind::Let => {
-                if !is_identifier_like(self.peek_ahead()?.kind) {
-                    return Ok(None);
+                match self.peek_ahead()?.kind {
+                    k if is_identifier_like(k) => {}
+                    TokenKind::LBracket | TokenKind::LBrace => {}
+                    _ => return Ok(None),
                 }
                 VarKind::Let
             }
@@ -367,6 +596,21 @@ impl<S: CharStream> Parser<S> {
     }
 
     fn parse_statement(&mut self) -> Result<NodeId, ParseError> {
+        // a CoverInitializedName (`{a = 1}`) that survives the statement
+        // was never consumed by a pattern rewrite: Syntax Error (ES 14.13.3)
+        let stmt = self.parse_statement_inner();
+        if let Some(&node) = self.cover_init.last() {
+            let span = self.ast.span(node);
+            self.cover_init.clear();
+            return Err(ParseError::new(
+                span,
+                "literal-property shorthand with initializer is only valid in destructuring patterns",
+            ));
+        }
+        stmt
+    }
+
+    fn parse_statement_inner(&mut self) -> Result<NodeId, ParseError> {
         let t = self.peek()?;
         // labeled statement: `label : Statement` (not before function/class)
         if is_identifier_like(t.kind)
@@ -433,13 +677,20 @@ impl<S: CharStream> Parser<S> {
         let start = self.next()?.span.start; // var / let / const
         let mut decls = Vec::new();
         loop {
-            let t = self.next()?;
-            let name = self.ident_symbol(t)?;
-            match kind {
-                VarKind::Var => self.declare_var(name, t.span, DeclKind::Var)?,
-                VarKind::Let => self.declare_lexical(name, t.span, DeclKind::Let)?,
-                VarKind::Const => self.declare_lexical(name, t.span, DeclKind::Const)?,
-            }
+            let t = self.peek()?;
+            let target = if matches!(t.kind, TokenKind::LBracket | TokenKind::LBrace) {
+                self.pattern_names.clear();
+                self.parse_binding_pattern(PatCtx::VarDecl(kind))?
+            } else {
+                let t = self.next()?;
+                let name = self.ident_symbol(t)?;
+                match kind {
+                    VarKind::Var => self.declare_var(name, t.span, DeclKind::Var)?,
+                    VarKind::Let => self.declare_lexical(name, t.span, DeclKind::Let)?,
+                    VarKind::Const => self.declare_lexical(name, t.span, DeclKind::Const)?,
+                }
+                self.ast.add(Node::Identifier { sym: name }, t.span)
+            };
             let init = if self.eat(TokenKind::Assign)? {
                 Some(self.parse_assignment()?)
             } else {
@@ -451,9 +702,11 @@ impl<S: CharStream> Parser<S> {
                     "missing initializer in const declaration",
                 ));
             }
-            let end = init.map(|i| self.ast.span(i).end).unwrap_or(t.span.end);
+            let end = init
+                .map(|i| self.ast.span(i).end)
+                .unwrap_or(self.ast.span(target).end);
             decls.push(self.ast.add(
-                Node::VarDeclarator { name, init },
+                Node::VarDeclarator { target, init },
                 Span::new(t.span.start, end),
             ));
             if !self.eat(TokenKind::Comma)? {
@@ -694,11 +947,19 @@ impl<S: CharStream> Parser<S> {
             // `catch (e) { let e; }` is an early error, `var e` is not
             catch_scope = Some(self.push_scope(ScopeKind::Catch));
             if self.eat(TokenKind::LParen)? {
-                let t = self.next()?;
-                let sym = self.ident_symbol(t)?;
+                let t = self.peek()?;
+                catch_param = Some(
+                    if matches!(t.kind, TokenKind::LBracket | TokenKind::LBrace) {
+                        self.pattern_names.clear();
+                        self.parse_binding_pattern(PatCtx::Catch)?
+                    } else {
+                        let t = self.next()?;
+                        let sym = self.ident_symbol(t)?;
+                        self.declare_lexical(sym, t.span, DeclKind::CatchParam)?;
+                        self.ast.add(Node::Identifier { sym }, t.span)
+                    },
+                );
                 self.expect(TokenKind::RParen)?;
-                self.declare_lexical(sym, t.span, DeclKind::CatchParam)?;
-                catch_param = Some(sym);
             }
             catch_block = Some(self.parse_statement_block()?);
             self.scopes.pop();
@@ -760,6 +1021,7 @@ impl<S: CharStream> Parser<S> {
                 } else {
                     FunctionKind::Normal
                 },
+                ..Default::default()
             },
         )
     }
@@ -771,23 +1033,62 @@ impl<S: CharStream> Parser<S> {
         name: Option<Symbol>,
         flags: FnFlags,
     ) -> Result<FunctionId, ParseError> {
-        let params = self.parse_params()?;
+        // duplicate parameter names are an early error in strict code and
+        // in non-simple lists (ES 15.1.2)
+        let strict = self
+            .fn_stack
+            .last()
+            .is_some_and(|&f| self.ast.function(f).strict)
+            || flags.force_strict;
+        let params = self.parse_params(strict)?;
         let fid = self.add_function_info(start, name, params, flags);
         let saved_loop_depth = self.begin_fn_body(fid);
-        let body = self.parse_statement_block();
-        let body = body?;
-        self.end_fn_body(fid, start, body, saved_loop_depth);
+        let body = self.parse_statement_block()?;
+        self.end_fn_body(fid, start, body, saved_loop_depth)?;
         Ok(fid)
     }
 
-    fn parse_params(&mut self) -> Result<Vec<Symbol>, ParseError> {
+    /// Formal parameter list (ES 15.1): plain identifiers, binding
+    /// patterns, default initializers, and one trailing rest parameter.
+    fn parse_params(&mut self, strict_unique: bool) -> Result<Vec<Param>, ParseError> {
         self.expect(TokenKind::LParen)?;
+        self.pattern_names.clear();
         let mut params = Vec::new();
+        let mut non_simple = false;
         if self.peek()?.kind != TokenKind::RParen {
             loop {
-                let t = self.next()?;
-                let sym = self.ident_symbol(t)?;
-                params.push(sym);
+                if self.peek()?.kind == TokenKind::Ellipsis {
+                    let t = self.next()?;
+                    let target = self.parse_binding_target()?;
+                    if self.peek()?.kind != TokenKind::RParen {
+                        return Err(ParseError::new(
+                            t.span,
+                            "rest parameter must be the last formal parameter",
+                        ));
+                    }
+                    params.push(Param {
+                        target,
+                        default: None,
+                        rest: true,
+                    });
+                    non_simple = true;
+                    break;
+                }
+                let target = self.parse_binding_target()?;
+                let default = if self.eat(TokenKind::Assign)? {
+                    non_simple = true;
+                    Some(self.parse_assignment()?)
+                } else {
+                    None
+                };
+                if !matches!(*self.ast.node(target), Node::Identifier { .. }) {
+                    non_simple = true;
+                }
+                params.push(Param {
+                    target,
+                    default,
+                    rest: false,
+                });
                 if !self.eat(TokenKind::Comma)? {
                     break;
                 }
@@ -797,14 +1098,51 @@ impl<S: CharStream> Parser<S> {
             }
         }
         self.expect(TokenKind::RParen)?;
+        if strict_unique || non_simple {
+            // every name in a non-simple list (or any strict parameter
+            // list) must be unique (ES 15.1.2); sloppy simple lists keep
+            // legacy duplicates (re-checked in `end_fn_body` if the body
+            // turns out strict)
+            for (i, &(name, span)) in self.pattern_names.iter().enumerate() {
+                if self.pattern_names[..i].iter().any(|&(n, _)| n == name) {
+                    return Err(ParseError::new(
+                        span,
+                        "duplicate parameter name not allowed in this context",
+                    ));
+                }
+            }
+        }
         Ok(params)
+    }
+
+    /// A formal-parameter binding target without an initializer: an
+    /// identifier (collected for the function scope) or a nested pattern.
+    /// Duplicate plain identifiers are tolerated here (sloppy simple lists
+    /// allow them); `parse_params` rejects them where the spec requires.
+    fn parse_binding_target(&mut self) -> Result<NodeId, ParseError> {
+        let t = self.peek()?;
+        match t.kind {
+            TokenKind::LBracket | TokenKind::LBrace => {
+                self.parse_binding_pattern(PatCtx::CollectParams)
+            }
+            k if is_identifier_like(k) => {
+                let sym = self.ident_symbol(t)?;
+                self.next()?;
+                self.pattern_names.push((sym, t.span));
+                Ok(self.ast.add(Node::Identifier { sym }, t.span))
+            }
+            _ => Err(ParseError::new(
+                t.span,
+                "expected identifier or destructuring pattern",
+            )),
+        }
     }
 
     fn add_function_info(
         &mut self,
         start: u32,
         name: Option<Symbol>,
-        params: Vec<Symbol>,
+        params: Vec<Param>,
         flags: FnFlags,
     ) -> FunctionId {
         let strict = self
@@ -815,53 +1153,115 @@ impl<S: CharStream> Parser<S> {
         // per-iteration-environment desugar
         let enclosing = self.fn_scope_id();
         self.ast.scope_mut(enclosing).contains_function_or_eval = true;
+        // f.length: parameters before the first default / rest / pattern
+        let formal_length = params
+            .iter()
+            .position(|p| p.is_non_simple(&self.ast))
+            .unwrap_or(params.len()) as u32;
         let literal_id = self.alloc_literal_id();
         self.ast.add_function(FunctionInfo {
             span: Span::new(start, start),
             name,
             params,
+            formal_length,
             body: None,
             literal_id,
             is_declaration: flags.declaration,
             kind: flags.kind,
             strict,
+            field_key: None,
             lazy_data: None,
         })
     }
 
-    /// Push the function scope and declare its params. Returns the outer
-    /// loop depth for `end_fn_body`.
+    /// Push the function scope and declare its parameters. Plain params
+    /// become register-backed `Param` decls (with their positional index);
+    /// pattern-bound names become `PatternParam` decls (prologue-initialized).
+    /// Returns the outer loop depth for `end_fn_body`.
     fn begin_fn_body(&mut self, fid: FunctionId) -> u32 {
         self.fn_stack.push(fid);
         let scope_id = self.push_scope(ScopeKind::Function);
         self.ast.scope_mut(scope_id).function = Some(fid);
-        // params live in the function scope; sloppy mode allows duplicates
+        // params live in the function scope; sloppy simple lists allow
+        // duplicates (each declared, sharing a register)
         let scope = self.scopes.last_mut().unwrap();
-        let params: Vec<Symbol> = self.ast.function(fid).params.clone();
+        let params: Vec<Param> = self.ast.function(fid).params.clone();
         for &p in &params {
-            if !scope.var_declared.contains(&p) {
-                scope.var_declared.push(p);
+            let sym = match *self.ast.node(p.target) {
+                Node::Identifier { sym } => Some(sym),
+                _ => None,
+            };
+            if let Some(sym) = sym {
+                if !scope.var_declared.contains(&sym) {
+                    scope.var_declared.push(sym);
+                }
             }
         }
         let span = self.ast.function(fid).span;
-        for p in params {
-            self.ast.declare(scope_id, p, DeclKind::Param, span);
+        for (i, p) in params.iter().enumerate() {
+            match *self.ast.node(p.target) {
+                Node::Identifier { sym } => {
+                    self.ast
+                        .declare_param(scope_id, sym, DeclKind::Param, span, i as u32);
+                }
+                _ => {
+                    let mut names = Vec::new();
+                    collect_pattern_names(&self.ast, p.target, &mut names);
+                    for (sym, span) in names {
+                        // pattern names are var-like in the function scope
+                        // (body `var x` redeclares them, `let x` is an error)
+                        let scope = self.scopes.last_mut().unwrap();
+                        if !scope.var_declared.contains(&sym) {
+                            scope.var_declared.push(sym);
+                        }
+                        self.ast
+                            .declare(scope_id, sym, DeclKind::PatternParam, span);
+                    }
+                }
+            }
         }
         std::mem::replace(&mut self.loop_depth, 0)
     }
 
-    fn end_fn_body(&mut self, fid: FunctionId, start: u32, body: NodeId, saved_loop_depth: u32) {
+    fn end_fn_body(
+        &mut self,
+        fid: FunctionId,
+        start: u32,
+        body: NodeId,
+        saved_loop_depth: u32,
+    ) -> Result<(), ParseError> {
         self.loop_depth = saved_loop_depth;
         self.scopes.pop();
         self.fn_stack.pop();
         let end = self.ast.span(body).end;
-        let info = self.ast.function_mut(fid);
-        info.span = Span::new(start, end);
-        info.body = Some(body);
+        let (strict, params) = {
+            let info = self.ast.function_mut(fid);
+            info.span = Span::new(start, end);
+            info.body = Some(body);
+            (info.strict, info.params.clone())
+        };
+        // duplicate parameter names + a strict body directive is an early
+        // error (ES 15.1.2, applied retroactively: the directive is only
+        // discovered while parsing the body)
+        if strict {
+            let mut names: Vec<(Symbol, Span)> = Vec::new();
+            for p in &params {
+                collect_pattern_names(&self.ast, p.target, &mut names);
+            }
+            for (i, &(name, span)) in names.iter().enumerate() {
+                if names[..i].iter().any(|&(n, _)| n == name) {
+                    return Err(ParseError::new(
+                        span,
+                        "duplicate parameter name not allowed in strict mode",
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// `=> body` after the params: expression bodies get an implicit return.
-    fn parse_arrow_rest(&mut self, start: u32, params: Vec<Symbol>) -> Result<NodeId, ParseError> {
+    fn parse_arrow_rest(&mut self, start: u32, params: Vec<Param>) -> Result<NodeId, ParseError> {
         let arrow = self.expect(TokenKind::Arrow)?;
         // restricted production: no line terminator before `=>`
         if arrow.after_newline {
@@ -870,6 +1270,9 @@ impl<S: CharStream> Parser<S> {
                 "no line terminator allowed before `=>`",
             ));
         }
+        // arrow parameters are always unique (non-simple rules apply to
+        // every arrow, ES 15.1.2); the params were already checked in
+        // `parse_assignment` via `parse_params(true)`
         let fid = self.add_function_info(
             start,
             None,
@@ -893,52 +1296,59 @@ impl<S: CharStream> Parser<S> {
             self.ast.set_node_scope(block, scope);
             block
         };
-        self.end_fn_body(fid, start, body, saved_loop_depth);
+        self.end_fn_body(fid, start, body, saved_loop_depth)?;
         let span = self.ast.function(fid).span;
         Ok(self.ast.add(Node::FunctionExpr { function: fid }, span))
     }
 
-    /// On `(`, try to parse an identifier-only parameter list followed by
-    /// `=>`. Rest/destructuring params are not supported yet. Consumes
-    /// nothing on None (the caller restores the bookmark).
-    fn try_parse_arrow_params(&mut self) -> Result<Option<(u32, Vec<Symbol>)>, ParseError> {
-        let start = self.peek()?.span.start;
-        self.next()?; // (
-        let mut params = Vec::new();
-        if self.peek()?.kind != TokenKind::RParen {
-            loop {
-                let t = self.peek()?;
-                if !is_identifier_like(t.kind) {
-                    return Ok(None);
-                }
-                let sym = self.ident_symbol(t)?;
-                self.next()?;
-                params.push(sym);
-                if !self.eat(TokenKind::Comma)? {
-                    break;
-                }
-                if self.peek()?.kind == TokenKind::RParen {
-                    break; // trailing comma
+    /// On `(`, token-scan ahead to the matching `)` and check for `=>`:
+    /// a cheap speculative test for a parenthesized arrow parameter list
+    /// (patterns/defaults/rest included). Consumes nothing.
+    fn arrow_params_ahead(&mut self) -> Result<bool, ParseError> {
+        let bm = self.bookmark();
+        let is_arrow = (|| {
+            self.next()?; // (
+            let mut depth = 1usize;
+            while depth > 0 {
+                let t = self.next()?;
+                match t.kind {
+                    TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                    TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => depth -= 1,
+                    TokenKind::Eof => return Ok(false),
+                    _ => {}
                 }
             }
-        }
-        if self.peek()?.kind != TokenKind::RParen {
-            return Ok(None);
-        }
-        self.next()?;
-        if self.peek()?.kind != TokenKind::Arrow {
-            return Ok(None);
-        }
-        Ok(Some((start, params)))
+            Ok(self.peek()?.kind == TokenKind::Arrow)
+        })();
+        self.restore(bm);
+        is_arrow
     }
 
     // -- classes --------------------------------------------------------------
 
-    /// Class declarations and expressions (ES 15.7). Deferred: fields,
-    /// private names, static blocks (all get a clean error).
+    /// Record a `#name` reference for end-of-class validation (forward
+    /// references within the class body are legal, so checks are deferred).
+    fn note_private_use(&mut self, hidden: Symbol, span: Span) -> Result<(), ParseError> {
+        if self.class_stack.is_empty() {
+            return Err(ParseError::new(
+                span,
+                "private names are only valid inside a class",
+            ));
+        }
+        self.class_stack
+            .last_mut()
+            .unwrap()
+            .private_uses
+            .push((hidden, span));
+        Ok(())
+    }
+
+    /// Class declarations and expressions (ES 15.7): methods, accessors,
+    /// public/private instance and static fields.
     ///
     /// Returns the ClassDecl/ClassExpr node; the class inner scope (name
-    /// binding + super home objects) is attached as the node's scope.
+    /// binding, super home objects, private names) is attached as the
+    /// node's scope.
     fn parse_class(&mut self, is_declaration: bool) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::Class)?.span.start;
         let t = self.peek()?;
@@ -975,6 +1385,8 @@ impl<S: CharStream> Parser<S> {
             entry_fn_depth: self.fn_stack.len(),
             uses_super: false,
             is_static: false,
+            privates: Vec::new(),
+            private_uses: Vec::new(),
         });
         let end = loop {
             let t = self.peek()?;
@@ -1008,10 +1420,12 @@ impl<S: CharStream> Parser<S> {
             let accessor = self.eat_accessor_prefix()?;
             let (key, key_sym, computed) = self.parse_property_key()?;
             let key_span = self.ast.span(key);
+            let is_private = matches!(*self.ast.node(key), Node::PrivateName { .. });
 
             // early errors (ES 15.7.1)
             let is_constructor_name = !computed
                 && !is_static
+                && !is_private
                 && key_sym.is_some_and(|s| self.symbols().get(s) == b"constructor");
             if is_constructor_name && accessor.is_some() {
                 return Err(ParseError::new(
@@ -1029,6 +1443,7 @@ impl<S: CharStream> Parser<S> {
             // member named "constructor" is an ordinary method
             if is_static
                 && !computed
+                && !is_private
                 && key_sym.is_some_and(|s| self.symbols().get(s) == b"prototype")
             {
                 return Err(ParseError::new(
@@ -1037,51 +1452,118 @@ impl<S: CharStream> Parser<S> {
                 ));
             }
 
-            if self.peek()?.kind != TokenKind::LParen {
-                return Err(ParseError::new(
-                    self.peek()?.span,
-                    "class fields are not supported yet",
-                ));
-            }
-            let kind = match accessor {
-                Some(true) => PropKind::Get,
-                Some(false) => PropKind::Set,
-                None => PropKind::Method,
-            };
-            let function_kind = if is_constructor_name {
-                if superclass.is_some() {
-                    FunctionKind::DerivedClassConstructor
-                } else {
-                    FunctionKind::BaseClassConstructor
+            if self.peek()?.kind == TokenKind::LParen {
+                // method or accessor
+                if is_private {
+                    return Err(ParseError::new(
+                        key_span,
+                        "private methods and accessors are not supported yet",
+                    ));
                 }
+                let kind = match accessor {
+                    Some(true) => PropKind::Get,
+                    Some(false) => PropKind::Set,
+                    None => PropKind::Method,
+                };
+                let function_kind = if is_constructor_name {
+                    if superclass.is_some() {
+                        FunctionKind::DerivedClassConstructor
+                    } else {
+                        FunctionKind::BaseClassConstructor
+                    }
+                } else {
+                    function_kind_for_property(kind)
+                };
+                // class members are always strict; accessors carry the
+                // "get x"/"set x" name (computed keys get theirs at runtime)
+                let fn_name = match kind {
+                    PropKind::Get => self.accessor_name(key_sym, true),
+                    PropKind::Set => self.accessor_name(key_sym, false),
+                    _ => key_sym,
+                };
+                let (value, _) = self.parse_method_value(
+                    member_start,
+                    fn_name,
+                    kind,
+                    function_kind,
+                    true,
+                    key_span,
+                )?;
+                members.push(ClassMember {
+                    key,
+                    value,
+                    kind,
+                    is_static,
+                    is_constructor: is_constructor_name,
+                    computed,
+                    is_private,
+                });
             } else {
-                function_kind_for_property(kind)
-            };
-            // class members are always strict; accessors carry the
-            // "get x"/"set x" name (computed keys get theirs at runtime)
-            let fn_name = match kind {
-                PropKind::Get => self.accessor_name(key_sym, true),
-                PropKind::Set => self.accessor_name(key_sym, false),
-                _ => key_sym,
-            };
-            let (value, _) = self.parse_method_value(
-                member_start,
-                fn_name,
-                kind,
-                function_kind,
-                true,
-                key_span,
-            )?;
-            members.push(ClassMember {
-                key,
-                value,
-                kind,
-                is_static,
-                is_constructor: is_constructor_name,
-                computed,
-            });
+                // field definition (ES 15.7.19): public or private,
+                // instance or static
+                if accessor.is_some() {
+                    return Err(ParseError::new(key_span, "class fields can't be accessors"));
+                }
+                if is_constructor_name {
+                    return Err(ParseError::new(
+                        key_span,
+                        "class may not have a field named 'constructor'",
+                    ));
+                }
+                if is_static
+                    && !computed
+                    && !is_private
+                    && key_sym.is_some_and(|s| self.symbols().get(s) == b"prototype")
+                {
+                    return Err(ParseError::new(
+                        key_span,
+                        "class may not have a static field named 'prototype'",
+                    ));
+                }
+                if is_private && computed {
+                    return Err(ParseError::new(key_span, "private names can't be computed"));
+                }
+                if is_private {
+                    // declare the private name in this class's environment:
+                    // a hidden class-scope slot holding a fresh Symbol per
+                    // class evaluation
+                    let Node::PrivateName { sym: hidden } = *self.ast.node(key) else {
+                        unreachable!("private key node");
+                    };
+                    let ctx = self.class_stack.last_mut().unwrap();
+                    if ctx.privates.contains(&hidden) {
+                        return Err(ParseError::new(key_span, "duplicate private name in class"));
+                    }
+                    ctx.privates.push(hidden);
+                    self.declare_class_slot(class_scope, hidden, key_span);
+                }
+                let value = self.parse_field_initializer(member_start, key)?;
+                members.push(ClassMember {
+                    key,
+                    value,
+                    kind: PropKind::Field,
+                    is_static,
+                    is_constructor: false,
+                    computed,
+                    is_private,
+                });
+                self.expect_semicolon()?;
+            }
         };
         let ctx = self.class_stack.pop().unwrap();
+
+        // `#name` references must resolve to a private name of this class
+        // or an enclosing one (ES 15.7.2)
+        for (hidden, span) in &ctx.private_uses {
+            let declared = ctx.privates.contains(hidden)
+                || self.class_stack.iter().any(|c| c.privates.contains(hidden));
+            if !declared {
+                return Err(ParseError::new(
+                    *span,
+                    "private name must be declared in an enclosing class",
+                ));
+            }
+        }
 
         // default constructor for classes without an explicit one:
         // base → empty body, derived → forward all arguments to super()
@@ -1119,6 +1601,7 @@ impl<S: CharStream> Parser<S> {
             uses_super: ctx.uses_super,
             home,
             static_home,
+            privates: ctx.privates,
         });
         let node = self.ast.add(
             if is_declaration {
@@ -1130,6 +1613,68 @@ impl<S: CharStream> Parser<S> {
         );
         self.ast.set_node_scope(node, class_scope);
         Ok(node)
+    }
+
+    /// The synthesized field-initializer function (ES 15.7.19): a strict
+    /// class-member function `return <init>;` — `= init` is parsed inside
+    /// so `this`/`super.x` attribute to this class. Returns the
+    /// FunctionExpr node.
+    fn parse_field_initializer(&mut self, start: u32, key: NodeId) -> Result<NodeId, ParseError> {
+        let name = match *self.ast.node(key) {
+            Node::StringLiteral(sym) => Some(sym),
+            _ => None,
+        };
+        let fid = self.add_function_info(
+            start,
+            name,
+            Vec::new(),
+            FnFlags {
+                force_strict: true,
+                kind: FunctionKind::Method,
+                ..Default::default()
+            },
+        );
+        // NamedEvaluation: an anonymous function value returned by the
+        // initializer is named after the field key (ES 15.7.19)
+        let key_for_naming = match *self.ast.node(key) {
+            Node::StringLiteral(_) => Some(key),
+            // private fields name their values "#name" (ES 6.2.12)
+            Node::PrivateName { sym } => {
+                let hidden = self.symbols().get(sym).to_vec();
+                let raw = hidden
+                    .strip_prefix(b".priv.#".as_slice())
+                    .unwrap_or(&hidden[6.min(hidden.len())..]);
+                let mut bytes = b"#".to_vec();
+                bytes.extend_from_slice(raw);
+                let text = self.symbols_mut().intern(&bytes);
+                let span = self.ast.span(key);
+                Some(self.ast.add(Node::StringLiteral(text), span))
+            }
+            _ => None,
+        };
+        if let Some(key) = key_for_naming {
+            self.ast.function_mut(fid).field_key = Some(key);
+        }
+        let saved_loop_depth = self.begin_fn_body(fid);
+        let body = (|| {
+            let init = if self.eat(TokenKind::Assign)? {
+                Some(self.parse_assignment()?)
+            } else {
+                None
+            };
+            let end = init.map(|i| self.ast.span(i).end).unwrap_or(start);
+            let ret = self
+                .ast
+                .add(Node::Return { value: init }, Span::new(start, end));
+            let block = self.add_block(vec![ret], Span::new(start, end));
+            let scope = self.scopes.last().expect("initializer fn scope").id;
+            self.ast.set_node_scope(block, scope);
+            Ok(block)
+        })();
+        let body = body?;
+        self.end_fn_body(fid, start, body, saved_loop_depth)?;
+        let span = self.ast.function(fid).span;
+        Ok(self.ast.add(Node::FunctionExpr { function: fid }, span))
     }
 
     fn declare_class_slot(&mut self, scope: ScopeId, sym: Symbol, span: Span) {
@@ -1161,6 +1706,7 @@ impl<S: CharStream> Parser<S> {
             FnFlags {
                 declaration: false,
                 kind,
+                ..Default::default()
             },
         );
         let scope_id = self.push_scope(ScopeKind::Function);
@@ -1204,6 +1750,12 @@ impl<S: CharStream> Parser<S> {
             TokenKind::Period => {
                 self.next()?;
                 let name = self.next()?;
+                if name.kind == TokenKind::PrivateName {
+                    return Err(ParseError::new(
+                        name.span,
+                        "private fields may not be accessed on 'super'",
+                    ));
+                }
                 let sym = match name.kind {
                     TokenKind::Identifier => Symbol(name.value.symbol().unwrap()),
                     k if k.is_keyword() => self.symbols_mut().intern(k.text().as_bytes()),
@@ -1282,19 +1834,46 @@ impl<S: CharStream> Parser<S> {
         if is_identifier_like(t.kind) && self.peek_ahead()?.kind == TokenKind::Arrow {
             let sym = self.ident_symbol(t)?;
             self.next()?;
-            return self.parse_arrow_rest(t.span.start, vec![sym]);
+            let target = self.ast.add(Node::Identifier { sym }, t.span);
+            return self.parse_arrow_rest(
+                t.span.start,
+                vec![Param {
+                    target,
+                    default: None,
+                    rest: false,
+                }],
+            );
         }
-        if t.kind == TokenKind::LParen {
-            let bm = self.bookmark();
-            if let Some((start, params)) = self.try_parse_arrow_params()? {
-                return self.parse_arrow_rest(start, params);
-            }
-            self.restore(bm);
+        if t.kind == TokenKind::LParen && self.arrow_params_ahead()? {
+            let start = t.span.start;
+            let params = self.parse_params(true)?;
+            return self.parse_arrow_rest(start, params);
         }
         let lhs = self.parse_conditional()?;
         let t = self.peek()?;
         if !t.kind.is_assignment() {
             return Ok(lhs);
+        }
+        if t.kind == TokenKind::Assign
+            && matches!(
+                *self.ast.node(lhs),
+                Node::ArrayLiteral { .. } | Node::ObjectLiteral { .. }
+            )
+        {
+            // cover grammar: `[a, b] = v` / `({a} = v)` reinterpret the
+            // literal as an assignment pattern (ES 14.13.3)
+            let target = self.rewrite_assignment_pattern(lhs)?;
+            self.next()?;
+            let value = self.parse_assignment()?; // right-associative
+            let span = Span::new(self.ast.span(target).start, self.ast.span(value).end);
+            return Ok(self.ast.add(
+                Node::Assign {
+                    op: TokenKind::Assign,
+                    target,
+                    value,
+                },
+                span,
+            ));
         }
         self.check_assign_target(lhs)?;
         let op = t.kind;
@@ -1309,6 +1888,130 @@ impl<S: CharStream> Parser<S> {
             },
             span,
         ))
+    }
+
+    /// Reinterpret an array/object literal in place as a destructuring
+    /// assignment pattern (node id preserved). `[a = 1]` covers the default
+    /// as an Assign node, `{a = 1}` as a CoverInitializedName.
+    fn rewrite_assignment_pattern(&mut self, node: NodeId) -> Result<NodeId, ParseError> {
+        let span = self.ast.span(node);
+        match *self.ast.node(node) {
+            Node::ArrayLiteral { elements } => {
+                let items = self.ast.list_items(elements).to_vec();
+                let mut out = Vec::with_capacity(items.len());
+                for &el in &items {
+                    let el_span = self.ast.span(el);
+                    match *self.ast.node(el) {
+                        Node::Hole => out.push(el),
+                        Node::Assign {
+                            op: TokenKind::Assign,
+                            target,
+                            value,
+                        } => {
+                            let target = self.convert_assignment_target(target)?;
+                            out.push(self.ast.add(
+                                Node::PatternElement {
+                                    target,
+                                    default: Some(value),
+                                },
+                                el_span,
+                            ));
+                        }
+                        Node::Spread { expr } => {
+                            let target = self.convert_assignment_target(expr)?;
+                            out.push(self.ast.add(Node::PatternRest { target }, el_span));
+                        }
+                        _ => {
+                            let target = self.convert_assignment_target(el)?;
+                            out.push(self.ast.add(
+                                Node::PatternElement {
+                                    target,
+                                    default: None,
+                                },
+                                el_span,
+                            ));
+                        }
+                    }
+                }
+                let elements = self.ast.list(&out);
+                self.ast
+                    .replace(node, Node::ArrayPattern { elements }, span);
+                Ok(node)
+            }
+            Node::ObjectLiteral { props } => {
+                let items = self.ast.list_items(props).to_vec();
+                let mut out = Vec::with_capacity(items.len());
+                for &prop in &items {
+                    let prop_span = self.ast.span(prop);
+                    match *self.ast.node(prop) {
+                        Node::Spread { expr } => {
+                            let target = self.convert_assignment_target(expr)?;
+                            out.push(self.ast.add(Node::PatternRest { target }, prop_span));
+                        }
+                        Node::ObjectProperty {
+                            key,
+                            value,
+                            kind: PropKind::Init,
+                            computed,
+                        } => {
+                            let v_span = self.ast.span(value);
+                            let (target, default) = match *self.ast.node(value) {
+                                // CoverInitializedName `{a = 1}`
+                                Node::Assign {
+                                    op: TokenKind::Assign,
+                                    target,
+                                    value,
+                                } => (self.convert_assignment_target(target)?, Some(value)),
+                                _ => (self.convert_assignment_target(value)?, None),
+                            };
+                            let elem = self
+                                .ast
+                                .add(Node::PatternElement { target, default }, v_span);
+                            out.push(self.ast.add(
+                                Node::PatternProperty {
+                                    key,
+                                    value: elem,
+                                    computed,
+                                },
+                                prop_span,
+                            ));
+                            // a consumed CoverInitializedName is no longer
+                            // pending (its value node was the Assign)
+                            self.cover_init.retain(|&id| id != value);
+                        }
+                        _ => {
+                            return Err(ParseError::new(
+                                prop_span,
+                                "invalid destructuring assignment target",
+                            ));
+                        }
+                    }
+                }
+                let props = self.ast.list(&out);
+                self.ast.replace(node, Node::ObjectPattern { props }, span);
+                Ok(node)
+            }
+            _ => Err(ParseError::new(
+                span,
+                "invalid destructuring assignment target",
+            )),
+        }
+    }
+
+    /// Validate/convert one assignment-pattern target: identifiers, member
+    /// expressions, and nested literal-covered patterns.
+    fn convert_assignment_target(&mut self, node: NodeId) -> Result<NodeId, ParseError> {
+        let span = self.ast.span(node);
+        match *self.ast.node(node) {
+            Node::Identifier { .. } | Node::Property { .. } => Ok(node),
+            Node::ArrayLiteral { .. } | Node::ObjectLiteral { .. } => {
+                self.rewrite_assignment_pattern(node)
+            }
+            _ => Err(ParseError::new(
+                span,
+                "invalid destructuring assignment target",
+            )),
+        }
     }
 
     fn parse_conditional(&mut self) -> Result<NodeId, ParseError> {
@@ -1424,7 +2127,10 @@ impl<S: CharStream> Parser<S> {
                     .symbol()
                     .is_some_and(|sym| self.symbols().get(Symbol(sym)) == b"target");
             if !is_target {
-                return Err(ParseError::new(dot.span, "expected property name after `new.`"));
+                return Err(ParseError::new(
+                    dot.span,
+                    "expected property name after `new.`",
+                ));
             }
             self.next()?;
             return Ok(self.ast.add(Node::NewTarget, Span::new(start, t.span.end)));
@@ -1468,6 +2174,24 @@ impl<S: CharStream> Parser<S> {
                         TokenKind::Identifier => Symbol(name.value.symbol().unwrap()),
                         // any keyword may be a property name: `a.class`
                         k if k.is_keyword() => self.symbols_mut().intern(k.text().as_bytes()),
+                        // `obj.#x`: a private name reference, resolved
+                        // against the enclosing class's private environment
+                        TokenKind::PrivateName => {
+                            let name_sym = Symbol(name.value.symbol().unwrap());
+                            let hidden = self.private_sym(name_sym);
+                            self.note_private_use(hidden, name.span)?;
+                            let node = self.ast.add(Node::PrivateName { sym: hidden }, name.span);
+                            let span = Span::new(self.ast.span(expr).start, name.span.end);
+                            expr = self.ast.add(
+                                Node::Property {
+                                    object: expr,
+                                    key: node,
+                                    computed: false,
+                                },
+                                span,
+                            );
+                            continue;
+                        }
                         _ => return Err(ParseError::new(name.span, "expected property name")),
                     };
                     let key = self.ast.add(Node::StringLiteral(sym), name.span);
@@ -1604,6 +2328,15 @@ impl<S: CharStream> Parser<S> {
             }
             TokenKind::Class => self.parse_class(false),
             TokenKind::Super => self.parse_super(t.span),
+            // `#x` alone is only meaningful as the left operand of `in`
+            // (ES 13.3.9); the codegen rejects it anywhere else
+            TokenKind::PrivateName => {
+                let name_sym = Symbol(t.value.symbol().unwrap());
+                let hidden = self.private_sym(name_sym);
+                self.note_private_use(hidden, t.span)?;
+                self.next()?;
+                Ok(self.ast.add(Node::PrivateName { sym: hidden }, t.span))
+            }
             _ => Err(ParseError::new(
                 t.span,
                 format!("unexpected token `{}`", kind_text(t)),
@@ -1663,6 +2396,8 @@ impl<S: CharStream> Parser<S> {
             entry_fn_depth: self.fn_stack.len(),
             uses_super: false,
             is_static: false,
+            privates: Vec::new(),
+            private_uses: Vec::new(),
         });
         let mut props = Vec::new();
         let end = loop {
@@ -1685,6 +2420,14 @@ impl<S: CharStream> Parser<S> {
             break self.expect(TokenKind::RBrace)?.span.end;
         };
         let ctx = self.class_stack.pop().unwrap();
+        // `#name` references are never valid inside an object literal
+        // (no private environment to declare them)
+        if let Some((_, span)) = ctx.private_uses.first() {
+            return Err(ParseError::new(
+                *span,
+                "private names are only valid inside a class",
+            ));
+        }
         if ctx.uses_super {
             let home = self.symbols_mut().intern(b".home_object");
             self.declare_class_slot(obj_scope, home, Span::new(start, start));
@@ -1704,6 +2447,12 @@ impl<S: CharStream> Parser<S> {
         let t = self.peek()?;
         if let Some(is_get) = self.eat_accessor_prefix()? {
             let (key, key_sym, computed) = self.parse_property_key()?;
+            if matches!(*self.ast.node(key), Node::PrivateName { .. }) {
+                return Err(ParseError::new(
+                    self.ast.span(key),
+                    "private names are only valid in class bodies",
+                ));
+            }
             let kind = if is_get { PropKind::Get } else { PropKind::Set };
             let fn_name = self.accessor_name(key_sym, is_get);
             let (value, vspan) = self.parse_method_value(
@@ -1726,6 +2475,12 @@ impl<S: CharStream> Parser<S> {
         }
         let (key, shorthand, computed) = self.parse_property_key()?;
         let key_span = self.ast.span(key);
+        if matches!(*self.ast.node(key), Node::PrivateName { .. }) {
+            return Err(ParseError::new(
+                key_span,
+                "private names are only valid in class bodies",
+            ));
+        }
         if self.peek()?.kind == TokenKind::LParen {
             // method shorthand
             let (value, vspan) = self.parse_method_value(
@@ -1749,14 +2504,34 @@ impl<S: CharStream> Parser<S> {
         let value = if self.eat(TokenKind::Colon)? {
             self.parse_assignment()?
         } else {
-            // shorthand: `{ a }` means `{ a: a }`
+            // shorthand: `{ a }` means `{ a: a }`; `{ a = 1 }` is a
+            // CoverInitializedName — legal only as (part of) a pattern
             let Some(sym) = shorthand else {
                 return Err(ParseError::new(
                     key_span,
                     "expected `:` after property name",
                 ));
             };
-            self.ast.add(Node::Identifier { sym }, key_span)
+            let value = self.ast.add(Node::Identifier { sym }, key_span);
+            if self.eat(TokenKind::Assign)? {
+                let default = self.parse_assignment()?;
+                let span = Span::new(key_span.start, self.ast.span(default).end);
+                let prop_id = self.ast.add(
+                    Node::Assign {
+                        op: TokenKind::Assign,
+                        target: value,
+                        value: default,
+                    },
+                    span,
+                );
+                // visible only through the pattern cover grammar; unless the
+                // literal is rewritten into a pattern, this is a Syntax
+                // Error (checked at statement end)
+                self.cover_init.push(prop_id);
+                prop_id
+            } else {
+                value
+            }
         };
         let span = Span::new(key_span.start, self.ast.span(value).end);
         Ok(self.ast.add(
@@ -1818,6 +2593,7 @@ impl<S: CharStream> Parser<S> {
             start,
             name,
             FnFlags {
+                force_strict,
                 kind: function_kind,
                 ..Default::default()
             },
@@ -1850,6 +2626,15 @@ impl<S: CharStream> Parser<S> {
                 (
                     self.ast.add(Node::StringLiteral(sym), t.span),
                     Some(sym),
+                    false,
+                )
+            }
+            TokenKind::PrivateName => {
+                let name = Symbol(t.value.symbol().unwrap());
+                let hidden = self.private_sym(name);
+                (
+                    self.ast.add(Node::PrivateName { sym: hidden }, t.span),
+                    None,
                     false,
                 )
             }
@@ -1901,7 +2686,31 @@ fn function_kind_for_property(kind: PropKind) -> FunctionKind {
         PropKind::Method => FunctionKind::Method,
         PropKind::Get => FunctionKind::Getter,
         PropKind::Set => FunctionKind::Setter,
-        PropKind::Init => unreachable!("data properties do not contain method functions"),
+        PropKind::Init | PropKind::Field => {
+            unreachable!("data properties do not contain method functions")
+        }
+    }
+}
+
+/// Collect the (name, span) of every identifier bound by a binding pattern
+/// (the target positions only — default expressions are references).
+pub fn collect_pattern_names(ast: &Ast, id: NodeId, out: &mut Vec<(Symbol, Span)>) {
+    match ast.node(id) {
+        Node::Identifier { sym } => out.push((*sym, ast.span(id))),
+        Node::ArrayPattern { elements } => {
+            for &el in ast.list_items(*elements) {
+                collect_pattern_names(ast, el, out);
+            }
+        }
+        Node::ObjectPattern { props } => {
+            for &p in ast.list_items(*props) {
+                collect_pattern_names(ast, p, out);
+            }
+        }
+        Node::PatternElement { target, .. } => collect_pattern_names(ast, *target, out),
+        Node::PatternProperty { value, .. } => collect_pattern_names(ast, *value, out),
+        Node::PatternRest { target } => collect_pattern_names(ast, *target, out),
+        _ => {}
     }
 }
 

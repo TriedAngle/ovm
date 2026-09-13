@@ -61,6 +61,18 @@ impl Value {
         if receiver == nogc.known().null.value() || receiver == nogc.known().undefined.value() {
             return Err(VmError::Type);
         }
+        // non-receiver heap values (VMStrings, Symbols, Floats, ...) and
+        // smis are not property stores' targets: sloppy-mode stores onto
+        // primitives are silently ignored (strict throws — deferred with
+        // the other language-mode TODOs)
+        if let Some(obj) = receiver.as_heap_object(nogc) {
+            let kind = obj.as_ref().header.map.heap_ref(nogc).kind().kind();
+            if !Object::matches_kind(kind) {
+                return Ok(StoreOutcome::Done);
+            }
+        } else {
+            return Ok(StoreOutcome::Done);
+        }
         match receiver.lookup(nogc, name) {
             Lookup::Data {
                 slot,
@@ -101,78 +113,86 @@ impl Value {
             }
         }
     }
-
 }
 
-    /// `super.x = v` (ES 15.4.4 PutValue on a super reference): the store
-    /// walks the chain starting at the pre-resolved parent link (read
-    /// before ToPropertyKey; any of the three prototype shapes) but the
-    /// receiver is `this`:
-    /// - `Shadow` (JS): inherited writable data properties create an own
-    ///   property on the receiver (OrdinarySet's receiver != O path),
-    ///   setters run with the receiver, misses define on the receiver
-    /// - `WriteThrough` (Self-style): inherited writable data properties
-    ///   are written at the holder instead of shadowing
-    pub fn super_store_lookup<'a>(
-        nogc: &'a NoGc<'a>,
-        proto: Option<Value>,
-        recv: Value,
-        name: SlotName,
-        value: Value,
-        semantics: StoreSemantics,
-    ) -> Result<StoreOutcome, VmError> {
-        if recv == nogc.known().null.value() || recv == nogc.known().undefined.value() {
+/// `super.x = v` (ES 15.4.4 PutValue on a super reference): the store
+/// walks the chain starting at the pre-resolved parent link (read
+/// before ToPropertyKey; any of the three prototype shapes) but the
+/// receiver is `this`:
+/// - `Shadow` (JS): inherited writable data properties create an own
+///   property on the receiver (OrdinarySet's receiver != O path),
+///   setters run with the receiver, misses define on the receiver
+/// - `WriteThrough` (Self-style): inherited writable data properties
+///   are written at the holder instead of shadowing
+pub fn super_store_lookup<'a>(
+    nogc: &'a NoGc<'a>,
+    proto: Option<Value>,
+    recv: Value,
+    name: SlotName,
+    value: Value,
+    semantics: StoreSemantics,
+) -> Result<StoreOutcome, VmError> {
+    if recv == nogc.known().null.value() || recv == nogc.known().undefined.value() {
+        return Err(VmError::Type);
+    }
+    let Some(proto) = proto else {
+        // non-object home: no parent chain, define on the receiver
+        if !recv.is_strong_ptr() {
             return Err(VmError::Type);
         }
-        let Some(proto) = proto else {
-            // non-object home: no parent chain, define on the receiver
+        return Ok(StoreOutcome::Transition {
+            receiver: recv,
+            name,
+        });
+    };
+    match lookup_in_parents(nogc, proto, name) {
+        Lookup::Data {
+            slot,
+            holder,
+            flags,
+            ..
+        } => {
+            if !flags.is_writable() {
+                return Err(VmError::Type);
+            }
+            match semantics {
+                StoreSemantics::WriteThrough => {
+                    let host = holder.as_ref().erase();
+                    slot.set(nogc, host, value);
+                    Ok(StoreOutcome::Done)
+                }
+                // receiver (`this`) differs from the holder by
+                // construction: OrdinarySet creates an own property on
+                // the receiver
+                StoreSemantics::Shadow => {
+                    if !recv.is_strong_ptr() {
+                        return Err(VmError::Type);
+                    }
+                    Ok(StoreOutcome::Transition {
+                        receiver: recv,
+                        name,
+                    })
+                }
+            }
+        }
+        Lookup::NotFound => {
             if !recv.is_strong_ptr() {
                 return Err(VmError::Type);
             }
-            return Ok(StoreOutcome::Transition { receiver: recv, name });
-        };
-        match lookup_in_parents(nogc, proto, name) {
-            Lookup::Data {
-                slot,
-                holder,
-                flags,
-                ..
-            } => {
-                if !flags.is_writable() {
-                    return Err(VmError::Type);
-                }
-                match semantics {
-                    StoreSemantics::WriteThrough => {
-                        let host = holder.as_ref().erase();
-                        slot.set(nogc, host, value);
-                        Ok(StoreOutcome::Done)
-                    }
-                    // receiver (`this`) differs from the holder by
-                    // construction: OrdinarySet creates an own property on
-                    // the receiver
-                    StoreSemantics::Shadow => {
-                        if !recv.is_strong_ptr() {
-                            return Err(VmError::Type);
-                        }
-                        Ok(StoreOutcome::Transition { receiver: recv, name })
-                    }
-                }
+            Ok(StoreOutcome::Transition {
+                receiver: recv,
+                name,
+            })
+        }
+        Lookup::Accessor { pair, .. } => {
+            let setter = pair.set.inner();
+            if setter == nogc.known().undefined.value() {
+                return Ok(StoreOutcome::Done);
             }
-            Lookup::NotFound => {
-                if !recv.is_strong_ptr() {
-                    return Err(VmError::Type);
-                }
-                Ok(StoreOutcome::Transition { receiver: recv, name })
-            }
-            Lookup::Accessor { pair, .. } => {
-                let setter = pair.set.inner();
-                if setter == nogc.known().undefined.value() {
-                    return Ok(StoreOutcome::Done);
-                }
-                Ok(StoreOutcome::CallSetter { setter })
-            }
+            Ok(StoreOutcome::CallSetter { setter })
         }
     }
+}
 pub struct Transition;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
