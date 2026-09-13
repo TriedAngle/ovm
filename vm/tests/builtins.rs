@@ -1,11 +1,11 @@
 //! Builtins + direct eval end-to-end.
 
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::VM;
 use vm::Value;
 
 fn vm() -> VM {
-    VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap()
+    VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap()
 }
 
 fn run_smi(vm: &VM, src: &str) -> i64 {

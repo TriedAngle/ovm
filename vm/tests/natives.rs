@@ -1,5 +1,6 @@
-use dummy_heap::{DummyHeap, DummyHeapConfig};
-use vm::natives::{NativeContext, NativeIndex, native_trampoline};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
+
+use vm::natives::{NativeContext, native_trampoline};
 use vm::{Float, GcSlice, Smi, Value};
 use vm::{Thread, VM, VmError};
 
@@ -11,59 +12,79 @@ fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
-#[test]
-fn smi_add_adds_and_checks_types() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
-    let mut thread = vm.attach();
-    let add = vm.native(NativeIndex::SMI_ADD);
+fn smi_add(_nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+    let (a, b) = match (args.get(1), args.get(2)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Err(VmError::Arity),
+    };
+    let (a, b) = (
+        Smi::decode(a).ok_or(VmError::Type)?,
+        Smi::decode(b).ok_or(VmError::Type)?,
+    );
+    Ok(Smi::new(a.value() + b.value()).encode())
+}
 
-    let r = thread.run_native(add, &[smi(0), smi(6), smi(7)]).unwrap();
+#[test]
+fn registered_native_invokes_and_checks_types() {
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let mut thread = vm.attach();
+
+    let r = thread
+        .run_native(smi_add, &[smi(0), smi(6), smi(7)])
+        .unwrap();
     assert_eq!(r.to_i64().unwrap(), 13);
 
     assert_eq!(
-        thread.run_native(add, &[smi(0), smi(1)]),
+        thread.run_native(smi_add, &[smi(0), smi(1)]),
         Err(VmError::Arity)
     );
 
     let f = float(&mut thread, 1.0);
     assert_eq!(
-        thread.run_native(add, &[smi(0), f, smi(1)]),
+        thread.run_native(smi_add, &[smi(0), f, smi(1)]),
         Err(VmError::Type)
     );
 }
 
 #[test]
-fn float_add_adds_and_boxes_result() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+fn native_result_is_boxed_when_not_smi() {
+    fn fadd(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+        let (a, b) = match (args.get(1), args.get(2)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return Err(VmError::Arity),
+        };
+        let sum = nctx.heap().no_gc(|nogc| {
+            let fa = a.get_as::<Float>(nogc).ok_or(VmError::Type)?.value.get();
+            let fb = b.get_as::<Float>(nogc).ok_or(VmError::Type)?.value.get();
+            Ok::<_, VmError>(fa + fb)
+        })?;
+        nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum)))
+    }
+
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
-    let add = vm.native(NativeIndex::FLOAT_ADD);
 
     let fa = float(&mut thread, 1.5);
     let fb = float(&mut thread, 2.25);
-    let r = thread.run_native(add, &[smi(0), fa, fb]).unwrap();
+    let r = thread.run_native(fadd, &[smi(0), fa, fb]).unwrap();
     let out = thread
         .heap()
         .no_gc(|nogc| r.get_as::<Float>(nogc).unwrap().value.get());
     assert_eq!(out, 3.75);
 
     assert_eq!(
-        thread.run_native(add, &[smi(0), smi(1), smi(2)]),
+        thread.run_native(fadd, &[smi(0), smi(1), smi(2)]),
         Err(VmError::Type)
     );
 }
 
 #[test]
 fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let args = [smi(0), smi(1)]; // arity error for smi_add
 
-    let result = native_trampoline(
-        vm.native(NativeIndex::SMI_ADD),
-        &mut thread,
-        args.as_ptr(),
-        args.len() as u32,
-    );
+    let result = native_trampoline(smi_add, &mut thread, args.as_ptr(), args.len() as u32);
 
     assert_eq!(result, vm.known().exception.value());
     let ex = thread
@@ -105,10 +126,13 @@ fn register_native_appends_after_well_known() {
         }
     }
 
-    let mut vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let idx = vm.register_native(double as vm::NativeFn);
-    assert!(idx > NativeIndex::FLOAT_ADD);
-    assert_eq!(vm.natives().len(), 3);
+    // the registry starts with the fixed RuntimeFn table; dynamic
+    // registrations append after it
+    let fixed = bytecode::RuntimeFn::COUNT as usize;
+    assert_eq!(idx.0, fixed);
+    assert_eq!(vm.natives().len(), fixed + 1);
 
     let mut thread = vm.attach();
     let r = thread

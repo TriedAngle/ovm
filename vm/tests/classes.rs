@@ -4,12 +4,12 @@
 //! [[Construct]] of base/derived constructors, super property access and super
 //! calls) plus the observable edge cases.
 
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{ScriptError, Thread, VM};
 use vm::{SlotName, Smi, VMString, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     thread.run_script(src)
 }
@@ -19,7 +19,7 @@ fn run_smi(src: &str) -> i64 {
 }
 
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
     (result, thread)
@@ -710,10 +710,16 @@ fn super_in_nested_arrows() {
 fn new_target_basic_forms() {
     // undefined outside construction
     assert!(run_bool("new.target === undefined;"));
-    assert!(run_bool("function f() { return new.target; } f() === undefined;"));
+    assert!(run_bool(
+        "function f() { return new.target; } f() === undefined;"
+    ));
     // the constructor itself
-    assert!(run_bool("function f() { return new.target; } new f() === f;"));
-    assert!(run_bool("class A { constructor() { this.t = new.target; } } new A().t === A;"));
+    assert!(run_bool(
+        "function f() { return new.target; } new f() === f;"
+    ));
+    assert!(run_bool(
+        "class A { constructor() { this.t = new.target; } } new A().t === A;"
+    ));
     // new.target threads through the default-ctor super chain
     assert!(run_bool(
         "class A { constructor() { this.q = new.target; } }

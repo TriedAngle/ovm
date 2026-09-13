@@ -142,10 +142,11 @@ fn materialize_function<'s>(
         parser::FunctionKind::DefaultDerivedConstructor => FunctionKind::DefaultDerivedConstructor,
     };
     heap.no_gc(|nogc| {
-        info.heap_ref(nogc).set_metadata(
+        info.heap_ref(nogc).set_metadata_full(
             nogc,
             name,
             function.formal_parameter_count as usize,
+            function.formal_length as usize,
             kind,
             function.strict,
         );

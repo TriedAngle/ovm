@@ -85,6 +85,14 @@ pub struct WellKnown {
     pub class_constructor_map: Global<Map>,
     /// The `@@toPrimitive` well-known symbol
     pub to_primitive_symbol: Global<Symbol>,
+    /// The `@@iterator` well-known symbol (internal: no Symbol global yet)
+    pub iterator_symbol: Global<Symbol>,
+    /// Map of array-iterator objects (slots: [iterated array, next index])
+    pub array_iterator_map: Global<Map>,
+    /// %ArrayIteratorPrototype% (holds `next` and @@iterator)
+    pub array_iterator_prototype: Global<Object>,
+    /// Map of iterator-result objects `{ value, done }` (w+, e+, c+)
+    pub iterator_result_map: Global<Map>,
     pub strings: WellKnownStrings,
 }
 
@@ -127,6 +135,10 @@ define_well_known_strings! {
     constructor => "constructor",
     to_string => "toString",
     value_of => "valueOf",
+    next => "next",
+    done => "done",
+    value => "value",
+    values => "values",
     default => "default",
     number => "number",
     string => "string",
@@ -202,6 +214,10 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         non_constructor_function_map: map,
         class_constructor_map: map,
         to_primitive_symbol: unsafe { smi_handle::<Symbol>(roots) },
+        iterator_symbol: unsafe { smi_handle::<Symbol>(roots) },
+        array_iterator_map: map,
+        array_iterator_prototype: obj,
+        iterator_result_map: map,
         strings: WellKnownStrings::uninit(roots),
     }
 }
@@ -371,7 +387,8 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
                 .union(MapKind::CONSTRUCTOR)
                 .union(MapKind::EXTENDABLE)
                 .union(MapKind::CLASS_CONSTRUCTOR),
-            value_slot_count: 2,
+            // slots: [callable info, closure context, instance-field array]
+            value_slot_count: 3,
             descriptors: &[],
             prototype: known.null.erase(),
         })
@@ -466,6 +483,8 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
 
     let to_primitive_symbol =
         roots.create_handle(Symbol::new(heap, &scope, b"Symbol.toPrimitive").as_tagged());
+    let iterator_symbol =
+        roots.create_handle(Symbol::new(heap, &scope, b"Symbol.iterator").as_tagged());
 
     let empty_scope_info = heap
         .allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots })
@@ -517,6 +536,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.boolean_map = boolean_map;
     known.exception = exception;
     known.to_primitive_symbol = to_primitive_symbol;
+    known.iterator_symbol = iterator_symbol;
     known.object_prototype = object_prototype;
     known.array_prototype = array_prototype;
     known.error_prototype = error_prototype;

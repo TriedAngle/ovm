@@ -1,11 +1,11 @@
 //! End-to-end: parse → resolve → compile → materialize → run.
 
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Float, FunctionKind, Lookup, SlotName, Smi, VMString, Value};
 use vm::{ScriptError, Thread, VM};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     thread.run_script(src)
 }
@@ -20,7 +20,7 @@ fn run_smi(src: &str) -> i64 {
 
 /// Run and read back the result as a Rust value.
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
     (result, thread)
@@ -327,7 +327,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
 
 #[test]
 fn arrows_and_methods_are_not_constructible() {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread
         .run_script("var arrow = () => 1; var method = ({ m() { return 2; } }).m; new arrow();")
@@ -345,7 +345,7 @@ fn arrows_and_methods_are_not_constructible() {
 fn tdz_throws_on_let_before_init() {
     // uncaught exceptions escape as the exception sentinel + pending
     // exception holding a ReferenceError
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script("let x = x;").unwrap();
     assert_eq!(result, thread.heap().known().exception.value());
@@ -373,7 +373,7 @@ fn tdz_throws_on_let_before_init() {
 
 #[test]
 fn uncaught_throw_escapes_as_exception() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script("throw 42;").unwrap();
     assert_eq!(result, thread.heap().known().exception.value());
@@ -432,7 +432,7 @@ fn update_on_property_refs() {
 #[test]
 fn unused_let_without_init_is_still_tdz() {
     // `y` is never read; `x` reads before its initializer runs
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script("let x = 1, y; y = x; x;").unwrap();
     assert_eq!(result.to_i64().unwrap(), 1);
@@ -440,7 +440,7 @@ fn unused_let_without_init_is_still_tdz() {
 
 #[test]
 fn repl_mode_persists_top_level_bindings() {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     thread.run_script_repl("let x = 10;").unwrap();
     thread.run_script_repl("var y = 2;").unwrap();
@@ -451,7 +451,7 @@ fn repl_mode_persists_top_level_bindings() {
 
 #[test]
 fn repl_mode_functions_persist_and_read_globals() {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     thread.run_script_repl("let x = 10;").unwrap();
     thread
@@ -464,7 +464,7 @@ fn repl_mode_functions_persist_and_read_globals() {
 
 #[test]
 fn repl_mode_allows_redeclaration_across_entries() {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     thread.run_script_repl("let x = 1;").unwrap();
     let v = thread.run_script_repl("let x = 2; x;").unwrap();
@@ -473,7 +473,7 @@ fn repl_mode_allows_redeclaration_across_entries() {
 
 #[test]
 fn repl_mode_keeps_nested_scopes_local() {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     thread.run_script_repl("{ let inner = 5; }").unwrap();
     // `inner` was block-scoped: gone with the block, this throws
@@ -484,7 +484,7 @@ fn repl_mode_keeps_nested_scopes_local() {
 
 #[test]
 fn script_mode_top_level_bindings_do_not_persist() {
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     thread.run_script("let x = 10;").unwrap();
     let result = thread.run_script("x;").unwrap();

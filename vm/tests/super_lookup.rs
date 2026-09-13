@@ -2,7 +2,7 @@
 //! map's `prototype` slot can hold (null / single object / FixedArray of
 //! parents) and both `StoreSemantics` variants of `super_store_lookup`.
 
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
     FixedArray, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi, StoreOutcome,
     StoreSemantics, Thread, VM, Value, VmError, home_proto, lookup_in_parents, super_lookup,
@@ -14,7 +14,7 @@ fn smi(v: i64) -> Value {
 }
 
 fn thread() -> (VM, Thread) {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let thread = vm.attach();
     (vm, thread)
 }
@@ -271,7 +271,14 @@ fn super_store_readonly_and_nullish_receiver_throw() {
         // nullish receivers are invalid property store receivers
         for bad in [null, undefined] {
             assert_eq!(
-                super_store_lookup(nogc, home_proto(nogc, home), bad, x, smi(2), StoreSemantics::Shadow),
+                super_store_lookup(
+                    nogc,
+                    home_proto(nogc, home),
+                    bad,
+                    x,
+                    smi(2),
+                    StoreSemantics::Shadow
+                ),
                 Err(VmError::Type)
             );
         }

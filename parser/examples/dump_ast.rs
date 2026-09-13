@@ -104,8 +104,13 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
             println!("{pad}VarDecl({kind:?}) {at}");
             dump_list(ast, decls, indent + 1);
         }
-        Node::VarDeclarator { name, init } => {
-            println!("{pad}Declarator({}) {at}", name_of(ast, name));
+        Node::VarDeclarator { target, init } => {
+            let name = match ast.node(target) {
+                Node::Identifier { sym } => name_of(ast, *sym),
+                _ => "<pattern>".to_string(),
+            };
+            println!("{pad}Declarator({name}) {at}");
+            dump(ast, target, indent + 1);
             if let Some(init) = init {
                 dump(ast, init, indent + 1);
             }
@@ -157,8 +162,17 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
             catch_block,
             finally_block,
         } => {
-            println!("{pad}Try(catch={catch_param:?}) {at}");
+            let param = catch_param
+                .map(|p| match ast.node(p) {
+                    Node::Identifier { sym } => name_of(ast, *sym),
+                    _ => "<pattern>".to_string(),
+                })
+                .unwrap_or_default();
+            println!("{pad}Try(catch={param}) {at}");
             dump(ast, try_block, indent + 1);
+            if let Some(p) = catch_param {
+                dump(ast, p, indent + 1);
+            }
             if let Some(c) = catch_block {
                 dump(ast, c, indent + 1);
             }
@@ -211,6 +225,37 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
             dump_list(ast, args, indent + 1);
         }
         Node::NewTarget => println!("{pad}NewTarget {at}"),
+        Node::PrivateName { sym } => println!("{pad}PrivateName({}) {at}", name_of(ast, sym)),
+        Node::ArrayPattern { elements } => {
+            println!("{pad}ArrayPattern {at}");
+            dump_list(ast, elements, indent + 1);
+        }
+        Node::ObjectPattern { props } => {
+            println!("{pad}ObjectPattern {at}");
+            dump_list(ast, props, indent + 1);
+        }
+        Node::PatternElement { target, default } => {
+            println!("{pad}PatternElement {at}");
+            dump(ast, target, indent + 1);
+            if let Some(d) = default {
+                dump(ast, d, indent + 1);
+            }
+        }
+        Node::PatternProperty {
+            key,
+            value,
+            computed,
+        } => {
+            println!("{pad}PatternProperty(computed={computed}) {at}");
+            if computed {
+                dump(ast, key, indent + 1);
+            }
+            dump(ast, value, indent + 1);
+        }
+        Node::PatternRest { target } => {
+            println!("{pad}PatternRest {at}");
+            dump(ast, target, indent + 1);
+        }
         Node::Empty => println!("{pad}Empty {at}"),
     }
 }

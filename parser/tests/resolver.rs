@@ -30,8 +30,20 @@ fn locals_and_params() {
             hole_check: false
         }]
     );
-    assert_eq!(resolutions_of(&ast, &r, "a"), vec![Resolution::Param(0)]);
-    assert_eq!(resolutions_of(&ast, &r, "b"), vec![Resolution::Param(1)]);
+    assert_eq!(
+        resolutions_of(&ast, &r, "a"),
+        vec![Resolution::Param {
+            index: 0,
+            hole_check: false
+        }]
+    );
+    assert_eq!(
+        resolutions_of(&ast, &r, "b"),
+        vec![Resolution::Param {
+            index: 1,
+            hole_check: false
+        }]
+    );
     let f = (0..ast.function_count() as u32)
         .map(FunctionId)
         .find(|&id| ast.function(id).name.is_some())

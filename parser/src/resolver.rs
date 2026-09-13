@@ -4,8 +4,10 @@ use crate::{Ast, DeclKind, FunctionId, Node, NodeId, ScopeId, ScopeKind, Symbol}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolution {
-    /// function parameter i → negative register -(i+2) (slot 0 = receiver)
-    Param(u32),
+    /// function parameter i → negative register -(i+2) (slot 0 = receiver).
+    /// `hole_check`: non-simple parameter lists initialize left-to-right
+    /// with TDZ (references to later parameters from initializers throw)
+    Param { index: u32, hole_check: bool },
     /// local register
     Local { reg: u32, hole_check: bool },
     /// captured: context slot, at the precomputed chain depth from the use
@@ -224,9 +226,7 @@ fn resolve_with_mode(ast: &Ast, mode: ResolveMode) -> Resolved {
     // class-kind scope with at least one declaration
     for s in 0..ast.scope_count() {
         let scope = ScopeId(s as u32);
-        if ast.scope(scope).kind == ScopeKind::Class
-            && !ast.scope(scope).decls.is_empty()
-        {
+        if ast.scope(scope).kind == ScopeKind::Class && !ast.scope(scope).decls.is_empty() {
             r.ctx_classes.insert(scope);
         }
     }
@@ -237,12 +237,22 @@ fn resolve_with_mode(ast: &Ast, mode: ResolveMode) -> Resolved {
 
 impl<'a> Resolver<'a> {
     fn walk_function(&mut self, fid: FunctionId) {
-        let body = self
-            .ast
-            .function(fid)
-            .body
-            .expect("function must be parsed");
+        let info = self.ast.function(fid);
+        let body = info.body.expect("function must be parsed");
         self.fn_stack.push(fid);
+        // parameter initializers and pattern leaves resolve within the
+        // function scope (they are initialized before the body runs)
+        let fscope = self.fn_scope[fid.0 as usize];
+        self.scope_stack.push(fscope);
+        for p in &info.params {
+            if let Some(d) = p.default {
+                self.walk_node(d);
+            }
+            if !matches!(self.ast.node(p.target), Node::Identifier { .. }) {
+                self.walk_node(p.target);
+            }
+        }
+        self.scope_stack.pop();
         self.walk_node(body);
         self.fn_stack.pop();
     }
@@ -375,6 +385,7 @@ impl<'a> Resolver<'a> {
         }
         match *self.ast.node(id) {
             Node::Identifier { sym } => self.resolve_reference(id, sym),
+            Node::PrivateName { sym } => self.resolve_reference(id, sym),
             Node::This => {
                 // nearest enclosing non-arrow function owns `this`
                 let owner = self
@@ -469,7 +480,9 @@ impl<'a> Resolver<'a> {
                 computed,
             } => {
                 self.walk_node(object);
-                if computed {
+                // private-name keys (`obj.#x`) resolve against the class
+                // scope even though they are never computed
+                if computed || matches!(self.ast.node(key), Node::PrivateName { .. }) {
                     self.walk_node(key);
                 }
             }
@@ -496,7 +509,7 @@ impl<'a> Resolver<'a> {
                     self.walk_node(sup);
                 }
                 for m in &info.members {
-                    if m.computed {
+                    if m.computed || matches!(self.ast.node(m.key), Node::PrivateName { .. }) {
                         self.walk_node(m.key);
                     }
                     self.walk_node(m.value); // FunctionExpr
@@ -504,11 +517,39 @@ impl<'a> Resolver<'a> {
             }
             Node::ExprStmt { expr } => self.walk_node(expr),
             Node::VarDecl { decls, .. } => self.walk_list(decls),
-            Node::VarDeclarator { init, .. } => {
+            Node::VarDeclarator { target, init } => {
+                // plain identifier targets store through the declaration's
+                // slot (resolution_for_decl); only patterns carry leaf
+                // Identifier nodes that need their own resolutions
+                if !matches!(self.ast.node(*&target), Node::Identifier { .. }) {
+                    self.walk_node(target);
+                }
                 if let Some(init) = init {
                     self.walk_node(init);
                 }
             }
+            // binding patterns: keys, defaults and leaf targets (defaults
+            // may reference outer bindings; leaf Identifier targets carry
+            // the store resolutions)
+            Node::ArrayPattern { elements } => self.walk_list(elements),
+            Node::ObjectPattern { props } => self.walk_list(props),
+            Node::PatternElement { target, default } => {
+                self.walk_node(target);
+                if let Some(d) = default {
+                    self.walk_node(d);
+                }
+            }
+            Node::PatternProperty {
+                key,
+                value,
+                computed,
+            } => {
+                if computed {
+                    self.walk_node(key);
+                }
+                self.walk_node(value);
+            }
+            Node::PatternRest { target } => self.walk_node(target),
             Node::Block { stmts } => self.walk_list(stmts),
             Node::If { cond, then, else_ } => {
                 self.walk_node(cond);
@@ -559,6 +600,7 @@ impl<'a> Resolver<'a> {
             Node::Labeled { body, .. } => self.walk_node(body),
             Node::TryCatch {
                 try_block,
+                catch_param,
                 catch_block,
                 finally_block,
                 ..
@@ -573,7 +615,13 @@ impl<'a> Resolver<'a> {
                 if let Some(scope) = entered {
                     self.scope_stack.push(scope);
                 }
-                if let Some(c) = catch_block {
+                if let (Some(param), Some(c)) = (catch_param, catch_block) {
+                    // the param pattern's leaves resolve within the catch
+                    // scope (the store targets of the handler prologue);
+                    // plain identifier params store by declaration
+                    if !matches!(self.ast.node(*&param), Node::Identifier { .. }) {
+                        self.walk_node(param);
+                    }
                     self.walk_node(c);
                 }
                 if entered.is_some() {
@@ -614,6 +662,14 @@ impl<'a> Resolver<'a> {
             let fid = FunctionId(fid as u32);
             let fscope = self.fn_scope[fid.0 as usize];
             let calls_eval = ast.scope(fscope).calls_eval;
+            // non-simple parameter lists (any default / pattern / rest)
+            // initialize parameters left-to-right with TDZ: every parameter
+            // read inside initializers carries a hole check
+            let param_hole_check = ast
+                .function(fid)
+                .params
+                .iter()
+                .any(|p| p.is_non_simple(ast));
             let mut next_reg = 0u32;
             let mut next_ctx = 0u32;
             let mut this_slot = None;
@@ -649,11 +705,16 @@ impl<'a> Resolver<'a> {
                         slots.insert(key, Resolution::GlobalObject);
                         continue;
                     }
-                    let hole_check =
-                        matches!(decl.kind, DeclKind::Let | DeclKind::Const | DeclKind::Class);
+                    let hole_check = matches!(
+                        decl.kind,
+                        DeclKind::Let | DeclKind::Const | DeclKind::Class | DeclKind::PatternParam
+                    );
                     let forced = calls_eval || self.captured.contains(&key);
                     let res = match decl.kind {
-                        DeclKind::Param if !forced => Resolution::Param(d as u32),
+                        DeclKind::Param if !forced => Resolution::Param {
+                            index: decl.param_index.unwrap_or(0),
+                            hole_check: param_hole_check,
+                        },
                         _ if forced => {
                             let slot = next_ctx;
                             next_ctx += 1;

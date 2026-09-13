@@ -25,7 +25,11 @@ use crate::{CompileError, CompiledFunction, CompiledScript, Constant, HandlerEnt
 fn emit_jump(code: &mut Vec<u8>, op: Opcode, label: &mut Label) {
     debug_assert!(matches!(
         op,
-        Opcode::Jump | Opcode::JumpLoop | Opcode::JumpIfTruthy | Opcode::JumpIfFalsy
+        Opcode::Jump
+            | Opcode::JumpLoop
+            | Opcode::JumpIfTruthy
+            | Opcode::JumpIfFalsy
+            | Opcode::JumpIfNotUndefined
     ));
     let pc = code.len();
     code.push(Opcode::Wide as u8);
@@ -52,6 +56,11 @@ enum StoreTarget {
         obj: u32,
         key: u32,
     },
+    /// `this.#x = v`: the private name symbol loaded into a register
+    PrivateKeyed {
+        obj: u32,
+        key: u32,
+    },
     /// `super.x = v` / `super[k] = v`: receiver (this) and home object in
     /// live registers
     SuperNamed {
@@ -64,6 +73,14 @@ enum StoreTarget {
         home: u32,
         key: u32,
     },
+}
+
+/// Name hint for NamedEvaluation in pattern defaults (ES 8.4.3): the
+/// property key (or array index) an anonymous function is named after.
+enum NameHint {
+    Const(u32),
+    Reg(u32),
+    None,
 }
 
 struct FunctionGen<'a> {
@@ -89,13 +106,32 @@ struct FunctionGen<'a> {
     breakables: Vec<Breakable>,
 }
 
+/// The value of a body that is exactly `return <expr>;`, if it is.
+fn single_return_value(ast: &Ast, body: NodeId) -> Option<NodeId> {
+    let Node::Block { stmts } = *ast.node(body) else {
+        return None;
+    };
+    let [only] = ast.list_items(stmts) else {
+        return None;
+    };
+    match *ast.node(*only) {
+        Node::Return { value: Some(v) } => Some(v),
+        _ => None,
+    }
+}
+
 pub fn generate(ast: &Ast, resolved: &Resolved) -> Result<CompiledScript, CompileError> {
     let mut functions = Vec::with_capacity(ast.function_count());
     for fid in 0..ast.function_count() {
         let fid = FunctionId(fid as u32);
         let mut generator = FunctionGen::new(ast, resolved, fid);
         generator.emit_function_body()?;
-        debug_assert!(generator.next_temp == 0, "unbalanced temp allocation");
+        debug_assert!(
+            generator.next_temp == 0,
+            "unbalanced temp allocation in {:?} ({:?})",
+            fid,
+            ast.function(fid).kind
+        );
         functions.push(generator.finish());
     }
     Ok(CompiledScript { functions })
@@ -127,6 +163,7 @@ impl<'a> FunctionGen<'a> {
             constants: self.constants,
             name: info.name.map(|name| self.ast.symbol(name).to_vec()),
             formal_parameter_count: info.params.len() as u32,
+            formal_length: info.formal_length,
             kind: info.kind,
             strict: info.strict,
             register_count: self.reg_base + self.max_temps,
@@ -192,6 +229,15 @@ impl<'a> FunctionGen<'a> {
         emit(&mut self.code, Opcode::SetFunctionNameConst, &[idx]);
     }
 
+    /// SetFunctionName from a key node usable for naming (StringLiteral or
+    /// NumberLiteral keys).
+    fn emit_set_name_for_key_node(&mut self, key: NodeId) {
+        if let Node::StringLiteral(sym) = *self.ast.node(key) {
+            let bytes = self.ast.symbol(sym).to_vec();
+            self.emit_set_name_const(&bytes);
+        }
+    }
+
     // -- scopes / resolutions -------------------------------------------------
 
     /// Innermost scope (from the current position) declaring `name`.
@@ -205,9 +251,11 @@ impl<'a> FunctionGen<'a> {
 
     fn store_resolution(&mut self, res: Resolution) {
         match res {
-            Resolution::Param(i) => {
-                emit(&mut self.code, Opcode::Store, &[(-(i as i32 + 2)) as u32])
-            }
+            Resolution::Param { index, .. } => emit(
+                &mut self.code,
+                Opcode::Store,
+                &[(-(index as i32 + 2)) as u32],
+            ),
             Resolution::Local { reg, .. } => emit(&mut self.code, Opcode::Store, &[reg]),
             Resolution::Context { slot, depth, .. } => {
                 emit(&mut self.code, Opcode::StoreContextSlot, &[slot, depth])
@@ -267,8 +315,15 @@ impl<'a> FunctionGen<'a> {
             .resolution(node)
             .expect("identifier must be resolved");
         match res {
-            Resolution::Param(i) => {
-                emit(&mut self.code, Opcode::Load, &[(-(i as i32 + 2)) as u32]);
+            Resolution::Param { index, hole_check } => {
+                emit(
+                    &mut self.code,
+                    Opcode::Load,
+                    &[(-(index as i32 + 2)) as u32],
+                );
+                if hole_check {
+                    emit(&mut self.code, Opcode::ThrowReferenceErrorIfHole, &[]);
+                }
                 Ok(())
             }
             Resolution::Local { reg, hole_check } => {
@@ -318,6 +373,17 @@ impl<'a> FunctionGen<'a> {
         self.emit_load_constant(Constant::Boolean(false));
         end.bind(&self.code);
         end.patch_all(&mut self.code);
+    }
+
+    /// Load a private-name symbol from its class-context slot.
+    fn emit_private_key_load(&mut self, key: NodeId) -> Result<(), CompileError> {
+        match self.resolved.resolution(key) {
+            Some(Resolution::Context { slot, depth, .. }) => {
+                emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
+                Ok(())
+            }
+            _ => self.err(key, "private name outside its class"),
+        }
     }
 
     /// Load `this` of `owner` (the nearest non-arrow function). Inside a
@@ -424,6 +490,10 @@ impl<'a> FunctionGen<'a> {
                 Ok(())
             }
             Node::Hole => self.err(node, "array elision outside array literals"),
+            Node::PrivateName { .. } => self.err(
+                node,
+                "private names are only valid as `obj.#x` or `#x in obj`",
+            ),
             Node::ObjectProperty { .. } => unreachable!("handled by object literal codegen"),
             _ => self.err(node, "statement in expression position"),
         }
@@ -565,10 +635,41 @@ impl<'a> FunctionGen<'a> {
                 self.expr(lhs)?;
                 self.expr(rhs)
             }
-            TokenKind::In | TokenKind::QuestionDot | TokenKind::Nullish => self.err(
+            TokenKind::In => {
+                // `key in obj` (ES 14.11.2) or `#x in obj` (private, ES 13.3.9):
+                // key in the accumulator, object in a register
+                if matches!(self.ast.node(lhs), Node::PrivateName { .. }) {
+                    // `#x in obj`: (key, obj) -> bool
+                    self.emit_private_key_load(lhs)?;
+                    let base = self.push_value();
+                    self.expr(rhs)?;
+                    self.push_value();
+                    emit(
+                        &mut self.code,
+                        Opcode::CallRuntime,
+                        &[bytecode::RuntimeFn::PrivateIn as u32, base, 2],
+                    );
+                    self.pop_value();
+                    self.pop_value();
+                } else {
+                    // `key in obj`: (key, obj) -> bool
+                    self.expr(lhs)?;
+                    let base = self.push_value();
+                    self.expr(rhs)?;
+                    self.push_value();
+                    emit(
+                        &mut self.code,
+                        Opcode::CallRuntime,
+                        &[bytecode::RuntimeFn::HasProperty as u32, base, 2],
+                    );
+                    self.pop_value();
+                    self.pop_value();
+                }
+                Ok(())
+            }
+            TokenKind::QuestionDot | TokenKind::Nullish => self.err(
                 node,
                 match op {
-                    TokenKind::In => "in operator",
                     TokenKind::QuestionDot => "optional chaining",
                     _ => "nullish coalescing",
                 },
@@ -617,6 +718,21 @@ impl<'a> FunctionGen<'a> {
         target: NodeId,
         value: NodeId,
     ) -> Result<(), CompileError> {
+        if op == TokenKind::Assign
+            && matches!(
+                *self.ast.node(target),
+                Node::ArrayPattern { .. } | Node::ObjectPattern { .. }
+            )
+        {
+            // destructuring assignment (ES 14.13.3): the RHS value, then
+            // the pattern against it; the expression evaluates to the value
+            self.expr(value)?;
+            let v = self.push_value();
+            self.emit_pattern(target, v, false)?;
+            emit(&mut self.code, Opcode::Load, &[v]);
+            self.pop_value();
+            return Ok(());
+        }
         match op {
             TokenKind::Assign => self.emit_simple_assign(target, value),
             TokenKind::PlusAssign => self.emit_compound_assign(node, target, value, Opcode::Add),
@@ -679,6 +795,430 @@ impl<'a> FunctionGen<'a> {
         }
     }
 
+    // -- destructuring ------------------------------------------------------------
+
+    /// Compile a destructuring pattern against a value held in `value_reg`
+    /// (ES 14.13). `binding`: the leaf targets are declarations (var/let/
+    /// const/param names, stored by their Identifier resolution); otherwise
+    /// they are assignment targets (identifiers and member expressions).
+    fn emit_pattern(
+        &mut self,
+        pattern: NodeId,
+        value_reg: u32,
+        binding: bool,
+    ) -> Result<(), CompileError> {
+        match *self.ast.node(pattern) {
+            Node::ObjectPattern { props } => {
+                // RequireObjectCoercible runs even for the empty pattern
+                // (ES 14.13.3)
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[
+                        bytecode::RuntimeFn::RequireObjectCoercible as u32,
+                        value_reg,
+                        1,
+                    ],
+                );
+                emit(&mut self.code, Opcode::Store, &[value_reg]);
+                let has_rest = self
+                    .ast
+                    .list_items(props)
+                    .last()
+                    .is_some_and(|&p| matches!(self.ast.node(p), Node::PatternRest { .. }));
+                // with a rest property, every earlier key stays live in
+                // contiguous registers as the CopyDataProperties exclusion set
+                let excl_base = self.reg_base + self.next_temp;
+                let mut excluded = 0u32;
+                for &prop in self.ast.list_items(props) {
+                    match *self.ast.node(prop) {
+                        Node::PatternRest { target } => {
+                            // native layout: (excluded..., target, source)
+                            emit(&mut self.code, Opcode::CreateEmptyObjectLiteral, &[]);
+                            let rest_obj = self.push_value();
+                            emit(&mut self.code, Opcode::Load, &[value_reg]);
+                            self.push_value();
+                            emit(
+                                &mut self.code,
+                                Opcode::CallRuntime,
+                                &[
+                                    bytecode::RuntimeFn::CopyDataProperties as u32,
+                                    excl_base,
+                                    excluded + 2,
+                                ],
+                            );
+                            emit(&mut self.code, Opcode::Store, &[rest_obj]);
+                            self.emit_pattern_leaf(target, rest_obj, binding, NameHint::None)?;
+                            self.pop_value(); // source
+                            self.pop_value(); // rest_obj
+                        }
+                        Node::PatternProperty {
+                            key,
+                            value: elem,
+                            computed,
+                        } => {
+                            let key_reg = if computed {
+                                self.expr(key)?;
+                                Some(self.push_value())
+                            } else if matches!(self.ast.node(key), Node::NumberLiteral(_)) {
+                                self.emit_number_key(key);
+                                Some(self.push_value())
+                            } else {
+                                None
+                            };
+                            let name_hint = match key_reg {
+                                Some(r) => NameHint::Reg(r),
+                                None => NameHint::Const(self.name_constant(key)?),
+                            };
+                            if has_rest {
+                                match key_reg {
+                                    Some(_) => excluded += 1,
+                                    None => {
+                                        // materialize the constant key for
+                                        // the exclusion set
+                                        if let NameHint::Const(idx) = name_hint {
+                                            emit(&mut self.code, Opcode::LoadConstant, &[idx]);
+                                            self.push_value();
+                                            excluded += 1;
+                                        }
+                                    }
+                                }
+                            }
+                            // v = GetV(value, P)
+                            match key_reg {
+                                Some(k) => {
+                                    emit(&mut self.code, Opcode::Load, &[k]);
+                                    emit(
+                                        &mut self.code,
+                                        Opcode::LoadKeyedProperty,
+                                        &[value_reg, 0],
+                                    );
+                                }
+                                None => {
+                                    let NameHint::Const(name_idx) = name_hint else {
+                                        unreachable!("constant keys have a constant hint")
+                                    };
+                                    emit(
+                                        &mut self.code,
+                                        Opcode::LoadNamedProperty,
+                                        &[value_reg, name_idx, 0],
+                                    );
+                                }
+                            }
+                            self.emit_pattern_element(elem, binding, name_hint)?;
+                            if !has_rest && key_reg.is_some() {
+                                self.pop_value();
+                            }
+                        }
+                        _ => return self.err(prop, "object pattern property"),
+                    }
+                }
+                for _ in 0..excluded {
+                    self.pop_value();
+                }
+                Ok(())
+            }
+            Node::ArrayPattern { elements } => {
+                // iterator = GetIterator(value)
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::GetIterator as u32, value_reg, 1],
+                );
+                let iter = self.push_value();
+                // done flag (ES 8.5.9: once done, later elements read
+                // undefined without calling next again)
+                emit(&mut self.code, Opcode::LoadSmi, &[0]);
+                let done = self.push_value();
+                let items = self.ast.list_items(elements).to_vec();
+                let mut rest: Option<NodeId> = None;
+                for &el in &items {
+                    match *self.ast.node(el) {
+                        Node::Hole => {
+                            // elision still consumes one iterator step
+                            emit(&mut self.code, Opcode::Load, &[done]);
+                            let mut skip = Label::new();
+                            emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut skip);
+                            emit(
+                                &mut self.code,
+                                Opcode::CallRuntime,
+                                &[bytecode::RuntimeFn::IteratorNext as u32, iter, 1],
+                            );
+                            skip.bind(&self.code);
+                            skip.patch_all(&mut self.code);
+                        }
+                        Node::PatternRest { target } => {
+                            rest = Some(target);
+                        }
+                        Node::PatternElement { .. } => {
+                            self.emit_iterator_element(el, iter, done, binding)?;
+                        }
+                        _ => return self.err(el, "array pattern element"),
+                    }
+                }
+                if let Some(target) = rest {
+                    // array ← remaining values (loop while !done)
+                    emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
+                    let arr = self.push_value();
+                    emit(&mut self.code, Opcode::LoadSmi, &[0]);
+                    let idx = self.push_value();
+                    let head = self.code.len();
+                    emit(&mut self.code, Opcode::Load, &[done]);
+                    let mut exit = Label::new();
+                    emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut exit);
+                    emit(
+                        &mut self.code,
+                        Opcode::CallRuntime,
+                        &[bytecode::RuntimeFn::IteratorNext as u32, iter, 1],
+                    );
+                    let result = self.push_value();
+                    emit(
+                        &mut self.code,
+                        Opcode::CallRuntime,
+                        &[bytecode::RuntimeFn::IteratorDone as u32, result, 1],
+                    );
+                    let mut have = Label::new();
+                    emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut have);
+                    emit(&mut self.code, Opcode::LoadSmi, &[1]);
+                    emit(&mut self.code, Opcode::Store, &[done]);
+                    let mut after = Label::new();
+                    emit_jump(&mut self.code, Opcode::Jump, &mut after);
+                    have.bind(&self.code);
+                    have.patch_all(&mut self.code);
+                    emit(
+                        &mut self.code,
+                        Opcode::CallRuntime,
+                        &[bytecode::RuntimeFn::IteratorValue as u32, result, 1],
+                    );
+                    emit(
+                        &mut self.code,
+                        Opcode::StoreKeyedPropertyNoShadow,
+                        &[arr, idx, 0],
+                    );
+                    emit(&mut self.code, Opcode::Load, &[idx]);
+                    emit(&mut self.code, Opcode::LoadSmi, &[1]);
+                    emit(&mut self.code, Opcode::Add, &[idx]);
+                    emit(&mut self.code, Opcode::Store, &[idx]);
+                    let mut back = Label::new();
+                    emit_jump(&mut self.code, Opcode::JumpLoop, &mut back);
+                    back.bind_at(head);
+                    back.patch_all(&mut self.code);
+                    after.bind(&self.code);
+                    after.patch_all(&mut self.code);
+                    self.pop_value(); // result
+                    self.pop_value(); // idx
+                    // both loop exits converge here: normal exhaustion and
+                    // a done iterator short-circuit — the rest binding runs
+                    // either way
+                    exit.bind(&self.code);
+                    exit.patch_all(&mut self.code);
+                    emit(&mut self.code, Opcode::Load, &[arr]);
+                    self.emit_pattern_leaf(target, arr, binding, NameHint::None)?;
+                    self.pop_value(); // arr
+                }
+                self.pop_value(); // done
+                self.pop_value(); // iter
+                Ok(())
+            }
+            _ => self.err(pattern, "destructuring pattern"),
+        }
+    }
+
+    /// Load a numeric literal key (small ints inline, floats via the pool).
+    fn emit_number_key(&mut self, key: NodeId) {
+        if let Node::NumberLiteral(f) = *self.ast.node(key) {
+            if f.fract() == 0.0 && f.is_sign_positive() && f <= i16::MAX as f64 {
+                emit(&mut self.code, Opcode::LoadSmi, &[f as i32 as u32]);
+            } else {
+                self.emit_load_constant(Constant::Float(f));
+            }
+        }
+    }
+
+    /// One array-pattern element: v = done ? undefined : IteratorValue;
+    /// then the shared default handling.
+    fn emit_iterator_element(
+        &mut self,
+        elem: NodeId,
+        iter: u32,
+        done: u32,
+        binding: bool,
+    ) -> Result<(), CompileError> {
+        let (target, default) = match *self.ast.node(elem) {
+            Node::PatternElement { target, default } => (target, default),
+            _ => return self.err(elem, "array pattern element"),
+        };
+        self.emit_load_constant(Constant::Undefined);
+        let v = self.push_value();
+        emit(&mut self.code, Opcode::Load, &[done]);
+        let mut skip_next = Label::new();
+        emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut skip_next);
+        emit(
+            &mut self.code,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::IteratorNext as u32, iter, 1],
+        );
+        let result = self.push_value();
+        emit(
+            &mut self.code,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::IteratorDone as u32, result, 1],
+        );
+        let mut have = Label::new();
+        emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut have);
+        emit(&mut self.code, Opcode::LoadSmi, &[1]);
+        emit(&mut self.code, Opcode::Store, &[done]);
+        let mut after = Label::new();
+        emit_jump(&mut self.code, Opcode::Jump, &mut after);
+        have.bind(&self.code);
+        have.patch_all(&mut self.code);
+        emit(
+            &mut self.code,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::IteratorValue as u32, result, 1],
+        );
+        emit(&mut self.code, Opcode::Store, &[v]);
+        after.bind(&self.code);
+        after.patch_all(&mut self.code);
+        self.pop_value(); // result
+        skip_next.bind(&self.code);
+        skip_next.patch_all(&mut self.code);
+        // array-element defaults name anonymous functions after the
+        // binding identifier (ES 8.6.2: NamedEvaluation with bindingName)
+        let bind_name = match self.ast.node(target) {
+            Node::Identifier { sym } if binding => Some(*sym),
+            _ => None,
+        };
+        let hint = if default.is_some_and(|d| self.is_anon_function(d)) && bind_name.is_some() {
+            let name = self.ast.symbol(bind_name.unwrap()).to_vec();
+            let idx = self.add_constant(Constant::String(name));
+            NameHint::Const(idx)
+        } else {
+            NameHint::None
+        };
+        self.emit_pattern_element_with(target, default, v, binding, hint)?;
+        self.pop_value(); // v
+        Ok(())
+    }
+
+    /// Value in the accumulator: apply the default and bind. The value is
+    /// kept in a fresh register `v` for the (possibly nested) target.
+    fn emit_pattern_element(
+        &mut self,
+        elem: NodeId,
+        binding: bool,
+        name_hint: NameHint,
+    ) -> Result<(), CompileError> {
+        let (target, default) = match *self.ast.node(elem) {
+            Node::PatternElement { target, default } => (target, default),
+            _ => return self.err(elem, "pattern element"),
+        };
+        let v = self.push_value();
+        self.emit_pattern_element_with(target, default, v, binding, name_hint)?;
+        self.pop_value();
+        Ok(())
+    }
+
+    /// Default application + target binding with the current value in `v`.
+    fn emit_pattern_element_with(
+        &mut self,
+        target: NodeId,
+        default: Option<NodeId>,
+        v: u32,
+        binding: bool,
+        name_hint: NameHint,
+    ) -> Result<(), CompileError> {
+        if let Some(default) = default {
+            emit(&mut self.code, Opcode::Load, &[v]);
+            let mut skip = Label::new();
+            emit_jump(&mut self.code, Opcode::JumpIfNotUndefined, &mut skip);
+            self.expr(default)?;
+            // NamedEvaluation: `{a = function(){}} = x` names the closure
+            // after the property key / array index (ES 8.4.3). Binding
+            // patterns always name; assignment patterns only when the
+            // target is an identifier reference
+            if self.is_anon_function(default)
+                && (binding || matches!(self.ast.node(target), Node::Identifier { .. }))
+            {
+                match name_hint {
+                    NameHint::Const(idx) => {
+                        emit(&mut self.code, Opcode::SetFunctionNameConst, &[idx])
+                    }
+                    NameHint::Reg(r) => emit(&mut self.code, Opcode::SetFunctionNameKey, &[r, 0]),
+                    NameHint::None => {}
+                }
+            }
+            emit(&mut self.code, Opcode::Store, &[v]);
+            skip.bind(&self.code);
+            skip.patch_all(&mut self.code);
+        }
+        emit(&mut self.code, Opcode::Load, &[v]);
+        self.emit_pattern_leaf(target, v, binding, NameHint::None)
+    }
+
+    /// Store the value in the accumulator into one pattern leaf:
+    /// a declaration name (binding), an assignment target, or a nested
+    /// pattern destructuring `value_reg`.
+    fn emit_pattern_leaf(
+        &mut self,
+        target: NodeId,
+        value_reg: u32,
+        binding: bool,
+        name_hint: NameHint,
+    ) -> Result<(), CompileError> {
+        let _ = name_hint;
+        match *self.ast.node(target) {
+            Node::Identifier { sym } if binding => self.store_name(target, sym),
+            Node::Identifier { .. } | Node::Property { .. } => {
+                self.emit_store_to_assignment_target(target)
+            }
+            Node::ArrayPattern { .. } | Node::ObjectPattern { .. } => {
+                self.emit_pattern(target, value_reg, binding)
+            }
+            _ => self.err(target, "destructuring target"),
+        }
+    }
+
+    /// Store the pattern value (in the accumulator) into an assignment
+    /// target. Evaluating a member target's object clobbers the
+    /// accumulator, so the value is parked in a register first.
+    fn emit_store_to_assignment_target(&mut self, target: NodeId) -> Result<(), CompileError> {
+        match *self.ast.node(target) {
+            Node::Identifier { .. } => match self.resolved.resolution(target) {
+                Some(res) => self.store_decl_like(res, target),
+                None => self.err(target, "unresolved assignment target"),
+            },
+            Node::Property { .. } | Node::SuperProperty { .. } => {
+                let value = self.push_value();
+                let store = self.prepare_property_store(target)?;
+                emit(&mut self.code, Opcode::Load, &[value]);
+                self.emit_property_store(&store);
+                self.release_store(&store);
+                self.pop_value(); // value
+                Ok(())
+            }
+            _ => self.err(target, "assignment target"),
+        }
+    }
+
+    /// Store acc into an identifier via its node resolution (assignment
+    /// patterns; the node was resolved by the walk).
+    fn store_decl_like(&mut self, res: Resolution, node: NodeId) -> Result<(), CompileError> {
+        match res {
+            Resolution::GlobalObject | Resolution::Dynamic => {
+                if let Node::Identifier { sym } = *self.ast.node(node) {
+                    self.store_name(node, sym)
+                } else {
+                    unreachable!("identifier target")
+                }
+            }
+            other => {
+                self.store_resolution(other);
+                Ok(())
+            }
+        }
+    }
+
     /// A store target ready for the final store: the object (and computed
     /// key) evaluated into live registers, plus the name constant index.
 
@@ -693,6 +1233,16 @@ impl<'a> FunctionGen<'a> {
             }
             StoreTarget::Keyed { obj, key } => {
                 emit(&mut self.code, Opcode::StoreKeyedProperty, &[*obj, *key, 0]);
+            }
+            StoreTarget::PrivateKeyed { obj, key: _ } => {
+                // (obj, key, value): the value is in the accumulator
+                let _ = self.push_value();
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::PrivateSet as u32, *obj, 3],
+                );
+                self.pop_value();
             }
             StoreTarget::SuperNamed {
                 recv,
@@ -730,6 +1280,14 @@ impl<'a> FunctionGen<'a> {
                 emit(&mut self.code, Opcode::Load, &[*key]);
                 emit(&mut self.code, Opcode::LoadKeyedProperty, &[*obj, 0]);
             }
+            StoreTarget::PrivateKeyed { obj, key } => {
+                emit(&mut self.code, Opcode::Load, &[*key]);
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::PrivateGet as u32, *obj, 2],
+                );
+            }
             StoreTarget::SuperNamed {
                 recv,
                 home,
@@ -761,6 +1319,10 @@ impl<'a> FunctionGen<'a> {
                 self.pop_value(); // key
                 self.pop_value(); // obj
             }
+            StoreTarget::PrivateKeyed { .. } => {
+                self.pop_value(); // key
+                self.pop_value(); // obj
+            }
             StoreTarget::SuperNamed { .. } => {
                 self.pop_value(); // home
                 self.pop_value(); // recv
@@ -777,6 +1339,17 @@ impl<'a> FunctionGen<'a> {
     /// leaving them as live registers above `reg_base`.
     fn prepare_property_store(&mut self, target: NodeId) -> Result<StoreTarget, CompileError> {
         match *self.ast.node(target) {
+            Node::Property {
+                object,
+                key,
+                computed: false,
+            } if matches!(self.ast.node(key), Node::PrivateName { .. }) => {
+                self.expr(object)?;
+                let obj = self.push_value();
+                self.emit_private_key_load(key)?;
+                let k = self.push_value();
+                Ok(StoreTarget::PrivateKeyed { obj, key: k })
+            }
             Node::Property {
                 object,
                 key,
@@ -948,6 +1521,21 @@ impl<'a> FunctionGen<'a> {
         key: NodeId,
         computed: bool,
     ) -> Result<(), CompileError> {
+        if !computed && matches!(self.ast.node(key), Node::PrivateName { .. }) {
+            // PrivateGet: `obj.#x` — own private field or TypeError
+            self.expr(object)?;
+            let obj = self.push_value();
+            self.emit_private_key_load(key)?;
+            self.push_value();
+            emit(
+                &mut self.code,
+                Opcode::CallRuntime,
+                &[bytecode::RuntimeFn::PrivateGet as u32, obj, 2],
+            );
+            self.pop_value();
+            self.pop_value();
+            return Ok(());
+        }
         if computed {
             self.expr(object)?;
             let obj = self.push_value();
@@ -1161,7 +1749,7 @@ impl<'a> FunctionGen<'a> {
             .ast
             .node_scope(node)
             .expect("class node owns its scope");
-        let needs_ctx = info.name.is_some() || info.uses_super;
+        let needs_ctx = info.name.is_some() || info.uses_super || !info.privates.is_empty();
 
         // class inner context: the name binding (TDZ until the class value
         // exists) and the super home objects; captured by member closures.
@@ -1176,6 +1764,30 @@ impl<'a> FunctionGen<'a> {
         } else {
             None
         };
+
+        // private names: one fresh Symbol per private field per class
+        // evaluation, stored into the class context before any element
+        // evaluates (methods and initializers reference them by slot)
+        for hidden in &info.privates {
+            let res = self
+                .resolved
+                .resolution_for_decl(class_scope, *hidden)
+                .expect("private slot declared");
+            if let Resolution::Context { slot, .. } = res {
+                let text = self.ast.symbol(*hidden);
+                let desc = text.strip_prefix(&b".priv."[..]).unwrap_or(text).to_vec();
+                let idx = self.add_constant(Constant::String(desc));
+                emit(&mut self.code, Opcode::LoadConstant, &[idx]);
+                let _desc_reg = self.push_value();
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::CreatePrivateName as u32, _desc_reg, 1],
+                );
+                self.pop_value();
+                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            }
+        }
 
         // superclass: must be null or a constructor
         let sup = if let Some(sup) = info.superclass {
@@ -1259,16 +1871,101 @@ impl<'a> FunctionGen<'a> {
         emit(&mut self.code, Opcode::Load, &[ctor]);
         emit(&mut self.code, Opcode::SetPrototype, &[cp]);
 
+        // instance field list: a JS array [key0, init0, key1, init1, ...]
+        // attached to the constructor (its hidden fields slot)
+        let has_instance_fields = info
+            .members
+            .iter()
+            .any(|m| m.kind == PropKind::Field && !m.is_static);
+        let fields_arr = if has_instance_fields {
+            emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
+            Some(self.push_value())
+        } else {
+            None
+        };
+        let mut field_index = 0u32;
+
+        // static field keys (evaluated in element order) stay live until
+        // the deferred initializer calls after the class is complete
+        // (closure register, key register, constant-key name index)
+        let mut static_fields: Vec<(u32, Option<u32>, Option<u32>)> = Vec::new();
+
         // members in declaration order; the constructor is already installed
         for m in &info.members {
             if m.is_constructor {
                 continue;
             }
-            let target = if m.is_static { ctor } else { proto };
             let function = match *self.ast.node(m.value) {
                 Node::FunctionExpr { function } => function,
                 _ => return self.err(m.value, "class member function"),
             };
+            if m.kind == PropKind::Field {
+                // field key: evaluated in element order (ES 15.7.14 step 27)
+                let key_reg = if m.is_private {
+                    self.emit_private_key_load(m.key)?;
+                    Some(self.push_value())
+                } else if m.computed {
+                    self.expr(m.key)?;
+                    Some(self.push_value())
+                } else if matches!(*self.ast.node(m.key), Node::NumberLiteral(_)) {
+                    self.emit_number_key(m.key);
+                    Some(self.push_value())
+                } else {
+                    None
+                };
+                let fn_idx = self.add_constant(Constant::Callable(function));
+                emit(&mut self.code, Opcode::CreateClosure, &[fn_idx]);
+                if m.is_static {
+                    let closure = self.push_value();
+                    let name_idx = match key_reg {
+                        Some(_) => None,
+                        None => Some(self.name_constant(m.key)?),
+                    };
+                    static_fields.push((closure, key_reg, name_idx));
+                } else {
+                    // append [key, initializer] to the instance field list
+                    let arr = fields_arr.expect("instance fields allocate the list");
+                    let closure = self.push_value();
+                    emit(&mut self.code, Opcode::LoadSmi, &[field_index]);
+                    let i = self.push_value();
+                    match key_reg {
+                        Some(k) => {
+                            emit(&mut self.code, Opcode::Load, &[k]);
+                            emit(
+                                &mut self.code,
+                                Opcode::StoreKeyedPropertyNoShadow,
+                                &[arr, i, 0],
+                            );
+                        }
+                        None => {
+                            let name_idx = self.name_constant(m.key)?;
+                            emit(&mut self.code, Opcode::LoadConstant, &[name_idx]);
+                            emit(
+                                &mut self.code,
+                                Opcode::StoreKeyedPropertyNoShadow,
+                                &[arr, i, 0],
+                            );
+                        }
+                    }
+                    // initializer at the next slot
+                    emit(&mut self.code, Opcode::LoadSmi, &[field_index + 1]);
+                    emit(&mut self.code, Opcode::Store, &[i]);
+                    emit(&mut self.code, Opcode::Load, &[closure]);
+                    emit(
+                        &mut self.code,
+                        Opcode::StoreKeyedPropertyNoShadow,
+                        &[arr, i, 0],
+                    );
+                    self.pop_value(); // i
+                    self.pop_value(); // closure
+                    field_index += 2;
+                    if key_reg.is_some() {
+                        self.pop_value();
+                    }
+                }
+                continue;
+            }
+            let target = if m.is_static { ctor } else { proto };
             // non-computed keys are strings or numbers; numbers go through
             // the keyed define with the literal loaded into a register
             let numeric_key =
@@ -1345,7 +2042,9 @@ impl<'a> FunctionGen<'a> {
                         }
                     }
                 }
-                PropKind::Init => return self.err(m.value, "class field initializers"),
+                PropKind::Init | PropKind::Field => {
+                    return self.err(m.value, "class field initializers");
+                }
             }
             if key.is_some() {
                 self.pop_value();
@@ -1385,6 +2084,55 @@ impl<'a> FunctionGen<'a> {
                 emit(&mut self.code, Opcode::Load, &[ctor]);
                 emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
             }
+        }
+
+        // static fields: each initializer runs with the constructor as
+        // `this` and its result is [[DefineOwnProperty]]'d on it, in
+        // declaration order (ES 15.7.14 step 33; keys were already
+        // evaluated during the element loop)
+        for (closure, key_reg, name_idx) in &static_fields {
+            emit(&mut self.code, Opcode::Load, &[*closure]);
+            emit(&mut self.code, Opcode::CallNoFeedback, &[*closure, ctor, 1]);
+            match (key_reg, name_idx) {
+                (Some(k), _) => {
+                    emit(
+                        &mut self.code,
+                        Opcode::DefineKeyedOwnProperty,
+                        &[ctor, *k, 0, 0],
+                    );
+                }
+                (None, Some(name_idx)) => {
+                    emit(
+                        &mut self.code,
+                        Opcode::DefineNamedOwnProperty,
+                        &[ctor, *name_idx, 0, 0],
+                    );
+                }
+                (None, None) => unreachable!("static field keys are reg or const"),
+            }
+        }
+        // LIFO pops for the static field registers (key under closure)
+        for (_closure, key_reg, _) in static_fields.iter().rev() {
+            self.pop_value(); // closure
+            if key_reg.is_some() {
+                self.pop_value(); // key
+            }
+        }
+
+        // attach the instance field list to the constructor
+        if let Some(arr) = fields_arr {
+            emit(&mut self.code, Opcode::Load, &[ctor]);
+            let ctor_reg = self.push_value();
+            emit(&mut self.code, Opcode::Load, &[arr]);
+            self.push_value();
+            emit(
+                &mut self.code,
+                Opcode::CallRuntime,
+                &[bytecode::RuntimeFn::SetClassFields as u32, ctor_reg, 2],
+            );
+            self.pop_value(); // arr copy
+            self.pop_value(); // ctor_reg
+            self.pop_value(); // the fields array itself
         }
 
         // pop the class context; member closures already captured it
@@ -1470,7 +2218,11 @@ impl<'a> FunctionGen<'a> {
     /// Direct calls resolve the super constructor from the frame; calls
     /// delegated through arrows use the constructor's threaded closure and
     /// new.target. Evaluates to the new `this`.
-    fn emit_super_call(&mut self, node: NodeId, args: parser::NodeList) -> Result<(), CompileError> {
+    fn emit_super_call(
+        &mut self,
+        node: NodeId,
+        args: parser::NodeList,
+    ) -> Result<(), CompileError> {
         let items = self.ast.list_items(args).to_vec();
         let argc = items.len();
         let (owner, owner_depth) = match self.resolved.resolution(node) {
@@ -1565,6 +2317,38 @@ impl<'a> FunctionGen<'a> {
                 emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
             }
         }
+        // InitializeInstanceElements (ES 7.3.33): the derived constructor's
+        // own fields are defined on the freshly bound instance (for
+        // arrow-delegated super(), the owner is the constructor)
+        let field_owner = if direct { self.fid } else { owner };
+        if self.fn_has_instance_fields(field_owner) {
+            let ctor = self.reserve_temp();
+            if direct {
+                emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
+            } else {
+                let layout = self.resolved.layout(owner);
+                emit(
+                    &mut self.code,
+                    Opcode::LoadContextSlot,
+                    &[
+                        layout
+                            .this_function_slot
+                            .expect("delegated super() forces the closure slot"),
+                        owner_depth,
+                    ],
+                );
+            }
+            emit(&mut self.code, Opcode::Store, &[ctor]);
+            emit(&mut self.code, Opcode::Load, &[result]);
+            self.push_value();
+            let _ = ctor;
+            emit(
+                &mut self.code,
+                Opcode::CallRuntime,
+                &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
+            );
+            self.next_temp -= 2;
+        }
         emit(&mut self.code, Opcode::Load, &[result]);
         self.next_temp -= reserved;
         Ok(())
@@ -1630,33 +2414,39 @@ impl<'a> FunctionGen<'a> {
                     let key_reg = if computed {
                         self.expr(key)?;
                         Some(self.push_value())
+                    } else if matches!(self.ast.node(key), Node::NumberLiteral(_)) {
+                        // numeric literal keys ({ 1: x }) use the keyed path
+                        self.emit_number_key(key);
+                        Some(self.push_value())
                     } else {
                         None
                     };
                     match kind {
                         PropKind::Init => {
                             self.expr(value)?;
-                            if !computed {
-                                // NamedEvaluation: { m: function () {} }
-                                let name_idx = self.name_constant(key)?;
-                                if self.is_anon_function(value) {
+                            match key_reg {
+                                None => {
+                                    // NamedEvaluation: { m: function () {} }
+                                    let name_idx = self.name_constant(key)?;
+                                    if self.is_anon_function(value) {
+                                        emit(
+                                            &mut self.code,
+                                            Opcode::SetFunctionNameConst,
+                                            &[name_idx],
+                                        );
+                                    }
                                     emit(
                                         &mut self.code,
-                                        Opcode::SetFunctionNameConst,
-                                        &[name_idx],
+                                        Opcode::StoreNamedProperty,
+                                        &[obj, name_idx, 0],
                                     );
                                 }
-                                emit(
-                                    &mut self.code,
-                                    Opcode::StoreNamedProperty,
-                                    &[obj, name_idx, 0],
-                                );
-                            } else {
-                                let k = key_reg.unwrap();
-                                if self.is_anon_function(value) {
-                                    emit(&mut self.code, Opcode::SetFunctionNameKey, &[k, 0]);
+                                Some(k) => {
+                                    if self.is_anon_function(value) {
+                                        emit(&mut self.code, Opcode::SetFunctionNameKey, &[k, 0]);
+                                    }
+                                    emit(&mut self.code, Opcode::StoreKeyedProperty, &[obj, k, 0]);
                                 }
-                                emit(&mut self.code, Opcode::StoreKeyedProperty, &[obj, k, 0]);
                             }
                         }
                         PropKind::Method | PropKind::Get | PropKind::Set => {
@@ -1710,9 +2500,10 @@ impl<'a> FunctionGen<'a> {
                                         );
                                     }
                                 }
-                                PropKind::Init => unreachable!(),
+                                PropKind::Init | PropKind::Field => unreachable!(),
                             }
                         }
+                        PropKind::Field => unreachable!("fields only exist in class bodies"),
                     }
                     if let Some(k) = key_reg {
                         let _ = k;
@@ -1871,31 +2662,45 @@ impl<'a> FunctionGen<'a> {
         decls: parser::NodeList,
     ) -> Result<(), CompileError> {
         for &d in self.ast.list_items(decls) {
-            let Node::VarDeclarator { name, init } = *self.ast.node(d) else {
+            let Node::VarDeclarator { target, init } = *self.ast.node(d) else {
                 return self.err(d, "var declarator");
             };
-            let Some(scope) = self.find_decl_scope(name) else {
-                return self.err(d, "declaration without a binding");
-            };
-            let res = self
-                .resolved
-                .resolution_for_decl(scope, name)
-                .expect("declared");
-            match init {
-                Some(init) => {
+            match *self.ast.node(target) {
+                Node::ArrayPattern { .. } | Node::ObjectPattern { .. } => {
+                    let Some(init) = init else {
+                        return self.err(d, "destructuring declaration needs an initializer");
+                    };
                     self.expr(init)?;
-                    if self.is_anon_function(init) {
-                        self.emit_set_name_const(self.ast.symbol(name));
+                    let value = self.push_value();
+                    self.emit_pattern(target, value, true)?;
+                    self.pop_value();
+                }
+                Node::Identifier { sym } => {
+                    let Some(scope) = self.find_decl_scope(sym) else {
+                        return self.err(d, "declaration without a binding");
+                    };
+                    let res = self
+                        .resolved
+                        .resolution_for_decl(scope, sym)
+                        .expect("declared");
+                    match init {
+                        Some(init) => {
+                            self.expr(init)?;
+                            if self.is_anon_function(init) {
+                                self.emit_set_name_const(self.ast.symbol(sym));
+                            }
+                            self.store_decl(res, sym);
+                        }
+                        None if kind == VarKind::Var || res == Resolution::GlobalObject => {
+                            // `var` (and REPL globals) initialize to undefined;
+                            // local let/const without init stay the hole (TDZ)
+                            self.emit_load_constant(Constant::Undefined);
+                            self.store_decl(res, sym);
+                        }
+                        None => {}
                     }
-                    self.store_decl(res, name);
                 }
-                None if kind == VarKind::Var || res == Resolution::GlobalObject => {
-                    // `var` (and REPL globals) initialize to undefined;
-                    // local let/const without init stay the hole (TDZ)
-                    self.emit_load_constant(Constant::Undefined);
-                    self.store_decl(res, name);
-                }
-                None => {}
+                _ => return self.err(target, "var declarator target"),
             }
         }
         Ok(())
@@ -2160,7 +2965,7 @@ impl<'a> FunctionGen<'a> {
         &mut self,
         node: NodeId,
         try_block: NodeId,
-        catch_param: Option<Symbol>,
+        catch_param: Option<NodeId>,
         catch_block: Option<NodeId>,
         finally_block: Option<NodeId>,
     ) -> Result<(), CompileError> {
@@ -2181,11 +2986,21 @@ impl<'a> FunctionGen<'a> {
             if let Some(s) = scope {
                 self.scopes.push(s);
             }
-            let res = self
-                .resolved
-                .resolution_for_decl(scope.expect("catch scope"), param)
-                .expect("catch param declared");
-            self.store_resolution(res);
+            match *self.ast.node(param) {
+                Node::ArrayPattern { .. } | Node::ObjectPattern { .. } => {
+                    let value = self.push_value();
+                    self.emit_pattern(param, value, true)?;
+                    self.pop_value();
+                }
+                Node::Identifier { sym } => {
+                    let res = self
+                        .resolved
+                        .resolution_for_decl(scope.expect("catch scope"), sym)
+                        .expect("catch param declared");
+                    self.store_resolution(res);
+                }
+                _ => return self.err(param, "catch parameter"),
+            }
             self.stmt(block)?;
             if scope.is_some() {
                 self.scopes.pop();
@@ -2260,6 +3075,31 @@ impl<'a> FunctionGen<'a> {
             .is_derived_class_constructor()
     }
 
+    /// Whether the class this function constructs has instance fields (the
+    /// fields attach to the class's constructor).
+    fn ctor_has_instance_fields(&self) -> bool {
+        self.fn_has_instance_fields(self.fid)
+    }
+
+    fn fn_has_instance_fields(&self, fid: FunctionId) -> bool {
+        self.ctor_class(fid)
+            .is_some_and(|c| self.class_has_instance_fields(c))
+    }
+
+    fn ctor_class(&self, fid: FunctionId) -> Option<parser::ClassId> {
+        (0..self.ast.class_count() as u32)
+            .map(parser::ClassId)
+            .find(|&c| self.ast.class(c).ctor == fid)
+    }
+
+    fn class_has_instance_fields(&self, class: parser::ClassId) -> bool {
+        self.ast
+            .class(class)
+            .members
+            .iter()
+            .any(|m| m.kind == PropKind::Field && !m.is_static)
+    }
+
     /// Load this function's own `this`: the context slot when captured
     /// (the bind target of super(), shared with nested arrows), else the
     /// receiver register.
@@ -2330,22 +3170,90 @@ impl<'a> FunctionGen<'a> {
         emit(&mut self.code, Opcode::CreateFunctionContext, &[0]);
         emit(&mut self.code, Opcode::PushContext, &[self.ctx_save as u32]);
 
-        // context-allocated parameters: copy the argument into its slot
-        // (captured params and direct-eval scopes force params to contexts)
+        // parameters: non-simple lists (any default / pattern / rest) stage
+        // the incoming arguments, hole-fill the parameter registers, and
+        // initialize each binding in order (TDZ until its turn, ES 10.2.11
+        // FunctionDeclarationInstantiation); simple lists only copy
+        // context-allocated (captured) parameters into their slots
+        let params: Vec<parser::Param> = self.ast.function(self.fid).params.clone();
+        let non_simple = params.iter().any(|p| p.is_non_simple(self.ast));
         if let Some(fscope_id) = self.ast.node_scope(body) {
             let fscope = self.ast.scope(fscope_id);
-            let mut param_index = 0u32;
-            for decl in &fscope.decls {
-                if decl.kind != parser::DeclKind::Param {
-                    continue;
+            if non_simple {
+                let n = params.len() as u32;
+                let staged_base = self.reg_base + self.next_temp;
+                self.next_temp += n;
+                self.max_temps = self.max_temps.max(self.next_temp);
+                // stage the incoming arguments (missing ones arrive as
+                // undefined through frame padding)
+                for i in 0..n {
+                    emit(&mut self.code, Opcode::Load, &[(-(i as i32 + 2)) as u32]);
+                    emit(&mut self.code, Opcode::Store, &[staged_base + i]);
                 }
-                let reg = -(param_index as i32 + 2);
-                param_index += 1;
-                if let Some(Resolution::Context { slot, .. }) =
-                    self.resolved.resolution_for_decl(fscope_id, decl.name)
-                {
-                    emit(&mut self.code, Opcode::Load, &[reg as u32]);
-                    emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+                // rest arrays capture the frame's raw argument list — build
+                // them before the registers are hole-filled
+                for (i, p) in params.iter().enumerate() {
+                    if p.rest {
+                        emit(&mut self.code, Opcode::CreateRestParameter, &[i as u32]);
+                        emit(&mut self.code, Opcode::Store, &[staged_base + i as u32]);
+                    }
+                }
+                // parameters start in their TDZ
+                for i in 0..n {
+                    emit(&mut self.code, Opcode::LdaHole, &[]);
+                    emit(&mut self.code, Opcode::Store, &[(-(i as i32 + 2)) as u32]);
+                }
+                // left-to-right initialization
+                for (i, p) in params.iter().enumerate() {
+                    let reg = (-(i as i32 + 2)) as u32;
+                    let staged = staged_base + i as u32;
+                    if let Some(default) = p.default {
+                        emit(&mut self.code, Opcode::Load, &[staged]);
+                        let mut skip = Label::new();
+                        emit_jump(&mut self.code, Opcode::JumpIfNotUndefined, &mut skip);
+                        self.expr(default)?;
+                        emit(&mut self.code, Opcode::Store, &[staged]);
+                        skip.bind(&self.code);
+                        skip.patch_all(&mut self.code);
+                    }
+                    // InitializeBinding: the register (and, when captured,
+                    // the context slot) receives the value
+                    emit(&mut self.code, Opcode::Load, &[staged]);
+                    emit(&mut self.code, Opcode::Store, &[reg]);
+                    if let Node::Identifier { sym } = *self.ast.node(p.target) {
+                        if let Some(Resolution::Context { slot, .. }) =
+                            self.resolved.resolution_for_decl(fscope_id, sym)
+                        {
+                            emit(&mut self.code, Opcode::Load, &[reg]);
+                            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+                        }
+                    }
+                    // pattern parameters destructure the bound value
+                    if matches!(
+                        *self.ast.node(p.target),
+                        Node::ArrayPattern { .. } | Node::ObjectPattern { .. }
+                    ) {
+                        self.emit_pattern(p.target, staged, true)?;
+                    }
+                }
+                self.next_temp -= n;
+            } else {
+                // context-allocated parameters: copy the argument into its
+                // slot (captured params and direct-eval scopes force params
+                // to contexts)
+                let mut param_index = 0u32;
+                for decl in &fscope.decls {
+                    if decl.kind != parser::DeclKind::Param {
+                        continue;
+                    }
+                    let reg = -(param_index as i32 + 2);
+                    param_index += 1;
+                    if let Some(Resolution::Context { slot, .. }) =
+                        self.resolved.resolution_for_decl(fscope_id, decl.name)
+                    {
+                        emit(&mut self.code, Opcode::Load, &[reg as u32]);
+                        emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+                    }
                 }
             }
         }
@@ -2372,10 +3280,41 @@ impl<'a> FunctionGen<'a> {
         if info.kind == parser::FunctionKind::DefaultDerivedConstructor {
             emit(&mut self.code, Opcode::ConstructSuperAllArgs, &[]);
             emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
+            if self.ctor_has_instance_fields() {
+                // InitializeInstanceElements on the bound this:
+                // native(ctor, instance)
+                emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
+                let ctor = self.push_value();
+                emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+                self.push_value();
+                emit(
+                    &mut self.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
+                );
+                self.next_temp -= 2;
+            }
             emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
             emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
             emit(&mut self.code, Opcode::Return, &[]);
             return Ok(());
+        }
+
+        // base class constructors run their instance field initializers
+        // right after the receiver exists (ES 7.3.33, before the body)
+        if info.kind == parser::FunctionKind::BaseClassConstructor
+            && self.ctor_has_instance_fields()
+        {
+            emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
+            let ctor = self.push_value();
+            self.emit_this_load_own();
+            self.push_value();
+            emit(
+                &mut self.code,
+                Opcode::CallRuntime,
+                &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
+            );
+            self.next_temp -= 2;
         }
 
         // the script's completion value starts as undefined; only
@@ -2383,6 +3322,19 @@ impl<'a> FunctionGen<'a> {
         if let Some(completion) = self.completion {
             self.emit_load_constant(Constant::Undefined);
             emit(&mut self.code, Opcode::Store, &[completion]);
+        }
+
+        // field-initializer functions (`return <init>;`): an anonymous
+        // function value is named after the field key (ES 15.7.19)
+        if let Some(key) = info.field_key
+            && let Some(value) = single_return_value(self.ast, body)
+            && self.is_anon_function(value)
+        {
+            self.expr(value)?;
+            self.emit_set_name_for_key_node(key);
+            emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+            emit(&mut self.code, Opcode::Return, &[]);
+            return Ok(());
         }
 
         self.stmt(body)?;

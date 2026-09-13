@@ -52,7 +52,10 @@ pub struct CompiledFunction {
     pub bytecode: Vec<u8>,
     pub constants: Vec<Constant>,
     pub name: Option<Vec<u8>>,
+    /// frame layout: one register per formal parameter (patterns count one)
     pub formal_parameter_count: u32,
+    /// JS-visible `length`: parameters before the first default/rest/pattern
+    pub formal_length: u32,
     pub kind: parser::FunctionKind,
     /// Preserved for strict-sensitive runtime operations. Enforcement is
     /// intentionally deferred until the VM has language-mode-aware stores.

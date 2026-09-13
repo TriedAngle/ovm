@@ -39,10 +39,12 @@ pub struct Stack {
     /// Register files of fresh frames are initialized to this value
     /// (the hole: uninitialized `let`/`const` reads must be TDZ errors).
     fill: Value,
+    /// Missing arguments are padded with this value (undefined).
+    undefined: Value,
 }
 
 impl Stack {
-    pub fn new(capacity: usize, fill: Value) -> Self {
+    pub fn new(capacity: usize, fill: Value, undefined: Value) -> Self {
         Self {
             slots: (0..capacity)
                 .map(|_| unsafe { Register::from_value(fill) })
@@ -50,6 +52,7 @@ impl Stack {
             top: Cell::new(0),
             frames: RefCell::new(Vec::new()),
             fill,
+            undefined,
         }
     }
 
@@ -111,9 +114,6 @@ impl Stack {
         unsafe { GcSlice::from_slice(self.value_slice(Self::reg_index(meta, reg_base), count)) }
     }
 
-    /// `callable` slots[0] is the CallableInfoObject; `context` is the
-    /// closure context the frame starts executing with; `new_target` is
-    /// new.target (undefined for plain calls).
     pub fn push_initial_frame(
         &self,
         callable: Tagged<Object>,
@@ -121,8 +121,11 @@ impl Stack {
         context: Value,
         new_target: Value,
         args: GcSlice<'_>,
+        formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
-        let base = self.reserve(register_count, args.len())?;
+        let argc = args.len();
+        let padded = args.len().max(formal_min);
+        let base = self.reserve(register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
         debug_assert!(args.as_slice().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
@@ -130,16 +133,14 @@ impl Stack {
                 args.as_slice().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
-            )
+            );
+            // missing arguments are undefined (registers are the hole)
+            let undefined = self.undefined;
+            for i in args.len()..padded {
+                self.slot_unchecked(dst + i).store(undefined);
+            }
         }
-        Ok(self.init_frame_header(
-            base,
-            register_count,
-            callable,
-            context,
-            new_target,
-            args.len(),
-        ))
+        Ok(self.init_frame_header(base, register_count, callable, context, new_target, argc))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -153,8 +154,10 @@ impl Stack {
         src_reg_base: i32,
         count: usize,
         new_target: Value,
+        formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
-        let base = self.reserve(register_count, count)?;
+        let padded = count.max(formal_min);
+        let base = self.reserve(register_count, padded)?;
         let src = Self::reg_index(&caller, src_reg_base);
         let dst = base + register_count + HEADER_SLOTS;
         debug_assert!(
@@ -167,7 +170,11 @@ impl Stack {
                 self.slots.as_ptr().add(src) as *const Value,
                 self.slots.as_ptr().add(dst) as *mut Value,
                 count,
-            )
+            );
+            let undefined = self.undefined;
+            for i in count..padded {
+                self.slot_unchecked(dst + i).store(undefined);
+            }
         }
         let callee =
             self.init_frame_header(base, register_count, callable, context, new_target, count);
@@ -187,8 +194,10 @@ impl Stack {
         context: Value,
         args: &[Value],
         new_target: Value,
+        formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
-        let base = self.reserve(register_count, args.len())?;
+        let padded = args.len().max(formal_min);
+        let base = self.reserve(register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
         debug_assert!(args.iter().all(|v| !v.is_weak_ptr()));
         unsafe {
@@ -196,7 +205,11 @@ impl Stack {
                 args.as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
-            )
+            );
+            let undefined = self.undefined;
+            for i in args.len()..padded {
+                self.slot_unchecked(dst + i).store(undefined);
+            }
         }
         let callee = self.init_frame_header(
             base,
@@ -254,8 +267,6 @@ impl Stack {
         if base + size > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
-        // registers are born as the hole (TDZ); arguments are copied over
-        // them afterwards
         for i in 0..register_count {
             self.slot_unchecked(base + i).store(self.fill);
         }

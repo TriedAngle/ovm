@@ -37,6 +37,65 @@ impl core::ops::BitOr<PropertyFlags> for u32 {
 /// variant writes at the holder (Self-style semantics).
 pub const SUPER_STORE_WRITE_THROUGH: u32 = 1;
 
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFn {
+    /// (obj) -> iterator — GetProperty(obj, @@iterator) + Call (ES 8.5.4)
+    GetIterator,
+    /// (iterator) -> result object — Call(GetProperty(iter, "next"), iter)
+    IteratorNext,
+    /// (result) -> bool — ToBoolean(Get(result, "done"))
+    IteratorDone,
+    /// (result) -> value — Get(result, "value")
+    IteratorValue,
+    /// (key, obj) -> bool — HasProperty (the `in` operator, ES 14.11.2)
+    HasProperty,
+    /// (excluded..., target, source) — CopyDataProperties with an
+    /// exclusion list (object rest, ES 8.5.1); `excluded` has
+    /// count − 2 entries
+    CopyDataProperties,
+    /// (description) -> Symbol — a fresh private name
+    CreatePrivateName,
+    /// (obj, key) -> value — PrivateGet (ES 7.3.30), TypeError if absent
+    PrivateGet,
+    /// (obj, key, value) — PrivateSet (ES 7.3.31), TypeError if absent
+    PrivateSet,
+    /// (key, obj) -> bool — `#x in obj` own-private presence
+    PrivateIn,
+    /// (ctor, fields) — attach the instance-field array to the class
+    /// constructor's hidden slot
+    SetClassFields,
+    /// (ctor, instance) -> instance — run each field initializer with the
+    /// instance as receiver, [[DefineOwnProperty]] the results (ES 7.3.33)
+    InitInstanceFields,
+    /// (value) -> value — RequireObjectCoercible (ES 7.2.2): TypeError on
+    /// null/undefined (object destructuring sources)
+    RequireObjectCoercible,
+}
+
+impl RuntimeFn {
+    /// All variants in discriminant order. The array length is the
+    /// variant count (type-checked), and the VM registers its table in
+    /// this order so registry indices equal discriminants.
+    pub const ALL: [Self; 13] = [
+        Self::GetIterator,
+        Self::IteratorNext,
+        Self::IteratorDone,
+        Self::IteratorValue,
+        Self::HasProperty,
+        Self::CopyDataProperties,
+        Self::CreatePrivateName,
+        Self::PrivateGet,
+        Self::PrivateSet,
+        Self::PrivateIn,
+        Self::SetClassFields,
+        Self::InitInstanceFields,
+        Self::RequireObjectCoercible,
+    ];
+
+    pub const COUNT: u16 = Self::ALL.len() as u16;
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
@@ -95,7 +154,7 @@ pub enum Opcode {
     // for methods the `self` is the first element in the reglist
     Call,           // reg (callee) reglist (base) regcount (count) idx (feedback) -> acc
     CallNoFeedback, // reg (callee) reglist (base) regcount (count) -> acc
-    CallNative, // idx (native index) reglist (base, first element is the receiver) regcount (count) -> acc
+    CallRuntime,    // idx (RuntimeFn discriminant) reglist (base) regcount (count) -> acc
 
     Construct, // reg (callee) reglist (base) regcount (count) -> acc
 
@@ -176,6 +235,12 @@ pub enum Opcode {
     // exception handling
     Throw,   // acc -> pending exception
     ReThrow, // acc -> pending exception
+
+    /// acc = TheHole (TDZ staging of non-simple parameter lists)
+    LdaHole, // -> acc
+    /// jump unless acc is `undefined` (pattern/param default guards)
+    JumpIfNotUndefined, // imm (offset)
+    CreateRestParameter, // uimm (first formal parameter index) -> acc
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -292,7 +357,7 @@ impl Opcode {
             b if b == DefineKeyedOwnProperty as u8 => DefineKeyedOwnProperty,
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
-            b if b == CallNative as u8 => CallNative,
+            b if b == CallRuntime as u8 => CallRuntime,
             b if b == Construct as u8 => Construct,
             b if b == CreateEmptyObjectLiteral as u8 => CreateEmptyObjectLiteral,
             b if b == CreateEmptyArrayLiteral as u8 => CreateEmptyArrayLiteral,
@@ -342,6 +407,9 @@ impl Opcode {
             b if b == GreaterThanOrEqual as u8 => GreaterThanOrEqual,
             b if b == Throw as u8 => Throw,
             b if b == ReThrow as u8 => ReThrow,
+            b if b == LdaHole as u8 => LdaHole,
+            b if b == JumpIfNotUndefined as u8 => JumpIfNotUndefined,
+            b if b == CreateRestParameter as u8 => CreateRestParameter,
             _ => return None,
         })
     }
@@ -390,7 +458,7 @@ impl Opcode {
 
             Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
-            Self::CallNative => &[Index, RegisterListStart, RegisterCount],
+            Self::CallRuntime => &[Index, RegisterListStart, RegisterCount],
             Self::Construct => &[Register, RegisterListStart, RegisterCount],
 
             Self::CreateEmptyObjectLiteral | Self::CreateEmptyArrayLiteral => &[],
@@ -428,6 +496,7 @@ impl Opcode {
             | Self::ShiftRightLogical => &[Register],
 
             Self::Jump | Self::JumpLoop | Self::JumpIfTruthy | Self::JumpIfFalsy => &[Immediate],
+            Self::JumpIfNotUndefined => &[Immediate],
             Self::TestTypeof | Self::Negate => &[],
             Self::TestReferenceEqual
             | Self::EqualStrict
@@ -437,6 +506,9 @@ impl Opcode {
             | Self::GreaterThan
             | Self::GreaterThanOrEqual
             | Self::InstanceOf => &[Register],
+
+            Self::LdaHole => &[],
+            Self::CreateRestParameter => &[UImmediate],
         }
     }
 

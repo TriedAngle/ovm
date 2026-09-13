@@ -91,6 +91,20 @@ impl Value {
     }
 }
 
+/// ES 7.3.11 HasProperty (the `in` operator): walks the prototype chain
+/// without invoking anything. Element indices consult the array elements
+/// (including their backing-store holes).
+pub fn has_property<'a>(nogc: &'a NoGc<'a>, receiver: Value, name: SlotName) -> bool {
+    if let Key::Element(i) = classify_key(nogc, name.value()).unwrap_or(Key::Name(name)) {
+        if let Some(obj) = receiver.as_heap_object(nogc)
+            && obj.as_ref().element_value(nogc, i).is_some()
+        {
+            return true;
+        }
+    }
+    !matches!(receiver.lookup(nogc, name), Lookup::NotFound)
+}
+
 impl Map {
     pub fn lookup<'a>(
         &'a self,
@@ -230,6 +244,20 @@ pub fn super_constructor<'a>(nogc: &'a NoGc<'a>, stack: &Stack, meta: &FrameMeta
         return None;
     }
     Some(proto)
+}
+
+/// ES 7.3.26 PrivateElementFind restricted to fields: an own data
+/// descriptor matching the private Symbol key (no prototype walk — private
+/// elements live only on the instance itself).
+pub fn private_find<'a>(nogc: &'a NoGc<'a>, obj: Value, key: Value) -> Option<&'a GcSlot> {
+    let o = obj.as_heap_object(nogc)?;
+    let map = o.as_ref().header.map.heap_ref(nogc);
+    for d in map.descriptors() {
+        if d.name() == SlotName::from_value(key) && !d.flags().is_accessor() {
+            return Some(o.as_ref().slot(nogc, d.offset()));
+        }
+    }
+    None
 }
 
 impl Object {
