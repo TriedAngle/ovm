@@ -89,6 +89,8 @@ enum Action {
     Punct(TokenKind),
     /// multi-char handling in `scan_special`
     Special,
+    /// `#` private name: `#` + identifier continuation
+    Hash,
 }
 
 const fn first_char_table() -> [Action; 128] {
@@ -142,6 +144,7 @@ const fn first_char_table() -> [Action; 128] {
     t[b'^' as usize] = Special;
     t[b'?' as usize] = Special;
     t[b'.' as usize] = Special;
+    t[b'#' as usize] = Hash;
 
     t
 }
@@ -330,6 +333,7 @@ impl<S: CharStream> Scanner<S> {
                     Token::new(kind, Span::new(start, self.stream.pos()))
                 }
                 Action::Special => self.scan_special(start)?,
+                Action::Hash => self.scan_private_name(start)?,
             }
         } else if is_ident_start(c) {
             self.scan_identifier(start)?
@@ -430,6 +434,31 @@ impl<S: CharStream> Scanner<S> {
                 },
             },
         )
+    }
+
+    /// `#name`: a PrivateName token whose symbol excludes the `#` (ES 12.9).
+    fn scan_private_name(&mut self, start: u32) -> ScanResult {
+        self.stream.advance(); // #
+        if !self.stream.peek().is_some_and(is_ident_start) {
+            return Err(ParseError::new(
+                Span::new(start, self.stream.pos() + 1),
+                "invalid character in private name",
+            ));
+        }
+        while let Some(c) = self.stream.peek() {
+            if !is_ident_continue(c) {
+                break;
+            }
+            self.stream.advance();
+        }
+        let span = Span::new(start + 1, self.stream.pos());
+        let sym = self.intern_span(span);
+        Ok(Token {
+            kind: TokenKind::PrivateName,
+            after_newline: false,
+            value: TokenValue::Symbol(sym.0),
+            span: Span::new(start, self.stream.pos()),
+        })
     }
 
     fn scan_number(&mut self, start: u32) -> ScanResult {

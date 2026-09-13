@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{ScriptError, VM};
 
 const UNSUPPORTED_FEATURES: &[&str] = &[
@@ -18,15 +18,11 @@ const UNSUPPORTED_FEATURES: &[&str] = &[
     "Symbol",
     "Temporal",
     "regexp-modifiers",
-    // class features beyond methods/accessors/super: fields, static blocks,
-    // private names are not implemented yet (clean parser errors)
-    "class-fields-public",
-    "class-fields-private",
-    "class-static-fields-public",
-    "class-static-fields-private",
+    // remaining class extensions beyond fields: static blocks, private
+    // methods/accessors, decorators
     "class-static-block",
     "class-private-methods",
-    "class-private-fields",
+    "class-static-methods-private",
     "class-decorators",
 ];
 /// Tests exercising runtime objects the VM does not have yet.
@@ -104,11 +100,11 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn run_test(harness: &str, path: &Path, stats: &mut Stats) {
+fn run_test(harness: &str, harness_dir: Option<&Path>, path: &Path, stats: &mut Stats) {
     // survive panics (e.g. bytecode operand overflow on huge generated
     // files): count them separately and keep going
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_test_inner(harness, path, stats)
+        run_test_inner(harness, harness_dir, path, stats)
     }));
     if result.is_err() {
         stats.panicked.push(path.to_path_buf());
@@ -139,7 +135,10 @@ fn exception_name(thread: &mut vm::Thread) -> String {
     })
 }
 
-fn run_test_inner(harness: &str, path: &Path, stats: &mut Stats) {
+/// Run one test in `vm`. The harness prelude is `harness` plus any files
+/// the test's `includes:` frontmatter names (resolved in the first harness
+/// file's directory, INTERPRETING.md).
+fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats: &mut Stats) {
     let Ok(src) = std::fs::read_to_string(path) else {
         stats.fail.push((path.to_path_buf(), "not utf-8".into()));
         return;
@@ -167,13 +166,34 @@ fn run_test_inner(harness: &str, path: &Path, stats: &mut Stats) {
     // `raw` tests run without the harness preludes (INTERPRETING.md)
     let raw = fm.contains("flags") && fm.contains("raw");
 
+    // `includes:` harness files (sta.js-style helpers like propertyHelper)
+    let mut includes = String::new();
+    if let Some(dir) = harness_dir
+        && let Some(start) = fm.find("includes:")
+    {
+        {
+            let rest = &fm[start + "includes:".len()..];
+            let end = rest.find(']').unwrap_or(0);
+            for name in rest[..end].split(&[',', '[', '\n'][..]) {
+                let name = name.trim().trim_matches(|c| c == '\'' || c == '"');
+                if name.ends_with(".js") {
+                    let p = dir.join(name);
+                    if let Ok(text) = std::fs::read_to_string(&p) {
+                        includes.push_str(&text);
+                        includes.push('\n');
+                    }
+                }
+            }
+        }
+    }
+
     let code = if raw {
         src
     } else {
-        format!("{harness}\n{src}\n")
+        format!("{harness}\n{includes}\n{src}\n")
     };
     // realm isolation: every test runs in a fresh VM (INTERPRETING.md)
-    let vm = VM::with_builtins::<DummyHeap>(DummyHeapConfig { heap_size: 1 << 30 }).expect("vm");
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).expect("vm");
     let mut thread = vm.attach();
     match thread.run_script(&code) {
         Ok(v) if v == thread.heap().known().exception.value() => {
@@ -219,13 +239,15 @@ fn real_main() -> i32 {
         eprintln!("usage: test262 <harness...> <test-file-or-dir>...");
         std::process::exit(2);
     }
-    // heuristic: the first two args are harness files (sta.js, assert.js)
+    // heuristic: the first two args are harness files (sta.js, assert.js);
+    // `includes:` frontmatter resolves against the first one's directory
     let harness = args
         .iter()
         .take(2)
         .map(|p| std::fs::read_to_string(p).expect("harness file"))
         .collect::<Vec<_>>()
         .join("\n");
+    let harness_dir = args.first().and_then(|p| p.parent().map(Path::to_path_buf));
 
     let mut files = Vec::new();
     for root in &args[2..] {
@@ -243,7 +265,7 @@ fn real_main() -> i32 {
             // last line before a crash identifies the culprit test
             eprintln!("running {}", file.display());
         }
-        run_test(&harness, file, &mut stats);
+        run_test(&harness, harness_dir.as_deref(), file, &mut stats);
     }
 
     println!("total:           {}", files.len());

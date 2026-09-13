@@ -1,4 +1,4 @@
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
     HandlerTable, HandlerTableInit, ObjectSlotsInit,
@@ -17,7 +17,7 @@ fn table<'s>(
 
 #[test]
 fn roundtrip_entries() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -44,7 +44,7 @@ fn roundtrip_entries() {
 
 #[test]
 fn lookup_finds_handler_inside_range() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -61,7 +61,7 @@ fn lookup_finds_handler_inside_range() {
 
 #[test]
 fn lookup_returns_none_outside_range() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -80,7 +80,7 @@ fn lookup_returns_none_outside_range() {
 
 #[test]
 fn lookup_returns_innermost_of_nested_ranges() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -107,7 +107,7 @@ fn lookup_returns_innermost_of_nested_ranges() {
 
 #[test]
 fn lookup_on_empty_table_returns_none() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -122,7 +122,7 @@ fn lookup_on_empty_table_returns_none() {
 
 #[test]
 fn callable_info_carries_handler_table() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread: &mut Thread, scope| {
@@ -174,7 +174,7 @@ fn callable_info_carries_handler_table() {
 
 #[test]
 fn callable_info_without_handler_table() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread: &mut Thread, scope| {

@@ -7,11 +7,11 @@
 
 use crate::{
     Convert, FixedArray, GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object,
-    PropertyDescriptor, SlotName, Smi, VMString, Value, VmError,
+    PropertyDescriptor, SlotFlags, SlotName, Smi, Symbol, VMString, Value, VmError,
 };
 use base_compiler::compile_eval;
 
-use crate::natives::NativeIndex;
+use crate::natives::{NativeContext, NativeIndex};
 use crate::{ContextState, VM, materialize::materialize_closure_vm, runtime::Runtime};
 
 /// Register the builtin natives.
@@ -38,6 +38,20 @@ pub fn register_builtin_natives(vm: &mut VM) -> BuiltinIndices {
         object_set_prototype_of: vm.register_native(object_set_prototype_of),
         array: vm.register_native(array_constructor),
         is_nan: vm.register_native(is_nan),
+        array_values: vm.register_native(array_values),
+        array_iterator_next: vm.register_native(array_iterator_next),
+        array_iterator_symbol_iterator: vm.register_native(array_iterator_symbol_iterator),
+        symbol: vm.register_native(symbol_constructor),
+        object_has_own_property: vm.register_native(object_has_own_property),
+        object_property_is_enumerable: vm.register_native(object_property_is_enumerable),
+        object_get_own_property_names: vm.register_native(object_get_own_property_names),
+        object_get_own_property_descriptor: vm.register_native(object_get_own_property_descriptor),
+        object_define_property: vm.register_native(object_define_property),
+        function_call: vm.register_native(function_call),
+        function_apply: vm.register_native(function_apply),
+        function_bind: vm.register_native(function_bind),
+        function_constructor: vm.register_native(function_constructor),
+        array_is_array: vm.register_native(array_is_array),
     }
 }
 
@@ -63,6 +77,20 @@ pub struct BuiltinIndices {
     pub object_set_prototype_of: NativeIndex,
     pub array: NativeIndex,
     pub is_nan: NativeIndex,
+    pub array_values: NativeIndex,
+    pub array_iterator_next: NativeIndex,
+    pub array_iterator_symbol_iterator: NativeIndex,
+    pub symbol: NativeIndex,
+    pub object_has_own_property: NativeIndex,
+    pub object_property_is_enumerable: NativeIndex,
+    pub object_get_own_property_names: NativeIndex,
+    pub object_get_own_property_descriptor: NativeIndex,
+    pub object_define_property: NativeIndex,
+    pub function_call: NativeIndex,
+    pub function_apply: NativeIndex,
+    pub function_bind: NativeIndex,
+    pub function_constructor: NativeIndex,
+    pub array_is_array: NativeIndex,
 }
 
 /// Build the builtin objects and install them on the global object.
@@ -331,8 +359,34 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         )?;
         thread.heap().set_known(known);
 
-        // ---- Function.prototype.toString (stub) -----------------------------------
+        // ---- Function (constructor: dynamic bodies via eval, ES 20.2.1) --------
         let function_prototype = thread.heap().known().function_prototype;
+        let function_fn = make_native_function(thread, &scope, roots, idx.function_constructor)?;
+        define_data(
+            thread.heap(),
+            &scope,
+            function_prototype,
+            wks.constructor,
+            function_fn.value(),
+        )?;
+        define_data(
+            thread.heap(),
+            &scope,
+            function_fn,
+            wks.prototype,
+            function_prototype.value(),
+        )?;
+        let function_name = thread.intern(&scope, "Function");
+        let global_object = thread.heap().known().global_object;
+        define_data(
+            thread.heap(),
+            &scope,
+            global_object,
+            SlotName::from(function_name.as_tagged()),
+            function_fn.value(),
+        )?;
+
+        // ---- Function.prototype toString/call/apply/bind ------------------------
         install_method(
             thread,
             &scope,
@@ -341,6 +395,58 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             "toString",
             idx.function_to_string,
         )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            function_prototype,
+            "call",
+            idx.function_call,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            function_prototype,
+            "apply",
+            idx.function_apply,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            function_prototype,
+            "bind",
+            idx.function_bind,
+        )?;
+        // bind is a JS closure (see BIND_PRELUDE); compile and run it once
+        // here, capturing the empty context
+        {
+            let (vm, heap, state) = thread.split();
+            let empty = heap.known().empty_context.value();
+            let closure = {
+                let mut p = parser::Parser::new(parser::Utf8SliceStream::new(BIND_PRELUDE));
+                p.parse_script().map_err(|e| {
+                    eprintln!("bind prelude parse error: {e}");
+                    VmError::Type
+                })?;
+                let ast = p.into_ast();
+                let compiled = base_compiler::compile_script(&ast).map_err(|e| {
+                    eprintln!("bind prelude compile error: {e}");
+                    VmError::Type
+                })?;
+                materialize_closure_vm(vm, heap, state, &scope, &compiled, empty)?
+            };
+            let (vm, heap, state) = thread.split();
+            let result =
+                NativeContext::new(vm, heap, state).call(closure.value(), GcSlice::EMPTY)?;
+            if result == heap.known().exception.value() {
+                state
+                    .take_pending_exception()
+                    .map(|ex| eprintln!("bind prelude threw: {ex:?}"));
+                return Err(VmError::Type);
+            }
+        }
 
         // ---- eval -------------------------------------------------------------
         let eval_fn = make_native_function(thread, &scope, roots, idx.eval)?;
@@ -354,7 +460,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             eval_fn.value(),
         )?;
 
-        // ---- Object.prototype.toString --------------------------------------------
+        // ---- Object.prototype.toString/hasOwnProperty/propertyIsEnumerable ------
         let object_prototype = thread.heap().known().object_prototype;
         install_method(
             thread,
@@ -363,6 +469,22 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             object_prototype,
             "toString",
             idx.object_to_string,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_prototype,
+            "hasOwnProperty",
+            idx.object_has_own_property,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_prototype,
+            "propertyIsEnumerable",
+            idx.object_property_is_enumerable,
         )?;
 
         // ---- Object / isNaN -----------------------------------------------------
@@ -405,6 +527,30 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             &scope,
             roots,
             object_fn,
+            "getOwnPropertyNames",
+            idx.object_get_own_property_names,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
+            "getOwnPropertyDescriptor",
+            idx.object_get_own_property_descriptor,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
+            "defineProperty",
+            idx.object_define_property,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
             "setPrototypeOf",
             idx.object_set_prototype_of,
         )?;
@@ -436,6 +582,119 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             SlotName::from(array_name.as_tagged()),
             array_fn.value(),
         )?;
+
+        // Array.isArray
+        let is_array_fn = make_native_function(thread, &scope, roots, idx.array_is_array)?;
+        let is_array_name = thread.intern(&scope, "isArray");
+        define_data(
+            thread.heap(),
+            &scope,
+            array_fn,
+            SlotName::from(is_array_name.as_tagged()),
+            is_array_fn.value(),
+        )?;
+
+        // ---- Array iteration (the iterator protocol minimum) ---------------------
+        // %ArrayIteratorPrototype%: next + @@iterator (returns the receiver)
+        let array_iterator_prototype = {
+            let map = alloc_map(
+                thread.heap(),
+                &scope,
+                roots,
+                MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                object_prototype,
+            )?;
+            thread
+                .heap()
+                .new_object(&scope, map, &[])
+                .into_global(roots)
+        };
+        install_method(
+            thread,
+            &scope,
+            roots,
+            array_iterator_prototype,
+            "next",
+            idx.array_iterator_next,
+        )?;
+        let sym_iterator_iter =
+            make_native_function(thread, &scope, roots, idx.array_iterator_symbol_iterator)?;
+        let iterator_symbol = thread.heap().known().iterator_symbol;
+        define_data(
+            thread.heap(),
+            &scope,
+            array_iterator_prototype,
+            SlotName::from(iterator_symbol.as_tagged()),
+            sym_iterator_iter.value(),
+        )?;
+
+        // Array.prototype.values === Array.prototype[Symbol.iterator]: a
+        // native returning a fresh array-iterator object
+        let values_fn = make_native_function(thread, &scope, roots, idx.array_values)?;
+        let values_name = thread.intern(&scope, "values");
+        define_data(
+            thread.heap(),
+            &scope,
+            array_prototype,
+            SlotName::from(values_name.as_tagged()),
+            values_fn.value(),
+        )?;
+        define_data(
+            thread.heap(),
+            &scope,
+            array_prototype,
+            SlotName::from(iterator_symbol.as_tagged()),
+            values_fn.value(),
+        )?;
+
+        // array-iterator map: slots [iterated array, next index], prototype
+        // %ArrayIteratorPrototype%
+        let array_iterator_map = alloc_map_with_slots(
+            thread.heap(),
+            &scope,
+            roots,
+            MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            array_iterator_prototype,
+            2,
+        )?;
+
+        // iterator-result map: { value, done } both {w+, e+, c+}
+        let iterator_result_map = {
+            let value_name = thread.intern(&scope, "value");
+            let done_name = thread.intern(&scope, "done");
+            let flags = SlotFlags::WRITABLE
+                .union(SlotFlags::CONFIGURABLE)
+                .union(SlotFlags::ENUMERABLE);
+            let descriptors = vec![
+                (
+                    SlotName::from(value_name.as_tagged()),
+                    flags,
+                    Smi::new(0).encode(),
+                ),
+                (
+                    SlotName::from(done_name.as_tagged()),
+                    flags,
+                    Smi::new(1).encode(),
+                ),
+            ];
+            let proto = scope.handle(object_prototype.value());
+            thread
+                .heap()
+                .allocate::<Map>(MapInit {
+                    kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                    value_slot_count: 2,
+                    descriptors: &descriptors,
+                    prototype: proto,
+                })
+                .into_global(roots)
+        };
+
+        let mut known = *thread.heap().known();
+        known.array_iterator_map = array_iterator_map;
+        known.array_iterator_prototype = array_iterator_prototype;
+        known.iterator_result_map = iterator_result_map;
+        thread.heap().set_known(known);
+
         let is_nan_fn = make_native_function(thread, &scope, roots, idx.is_nan)?;
         let is_nan_name = thread.intern(&scope, "isNaN");
         define_data(
@@ -444,6 +703,28 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             global,
             SlotName::from(is_nan_name.as_tagged()),
             is_nan_fn.value(),
+        )?;
+
+        // ---- Symbol (minimal: constructor + Symbol.iterator) ---------------
+        // enough to author custom iterables; the full Symbol surface stays
+        // gated by the test262 feature skip
+        let symbol_fn = make_native_function(thread, &scope, roots, idx.symbol)?;
+        let symbol_name = thread.intern(&scope, "Symbol");
+        define_data(
+            thread.heap(),
+            &scope,
+            global,
+            SlotName::from(symbol_name.as_tagged()),
+            symbol_fn.value(),
+        )?;
+        let iterator_symbol = thread.heap().known().iterator_symbol;
+        let iter_name = thread.intern(&scope, "iterator");
+        define_data(
+            thread.heap(),
+            &scope,
+            symbol_fn,
+            SlotName::from(iter_name.as_tagged()),
+            iterator_symbol.value(),
         )?;
 
         // ---- value properties of the global object -----------------------------
@@ -905,6 +1186,496 @@ fn object_get_prototype_of(
 /// unchanged (after RequireObjectCoercible); proto must be an object or
 /// null; the underlying [[SetPrototypeOf]] may reject (non-extensible
 /// receiver, prototype cycles) with a TypeError.
+/// Own enumerable-property keys in specification order: integer indices
+/// ascending, then string keys in insertion order (ES 8.6.2, the
+/// descriptors array is insertion-ordered).
+fn own_property_keys<'a>(nogc: &'a crate::NoGc<'a>, target: Value) -> Vec<Value> {
+    let mut keys = Vec::new();
+    let Some(obj) = target.as_heap_object(nogc) else {
+        return keys;
+    };
+    if obj.as_ref().is_array(nogc) {
+        let len = obj.as_ref().length().min(
+            obj.as_ref()
+                .elements_array(nogc)
+                .map(|e| e.len())
+                .unwrap_or(0),
+        );
+        for i in 0..len {
+            if obj.as_ref().element_value(nogc, i).is_some() {
+                keys.push(Smi::new(i as i64).encode());
+            }
+        }
+    }
+    for d in obj.as_ref().header.map.heap_ref(nogc).descriptors() {
+        keys.push(d.name().value());
+    }
+    keys
+}
+
+/// `Object.prototype.hasOwnProperty(key)` (ES 20.4.3.2, own properties
+/// only).
+fn object_has_own_property(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let receiver = args.get(0).ok_or(VmError::Arity)?;
+    let raw_key = args.get(1).ok_or(VmError::Arity)?;
+    let (vm, heap, state) = nctx.split();
+    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        return Ok(heap.known().exception.value());
+    };
+    let has = heap.no_gc(|nogc| {
+        let key = crate::SlotName::from_value(key);
+        if let crate::Key::Element(i) =
+            crate::classify_key(nogc, key.value()).unwrap_or(crate::Key::Name(key))
+        {
+            if let Some(obj) = receiver.as_heap_object(nogc)
+                && obj.as_ref().element_value(nogc, i).is_some()
+            {
+                return true;
+            }
+        }
+        match receiver.lookup(nogc, key) {
+            crate::Lookup::NotFound => false,
+            // the array `length` internal slot counts as an own property
+            _ => true,
+        }
+    });
+    Ok(Convert::boolean(nctx.heap(), has))
+}
+
+/// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
+fn object_property_is_enumerable(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let receiver = args.get(0).ok_or(VmError::Arity)?;
+    let raw_key = args.get(1).ok_or(VmError::Arity)?;
+    let (vm, heap, state) = nctx.split();
+    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        return Ok(heap.known().exception.value());
+    };
+    let enumerable = heap.no_gc(|nogc| {
+        let key = crate::SlotName::from_value(key);
+        if let crate::Key::Element(i) =
+            crate::classify_key(nogc, key.value()).unwrap_or(crate::Key::Name(key))
+        {
+            if let Some(obj) = receiver.as_heap_object(nogc)
+                && obj.as_ref().element_value(nogc, i).is_some()
+            {
+                return true; // array elements are enumerable
+            }
+        }
+        match receiver.lookup(nogc, key) {
+            crate::Lookup::Data { flags, .. } => flags.is_enumerable(),
+            crate::Lookup::Accessor {
+                holder, map_index, ..
+            } => holder
+                .as_ref()
+                .header
+                .map
+                .heap_ref(nogc)
+                .descriptor(map_index)
+                .flags()
+                .is_enumerable(),
+            crate::Lookup::NotFound => false,
+        }
+    });
+    Ok(Convert::boolean(nctx.heap(), enumerable))
+}
+
+/// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
+fn object_get_own_property_names(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    let names: Vec<Value> = nctx.heap().no_gc(|nogc| {
+        let mut keys = own_property_keys(nogc, target);
+        // arrays also list "length" (and it sorts with the strings)
+        if let Some(obj) = target.as_heap_object(nogc)
+            && obj.as_ref().is_array(nogc)
+        {
+            keys.push(nogc.known().strings.length.value());
+        }
+        keys
+    });
+    nctx.handle_scope(|nctx, scope| {
+        let (_, heap, _) = nctx.split();
+        let map = heap.known().js_array_map;
+        let elements = heap.allocate_handle::<FixedArray>(&names, &scope);
+        Ok(heap
+            .allocate_object(
+                &scope,
+                crate::ObjectSlotsInit {
+                    map,
+                    values: &[],
+                    elements: elements.erase(),
+                    length: names.len(),
+                },
+            )
+            .into_tagged()
+            .erase())
+    })
+}
+
+/// Build a plain `{ key: value, ... }` object from static field names.
+fn plain_object(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    fields: &[(&'static str, Value)],
+) -> Result<Value, VmError> {
+    nctx.handle_scope(|nctx, scope| {
+        let map = nctx.heap().known().object_initial_map;
+        let obj = nctx.heap().new_object(&scope, map, &[]).into_handle(&scope);
+        for (name, value) in fields {
+            let name = nctx.intern(&scope, name);
+            let name = scope.handle(SlotName::from(name.as_tagged()).tagged());
+            Object::define_own_property(
+                nctx.heap(),
+                &scope,
+                obj,
+                name,
+                PropertyDescriptor::data(*value),
+            )?;
+        }
+        Ok(obj.value())
+    })
+}
+
+/// `Object.getOwnPropertyDescriptor(O, P)` (ES 20.1.2.5).
+fn object_get_own_property_descriptor(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    let raw_key = args.get(2).ok_or(VmError::Arity)?;
+    let (vm, heap, state) = nctx.split();
+    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        return Ok(heap.known().exception.value());
+    };
+    enum Desc {
+        Data {
+            value: Value,
+            writable: bool,
+            enumerable: bool,
+            configurable: bool,
+        },
+        Accessor {
+            get: Value,
+            set: Value,
+            enumerable: bool,
+            configurable: bool,
+        },
+        /// the JSArray `length` internal slot {w+, e−, c−}
+        Length(Value),
+        Missing,
+    }
+    let desc = heap.no_gc(|nogc| {
+        let key = crate::SlotName::from_value(key);
+        if let crate::Key::Element(i) =
+            crate::classify_key(nogc, key.value()).unwrap_or(crate::Key::Name(key))
+        {
+            if let Some(obj) = target.as_heap_object(nogc)
+                && let Some(v) = obj.as_ref().element_value(nogc, i)
+            {
+                return Desc::Data {
+                    value: v,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                };
+            }
+        }
+        if let Some(obj) = target.as_heap_object(nogc)
+            && let Some(v) = obj.as_ref().array_length(nogc, key)
+        {
+            return Desc::Length(v);
+        }
+        match target.lookup(nogc, key) {
+            crate::Lookup::Data { slot, flags, .. } => Desc::Data {
+                value: slot.inner(),
+                writable: flags.is_writable(),
+                enumerable: flags.is_enumerable(),
+                configurable: flags.is_configurable(),
+            },
+            crate::Lookup::Accessor {
+                pair,
+                holder,
+                map_index,
+            } => {
+                let flags = holder
+                    .as_ref()
+                    .header
+                    .map
+                    .heap_ref(nogc)
+                    .descriptor(map_index)
+                    .flags();
+                Desc::Accessor {
+                    get: pair.get.inner(),
+                    set: pair.set.inner(),
+                    enumerable: flags.is_enumerable(),
+                    configurable: flags.is_configurable(),
+                }
+            }
+            crate::Lookup::NotFound => Desc::Missing,
+        }
+    });
+    let undefined = nctx.heap().known().undefined.value();
+    let true_v = nctx.heap().known().true_object.value();
+    let false_v = nctx.heap().known().false_object.value();
+    let bool_ = |b| if b { true_v } else { false_v };
+    match desc {
+        Desc::Data {
+            value,
+            writable,
+            enumerable,
+            configurable,
+        } => plain_object(
+            nctx,
+            &[
+                ("value", value),
+                ("writable", bool_(writable)),
+                ("enumerable", bool_(enumerable)),
+                ("configurable", bool_(configurable)),
+            ],
+        ),
+        Desc::Length(value) => plain_object(
+            nctx,
+            &[
+                ("value", value),
+                ("writable", bool_(true)),
+                ("enumerable", bool_(false)),
+                ("configurable", bool_(false)),
+            ],
+        ),
+        Desc::Accessor {
+            get,
+            set,
+            enumerable,
+            configurable,
+        } => plain_object(
+            nctx,
+            &[
+                ("get", get),
+                ("set", set),
+                ("enumerable", bool_(enumerable)),
+                ("configurable", bool_(configurable)),
+            ],
+        ),
+        Desc::Missing => Ok(undefined),
+    }
+}
+
+/// `Object.defineProperty(O, P, Attributes)` (ES 20.1.2.4): ToPropertyDescriptor
+/// + [[DefineOwnProperty]].
+fn object_define_property(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    let raw_key = args.get(2).ok_or(VmError::Arity)?;
+    let attrs = args.get(3).ok_or(VmError::Arity)?;
+    let (vm, heap, state) = nctx.split();
+    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        return Ok(heap.known().exception.value());
+    };
+    if heap.no_gc(|nogc| Convert::is_primitive(nogc, attrs)) {
+        return Err(VmError::Type);
+    }
+    // ToPropertyDescriptor (ES 7.1.6, data descriptors only)
+    let read = |nctx: &mut crate::natives::NativeContext<'_>,
+                name: &str|
+     -> Result<Option<Value>, VmError> {
+        // interned: descriptor lookup matches property names by identity
+        let s = nctx.handle_scope(|nctx, scope| nctx.intern(&scope, name).value());
+        let (vm, heap, state) = nctx.split();
+        match crate::runtime::Runtime::get_property(vm, heap, state, attrs, s)? {
+            crate::runtime::Coercion::Threw => Err(VmError::Type),
+            crate::runtime::Coercion::Value(v) => Ok(Some(v)),
+        }
+    };
+    let undefined = nctx.heap().known().undefined.value();
+    let has_value = read(nctx, "value")?.filter(|v| *v != undefined);
+    let has_get = read(nctx, "get")?.filter(|v| *v != undefined);
+    let has_set = read(nctx, "set")?.filter(|v| *v != undefined);
+    let writable = read(nctx, "writable")?
+        .map(|v| nctx.heap().no_gc(|nogc| Convert::is_truthy(nogc, v)))
+        .unwrap_or(true);
+    let enumerable = read(nctx, "enumerable")?
+        .map(|v| nctx.heap().no_gc(|nogc| Convert::is_truthy(nogc, v)))
+        .unwrap_or(false);
+    let configurable = read(nctx, "configurable")?
+        .map(|v| nctx.heap().no_gc(|nogc| Convert::is_truthy(nogc, v)))
+        .unwrap_or(false);
+    let desc = if let Some(get) = has_get.or(has_set.map(|_| nctx.heap().known().undefined.value()))
+    {
+        // accessor descriptor (ES 7.1.6): the getters/setters must be
+        // callable-or-undefined
+        let get = if has_get.is_some() {
+            get
+        } else {
+            nctx.heap().known().undefined.value()
+        };
+        let set = has_set.unwrap_or_else(|| nctx.heap().known().undefined.value());
+        for half in [get, set] {
+            if half != nctx.heap().known().undefined.value()
+                && !crate::runtime::Runtime::is_callable(nctx.heap(), half)
+            {
+                return Err(VmError::Type);
+            }
+        }
+        PropertyDescriptor::Accessor {
+            get,
+            set,
+            enumerable,
+            configurable,
+        }
+    } else {
+        PropertyDescriptor::Data {
+            value: has_value.unwrap_or_else(|| nctx.heap().known().undefined.value()),
+            writable,
+            enumerable,
+            configurable,
+        }
+    };
+    nctx.handle_scope(|nctx, scope| {
+        let target = scope.cast::<Object>(target).ok_or(VmError::Type)?;
+        let key = scope.handle(crate::SlotName::from_value(key).tagged());
+        let defined = Object::define_own_property(nctx.heap(), &scope, target, key, desc)?;
+        if !defined {
+            return Err(VmError::Type);
+        }
+        Ok(target.value())
+    })
+}
+
+/// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.4).
+fn function_call(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let f = args.get(0).ok_or(VmError::Arity)?;
+    if !crate::runtime::Runtime::is_callable(nctx.heap(), f) {
+        return Err(VmError::Type);
+    }
+    let call_args: Vec<Value> = args.as_slice().iter().skip(1).copied().collect();
+    nctx.handle_scope(|nctx, scope| nctx.call(f, scope.stage(&call_args)))
+}
+
+/// `Function.prototype.bind(thisArg, ...prepend)` (ES 20.2.3.5): the
+/// bound function is the JS closure template installed by BIND_PRELUDE,
+/// called with (target, thisArg, prepend-array).
+fn function_bind(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let f = args.get(0).ok_or(VmError::Arity)?;
+    if !crate::runtime::Runtime::is_callable(nctx.heap(), f) {
+        return Err(VmError::Type);
+    }
+    let this_arg = args
+        .get(1)
+        .unwrap_or_else(|| nctx.heap().known().undefined.value());
+    let prepend: Vec<Value> = args.as_slice().iter().skip(2).copied().collect();
+    // Function.prototype.__makeBound (installed by BIND_PRELUDE)
+    let make_bound = {
+        let name = nctx.handle_scope(|nctx, scope| nctx.intern(&scope, "__makeBound").value());
+        let (vm, heap, state) = nctx.split();
+        let proto = heap.known().function_prototype.value();
+        match crate::runtime::Runtime::get_property(vm, heap, state, proto, name)? {
+            crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
+            crate::runtime::Coercion::Value(v) => v,
+        }
+    };
+    let array = nctx.handle_scope(|nctx, scope| {
+        let (_, heap, _) = nctx.split();
+        let map = heap.known().js_array_map;
+        let elements = heap.allocate_handle::<FixedArray>(&prepend, &scope);
+        heap.allocate_object(
+            &scope,
+            crate::ObjectSlotsInit {
+                map,
+                values: &[],
+                elements: elements.erase(),
+                length: prepend.len(),
+            },
+        )
+        .into_tagged()
+        .erase()
+    });
+    nctx.handle_scope(|nctx, scope| {
+        // args[0] is the receiver (undefined for the plain call)
+        let recv = nctx.heap().known().undefined.value();
+        nctx.call(make_bound, scope.stage(&[recv, f, this_arg, array]))
+    })
+}
+
+/// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.3).
+fn function_apply(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let f = args.get(0).ok_or(VmError::Arity)?;
+    if !crate::runtime::Runtime::is_callable(nctx.heap(), f) {
+        return Err(VmError::Type);
+    }
+    let this_arg = args
+        .get(1)
+        .unwrap_or_else(|| nctx.heap().known().undefined.value());
+    let array = args
+        .get(2)
+        .unwrap_or_else(|| nctx.heap().known().undefined.value());
+    let call_args: Vec<Value> = if array == nctx.heap().known().undefined.value()
+        || array == nctx.heap().known().null.value()
+    {
+        vec![this_arg]
+    } else {
+        // array-like: read elements 0..length (holes read as undefined)
+        let len = nctx.heap().no_gc(|nogc| {
+            array
+                .as_heap_object(nogc)
+                .map(|o| {
+                    o.as_ref()
+                        .array_length(
+                            nogc,
+                            crate::SlotName::from_value(nogc.known().strings.length.value()),
+                        )
+                        .and_then(|v| Smi::decode(v).map(|s| s.value() as usize))
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0)
+        });
+        let mut out = Vec::with_capacity(len + 1);
+        out.push(this_arg);
+        for i in 0..len {
+            out.push(nctx.heap().no_gc(|nogc| {
+                array
+                    .as_heap_object(nogc)
+                    .and_then(|o| o.as_ref().element_value(nogc, i))
+                    .unwrap_or_else(|| nogc.known().undefined.value())
+            }));
+        }
+        out
+    };
+    nctx.handle_scope(|nctx, scope| nctx.call(f, scope.stage(&call_args)))
+}
+
+/// The bound-function template: a plain JS closure over (target, bound
+/// this, prepend array). The native `function_bind` builds the prepend
+/// array and delegates here — the native registry holds stateless fn
+/// pointers, so the closure state must live in a JS closure.
+const BIND_PRELUDE: &str = r#"
+Function.prototype.__makeBound = function (f, t, p) {
+  return function (...rest) {
+    var all = [];
+    for (var i = 0; i < p.length; i++) all[all.length] = p[i];
+    for (var j = 0; j < rest.length; j++) all[all.length] = rest[j];
+    return f.apply(t, all);
+  };
+};
+"#;
+
 fn object_set_prototype_of(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
@@ -913,8 +1684,7 @@ fn object_set_prototype_of(
     let proto = args.get(2).ok_or(VmError::Arity)?;
     let (nullish, target_is_object, proto_ok) = nctx.heap().no_gc(|nogc| {
         (
-            target == nogc.known().null.value()
-                || target == nogc.known().undefined.value(),
+            target == nogc.known().null.value() || target == nogc.known().undefined.value(),
             !crate::Convert::is_primitive(nogc, target),
             proto == nogc.known().null.value() || !crate::Convert::is_primitive(nogc, proto),
         )
@@ -980,6 +1750,194 @@ fn array_constructor(
             .into_tagged()
             .erase())
     })
+}
+
+/// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):
+/// returns a fresh array-iterator over the receiver (CreateArrayIterator).
+fn array_values(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let receiver = args.get(0).ok_or(VmError::Arity)?;
+    let is_array = nctx.heap().no_gc(|nogc| {
+        receiver
+            .as_heap_object(nogc)
+            .is_some_and(|o| o.as_ref().is_array(nogc))
+    });
+    if !is_array {
+        // Array.prototype[Symbol.iterator] called on a non-array: per spec
+        // the iterator operates on any array-like via length + index gets;
+        // only real arrays are supported here
+        return Err(VmError::Type);
+    }
+    nctx.handle_scope(|nctx, scope| {
+        let (_, heap, _) = nctx.split();
+        let map = heap.known().array_iterator_map;
+        let zero = Smi::new(0).encode();
+        Ok(heap
+            .new_object(&scope, map, &[receiver, zero])
+            .into_tagged()
+            .erase())
+    })
+}
+
+/// `%ArrayIteratorPrototype%.next` (ES 23.1.5.2.1): one step over the
+/// iterated array, producing `{ value, done }`.
+fn array_iterator_next(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let receiver = args.get(0).ok_or(VmError::Arity)?;
+    nctx.handle_scope(|nctx, scope| {
+        let (_, heap, _) = nctx.split();
+        let (array, index) = heap.no_gc(|nogc| {
+            let Some(obj) = receiver.as_heap_object(nogc) else {
+                return Err(VmError::Type);
+            };
+            let slots = obj.as_ref().slots.heap_ref(nogc);
+            if slots.len() < 2 {
+                return Err(VmError::Type);
+            }
+            Ok((slots.at(0), slots.at(1)))
+        })?;
+        let Some(index) = Smi::decode(index) else {
+            return Err(VmError::Type);
+        };
+        let done = {
+            let len = heap.no_gc(|nogc| {
+                array
+                    .as_heap_object(nogc)
+                    .map(|o| o.as_ref().length())
+                    .unwrap_or(0)
+            });
+            index.value() as usize >= len
+        };
+        let (value, done_value) = if done {
+            (
+                heap.known().undefined.value(),
+                heap.known().true_object.value(),
+            )
+        } else {
+            // element reads see holes as undefined
+            let v = heap.no_gc(|nogc| {
+                array
+                    .as_heap_object(nogc)
+                    .and_then(|o| o.as_ref().element_value(nogc, index.value() as usize))
+                    .unwrap_or_else(|| nogc.known().undefined.value())
+            });
+            (v, heap.known().false_object.value())
+        };
+        // advance the index slot
+        heap.no_gc(|nogc| {
+            let Some(obj) = receiver.as_heap_object(nogc) else {
+                return Err(VmError::Type);
+            };
+            let slots = obj.as_ref().slots.heap_ref(nogc);
+            slots.set(nogc, 1, Smi::new(index.value() + 1).encode());
+            Ok(())
+        })?;
+        let map = heap.known().iterator_result_map;
+        Ok(heap
+            .new_object(&scope, map, &[value, done_value])
+            .into_tagged()
+            .erase())
+    })
+}
+
+/// `%ArrayIteratorPrototype%[@@iterator]`: returns the receiver.
+fn array_iterator_symbol_iterator(
+    _nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    args.get(0).ok_or(VmError::Arity)
+}
+
+/// `Symbol(desc)`: a fresh Symbol primitive (ES 20.4.1.1). This minimal
+/// surface exists so user code can author iterables
+/// (`obj[Symbol.iterator] = ...`); `Symbol.iterator` is the well-known one.
+fn symbol_constructor(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let desc = args.get(1);
+    let bytes = nctx.heap().no_gc(|nogc| {
+        desc.and_then(|d| {
+            d.get_as::<VMString>(nogc)
+                .map(|s| s.as_slice(nogc).to_vec())
+        })
+    });
+    nctx.handle_scope(|nctx, scope| {
+        let mut text = b"Symbol(".to_vec();
+        if let Some(d) = &bytes {
+            text.extend_from_slice(d);
+        }
+        text.push(b')');
+        Ok(Symbol::new(nctx.heap(), &scope, &text).as_tagged().erase())
+    })
+}
+
+/// `Function(p0, p1, ..., body)` (ES 20.2.1.1): the dynamic constructor.
+/// Builds `function (p0, p1, ...) { body }` and evaluates it in the global
+/// scope (approximated with the caller's context; the direct-eval pipeline
+/// provides the parsing).
+fn function_constructor(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let argv: Vec<Value> = (1..args.len()).filter_map(|i| args.get(i)).collect();
+    // ToString all arguments (user toString may run)
+    let mut parts: Vec<String> = Vec::with_capacity(argv.len());
+    for a in argv {
+        let s = nctx.handle_scope(|nctx, scope| {
+            let (_, heap, _) = nctx.split();
+            let _ = heap;
+            Convert::to_string(nctx.heap(), &scope, a)
+        })?;
+        parts.push(nctx.heap().no_gc(|nogc| {
+            s.get_as::<VMString>(nogc)
+                .map(|x| String::from_utf8_lossy(x.as_slice(nogc)).into_owned())
+                .unwrap_or_default()
+        }));
+    }
+    let (params, body) = match parts.split_last() {
+        Some((body, params)) => (params.join(", "), body.clone()),
+        None => (String::new(), String::new()),
+    };
+    let source = format!("(function ({params}) {{\n{body}\n}})");
+    let context = nctx
+        .current_context()
+        .unwrap_or_else(|| nctx.heap().known().empty_context.value());
+    let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&source));
+    if p.parse_script().is_err() {
+        nctx.set_pending_exception(VmError::Type);
+        return Ok(nctx.heap().known().exception.value());
+    }
+    let ast = p.into_ast();
+    let compiled = match base_compiler::compile_eval(&ast) {
+        Ok(c) => c,
+        Err(_) => {
+            nctx.set_pending_exception(VmError::Type);
+            return Ok(nctx.heap().known().exception.value());
+        }
+    };
+    nctx.handle_scope(|nctx, scope| {
+        let (vm, heap, state) = nctx.split();
+        let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
+        nctx.call(closure.value(), GcSlice::EMPTY)
+    })
+}
+
+/// `Array.isArray(arg)` (ES 24.1.2.1).
+fn array_is_array(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let arg = args.get(1).ok_or(VmError::Arity)?;
+    let is_array = nctx.heap().no_gc(|nogc| {
+        arg.as_heap_object(nogc)
+            .is_some_and(|o| o.as_ref().is_array(nogc))
+    });
+    Ok(Convert::boolean(nctx.heap(), is_array))
 }
 
 /// `isNaN(x)`: ToNumber(x) is NaN.

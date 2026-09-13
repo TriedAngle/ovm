@@ -1,4 +1,4 @@
-use dummy_heap::{DummyHeap, DummyHeapConfig};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Value};
 use vm::{Thread, VM, VmError};
 
@@ -31,7 +31,7 @@ fn error_and_props(thread: &mut Thread, err: VmError) -> (Value, Value, Value) {
 
 #[test]
 fn error_names_map_to_spec_classes() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     for (err, expected) in [
@@ -50,7 +50,7 @@ fn error_names_map_to_spec_classes() {
 
 #[test]
 fn error_object_carries_name_and_message() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (_, name, message) = error_and_props(&mut thread, VmError::Type);
@@ -66,7 +66,7 @@ fn error_object_carries_name_and_message() {
 
 #[test]
 fn distinct_vm_errors_have_distinct_messages() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (_, _, type_msg) = error_and_props(&mut thread, VmError::Type);
@@ -76,7 +76,7 @@ fn distinct_vm_errors_have_distinct_messages() {
 
 #[test]
 fn error_objects_are_distinct_but_share_shapes() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (a, _, _) = error_and_props(&mut thread, VmError::Type);
@@ -103,7 +103,7 @@ fn error_objects_are_distinct_but_share_shapes() {
 
 #[test]
 fn error_properties_are_writable() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (obj, _, _) = error_and_props(&mut thread, VmError::Type);
@@ -128,7 +128,7 @@ fn error_properties_are_writable() {
 
 #[test]
 fn error_objects_are_extendable() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (obj, _, _) = error_and_props(&mut thread, VmError::Type);
@@ -188,7 +188,7 @@ fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
 
 #[test]
 fn startup_prototype_hierarchy() {
-    let vm = VM::new::<DummyHeap>(DummyHeapConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (error_obj, _, _) = error_and_props(&mut thread, VmError::Type);

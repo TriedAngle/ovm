@@ -42,7 +42,8 @@ pub enum ScopeKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeclKind {
-    /// function parameter
+    /// function parameter; `Declaration.param_index` is its positional slot
+    /// (none for the names bound out of a parameter pattern)
     Param,
     Var,
     Let,
@@ -50,6 +51,10 @@ pub enum DeclKind {
     /// function declaration (var-like in a function scope, lexical in a block)
     Function,
     CatchParam,
+    /// a name bound by a parameter destructuring pattern: initialized by the
+    /// prologue's destructure step (Let-like TDZ before that, var-like
+    /// redeclaration rules)
+    PatternParam,
     Class,
 }
 
@@ -57,6 +62,9 @@ pub struct Declaration {
     pub name: Symbol,
     pub kind: DeclKind,
     pub span: Span,
+    /// positional register index of a plain `DeclKind::Param` declaration
+    /// (`None` for pattern-bound param names and every other kind)
+    pub param_index: Option<u32>,
 }
 
 pub struct ScopeInfo {
@@ -109,6 +117,8 @@ pub enum PropKind {
     Method,
     Get,
     Set,
+    /// class field definition `x = init` (instance or static)
+    Field,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -203,6 +213,40 @@ pub enum Node {
     /// undefined outside construction; arrows delegate to the enclosing
     /// non-arrow function
     NewTarget,
+    /// `#name` reference: `this.#x`, `#x in obj`. The symbol is the hidden
+    /// class-scope declaration (`.priv.#x`), resolved against the enclosing
+    /// class's private environment
+    PrivateName {
+        sym: Symbol,
+    },
+
+    // binding & assignment patterns (ES 14.13)
+    /// `[a, b = 1, ...rest]`; `elements` are PatternElement | Hole (elision)
+    /// | PatternRest
+    ArrayPattern {
+        elements: NodeList,
+    },
+    /// `{a, b: c = 1, ...rest}`; `props` are PatternProperty | PatternRest
+    ObjectPattern {
+        props: NodeList,
+    },
+    /// one array-pattern element or the value of a property/parameter:
+    /// the binding or nested pattern target plus an optional default
+    PatternElement {
+        target: NodeId,
+        default: Option<NodeId>,
+    },
+    /// `{ key: target = default }` (shorthand keys carry an Identifier
+    /// target); `computed` marks `[expr]` keys
+    PatternProperty {
+        key: NodeId,
+        value: NodeId,
+        computed: bool,
+    },
+    /// `...target` in an array or object pattern (always last)
+    PatternRest {
+        target: NodeId,
+    },
 
     // statements & declarations
     ExprStmt {
@@ -214,7 +258,8 @@ pub enum Node {
         decls: NodeList,
     },
     VarDeclarator {
-        name: Symbol,
+        /// Identifier node or a binding pattern
+        target: NodeId,
         init: Option<NodeId>,
     },
     Block {
@@ -249,7 +294,8 @@ pub enum Node {
     },
     TryCatch {
         try_block: NodeId,
-        catch_param: Option<Symbol>,
+        /// Identifier node or a binding pattern
+        catch_param: Option<NodeId>,
         catch_block: Option<NodeId>,
         finally_block: Option<NodeId>,
     },
@@ -275,10 +321,34 @@ pub enum Node {
     Empty,
 }
 
+/// One formal parameter: a binding target (Identifier node or pattern),
+/// an optional default initializer, and the rest flag (ES 15.1).
+#[derive(Clone, Copy, Debug)]
+pub struct Param {
+    /// Identifier node or an ArrayPattern/ObjectPattern node
+    pub target: NodeId,
+    pub default: Option<NodeId>,
+    pub rest: bool,
+}
+
+impl Param {
+    /// Parameter lists containing any of these make the function's parameter
+    /// list "non-simple" (ES 15.1.2): names become unique, TDZ-initialized
+    /// left-to-right, and `length` truncates.
+    pub fn is_non_simple(&self, ast: &Ast) -> bool {
+        self.rest
+            || self.default.is_some()
+            || !matches!(ast.node(self.target), Node::Identifier { .. })
+    }
+}
+
 pub struct FunctionInfo {
     pub span: Span,
     pub name: Option<Symbol>,
-    pub params: Vec<Symbol>,
+    pub params: Vec<Param>,
+    /// JS-visible `length`: the number of parameters preceding the first
+    /// default / rest / pattern parameter (ES 20.2.3)
+    pub formal_length: u32,
     /// body block root; `None` once lazy parsing can skip bodies
     pub body: Option<NodeId>,
     /// stable across a skipping (pre)parse and a later full re-parse
@@ -286,6 +356,10 @@ pub struct FunctionInfo {
     pub is_declaration: bool,
     pub kind: FunctionKind,
     pub strict: bool,
+    /// synthesized field-initializer functions only: the field's key node.
+    /// When the initializer returns an anonymous function definition, the
+    /// value is NamedEvaluation'd after this key (ES 15.7.19).
+    pub field_key: Option<NodeId>,
     /// preparse data slot for lazy body skipping
     pub lazy_data: Option<Box<[u8]>>,
 }
@@ -338,12 +412,15 @@ impl FunctionKind {
 
 pub struct ClassMember {
     pub key: NodeId,
-    /// FunctionExpr node
+    /// FunctionExpr node: the method, or the synthesized field-initializer
+    /// function for `PropKind::Field` members (body `return <init>;`)
     pub value: NodeId,
     pub kind: PropKind,
     pub is_static: bool,
     pub is_constructor: bool,
     pub computed: bool,
+    /// private name fields (`#x`): key is a PrivateName node
+    pub is_private: bool,
 }
 
 pub struct ClassInfo {
@@ -361,6 +438,10 @@ pub struct ClassInfo {
     /// `super.x` resolution (the prototype and the constructor)
     pub home: Option<Symbol>,
     pub static_home: Option<Symbol>,
+    /// private names declared by this class in declaration order (hidden
+    /// class-scope const declarations `.priv.#x`, holding a fresh private
+    /// Symbol per class evaluation)
+    pub privates: Vec<Symbol>,
 }
 
 /// parse-local byte-slice interner; heap internalization at materialization
@@ -502,6 +583,10 @@ impl Ast {
         &self.classes[id.0 as usize]
     }
 
+    pub fn class_count(&self) -> usize {
+        self.classes.len()
+    }
+
     // ---- scopes ----
 
     pub fn add_scope(&mut self, kind: ScopeKind, parent: Option<ScopeId>) -> ScopeId {
@@ -523,9 +608,36 @@ impl Ast {
     }
 
     pub fn declare(&mut self, scope: ScopeId, name: Symbol, kind: DeclKind, span: Span) {
-        self.scopes[scope.0 as usize]
-            .decls
-            .push(Declaration { name, kind, span });
+        self.scopes[scope.0 as usize].decls.push(Declaration {
+            name,
+            kind,
+            span,
+            param_index: None,
+        });
+    }
+
+    /// Declare a positional formal parameter (register-backed).
+    pub fn declare_param(
+        &mut self,
+        scope: ScopeId,
+        name: Symbol,
+        kind: DeclKind,
+        span: Span,
+        param_index: u32,
+    ) {
+        self.scopes[scope.0 as usize].decls.push(Declaration {
+            name,
+            kind,
+            span,
+            param_index: Some(param_index),
+        });
+    }
+
+    /// Replace the node stored at `id` (pattern cover-grammar rewrites keep
+    /// node ids stable so parent references survive).
+    pub fn replace(&mut self, id: NodeId, node: Node, span: Span) {
+        self.nodes[id.0 as usize] = node;
+        self.spans[id.0 as usize] = span;
     }
 
     pub fn set_node_scope(&mut self, node: NodeId, scope: ScopeId) {

@@ -400,15 +400,21 @@ fn var_declarations() {
     assert_eq!(kind, parser::VarKind::Var);
     let decls = ast.list_items(decls);
     assert_eq!(decls.len(), 2);
-    let VarDeclarator { name, init } = *ast.node(decls[0]) else {
+    let VarDeclarator { target, init } = *ast.node(decls[0]) else {
         panic!()
     };
-    assert_eq!(sym_text(&ast, name), b"x");
+    let Identifier { sym } = *ast.node(target) else {
+        panic!()
+    };
+    assert_eq!(sym_text(&ast, sym), b"x");
     assert!(init.is_some());
-    let VarDeclarator { name, init } = *ast.node(decls[1]) else {
+    let VarDeclarator { target, init } = *ast.node(decls[1]) else {
         panic!()
     };
-    assert_eq!(sym_text(&ast, name), b"y");
+    let Identifier { sym } = *ast.node(target) else {
+        panic!()
+    };
+    assert_eq!(sym_text(&ast, sym), b"y");
     assert!(init.is_none());
     assert!(matches!(
         stmt(&ast, 1),
@@ -558,7 +564,10 @@ fn function_declaration() {
     assert_eq!(sym_text(&ast, f.name.unwrap()), b"add");
     assert!(f.is_declaration);
     assert_eq!(f.params.len(), 2);
-    assert_eq!(sym_text(&ast, f.params[0]), b"a");
+    let Identifier { sym } = *ast.node(f.params[0].target) else {
+        panic!()
+    };
+    assert_eq!(sym_text(&ast, sym), b"a");
     let Block { stmts } = ast.node(f.body.unwrap()) else {
         panic!()
     };
@@ -728,7 +737,10 @@ fn try_catch_forms() {
     else {
         panic!()
     };
-    assert_eq!(sym_text(&ast, catch_param.unwrap()), b"e");
+    let Identifier { sym } = *ast.node(catch_param.unwrap()) else {
+        panic!()
+    };
+    assert_eq!(sym_text(&ast, sym), b"e");
     assert!(catch_block.is_some());
     assert!(finally_block.is_none());
 
@@ -957,11 +969,18 @@ fn class_early_errors() {
     parse_err("class C { constructor() {} constructor() {} }"); // duplicate
     parse_err("class C { get constructor() {} }");
     parse_err("class C { static prototype() {} }"); // ES 15.7.1
-    parse_err("class C { x = 1; }"); // fields not supported yet
     parse_err("class C { static { } }"); // static blocks not supported yet
     parse_err("class { }"); // declaration needs a name
     parse_err("class C { get x(a) {} }");
     parse_err("class C { set x() {} }");
+    // field early errors (ES 15.7.1)
+    parse_err("class C { constructor = 1; }"); // field named constructor
+    parse_err("class C { static prototype = 1; }"); // static field named prototype
+    parse_err("class C { #x; #x; }"); // duplicate private name
+    parse_err("class C { m() { this.#y; } }"); // undeclared private name
+    parse_err("this.#x;"); // private name outside a class
+    // fields now parse
+    parse("class C { x = 1; static y = 2; #z = 3; [w] = 4; static [v] = 5; }");
     // `static` as a member name still works
     parse("class C { static() {} }");
     // a static member named "constructor" is an ordinary method
