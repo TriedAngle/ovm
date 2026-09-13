@@ -1,7 +1,7 @@
 use core::ptr::NonNull;
 
 use crate::{
-    Convert, GcSlice, Handle, HandleScope, Heap, InternedString, Lookup, Object,
+    Convert, GcSlice, Handle, HandleScope, Heap, InternedString, Lookup, NoGc, Object,
     PropertyDescriptor, SlotName, Smi, Symbol, VMString, Value, VmError, private_find,
     runtime::Coercion,
 };
@@ -189,6 +189,10 @@ fn runtime_fn(id: bytecode::RuntimeFn) -> NativeFn {
         bytecode::RuntimeFn::SetClassFields => set_class_fields,
         bytecode::RuntimeFn::InitInstanceFields => init_instance_fields,
         bytecode::RuntimeFn::RequireObjectCoercible => require_object_coercible,
+        bytecode::RuntimeFn::DeletePropertySloppy => delete_property_sloppy,
+        bytecode::RuntimeFn::DeletePropertyStrict => delete_property_strict,
+        bytecode::RuntimeFn::DeleteIdentifierSloppy => delete_identifier_sloppy,
+        bytecode::RuntimeFn::DeleteSuperProperty => delete_super_property,
     }
 }
 
@@ -255,6 +259,158 @@ fn require_object_coercible(
         return Err(VmError::Type);
     }
     Ok(arg)
+}
+
+// ---- delete (ES 13.5.1) ----------------------------------------------------
+
+/// `delete obj.key` in sloppy code: (obj, key) -> bool.
+fn delete_property_sloppy(
+    nctx: &mut NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    delete_property(nctx, args, false)
+}
+
+/// `delete obj.key` in strict code: (obj, key) -> bool, TypeError when
+/// the delete fails (ES 13.5.1.2 step 4.h).
+fn delete_property_strict(
+    nctx: &mut NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    delete_property(nctx, args, true)
+}
+
+fn delete_property(
+    nctx: &mut NativeContext<'_>,
+    args: GcSlice<'_>,
+    strict: bool,
+) -> Result<Value, VmError> {
+    let target = args.get(0).ok_or(VmError::Arity)?;
+    let raw_key = args.get(1).ok_or(VmError::Arity)?;
+    // the reference's key is coerced before the base is touched (ES
+    // 13.15.5 EvaluatePropertyAccess: user toString/valueOf of a
+    // computed key runs even when the delete afterwards throws)
+    let (vm, heap, state) = nctx.split();
+    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        return Ok(nctx.heap().known().exception.value());
+    };
+    let ok = delete_property_core(nctx, target, key)?;
+    if strict && !ok {
+        return Err(VmError::Type);
+    }
+    Ok(Convert::boolean(nctx.heap(), ok))
+}
+
+fn delete_property_core(
+    nctx: &mut NativeContext<'_>,
+    target: Value,
+    key: Value,
+) -> Result<bool, VmError> {
+    // ToObject (ES 7.2.3): a null/undefined base throws
+    let nullish = nctx.heap().no_gc(|nogc| {
+        target == nogc.known().null.value() || target == nogc.known().undefined.value()
+    });
+    if nullish {
+        return Err(VmError::Type);
+    }
+    // primitives: ToObject creates a fresh wrapper whose only own
+    // properties are a string's non-configurable length/indices
+    if nctx
+        .heap()
+        .no_gc(|nogc| Convert::is_primitive(nogc, target))
+    {
+        let owned = nctx
+            .heap()
+            .no_gc(|nogc| string_exotic_own(nogc, target, key));
+        return Ok(!owned);
+    }
+    nctx.handle_scope(|nctx, scope| {
+        let receiver = scope
+            .cast::<Object>(target)
+            .expect("non-primitive receivers are objects");
+        Object::delete_own_property(nctx.heap(), &scope, receiver, key)
+    })
+}
+
+/// Whether a ToObject'd primitive owns `key` non-configurably: only
+/// String wrappers own anything — "length" and their indices (ES
+/// 10.4.3.3/4 StringGetOwnProperty). Deleting those yields false; every
+/// other primitive property deletes as absent (true).
+fn string_exotic_own<'a>(nogc: &'a NoGc<'a>, target: Value, key: Value) -> bool {
+    let Some(s) = target.get_as::<VMString>(nogc) else {
+        return false;
+    };
+    if let Some(idx) = Smi::decode(key) {
+        let i = idx.value();
+        return i >= 0 && (i as u64) < utf16_length(s.as_slice(nogc)) as u64;
+    }
+    let Some(name) = key.get_as::<InternedString>(nogc) else {
+        return false; // symbols own nothing on primitives
+    };
+    let bytes = name.string().as_slice(nogc);
+    bytes == b"length" || canonical_index(bytes).is_some_and(|i| i < utf16_length(s.as_slice(nogc)))
+}
+
+/// Canonical array-index strings ("0", "1", "42"): digits only, no
+/// leading zeros (ES 6.1.7). "01", "-0" and "1e2" are not indices.
+fn canonical_index(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() || bytes.len() > 10 {
+        return None;
+    }
+    if bytes[0] == b'0' {
+        return (bytes.len() == 1).then_some(0);
+    }
+    let mut n: usize = 0;
+    for &b in bytes {
+        let d = b.checked_sub(b'0')?;
+        n = n.checked_mul(10)?.checked_add(d as usize)?;
+    }
+    Some(n)
+}
+
+/// WTF-8 bytes → UTF-16 code-unit count: BMP code points (1-3 byte
+/// sequences) are one unit, supplementary code points (4-byte sequences)
+/// are two.
+fn utf16_length(bytes: &[u8]) -> usize {
+    let mut units = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let width = match b {
+            0x00..=0x7F => 1,
+            0x80..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            _ => 4,
+        };
+        units += usize::from(width == 4) + 1;
+        i += width;
+    }
+    units
+}
+
+/// Sloppy `delete x` on an unresolved name (ES 13.5.1.2 step 5 →
+/// GlobalEnvironmentRecord.DeleteBinding): (name) -> bool. Declared
+/// bindings resolve statically and compile to `false`; only global-object
+/// properties reach here, and sloppy references never throw on failure.
+fn delete_identifier_sloppy(
+    nctx: &mut NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let name = args.get(0).ok_or(VmError::Arity)?;
+    let global = nctx.heap().known().global_object.value();
+    let ok = delete_property_core(nctx, global, name)?;
+    Ok(Convert::boolean(nctx.heap(), ok))
+}
+
+/// `delete super.x` (ES 13.5.1.2 step 4.c): ReferenceError in both
+/// language modes. The reference has already been evaluated (including
+/// the uninitialized-`this` check and the key expression); the key is
+/// never coerced — delete-super fails before any ToPropertyKey.
+fn delete_super_property(
+    _nctx: &mut NativeContext<'_>,
+    _args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    Err(VmError::Reference)
 }
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
