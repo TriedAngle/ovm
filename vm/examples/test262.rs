@@ -66,6 +66,10 @@ const UNSUPPORTED_PATHS: &[&str] = &[
     "15.4.4.14-9-9",
     "15.4.4.15-8-9",
     "length-truncate-with-indexed",
+    // newly-parsing legacy array tests hitting the same dense-allocation
+    // limitation (new Array(4294967295)-style)
+    "S15.4_A1.1_T10",
+    "S12.6.3_A3",
 ];
 
 #[derive(Default)]

@@ -37,12 +37,43 @@ pub fn classify_key<'a>(nogc: &'a NoGc<'a>, key: Value) -> Result<Key, VmError> 
         return Ok(Key::Name(SlotName::from(Tagged::from_smi(smi))));
     }
     if let Some(s) = key.get_as::<InternedString>(nogc) {
+        // Canonical index strings ("0", "1", … up to 2^32−2) name the same
+        // property as their numeric form (ES 6.1.7: ToString(i) is the
+        // canonical key); non-canonical spellings ("01", "-0", "1e2") stay
+        // ordinary names
+        if let Some(i) = canonical_index(s.string().as_slice(nogc))
+            && i <= u32::MAX as usize - 1
+        {
+            return Ok(Key::Element(i));
+        }
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
     if let Some(s) = key.get_as::<Symbol>(nogc) {
         return Ok(Key::Name(SlotName::from(s.into_tagged())));
     }
     Err(VmError::Type)
+}
+
+/// Canonical array-index strings ("0", "1", "42"): digits only, no
+/// leading zeros (ES 6.1.7). "01", "-0", "1e2" and any non-digit
+/// spelling ("a", "+1") are not indices. The result is NOT
+/// range-checked against 2^32−1 — callers decide whether a value that
+/// large is still an array index.
+pub fn canonical_index(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() || bytes.len() > 10 {
+        return None;
+    }
+    if bytes[0] == b'0' {
+        return (bytes.len() == 1).then_some(0);
+    }
+    let mut n: usize = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(n)
 }
 
 /// The result of a property load: a plain value or a getter that must be invoked.
@@ -64,6 +95,18 @@ pub fn load_outcome<'a>(
         && let Some(v) = obj.as_ref().array_length(nogc, name)
     {
         return Ok(LoadOutcome::Value(v));
+    }
+    // string primitives expose `length` (UTF-16 code units) as an own
+    // property without boxing (ES 5.4.3.1); index loads need a fresh
+    // one-character string and stay unsupported here
+    if let Some(s) = receiver.get_as::<crate::VMString>(nogc)
+        && name
+            .value()
+            .get_as::<InternedString>(nogc)
+            .is_some_and(|n| n.string().as_slice(nogc) == b"length")
+    {
+        let len = crate::natives::utf16_length(s.as_slice(nogc)) as i64;
+        return Ok(LoadOutcome::Value(Smi::new(len).encode()));
     }
     match receiver.lookup(nogc, name) {
         Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.inner())),
@@ -93,15 +136,23 @@ impl Value {
 
 /// ES 7.3.11 HasProperty (the `in` operator): walks the prototype chain
 /// without invoking anything. Element indices consult the array elements
-/// (including their backing-store holes).
+/// (including their backing-store holes); canonical index strings are
+/// classified first so `"2" in o` and `2 in o` agree.
 pub fn has_property<'a>(nogc: &'a NoGc<'a>, receiver: Value, name: SlotName) -> bool {
-    if let Key::Element(i) = classify_key(nogc, name.value()).unwrap_or(Key::Name(name)) {
-        if let Some(obj) = receiver.as_heap_object(nogc)
-            && obj.as_ref().element_value(nogc, i).is_some()
-        {
-            return true;
+    let name = match classify_key(nogc, name.value()) {
+        Ok(Key::Element(i)) => {
+            // non-array receivers keep index keys as Smi-named
+            // descriptors; canonicalize so the named walk finds them
+            let smi_name = SlotName::from(Tagged::from_smi(Smi::new(i as i64)));
+            if let Some(obj) = receiver.as_heap_object(nogc)
+                && obj.as_ref().element_value(nogc, i).is_some()
+            {
+                return true;
+            }
+            smi_name
         }
-    }
+        _ => name,
+    };
     !matches!(receiver.lookup(nogc, name), Lookup::NotFound)
 }
 

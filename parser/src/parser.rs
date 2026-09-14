@@ -576,7 +576,11 @@ impl<S: CharStream> Parser<S> {
             TokenKind::Let => {
                 match self.peek_ahead()?.kind {
                     k if is_identifier_like(k) => {}
-                    TokenKind::LBracket | TokenKind::LBrace => {}
+                    // `let [` / `let {` only declare when on the same
+                    // line: `let\n[x] = y` is a member access on the
+                    // variable `let` (web legacy, ES B.3.3)
+                    TokenKind::LBracket | TokenKind::LBrace
+                        if !self.peek_ahead()?.after_newline => {}
                     _ => return Ok(None),
                 }
                 VarKind::Let
@@ -612,10 +616,11 @@ impl<S: CharStream> Parser<S> {
 
     fn parse_statement_inner(&mut self) -> Result<NodeId, ParseError> {
         let t = self.peek()?;
-        // labeled statement: `label : Statement` (not before function/class)
+        // labeled statement: `label : Statement` (not before function/class).
+        // No newline restriction: `x` on its own line followed by `:` is a
+        // label (`:` cannot start a statement, so there is no ASI hazard)
         if is_identifier_like(t.kind)
             && !matches!(t.kind, TokenKind::Function | TokenKind::Class)
-            && !t.after_newline
             && self.peek_ahead()?.kind == TokenKind::Colon
         {
             return self.parse_labeled_statement();
@@ -677,38 +682,8 @@ impl<S: CharStream> Parser<S> {
         let start = self.next()?.span.start; // var / let / const
         let mut decls = Vec::new();
         loop {
-            let t = self.peek()?;
-            let target = if matches!(t.kind, TokenKind::LBracket | TokenKind::LBrace) {
-                self.pattern_names.clear();
-                self.parse_binding_pattern(PatCtx::VarDecl(kind))?
-            } else {
-                let t = self.next()?;
-                let name = self.ident_symbol(t)?;
-                match kind {
-                    VarKind::Var => self.declare_var(name, t.span, DeclKind::Var)?,
-                    VarKind::Let => self.declare_lexical(name, t.span, DeclKind::Let)?,
-                    VarKind::Const => self.declare_lexical(name, t.span, DeclKind::Const)?,
-                }
-                self.ast.add(Node::Identifier { sym: name }, t.span)
-            };
-            let init = if self.eat(TokenKind::Assign)? {
-                Some(self.parse_assignment()?)
-            } else {
-                None
-            };
-            if kind == VarKind::Const && init.is_none() {
-                return Err(ParseError::new(
-                    t.span,
-                    "missing initializer in const declaration",
-                ));
-            }
-            let end = init
-                .map(|i| self.ast.span(i).end)
-                .unwrap_or(self.ast.span(target).end);
-            decls.push(self.ast.add(
-                Node::VarDeclarator { target, init },
-                Span::new(t.span.start, end),
-            ));
+            let target = self.parse_declarator_binding(kind)?;
+            decls.push(self.parse_declarator_tail(kind, target)?);
             if !self.eat(TokenKind::Comma)? {
                 break;
             }
@@ -721,6 +696,48 @@ impl<S: CharStream> Parser<S> {
         Ok(self
             .ast
             .add(Node::VarDecl { kind, decls }, Span::new(start, end)))
+    }
+
+    /// One declarator binding: an identifier (declared in the scope the
+    /// kind requires) or a binding pattern.
+    fn parse_declarator_binding(&mut self, kind: VarKind) -> Result<NodeId, ParseError> {
+        let t = self.peek()?;
+        if matches!(t.kind, TokenKind::LBracket | TokenKind::LBrace) {
+            self.pattern_names.clear();
+            return self.parse_binding_pattern(PatCtx::VarDecl(kind));
+        }
+        let t = self.next()?;
+        let name = self.ident_symbol(t)?;
+        match kind {
+            VarKind::Var => self.declare_var(name, t.span, DeclKind::Var)?,
+            VarKind::Let => self.declare_lexical(name, t.span, DeclKind::Let)?,
+            VarKind::Const => self.declare_lexical(name, t.span, DeclKind::Const)?,
+        }
+        Ok(self.ast.add(Node::Identifier { sym: name }, t.span))
+    }
+
+    /// The part of a declarator after its binding target: the optional
+    /// initializer (const requires one), producing a VarDeclarator.
+    fn parse_declarator_tail(&mut self, kind: VarKind, target: NodeId) -> Result<NodeId, ParseError> {
+        let init = if self.eat(TokenKind::Assign)? {
+            Some(self.parse_assignment()?)
+        } else {
+            None
+        };
+        if kind == VarKind::Const && init.is_none() {
+            return Err(ParseError::new(
+                self.ast.span(target),
+                "missing initializer in const declaration",
+            ));
+        }
+        let start = self.ast.span(target).start;
+        let end = init
+            .map(|i| self.ast.span(i).end)
+            .unwrap_or(self.ast.span(target).end);
+        Ok(self.ast.add(
+            Node::VarDeclarator { target, init },
+            Span::new(start, end),
+        ))
     }
 
     fn parse_if(&mut self) -> Result<NodeId, ParseError> {
@@ -741,6 +758,36 @@ impl<S: CharStream> Parser<S> {
             .add(Node::If { cond, then, else_ }, Span::new(start, end)))
     }
 
+    /// ES 14.13/14.7: a single-statement loop body (for / for-in /
+    /// for-of / while / do-while) is a Statement — `var` qualifies,
+    /// lexical declarations (let/const), function and class
+    /// declarations do not and are early errors.
+    fn reject_lexical_loop_body(&self, body: NodeId) -> Result<(), ParseError> {
+        let bad = match *self.ast.node(body) {
+            Node::VarDecl { kind, .. } => {
+                matches!(kind, VarKind::Let | VarKind::Const)
+            }
+            Node::FunctionDecl { .. } | Node::ClassDecl { .. } => true,
+            _ => false,
+        };
+        if bad {
+            return Err(ParseError::new(
+                self.ast.span(body),
+                "lexical declaration not allowed as a single-statement loop body",
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_lexical_loop_body_checked(
+        &self,
+        body: Result<NodeId, ParseError>,
+    ) -> Result<NodeId, ParseError> {
+        let body = body?;
+        self.reject_lexical_loop_body(body)?;
+        Ok(body)
+    }
+
     fn parse_while(&mut self) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::While)?.span.start;
         self.expect(TokenKind::LParen)?;
@@ -749,7 +796,7 @@ impl<S: CharStream> Parser<S> {
         self.loop_depth += 1;
         let body = self.parse_statement();
         self.loop_depth -= 1;
-        let body = body?;
+        let body = self.reject_lexical_loop_body_checked(body)?;
         let end = self.ast.span(body).end;
         Ok(self
             .ast
@@ -762,47 +809,128 @@ impl<S: CharStream> Parser<S> {
         // not leak into the enclosing scope
         let scope_id = self.push_scope(ScopeKind::For);
         self.expect(TokenKind::LParen)?;
-        let init = if self.eat(TokenKind::Semicolon)? {
-            None
-        } else {
-            let init = if let Some(kind) = self.peek_var_kind()? {
-                self.parse_var_decl(kind, false)?
+
+        // Head disambiguation (ES 14.7.5): `for (binding in expr)` /
+        // `for (LHS in expr)` are for-in; anything else is the C-style
+        // three-clause head.
+        enum Head {
+            ForIn { left: NodeId, object: NodeId },
+            Init { expr: Option<NodeId> },
+        }
+        let head = if self.peek()?.kind == TokenKind::Semicolon {
+            self.next()?;
+            Head::Init { expr: None }
+        } else if let Some(kind) = self.peek_var_kind()? {
+            // a declarator head: parse ONE binding with no initializer;
+            // `in` directly after it is for-in, otherwise parsing
+            // resumes as the C-style declarator list
+            let decl_start = self.next()?.span.start; // var / let / const
+            let target = self.parse_declarator_binding(kind)?;
+            if self.eat(TokenKind::In)? {
+                let object = self.parse_expression()?;
+                let decl_span = Span::new(decl_start, self.ast.span(object).end);
+                let declarator = self.ast.add(
+                    Node::VarDeclarator {
+                        target,
+                        init: None,
+                    },
+                    Span::new(decl_start, self.ast.span(target).end),
+                );
+                let decls = self.ast.list(&[declarator]);
+                let left = self.ast.add(Node::VarDecl { kind, decls }, decl_span);
+                Head::ForIn { left, object }
             } else {
-                self.parse_expression()?
-            };
-            self.expect(TokenKind::Semicolon)?;
-            Some(init)
-        };
-        let cond = if self.eat(TokenKind::Semicolon)? {
-            None
+                // C-style: finish this declarator, then the rest of the list
+                let mut decls = vec![self.parse_declarator_tail(kind, target)?];
+                while self.eat(TokenKind::Comma)? {
+                    let target = self.parse_declarator_binding(kind)?;
+                    decls.push(self.parse_declarator_tail(kind, target)?);
+                }
+                let end = self.ast.span(*decls.last().unwrap()).end;
+                let decls = self.ast.list(&decls);
+                let expr = self
+                    .ast
+                    .add(Node::VarDecl { kind, decls }, Span::new(decl_start, end));
+                self.expect(TokenKind::Semicolon)?;
+                Head::Init { expr: Some(expr) }
+            }
         } else {
-            let c = self.parse_expression()?;
-            self.expect(TokenKind::Semicolon)?;
-            Some(c)
+            // an expression head: a for-in LHS is a LeftHandSideExpression,
+            // so parse one speculatively and check for `in` (bookmarks
+            // restore the scanner only — the discarded fragment leaves
+            // orphaned, unreachable AST nodes). `of`-heads are rejected
+            // by the C-style path's `;` expectation, as before.
+            let mark = self.bookmark();
+            let lhs = self.parse_postfix()?;
+            if self.eat(TokenKind::In)? {
+                if !matches!(*self.ast.node(lhs), Node::Identifier { .. } | Node::Property { .. }) {
+                    return Err(ParseError::new(
+                        self.ast.span(lhs),
+                        "invalid for-in assignment target",
+                    ));
+                }
+                let object = self.parse_expression()?;
+                Head::ForIn { left: lhs, object }
+            } else {
+                self.restore(mark);
+                let expr = self.parse_expression()?;
+                // wrap as a statement so C-style codegen accepts it
+                // (emit_for takes ExprStmt/VarDecl/Empty inits)
+                let span = self.ast.span(expr);
+                let wrapped = self.ast.add(Node::ExprStmt { expr }, span);
+                self.expect(TokenKind::Semicolon)?;
+                Head::Init { expr: Some(wrapped) }
+            }
         };
-        let next = if self.peek()?.kind == TokenKind::RParen {
-            None
-        } else {
-            Some(self.parse_expression()?)
-        };
-        self.expect(TokenKind::RParen)?;
-        self.loop_depth += 1;
-        let body = self.parse_statement();
-        self.loop_depth -= 1;
-        self.scopes.pop();
-        let body = body?;
-        let end = self.ast.span(body).end;
-        let node = self.ast.add(
-            Node::For {
-                init,
-                cond,
-                next,
-                body,
-            },
-            Span::new(start, end),
-        );
-        self.ast.set_node_scope(node, scope_id);
-        Ok(node)
+
+        match head {
+            Head::ForIn { left, object } => {
+                self.expect(TokenKind::RParen)?;
+                self.loop_depth += 1;
+                let body = self.parse_statement();
+                self.loop_depth -= 1;
+                self.scopes.pop();
+                let body = self.reject_lexical_loop_body_checked(body)?;
+                let end = self.ast.span(body).end;
+                let node = self
+                    .ast
+                    .add(Node::ForIn { left, object, body }, Span::new(start, end));
+                self.ast.set_node_scope(node, scope_id);
+                Ok(node)
+            }
+            Head::Init { expr: init } => {
+                let cond = if self.eat(TokenKind::Semicolon)? {
+                    None
+                } else {
+                    let c = self.parse_expression()?;
+                    self.expect(TokenKind::Semicolon)?;
+                    Some(c)
+                };
+                let next = if self.peek()?.kind == TokenKind::RParen {
+                    None
+                } else {
+                    Some(self.parse_expression()?)
+                };
+                self.expect(TokenKind::RParen)?;
+                self.loop_depth += 1;
+                let body = self.parse_statement();
+                self.loop_depth -= 1;
+                self.scopes.pop();
+                let body = self.reject_lexical_loop_body_checked(body)?;
+                let end = self.ast.span(body).end;
+                let node = self.ast.add(
+                    Node::For {
+                        init,
+                        cond,
+                        next,
+                        body,
+                    },
+                    Span::new(start, end),
+                );
+                self.ast.set_node_scope(node, scope_id);
+                Ok(node)
+            }
+        }
     }
 
     fn parse_return(&mut self) -> Result<NodeId, ParseError> {

@@ -93,6 +93,9 @@ pub struct WellKnown {
     pub array_iterator_prototype: Global<Object>,
     /// Map of iterator-result objects `{ value, done }` (w+, e+, c+)
     pub iterator_result_map: Global<Map>,
+    /// Hidden for-in enumerator: slots [level, keys, index, visited]
+    /// (ES 14.7.5.9 EnumerateObjectProperties; unreachable from JS)
+    pub for_in_enumerator_map: Global<Map>,
     pub strings: WellKnownStrings,
 }
 
@@ -143,6 +146,9 @@ define_well_known_strings! {
     number => "number",
     string => "string",
     boolean => "boolean",
+    number_ctor => "Number",
+    boolean_ctor => "Boolean",
+    symbol_ctor => "Symbol",
     object => "object",
     function => "function",
     symbol => "symbol",
@@ -218,6 +224,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         array_iterator_map: map,
         array_iterator_prototype: obj,
         iterator_result_map: map,
+        for_in_enumerator_map: map,
         strings: WellKnownStrings::uninit(roots),
     }
 }

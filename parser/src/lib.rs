@@ -280,6 +280,16 @@ pub enum Node {
         next: Option<NodeId>,
         body: NodeId,
     },
+    /// `for (left in object) body` (ES 14.7.5). `left` is a
+    /// single-declarator initializer-less VarDecl (`for (var/let/const k
+    /// in …)`), or an assignment target (identifier / member reference,
+    /// re-evaluated per iteration). The object expression evaluates
+    /// inside the head scope; `body` runs once per yielded key.
+    ForIn {
+        left: NodeId,
+        object: NodeId,
+        body: NodeId,
+    },
     Return {
         value: Option<NodeId>,
     },
