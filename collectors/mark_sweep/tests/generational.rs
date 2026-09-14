@@ -24,9 +24,9 @@ impl Roots {
         let boxed = Box::new(self);
         state.set_host(GcHost {
             ctx: boxed.as_ref() as *const Roots as *const (),
-            visit_roots: visit_roots,
-            layout_of: layout_of,
-            visit_object: visit_object,
+            visit_roots,
+            layout_of,
+            visit_object,
         });
         boxed
     }

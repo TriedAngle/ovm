@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use heap_api::{
-    AllocError, GcHost, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell, Visitor, Word,
+    AllocError, GcHost, HeapBackend, HeapStats, LocalHeap, RawCell, SharedHeap, Visitor, Word,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -102,7 +102,7 @@ impl DummyHeap {
     }
 }
 
-/// Concrete per-thread heap used behind [`DUMMY_HEAP_VTABLE`].
+/// Concrete per-thread heap; type-erased behind [`LocalHeap`].
 pub struct DummyLocalHeap {
     shared: Arc<DummyHeapState>,
 }
@@ -113,100 +113,66 @@ impl DummyLocalHeap {
     }
 }
 
-fn erased_allocate_raw(local: *mut (), layout: Layout) -> Result<NonNull<u8>, AllocError> {
-    let local: &DummyLocalHeap = unsafe { &*local.cast::<DummyLocalHeap>() };
-    local.shared.allocate(layout)
-}
+impl LocalHeap for DummyLocalHeap {
+    fn allocate_raw(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        self.shared.allocate(layout)
+    }
 
-fn erased_write_barrier(_local: *const (), _host: Word, _slot: &RawCell, _value: Word) {}
+    fn write_barrier(&self, _host: Word, _slot: &RawCell, _value: Word) {}
 
-fn erased_collection_requested(_local: *const ()) -> bool {
-    false
-}
+    fn collection_requested(&self) -> bool {
+        false
+    }
 
-fn erased_park_for_collection(_local: *const ()) {}
+    fn park_for_collection(&self) {}
 
-fn erased_force_collect(_local: *const ()) {}
-fn erased_collect_minor(_local: *const ()) {}
+    fn force_collect(&self) {}
 
-fn erased_gc_in_progress(_local: *const ()) -> bool {
-    false
-}
+    fn collect_minor(&self) {}
 
-/// The dummy heap never collects: it accepts the host registration and
-/// drops it.
-fn erased_set_host(_shared: *const (), _host: GcHost) {}
-
-fn erased_drop_local(local: *mut ()) {
-    unsafe { drop(Box::from_raw(local.cast::<DummyLocalHeap>())) };
-}
-
-fn erased_global_new_local(shared: *const ()) -> *mut () {
-    let state: *const DummyHeapState = shared.cast();
-    // clone-through-raw: take another reference for the new local
-    unsafe { Arc::increment_strong_count(state) };
-    Box::into_raw(Box::new(DummyLocalHeap {
-        shared: unsafe { Arc::from_raw(state) },
-    })) as *mut ()
-}
-
-fn erased_global_iterate_roots(_shared: *const (), _roots: &mut dyn Visitor) {}
-
-fn erased_global_should_collect(_shared: *const ()) -> bool {
-    false
-}
-
-fn erased_global_gc_in_progress(_shared: *const ()) -> bool {
-    false
-}
-
-fn erased_global_force_collect(_shared: *const ()) {}
-
-fn erased_global_contains(shared: *const (), addr: Word) -> bool {
-    let state: &DummyHeapState = unsafe { &*shared.cast::<DummyHeapState>() };
-    state.contains(addr)
-}
-
-fn erased_global_is_young(_shared: *const (), _value: Word) -> bool {
-    false
-}
-
-fn erased_global_stats(shared: *const ()) -> HeapStats {
-    let state: &DummyHeapState = unsafe { &*shared.cast::<DummyHeapState>() };
-    HeapStats {
-        used: state.used(),
-        capacity: state.capacity(),
+    fn gc_in_progress(&self) -> bool {
+        false
     }
 }
 
-fn erased_global_drop_shared(shared: *mut ()) {
-    unsafe { Arc::decrement_strong_count(shared.cast::<DummyHeapState>()) };
+impl SharedHeap for DummyHeap {
+    fn new_local(&self) -> Box<dyn LocalHeap> {
+        Box::new(DummyLocalHeap {
+            shared: Arc::clone(&self.inner),
+        })
+    }
+
+    /// The dummy heap never collects: it accepts the host registration and
+    /// drops it.
+    fn set_host(&self, _host: GcHost) {}
+
+    fn iterate_roots(&self, _roots: &mut dyn Visitor) {}
+
+    fn should_collect(&self) -> bool {
+        false
+    }
+
+    fn gc_in_progress(&self) -> bool {
+        false
+    }
+
+    fn force_collect(&self) {}
+
+    fn contains(&self, addr: Word) -> bool {
+        self.inner.contains(addr)
+    }
+
+    fn is_young(&self, _value: Word) -> bool {
+        false
+    }
+
+    fn stats(&self) -> HeapStats {
+        HeapStats {
+            used: self.inner.used(),
+            capacity: self.inner.capacity(),
+        }
+    }
 }
-
-static DUMMY_HEAP_VTABLE: HeapVtable = HeapVtable {
-    allocate_raw: erased_allocate_raw,
-    write_barrier: erased_write_barrier,
-    collection_requested: erased_collection_requested,
-    park_for_collection: erased_park_for_collection,
-    force_collect: erased_force_collect,
-    collect_minor: erased_collect_minor,
-    gc_in_progress: erased_gc_in_progress,
-    drop_local: erased_drop_local,
-};
-
-static DUMMY_GLOBAL_VTABLE: GlobalVtable = GlobalVtable {
-    local_vtable: &DUMMY_HEAP_VTABLE,
-    new_local: erased_global_new_local,
-    set_host: erased_set_host,
-    iterate_roots: erased_global_iterate_roots,
-    should_collect: erased_global_should_collect,
-    gc_in_progress: erased_global_gc_in_progress,
-    force_collect: erased_global_force_collect,
-    contains: erased_global_contains,
-    is_young: erased_global_is_young,
-    stats: erased_global_stats,
-    drop_shared: erased_global_drop_shared,
-};
 
 impl HeapBackend for DummyHeap {
     type Config = DummyHeapConfig;
@@ -215,9 +181,8 @@ impl HeapBackend for DummyHeap {
         DummyHeap::new(config)
     }
 
-    fn into_global(self) -> (*mut (), &'static GlobalVtable) {
-        let state = Arc::into_raw(self.inner) as *mut ();
-        (state, &DUMMY_GLOBAL_VTABLE)
+    fn into_shared(self) -> std::sync::Arc<dyn SharedHeap> {
+        std::sync::Arc::new(self)
     }
 }
 
@@ -236,13 +201,13 @@ mod tests {
 
     impl Fixture {
         fn new(size: usize) -> Self {
-            let (state, vtable) = DummyHeap::new(DummyHeapConfig { heap_size: size })
+            let shared = DummyHeap::new(DummyHeapConfig { heap_size: size })
                 .unwrap()
-                .into_global();
+                .into_shared();
             // same capacity the real VM uses (one bootstrap pass)
             let roots = unsafe { vm::RootHandles::new(256, vm::Smi::new(0).encode()) };
             Self {
-                global: vm::GlobalHeap::new(state, vtable),
+                global: vm::GlobalHeap::new(shared),
                 known: vm::KnownCell::new(vm::WellKnown::uninit(&roots)),
                 roots,
             }

@@ -12,10 +12,6 @@ fn run(src: &str) -> Result<Value, ScriptError> {
     thread.run_script(src)
 }
 
-fn smi(v: i64) -> Value {
-    Smi::new(v).encode()
-}
-
 fn run_smi(src: &str) -> i64 {
     Smi::decode(run(src).unwrap()).unwrap().value()
 }
@@ -178,7 +174,7 @@ fn symbol_keys_delete() {
 }
 
 #[test]
-fn propertyIntrospectionReflectsTheDelete() {
+fn property_introspection_reflects_the_delete() {
     assert_eq!(
         run_smi(
             "var o = {a: 1, b: 2};

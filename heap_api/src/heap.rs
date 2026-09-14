@@ -62,7 +62,7 @@ pub struct HeapStats {
     pub capacity: usize,
 }
 
-/// VM services a collector needs, registered once via `GlobalVtable::set_host`.
+/// VM services a collector needs, registered once via [`SharedHeap::set_host`].
 ///
 /// Callable from any thread: `visit_roots` runs once per cycle on the
 /// initiating thread while all mutators are stopped; `visit_object` may run
@@ -81,32 +81,28 @@ pub struct GcHost {
 unsafe impl Send for GcHost {}
 unsafe impl Sync for GcHost {}
 
-pub struct HeapVtable {
-    pub allocate_raw: fn(local: *mut (), layout: Layout) -> Result<NonNull<u8>, AllocError>,
-    pub write_barrier: fn(local: *const (), host: Word, slot: &RawCell, value: Word),
-    pub collection_requested: fn(local: *const ()) -> bool,
-    pub park_for_collection: fn(local: *const ()),
-    pub force_collect: fn(local: *const ()),
-    pub collect_minor: fn(local: *const ()),
-    pub gc_in_progress: fn(local: *const ()) -> bool,
-    pub drop_local: fn(local: *mut ()),
+pub trait LocalHeap: Send {
+    fn allocate_raw(&self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
+    fn write_barrier(&self, host: Word, slot: &RawCell, value: Word);
+    fn collection_requested(&self) -> bool;
+    fn park_for_collection(&self);
+    fn force_collect(&self);
+    fn collect_minor(&self);
+    fn gc_in_progress(&self) -> bool;
 }
 
-pub struct GlobalVtable {
-    /// Vtable used for local heaps created by the global heap.
-    pub local_vtable: &'static HeapVtable,
-    pub new_local: fn(shared: *const ()) -> *mut (),
-    pub set_host: fn(shared: *const (), host: GcHost),
-    pub iterate_roots: fn(shared: *const (), roots: &mut dyn Visitor),
-    pub should_collect: fn(shared: *const ()) -> bool,
-    pub gc_in_progress: fn(shared: *const ()) -> bool,
+pub trait SharedHeap: Send + Sync {
+    fn new_local(&self) -> Box<dyn LocalHeap>;
+    fn set_host(&self, host: GcHost);
+    fn iterate_roots(&self, roots: &mut dyn Visitor);
+    fn should_collect(&self) -> bool;
+    fn gc_in_progress(&self) -> bool;
     /// Run one full collection cycle synchronously; returns when complete.
     /// Must not be called from a thread that owns a local heap.
-    pub force_collect: fn(shared: *const ()),
-    pub contains: fn(shared: *const (), addr: Word) -> bool,
-    pub is_young: fn(shared: *const (), value: Word) -> bool,
-    pub stats: fn(shared: *const ()) -> HeapStats,
-    pub drop_shared: fn(shared: *mut ()),
+    fn force_collect(&self);
+    fn contains(&self, addr: Word) -> bool;
+    fn is_young(&self, value: Word) -> bool;
+    fn stats(&self) -> HeapStats;
 }
 
 pub trait HeapBackend: Sized + Send + Sync {
@@ -114,5 +110,5 @@ pub trait HeapBackend: Sized + Send + Sync {
 
     fn new(config: Self::Config) -> Result<Self, AllocError>;
 
-    fn into_global(self) -> (*mut (), &'static GlobalVtable);
+    fn into_shared(self) -> std::sync::Arc<dyn SharedHeap>;
 }

@@ -2,8 +2,7 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 use heap_api::{
-    AllocError, CLEARED, GcHost, HeapBackend, RawCell, STRONG_PTR, TAG_MASK, Visitor, WEAK_PTR,
-    Word,
+    CLEARED, GcHost, HeapBackend, RawCell, STRONG_PTR, TAG_MASK, Visitor, WEAK_PTR, Word,
 };
 
 use mark_sweep::heap::{MarkSweep, MarkSweepConfig, MarkSweepLocal, MarkSweepState};
@@ -137,20 +136,19 @@ fn backend(
 }
 
 #[test]
-fn vtable_roundtrip_smoke() {
-    let ms = MarkSweep::new(MarkSweepConfig {
+fn shared_heap_smoke() {
+    let shared = MarkSweep::new(MarkSweepConfig {
         heap_size: 64 * 1024,
     })
-    .unwrap();
-    let (shared, vtable) = ms.into_global();
-    let local = (vtable.new_local)(shared);
-    let ptr = (vtable.local_vtable.allocate_raw)(local, Layout::new::<u64>()).unwrap();
-    assert!((vtable.contains)(shared, ptr.as_ptr() as Word));
+    .unwrap()
+    .into_shared();
+    let local = shared.new_local();
+    let ptr = local.allocate_raw(Layout::new::<u64>()).unwrap();
+    assert!(shared.contains(ptr.as_ptr() as Word));
     // capacity counts the usable region: the chunk header is carved out
     let usable = 64 * 1024 - mark_sweep::chunk::HEADER_SIZE;
-    assert_eq!((vtable.stats)(shared).capacity, usable);
-    (vtable.local_vtable.drop_local)(local);
-    (vtable.drop_shared)(shared);
+    assert_eq!(shared.stats().capacity, usable);
+    drop(local);
 }
 
 #[test]
@@ -196,15 +194,10 @@ fn oom_when_live_data_exhausts_arena() {
     let (state, local, mut roots) = backend(16 * 1024, Roots::empty());
     let layout = Layout::new::<u64>();
     let mut live = Vec::new();
-    loop {
-        match local.allocate(layout) {
-            Ok(ptr) => {
-                register(ptr, 8);
-                roots.strong(ptr);
-                live.push(ptr);
-            }
-            Err(AllocError::OutOfMemory(_)) => break,
-        }
+    while let Ok(ptr) = local.allocate(layout) {
+        register(ptr, 8);
+        roots.strong(ptr);
+        live.push(ptr);
     }
     assert!(state.stats().used > 0);
     // freeing the roots lets the next allocation trigger a cycle and succeed
