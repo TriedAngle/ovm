@@ -362,18 +362,18 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Function (constructor: dynamic bodies via eval, ES 20.2.1) --------
         let function_prototype = thread.heap().known().function_prototype;
         let function_fn = make_native_function(thread, &scope, roots, idx.function_constructor)?;
-        define_data(
+        define_method_prop(
             thread.heap(),
             &scope,
             function_prototype,
-            wks.constructor,
+            SlotName::from_value(wks.constructor.value()),
             function_fn.value(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             function_fn,
-            wks.prototype,
+            SlotName::from_value(wks.prototype.value()),
             function_prototype.value(),
         )?;
         let function_name = thread.intern(&scope, "Function");
@@ -492,18 +492,18 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // constructor to it (like Array below)
         let object_prototype = thread.heap().known().object_prototype;
         let object_fn = make_native_function(thread, &scope, roots, idx.object)?;
-        define_data(
+        define_method_prop(
             thread.heap(),
             &scope,
             object_prototype,
-            wks.constructor,
+            SlotName::from_value(wks.constructor.value()),
             object_fn.value(),
         )?;
-        define_data(
+        define_method_prop(
             thread.heap(),
             &scope,
             object_fn,
-            wks.prototype,
+            SlotName::from_value(wks.prototype.value()),
             object_prototype.value(),
         )?;
         let object_name = thread.intern(&scope, "Object");
@@ -560,18 +560,18 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // whose prototype is %Object.prototype%); just link the constructor
         let array_fn = make_native_function(thread, &scope, roots, idx.array)?;
         let array_prototype = thread.heap().known().array_prototype;
-        define_data(
+        define_method_prop(
             thread.heap(),
             &scope,
             array_prototype,
-            wks.constructor,
+            SlotName::from_value(wks.constructor.value()),
             array_fn.value(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             array_fn,
-            wks.prototype,
+            SlotName::from_value(wks.prototype.value()),
             array_prototype.value(),
         )?;
         let array_name = thread.intern(&scope, "Array");
@@ -620,7 +620,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let sym_iterator_iter =
             make_native_function(thread, &scope, roots, idx.array_iterator_symbol_iterator)?;
         let iterator_symbol = thread.heap().known().iterator_symbol;
-        define_data(
+        define_method_prop(
             thread.heap(),
             &scope,
             array_iterator_prototype,
@@ -632,14 +632,14 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // native returning a fresh array-iterator object
         let values_fn = make_native_function(thread, &scope, roots, idx.array_values)?;
         let values_name = thread.intern(&scope, "values");
-        define_data(
+        define_method_prop(
             thread.heap(),
             &scope,
             array_prototype,
             SlotName::from(values_name.as_tagged()),
             values_fn.value(),
         )?;
-        define_data(
+        define_method_prop(
             thread.heap(),
             &scope,
             array_prototype,
@@ -693,6 +693,18 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         known.array_iterator_map = array_iterator_map;
         known.array_iterator_prototype = array_iterator_prototype;
         known.iterator_result_map = iterator_result_map;
+        // for-in enumerator map: slots [level, keys, index, visited],
+        // prototype Object.prototype (it must survive `x in Object.prototype`
+        // style probes without special cases; the object is never exposed)
+        let for_in_enumerator_map = alloc_map_with_slots(
+            thread.heap(),
+            &scope,
+            roots,
+            MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            object_prototype,
+            4,
+        )?;
+        known.for_in_enumerator_map = for_in_enumerator_map;
         thread.heap().set_known(known);
 
         let is_nan_fn = make_native_function(thread, &scope, roots, idx.is_nan)?;
@@ -844,16 +856,17 @@ fn install_constructor<'s>(
     let proto = thread.heap().new_object(scope, map, &[]).into_global(roots);
 
     // proto.constructor = fn; fn.prototype = proto
+    // (built-in methods/constructor properties are non-enumerable, ES 20+)
     let constructor_str = thread.intern(scope, "constructor");
     let prototype_str = thread.intern(scope, "prototype");
-    define_data(
+    define_method_prop(
         thread.heap(),
         scope,
         proto,
         SlotName::from(constructor_str.as_tagged()),
         fn_obj.value(),
     )?;
-    define_data(
+    define_method_prop(
         thread.heap(),
         scope,
         fn_obj,
@@ -883,12 +896,40 @@ fn install_method<'s>(
 ) -> Result<(), VmError> {
     let method = make_native_function(thread, scope, roots, index)?;
     let name_str = thread.intern(scope, name);
-    define_data(
+    define_method_prop(
         thread.heap(),
         scope,
         receiver,
         SlotName::from(name_str.as_tagged()),
         method.value(),
+    )?;
+    Ok(())
+}
+
+/// A built-in method property: {writable: true, enumerable: false,
+/// configurable: true} (ES 20.1.3-style attributes for prototype
+/// methods). Non-enumerability keeps for-in/`Object.keys` clean.
+#[allow(clippy::too_many_arguments)]
+fn define_method_prop(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    object: crate::Global<Object>,
+    name: SlotName,
+    value: Value,
+) -> Result<(), VmError> {
+    let obj = scope.handle(object.as_tagged());
+    let name = scope.handle(name.tagged());
+    Object::define_own_property(
+        heap,
+        scope,
+        obj,
+        name,
+        PropertyDescriptor::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        },
     )?;
     Ok(())
 }
@@ -1970,12 +2011,8 @@ fn error_to_string(
 ) -> Result<Value, VmError> {
     let receiver = args.get(0).ok_or(VmError::Arity)?;
     let (vm, heap, state) = nctx.split();
-    let name = get_property(vm, heap, state, receiver, "name");
-    eprintln!("get name: {name:?}");
-    let name = name?;
-    let message = get_property(vm, heap, state, receiver, "message");
-    eprintln!("get message: {message:?}");
-    let message = message?;
+    let name = get_property(vm, heap, state, receiver, "name")?;
+    let message = get_property(vm, heap, state, receiver, "message")?;
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, _) = nctx.split();
         let a = Convert::to_string(heap, &scope, name)?;

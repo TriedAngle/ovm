@@ -84,13 +84,22 @@ pub enum RuntimeFn {
     /// (key) -> never returns — `delete super.x` (ES 13.5.1.2 step 4.c):
     /// ReferenceError in both language modes; the key is coerced first
     DeleteSuperProperty,
+    /// (obj) -> enumerator | undefined — for-in head (ES 14.7.5.6):
+    /// undefined for a null/undefined subject (zero iterations), else a
+    /// hidden enumerator walking the prototype chain lazily
+    ForInEnumerate,
+    /// (enumerator) -> key-string | undefined — the next enumerable
+    /// string key (ES 14.7.5.9 EnumerateObjectProperties), or undefined
+    /// when the walk is exhausted; deleted-before-visited and
+    /// shadowed keys are skipped inside
+    ForInNext,
 }
 
 impl RuntimeFn {
     /// All variants in discriminant order. The array length is the
     /// variant count (type-checked), and the VM registers its table in
     /// this order so registry indices equal discriminants.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 19] = [
         Self::GetIterator,
         Self::IteratorNext,
         Self::IteratorDone,
@@ -108,6 +117,8 @@ impl RuntimeFn {
         Self::DeletePropertyStrict,
         Self::DeleteIdentifierSloppy,
         Self::DeleteSuperProperty,
+        Self::ForInEnumerate,
+        Self::ForInNext,
     ];
 
     pub const COUNT: u16 = Self::ALL.len() as u16;
