@@ -2683,6 +2683,9 @@ impl<'a> FunctionGen<'a> {
                 next,
                 body,
             } => self.emit_for(node, init, cond, next, body, None),
+            Node::ForIn { left, object, body } => {
+                self.emit_for_in(node, left, object, body, None)
+            }
             Node::Return { value } => {
                 // derived constructors: `return v` returns v only when it is
                 // an object; `undefined` (and fallthrough) return `this`,
@@ -2787,6 +2790,165 @@ impl<'a> FunctionGen<'a> {
         Ok(())
     }
 
+    /// `for (left in object) body` (ES 14.7.5): the subject evaluates in
+    /// the head scope (lexical bindings are in TDZ there), null/undefined
+    /// enumerate nothing, and the loop pulls one key per iteration from
+    /// the hidden enumerator. The assignment target re-evaluates per
+    /// iteration (ForIn/OfBodyEvaluation: "it may be evaluated
+    /// repeatedly").
+    fn emit_for_in(
+        &mut self,
+        node: NodeId,
+        left: NodeId,
+        object: NodeId,
+        body: NodeId,
+        label: Option<Symbol>,
+    ) -> Result<(), CompileError> {
+        let scope = self.ast.node_scope(node);
+        let per_iteration = self.resolved.per_iteration_loops.contains(&node);
+        // lexical heads (`for (let/const k in …)`) own a block context;
+        // captured heads get a fresh copy per iteration so closures in
+        // the body capture per-iteration bindings (ES 14.7.5.7)
+        let ctx_save = scope.filter(|s| !self.ast.scope(*s).decls.is_empty()).map(|s| {
+            let count = self.ast.scope(s).decls.len() as u32;
+            emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
+            let save = self.reserve_temp();
+            emit(&mut self.code, Opcode::PushContext, &[save]);
+            save
+        });
+        if let Some(s) = scope {
+            self.scopes.push(s);
+        }
+        let result = (|| {
+            // head: subject → enumerator (undefined for nullish subjects;
+            // ForInNext(undefined) is immediately done). Lexical heads
+            // are in TDZ here: `for (let k in k)` throws (ES 14.7.5.6)
+            self.expr(object)?;
+            let subject = self.push_value();
+            emit(
+                &mut self.code,
+                Opcode::CallRuntime,
+                &[bytecode::RuntimeFn::ForInEnumerate as u32, subject, 1],
+            );
+            self.pop_value(); // the call consumed the subject; acc = enumerator
+            let enumerator = self.push_value();
+
+            // loop: next key or undefined
+            let head = self.code.len();
+            self.breakables.push(Breakable {
+                label,
+                breaks: Label::new(),
+                continues: Some(Label::new()),
+            });
+            emit(
+                &mut self.code,
+                Opcode::CallRuntime,
+                &[bytecode::RuntimeFn::ForInNext as u32, enumerator, 1],
+            );
+            let mut have_key = Label::new();
+            emit_jump(&mut self.code, Opcode::JumpIfNotUndefined, &mut have_key);
+            emit_jump(
+                &mut self.code,
+                Opcode::Jump,
+                &mut self.breakables.last_mut().unwrap().breaks,
+            );
+            have_key.bind(&self.code);
+            have_key.patch_all(&mut self.code);
+            let key = self.push_value();
+
+            // per iteration with a lexical head: replace the context with
+            // a fresh sibling (same outer) and initialize the binding
+            // there — a fresh binding per iteration
+            if per_iteration {
+                let save = ctx_save.expect("per-iteration loops own a context");
+                emit(&mut self.code, Opcode::PopContext, &[save]);
+                let count = self
+                    .ast
+                    .scope(scope.expect("lexical loop heads own their scope"))
+                    .decls
+                    .len() as u32;
+                emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
+                emit(&mut self.code, Opcode::PushContext, &[save]);
+            }
+
+            // assign the key to the target (per iteration), then the body
+            self.emit_for_in_assign(left, key)?;
+            self.stmt(body)?;
+
+            self.breakables
+                .last_mut()
+                .unwrap()
+                .continues
+                .as_mut()
+                .unwrap()
+                .bind(&self.code);
+            let mut back = Label::new();
+            emit_jump(&mut self.code, Opcode::JumpLoop, &mut back);
+            let (mut breaks, continues) = self.end_breakable();
+            breaks.bind(&self.code);
+            breaks.patch_all(&mut self.code);
+            continues.unwrap().patch_all(&mut self.code);
+            back.bind_at(head);
+            back.patch_all(&mut self.code);
+            // absolute restore: break may arrive from arbitrary context
+            // depth (labelled jumps past nested loop pops)
+            if let Some(save) = ctx_save {
+                emit(&mut self.code, Opcode::PopContext, &[save]);
+            }
+
+            self.pop_value(); // key
+            self.pop_value(); // enumerator
+            Ok(())
+        })();
+        if ctx_save.is_some() {
+            self.next_temp -= 1; // save
+        }
+        if scope.is_some() {
+            self.scopes.pop();
+        }
+        result
+    }
+
+    /// Store the enumeration key (in register `key`) into the for-in
+    /// assignment target. Declaration heads assign their single binding
+    /// (patterns destructure); expression targets are stored through the
+    /// normal assignment machinery.
+    fn emit_for_in_assign(&mut self, left: NodeId, key: u32) -> Result<(), CompileError> {
+        match *self.ast.node(left) {
+            Node::VarDecl { decls, .. } => {
+                let [declarator] = self.ast.list_items(decls) else {
+                    return self.err(left, "for-in declarator");
+                };
+                let Node::VarDeclarator { target, init: None } = *self.ast.node(*declarator)
+                else {
+                    return self.err(left, "for-in declarator initializer");
+                };
+                match *self.ast.node(target) {
+                    Node::Identifier { sym } => {
+                        emit(&mut self.code, Opcode::Load, &[key]);
+                        self.store_name(target, sym)
+                    }
+                    Node::ObjectPattern { .. } | Node::ArrayPattern { .. } => {
+                        self.emit_pattern(target, key, true)
+                    }
+                    _ => self.err(left, "for-in binding pattern"),
+                }
+            }
+            Node::Identifier { sym } => {
+                emit(&mut self.code, Opcode::Load, &[key]);
+                self.store_name(left, sym)
+            }
+            Node::Property { .. } => {
+                let store = self.prepare_property_store(left)?;
+                emit(&mut self.code, Opcode::Load, &[key]);
+                self.emit_property_store(&store);
+                self.release_store(&store);
+                Ok(())
+            }
+            _ => self.err(left, "for-in assignment target"),
+        }
+    }
+
     fn emit_while(
         &mut self,
         cond: NodeId,
@@ -2834,10 +2996,22 @@ impl<'a> FunctionGen<'a> {
         body: NodeId,
         label: Option<Symbol>,
     ) -> Result<(), CompileError> {
-        if self.resolved.per_iteration_loops.contains(&node) {
-            return self.err(node, "per-iteration loop environments");
-        }
         let scope = self.ast.node_scope(node);
+        let per_iteration = self.resolved.per_iteration_loops.contains(&node);
+        // `for (let/const i = …; …; …)`: the head bindings own a block
+        // context. Captured bindings require a fresh environment per
+        // iteration with the values copied forward, so closures in the
+        // body observe per-iteration bindings (ES 14.7.5.4,
+        // CreatePerIterationEnvironment)
+        let for_ctx = scope
+            .filter(|s| !self.ast.scope(*s).decls.is_empty())
+            .map(|s| (s, self.ast.scope(s).decls.len() as u32));
+        let ctx_save = for_ctx.map(|(_, count)| {
+            emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
+            let save = self.reserve_temp();
+            emit(&mut self.code, Opcode::PushContext, &[save]);
+            save
+        });
         if let Some(s) = scope {
             self.scopes.push(s);
         }
@@ -2849,6 +3023,23 @@ impl<'a> FunctionGen<'a> {
                     }
                     _ => return self.err(init, "for loop initializer"),
                 }
+            }
+            // per-iteration state: copy registers for the head bindings
+            // and the current iteration's context (merge points restore
+            // absolutely — a labelled continue may bypass the pops of
+            // nested loops still holding contexts)
+            let copies: Vec<u32>;
+            let mut iter_ctx: Option<u32> = None;
+            if per_iteration {
+                let (_, count) = for_ctx.expect("per-iteration loops own a scope");
+                copies = (0..count).map(|_| self.reserve_temp()).collect();
+                let iter_ctx_reg = self.reserve_temp();
+                // the first iteration starts from a copy of the head
+                // context: values copied out, fresh sibling pushed
+                self.emit_iteration_context_copy(Some(iter_ctx_reg), count, &copies, ctx_save);
+                iter_ctx = Some(iter_ctx_reg);
+            } else {
+                copies = Vec::new();
             }
             // head: cond?; JumpIfFalsy breaks; body; continues; update; back-edge
             let head = self.code.len();
@@ -2873,6 +3064,14 @@ impl<'a> FunctionGen<'a> {
                 .as_mut()
                 .unwrap()
                 .bind(&self.code);
+            if let Some(iter_ctx) = iter_ctx {
+                let (_, count) = for_ctx.expect("per-iteration loops own a scope");
+                // absolute restore to this iteration's context, then
+                // copy its values into a fresh sibling for the next
+                // iteration (ES 14.7.5.4: the copy precedes the update)
+                emit(&mut self.code, Opcode::PopContext, &[iter_ctx]);
+                self.emit_iteration_context_copy(Some(iter_ctx), count, &copies, ctx_save);
+            }
             if let Some(next) = next {
                 self.expr(next)?;
             }
@@ -2884,12 +3083,64 @@ impl<'a> FunctionGen<'a> {
             continues.unwrap().patch_all(&mut self.code);
             back.bind_at(head);
             back.patch_all(&mut self.code);
+            // absolute restore: break may arrive from arbitrary context
+            // depth (labelled jumps past nested loop pops)
+            if let Some(save) = ctx_save {
+                emit(&mut self.code, Opcode::PopContext, &[save]);
+            }
             Ok(())
         })();
+        // release the loop's permanent temps: the context save, the
+        // per-iteration copy registers and the iteration-context register
+        if ctx_save.is_some() {
+            self.next_temp -= 1; // save
+        }
+        if per_iteration {
+            let (_, count) = for_ctx.expect("per-iteration loops own a scope");
+            self.next_temp -= count + 1; // copies + iter ctx
+        }
         if scope.is_some() {
             self.scopes.pop();
         }
         result
+    }
+
+    /// Copy a loop head's bindings into a fresh sibling context: read
+    /// the slots out of the current context, pop to the shared outer,
+    /// create a fresh context (holes) and write the values back in.
+    /// `ctx_save` holds the outer context (the PushContext invariant);
+    /// when `iter_ctx` is given it receives the new context's value (the
+    /// absolute restore target at merge points).
+    fn emit_iteration_context_copy(
+        &mut self,
+        iter_ctx: Option<u32>,
+        count: u32,
+        copies: &[u32],
+        ctx_save: Option<u32>,
+    ) {
+        for slot in 0..count {
+            emit(
+                &mut self.code,
+                Opcode::LoadContextSlot,
+                &[slot, 0],
+            );
+            emit(&mut self.code, Opcode::Store, &[copies[slot as usize]]);
+        }
+        let save = ctx_save.expect("per-iteration loops own a context");
+        emit(&mut self.code, Opcode::PopContext, &[save]);
+        emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
+        if let Some(iter_ctx) = iter_ctx {
+            emit(&mut self.code, Opcode::Store, &[iter_ctx]);
+        }
+        emit(&mut self.code, Opcode::PushContext, &[save]);
+        for slot in 0..count {
+            emit(&mut self.code, Opcode::Load, &[copies[slot as usize]]);
+            emit(
+                &mut self.code,
+                Opcode::StoreContextSlot,
+                &[slot, 0],
+            );
+        }
     }
 
     /// Pop the innermost breakable; the caller must bind+patch the labels.
@@ -2905,15 +3156,22 @@ impl<'a> FunctionGen<'a> {
         body: NodeId,
     ) -> Result<(), CompileError> {
         // a label on a loop/switch tags its breakable; elsewhere it wraps
-        // a break-only breakable
+        // a break-only breakable. Loop bodies re-dispatch with the LOOP
+        // node (`body`): head scopes and per-iteration contexts hang off
+        // the loop node, not the label wrapper
         match *self.ast.node(body) {
             Node::While { cond, body } => self.emit_while(cond, body, Some(label)),
             Node::For {
                 init,
                 cond,
                 next,
-                body,
-            } => self.emit_for(node, init, cond, next, body, Some(label)),
+                body: loop_body,
+            } => self.emit_for(body, init, cond, next, loop_body, Some(label)),
+            Node::ForIn {
+                left,
+                object,
+                body: loop_body,
+            } => self.emit_for_in(body, left, object, loop_body, Some(label)),
             Node::Switch { disc, cases } => self.emit_switch(node, disc, cases, Some(label)),
             _ => {
                 self.breakables.push(Breakable {
@@ -3116,8 +3374,12 @@ impl<'a> FunctionGen<'a> {
         }
         for s in 0..self.ast.scope_count() {
             let scope = ScopeId(s as u32);
-            // class scopes own their own contexts, not this function's
-            if self.ast.scope(scope).kind == ScopeKind::Class {
+            // class scopes and lexical for-head scopes own their own
+            // contexts, not this function's
+            if matches!(self.ast.scope(scope).kind, ScopeKind::Class)
+                || (self.ast.scope(scope).kind == ScopeKind::For
+                    && !self.ast.scope(scope).decls.is_empty())
+            {
                 continue;
             }
             // owning function of this scope: nearest enclosing function scope

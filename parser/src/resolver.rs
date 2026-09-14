@@ -258,11 +258,17 @@ impl<'a> Resolver<'a> {
     }
 
     /// Whether a scope introduces a context at runtime: every function
-    /// does, plus the context-creating class scopes.
+    /// does, plus the context-creating class scopes and for-head scopes
+    /// with lexical bindings (per-iteration environments, ES 14.7.5).
     fn creates_ctx(&self, scope: ScopeId) -> bool {
         match self.ast.scope(scope).kind {
             ScopeKind::Script | ScopeKind::Function => true,
             ScopeKind::Class => self.ctx_classes.contains(&scope),
+            // `for (let/const …; …)` and `for (let/const k in …)`: the
+            // head bindings need a per-evaluation context. Uncaptured
+            // heads use a single one; captured heads get a fresh copy
+            // per iteration (per_iteration_loops)
+            ScopeKind::For => !self.ast.scope(scope).decls.is_empty(),
             _ => false,
         }
     }
@@ -518,12 +524,12 @@ impl<'a> Resolver<'a> {
             Node::ExprStmt { expr } => self.walk_node(expr),
             Node::VarDecl { decls, .. } => self.walk_list(decls),
             Node::VarDeclarator { target, init } => {
-                // plain identifier targets store through the declaration's
-                // slot (resolution_for_decl); only patterns carry leaf
-                // Identifier nodes that need their own resolutions
-                if !matches!(self.ast.node(*&target), Node::Identifier { .. }) {
-                    self.walk_node(target);
-                }
+                // targets always resolve: pattern leaves are stored
+                // through by destructuring codegen, and a plain
+                // identifier target is the per-iteration assignment
+                // target of a for-in declaration head (its resolution
+                // is keyed by node id like any reference)
+                self.walk_node(target);
                 if let Some(init) = init {
                     self.walk_node(init);
                 }
@@ -577,6 +583,11 @@ impl<'a> Resolver<'a> {
                 if let Some(n) = next {
                     self.walk_node(n);
                 }
+                self.walk_node(body);
+            }
+            Node::ForIn { left, object, body } => {
+                self.walk_node(left);
+                self.walk_node(object);
                 self.walk_node(body);
             }
             Node::Return { value } => {
@@ -692,9 +703,13 @@ impl<'a> Resolver<'a> {
                 if self.fn_owner[s] != fid {
                     continue;
                 }
-                // class scopes own a dedicated per-evaluation context with
-                // its own slot space (created by CreateBlockContext)
-                if ast.scope(scope).kind == ScopeKind::Class {
+                // class scopes and lexical for-head scopes own a
+                // dedicated per-evaluation context with its own slot
+                // space (created by CreateBlockContext)
+                if matches!(ast.scope(scope).kind, ScopeKind::Class)
+                    || (ast.scope(scope).kind == ScopeKind::For
+                        && !ast.scope(scope).decls.is_empty())
+                {
                     continue;
                 }
                 for (d, decl) in ast.scope(scope).decls.iter().enumerate() {
@@ -742,6 +757,31 @@ impl<'a> Resolver<'a> {
                 new_target_slot,
                 this_function_slot,
             };
+        }
+
+        // lexical for-head scopes: like class inner scopes, every
+        // declaration is a context slot in the loop's dedicated block
+        // context, numbered in declaration order (the context is
+        // re-created per iteration for captured heads)
+        for s in 0..ast.scope_count() {
+            let scope = ScopeId(s as u32);
+            if ast.scope(scope).kind != ScopeKind::For
+                || ast.scope(scope).decls.is_empty()
+            {
+                continue;
+            }
+            for (d, decl) in ast.scope(scope).decls.iter().enumerate() {
+                let hole_check =
+                    matches!(decl.kind, DeclKind::Let | DeclKind::Const);
+                slots.insert(
+                    (scope, d as u32),
+                    Resolution::Context {
+                        slot: d as u32,
+                        depth: 0,
+                        hole_check,
+                    },
+                );
+            }
         }
 
         // class inner scopes: every declaration is a context slot in the
@@ -811,7 +851,7 @@ impl<'a> Resolver<'a> {
         let mut per_iteration_loops = Vec::new();
         for n in 0..ast.node_count() {
             let id = NodeId(n as u32);
-            if !matches!(ast.node(id), Node::For { .. }) {
+            if !matches!(ast.node(id), Node::For { .. } | Node::ForIn { .. }) {
                 continue;
             }
             let Some(scope) = ast.node_scope(id) else {

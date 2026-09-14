@@ -1064,6 +1064,24 @@ fn step(
                 return Step::PendingThrow;
             };
             cache.set_acc(key);
+            // string primitives expose their code units as index
+            // properties (ES 5.4.3.1): `"ab"[1]` is "b". The one-unit
+            // string is allocated fresh — string comparison is by
+            // content, so identity is unobservable. Out-of-range and
+            // non-string receivers fall through to the ordinary path.
+            let string_index = heap.no_gc(|nogc| match classify_key(nogc, key) {
+                Ok(Key::Element(i)) if receiver.get_as::<VMString>(nogc).is_some() => Some(i),
+                _ => None,
+            });
+            if let Some(i) = string_index {
+                let unit = state.handle_scope(|scope| {
+                    crate::natives::string_char_at(heap, &scope, receiver, i)
+                });
+                if let Some(unit) = unit {
+                    cache.set_acc(unit);
+                    return Step::Next;
+                }
+            }
             let outcome = step_try!(heap.no_gc(|nogc| {
                 match classify_key(nogc, cache.acc())? {
                     Key::Element(i) => match receiver

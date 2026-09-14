@@ -1,8 +1,8 @@
 use core::ptr::NonNull;
 
 use crate::{
-    Convert, GcSlice, Handle, HandleScope, Heap, InternedString, Lookup, NoGc, Object,
-    PropertyDescriptor, SlotName, Smi, Symbol, VMString, Value, VmError, private_find,
+    Convert, FixedArray, GcSlice, Handle, HandleScope, Heap, InternedString, Lookup, NoGc, Object,
+    PropertyDescriptor, SlotName, Smi, Symbol, Tagged, VMString, Value, VmError, private_find,
     runtime::Coercion,
 };
 
@@ -193,6 +193,8 @@ fn runtime_fn(id: bytecode::RuntimeFn) -> NativeFn {
         bytecode::RuntimeFn::DeletePropertyStrict => delete_property_strict,
         bytecode::RuntimeFn::DeleteIdentifierSloppy => delete_identifier_sloppy,
         bytecode::RuntimeFn::DeleteSuperProperty => delete_super_property,
+        bytecode::RuntimeFn::ForInEnumerate => for_in_enumerate,
+        bytecode::RuntimeFn::ForInNext => for_in_next,
     }
 }
 
@@ -354,30 +356,14 @@ fn string_exotic_own<'a>(nogc: &'a NoGc<'a>, target: Value, key: Value) -> bool 
         return false; // symbols own nothing on primitives
     };
     let bytes = name.string().as_slice(nogc);
-    bytes == b"length" || canonical_index(bytes).is_some_and(|i| i < utf16_length(s.as_slice(nogc)))
-}
-
-/// Canonical array-index strings ("0", "1", "42"): digits only, no
-/// leading zeros (ES 6.1.7). "01", "-0" and "1e2" are not indices.
-fn canonical_index(bytes: &[u8]) -> Option<usize> {
-    if bytes.is_empty() || bytes.len() > 10 {
-        return None;
-    }
-    if bytes[0] == b'0' {
-        return (bytes.len() == 1).then_some(0);
-    }
-    let mut n: usize = 0;
-    for &b in bytes {
-        let d = b.checked_sub(b'0')?;
-        n = n.checked_mul(10)?.checked_add(d as usize)?;
-    }
-    Some(n)
+    bytes == b"length"
+        || crate::lookup::canonical_index(bytes).is_some_and(|i| i < utf16_length(s.as_slice(nogc)))
 }
 
 /// WTF-8 bytes → UTF-16 code-unit count: BMP code points (1-3 byte
 /// sequences) are one unit, supplementary code points (4-byte sequences)
 /// are two.
-fn utf16_length(bytes: &[u8]) -> usize {
+pub(crate) fn utf16_length(bytes: &[u8]) -> usize {
     let mut units = 0;
     let mut i = 0;
     while i < bytes.len() {
@@ -392,6 +378,72 @@ fn utf16_length(bytes: &[u8]) -> usize {
         i += width;
     }
     units
+}
+
+/// The WTF-8 encoding of UTF-16 code unit `i` of a string, or `None`
+/// when `i` is out of range (ES 6.1.4: string indices are code units).
+/// A surrogate half of a 4-byte sequence re-encodes as its own 3-byte
+/// WTF-8 (CESU-8 style) sequence.
+pub(crate) fn utf16_unit_at(bytes: &[u8], i: usize) -> Option<Vec<u8>> {
+    let mut unit = 0usize;
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let b = bytes[off];
+        let width = match b {
+            0x00..=0x7F => 1,
+            0x80..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            _ => 4,
+        };
+        if width == 4 {
+            // two code units: the surrogate halves of the code point
+            let cp = {
+                let w1 = (bytes[off] as u32) & 0x07;
+                let w2 = (bytes[off + 1] as u32) & 0x3F;
+                let w3 = (bytes[off + 2] as u32) & 0x3F;
+                let w4 = (bytes[off + 3] as u32) & 0x3F;
+                (w1 << 18) | (w2 << 12) | (w3 << 6) | w4
+            };
+            let v = cp - 0x1_0000;
+            let surrogates = [(0xD800 + (v >> 10)) as u32, (0xDC00 + (v & 0x3FF)) as u32];
+            for &s in &surrogates {
+                if unit == i {
+                    return Some(vec![
+                        0xE0 | (s >> 12) as u8,
+                        0x80 | ((s >> 6) as u8 & 0x3F),
+                        0x80 | (s as u8 & 0x3F),
+                    ]);
+                }
+                unit += 1;
+            }
+            off += 4;
+            continue;
+        }
+        if unit == i {
+            return Some(bytes[off..off + width].to_vec());
+        }
+        unit += 1;
+        off += width;
+    }
+    None
+}
+
+/// The one-code-unit string at index `i` of a string value, freshly
+/// allocated (string comparisons are by content, so identity never
+/// shows). `None` when the receiver is not a string or `i` is out of
+/// range.
+pub(crate) fn string_char_at(
+    heap: &mut Heap,
+    scope: &crate::HandleScope<'_>,
+    receiver: Value,
+    i: usize,
+) -> Option<Value> {
+    let bytes = heap.no_gc(|nogc| {
+        let s = receiver.get_as::<VMString>(nogc)?;
+        let bytes = utf16_unit_at(s.as_slice(nogc), i)?;
+        Some(bytes)
+    })?;
+    Some(VMString::from_bytes(heap, scope, &bytes).value())
 }
 
 /// Sloppy `delete x` on an unresolved name (ES 13.5.1.2 step 5 →
@@ -417,6 +469,416 @@ fn delete_super_property(
     _args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     Err(VmError::Reference)
+}
+
+// ---- for-in (ES 14.7.5) ----------------------------------------------------
+
+/// Enumerator slot layout (a hidden object of `for_in_enumerator_map`):
+/// [0] the current prototype-chain level (an object, or a string
+///     primitive for level 0 of string subjects),
+/// [1] the level's own-string-key snapshot (a FixedArray of interned
+///     strings, taken when the level is reached),
+/// [2] the snapshot cursor (Smi),
+/// [3] keys already registered (a FixedArray; yielded keys and
+///     non-enumerable shadowing keys both enter it, ES 14.7.5.9).
+const FOR_IN_LEVEL: usize = 0;
+const FOR_IN_KEYS: usize = 1;
+const FOR_IN_INDEX: usize = 2;
+const FOR_IN_VISITED: usize = 3;
+
+/// for-in head (ES 14.7.5.6 ForIn/OfHeadEvaluation, enumerate):
+/// (subject) -> enumerator | undefined. null/undefined subjects run
+/// zero iterations; objects and strings snapshot level 0 of the lazy
+/// chain walk. Other primitives' prototypes are not walked yet (their
+/// own properties are none, so they enumerate empty).
+fn for_in_enumerate(
+    nctx: &mut NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let subject = args.get(0).ok_or(VmError::Arity)?;
+    let nullish = nctx.heap().no_gc(|nogc| {
+        subject == nogc.known().null.value() || subject == nogc.known().undefined.value()
+    });
+    if nullish {
+        return Ok(nctx.heap().known().undefined.value());
+    }
+    let level = nctx.heap().no_gc(|nogc| for_in_initial_level(nogc, subject));
+    let Some(level) = level else {
+        return Ok(nctx.heap().known().undefined.value());
+    };
+    nctx.handle_scope(|nctx, scope| {
+        let (vm, heap, _) = nctx.split();
+        let keys = for_in_level_keys(vm, heap, &scope, level)?;
+
+        let keys = heap.allocate_handle::<FixedArray>(&keys, &scope);
+        let empty = heap.known().empty_fixed_array;
+        let map = heap.known().for_in_enumerator_map;
+        let enumerator = heap.new_object(
+            &scope,
+            map,
+            &[
+                level,
+                keys.value(),
+                Smi::new(0).encode(),
+                empty.value(),
+            ],
+        );
+        Ok(enumerator.into_tagged().erase())
+    })
+}
+
+/// Level 0 of the chain for a subject: objects are their own level 0;
+/// string primitives enumerate their indices (a fresh wrapper would be
+/// unobservable otherwise). Other primitives have no own properties —
+/// their level 0 is the constructor's prototype, so additions to
+/// `Number.prototype` etc. are observable (ES 14.7.5.9: the walk starts
+/// at ToObject(subject)). `None` when the prototype is unreachable.
+fn for_in_initial_level<'a>(nogc: &'a NoGc<'a>, subject: Value) -> Option<Value> {
+    if subject.get_as::<VMString>(nogc).is_some() {
+        return Some(subject);
+    }
+    if !Convert::is_primitive(nogc, subject) {
+        return Some(subject);
+    }
+    let ctor_name = if Smi::decode(subject).is_some() {
+        "Number"
+    } else if subject.get_as::<crate::Float>(nogc).is_some() {
+        "Number"
+    } else if subject == nogc.known().true_object.value()
+        || subject == nogc.known().false_object.value()
+    {
+        "Boolean"
+    } else if subject.get_as::<Symbol>(nogc).is_some() {
+        "Symbol"
+    } else {
+        return None;
+    };
+    let global = nogc.known().global_object.value();
+    let strings = nogc.known().strings;
+    let name = SlotName::from_value(match ctor_name {
+        "Number" => strings.number_ctor.value(),
+        "Boolean" => strings.boolean_ctor.value(),
+        _ => strings.symbol_ctor.value(),
+    });
+    let ctor = match crate::lookup::load_outcome(nogc, global, name).ok()? {
+        crate::LoadOutcome::Value(v) if v.is_strong_ptr() => v,
+        _ => return None,
+    };
+    let proto_name = SlotName::from_value(nogc.known().strings.prototype.value());
+    match crate::lookup::load_outcome(nogc, ctor, proto_name).ok()? {
+        crate::LoadOutcome::Value(p) if p.is_strong_ptr() => Some(p),
+        _ => None,
+    }
+}
+
+/// The own string keys of a level in [[OwnPropertyKeys]] order (ES
+/// 10.1.11: array indices ascending, then strings in insertion order;
+/// symbols excluded). Index keys are interned to their canonical string
+/// form, the value a for-in binding receives. Enumerability is NOT
+/// filtered here: EnumerateObjectProperties checks it lazily per key,
+/// and non-enumerable own keys must still register as visited.
+fn for_in_level_keys(
+    vm: &VM,
+    heap: &mut Heap,
+    scope: &crate::HandleScope<'_>,
+    level: Value,
+) -> Result<Vec<Value>, VmError> {
+    // raw pass: Smi index keys (to be interned) and ready name keys
+    let (mut indices, names) = heap.no_gc(|nogc| {
+        let mut indices: Vec<i64> = Vec::new();
+        let mut names: Vec<Value> = Vec::new();
+        if let Some(s) = level.get_as::<VMString>(nogc) {
+            // string exotic: the only own string keys are the indices
+            // ("length" is non-enumerable; the wrapper's own "length"
+            // shadowing String.prototype additions is not modeled)
+            indices.extend(0..utf16_length(s.as_slice(nogc)) as i64);
+            return (indices, names);
+        }
+        let Some(obj) = level.as_heap_object(nogc) else {
+            return (indices, names);
+        };
+        let obj = obj.as_ref();
+        // array elements: non-hole indices ascending
+        if obj.is_array(nogc) {
+            let len = obj
+                .length()
+                .min(obj.elements_array(nogc).map(|e| e.len()).unwrap_or(0));
+            for i in 0..len {
+                if obj.element_value(nogc, i).is_some() {
+
+                    indices.push(i as i64);
+                }
+            }
+        }
+
+        for d in obj.map_ref(nogc).descriptors() {
+            let name = d.name();
+
+            if let Some(smi) = Smi::decode(name.value()) {
+                let v = smi.value();
+                // array-index-range Smi names are index keys; anything
+                // else (negative, ≥ 2^32−1) keeps insertion order
+                if (0..u32::MAX as i64).contains(&v) {
+
+                    indices.push(v);
+                } else {
+                    names.push(name.value());
+                }
+                continue;
+            }
+            if name.value().get_as::<Symbol>(nogc).is_some() {
+                continue; // symbols are never yielded
+            }
+            // canonical index strings classify as index keys (a store
+            // through them creates a Smi-named descriptor, but object
+            // literals and defines can still reach here)
+            let is_index = name
+                .value()
+                .get_as::<InternedString>(nogc)
+                .is_some_and(|s| {
+                    crate::lookup::canonical_index(s.string().as_slice(nogc))
+                        .is_some_and(|i| i <= u32::MAX as usize - 1)
+                });
+            if is_index {
+                let v = crate::lookup::canonical_index(
+                    name.value()
+                        .get_as::<InternedString>(nogc)
+                        .unwrap()
+                        .string()
+                        .as_slice(nogc),
+                )
+                .unwrap() as i64;
+
+                indices.push(v);
+            } else {
+                names.push(name.value());
+            }
+        }
+        (indices, names)
+    });
+
+    indices.sort_unstable();
+    indices.dedup();
+    // intern the index keys to canonical strings
+    let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + names.len());
+    for i in indices {
+        let bytes = i.to_string().into_bytes();
+        keys.push(vm.interner().intern(heap, scope, bytes).value());
+    }
+    keys.extend(names.iter().copied());
+    Ok(keys)
+}
+
+/// for-in iteration step (ES 14.7.5.9 EnumerateObjectProperties):
+/// (enumerator) -> next key string | undefined. Per candidate key, the
+/// own descriptor is checked lazily against the key's own level —
+/// deleted-since-snapshot keys are skipped unvisited; keys shadowed by
+/// an earlier level (yielded or non-enumerable) are skipped; enumerable
+/// survivors are yielded at most once. When a level's snapshot runs
+/// dry, the walk advances to the live prototype and snapshots it.
+fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+    let enumerator = args.get(0).ok_or(VmError::Arity)?;
+    if enumerator == nctx.heap().known().undefined.value() {
+        // nullish subject: the head produced no enumerator
+        return Ok(nctx.heap().known().undefined.value());
+    }
+    nctx.handle_scope(|nctx, scope| {
+        let (vm, heap, _) = nctx.split();
+        loop {
+            // one candidate per turn: the cursor advances before the
+            // key is examined, so skipped keys are never revisited
+            let candidate = heap.no_gc(|nogc| -> Result<Option<Value>, VmError> {
+                let Some(obj) = enumerator.as_heap_object(nogc) else {
+                    return Err(VmError::Type);
+                };
+                let slots = obj.as_ref().slots.heap_ref(nogc);
+                let keys = slots
+                    .at(FOR_IN_KEYS)
+                    .get_as::<FixedArray>(nogc)
+                    .ok_or(VmError::Type)?;
+                let index = Smi::decode(slots.at(FOR_IN_INDEX))
+                    .ok_or(VmError::Type)?
+                    .value() as usize;
+                let Some(key) = (index < keys.len()).then(|| keys.at(index)) else {
+                    return Ok(None);
+                };
+                slots.set(nogc, FOR_IN_INDEX, Smi::new(index as i64 + 1).encode());
+                Ok(Some(key))
+            })?;
+            let Some(key) = candidate else {
+                // snapshot exhausted: advance to the live prototype
+                let level = heap.no_gc(|nogc| -> Result<Value, VmError> {
+                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                        return Err(VmError::Type);
+                    };
+                    Ok(obj.as_ref().slots.heap_ref(nogc).at(FOR_IN_LEVEL))
+                })?;
+                let Some(proto) = for_in_next_level(vm, heap, level)? else {
+                    return Ok(heap.known().undefined.value());
+                };
+                let keys = for_in_level_keys(vm, heap, &scope, proto)?;
+                let keys = heap.allocate_handle::<FixedArray>(&keys, &scope);
+                heap.no_gc(|nogc| -> Result<(), VmError> {
+                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                        return Err(VmError::Type);
+                    };
+                    let slots = obj.as_ref().slots.heap_ref(nogc);
+                    slots.set(nogc, FOR_IN_LEVEL, proto);
+                    slots.set(nogc, FOR_IN_KEYS, keys.value());
+                    slots.set(nogc, FOR_IN_INDEX, Smi::new(0).encode());
+                    Ok(())
+                })?;
+                continue;
+            };
+            // lazy [[GetOwnProperty]] on the key's own level: a key
+            // deleted since the snapshot is skipped without registering
+            let level = heap.no_gc(|nogc| -> Result<Value, VmError> {
+                let Some(obj) = enumerator.as_heap_object(nogc) else {
+                    return Err(VmError::Type);
+                };
+                Ok(obj.as_ref().slots.heap_ref(nogc).at(FOR_IN_LEVEL))
+            })?;
+            let own = heap.no_gc(|nogc| for_in_own_state(nogc, level, key));
+            let Some(enumerable) = own else {
+                continue;
+            };
+            // already registered (yielded earlier, or shadowing
+            // non-enumerable on a closer level): skip
+            let seen = heap.no_gc(|nogc| -> Result<bool, VmError> {
+                let Some(obj) = enumerator.as_heap_object(nogc) else {
+                    return Err(VmError::Type);
+                };
+                let visited = obj
+                    .as_ref()
+                    .slots
+                    .heap_ref(nogc)
+                    .at(FOR_IN_VISITED)
+                    .get_as::<FixedArray>(nogc)
+                    .ok_or(VmError::Type)?;
+                Ok(visited.as_slice().iter().any(|s| s.inner() == key))
+            })?;
+            if seen {
+                continue;
+            }
+            // register the key — yielded or shadowing, both at most once
+            {
+                let visited = heap.no_gc(|nogc| -> Result<Vec<Value>, VmError> {
+                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                        return Err(VmError::Type);
+                    };
+                    Ok(obj
+                        .as_ref()
+                        .slots
+                        .heap_ref(nogc)
+                        .at(FOR_IN_VISITED)
+                        .get_as::<FixedArray>(nogc)
+                        .ok_or(VmError::Type)?
+                        .as_slice()
+                        .iter()
+                        .map(|s| s.inner())
+                        .collect())
+                })?;
+                let mut visited = visited;
+                visited.push(key);
+                let visited = heap.allocate_handle::<FixedArray>(&visited, &scope);
+                heap.no_gc(|nogc| -> Result<(), VmError> {
+                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                        return Err(VmError::Type);
+                    };
+                    obj.as_ref()
+                        .slots
+                        .heap_ref(nogc)
+                        .set(nogc, FOR_IN_VISITED, visited.value());
+                    Ok(())
+                })?;
+            }
+            if !enumerable {
+                continue;
+            }
+            return Ok(key);
+        }
+    })
+}
+
+/// The next level of the prototype chain: an object's live [[Prototype]]
+/// (read at advance time, so mutations between iterations are visible),
+/// or `String.prototype` for a string primitive level. Multi-parent
+/// (Self-style) and null prototypes end the walk.
+fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<Value>, VmError> {
+    heap.no_gc(|nogc| {
+        if level.get_as::<VMString>(nogc).is_some() {
+            // String.prototype via the global object (both plain data
+            // lookups; no user code can run)
+            let global = nogc.known().global_object.value();
+            let string_name = SlotName::from_value(nogc.known().strings.string.value());
+            let Some(string_ctor) = crate::lookup::load_outcome(nogc, global, string_name)
+                .ok()
+                .and_then(|o| match o {
+                    crate::LoadOutcome::Value(v) => Some(v),
+                    crate::LoadOutcome::Getter(_) => None,
+                })
+            else {
+                return Ok(None);
+            };
+            let proto_name = SlotName::from_value(nogc.known().strings.prototype.value());
+            let proto = crate::lookup::load_outcome(nogc, string_ctor, proto_name)
+                .ok()
+                .and_then(|o| match o {
+                    crate::LoadOutcome::Value(v) => Some(v),
+                    crate::LoadOutcome::Getter(_) => None,
+                });
+            return Ok(proto.filter(|p| p.is_strong_ptr()));
+        }
+        let Some(obj) = level.as_heap_object(nogc) else {
+            return Ok(None);
+        };
+        let proto = obj.as_ref().map_ref(nogc).prototype.inner();
+        if proto == nogc.known().the_hole.value() || proto == nogc.known().null.value() {
+            return Ok(None);
+        }
+        // a FixedArray prototype is the Self-style multi-parent form;
+        // the chain walk does not model it (ends the enumeration)
+        Ok(proto.get_as::<FixedArray>(nogc).map_or(Some(proto), |_| None))
+    })
+}
+
+/// The lazy own-property state of `key` on its own level: `None` when
+/// the property is gone (deleted since the snapshot), else its
+/// [[Enumerable]]. Own-only — the shadow check against other levels is
+/// the visited set's job.
+fn for_in_own_state<'a>(nogc: &'a NoGc<'a>, level: Value, key: Value) -> Option<bool> {
+    match crate::lookup::classify_key(nogc, key).ok()? {
+        crate::Key::Element(i) => {
+            if let Some(s) = level.get_as::<VMString>(nogc) {
+                // string indices are enumerable own properties
+                return Some((i as u64) < utf16_length(s.as_slice(nogc)) as u64);
+            }
+            let obj = level.as_heap_object(nogc)?;
+            let obj = obj.as_ref();
+            if obj.is_array(nogc) {
+                return obj.element_value(nogc, i).is_some().then_some(true);
+            }
+            // plain objects keep index keys as Smi-named descriptors
+            let name = SlotName::from(Tagged::from_smi(Smi::new(i as i64)));
+            obj.map_ref(nogc)
+                .descriptors()
+                .iter()
+                .find(|d| d.name() == name)
+                .map(|d| d.flags().is_enumerable())
+        }
+        crate::Key::Name(name) => {
+            let obj = level.as_heap_object(nogc)?;
+            let obj = obj.as_ref();
+
+            // arrays hold "length" outside the descriptors (never a
+            // snapshot key) — any other name lives in them
+            obj.map_ref(nogc)
+                .descriptors()
+                .iter()
+                .find(|d| d.name() == name)
+                .map(|d| d.flags().is_enumerable())
+        }
+    }
 }
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
