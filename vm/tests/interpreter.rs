@@ -502,27 +502,37 @@ fn define_named_own_property_attributes_and_value() {
 
     // r0 = {}; define m = 7 {writable, non-enum, configurable};
     // re-define m = 8 with the same attributes; return r0
+    // (runtime(obj, key, value, flags) window: r1..r4)
     let build = |thread: &mut Thread| -> Value {
         thread.handle_scope(|thread, scope| {
             let m = thread.intern(&scope, "m");
             let consts = thread
                 .heap()
                 .allocate_handle::<FixedArray>(&[m.value()], &scope);
+            let define = |program: &mut Vec<u8>, value: i32| {
+                emit(program, Opcode::Load, &[0]);
+                emit(program, Opcode::Store, &[1]);
+                emit(program, Opcode::LoadConstant, &[0]);
+                emit(program, Opcode::Store, &[2]);
+                emit(program, Opcode::LoadSmi, &[value as u32]);
+                emit(program, Opcode::Store, &[3]);
+                emit(
+                    program,
+                    Opcode::LoadSmi,
+                    &[PropertyFlags::DontEnum.bits() as u32],
+                );
+                emit(program, Opcode::Store, &[4]);
+                emit(
+                    program,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::DefineOwnProperty as u32, 1, 4],
+                );
+            };
             let mut program = Vec::new();
             emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
             emit(&mut program, Opcode::Store, &[0]);
-            emit(&mut program, Opcode::LoadSmi, &[7]);
-            emit(
-                &mut program,
-                Opcode::DefineNamedOwnProperty,
-                &[0, 0, PropertyFlags::DontEnum.bits(), 0],
-            );
-            emit(&mut program, Opcode::LoadSmi, &[8]);
-            emit(
-                &mut program,
-                Opcode::DefineNamedOwnProperty,
-                &[0, 0, PropertyFlags::DontEnum.bits(), 0],
-            );
+            define(&mut program, 7);
+            define(&mut program, 8);
             emit(&mut program, Opcode::Load, &[0]);
             emit(&mut program, Opcode::Return, &[]);
 
@@ -533,7 +543,7 @@ fn define_named_own_property_attributes_and_value() {
                 CallableInfoInit {
                     bytecode,
                     constants: consts,
-                    register_count: 1,
+                    register_count: 5,
                     handlers: None,
                 },
                 &scope,
@@ -583,30 +593,35 @@ fn define_named_own_property_conflicting_redefine_throws() {
 
     // r0 = {}; define p = 1 {w-, e-, c-}; re-define p = 2 {w, e-, c}:
     // non-configurable with differing attributes rejects the define
+    // (runtime(obj, key, value, flags) window: r1..r4)
     let p = thread.handle_scope(|thread, scope| thread.intern(&scope, "p").value());
+    let define = |program: &mut Vec<u8>, value: i32, flags: u32| {
+        emit(program, Opcode::Load, &[0]);
+        emit(program, Opcode::Store, &[1]);
+        emit(program, Opcode::LoadConstant, &[0]);
+        emit(program, Opcode::Store, &[2]);
+        emit(program, Opcode::LoadSmi, &[value as u32]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadSmi, &[flags]);
+        emit(program, Opcode::Store, &[4]);
+        emit(
+            program,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::DefineOwnProperty as u32, 1, 4],
+        );
+    };
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
     emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(
+    define(
         &mut program,
-        Opcode::DefineNamedOwnProperty,
-        &[
-            0,
-            0,
-            PropertyFlags::ReadOnly | PropertyFlags::DontEnum | PropertyFlags::DontDelete,
-            0,
-        ],
+        1,
+        PropertyFlags::ReadOnly | PropertyFlags::DontEnum | PropertyFlags::DontDelete,
     );
-    emit(&mut program, Opcode::LoadSmi, &[2]);
-    emit(
-        &mut program,
-        Opcode::DefineNamedOwnProperty,
-        &[0, 0, PropertyFlags::DontEnum.bits(), 0],
-    );
+    define(&mut program, 2, PropertyFlags::DontEnum.bits());
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program_consts(&mut thread, program, 1, &[], &[p]);
+    let result = run_program_consts(&mut thread, program, 5, &[], &[p]);
     expect_escaped(&mut thread, result, "TypeError");
 }
 
@@ -617,30 +632,40 @@ fn define_keyed_own_property_string_and_smi_keys() {
 
     // r0 = {}; r1 = "x"; define r0[r1] = 5 {e-};
     // r1 = 3 (smi key); define r0[r1] = 6 {e-}; return r0
+    // (runtime(obj, key, value, flags) window: r2..r5)
     let x = thread.handle_scope(|thread, scope| thread.intern(&scope, "x").value());
+    let define = |program: &mut Vec<u8>, value: i32| {
+        emit(program, Opcode::Load, &[0]);
+        emit(program, Opcode::Store, &[2]);
+        emit(program, Opcode::Load, &[1]);
+        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::LoadSmi, &[value as u32]);
+        emit(program, Opcode::Store, &[4]);
+        emit(
+            program,
+            Opcode::LoadSmi,
+            &[PropertyFlags::DontEnum.bits() as u32],
+        );
+        emit(program, Opcode::Store, &[5]);
+        emit(
+            program,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::DefineOwnProperty as u32, 2, 4],
+        );
+    };
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
     emit(&mut program, Opcode::Store, &[0]);
     emit(&mut program, Opcode::LoadConstant, &[0]);
     emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::LoadSmi, &[5]);
-    emit(
-        &mut program,
-        Opcode::DefineKeyedOwnProperty,
-        &[0, 1, PropertyFlags::DontEnum.bits(), 0],
-    );
+    define(&mut program, 5);
     emit(&mut program, Opcode::LoadSmi, &[3]);
     emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::LoadSmi, &[6]);
-    emit(
-        &mut program,
-        Opcode::DefineKeyedOwnProperty,
-        &[0, 1, PropertyFlags::DontEnum.bits(), 0],
-    );
+    define(&mut program, 6);
     emit(&mut program, Opcode::Load, &[0]);
     emit(&mut program, Opcode::Return, &[]);
 
-    let obj = run_program_consts(&mut thread, program, 2, &[], &[x]).unwrap();
+    let obj = run_program_consts(&mut thread, program, 6, &[], &[x]).unwrap();
     thread.heap().no_gc(|nogc| {
         let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
@@ -698,22 +723,33 @@ fn define_own_property_accessor_invokes_getter() {
         (getter, p)
     });
 
-    // r0 = {}; r1 = getter; r2 = setter (undefined); acc = pair;
-    // define r0.p {accessor, e-}; then either load r0.p (invokes the
-    // getter) or return r0 to inspect the installed descriptor
+    // r0 = {}; r1 = getter; InstallAccessor(r0, "p", getter) installs the
+    // getter half {e-, c}; then either load r0.p (invokes the getter) or
+    // return r0 to inspect the installed descriptor
+    // (runtime(target, key, closure, flags) window: r2..r5)
     let accessor_program = |load: bool| -> Vec<u8> {
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
         emit(&mut program, Opcode::Store, &[0]);
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::LoadConstant, &[1]);
+        emit(&mut program, Opcode::Load, &[0]);
         emit(&mut program, Opcode::Store, &[2]);
-        emit(&mut program, Opcode::CreateAccessorPair, &[1, 2]);
+        emit(&mut program, Opcode::LoadConstant, &[2]);
+        emit(&mut program, Opcode::Store, &[3]);
+        emit(&mut program, Opcode::Load, &[1]);
+        emit(&mut program, Opcode::Store, &[4]);
+        // flags: getter half (bit 0) + non-enumerable
         emit(
             &mut program,
-            Opcode::DefineNamedOwnProperty,
-            &[0, 2, PropertyFlags::Accessor | PropertyFlags::DontEnum, 0],
+            Opcode::LoadSmi,
+            &[(PropertyFlags::DontEnum.bits() | 1) as u32],
+        );
+        emit(&mut program, Opcode::Store, &[5]);
+        emit(
+            &mut program,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::InstallAccessor as u32, 2, 4],
         );
         if load {
             emit(&mut program, Opcode::LoadNamedProperty, &[0, 2, 0]);
@@ -726,10 +762,10 @@ fn define_own_property_accessor_invokes_getter() {
 
     let undefined = thread.heap().known().undefined.value();
     let constants = [getter, undefined, p];
-    let result = run_program_consts(&mut thread, accessor_program(true), 3, &[], &constants);
+    let result = run_program_consts(&mut thread, accessor_program(true), 6, &[], &constants);
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 
-    let obj = run_program_consts(&mut thread, accessor_program(false), 3, &[], &constants).unwrap();
+    let obj = run_program_consts(&mut thread, accessor_program(false), 6, &[], &constants).unwrap();
     thread.heap().no_gc(|nogc| {
         let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
@@ -2899,24 +2935,6 @@ fn block_context_reads_outer_scope_via_depth() {
 }
 
 #[test]
-fn catch_context_binds_exception_in_slot_zero() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let mut thread = vm.attach();
-
-    // CreateCatchContext r2 (exception); PushContext; read slot 0
-    let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadSmi, &[55]);
-    emit(&mut program, Opcode::Store, &[2]);
-    emit(&mut program, Opcode::CreateCatchContext, &[2]);
-    emit(&mut program, Opcode::PushContext, &[0]);
-    emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
-    emit(&mut program, Opcode::Return, &[]);
-
-    let result = run_program(&mut thread, program, 3, &[]);
-    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 55);
-}
-
-#[test]
 fn tdz_hole_read_throws_reference_error() {
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
@@ -3055,7 +3073,14 @@ fn set_prototype_changes_property_lookup_chain() {
         emit(&mut program, Opcode::LoadConstant, &[1]);
         emit(&mut program, Opcode::Store, &[1]);
         emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::SetPrototype, &[1]);
+        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Load, &[1]);
+        emit(&mut program, Opcode::Store, &[3]);
+        emit(
+            &mut program,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::SetPrototype as u32, 2, 2],
+        );
         emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
         emit(&mut program, Opcode::Return, &[]);
 
@@ -3066,7 +3091,7 @@ fn set_prototype_changes_property_lookup_chain() {
             CallableInfoInit {
                 bytecode,
                 constants: consts,
-                register_count: 2,
+                register_count: 4,
                 handlers: None,
             },
             &scope,
@@ -3097,7 +3122,14 @@ fn set_prototype_survives_property_transitions() {
         emit(&mut program, Opcode::LoadConstant, &[1]);
         emit(&mut program, Opcode::Store, &[1]);
         emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::SetPrototype, &[1]);
+        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Load, &[1]);
+        emit(&mut program, Opcode::Store, &[3]);
+        emit(
+            &mut program,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::SetPrototype as u32, 2, 2],
+        );
         emit(&mut program, Opcode::LoadSmi, &[1]);
         emit(&mut program, Opcode::StoreNamedProperty, &[0, 2, 0]);
         emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
@@ -3110,7 +3142,7 @@ fn set_prototype_survives_property_transitions() {
             CallableInfoInit {
                 bytecode,
                 constants: consts,
-                register_count: 2,
+                register_count: 4,
                 handlers: None,
             },
             &scope,
@@ -3131,10 +3163,17 @@ fn set_prototype_cycle_throws_type_error() {
     emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
     emit(&mut program, Opcode::Store, &[0]);
     emit(&mut program, Opcode::Load, &[0]);
-    emit(&mut program, Opcode::SetPrototype, &[0]);
+    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::Store, &[2]);
+    emit(
+        &mut program,
+        Opcode::CallRuntime,
+        &[bytecode::RuntimeFn::SetPrototype as u32, 1, 2],
+    );
     emit(&mut program, Opcode::Return, &[]);
 
-    let result = run_program(&mut thread, program, 1, &[]);
+    let result = run_program(&mut thread, program, 3, &[]);
     expect_escaped(&mut thread, result, "TypeError");
 }
 
@@ -3180,7 +3219,14 @@ fn set_prototype_on_non_extensible_throws_type_error() {
         emit(&mut program, Opcode::LoadConstant, &[1]);
         emit(&mut program, Opcode::Store, &[1]);
         emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::SetPrototype, &[1]);
+        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Load, &[1]);
+        emit(&mut program, Opcode::Store, &[3]);
+        emit(
+            &mut program,
+            Opcode::CallRuntime,
+            &[bytecode::RuntimeFn::SetPrototype as u32, 2, 2],
+        );
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -3190,7 +3236,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
             CallableInfoInit {
                 bytecode,
                 constants: consts,
-                register_count: 2,
+                register_count: 4,
                 handlers: None,
             },
             &scope,

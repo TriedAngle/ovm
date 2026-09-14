@@ -61,9 +61,6 @@ fn render_constant(constants: &[Constant], idx: usize) -> String {
         Constant::String(bytes) => format!("#str[{:?}]", String::from_utf8_lossy(bytes)),
         Constant::Float(f) => format!("#f64[{f}]"),
         Constant::Smi(v) => format!("#smi[{v}]"),
-        Constant::Boolean(b) => format!("#bool[{b}]"),
-        Constant::Undefined => "#undefined".into(),
-        Constant::Null => "#null".into(),
         Constant::Callable(fid) => format!("#fn[{}]", fid.0),
         Constant::ContextNames(names) => format!("#ctxnames[{names:?}]"),
         Constant::ObjectPrototype => "#object-prototype".into(),
@@ -90,15 +87,15 @@ fn add_smi_temps_above_locals() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1", // completion = undefined
+        "LdaUndefined",
+        "Store 1",
         "LoadSmi 1",
         "Store 2",
         "LoadSmi 2",
         "Store 3",
         "Load 2",
         "Add 3",
-        "Store 1", // completion = 1 + 2
+        "Store 1",
         "PopContext 0",
         "Load 1",
         "Return",
@@ -114,7 +111,7 @@ fn nested_binary_reuses_temps() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
+        "LdaUndefined",
         "Store 1",
         "LoadSmi 1",
         "Store 2",
@@ -142,7 +139,7 @@ fn strict_equality_yields_singletons_and_not_flips() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
+        "LdaUndefined",
         "Store 1",
         "LoadSmi 1",
         "Store 2",
@@ -150,10 +147,10 @@ fn strict_equality_yields_singletons_and_not_flips() {
         "Store 3",
         "Load 2",
         "EqualStrict 3",
-        "JumpIfTruthy 30",
-        "LoadConstant #bool[true]",
-        "Jump 32",
-        "LoadConstant #bool[false]",
+        "JumpIfTruthy 28",
+        "LdaTrue",
+        "Jump 29",
+        "LdaFalse",
         "Store 1",
         "PopContext 0",
         "Load 1",
@@ -169,7 +166,7 @@ fn number_literals_outside_smi_range_become_constants() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
+        "LdaUndefined",
         "Store 1",
         "LoadConstant #f64[1.5]",
         "Store 2",
@@ -189,7 +186,7 @@ fn number_literals_outside_smi_range_become_constants() {
 fn string_literal_is_interned_constant() {
     let script = compile("'a' + 'b';").unwrap();
     let out = body(&script);
-    assert_eq!(out[2], "LoadConstant #undefined");
+    assert_eq!(out[2], "LdaUndefined");
     assert!(out[4].starts_with("LoadConstant #str["));
     assert!(out[6].starts_with("LoadConstant #str["));
 }
@@ -201,8 +198,8 @@ fn var_declaration_stores_into_local() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LoadConstant #undefined",
-        "Store 2", // completion register
+        "LdaUndefined",
+        "Store 2",
         "LoadSmi 5",
         "Store 0",
         "Load 0",
@@ -222,9 +219,9 @@ fn var_without_init_stores_undefined() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LoadConstant #undefined",
-        "Store 2", // completion register
-        "LoadConstant #undefined",
+        "LdaUndefined",
+        "Store 2",
+        "LdaUndefined",
         "Store 0",
         "Load 0",
         "PopContext 1",
@@ -243,11 +240,11 @@ fn let_has_tdz_hole_check() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LoadConstant #undefined",
-        "Store 2", // completion register
+        "LdaUndefined",
+        "Store 2",
         "Load 0",
         "ThrowReferenceErrorIfHole",
-        "Store 2", // completion = x
+        "Store 2",
         "PopContext 1",
         "Load 2",
         "Return",
@@ -262,15 +259,15 @@ fn if_else_jumps() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
+        "LdaUndefined",
         "Store 1",
         "LoadSmi 1",
-        "JumpIfFalsy 22",
+        "JumpIfFalsy 21",
         "LoadSmi 2",
-        "Store 1", // completion from the then branch
-        "Jump 26",
+        "Store 1",
+        "Jump 25",
         "LoadSmi 3",
-        "Store 1", // completion from the else branch
+        "Store 1",
         "PopContext 0",
         "Load 1",
         "Return",
@@ -285,13 +282,13 @@ fn while_loop_back_edge() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
+        "LdaUndefined",
         "Store 1",
         "LoadSmi 0",
-        "JumpIfFalsy 22",
+        "JumpIfFalsy 21",
         "LoadSmi 1",
-        "Store 1", // body completion
-        "JumpLoop 8",
+        "Store 1",
+        "JumpLoop 7",
         "PopContext 0",
         "Load 1",
         "Return",
@@ -306,31 +303,31 @@ fn for_loop_with_update_and_condition() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LoadConstant #undefined",
-        "Store 2", // completion register
+        "LdaUndefined",
+        "Store 2",
         "LoadSmi 0",
-        "Store 0", // i = 0
-        "Load 0",  // cond: i
+        "Store 0",
+        "Load 0",
         "Store 3",
         "LoadSmi 3",
         "Store 4",
         "Load 3",
         "LessThan 4",
-        "JumpIfFalsy 58",
-        "LoadSmi 1", // body
-        "Store 2",   // body completion
-        "Load 0",    // update: i
+        "JumpIfFalsy 56",
+        "LoadSmi 1",
+        "Store 2",
+        "Load 0",
         "Store 3",
         "LoadSmi 1",
         "Store 4",
-        "LoadSmi 0",
+        "LdaZero",
         "Store 5",
         "Load 3",
         "Sub 5",
         "Add 4",
-        "Store 0", // i = i + 1
-        "Load 3",  // postfix result, discarded
-        "JumpLoop 12",
+        "Store 0",
+        "Load 3",
+        "JumpLoop 11",
         "PopContext 1",
         "Load 2",
         "Return",
@@ -345,18 +342,18 @@ fn plain_call_receiver_is_undefined() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1", // completion register
-        "LoadGlobal 2 0",
-        "Store 5", // callee above args
-        "LoadConstant #undefined",
-        "Store 2", // receiver
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
+        "Store 5",
+        "LdaUndefined",
+        "Store 2",
         "LoadSmi 6",
         "Store 3",
         "LoadSmi 7",
         "Store 4",
         "CallNoFeedback 5 2 3",
-        "Store 1", // completion = call result
+        "Store 1",
         "PopContext 0",
         "Load 1",
         "Return",
@@ -371,14 +368,14 @@ fn method_call_passes_receiver() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1",                 // completion register
-        "LoadGlobal 2 0",          // o
-        "Store 2",                 // recv
-        "LoadNamedProperty 2 3 0", // o.m
-        "Store 4",                 // callee above args
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
+        "Store 2",
+        "LoadNamedProperty 2 2 0",
+        "Store 4",
         "LoadSmi 6",
-        "Store 3", // arg 0
+        "Store 3",
         "CallNoFeedback 4 2 2",
         "Store 1",
         "PopContext 0",
@@ -395,12 +392,12 @@ fn new_construct_with_args() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1",        // completion register
-        "LoadGlobal 2 0", // C
-        "Store 3",        // callee
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
+        "Store 3",
         "LoadSmi 1",
-        "Store 2", // arg 0 (no receiver)
+        "Store 2",
         "Construct 3 2 1",
         "Store 1",
         "PopContext 0",
@@ -417,16 +414,16 @@ fn property_load_and_store() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1", // completion register
-        "LoadGlobal 2 0",
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
         "Store 2",
         "LoadSmi 1",
-        "StoreNamedProperty 2 3 0",
+        "StoreNamedProperty 2 2 0",
         "Store 1",
-        "LoadGlobal 4 0",
+        "LoadGlobal 3 0",
         "Store 2",
-        "LoadNamedProperty 2 5 0",
+        "LoadNamedProperty 2 4 0",
         "Store 1",
         "PopContext 0",
         "Load 1",
@@ -442,18 +439,18 @@ fn keyed_load_and_store() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1",        // completion register
-        "LoadGlobal 2 0", // a
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
         "Store 2",
-        "LoadGlobal 3 0", // k
+        "LoadGlobal 2 0",
         "Store 3",
         "LoadSmi 1",
         "StoreKeyedProperty 2 3 0",
         "Store 1",
-        "LoadGlobal 4 0",
+        "LoadGlobal 3 0",
         "Store 2",
-        "LoadGlobal 5 0",
+        "LoadGlobal 4 0",
         "LoadKeyedProperty 2 0",
         "Store 1",
         "PopContext 0",
@@ -470,8 +467,8 @@ fn array_literal_skips_holes() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1", // completion register
+        "LdaUndefined",
+        "Store 1",
         "CreateEmptyArrayLiteral",
         "Store 2",
         "LoadSmi 0",
@@ -498,14 +495,14 @@ fn object_literal_shadow_stores() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1", // completion register
+        "LdaUndefined",
+        "Store 1",
         "CreateEmptyObjectLiteral",
         "Store 2",
         "LoadSmi 1",
-        "StoreNamedProperty 2 2 0",
+        "StoreNamedProperty 2 1 0",
         "LoadSmi 2",
-        "StoreNamedProperty 2 3 0",
+        "StoreNamedProperty 2 2 0",
         "Load 2",
         "Store 1",
         "PopContext 0",
@@ -522,13 +519,13 @@ fn logical_and_short_circuits() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1",        // completion register
-        "LoadGlobal 2 0", // a
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
         "Store 2",
-        "JumpIfFalsy 24",
-        "LoadGlobal 3 0", // b
-        "Jump 26",
+        "JumpIfFalsy 23",
+        "LoadGlobal 2 0",
+        "Jump 25",
         "Load 2",
         "Store 1",
         "PopContext 0",
@@ -545,12 +542,12 @@ fn conditional_expression() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1", // completion register
-        "LoadGlobal 2 0",
-        "JumpIfFalsy 21",
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
+        "JumpIfFalsy 20",
         "LoadSmi 1",
-        "Jump 23",
+        "Jump 22",
         "LoadSmi 2",
         "Store 1",
         "PopContext 0",
@@ -567,15 +564,15 @@ fn throw_and_catch_binds_param() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LoadConstant #undefined",
-        "Store 2", // completion register
+        "LdaUndefined",
+        "Store 2",
         "LdaContext",
-        "Store 3", // try-entry context snapshot
+        "Store 3",
         "LoadSmi 42",
         "Throw",
-        "Jump 27",
-        "PopContext 3", // handler: restore the snapshotted context
-        "Store 0",      // e = exception
+        "Jump 26",
+        "PopContext 3",
+        "Store 0",
         "Load 0",
         "PopContext 1",
         "Return",
@@ -586,9 +583,9 @@ fn throw_and_catch_binds_param() {
     assert_eq!(out, expect);
     let handlers = &script.functions[0].handlers;
     assert_eq!(handlers.len(), 1);
-    assert_eq!(handlers[0].try_start, 11);
-    assert_eq!(handlers[0].try_end, 14);
-    assert_eq!(handlers[0].handler_pc, 18);
+    assert_eq!(handlers[0].try_start, 10);
+    assert_eq!(handlers[0].try_end, 13);
+    assert_eq!(handlers[0].handler_pc, 17);
 }
 
 #[test]
@@ -598,16 +595,16 @@ fn function_declaration_creates_closure_and_stores() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LoadConstant #undefined",
-        "Store 2", // completion register
+        "LdaUndefined",
+        "Store 2",
         "CreateClosure #fn[1]",
         "Store 0",
         "Load 0",
         "Store 4",
-        "LoadConstant #undefined",
+        "LdaUndefined",
         "Store 3",
         "CallNoFeedback 4 3 1",
-        "Store 2", // completion = call result
+        "Store 2",
         "PopContext 1",
         "Load 2",
         "Return",
@@ -631,7 +628,7 @@ fn function_declaration_creates_closure_and_stores() {
             "PopContext",
             "Return",
             "PopContext",
-            "LoadConstant",
+            "LdaUndefined",
             "Return",
         ]
     );
@@ -712,27 +709,27 @@ fn switch_compiles_to_strict_equal_chain() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LoadConstant #undefined",
-        "Store 1",        // completion register
-        "LoadGlobal 2 0", // x
-        "Store 2",        // discriminant temp
+        "LdaUndefined",
+        "Store 1",
+        "LoadGlobal 1 0",
+        "Store 2",
         "LoadSmi 1",
         "Store 3",
         "Load 2",
         "EqualStrict 3",
-        "JumpIfTruthy 41",
+        "JumpIfTruthy 40",
         "LoadSmi 2",
         "Store 3",
         "Load 2",
         "EqualStrict 3",
-        "JumpIfTruthy 49",
-        "Jump 57",
+        "JumpIfTruthy 48",
+        "Jump 56",
         "LoadSmi 10",
-        "Store 1", // case completion
-        "Jump 61",
+        "Store 1",
+        "Jump 60",
         "LoadSmi 20",
         "Store 1",
-        "Jump 61",
+        "Jump 60",
         "LoadSmi 30",
         "Store 1",
         "PopContext 0",
@@ -747,9 +744,9 @@ fn switch_without_default_skips_body() {
     let script = compile("switch (x) { case 1: 1; }").unwrap();
     let out = body(&script);
     // no default: both jumps land past the (empty-fallthrough) body
-    assert_eq!(out[10], "JumpIfTruthy 29");
+    assert_eq!(out[10], "JumpIfTruthy 28");
     assert_eq!(
-        out[11], "Jump 33",
+        out[11], "Jump 32",
         "no default: fallthrough jumps past the body"
     );
     assert_eq!(out[12], "LoadSmi 1");

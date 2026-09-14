@@ -137,13 +137,7 @@ pub fn super_store_lookup<'a>(
     }
     let Some(proto) = proto else {
         // non-object home: no parent chain, define on the receiver
-        if !recv.is_strong_ptr() {
-            return Err(VmError::Type);
-        }
-        return Ok(StoreOutcome::Transition {
-            receiver: recv,
-            name,
-        });
+        return super_store_on_receiver(nogc, recv, name, value);
     };
     match lookup_in_parents(nogc, proto, name) {
         Lookup::Data {
@@ -164,26 +158,10 @@ pub fn super_store_lookup<'a>(
                 // receiver (`this`) differs from the holder by
                 // construction: OrdinarySet creates an own property on
                 // the receiver
-                StoreSemantics::Shadow => {
-                    if !recv.is_strong_ptr() {
-                        return Err(VmError::Type);
-                    }
-                    Ok(StoreOutcome::Transition {
-                        receiver: recv,
-                        name,
-                    })
-                }
+                StoreSemantics::Shadow => super_store_on_receiver(nogc, recv, name, value),
             }
         }
-        Lookup::NotFound => {
-            if !recv.is_strong_ptr() {
-                return Err(VmError::Type);
-            }
-            Ok(StoreOutcome::Transition {
-                receiver: recv,
-                name,
-            })
-        }
+        Lookup::NotFound => super_store_on_receiver(nogc, recv, name, value),
         Lookup::Accessor { pair, .. } => {
             let setter = pair.set.inner();
             if setter == nogc.known().undefined.value() {
@@ -191,6 +169,48 @@ pub fn super_store_lookup<'a>(
             }
             Ok(StoreOutcome::CallSetter { setter })
         }
+    }
+}
+
+/// OrdinarySet's final receiver step (ES 9.1.9.2 step 3): the parent walk
+/// resolved to a writable data property (or exhausted the chain, which
+/// implies the default writable descriptor), so the write lands on the
+/// receiver — a writable data property the receiver already owns is
+/// overwritten in place, and only a true miss defines a fresh own
+/// property. An own accessor (or non-writable own data property)
+/// rejects the `{value}` define: a TypeError at these strict sites.
+fn super_store_on_receiver<'a>(
+    nogc: &'a NoGc<'a>,
+    recv: Value,
+    name: SlotName,
+    value: Value,
+) -> Result<StoreOutcome, VmError> {
+    if !recv.is_strong_ptr() {
+        return Err(VmError::Type);
+    }
+    match recv.lookup(nogc, name) {
+        // already owned (the nearest hit is the receiver itself, not an
+        // inherited one): overwrite the slot instead of re-adding it
+        Lookup::Data {
+            holder,
+            slot,
+            flags,
+            ..
+        } if holder.as_ref().erase() == recv => {
+            if !flags.is_writable() {
+                return Err(VmError::Type);
+            }
+            slot.set(nogc, recv, value);
+            Ok(StoreOutcome::Done)
+        }
+        // own accessor: Receiver.[[DefineOwnProperty]]({value}) on an
+        // accessor is an incompatible change (ES 9.1.9.2 step 3.d.i)
+        Lookup::Accessor { holder, .. } if holder.as_ref().erase() == recv => Err(VmError::Type),
+        // not owned by the receiver: define a fresh own property
+        _ => Ok(StoreOutcome::Transition {
+            receiver: recv,
+            name,
+        }),
     }
 }
 pub struct Transition;

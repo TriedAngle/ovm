@@ -1,11 +1,10 @@
-use bytecode::{Opcode, Operands, PropertyFlags, decode, jump_target};
+use bytecode::{Opcode, Operands, decode, jump_target};
 
 use crate::{
-    AccessorPair, CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert,
-    FixedArray, GcSlice, Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object,
-    ObjectSlotsInit, PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics,
-    Tagged, VMString, Value, call_target, classify_key, function_kind_of, home_proto, load_outcome,
-    store_array_element, super_constructor, super_lookup_from_proto, super_store_lookup,
+    CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, FixedArray, GcSlice,
+    Handle, Heap, Key, LoadOutcome, Lookup, NoGc, Object, PropertyDescriptor, ScopeInfo, SlotName,
+    Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, call_target, classify_key,
+    function_kind_of, load_outcome, store_array_element,
 };
 
 use crate::{
@@ -143,54 +142,6 @@ fn closure_context<'a>(nogc: &'a NoGc<'a>, callable: Tagged<Object>) -> Value {
         .expect("callable must have a closure context")
         .into_tagged()
         .erase()
-}
-
-/// Find the slot named `name` in `context`'s chain (direct eval). Returns
-/// the slot cell, or Reference when no context in the chain has the name.
-fn dynamic_slot<'a>(
-    nogc: &'a NoGc<'a>,
-    context: &mut HeapRef<'a, Context>,
-    name: Value,
-) -> Result<&'a crate::GcSlot, VmError> {
-    let name_str = name.get_as::<VMString>(nogc).ok_or(VmError::Type)?;
-    let name_hash = name_str.hash();
-    let name_bytes = name_str.as_slice(nogc);
-    loop {
-        let ctx = context.as_ref();
-        let names = ctx.scope_info.heap_ref(nogc).as_ref().names.heap_ref(nogc);
-        for i in 0..names.len() {
-            let candidate = names.at(i);
-            if let Some(s) = candidate.get_as::<VMString>(nogc) {
-                if s.hash() == name_hash && s.as_slice(nogc) == name_bytes {
-                    return Ok(ctx.slots.heap_ref(nogc).as_ref().element_slot(i));
-                }
-            }
-        }
-        match ctx.outer.heap_ref(nogc) {
-            Some(outer) => *context = outer,
-            None => return Err(VmError::Reference),
-        }
-    }
-}
-
-/// Walk the frame context chain looking for a slot named `name` (direct
-/// eval: unresolved names resolve through the caller's chain).
-fn dynamic_lookup<'a>(
-    nogc: &'a NoGc<'a>,
-    stack: &Stack,
-    meta: &FrameMeta,
-    name: Value,
-) -> Result<Option<Value>, VmError> {
-    let mut context = stack
-        .context_slot(meta)
-        .inner()
-        .get_as::<Context>(nogc)
-        .ok_or(VmError::Type)?;
-    match dynamic_slot(nogc, &mut context, name) {
-        Ok(slot) => Ok(Some(slot.inner())),
-        Err(VmError::Reference) => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 fn call_value(
@@ -450,6 +401,26 @@ fn step(
         Opcode::LoadConstant => {
             let v = cache.constants_ref(&heap.guard()).at(ops.idx(0));
             cache.set_acc(v);
+            Step::Next
+        }
+        Opcode::LdaZero => {
+            cache.set_acc(Smi::new(0).encode());
+            Step::Next
+        }
+        Opcode::LdaUndefined => {
+            cache.set_acc(heap.known().undefined.value());
+            Step::Next
+        }
+        Opcode::LdaNull => {
+            cache.set_acc(heap.known().null.value());
+            Step::Next
+        }
+        Opcode::LdaTrue => {
+            cache.set_acc(heap.known().true_object.value());
+            Step::Next
+        }
+        Opcode::LdaFalse => {
+            cache.set_acc(heap.known().false_object.value());
             Step::Next
         }
         Opcode::Add => {
@@ -1169,71 +1140,6 @@ fn step(
             }
             Step::Next
         }
-        Opcode::CreateAccessorPair => {
-            let get = stack.reg(&meta, ops.reg(0));
-            let set = stack.reg(&meta, ops.reg(1));
-            let pair = state.handle_scope(|scope| {
-                heap.allocate_handle::<AccessorPair>((get, set), &scope)
-                    .value()
-            });
-            cache.set_acc(pair);
-            Step::Next
-        }
-        Opcode::DefineNamedOwnProperty | Opcode::DefineKeyedOwnProperty => {
-            let receiver = stack.reg(&meta, ops.reg(0));
-            // canonicalize computed string keys before the no-GC readback
-            if op == Opcode::DefineKeyedOwnProperty {
-                let raw = stack.reg(&meta, ops.reg(1));
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
-                    return Step::PendingThrow;
-                };
-                stack.set_reg(&meta, ops.reg(1), key);
-            }
-            let (name, desc) = step_try!(heap.no_gc(|nogc| {
-                if !receiver.as_heap_object(nogc).is_some() {
-                    return Err(VmError::Type);
-                }
-                let name = match op {
-                    Opcode::DefineNamedOwnProperty => callable_name(nogc, stack, &meta, ops.idx(1)),
-                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(1)))? {
-                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                        Key::Name(name) => name,
-                    },
-                };
-                let flags = ops.uimm(2);
-                let enumerable = flags & PropertyFlags::DontEnum.bits() == 0;
-                let configurable = flags & PropertyFlags::DontDelete.bits() == 0;
-                let desc = if flags & PropertyFlags::Accessor.bits() != 0 {
-                    let pair = cache
-                        .acc()
-                        .get_as::<AccessorPair>(nogc)
-                        .ok_or(VmError::Type)?;
-                    let pair = pair.as_ref();
-                    PropertyDescriptor::Accessor {
-                        get: pair.get.inner(),
-                        set: pair.set.inner(),
-                        enumerable,
-                        configurable,
-                    }
-                } else {
-                    PropertyDescriptor::Data {
-                        value: cache.acc(),
-                        writable: flags & PropertyFlags::ReadOnly.bits() == 0,
-                        enumerable,
-                        configurable,
-                    }
-                };
-                Ok((name, desc))
-            }));
-            let defined = state.handle_scope(|scope| {
-                Object::define_own_property_values(heap, &scope, receiver, name, desc)
-            });
-            let defined = step_try!(defined);
-            if !defined {
-                return Step::Error(VmError::Type);
-            }
-            Step::Next
-        }
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
                 heap.new_object(&scope, heap.known().object_initial_map, &[])
@@ -1378,23 +1284,6 @@ fn step(
             cache.set_acc(ctx.erase());
             Step::Next
         }
-        Opcode::CreateCatchContext => {
-            let exception = stack.reg(&meta, ops.reg(0));
-            let outer = step_try!(frame_context(heap, stack, &meta));
-            let ctx = state.handle_scope(|scope| {
-                let outer = scope
-                    .cast::<Context>(outer)
-                    .expect("frame context slot holds a Context");
-                let slots = heap.allocate_handle::<FixedArray>(&[exception], &scope);
-                heap.allocate::<Context>(ContextInit {
-                    outer: Some(outer),
-                    slots,
-                    scope_info: heap.known().empty_scope_info,
-                })
-            });
-            cache.set_acc(ctx.erase());
-            Step::Next
-        }
         Opcode::PushContext => {
             let old = step_try!(frame_context(heap, stack, &meta));
             stack.set_reg(&meta, ops.reg(0), old);
@@ -1404,13 +1293,6 @@ fn step(
         Opcode::PopContext => {
             let context = stack.reg(&meta, ops.reg(0));
             step_try!(set_frame_context(heap, stack, &meta, context));
-            Step::Next
-        }
-        Opcode::SetPrototype => {
-            let proto = stack.reg(&meta, ops.reg(0));
-            let result =
-                state.handle_scope(|scope| Object::set_prototype(heap, &scope, cache.acc(), proto));
-            step_try!(result);
             Step::Next
         }
         Opcode::ThrowReferenceErrorIfHole => {
@@ -1461,312 +1343,6 @@ fn step(
             }));
             Step::Next
         }
-        Opcode::LoadDynamicName => {
-            let name = cache.constants_ref(&heap.guard()).at(ops.idx(0));
-            let found = step_try!(dynamic_lookup(&heap.guard(), stack, &meta, name));
-            match found {
-                Some(v) if v != heap.known().the_hole.value() => cache.set_acc(v),
-                Some(_) => return Step::Error(VmError::Reference),
-                None => {
-                    // unresolved: fall back to a global object property
-                    let global = heap.known().global_object.value();
-                    let outcome =
-                        step_try!(heap.no_gc(|nogc| {
-                            load_outcome(nogc, global, SlotName::from_value(name))
-                        }));
-                    match outcome {
-                        LoadOutcome::Value(v) => cache.set_acc(v),
-                        LoadOutcome::Getter(getter) => {
-                            let called = step_try!(call_value(
-                                heap,
-                                stack,
-                                cache,
-                                meta,
-                                pc,
-                                getter,
-                                &[global],
-                            ));
-                            if !called {
-                                cache.set_acc(heap.known().undefined.value());
-                            }
-                        }
-                    }
-                }
-            }
-            Step::Next
-        }
-        Opcode::StoreDynamicName => {
-            let name = cache.constants_ref(&heap.guard()).at(ops.idx(0));
-            let found = step_try!(dynamic_lookup(&heap.guard(), stack, &meta, name));
-            match found {
-                Some(v) if v != heap.known().the_hole.value() => {
-                    // write through to the found slot
-                    step_try!(heap.no_gc(|nogc| {
-                        let mut context = stack
-                            .context_slot(&meta)
-                            .inner()
-                            .get_as::<Context>(nogc)
-                            .ok_or(VmError::Type)?;
-                        let target = dynamic_slot(nogc, &mut context, name)?;
-                        let host = context.into_tagged().erase();
-                        target.set(nogc, host, cache.acc());
-                        Ok(())
-                    }));
-                }
-                Some(_) => return Step::Error(VmError::Reference),
-                None => {
-                    let global = heap.known().global_object.value();
-                    let outcome = step_try!(heap.no_gc(|nogc| {
-                        global.store_lookup(
-                            nogc,
-                            SlotName::from_value(name),
-                            cache.acc(),
-                            StoreSemantics::WriteThrough,
-                        )
-                    }));
-                    step_try!(apply_store_outcome(
-                        heap, state, stack, cache, meta, pc, global, outcome,
-                    ));
-                }
-            }
-            Step::Next
-        }
-        Opcode::ThrowIfNotConstructorOrNull => {
-            // ES 15.7.14 step 15.e: the superclass must be null or a
-            // constructor ("Class extends value is not a constructor or null")
-            let ok = heap.no_gc(|nogc| {
-                let v = cache.acc();
-                if v == nogc.known().null.value() {
-                    return true;
-                }
-                let Some(obj) = v.as_heap_object(nogc) else {
-                    return false;
-                };
-                obj.as_ref()
-                    .header
-                    .map
-                    .heap_ref(nogc)
-                    .kind()
-                    .is_constructor()
-            });
-            if !ok {
-                return Step::Error(VmError::Type);
-            }
-            Step::Next
-        }
-        Opcode::ThrowIfNotObjectOrNull => {
-            // superCtor.prototype must be an Object or null
-            let ok = heap.no_gc(|nogc| {
-                let v = cache.acc();
-                v == nogc.known().null.value() || !Convert::is_primitive(nogc, v)
-            });
-            if !ok {
-                return Step::Error(VmError::Type);
-            }
-            Step::Next
-        }
-        Opcode::ThrowSuperNotCalledIfHole => {
-            if cache.acc() == heap.known().the_hole.value() {
-                // "Must call super constructor before accessing 'this'"
-                return Step::Error(VmError::Reference);
-            }
-            Step::Next
-        }
-        Opcode::ThrowSuperAlreadyCalledIfNotHole => {
-            if cache.acc() != heap.known().the_hole.value() {
-                // "Super constructor may only be called once"
-                return Step::Error(VmError::Reference);
-            }
-            Step::Next
-        }
-        Opcode::LoadNamedPropertyFromSuper | Opcode::LoadKeyedPropertyFromSuper => {
-            let recv = stack.reg(&meta, ops.reg(0));
-            if recv == heap.known().the_hole.value() {
-                // super.x before super() in a derived constructor
-                return Step::Error(VmError::Reference);
-            }
-            let value = cache.acc();
-            // ES 15.4.2: GetSuperBase before ToPropertyKey — key coercion
-            // (user toString) must not change which chain is searched
-            let proto = heap.no_gc(|nogc| home_proto(nogc, value));
-            if op == Opcode::LoadKeyedPropertyFromSuper {
-                let raw = stack.reg(&meta, ops.reg(1));
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
-                    return Step::PendingThrow;
-                };
-                stack.set_reg(&meta, ops.reg(1), key);
-            }
-            let outcome = step_try!(heap.no_gc(|nogc| {
-                let name = match op {
-                    Opcode::LoadNamedPropertyFromSuper => {
-                        callable_name(nogc, stack, &meta, ops.idx(1))
-                    }
-                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(1)))? {
-                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                        Key::Name(name) => name,
-                    },
-                };
-                super_lookup_from_proto(nogc, proto, name)
-            }));
-            match outcome {
-                LoadOutcome::Value(v) => cache.set_acc(v),
-                LoadOutcome::Getter(getter) => {
-                    let called =
-                        step_try!(call_value(heap, stack, cache, meta, pc, getter, &[recv],));
-                    if !called {
-                        cache.set_acc(heap.known().undefined.value());
-                    }
-                }
-            }
-            Step::Next
-        }
-        Opcode::StoreNamedPropertyToSuper | Opcode::StoreKeyedPropertyToSuper => {
-            let value = stack.reg(&meta, ops.reg(0));
-            let recv = stack.reg(&meta, ops.reg(1));
-            if recv == heap.known().the_hole.value() {
-                return Step::Error(VmError::Reference);
-            }
-            // ES 15.4.4: GetSuperBase before ToPropertyKey — the parent
-            // link is resolved before any user key coercion runs
-            let proto = heap.no_gc(|nogc| home_proto(nogc, value));
-            if op == Opcode::StoreKeyedPropertyToSuper {
-                let raw = stack.reg(&meta, ops.reg(2));
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
-                    return Step::PendingThrow;
-                };
-                stack.set_reg(&meta, ops.reg(2), key);
-            }
-            let semantics = if ops.uimm(3) & bytecode::SUPER_STORE_WRITE_THROUGH != 0 {
-                StoreSemantics::WriteThrough
-            } else {
-                StoreSemantics::Shadow
-            };
-            let outcome = step_try!(heap.no_gc(|nogc| {
-                let name = match op {
-                    Opcode::StoreNamedPropertyToSuper => {
-                        callable_name(nogc, stack, &meta, ops.idx(2))
-                    }
-                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(2)))? {
-                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                        Key::Name(name) => name,
-                    },
-                };
-                super_store_lookup(nogc, proto, recv, name, cache.acc(), semantics)
-            }));
-            step_try!(apply_store_outcome(
-                heap, state, stack, cache, meta, pc, recv, outcome,
-            ));
-            Step::Next
-        }
-        Opcode::ConstructSuper | Opcode::ConstructSuperAllArgs | Opcode::ConstructSuperVia => {
-            // ES 15.4.3: construct GetSuperConstructor() with the
-            // constructor's new.target; derived parents get the hole
-            // receiver. The frame variants resolve the super constructor
-            // from the running closure; the Via variant receives the
-            // (arrow-threaded) closure and new.target from registers.
-            let (callee, new_target, args_base, count) = match op {
-                Opcode::ConstructSuperVia => {
-                    let closure = stack.reg(&meta, ops.reg(0));
-                    let new_target = stack.reg(&meta, ops.reg(1));
-                    let callee = heap.no_gc(|nogc| {
-                        let Some(obj) = closure.as_heap_object(nogc) else {
-                            return None;
-                        };
-                        let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
-                        let proto_obj = proto.as_heap_object(nogc)?;
-                        if !proto_obj
-                            .as_ref()
-                            .header
-                            .map
-                            .heap_ref(nogc)
-                            .kind()
-                            .is_constructor()
-                        {
-                            return None;
-                        }
-                        Some(proto)
-                    });
-                    (callee, new_target, ops.reg_list(2), ops.reg_count(3))
-                }
-                _ => {
-                    let (callee, nt) = heap.no_gc(|nogc| {
-                        let Some(callee) = super_constructor(nogc, stack, &meta) else {
-                            return (None, None);
-                        };
-                        let nt = stack.new_target_slot(&meta).inner();
-                        (Some(callee), Some(nt))
-                    });
-                    let (args_base, count) = if op == Opcode::ConstructSuperAllArgs {
-                        // forward the current frame's whole argument list
-                        (-2i32, stack.argc(&meta).saturating_sub(1))
-                    } else {
-                        (ops.reg_list(0), ops.reg_count(1))
-                    };
-                    // nt is None only when the callee lookup failed; the
-                    // undefined placeholder fails the checks below
-                    (
-                        callee,
-                        nt.unwrap_or_else(|| heap.known().undefined.value()),
-                        args_base,
-                        count,
-                    )
-                }
-            };
-            let Some(callee) = callee else {
-                return Step::Error(VmError::Type);
-            };
-            if new_target == heap.known().undefined.value()
-                || new_target == heap.known().the_hole.value()
-            {
-                // not inside a [[Construct]]: reachable via an arrow that
-                // escaped the constructor
-                return Step::Error(VmError::Type);
-            }
-            let derived = heap.no_gc(|nogc| {
-                function_kind_of(nogc, callee).is_some_and(|k| k.is_derived_class_constructor())
-            });
-            state.handle_scope(|scope| {
-                let Some(callee) = scope.cast::<Object>(callee) else {
-                    return Step::Error(VmError::Type);
-                };
-                let Some(new_target) = scope.cast::<Object>(new_target) else {
-                    return Step::Error(VmError::Type);
-                };
-                let (receiver, allocated) = if derived {
-                    (heap.known().the_hole.value(), false)
-                } else {
-                    match Runtime::create_construct_receiver(vm, heap, state, new_target) {
-                        Ok(Some(r)) => (r, true),
-                        Ok(None) => return Step::PendingThrow,
-                        Err(err) => return Step::Error(err),
-                    }
-                };
-                let mut args = Vec::with_capacity(count + 1);
-                args.push(receiver);
-                args.extend_from_slice(stack.args(&meta, args_base, count).as_slice());
-                let result = match NativeContext::new(vm, heap, state).call_construct(
-                    callee.value(),
-                    new_target.value(),
-                    scope.stage(&args),
-                ) {
-                    Ok(r) => r,
-                    Err(err) => return Step::Error(err),
-                };
-                if result == heap.known().exception.value() {
-                    return Step::PendingThrow;
-                }
-                cache.set_acc(if Convert::is_primitive(&heap.guard(), result) {
-                    if allocated {
-                        receiver
-                    } else {
-                        return Step::Error(VmError::Type);
-                    }
-                } else {
-                    result
-                });
-                Step::Next
-            })
-        }
         Opcode::LdaNewTarget => {
             cache.set_acc(stack.new_target_slot(&meta).inner());
             Step::Next
@@ -1780,157 +1356,6 @@ fn step(
             cache.set_acc(ctx);
             Step::Next
         }
-        Opcode::InstallNamedAccessor | Opcode::InstallKeyedAccessor => {
-            // ES 14.3.10: define one accessor half, merging with an existing
-            // accessor pair under the same key. acc holds the closure.
-            let target = stack.reg(&meta, ops.reg(0));
-            if op == Opcode::InstallKeyedAccessor {
-                let raw = stack.reg(&meta, ops.reg(1));
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
-                    return Step::PendingThrow;
-                };
-                stack.set_reg(&meta, ops.reg(1), key);
-            }
-            let flags = match op {
-                Opcode::InstallNamedAccessor => ops.uimm(2),
-                _ => ops.uimm(2),
-            };
-            let is_getter = flags & 1 != 0;
-            let enumerable = flags & PropertyFlags::DontEnum.bits() == 0;
-            let outcome = step_try!(heap.no_gc(|nogc| {
-                if target.as_heap_object(nogc).is_none() {
-                    return Err(VmError::Type);
-                }
-                let name = match op {
-                    Opcode::InstallNamedAccessor => callable_name(nogc, stack, &meta, ops.idx(1)),
-                    _ => match classify_key(nogc, stack.reg(&meta, ops.reg(1)))? {
-                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                        Key::Name(name) => name,
-                    },
-                };
-                // existing own accessor half, if any (own descriptors only)
-                let undefined = nogc.known().undefined.value();
-                let mut get = undefined;
-                let mut set = undefined;
-                if let Some(obj) = target.as_heap_object(nogc) {
-                    for d in obj.as_ref().header.map.heap_ref(nogc).descriptors() {
-                        if d.name() == name && d.flags().is_accessor() {
-                            let pair = d
-                                .value
-                                .inner()
-                                .get_as::<AccessorPair>(nogc)
-                                .expect("accessor descriptor holds a pair");
-                            let pair = pair.as_ref();
-                            get = pair.get.inner();
-                            set = pair.set.inner();
-                            break;
-                        }
-                    }
-                }
-                if is_getter {
-                    get = cache.acc();
-                } else {
-                    set = cache.acc();
-                }
-                Ok((
-                    name,
-                    PropertyDescriptor::Accessor {
-                        get,
-                        set,
-                        enumerable,
-                        configurable: true,
-                    },
-                ))
-            }));
-            let (name, desc) = outcome;
-            let defined = state.handle_scope(|scope| {
-                Object::define_own_property_values(heap, &scope, target, name, desc)
-            });
-            let defined = step_try!(defined);
-            if !defined {
-                return Step::Error(VmError::Type);
-            }
-            Step::Next
-        }
-        Opcode::SetFunctionNameConst | Opcode::SetFunctionNameKey => {
-            // ES 8.4.4 SetFunctionName: redefine `name` on the closure in
-            // the accumulator (defined configurable by create_closure)
-            let (fn_value, name) = match op {
-                Opcode::SetFunctionNameConst => {
-                    let name = cache.constants_ref(&heap.guard()).at(ops.idx(0));
-                    (cache.acc(), name)
-                }
-                _ => {
-                    let raw = stack.reg(&meta, ops.reg(0));
-                    let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw))
-                    else {
-                        return Step::PendingThrow;
-                    };
-                    let text = step_try!(
-                        state.handle_scope(|scope| { Convert::to_string(heap, &scope, key) })
-                    );
-                    let prefix: &[u8] = match ops.uimm(1) {
-                        1 => b"get ",
-                        2 => b"set ",
-                        _ => b"",
-                    };
-                    let bytes = heap.no_gc(|nogc| {
-                        let mut full = prefix.to_vec();
-                        full.extend_from_slice(
-                            text.get_as::<VMString>(nogc)
-                                .expect("ToString yields a string")
-                                .as_slice(nogc),
-                        );
-                        full
-                    });
-                    let name = state
-                        .handle_scope(|scope| vm.interner().intern(heap, &scope, bytes).value());
-                    (cache.acc(), name)
-                }
-            };
-            let defined = state.handle_scope(|scope| {
-                let Some(fn_obj) = scope.cast::<Object>(fn_value) else {
-                    return Err(VmError::Type);
-                };
-                let name_key = heap.known().strings.name;
-                // Class members named `name` (methods, fields, accessors)
-                // define over the constructor after ClassDefinitionEvaluation
-                // set its name — and since our NamedEvaluation SetFunctionName
-                // runs after the whole class expression, an already-explicitly
-                // defined `name` must win (ES 15.7.14: SetFunctionName
-                // happens before element installation). The closure's own
-                // placeholder is never writable nor an accessor, so only
-                // explicit member defines match here.
-                let explicit = heap.no_gc(|nogc| {
-                    let plain = SlotName::from_value(name_key.value());
-                    match fn_obj.heap_ref(nogc).as_ref().lookup(nogc, plain) {
-                        Lookup::Data { flags, .. } => flags.is_writable(),
-                        Lookup::Accessor { .. } => true,
-                        Lookup::NotFound => false,
-                    }
-                });
-                if explicit {
-                    return Ok(true);
-                }
-                Object::define_own_property(
-                    heap,
-                    &scope,
-                    fn_obj,
-                    name_key,
-                    PropertyDescriptor::Data {
-                        value: name,
-                        writable: false,
-                        enumerable: false,
-                        configurable: true,
-                    },
-                )
-            });
-            let defined = step_try!(defined);
-            if !defined {
-                return Step::Error(VmError::Type);
-            }
-            Step::Next
-        }
         Opcode::LdaHole => {
             cache.set_acc(heap.known().the_hole.value());
             Step::Next
@@ -1939,31 +1364,6 @@ fn step(
             if cache.acc() != heap.known().undefined.value() {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
-            Step::Next
-        }
-        Opcode::CreateRestParameter => {
-            // a fresh array of the frame's arguments from formal index `i`
-            let first = ops.uimm(0) as usize;
-            let argc = stack.argc(&meta); // receiver included
-            let count = argc.saturating_sub(1).saturating_sub(first);
-            let values: Vec<Value> = (0..count)
-                .map(|i| stack.reg(&meta, -((first + i + 2) as i32)))
-                .collect();
-            let arr = state.handle_scope(|scope| {
-                let elements = heap.allocate_handle::<FixedArray>(&values, &scope);
-                heap.allocate_object(
-                    &scope,
-                    ObjectSlotsInit {
-                        map: heap.known().js_array_map,
-                        values: &[],
-                        elements: elements.erase(),
-                        length: values.len(),
-                    },
-                )
-                .into_tagged()
-                .erase()
-            });
-            cache.set_acc(arr);
             Step::Next
         }
         Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),
