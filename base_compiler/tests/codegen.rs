@@ -575,7 +575,7 @@ fn throw_and_catch_binds_param() {
         "Throw",
         "Jump 27",
         "PopContext 3", // handler: restore the snapshotted context
-        "Store 0",     // e = exception
+        "Store 0",      // e = exception
         "Load 0",
         "PopContext 1",
         "Return",

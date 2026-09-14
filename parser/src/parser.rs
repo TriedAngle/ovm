@@ -89,14 +89,22 @@ enum PatCtx {
     CollectParams,
 }
 
-/// Per-function parse context saved by `begin_fn_body`: break/continue
-/// state never crosses function boundaries.
-struct FnParseState {
-    loop_depth: u32,
-    switch_depth: u32,
+/// A breakable statement being parsed (innermost last): its label set
+/// and kind. `continue` resolves to enclosing loops, `break` to any
+/// breakable — the single parse-time authority for both (ES 14.9, 14.10).
+struct Breakable {
     labels: Vec<Symbol>,
-    iter_labels: Vec<Symbol>,
-    pending_labels: Vec<Symbol>,
+    kind: BreakKind,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BreakKind {
+    /// iteration statement: break + continue target
+    Loop,
+    /// switch: break-only target
+    Switch,
+    /// any other labelled statement: break-only target
+    Other,
 }
 
 pub struct Parser<S: CharStream> {
@@ -104,19 +112,7 @@ pub struct Parser<S: CharStream> {
     ast: Ast,
     errors: Vec<ParseError>,
     scopes: Vec<Scope>,
-    loop_depth: u32,
-    /// switch statement nesting (break targets; continue stays loop-only)
-    switch_depth: u32,
-    /// labels of enclosing labelled statements (break targets; ES 14.10.1)
-    labels: Vec<Symbol>,
-    /// labels naming enclosing iteration statements (continue targets;
-    /// ES 14.9.1: only a label on the loop itself is continuable)
-    iter_labels: Vec<Symbol>,
-    /// label chain still awaiting its statement (the ES 14.13.1 LabelSet):
-    /// pushed by `parse_labeled_statement`, adopted by the loop it names,
-    /// cleared by any other statement dispatch; duplicates within the
-    /// chain are early errors
-    pending_labels: Vec<Symbol>,
+    breakables: Vec<Breakable>,
     /// functions currently being parsed (ids into the Ast table); last = innermost
     fn_stack: Vec<FunctionId>,
     /// classes currently being parsed; last = innermost
@@ -137,11 +133,7 @@ impl<S: CharStream> Parser<S> {
             ast: Ast::new(),
             errors: Vec::new(),
             scopes: Vec::new(),
-            loop_depth: 0,
-            switch_depth: 0,
-            labels: Vec::new(),
-            iter_labels: Vec::new(),
-            pending_labels: Vec::new(),
+            breakables: Vec::new(),
             fn_stack: Vec::new(),
             class_stack: Vec::new(),
             next_literal_id: 0,
@@ -197,15 +189,15 @@ impl<S: CharStream> Parser<S> {
             field_key: None,
             lazy_data: None,
         });
-        self.fn_stack.push(top_id);
-        let scope_id = self.push_scope(ScopeKind::Script);
-        self.ast.scope_mut(scope_id).function = Some(top_id);
-        let stmts = self.parse_statement_list(TokenKind::Eof)?;
-        let end = self.next()?.span.end; // consume Eof
-        self.scopes.pop();
-        let body = self.add_block(stmts, Span::new(start, end));
-        self.ast.set_node_scope(body, scope_id);
-        self.fn_stack.pop();
+        let body = self.in_fn_body(top_id, ScopeKind::Script, |p| {
+            let scope_id = p.scopes.last().unwrap().id;
+            let stmts = p.parse_statement_list(TokenKind::Eof)?;
+            let end = p.next()?.span.end; // consume Eof
+            let body = p.add_block(stmts, Span::new(start, end));
+            p.ast.set_node_scope(body, scope_id);
+            Ok(body)
+        })?;
+        let end = self.ast.span(body).end;
         let top = self.ast.function_mut(top_id);
         top.body = Some(body);
         top.span = Span::new(start, end);
@@ -312,6 +304,107 @@ impl<S: CharStream> Parser<S> {
             .find(|s| s.is_function)
             .expect("always inside a function scope")
             .id
+    }
+
+    // -- region brackets -------------------------------------------------------
+    //
+    // All parse-time region state goes through these brackets: the pop
+    // runs after `f` returns — on success and on every `?` early return
+    // inside it. That is the Drop guarantee as a closure: state stays
+    // balanced under error propagation, so no counter can underflow and
+    // no stack can leak past its region.
+
+    fn in_scope<T, F>(&mut self, kind: ScopeKind, f: F) -> Result<T, ParseError>
+    where
+        F: FnOnce(&mut Self, ScopeId) -> Result<T, ParseError>,
+    {
+        let id = self.push_scope(kind);
+        let result = f(self, id);
+        self.scopes.pop();
+        result
+    }
+
+    fn in_breakable<T, F>(
+        &mut self,
+        kind: BreakKind,
+        labels: Vec<Symbol>,
+        f: F,
+    ) -> Result<T, ParseError>
+    where
+        F: FnOnce(&mut Self) -> Result<T, ParseError>,
+    {
+        self.breakables.push(Breakable { labels, kind });
+        let result = f(self);
+        self.breakables.pop();
+        result
+    }
+
+    fn in_class<F, T>(&mut self, f: F) -> Result<(T, ClassCtx), ParseError>
+    where
+        F: FnOnce(&mut Self) -> Result<T, ParseError>,
+    {
+        self.class_stack.push(ClassCtx {
+            entry_fn_depth: self.fn_stack.len(),
+            uses_super: false,
+            is_static: false,
+            privates: Vec::new(),
+            private_uses: Vec::new(),
+        });
+        let result = f(self);
+        let ctx = self.class_stack.pop().expect("class context");
+        result.map(|t| (t, ctx))
+    }
+
+    /// A function body: pushes the function context (fn stack + scope +
+    /// parameter declarations) and parses with a fresh breakable stack —
+    /// break/continue never cross function boundaries (ES 14.9.1, 14.10.1).
+    fn in_fn_body<F, T>(&mut self, fid: FunctionId, kind: ScopeKind, f: F) -> Result<T, ParseError>
+    where
+        F: FnOnce(&mut Self) -> Result<T, ParseError>,
+    {
+        self.fn_stack.push(fid);
+        let scope_id = self.push_scope(kind);
+        self.ast.scope_mut(scope_id).function = Some(fid);
+        // params live in the function scope; sloppy simple lists allow
+        // duplicates (each declared, sharing a register)
+        let params: Vec<Param> = self.ast.function(fid).params.clone();
+        let scope = self.scopes.last_mut().unwrap();
+        for &p in &params {
+            if let Node::Identifier { sym } = *self.ast.node(p.target) {
+                if !scope.var_declared.contains(&sym) {
+                    scope.var_declared.push(sym);
+                }
+            }
+        }
+        let span = self.ast.function(fid).span;
+        for (i, p) in params.iter().enumerate() {
+            match *self.ast.node(p.target) {
+                Node::Identifier { sym } => {
+                    self.ast
+                        .declare_param(scope_id, sym, DeclKind::Param, span, i as u32);
+                }
+                _ => {
+                    let mut names = Vec::new();
+                    collect_pattern_names(&self.ast, p.target, &mut names);
+                    for (sym, span) in names {
+                        // pattern names are var-like in the function scope
+                        // (body `var x` redeclares them, `let x` is an error)
+                        let scope = self.scopes.last_mut().unwrap();
+                        if !scope.var_declared.contains(&sym) {
+                            scope.var_declared.push(sym);
+                        }
+                        self.ast
+                            .declare(scope_id, sym, DeclKind::PatternParam, span);
+                    }
+                }
+            }
+        }
+        let outer_breakables = std::mem::take(&mut self.breakables);
+        let result = f(self);
+        self.breakables = outer_breakables;
+        self.scopes.pop();
+        self.fn_stack.pop();
+        result
     }
 
     fn declare_var(&mut self, sym: Symbol, span: Span, kind: DeclKind) -> Result<(), ParseError> {
@@ -613,52 +706,43 @@ impl<S: CharStream> Parser<S> {
         Ok(Some(kind))
     }
 
-    fn parse_labeled_statement(&mut self) -> Result<NodeId, ParseError> {
-        let t = self.next()?;
-        let label = self.ident_symbol(t)?;
-        self.expect(TokenKind::Colon)?;
-        // ES 14.13.1: a label set may not repeat a label; sibling labels
-        // of separate statements (chain cleared between) may repeat
-        if self.pending_labels.contains(&label) {
-            return Err(ParseError::new(t.span, "duplicate label"));
-        }
-        self.labels.push(label);
-        self.pending_labels.push(label);
-        let body = self.parse_statement();
-        self.labels.pop();
-        self.pending_labels.pop();
-        let body = self.reject_labelled_item(body)?;
-        let span = Span::new(t.span.start, self.ast.span(body).end);
-        Ok(self.ast.add(Node::Labeled { label, body }, span))
-    }
-
-    /// ES 14.13: a labelled item is a Statement or (sloppy) a function
-    /// declaration — lexical and class declarations are early errors, and
-    /// the labelled function is one in strict code.
-    fn reject_labelled_item(&self, body: Result<NodeId, ParseError>) -> Result<NodeId, ParseError> {
-        let body = body?;
-        let bad = match *self.ast.node(body) {
-            Node::VarDecl { kind, .. } => matches!(kind, VarKind::Let | VarKind::Const),
-            Node::ClassDecl { .. } => true,
-            Node::FunctionDecl { .. } => self
-                .fn_stack
-                .last()
-                .is_some_and(|&f| self.ast.function(f).strict),
-            _ => false,
-        };
-        if bad {
-            return Err(ParseError::new(
-                self.ast.span(body),
-                "illegal declaration as a labelled item",
-            ));
-        }
-        Ok(body)
-    }
-
+    /// A statement with its label chain (ES 14.13): `a: b: stmt` collects
+    /// the whole chain up front (in-chain duplicates are early errors),
+    /// attaches it to loops and switches — whose breakable label set it
+    /// becomes — and wraps anything else in break-only `Labeled` nodes.
     fn parse_statement(&mut self) -> Result<NodeId, ParseError> {
+        let mut labels: Vec<(Symbol, Span)> = Vec::new();
+        loop {
+            let t = self.peek()?;
+            // `label : Statement` (not before function/class). No newline
+            // restriction: `x` on its own line followed by `:` is a label
+            // (`:` cannot start a statement, so there is no ASI hazard)
+            if is_identifier_like(t.kind)
+                && !matches!(t.kind, TokenKind::Function | TokenKind::Class)
+                && self.peek_ahead()?.kind == TokenKind::Colon
+            {
+                let label = self.ident_symbol(t.clone())?;
+                if labels.iter().any(|&(l, _)| l == label) {
+                    return Err(ParseError::new(t.span, "duplicate label"));
+                }
+                self.next()?; // identifier
+                self.next()?; // colon
+                labels.push((label, t.span));
+            } else {
+                break;
+            }
+        }
+        let stmt = self.parse_statement_body(&labels)?;
+        if !labels.is_empty() {
+            if self.forbidden_body(stmt, false) {
+                return Err(ParseError::new(
+                    self.ast.span(stmt),
+                    "illegal declaration as a labelled item",
+                ));
+            }
+        }
         // a CoverInitializedName (`{a = 1}`) that survives the statement
         // was never consumed by a pattern rewrite: Syntax Error (ES 14.13.3)
-        let stmt = self.parse_statement_inner();
         if let Some(&node) = self.cover_init.last() {
             let span = self.ast.span(node);
             self.cover_init.clear();
@@ -667,39 +751,45 @@ impl<S: CharStream> Parser<S> {
                 "literal-property shorthand with initializer is only valid in destructuring patterns",
             ));
         }
-        stmt
+        Ok(self.wrap_labels(labels, stmt))
     }
 
-    fn parse_statement_inner(&mut self) -> Result<NodeId, ParseError> {
+    fn wrap_labels(&mut self, labels: Vec<(Symbol, Span)>, mut node: NodeId) -> NodeId {
+        for (label, span) in labels.into_iter().rev() {
+            let end = self.ast.span(node).end;
+            node = self.ast.add(
+                Node::Labeled { label, body: node },
+                Span::new(span.start, end),
+            );
+        }
+        node
+    }
+
+    fn label_syms(labels: &[(Symbol, Span)]) -> Vec<Symbol> {
+        labels.iter().map(|&(l, _)| l).collect()
+    }
+
+    fn parse_statement_body(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
         let t = self.peek()?;
-        // labeled statement: `label : Statement` (not before function/class).
-        // No newline restriction: `x` on its own line followed by `:` is a
-        // label (`:` cannot start a statement, so there is no ASI hazard)
-        if is_identifier_like(t.kind)
-            && !matches!(t.kind, TokenKind::Function | TokenKind::Class)
-            && self.peek_ahead()?.kind == TokenKind::Colon
-        {
-            return self.parse_labeled_statement();
+        // a labelled item is a Statement, never a Declaration (ES 14.13):
+        // `l: let …` reads `let` as an identifier expression (ASI splits
+        // `l: let \n x = 1`); `const`/`class` stay declarations and fail
+        // `forbidden_body`
+        if !labels.is_empty() && self.peek_var_kind()? == Some(VarKind::Let) {
+            return self.parse_expr_stmt();
         }
-        // loops adopt the pending label chain as their label set (the
-        // labels name the loop itself); every other statement consumes it
-        // as a plain break target only (ES 14.13.1)
-        let labelled_item = !self.pending_labels.is_empty();
-        if !matches!(t.kind, TokenKind::While | TokenKind::For) {
-            self.pending_labels.clear();
-        }
-        if let Some(kind) = self.peek_var_kind()? {
-            // a labelled item is a Statement, never a Declaration
-            // (ES 14.13): `l: let …` reads `let` as an identifier
-            // expression (ASI splits `l: let \n x = 1`), while
-            // `const`/`class` bodies stay declarations and fail the
-            // labelled-item check
-            if kind == VarKind::Let && labelled_item {
-                return self.parse_expr_stmt();
-            }
-            return self.parse_var_decl(kind, true);
-        }
+        // loops and switches carry their label set themselves; a labelled
+        // anything-else is a plain break target (matching the codegen's
+        // break-only breakable for `Labeled`)
         match t.kind {
+            TokenKind::While => self.parse_while(labels),
+            TokenKind::For => self.parse_for(labels),
+            TokenKind::Switch => self.parse_switch(labels),
+            _ if !labels.is_empty() => {
+                let syms = Self::label_syms(labels);
+                self.in_breakable(BreakKind::Other, syms, |p| p.parse_statement_body(&[]))
+            }
+            _ if let Some(kind) = self.peek_var_kind()? => self.parse_var_decl(kind, true),
             TokenKind::Function => {
                 let function = self.parse_function(true)?;
                 let span = self.ast.function(function).span;
@@ -707,12 +797,9 @@ impl<S: CharStream> Parser<S> {
             }
             TokenKind::Class => self.parse_class(true),
             TokenKind::If => self.parse_if(),
-            TokenKind::While => self.parse_while(),
-            TokenKind::For => self.parse_for(),
             TokenKind::Return => self.parse_return(),
             TokenKind::Throw => self.parse_throw(),
             TokenKind::Try => self.parse_try(),
-            TokenKind::Switch => self.parse_switch(),
             TokenKind::Break | TokenKind::Continue => self.parse_break_continue(t.kind),
             TokenKind::LBrace => self.parse_block(),
             TokenKind::Semicolon => {
@@ -720,6 +807,25 @@ impl<S: CharStream> Parser<S> {
                 Ok(self.ast.add(Node::Empty, t.span))
             }
             _ => self.parse_expr_stmt(),
+        }
+    }
+
+    /// Whether a declaration is forbidden in a single-statement body
+    /// position: loop bodies take only Statements (ES 14.7: no let/const/
+    /// function/class at all), labelled items take Statements plus a
+    /// sloppy function declaration (ES 14.13).
+    fn forbidden_body(&self, stmt: NodeId, loop_body: bool) -> bool {
+        match *self.ast.node(stmt) {
+            Node::VarDecl { kind, .. } => matches!(kind, VarKind::Let | VarKind::Const),
+            Node::ClassDecl { .. } => true,
+            Node::FunctionDecl { .. } => {
+                loop_body
+                    || self
+                        .fn_stack
+                        .last()
+                        .is_some_and(|&f| self.ast.function(f).strict)
+            }
+            _ => false,
         }
     }
 
@@ -738,10 +844,7 @@ impl<S: CharStream> Parser<S> {
     }
 
     fn parse_block(&mut self) -> Result<NodeId, ParseError> {
-        self.push_scope(ScopeKind::Block);
-        let block = self.parse_statement_block();
-        self.scopes.pop();
-        block
+        self.in_scope(ScopeKind::Block, |p, _| p.parse_statement_block())
     }
 
     fn add_block(&mut self, stmts: Vec<NodeId>, span: Span) -> NodeId {
@@ -789,7 +892,11 @@ impl<S: CharStream> Parser<S> {
 
     /// The part of a declarator after its binding target: the optional
     /// initializer (const requires one), producing a VarDeclarator.
-    fn parse_declarator_tail(&mut self, kind: VarKind, target: NodeId) -> Result<NodeId, ParseError> {
+    fn parse_declarator_tail(
+        &mut self,
+        kind: VarKind,
+        target: NodeId,
+    ) -> Result<NodeId, ParseError> {
         let init = if self.eat(TokenKind::Assign)? {
             Some(self.parse_assignment()?)
         } else {
@@ -805,10 +912,9 @@ impl<S: CharStream> Parser<S> {
         let end = init
             .map(|i| self.ast.span(i).end)
             .unwrap_or(self.ast.span(target).end);
-        Ok(self.ast.add(
-            Node::VarDeclarator { target, init },
-            Span::new(start, end),
-        ))
+        Ok(self
+            .ast
+            .add(Node::VarDeclarator { target, init }, Span::new(start, end)))
     }
 
     fn parse_if(&mut self) -> Result<NodeId, ParseError> {
@@ -829,195 +935,176 @@ impl<S: CharStream> Parser<S> {
             .add(Node::If { cond, then, else_ }, Span::new(start, end)))
     }
 
-    /// ES 14.13/14.7: a single-statement loop body (for / for-in /
-    /// for-of / while / do-while) is a Statement — `var` qualifies,
-    /// lexical declarations (let/const), function and class
-    /// declarations do not and are early errors.
-    fn reject_lexical_loop_body(&self, body: NodeId) -> Result<(), ParseError> {
-        let bad = match *self.ast.node(body) {
-            Node::VarDecl { kind, .. } => {
-                matches!(kind, VarKind::Let | VarKind::Const)
-            }
-            Node::FunctionDecl { .. } | Node::ClassDecl { .. } => true,
-            _ => false,
-        };
-        if bad {
+    fn parse_while(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
+        let start = self.expect(TokenKind::While)?.span.start;
+        self.expect(TokenKind::LParen)?;
+        let cond = self.parse_expression()?;
+        self.expect(TokenKind::RParen)?;
+        let body = self.in_breakable(BreakKind::Loop, Self::label_syms(labels), |p| {
+            p.parse_statement()
+        })?;
+        if self.forbidden_body(body, true) {
             return Err(ParseError::new(
                 self.ast.span(body),
                 "lexical declaration not allowed as a single-statement loop body",
             ));
         }
-        Ok(())
-    }
-
-    fn reject_lexical_loop_body_checked(
-        &self,
-        body: Result<NodeId, ParseError>,
-    ) -> Result<NodeId, ParseError> {
-        let body = body?;
-        self.reject_lexical_loop_body(body)?;
-        Ok(body)
-    }
-
-    fn parse_while(&mut self) -> Result<NodeId, ParseError> {
-        let start = self.expect(TokenKind::While)?.span.start;
-        self.expect(TokenKind::LParen)?;
-        let cond = self.parse_expression()?;
-        self.expect(TokenKind::RParen)?;
-        // the trailing label chain names this loop: its labels become
-        // continue targets inside the body (ES 14.7.2 LabelSet)
-        let adopted = self.pending_labels.len();
-        self.iter_labels.extend(self.pending_labels.iter().copied());
-        self.loop_depth += 1;
-        let body = self.parse_statement();
-        self.loop_depth = self.loop_depth.saturating_sub(1);
-        self.iter_labels
-            .truncate(self.iter_labels.len() - adopted);
-        let body = self.reject_lexical_loop_body_checked(body)?;
         let end = self.ast.span(body).end;
-        Ok(self
-            .ast
-            .add(Node::While { cond, body }, Span::new(start, end)))
+        Ok(self.ast.add(
+            Node::While {
+                labels: Self::label_syms(labels),
+                cond,
+                body,
+            },
+            Span::new(start, end),
+        ))
     }
 
-    fn parse_for(&mut self) -> Result<NodeId, ParseError> {
+    fn parse_for(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::For)?.span.start;
         // the head gets its own scope: `for (let i ...)` binds there and does
         // not leak into the enclosing scope
-        let scope_id = self.push_scope(ScopeKind::For);
-        self.expect(TokenKind::LParen)?;
+        self.in_scope(ScopeKind::For, |p, scope_id| {
+            p.expect(TokenKind::LParen)?;
 
-        // Head disambiguation (ES 14.7.5): `for (binding in expr)` /
-        // `for (LHS in expr)` are for-in; anything else is the C-style
-        // three-clause head.
-        enum Head {
-            ForIn { left: NodeId, object: NodeId },
-            Init { expr: Option<NodeId> },
-        }
-        let head = if self.peek()?.kind == TokenKind::Semicolon {
-            self.next()?;
-            Head::Init { expr: None }
-        } else if let Some(kind) = self.peek_var_kind()? {
-            // a declarator head: parse ONE binding with no initializer;
-            // `in` directly after it is for-in, otherwise parsing
-            // resumes as the C-style declarator list
-            let decl_start = self.next()?.span.start; // var / let / const
-            let target = self.parse_declarator_binding(kind)?;
-            if self.eat(TokenKind::In)? {
-                let object = self.parse_expression()?;
-                let decl_span = Span::new(decl_start, self.ast.span(object).end);
-                let declarator = self.ast.add(
-                    Node::VarDeclarator {
-                        target,
-                        init: None,
-                    },
-                    Span::new(decl_start, self.ast.span(target).end),
-                );
-                let decls = self.ast.list(&[declarator]);
-                let left = self.ast.add(Node::VarDecl { kind, decls }, decl_span);
-                Head::ForIn { left, object }
-            } else {
-                // C-style: finish this declarator, then the rest of the list
-                let mut decls = vec![self.parse_declarator_tail(kind, target)?];
-                while self.eat(TokenKind::Comma)? {
-                    let target = self.parse_declarator_binding(kind)?;
-                    decls.push(self.parse_declarator_tail(kind, target)?);
-                }
-                let end = self.ast.span(*decls.last().unwrap()).end;
-                let decls = self.ast.list(&decls);
-                let expr = self
-                    .ast
-                    .add(Node::VarDecl { kind, decls }, Span::new(decl_start, end));
-                self.expect(TokenKind::Semicolon)?;
-                Head::Init { expr: Some(expr) }
+            // Head disambiguation (ES 14.7.5): `for (binding in expr)` /
+            // `for (LHS in expr)` are for-in; anything else is the C-style
+            // three-clause head.
+            enum Head {
+                ForIn { left: NodeId, object: NodeId },
+                Init { expr: Option<NodeId> },
             }
-        } else {
-            // an expression head: a for-in LHS is a LeftHandSideExpression,
-            // so parse one speculatively and check for `in` (bookmarks
-            // restore the scanner only — the discarded fragment leaves
-            // orphaned, unreachable AST nodes). `of`-heads are rejected
-            // by the C-style path's `;` expectation, as before.
-            let mark = self.bookmark();
-            let lhs = self.parse_postfix()?;
-            if self.eat(TokenKind::In)? {
-                if !matches!(*self.ast.node(lhs), Node::Identifier { .. } | Node::Property { .. }) {
-                    return Err(ParseError::new(
-                        self.ast.span(lhs),
-                        "invalid for-in assignment target",
-                    ));
+            let head = if p.peek()?.kind == TokenKind::Semicolon {
+                p.next()?;
+                Head::Init { expr: None }
+            } else if let Some(kind) = p.peek_var_kind()? {
+                // a declarator head: parse ONE binding with no initializer;
+                // `in` directly after it is for-in, otherwise parsing
+                // resumes as the C-style declarator list
+                let decl_start = p.next()?.span.start; // var / let / const
+                let target = p.parse_declarator_binding(kind)?;
+                if p.eat(TokenKind::In)? {
+                    let object = p.parse_expression()?;
+                    let decl_span = Span::new(decl_start, p.ast.span(object).end);
+                    let declarator = p.ast.add(
+                        Node::VarDeclarator { target, init: None },
+                        Span::new(decl_start, p.ast.span(target).end),
+                    );
+                    let decls = p.ast.list(&[declarator]);
+                    let left = p.ast.add(Node::VarDecl { kind, decls }, decl_span);
+                    Head::ForIn { left, object }
+                } else {
+                    // C-style: finish this declarator, then the rest of the list
+                    let mut decls = vec![p.parse_declarator_tail(kind, target)?];
+                    while p.eat(TokenKind::Comma)? {
+                        let target = p.parse_declarator_binding(kind)?;
+                        decls.push(p.parse_declarator_tail(kind, target)?);
+                    }
+                    let end = p.ast.span(*decls.last().unwrap()).end;
+                    let decls = p.ast.list(&decls);
+                    let expr = p
+                        .ast
+                        .add(Node::VarDecl { kind, decls }, Span::new(decl_start, end));
+                    p.expect(TokenKind::Semicolon)?;
+                    Head::Init { expr: Some(expr) }
                 }
-                let object = self.parse_expression()?;
-                Head::ForIn { left: lhs, object }
             } else {
-                self.restore(mark);
-                let expr = self.parse_expression()?;
-                // wrap as a statement so C-style codegen accepts it
-                // (emit_for takes ExprStmt/VarDecl/Empty inits)
-                let span = self.ast.span(expr);
-                let wrapped = self.ast.add(Node::ExprStmt { expr }, span);
-                self.expect(TokenKind::Semicolon)?;
-                Head::Init { expr: Some(wrapped) }
-            }
-        };
+                // an expression head: a for-in LHS is a LeftHandSideExpression,
+                // so parse one speculatively and check for `in` (bookmarks
+                // restore the scanner only — the discarded fragment leaves
+                // orphaned, unreachable AST nodes). `of`-heads are rejected
+                // by the C-style path's `;` expectation, as before.
+                let mark = p.bookmark();
+                let lhs = p.parse_postfix()?;
+                if p.eat(TokenKind::In)? {
+                    if !matches!(
+                        *p.ast.node(lhs),
+                        Node::Identifier { .. } | Node::Property { .. }
+                    ) {
+                        return Err(ParseError::new(
+                            p.ast.span(lhs),
+                            "invalid for-in assignment target",
+                        ));
+                    }
+                    let object = p.parse_expression()?;
+                    Head::ForIn { left: lhs, object }
+                } else {
+                    p.restore(mark);
+                    let expr = p.parse_expression()?;
+                    // wrap as a statement so C-style codegen accepts it
+                    // (emit_for takes ExprStmt/VarDecl/Empty inits)
+                    let span = p.ast.span(expr);
+                    let wrapped = p.ast.add(Node::ExprStmt { expr }, span);
+                    p.expect(TokenKind::Semicolon)?;
+                    Head::Init {
+                        expr: Some(wrapped),
+                    }
+                }
+            };
 
-        match head {
-            Head::ForIn { left, object } => {
-                self.expect(TokenKind::RParen)?;
-                // the trailing label chain names this loop (ES 14.7.5)
-                let adopted = self.pending_labels.len();
-                self.iter_labels.extend(self.pending_labels.iter().copied());
-                self.loop_depth += 1;
-                let body = self.parse_statement();
-                self.loop_depth = self.loop_depth.saturating_sub(1);
-                self.iter_labels
-                    .truncate(self.iter_labels.len() - adopted);
-                self.scopes.pop();
-                let body = self.reject_lexical_loop_body_checked(body)?;
-                let end = self.ast.span(body).end;
-                let node = self
-                    .ast
-                    .add(Node::ForIn { left, object, body }, Span::new(start, end));
-                self.ast.set_node_scope(node, scope_id);
-                Ok(node)
+            let syms = Self::label_syms(labels);
+            match head {
+                Head::ForIn { left, object } => {
+                    p.expect(TokenKind::RParen)?;
+                    let body =
+                        p.in_breakable(BreakKind::Loop, syms.clone(), |p| p.parse_statement())?;
+                    if p.forbidden_body(body, true) {
+                        return Err(ParseError::new(
+                            p.ast.span(body),
+                            "lexical declaration not allowed as a single-statement loop body",
+                        ));
+                    }
+                    let end = p.ast.span(body).end;
+                    let node = p.ast.add(
+                        Node::ForIn {
+                            labels: syms,
+                            left,
+                            object,
+                            body,
+                        },
+                        Span::new(start, end),
+                    );
+                    p.ast.set_node_scope(node, scope_id);
+                    Ok(node)
+                }
+                Head::Init { expr: init } => {
+                    let cond = if p.eat(TokenKind::Semicolon)? {
+                        None
+                    } else {
+                        let c = p.parse_expression()?;
+                        p.expect(TokenKind::Semicolon)?;
+                        Some(c)
+                    };
+                    let next = if p.peek()?.kind == TokenKind::RParen {
+                        None
+                    } else {
+                        Some(p.parse_expression()?)
+                    };
+                    p.expect(TokenKind::RParen)?;
+                    let body =
+                        p.in_breakable(BreakKind::Loop, syms.clone(), |p| p.parse_statement())?;
+                    if p.forbidden_body(body, true) {
+                        return Err(ParseError::new(
+                            p.ast.span(body),
+                            "lexical declaration not allowed as a single-statement loop body",
+                        ));
+                    }
+                    let end = p.ast.span(body).end;
+                    let node = p.ast.add(
+                        Node::For {
+                            labels: syms,
+                            init,
+                            cond,
+                            next,
+                            body,
+                        },
+                        Span::new(start, end),
+                    );
+                    p.ast.set_node_scope(node, scope_id);
+                    Ok(node)
+                }
             }
-            Head::Init { expr: init } => {
-                let cond = if self.eat(TokenKind::Semicolon)? {
-                    None
-                } else {
-                    let c = self.parse_expression()?;
-                    self.expect(TokenKind::Semicolon)?;
-                    Some(c)
-                };
-                let next = if self.peek()?.kind == TokenKind::RParen {
-                    None
-                } else {
-                    Some(self.parse_expression()?)
-                };
-                self.expect(TokenKind::RParen)?;
-                // the trailing label chain names this loop (ES 14.7.4)
-                let adopted = self.pending_labels.len();
-                self.iter_labels.extend(self.pending_labels.iter().copied());
-                self.loop_depth += 1;
-                let body = self.parse_statement();
-                self.loop_depth = self.loop_depth.saturating_sub(1);
-                self.iter_labels
-                    .truncate(self.iter_labels.len() - adopted);
-                self.scopes.pop();
-                let body = self.reject_lexical_loop_body_checked(body)?;
-                let end = self.ast.span(body).end;
-                let node = self.ast.add(
-                    Node::For {
-                        init,
-                        cond,
-                        next,
-                        body,
-                    },
-                    Span::new(start, end),
-                );
-                self.ast.set_node_scope(node, scope_id);
-                Ok(node)
-            }
-        }
+        })
     }
 
     fn parse_return(&mut self) -> Result<NodeId, ParseError> {
@@ -1053,38 +1140,36 @@ impl<S: CharStream> Parser<S> {
         } else {
             None
         };
-        let breakable = self.loop_depth > 0 || self.switch_depth > 0;
-        if (kind == TokenKind::Break && !breakable)
-            || (kind == TokenKind::Continue && self.loop_depth == 0)
-        {
-            return Err(ParseError::new(
-                t.span,
-                format!("`{}` outside of a loop", kind.text()),
-            ));
-        }
-        // label targets (ES 14.9.1, 14.10.1): `continue` needs the label
-        // on an enclosing iteration statement, `break` on any enclosing
-        // labelled statement (the codegen's label matching must agree)
-        if let Some(sym) = label {
-            let ok = if kind == TokenKind::Continue {
-                self.iter_labels.contains(&sym)
-            } else {
-                self.labels.contains(&sym)
-            };
-            if !ok {
-                return Err(ParseError::new(
-                    t.span,
-                    format!(
-                        "`{}` label does not name an enclosing {}",
-                        kind.text(),
-                        if kind == TokenKind::Continue {
-                            "loop"
-                        } else {
-                            "statement"
-                        }
-                    ),
-                ));
+        // target resolution over the breakable stack (ES 14.9.1, 14.10.1):
+        // `continue` needs an enclosing loop named by the label (or any
+        // loop without one), `break` any enclosing breakable whose label
+        // set contains the label (innermost without one)
+        let ok = match (&label, kind) {
+            (None, TokenKind::Break) => !self.breakables.is_empty(),
+            (Some(l), TokenKind::Break) => self.breakables.iter().any(|b| b.labels.contains(l)),
+            (None, TokenKind::Continue) => {
+                self.breakables.iter().any(|b| b.kind == BreakKind::Loop)
             }
+            (Some(l), TokenKind::Continue) => self
+                .breakables
+                .iter()
+                .any(|b| b.kind == BreakKind::Loop && b.labels.contains(l)),
+            _ => unreachable!("break/continue token"),
+        };
+        if !ok {
+            let what = match label {
+                Some(_) => format!(
+                    "`{}` label does not name an enclosing {}",
+                    kind.text(),
+                    if kind == TokenKind::Continue {
+                        "loop"
+                    } else {
+                        "statement"
+                    }
+                ),
+                None => format!("`{}` outside of a loop or switch", kind.text()),
+            };
+            return Err(ParseError::new(t.span, what));
         }
         self.expect_semicolon()?;
         let node = if kind == TokenKind::Break {
@@ -1117,7 +1202,7 @@ impl<S: CharStream> Parser<S> {
         Ok(self.ast.add(Node::Throw { expr }, span))
     }
 
-    fn parse_switch(&mut self) -> Result<NodeId, ParseError> {
+    fn parse_switch(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::Switch)?.span.start;
         self.expect(TokenKind::LParen)?;
         let disc = self.parse_expression()?;
@@ -1125,53 +1210,57 @@ impl<S: CharStream> Parser<S> {
         self.expect(TokenKind::LBrace)?;
 
         // one lexical scope for the whole switch (ES 16.2.2)
-        let scope = self.push_scope(ScopeKind::Block);
-        self.switch_depth += 1;
-
-        let mut cases = Vec::new();
-        loop {
-            let t = self.peek()?;
-            let (test, case_start) = match t.kind {
-                TokenKind::Case => {
-                    self.next()?;
-                    let test = self.parse_expression()?;
-                    self.expect(TokenKind::Colon)?;
-                    (Some(test), t.span.start)
+        self.in_scope(ScopeKind::Block, |p, scope| {
+            let cases = p.in_breakable(BreakKind::Switch, Self::label_syms(labels), |p| {
+                let mut cases = Vec::new();
+                loop {
+                    let t = p.peek()?;
+                    let (test, case_start) = match t.kind {
+                        TokenKind::Case => {
+                            p.next()?;
+                            let test = p.parse_expression()?;
+                            p.expect(TokenKind::Colon)?;
+                            (Some(test), t.span.start)
+                        }
+                        TokenKind::Default => {
+                            p.next()?;
+                            p.expect(TokenKind::Colon)?;
+                            (None, t.span.start)
+                        }
+                        TokenKind::RBrace => break,
+                        _ => {
+                            return Err(ParseError::new(
+                                t.span,
+                                "expected `case`, `default` or `}` in switch",
+                            ));
+                        }
+                    };
+                    let stmts = p.parse_statement_list(TokenKind::RBrace)?;
+                    let end = stmts
+                        .last()
+                        .map(|s| p.ast.span(*s).end)
+                        .unwrap_or(case_start);
+                    let stmts = p.ast.list(&stmts);
+                    cases.push(
+                        p.ast
+                            .add(Node::SwitchCase { test, stmts }, Span::new(case_start, end)),
+                    );
                 }
-                TokenKind::Default => {
-                    self.next()?;
-                    self.expect(TokenKind::Colon)?;
-                    (None, t.span.start)
-                }
-                TokenKind::RBrace => break,
-                _ => {
-                    return Err(ParseError::new(
-                        t.span,
-                        "expected `case`, `default` or `}` in switch",
-                    ));
-                }
-            };
-            let stmts = self.parse_statement_list(TokenKind::RBrace)?;
-            let end = stmts
-                .last()
-                .map(|s| self.ast.span(*s).end)
-                .unwrap_or(case_start);
-            let stmts = self.ast.list(&stmts);
-            cases.push(
-                self.ast
-                    .add(Node::SwitchCase { test, stmts }, Span::new(case_start, end)),
+                Ok(cases)
+            })?;
+            let end = p.expect(TokenKind::RBrace)?.span.end;
+            let cases = p.ast.list(&cases);
+            let node = p.ast.add(
+                Node::Switch {
+                    labels: Self::label_syms(labels),
+                    disc,
+                    cases,
+                },
+                Span::new(start, end),
             );
-        }
-
-        self.switch_depth = self.switch_depth.saturating_sub(1);
-        self.scopes.pop();
-        let end = self.expect(TokenKind::RBrace)?.span.end;
-        let cases = self.ast.list(&cases);
-        let node = self
-            .ast
-            .add(Node::Switch { disc, cases }, Span::new(start, end));
-        self.ast.set_node_scope(node, scope);
-        Ok(node)
+            p.ast.set_node_scope(node, scope);
+            Ok(node)
+        })
     }
 
     fn parse_try(&mut self) -> Result<NodeId, ParseError> {
@@ -1184,24 +1273,29 @@ impl<S: CharStream> Parser<S> {
         if self.eat(TokenKind::Catch)? {
             // the catch param lives in the catch block's own scope:
             // `catch (e) { let e; }` is an early error, `var e` is not
-            catch_scope = Some(self.push_scope(ScopeKind::Catch));
-            if self.eat(TokenKind::LParen)? {
-                let t = self.peek()?;
-                catch_param = Some(
-                    if matches!(t.kind, TokenKind::LBracket | TokenKind::LBrace) {
-                        self.pattern_names.clear();
-                        self.parse_binding_pattern(PatCtx::Catch)?
+            let (param, block, scope) = self.in_scope(ScopeKind::Catch, |p, scope| {
+                let param = if p.eat(TokenKind::LParen)? {
+                    let t = p.peek()?;
+                    let param = if matches!(t.kind, TokenKind::LBracket | TokenKind::LBrace) {
+                        p.pattern_names.clear();
+                        p.parse_binding_pattern(PatCtx::Catch)?
                     } else {
-                        let t = self.next()?;
-                        let sym = self.ident_symbol(t)?;
-                        self.declare_lexical(sym, t.span, DeclKind::CatchParam)?;
-                        self.ast.add(Node::Identifier { sym }, t.span)
-                    },
-                );
-                self.expect(TokenKind::RParen)?;
-            }
-            catch_block = Some(self.parse_statement_block()?);
-            self.scopes.pop();
+                        let t = p.next()?;
+                        let sym = p.ident_symbol(t)?;
+                        p.declare_lexical(sym, t.span, DeclKind::CatchParam)?;
+                        p.ast.add(Node::Identifier { sym }, t.span)
+                    };
+                    p.expect(TokenKind::RParen)?;
+                    Some(param)
+                } else {
+                    None
+                };
+                let block = p.parse_statement_block()?;
+                Ok((param, block, scope))
+            })?;
+            catch_param = param;
+            catch_block = Some(block);
+            catch_scope = Some(scope);
         }
         if self.eat(TokenKind::Finally)? {
             finally_block = Some(self.parse_block()?);
@@ -1281,9 +1375,8 @@ impl<S: CharStream> Parser<S> {
             || flags.force_strict;
         let params = self.parse_params(strict)?;
         let fid = self.add_function_info(start, name, params, flags);
-        let saved_loop_depth = self.begin_fn_body(fid);
-        let body = self.parse_statement_block()?;
-        self.end_fn_body(fid, start, body, saved_loop_depth)?;
+        let body = self.in_fn_body(fid, ScopeKind::Function, |p| p.parse_statement_block())?;
+        self.finish_fn_body(fid, start, body)?;
         Ok(fid)
     }
 
@@ -1413,78 +1506,15 @@ impl<S: CharStream> Parser<S> {
         })
     }
 
-    /// Push the function scope and declare its parameters. Plain params
-    /// become register-backed `Param` decls (with their positional index);
-    /// pattern-bound names become `PatternParam` decls (prologue-initialized).
-    /// Returns the outer statement context for `end_fn_body`: labels never
-    /// cross function boundaries (ES 14.10.1, 14.9.1), and `break` depth
-    /// counters reset per function.
-    fn begin_fn_body(&mut self, fid: FunctionId) -> FnParseState {
-        self.fn_stack.push(fid);
-        let scope_id = self.push_scope(ScopeKind::Function);
-        self.ast.scope_mut(scope_id).function = Some(fid);
-        // params live in the function scope; sloppy simple lists allow
-        // duplicates (each declared, sharing a register)
-        let scope = self.scopes.last_mut().unwrap();
-        let params: Vec<Param> = self.ast.function(fid).params.clone();
-        for &p in &params {
-            let sym = match *self.ast.node(p.target) {
-                Node::Identifier { sym } => Some(sym),
-                _ => None,
-            };
-            if let Some(sym) = sym {
-                if !scope.var_declared.contains(&sym) {
-                    scope.var_declared.push(sym);
-                }
-            }
-        }
-        let span = self.ast.function(fid).span;
-        for (i, p) in params.iter().enumerate() {
-            match *self.ast.node(p.target) {
-                Node::Identifier { sym } => {
-                    self.ast
-                        .declare_param(scope_id, sym, DeclKind::Param, span, i as u32);
-                }
-                _ => {
-                    let mut names = Vec::new();
-                    collect_pattern_names(&self.ast, p.target, &mut names);
-                    for (sym, span) in names {
-                        // pattern names are var-like in the function scope
-                        // (body `var x` redeclares them, `let x` is an error)
-                        let scope = self.scopes.last_mut().unwrap();
-                        if !scope.var_declared.contains(&sym) {
-                            scope.var_declared.push(sym);
-                        }
-                        self.ast
-                            .declare(scope_id, sym, DeclKind::PatternParam, span);
-                    }
-                }
-            }
-        }
-        let outer_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
-        FnParseState {
-            loop_depth: outer_loop_depth,
-            switch_depth: std::mem::replace(&mut self.switch_depth, 0),
-            labels: std::mem::take(&mut self.labels),
-            iter_labels: std::mem::take(&mut self.iter_labels),
-            pending_labels: std::mem::take(&mut self.pending_labels),
-        }
-    }
-
-    fn end_fn_body(
+    /// Post-body bookkeeping: final span/body and the retroactive strict
+    /// duplicate-parameter check (ES 15.1.2 — the directive is only
+    /// discovered while parsing the body).
+    fn finish_fn_body(
         &mut self,
         fid: FunctionId,
         start: u32,
         body: NodeId,
-        saved: FnParseState,
     ) -> Result<(), ParseError> {
-        self.loop_depth = saved.loop_depth;
-        self.switch_depth = saved.switch_depth;
-        self.labels = saved.labels;
-        self.iter_labels = saved.iter_labels;
-        self.pending_labels = saved.pending_labels;
-        self.scopes.pop();
-        self.fn_stack.pop();
         let end = self.ast.span(body).end;
         let (strict, params) = {
             let info = self.ast.function_mut(fid);
@@ -1492,9 +1522,6 @@ impl<S: CharStream> Parser<S> {
             info.body = Some(body);
             (info.strict, info.params.clone())
         };
-        // duplicate parameter names + a strict body directive is an early
-        // error (ES 15.1.2, applied retroactively: the directive is only
-        // discovered while parsing the body)
         if strict {
             let mut names: Vec<(Symbol, Span)> = Vec::new();
             for p in &params {
@@ -1534,21 +1561,22 @@ impl<S: CharStream> Parser<S> {
                 ..Default::default()
             },
         );
-        let saved_loop_depth = self.begin_fn_body(fid);
-        let body = if self.peek()?.kind == TokenKind::LBrace {
-            self.parse_statement_block()?
-        } else {
-            let expr = self.parse_assignment()?;
-            let span = self.ast.span(expr);
-            let ret = self.ast.add(Node::Return { value: Some(expr) }, span);
-            let block = self.add_block(vec![ret], span);
-            // link the expression body to the arrow's function scope so
-            // scope analysis (context depths) sees the function boundary
-            let scope = self.scopes.last().expect("arrow fn scope").id;
-            self.ast.set_node_scope(block, scope);
-            block
-        };
-        self.end_fn_body(fid, start, body, saved_loop_depth)?;
+        let body = self.in_fn_body(fid, ScopeKind::Function, |p| {
+            if p.peek()?.kind == TokenKind::LBrace {
+                p.parse_statement_block()
+            } else {
+                let expr = p.parse_assignment()?;
+                let span = p.ast.span(expr);
+                let ret = p.ast.add(Node::Return { value: Some(expr) }, span);
+                let block = p.add_block(vec![ret], span);
+                // link the expression body to the arrow's function scope so
+                // scope analysis (context depths) sees the function boundary
+                let scope = p.scopes.last().expect("arrow fn scope").id;
+                p.ast.set_node_scope(block, scope);
+                Ok(block)
+            }
+        })?;
+        self.finish_fn_body(fid, start, body)?;
         let span = self.ast.function(fid).span;
         Ok(self.ast.add(Node::FunctionExpr { function: fid }, span))
     }
@@ -1620,251 +1648,255 @@ impl<S: CharStream> Parser<S> {
 
         // class inner scope: the immutable class-name binding (in TDZ during
         // heritage/computed-key evaluation) plus the super home-object slots
-        let class_scope = self.push_scope(ScopeKind::Class);
-        if let Some(name) = name {
-            self.declare_lexical(name, t.span, DeclKind::Class)?;
-        }
-
-        let superclass = if self.eat(TokenKind::Extends)? {
-            Some(self.parse_assignment()?)
-        } else {
-            None
-        };
-        self.expect(TokenKind::LBrace)?;
-        let mut members = Vec::new();
-        let mut has_constructor = false;
-        self.class_stack.push(ClassCtx {
-            entry_fn_depth: self.fn_stack.len(),
-            uses_super: false,
-            is_static: false,
-            privates: Vec::new(),
-            private_uses: Vec::new(),
-        });
-        let end = loop {
-            let t = self.peek()?;
-            match t.kind {
-                TokenKind::RBrace => break self.next()?.span.end,
-                TokenKind::Semicolon => {
-                    self.next()?; // stray `;` is allowed in class bodies
-                    continue;
-                }
-                _ => {}
-            }
-            let member_start = t.span.start;
-
-            // `static` modifier vs a member literally named `static`
-            let mut is_static = false;
-            if t.kind == TokenKind::Static {
-                let ahead = self.peek_ahead()?;
-                if ahead.kind == TokenKind::LBrace {
-                    return Err(ParseError::new(
-                        ahead.span,
-                        "class static blocks are not supported yet",
-                    ));
-                }
-                if starts_property_key(ahead.kind) {
-                    is_static = true;
-                    self.next()?;
-                }
-            }
-            self.class_stack.last_mut().unwrap().is_static = is_static;
-
-            let accessor = self.eat_accessor_prefix()?;
-            let (key, key_sym, computed) = self.parse_property_key()?;
-            let key_span = self.ast.span(key);
-            let is_private = matches!(*self.ast.node(key), Node::PrivateName { .. });
-
-            // early errors (ES 15.7.1)
-            let is_constructor_name = !computed
-                && !is_static
-                && !is_private
-                && key_sym.is_some_and(|s| self.symbols().get(s) == b"constructor");
-            if is_constructor_name && accessor.is_some() {
-                return Err(ParseError::new(
-                    key_span,
-                    "constructor can't be an accessor",
-                ));
-            }
-            if is_constructor_name {
-                if has_constructor {
-                    return Err(ParseError::new(key_span, "duplicate constructor"));
-                }
-                has_constructor = true;
-            }
-            // a static member named "prototype" is a Syntax Error; a static
-            // member named "constructor" is an ordinary method
-            if is_static
-                && !computed
-                && !is_private
-                && key_sym.is_some_and(|s| self.symbols().get(s) == b"prototype")
-            {
-                return Err(ParseError::new(
-                    key_span,
-                    "class may not have a static method named 'prototype'",
-                ));
+        self.in_scope(ScopeKind::Class, |p, class_scope| {
+            if let Some(name) = name {
+                p.declare_lexical(name, t.span, DeclKind::Class)?;
             }
 
-            if self.peek()?.kind == TokenKind::LParen {
-                // method or accessor
-                if is_private {
-                    return Err(ParseError::new(
-                        key_span,
-                        "private methods and accessors are not supported yet",
-                    ));
-                }
-                let kind = match accessor {
-                    Some(true) => PropKind::Get,
-                    Some(false) => PropKind::Set,
-                    None => PropKind::Method,
-                };
-                let function_kind = if is_constructor_name {
-                    if superclass.is_some() {
-                        FunctionKind::DerivedClassConstructor
+            let superclass = if p.eat(TokenKind::Extends)? {
+                Some(p.parse_assignment()?)
+            } else {
+                None
+            };
+            p.expect(TokenKind::LBrace)?;
+            let ((end, members, has_constructor), ctx) = p.in_class(|p| {
+                let mut members = Vec::new();
+                let mut has_constructor = false;
+                let end = loop {
+                    let t = p.peek()?;
+                    match t.kind {
+                        TokenKind::RBrace => break p.next()?.span.end,
+                        TokenKind::Semicolon => {
+                            p.next()?; // stray `;` is allowed in class bodies
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let member_start = t.span.start;
+
+                    // `static` modifier vs a member literally named `static`
+                    let mut is_static = false;
+                    if t.kind == TokenKind::Static {
+                        let ahead = p.peek_ahead()?;
+                        if ahead.kind == TokenKind::LBrace {
+                            return Err(ParseError::new(
+                                ahead.span,
+                                "class static blocks are not supported yet",
+                            ));
+                        }
+                        if starts_property_key(ahead.kind) {
+                            is_static = true;
+                            p.next()?;
+                        }
+                    }
+                    p.class_stack.last_mut().unwrap().is_static = is_static;
+
+                    let accessor = p.eat_accessor_prefix()?;
+                    let (key, key_sym, computed) = p.parse_property_key()?;
+                    let key_span = p.ast.span(key);
+                    let is_private = matches!(*p.ast.node(key), Node::PrivateName { .. });
+
+                    // early errors (ES 15.7.1)
+                    let is_constructor_name = !computed
+                        && !is_static
+                        && !is_private
+                        && key_sym.is_some_and(|s| p.symbols().get(s) == b"constructor");
+                    if is_constructor_name && accessor.is_some() {
+                        return Err(ParseError::new(
+                            key_span,
+                            "constructor can't be an accessor",
+                        ));
+                    }
+                    if is_constructor_name {
+                        if has_constructor {
+                            return Err(ParseError::new(key_span, "duplicate constructor"));
+                        }
+                        has_constructor = true;
+                    }
+                    // a static member named "prototype" is a Syntax Error; a static
+                    // member named "constructor" is an ordinary method
+                    if is_static
+                        && !computed
+                        && !is_private
+                        && key_sym.is_some_and(|s| p.symbols().get(s) == b"prototype")
+                    {
+                        return Err(ParseError::new(
+                            key_span,
+                            "class may not have a static method named 'prototype'",
+                        ));
+                    }
+
+                    if p.peek()?.kind == TokenKind::LParen {
+                        // method or accessor
+                        if is_private {
+                            return Err(ParseError::new(
+                                key_span,
+                                "private methods and accessors are not supported yet",
+                            ));
+                        }
+                        let kind = match accessor {
+                            Some(true) => PropKind::Get,
+                            Some(false) => PropKind::Set,
+                            None => PropKind::Method,
+                        };
+                        let function_kind = if is_constructor_name {
+                            if superclass.is_some() {
+                                FunctionKind::DerivedClassConstructor
+                            } else {
+                                FunctionKind::BaseClassConstructor
+                            }
+                        } else {
+                            function_kind_for_property(kind)
+                        };
+                        // class members are always strict; accessors carry the
+                        // "get x"/"set x" name (computed keys get theirs at runtime)
+                        let fn_name = match kind {
+                            PropKind::Get => p.accessor_name(key_sym, true),
+                            PropKind::Set => p.accessor_name(key_sym, false),
+                            _ => key_sym,
+                        };
+                        let (value, _) = p.parse_method_value(
+                            member_start,
+                            fn_name,
+                            kind,
+                            function_kind,
+                            true,
+                            key_span,
+                        )?;
+                        members.push(ClassMember {
+                            key,
+                            value,
+                            kind,
+                            is_static,
+                            is_constructor: is_constructor_name,
+                            computed,
+                            is_private,
+                        });
                     } else {
-                        FunctionKind::BaseClassConstructor
+                        // field definition (ES 15.7.19): public or private,
+                        // instance or static
+                        if accessor.is_some() {
+                            return Err(ParseError::new(
+                                key_span,
+                                "class fields can't be accessors",
+                            ));
+                        }
+                        if is_constructor_name {
+                            return Err(ParseError::new(
+                                key_span,
+                                "class may not have a field named 'constructor'",
+                            ));
+                        }
+                        if is_static
+                            && !computed
+                            && !is_private
+                            && key_sym.is_some_and(|s| p.symbols().get(s) == b"prototype")
+                        {
+                            return Err(ParseError::new(
+                                key_span,
+                                "class may not have a static field named 'prototype'",
+                            ));
+                        }
+                        if is_private && computed {
+                            return Err(ParseError::new(
+                                key_span,
+                                "private names can't be computed",
+                            ));
+                        }
+                        if is_private {
+                            // declare the private name in this class's environment:
+                            // a hidden class-scope slot holding a fresh Symbol per
+                            // class evaluation
+                            let Node::PrivateName { sym: hidden } = *p.ast.node(key) else {
+                                unreachable!("private key node");
+                            };
+                            let ctx = p.class_stack.last_mut().unwrap();
+                            if ctx.privates.contains(&hidden) {
+                                return Err(ParseError::new(
+                                    key_span,
+                                    "duplicate private name in class",
+                                ));
+                            }
+                            ctx.privates.push(hidden);
+                            p.declare_class_slot(class_scope, hidden, key_span);
+                        }
+                        let value = p.parse_field_initializer(member_start, key)?;
+                        members.push(ClassMember {
+                            key,
+                            value,
+                            kind: PropKind::Field,
+                            is_static,
+                            is_constructor: false,
+                            computed,
+                            is_private,
+                        });
+                        p.expect_semicolon()?;
                     }
+                };
+                Ok((end, members, has_constructor))
+            })?;
+
+            // `#name` references must resolve to a private name of this class
+            // or an enclosing one (ES 15.7.2)
+            for (hidden, span) in &ctx.private_uses {
+                let declared = ctx.privates.contains(hidden)
+                    || p.class_stack.iter().any(|c| c.privates.contains(hidden));
+                if !declared {
+                    return Err(ParseError::new(
+                        *span,
+                        "private name must be declared in an enclosing class",
+                    ));
+                }
+            }
+
+            // default constructor for classes without an explicit one:
+            // base → empty body, derived → forward all arguments to super()
+            let ctor = if has_constructor {
+                members
+                    .iter()
+                    .find(|m| m.is_constructor)
+                    .and_then(|m| match *p.ast.node(m.value) {
+                        Node::FunctionExpr { function } => Some(function),
+                        _ => None,
+                    })
+                    .expect("constructor member holds a function")
+            } else {
+                p.synthesize_default_ctor(start, end, name, superclass.is_some())?
+            };
+
+            // super home-object slots (hidden const bindings in the class scope)
+            let (home, static_home) = if ctx.uses_super {
+                let home = p.symbols_mut().intern(b".home_object");
+                p.declare_class_slot(class_scope, home, Span::new(start, start));
+                let static_home = p.symbols_mut().intern(b".static_home_object");
+                p.declare_class_slot(class_scope, static_home, Span::new(start, start));
+                (Some(home), Some(static_home))
+            } else {
+                (None, None)
+            };
+
+            let class = p.ast.add_class(ClassInfo {
+                span: Span::new(start, end),
+                name,
+                superclass,
+                members,
+                ctor,
+                uses_super: ctx.uses_super,
+                home,
+                static_home,
+                privates: ctx.privates,
+            });
+            let node = p.ast.add(
+                if is_declaration {
+                    Node::ClassDecl { class }
                 } else {
-                    function_kind_for_property(kind)
-                };
-                // class members are always strict; accessors carry the
-                // "get x"/"set x" name (computed keys get theirs at runtime)
-                let fn_name = match kind {
-                    PropKind::Get => self.accessor_name(key_sym, true),
-                    PropKind::Set => self.accessor_name(key_sym, false),
-                    _ => key_sym,
-                };
-                let (value, _) = self.parse_method_value(
-                    member_start,
-                    fn_name,
-                    kind,
-                    function_kind,
-                    true,
-                    key_span,
-                )?;
-                members.push(ClassMember {
-                    key,
-                    value,
-                    kind,
-                    is_static,
-                    is_constructor: is_constructor_name,
-                    computed,
-                    is_private,
-                });
-            } else {
-                // field definition (ES 15.7.19): public or private,
-                // instance or static
-                if accessor.is_some() {
-                    return Err(ParseError::new(key_span, "class fields can't be accessors"));
-                }
-                if is_constructor_name {
-                    return Err(ParseError::new(
-                        key_span,
-                        "class may not have a field named 'constructor'",
-                    ));
-                }
-                if is_static
-                    && !computed
-                    && !is_private
-                    && key_sym.is_some_and(|s| self.symbols().get(s) == b"prototype")
-                {
-                    return Err(ParseError::new(
-                        key_span,
-                        "class may not have a static field named 'prototype'",
-                    ));
-                }
-                if is_private && computed {
-                    return Err(ParseError::new(key_span, "private names can't be computed"));
-                }
-                if is_private {
-                    // declare the private name in this class's environment:
-                    // a hidden class-scope slot holding a fresh Symbol per
-                    // class evaluation
-                    let Node::PrivateName { sym: hidden } = *self.ast.node(key) else {
-                        unreachable!("private key node");
-                    };
-                    let ctx = self.class_stack.last_mut().unwrap();
-                    if ctx.privates.contains(&hidden) {
-                        return Err(ParseError::new(key_span, "duplicate private name in class"));
-                    }
-                    ctx.privates.push(hidden);
-                    self.declare_class_slot(class_scope, hidden, key_span);
-                }
-                let value = self.parse_field_initializer(member_start, key)?;
-                members.push(ClassMember {
-                    key,
-                    value,
-                    kind: PropKind::Field,
-                    is_static,
-                    is_constructor: false,
-                    computed,
-                    is_private,
-                });
-                self.expect_semicolon()?;
-            }
-        };
-        let ctx = self.class_stack.pop().unwrap();
-
-        // `#name` references must resolve to a private name of this class
-        // or an enclosing one (ES 15.7.2)
-        for (hidden, span) in &ctx.private_uses {
-            let declared = ctx.privates.contains(hidden)
-                || self.class_stack.iter().any(|c| c.privates.contains(hidden));
-            if !declared {
-                return Err(ParseError::new(
-                    *span,
-                    "private name must be declared in an enclosing class",
-                ));
-            }
-        }
-
-        // default constructor for classes without an explicit one:
-        // base → empty body, derived → forward all arguments to super()
-        let ctor = if has_constructor {
-            members
-                .iter()
-                .find(|m| m.is_constructor)
-                .and_then(|m| match *self.ast.node(m.value) {
-                    Node::FunctionExpr { function } => Some(function),
-                    _ => None,
-                })
-                .expect("constructor member holds a function")
-        } else {
-            self.synthesize_default_ctor(start, end, name, superclass.is_some())?
-        };
-
-        // super home-object slots (hidden const bindings in the class scope)
-        let (home, static_home) = if ctx.uses_super {
-            let home = self.symbols_mut().intern(b".home_object");
-            self.declare_class_slot(class_scope, home, Span::new(start, start));
-            let static_home = self.symbols_mut().intern(b".static_home_object");
-            self.declare_class_slot(class_scope, static_home, Span::new(start, start));
-            (Some(home), Some(static_home))
-        } else {
-            (None, None)
-        };
-
-        self.scopes.pop();
-        let class = self.ast.add_class(ClassInfo {
-            span: Span::new(start, end),
-            name,
-            superclass,
-            members,
-            ctor,
-            uses_super: ctx.uses_super,
-            home,
-            static_home,
-            privates: ctx.privates,
-        });
-        let node = self.ast.add(
-            if is_declaration {
-                Node::ClassDecl { class }
-            } else {
-                Node::ClassExpr { class }
-            },
-            Span::new(start, end),
-        );
-        self.ast.set_node_scope(node, class_scope);
-        Ok(node)
+                    Node::ClassExpr { class }
+                },
+                Span::new(start, end),
+            );
+            p.ast.set_node_scope(node, class_scope);
+            Ok(node)
+        }) // in_scope(Class)
     }
 
     /// The synthesized field-initializer function (ES 15.7.19): a strict
@@ -1907,24 +1939,22 @@ impl<S: CharStream> Parser<S> {
         if let Some(key) = key_for_naming {
             self.ast.function_mut(fid).field_key = Some(key);
         }
-        let saved_loop_depth = self.begin_fn_body(fid);
-        let body = (|| {
-            let init = if self.eat(TokenKind::Assign)? {
-                Some(self.parse_assignment()?)
+        let body = self.in_fn_body(fid, ScopeKind::Function, |p| {
+            let init = if p.eat(TokenKind::Assign)? {
+                Some(p.parse_assignment()?)
             } else {
                 None
             };
-            let end = init.map(|i| self.ast.span(i).end).unwrap_or(start);
-            let ret = self
+            let end = init.map(|i| p.ast.span(i).end).unwrap_or(start);
+            let ret = p
                 .ast
                 .add(Node::Return { value: init }, Span::new(start, end));
-            let block = self.add_block(vec![ret], Span::new(start, end));
-            let scope = self.scopes.last().expect("initializer fn scope").id;
-            self.ast.set_node_scope(block, scope);
+            let block = p.add_block(vec![ret], Span::new(start, end));
+            let scope = p.scopes.last().expect("initializer fn scope").id;
+            p.ast.set_node_scope(block, scope);
             Ok(block)
-        })();
-        let body = body?;
-        self.end_fn_body(fid, start, body, saved_loop_depth)?;
+        })?;
+        self.finish_fn_body(fid, start, body)?;
         let span = self.ast.function(fid).span;
         Ok(self.ast.add(Node::FunctionExpr { function: fid }, span))
     }
@@ -2342,9 +2372,11 @@ impl<S: CharStream> Parser<S> {
                             ));
                         }
                         // `delete o.#x` (MemberExpression . PrivateIdentifier)
-                        Node::Property { key, computed: false, .. }
-                            if matches!(*self.ast.node(key), Node::PrivateName { .. }) =>
-                        {
+                        Node::Property {
+                            key,
+                            computed: false,
+                            ..
+                        } if matches!(*self.ast.node(key), Node::PrivateName { .. }) => {
                             return Err(ParseError::new(
                                 span,
                                 "cannot delete a private name in strict mode",
@@ -2682,54 +2714,49 @@ impl<S: CharStream> Parser<S> {
         // a class-style scope: holds the super home-object slot when any
         // method of the literal uses `super` (the home object is the
         // literal itself, ES 15.4.2)
-        let obj_scope = self.push_scope(ScopeKind::Class);
-        self.class_stack.push(ClassCtx {
-            entry_fn_depth: self.fn_stack.len(),
-            uses_super: false,
-            is_static: false,
-            privates: Vec::new(),
-            private_uses: Vec::new(),
-        });
-        let mut props = Vec::new();
-        let end = loop {
-            let t = self.peek()?;
-            match t.kind {
-                TokenKind::RBrace => break self.next()?.span.end,
-                TokenKind::Ellipsis => {
-                    self.next()?;
-                    let expr = self.parse_assignment()?;
-                    let span = Span::new(t.span.start, self.ast.span(expr).end);
-                    props.push(self.ast.add(Node::Spread { expr }, span));
-                }
-                _ => {
-                    props.push(self.parse_object_property()?);
-                }
+        self.in_scope(ScopeKind::Class, |p, obj_scope| {
+            let ((props, end), ctx) = p.in_class(|p| {
+                let mut props = Vec::new();
+                let end = loop {
+                    let t = p.peek()?;
+                    match t.kind {
+                        TokenKind::RBrace => break p.next()?.span.end,
+                        TokenKind::Ellipsis => {
+                            p.next()?;
+                            let expr = p.parse_assignment()?;
+                            let span = Span::new(t.span.start, p.ast.span(expr).end);
+                            props.push(p.ast.add(Node::Spread { expr }, span));
+                        }
+                        _ => {
+                            props.push(p.parse_object_property()?);
+                        }
+                    }
+                    if p.eat(TokenKind::Comma)? {
+                        continue;
+                    }
+                    break p.expect(TokenKind::RBrace)?.span.end;
+                };
+                Ok((props, end))
+            })?;
+            // `#name` references are never valid inside an object literal
+            // (no private environment to declare them)
+            if let Some((_, span)) = ctx.private_uses.first() {
+                return Err(ParseError::new(
+                    *span,
+                    "private names are only valid inside a class",
+                ));
             }
-            if self.eat(TokenKind::Comma)? {
-                continue;
+            if ctx.uses_super {
+                let home = p.symbols_mut().intern(b".home_object");
+                p.declare_class_slot(obj_scope, home, Span::new(start, start));
             }
-            break self.expect(TokenKind::RBrace)?.span.end;
-        };
-        let ctx = self.class_stack.pop().unwrap();
-        // `#name` references are never valid inside an object literal
-        // (no private environment to declare them)
-        if let Some((_, span)) = ctx.private_uses.first() {
-            return Err(ParseError::new(
-                *span,
-                "private names are only valid inside a class",
-            ));
-        }
-        if ctx.uses_super {
-            let home = self.symbols_mut().intern(b".home_object");
-            self.declare_class_slot(obj_scope, home, Span::new(start, start));
-        }
-        self.scopes.pop();
-        let props = self.ast.list(&props);
-        let node = self
-            .ast
-            .add(Node::ObjectLiteral { props }, Span::new(start, end));
-        self.ast.set_node_scope(node, obj_scope);
-        Ok(node)
+            let props = p.ast.list(&props);
+            let node = p
+                .ast
+                .add(Node::ObjectLiteral { props }, Span::new(start, end));
+            p.ast.set_node_scope(node, obj_scope);
+            Ok(node)
+        })
     }
 
     /// One object literal entry: `k: v`, shorthand, method, accessor,

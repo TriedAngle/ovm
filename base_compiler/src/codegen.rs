@@ -40,7 +40,9 @@ fn emit_jump(code: &mut Vec<u8>, op: Opcode, label: &mut Label) {
 
 /// A breakable statement: loops add a continue target, switches don't.
 struct Breakable {
-    label: Option<Symbol>,
+    /// the statement's label set (ES 14.13.1): `break`/`continue` with a
+    /// label target the innermost breakable whose set contains it
+    labels: Vec<Symbol>,
     breaks: Label,
     continues: Option<Label>,
     /// Loops owning a head context: the register holding the context
@@ -195,6 +197,50 @@ impl<'a> FunctionGen<'a> {
     fn pop_value(&mut self) {
         debug_assert!(self.next_temp > 0, "temp underflow");
         self.next_temp -= 1;
+    }
+
+    /// Reserve one temp register without storing the accumulator.
+    fn reserve_temp(&mut self) -> u32 {
+        let r = self.reg_base + self.next_temp;
+        self.next_temp += 1;
+        self.max_temps = self.max_temps.max(self.next_temp);
+        r
+    }
+
+    /// Reserve `n` contiguous temp registers (call-argument windows),
+    /// returning the first.
+    fn reserve_temps(&mut self, n: u32) -> u32 {
+        let r = self.reg_base + self.next_temp;
+        self.next_temp += n;
+        self.max_temps = self.max_temps.max(self.next_temp);
+        r
+    }
+
+    /// Bracket a temp-register region: everything reserved inside `f` is
+    /// released on every exit path (`?` early returns included), with the
+    /// high-water mark retained. Replaces hand-counted `next_temp -= n`
+    /// release arithmetic — a miscounted release silently overlaps
+    /// registers and corrupts code, the bracket cannot.
+    fn with_temps<F, T>(&mut self, f: F) -> Result<T, CompileError>
+    where
+        F: FnOnce(&mut Self) -> Result<T, CompileError>,
+    {
+        let mark = self.next_temp;
+        let result = f(self);
+        self.next_temp = mark;
+        result
+    }
+
+    /// Bracket a name-resolution scope region: the scope is on the stack
+    /// for `f` and off it on every exit path.
+    fn scoped<F, T>(&mut self, scope: ScopeId, f: F) -> Result<T, CompileError>
+    where
+        F: FnOnce(&mut Self) -> Result<T, CompileError>,
+    {
+        self.scopes.push(scope);
+        let result = f(self);
+        self.scopes.pop();
+        result
     }
 
     // -- constants ----------------------------------------------------------
@@ -567,7 +613,11 @@ impl<'a> FunctionGen<'a> {
     /// operands evaluate for side effects and yield `true`.
     fn emit_delete(&mut self, node: NodeId, expr: NodeId) -> Result<(), CompileError> {
         match *self.ast.node(expr) {
-            Node::Property { object, key, computed } => {
+            Node::Property {
+                object,
+                key,
+                computed,
+            } => {
                 self.expr(object)?;
                 let base = self.push_value();
                 if computed {
@@ -2254,14 +2304,6 @@ impl<'a> FunctionGen<'a> {
         Ok(())
     }
 
-    /// Reserve a temp register without storing the accumulator.
-    fn reserve_temp(&mut self) -> u32 {
-        let r = self.reg_base + self.next_temp;
-        self.next_temp += 1;
-        self.max_temps = self.max_temps.max(self.next_temp);
-        r
-    }
-
     /// `super.x` / `super[key]` load.
     fn emit_super_property_load(
         &mut self,
@@ -2681,16 +2723,24 @@ impl<'a> FunctionGen<'a> {
                 }
                 Ok(())
             }
-            Node::While { cond, body } => self.emit_while(cond, body, None),
+            Node::While {
+                ref labels,
+                cond,
+                body,
+            } => self.emit_while(cond, body, labels.clone()),
             Node::For {
+                ref labels,
                 init,
                 cond,
                 next,
                 body,
-            } => self.emit_for(node, init, cond, next, body, None),
-            Node::ForIn { left, object, body } => {
-                self.emit_for_in(node, left, object, body, None)
-            }
+            } => self.emit_for(node, init, cond, next, body, labels.clone()),
+            Node::ForIn {
+                ref labels,
+                left,
+                object,
+                body,
+            } => self.emit_for_in(node, left, object, body, labels.clone()),
             Node::Return { value } => {
                 // derived constructors: `return v` returns v only when it is
                 // an object; `undefined` (and fallthrough) return `this`,
@@ -2717,7 +2767,11 @@ impl<'a> FunctionGen<'a> {
                 catch_block,
                 finally_block,
             } => self.emit_try_catch(node, try_block, catch_param, catch_block, finally_block),
-            Node::Switch { disc, cases } => self.emit_switch(node, disc, cases, None),
+            Node::Switch {
+                ref labels,
+                disc,
+                cases,
+            } => self.emit_switch(node, disc, cases, labels.clone()),
             Node::FunctionDecl { function } => {
                 let idx = self.add_constant(Constant::Callable(function));
                 emit(&mut self.code, Opcode::CreateClosure, &[idx]);
@@ -2736,7 +2790,21 @@ impl<'a> FunctionGen<'a> {
                 self.store_decl(res, name);
                 Ok(())
             }
-            Node::Labeled { label, body } => self.emit_labeled(node, label, body),
+            Node::Labeled { label, body } => {
+                // a label on a non-loop/switch statement: a break-only
+                // breakable around the body (ES 14.13)
+                self.breakables.push(Breakable {
+                    labels: vec![label],
+                    breaks: Label::new(),
+                    continues: None,
+                    unwind_ctx: None,
+                });
+                let result = self.stmt(body);
+                let (mut breaks, _) = self.end_breakable();
+                breaks.bind(&self.code);
+                breaks.patch_all(&mut self.code);
+                result
+            }
             Node::Break { label } => self.emit_break_continue(node, label, true),
             Node::Continue { label } => self.emit_break_continue(node, label, false),
             Node::Empty => Ok(()),
@@ -2807,124 +2875,116 @@ impl<'a> FunctionGen<'a> {
         left: NodeId,
         object: NodeId,
         body: NodeId,
-        label: Option<Symbol>,
+        labels: Vec<Symbol>,
     ) -> Result<(), CompileError> {
         let scope = self.ast.node_scope(node);
         let per_iteration = self.resolved.per_iteration_loops.contains(&node);
         // lexical heads (`for (let/const k in …)`) own a block context;
         // captured heads get a fresh copy per iteration so closures in
         // the body capture per-iteration bindings (ES 14.7.5.7)
-        let mut loop_ctx: Option<u32> = None;
-        let ctx_save = scope.filter(|s| !self.ast.scope(*s).decls.is_empty()).map(|s| {
-            let count = self.ast.scope(s).decls.len() as u32;
-            emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
-            let save = self.reserve_temp();
-            let lc = self.reserve_temp();
-            emit(&mut self.code, Opcode::Store, &[lc]);
-            emit(&mut self.code, Opcode::PushContext, &[save]);
-            loop_ctx = Some(lc);
-            save
-        });
-        if let Some(s) = scope {
-            self.scopes.push(s);
-        }
-        let result = (|| {
-            // head: subject → enumerator (undefined for nullish subjects;
-            // ForInNext(undefined) is immediately done). Lexical heads
-            // are in TDZ here: `for (let k in k)` throws (ES 14.7.5.6)
-            self.expr(object)?;
-            let subject = self.push_value();
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::ForInEnumerate as u32, subject, 1],
-            );
-            self.pop_value(); // the call consumed the subject; acc = enumerator
-            let enumerator = self.push_value();
+        // the loop's permanent temps (context save + loop-context register)
+        self.with_temps(|g| {
+            let mut loop_ctx: Option<u32> = None;
+            let ctx_save = scope
+                .filter(|s| !g.ast.scope(*s).decls.is_empty())
+                .map(|s| {
+                    let count = g.ast.scope(s).decls.len() as u32;
+                    emit(&mut g.code, Opcode::CreateBlockContext, &[count]);
+                    let save = g.reserve_temp();
+                    let lc = g.reserve_temp();
+                    emit(&mut g.code, Opcode::Store, &[lc]);
+                    emit(&mut g.code, Opcode::PushContext, &[save]);
+                    loop_ctx = Some(lc);
+                    save
+                });
+            let inner = |g: &mut Self| -> Result<(), CompileError> {
+                // head: subject → enumerator (undefined for nullish subjects;
+                // ForInNext(undefined) is immediately done). Lexical heads
+                // are in TDZ here: `for (let k in k)` throws (ES 14.7.5.6)
+                g.expr(object)?;
+                let subject = g.push_value();
+                emit(
+                    &mut g.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::ForInEnumerate as u32, subject, 1],
+                );
+                g.pop_value(); // the call consumed the subject; acc = enumerator
+                let enumerator = g.push_value();
 
-            // loop: next key or undefined
-            let head = self.code.len();
-            self.breakables.push(Breakable {
-                label,
-                breaks: Label::new(),
-                continues: Some(Label::new()),
-                unwind_ctx: ctx_save,
-            });
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::ForInNext as u32, enumerator, 1],
-            );
-            let mut have_key = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpIfNotUndefined, &mut have_key);
-            emit_jump(
-                &mut self.code,
-                Opcode::Jump,
-                &mut self.breakables.last_mut().unwrap().breaks,
-            );
-            have_key.bind(&self.code);
-            have_key.patch_all(&mut self.code);
-            let key = self.push_value();
+                // loop: next key or undefined
+                let head = g.code.len();
+                g.breakables.push(Breakable {
+                    labels,
+                    breaks: Label::new(),
+                    continues: Some(Label::new()),
+                    unwind_ctx: ctx_save,
+                });
+                emit(
+                    &mut g.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::ForInNext as u32, enumerator, 1],
+                );
+                let mut have_key = Label::new();
+                emit_jump(&mut g.code, Opcode::JumpIfNotUndefined, &mut have_key);
+                emit_jump(
+                    &mut g.code,
+                    Opcode::Jump,
+                    &mut g.breakables.last_mut().unwrap().breaks,
+                );
+                have_key.bind(&g.code);
+                have_key.patch_all(&mut g.code);
+                let key = g.push_value();
 
-            // per iteration with a lexical head: replace the context with
-            // a fresh sibling (same outer) and initialize the binding
-            // there — a fresh binding per iteration
-            if per_iteration {
-                let save = ctx_save.expect("per-iteration loops own a context");
-                emit(&mut self.code, Opcode::PopContext, &[save]);
-                let count = self
-                    .ast
-                    .scope(scope.expect("lexical loop heads own their scope"))
-                    .decls
-                    .len() as u32;
-                emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
-                emit(&mut self.code, Opcode::PushContext, &[save]);
+                // per iteration with a lexical head: replace the context with
+                // a fresh sibling (same outer) and initialize the binding
+                // there — a fresh binding per iteration
+                if per_iteration {
+                    let save = ctx_save.expect("per-iteration loops own a context");
+                    emit(&mut g.code, Opcode::PopContext, &[save]);
+                    let count = g
+                        .ast
+                        .scope(scope.expect("lexical loop heads own their scope"))
+                        .decls
+                        .len() as u32;
+                    emit(&mut g.code, Opcode::CreateBlockContext, &[count]);
+                    emit(&mut g.code, Opcode::PushContext, &[save]);
+                }
+
+                // assign the key to the target (per iteration), then the body
+                g.emit_for_in_assign(left, key)?;
+                g.stmt(body)?;
+
+                g.breakables
+                    .last_mut()
+                    .unwrap()
+                    .continues
+                    .as_mut()
+                    .unwrap()
+                    .bind(&g.code);
+                // absolute restore: a labelled continue may arrive from a
+                // nested construct still holding its context (per-iteration
+                // heads self-heal at the top of the next iteration)
+                if !per_iteration && let Some(lc) = loop_ctx {
+                    emit(&mut g.code, Opcode::PopContext, &[lc]);
+                }
+                let mut back = Label::new();
+                emit_jump(&mut g.code, Opcode::JumpLoop, &mut back);
+                g.bind_loop_end(back, head);
+                // absolute restore: break may arrive from arbitrary context
+                // depth (labelled jumps past nested loop pops)
+                if let Some(save) = ctx_save {
+                    emit(&mut g.code, Opcode::PopContext, &[save]);
+                }
+
+                g.pop_value(); // key
+                g.pop_value(); // enumerator
+                Ok(())
+            };
+            match scope {
+                Some(s) => g.scoped(s, inner),
+                None => inner(g),
             }
-
-            // assign the key to the target (per iteration), then the body
-            self.emit_for_in_assign(left, key)?;
-            self.stmt(body)?;
-
-            self.breakables
-                .last_mut()
-                .unwrap()
-                .continues
-                .as_mut()
-                .unwrap()
-                .bind(&self.code);
-            // absolute restore: a labelled continue may arrive from a
-            // nested construct still holding its context (per-iteration
-            // heads self-heal at the top of the next iteration)
-            if !per_iteration
-                && let Some(lc) = loop_ctx
-            {
-                emit(&mut self.code, Opcode::PopContext, &[lc]);
-            }
-            let mut back = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpLoop, &mut back);
-            let (mut breaks, continues) = self.end_breakable();
-            breaks.bind(&self.code);
-            breaks.patch_all(&mut self.code);
-            continues.unwrap().patch_all(&mut self.code);
-            back.bind_at(head);
-            back.patch_all(&mut self.code);
-            // absolute restore: break may arrive from arbitrary context
-            // depth (labelled jumps past nested loop pops)
-            if let Some(save) = ctx_save {
-                emit(&mut self.code, Opcode::PopContext, &[save]);
-            }
-
-            self.pop_value(); // key
-            self.pop_value(); // enumerator
-            Ok(())
-        })();
-        if ctx_save.is_some() {
-            self.next_temp -= 2; // save + loop ctx
-        }
-        if scope.is_some() {
-            self.scopes.pop();
-        }
-        result
+        })
     }
 
     /// Store the enumeration key (in register `key`) into the for-in
@@ -2937,8 +2997,7 @@ impl<'a> FunctionGen<'a> {
                 let [declarator] = self.ast.list_items(decls) else {
                     return self.err(left, "for-in declarator");
                 };
-                let Node::VarDeclarator { target, init: None } = *self.ast.node(*declarator)
-                else {
+                let Node::VarDeclarator { target, init: None } = *self.ast.node(*declarator) else {
                     return self.err(left, "for-in declarator initializer");
                 };
                 match *self.ast.node(target) {
@@ -2967,17 +3026,29 @@ impl<'a> FunctionGen<'a> {
         }
     }
 
+    /// Bind a loop's tail: breaks land after the loop, continues patch
+    /// to their bind points inside it, and the back-edge returns to
+    /// `head`.
+    fn bind_loop_end(&mut self, mut back: Label, head: usize) {
+        let (mut breaks, continues) = self.end_breakable();
+        breaks.bind(&self.code);
+        breaks.patch_all(&mut self.code);
+        continues.unwrap().patch_all(&mut self.code);
+        back.bind_at(head);
+        back.patch_all(&mut self.code);
+    }
+
     fn emit_while(
         &mut self,
         cond: NodeId,
         body: NodeId,
-        label: Option<Symbol>,
+        labels: Vec<Symbol>,
     ) -> Result<(), CompileError> {
         // head: cond; JumpIfFalsy breaks; body; continues; back-edge
         let head = self.code.len();
         self.expr(cond)?;
         self.breakables.push(Breakable {
-            label,
+            labels,
             breaks: Label::new(),
             continues: Some(Label::new()),
             unwind_ctx: None,
@@ -2997,12 +3068,7 @@ impl<'a> FunctionGen<'a> {
             .bind(&self.code);
         let mut back = Label::new();
         emit_jump(&mut self.code, Opcode::JumpLoop, &mut back);
-        let (mut breaks, continues) = self.end_breakable();
-        breaks.bind(&self.code);
-        breaks.patch_all(&mut self.code);
-        continues.unwrap().patch_all(&mut self.code);
-        back.bind_at(head);
-        back.patch_all(&mut self.code);
+        self.bind_loop_end(back, head);
         Ok(())
     }
 
@@ -3013,7 +3079,7 @@ impl<'a> FunctionGen<'a> {
         cond: Option<NodeId>,
         next: Option<NodeId>,
         body: NodeId,
-        label: Option<Symbol>,
+        labels: Vec<Symbol>,
     ) -> Result<(), CompileError> {
         let scope = self.ast.node_scope(node);
         let per_iteration = self.resolved.per_iteration_loops.contains(&node);
@@ -3025,111 +3091,97 @@ impl<'a> FunctionGen<'a> {
         let for_ctx = scope
             .filter(|s| !self.ast.scope(*s).decls.is_empty())
             .map(|s| (s, self.ast.scope(s).decls.len() as u32));
-        let mut loop_ctx: Option<u32> = None;
-        let ctx_save = for_ctx.map(|(_, count)| {
-            emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
-            let save = self.reserve_temp();
-            let lc = self.reserve_temp();
-            emit(&mut self.code, Opcode::Store, &[lc]);
-            emit(&mut self.code, Opcode::PushContext, &[save]);
-            loop_ctx = Some(lc);
-            save
-        });
-        if let Some(s) = scope {
-            self.scopes.push(s);
-        }
-        let result = (|| {
-            if let Some(init) = init {
-                match *self.ast.node(init) {
-                    Node::ExprStmt { .. } | Node::VarDecl { .. } | Node::Empty => {
-                        self.stmt(init)?
-                    }
-                    _ => return self.err(init, "for loop initializer"),
-                }
-            }
-            // per-iteration state: copy registers for the head bindings
-            // and the current iteration's context (merge points restore
-            // absolutely — a labelled continue may bypass the pops of
-            // nested loops still holding contexts)
-            let copies: Vec<u32>;
-            let mut iter_ctx: Option<u32> = None;
-            if per_iteration {
-                let (_, count) = for_ctx.expect("per-iteration loops own a scope");
-                copies = (0..count).map(|_| self.reserve_temp()).collect();
-                let iter_ctx_reg = self.reserve_temp();
-                // the first iteration starts from a copy of the head
-                // context: values copied out, fresh sibling pushed
-                self.emit_iteration_context_copy(Some(iter_ctx_reg), count, &copies, ctx_save);
-                iter_ctx = Some(iter_ctx_reg);
-            } else {
-                copies = Vec::new();
-            }
-            // head: cond?; JumpIfFalsy breaks; body; continues; update; back-edge
-            let head = self.code.len();
-            self.breakables.push(Breakable {
-                label,
-                breaks: Label::new(),
-                continues: Some(Label::new()),
-                unwind_ctx: ctx_save,
+        // the loop's permanent temps (context save + loop-context
+        // register + per-iteration copy registers + iteration context)
+        self.with_temps(|g| {
+            let mut loop_ctx: Option<u32> = None;
+            let ctx_save = for_ctx.map(|(_, count)| {
+                emit(&mut g.code, Opcode::CreateBlockContext, &[count]);
+                let save = g.reserve_temp();
+                let lc = g.reserve_temp();
+                emit(&mut g.code, Opcode::Store, &[lc]);
+                emit(&mut g.code, Opcode::PushContext, &[save]);
+                loop_ctx = Some(lc);
+                save
             });
-            if let Some(cond) = cond {
-                self.expr(cond)?;
-                emit_jump(
-                    &mut self.code,
-                    Opcode::JumpIfFalsy,
-                    &mut self.breakables.last_mut().unwrap().breaks,
-                );
+            let inner = |g: &mut Self| -> Result<(), CompileError> {
+                if let Some(init) = init {
+                    match *g.ast.node(init) {
+                        Node::ExprStmt { .. } | Node::VarDecl { .. } | Node::Empty => {
+                            g.stmt(init)?
+                        }
+                        _ => return g.err(init, "for loop initializer"),
+                    }
+                }
+                // per-iteration state: copy registers for the head bindings
+                // and the current iteration's context (merge points restore
+                // absolutely — a labelled continue may bypass the pops of
+                // nested loops still holding contexts)
+                let copies: Vec<u32>;
+                let mut iter_ctx: Option<u32> = None;
+                if per_iteration {
+                    let (_, count) = for_ctx.expect("per-iteration loops own a scope");
+                    copies = (0..count).map(|_| g.reserve_temp()).collect();
+                    let iter_ctx_reg = g.reserve_temp();
+                    // the first iteration starts from a copy of the head
+                    // context: values copied out, fresh sibling pushed
+                    g.emit_iteration_context_copy(Some(iter_ctx_reg), count, &copies, ctx_save);
+                    iter_ctx = Some(iter_ctx_reg);
+                } else {
+                    copies = Vec::new();
+                }
+                // head: cond?; JumpIfFalsy breaks; body; continues; update; back-edge
+                let head = g.code.len();
+                g.breakables.push(Breakable {
+                    labels,
+                    breaks: Label::new(),
+                    continues: Some(Label::new()),
+                    unwind_ctx: ctx_save,
+                });
+                if let Some(cond) = cond {
+                    g.expr(cond)?;
+                    emit_jump(
+                        &mut g.code,
+                        Opcode::JumpIfFalsy,
+                        &mut g.breakables.last_mut().unwrap().breaks,
+                    );
+                }
+                g.stmt(body)?;
+                g.breakables
+                    .last_mut()
+                    .unwrap()
+                    .continues
+                    .as_mut()
+                    .unwrap()
+                    .bind(&g.code);
+                if let Some(iter_ctx) = iter_ctx {
+                    let (_, count) = for_ctx.expect("per-iteration loops own a scope");
+                    // absolute restore to this iteration's context, then
+                    // copy its values into a fresh sibling for the next
+                    // iteration (ES 14.7.5.4: the copy precedes the update)
+                    emit(&mut g.code, Opcode::PopContext, &[iter_ctx]);
+                    g.emit_iteration_context_copy(Some(iter_ctx), count, &copies, ctx_save);
+                } else if let Some(lc) = loop_ctx {
+                    emit(&mut g.code, Opcode::PopContext, &[lc]);
+                }
+                if let Some(next) = next {
+                    g.expr(next)?;
+                }
+                let mut back = Label::new();
+                emit_jump(&mut g.code, Opcode::JumpLoop, &mut back);
+                g.bind_loop_end(back, head);
+                // absolute restore: break may arrive from arbitrary context
+                // depth (labelled jumps past nested loop pops)
+                if let Some(save) = ctx_save {
+                    emit(&mut g.code, Opcode::PopContext, &[save]);
+                }
+                Ok(())
+            };
+            match scope {
+                Some(s) => g.scoped(s, inner),
+                None => inner(g),
             }
-            self.stmt(body)?;
-            self.breakables
-                .last_mut()
-                .unwrap()
-                .continues
-                .as_mut()
-                .unwrap()
-                .bind(&self.code);
-            if let Some(iter_ctx) = iter_ctx {
-                let (_, count) = for_ctx.expect("per-iteration loops own a scope");
-                // absolute restore to this iteration's context, then
-                // copy its values into a fresh sibling for the next
-                // iteration (ES 14.7.5.4: the copy precedes the update)
-                emit(&mut self.code, Opcode::PopContext, &[iter_ctx]);
-                self.emit_iteration_context_copy(Some(iter_ctx), count, &copies, ctx_save);
-            } else if let Some(lc) = loop_ctx {
-                emit(&mut self.code, Opcode::PopContext, &[lc]);
-            }
-            if let Some(next) = next {
-                self.expr(next)?;
-            }
-            let mut back = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpLoop, &mut back);
-            let (mut breaks, continues) = self.end_breakable();
-            breaks.bind(&self.code);
-            breaks.patch_all(&mut self.code);
-            continues.unwrap().patch_all(&mut self.code);
-            back.bind_at(head);
-            back.patch_all(&mut self.code);
-            // absolute restore: break may arrive from arbitrary context
-            // depth (labelled jumps past nested loop pops)
-            if let Some(save) = ctx_save {
-                emit(&mut self.code, Opcode::PopContext, &[save]);
-            }
-            Ok(())
-        })();
-        // release the loop's permanent temps: the context save, the
-        // loop-context register, the per-iteration copy registers and the
-        // iteration-context register
-        if ctx_save.is_some() {
-            self.next_temp -= 2; // save + loop ctx
-        }
-        if per_iteration {
-            let (_, count) = for_ctx.expect("per-iteration loops own a scope");
-            self.next_temp -= count + 1; // copies + iter ctx
-        }
-        if scope.is_some() {
-            self.scopes.pop();
-        }
-        result
+        })
     }
 
     /// Copy a loop head's bindings into a fresh sibling context: read
@@ -3146,11 +3198,7 @@ impl<'a> FunctionGen<'a> {
         ctx_save: Option<u32>,
     ) {
         for slot in 0..count {
-            emit(
-                &mut self.code,
-                Opcode::LoadContextSlot,
-                &[slot, 0],
-            );
+            emit(&mut self.code, Opcode::LoadContextSlot, &[slot, 0]);
             emit(&mut self.code, Opcode::Store, &[copies[slot as usize]]);
         }
         let save = ctx_save.expect("per-iteration loops own a context");
@@ -3162,11 +3210,7 @@ impl<'a> FunctionGen<'a> {
         emit(&mut self.code, Opcode::PushContext, &[save]);
         for slot in 0..count {
             emit(&mut self.code, Opcode::Load, &[copies[slot as usize]]);
-            emit(
-                &mut self.code,
-                Opcode::StoreContextSlot,
-                &[slot, 0],
-            );
+            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
         }
     }
 
@@ -3174,46 +3218,6 @@ impl<'a> FunctionGen<'a> {
     fn end_breakable(&mut self) -> (Label, Option<Label>) {
         let state = self.breakables.pop().expect("breakable state");
         (state.breaks, state.continues)
-    }
-
-    fn emit_labeled(
-        &mut self,
-        node: NodeId,
-        label: Symbol,
-        body: NodeId,
-    ) -> Result<(), CompileError> {
-        // a label on a loop/switch tags its breakable; elsewhere it wraps
-        // a break-only breakable. Loop bodies re-dispatch with the LOOP
-        // node (`body`): head scopes and per-iteration contexts hang off
-        // the loop node, not the label wrapper
-        match *self.ast.node(body) {
-            Node::While { cond, body } => self.emit_while(cond, body, Some(label)),
-            Node::For {
-                init,
-                cond,
-                next,
-                body: loop_body,
-            } => self.emit_for(body, init, cond, next, loop_body, Some(label)),
-            Node::ForIn {
-                left,
-                object,
-                body: loop_body,
-            } => self.emit_for_in(body, left, object, loop_body, Some(label)),
-            Node::Switch { disc, cases } => self.emit_switch(node, disc, cases, Some(label)),
-            _ => {
-                self.breakables.push(Breakable {
-                    label: Some(label),
-                    breaks: Label::new(),
-                    continues: None,
-                    unwind_ctx: None,
-                });
-                let result = self.stmt(body);
-                let (mut breaks, _) = self.end_breakable();
-                breaks.bind(&self.code);
-                breaks.patch_all(&mut self.code);
-                result
-            }
-        }
     }
 
     fn emit_break_continue(
@@ -3225,7 +3229,10 @@ impl<'a> FunctionGen<'a> {
         if is_break {
             let idx = match label {
                 None => self.breakables.len().checked_sub(1),
-                Some(name) => self.breakables.iter().rposition(|b| b.label == Some(name)),
+                Some(name) => self
+                    .breakables
+                    .iter()
+                    .rposition(|b| b.labels.contains(&name)),
             };
             let Some(idx) = idx else {
                 return self.err(node, "break outside a breakable statement");
@@ -3247,7 +3254,7 @@ impl<'a> FunctionGen<'a> {
             Some(name) => self
                 .breakables
                 .iter()
-                .rposition(|b| b.label == Some(name) && b.continues.is_some()),
+                .rposition(|b| b.labels.contains(&name) && b.continues.is_some()),
         };
         let Some(idx) = idx else {
             return self.err(node, "continue outside a loop");
@@ -3271,39 +3278,36 @@ impl<'a> FunctionGen<'a> {
         node: NodeId,
         disc: NodeId,
         cases: parser::NodeList,
-        label: Option<Symbol>,
+        labels: Vec<Symbol>,
     ) -> Result<(), CompileError> {
         let scope = self.ast.node_scope(node);
-        if let Some(s) = scope {
-            self.scopes.push(s);
-        }
-        let result = (|| {
+        let inner = |g: &mut Self| -> Result<(), CompileError> {
             // evaluate the discriminant once into a temp
-            self.expr(disc)?;
-            let d = self.push_value();
-            self.breakables.push(Breakable {
-                label,
+            g.expr(disc)?;
+            let d = g.push_value();
+            g.breakables.push(Breakable {
+                labels,
                 breaks: Label::new(),
                 continues: None,
                 unwind_ctx: None,
             });
 
-            let cases = self.ast.list_items(cases);
+            let cases = g.ast.list_items(cases);
             let mut bodies: Vec<Label> = (0..cases.len()).map(|_| Label::new()).collect();
             let mut default_idx = None;
 
             for (i, &case) in cases.iter().enumerate() {
-                let Node::SwitchCase { test, .. } = *self.ast.node(case) else {
-                    return self.err(case, "switch case");
+                let Node::SwitchCase { test, .. } = *g.ast.node(case) else {
+                    return g.err(case, "switch case");
                 };
                 match test {
                     Some(test) => {
-                        self.expr(test)?;
-                        let t = self.push_value();
-                        emit(&mut self.code, Opcode::Load, &[d]);
-                        emit(&mut self.code, Opcode::EqualStrict, &[t]);
-                        self.pop_value();
-                        emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut bodies[i]);
+                        g.expr(test)?;
+                        let t = g.push_value();
+                        emit(&mut g.code, Opcode::Load, &[d]);
+                        emit(&mut g.code, Opcode::EqualStrict, &[t]);
+                        g.pop_value();
+                        emit_jump(&mut g.code, Opcode::JumpIfTruthy, &mut bodies[i]);
                     }
                     None => default_idx = Some(i),
                 }
@@ -3312,34 +3316,34 @@ impl<'a> FunctionGen<'a> {
             // no case matched: the default body, or past the switch
             let mut end = Label::new();
             match default_idx {
-                Some(i) => emit_jump(&mut self.code, Opcode::Jump, &mut bodies[i]),
-                None => emit_jump(&mut self.code, Opcode::Jump, &mut end),
+                Some(i) => emit_jump(&mut g.code, Opcode::Jump, &mut bodies[i]),
+                None => emit_jump(&mut g.code, Opcode::Jump, &mut end),
             }
 
             // bodies execute in order; fallthrough is just sequential layout
             for (i, &case) in cases.iter().enumerate() {
-                bodies[i].bind(&self.code);
-                bodies[i].patch_all(&mut self.code);
-                let Node::SwitchCase { stmts, .. } = *self.ast.node(case) else {
-                    return self.err(case, "switch case");
+                bodies[i].bind(&g.code);
+                bodies[i].patch_all(&mut g.code);
+                let Node::SwitchCase { stmts, .. } = *g.ast.node(case) else {
+                    return g.err(case, "switch case");
                 };
-                for &s in self.ast.list_items(stmts) {
-                    self.stmt(s)?;
+                for &s in g.ast.list_items(stmts) {
+                    g.stmt(s)?;
                 }
             }
 
-            let (mut breaks, _) = self.end_breakable();
-            breaks.bind(&self.code);
-            breaks.patch_all(&mut self.code);
-            end.bind(&self.code);
-            end.patch_all(&mut self.code);
-            self.pop_value(); // discriminant
+            let (mut breaks, _) = g.end_breakable();
+            breaks.bind(&g.code);
+            breaks.patch_all(&mut g.code);
+            end.bind(&g.code);
+            end.patch_all(&mut g.code);
+            g.pop_value(); // discriminant
             Ok(())
-        })();
-        if scope.is_some() {
-            self.scopes.pop();
+        };
+        match scope {
+            Some(s) => self.scoped(s, inner),
+            None => inner(self),
         }
-        result
     }
 
     fn emit_try_catch(
@@ -3353,59 +3357,62 @@ impl<'a> FunctionGen<'a> {
         if finally_block.is_some() {
             return self.err(node, "finally blocks");
         }
-        // snapshot the current context: an exception may unwind out of
-        // context-owning constructs (lexical loop heads, class evaluation)
-        // whose PushContext the handler entry bypasses; the handler
-        // restores absolutely so the catch block's context-slot accesses
-        // see the context of the enclosing statement
-        let try_ctx = self.reserve_temp();
-        emit(&mut self.code, Opcode::LdaContext, &[]);
-        emit(&mut self.code, Opcode::Store, &[try_ctx]);
-        let try_start = self.code.len();
-        self.stmt(try_block)?;
-        let try_end = self.code.len();
+        self.with_temps(|g| {
+            // snapshot the current context: an exception may unwind out of
+            // context-owning constructs (lexical loop heads, class evaluation)
+            // whose PushContext the handler entry bypasses; the handler
+            // restores absolutely so the catch block's context-slot accesses
+            // see the context of the enclosing statement
+            let try_ctx = g.reserve_temp();
+            emit(&mut g.code, Opcode::LdaContext, &[]);
+            emit(&mut g.code, Opcode::Store, &[try_ctx]);
+            let try_start = g.code.len();
+            g.stmt(try_block)?;
+            let try_end = g.code.len();
 
-        let mut end = Label::new();
-        emit_jump(&mut self.code, Opcode::Jump, &mut end);
+            let mut end = Label::new();
+            emit_jump(&mut g.code, Opcode::Jump, &mut end);
 
-        // handler entry: the exception arrives in the accumulator
-        let handler_pc = self.code.len();
-        emit(&mut self.code, Opcode::PopContext, &[try_ctx]);
-        if let (Some(param), Some(block)) = (catch_param, catch_block) {
-            let scope = self.ast.node_scope(node);
-            if let Some(s) = scope {
-                self.scopes.push(s);
-            }
-            match *self.ast.node(param) {
-                Node::ArrayPattern { .. } | Node::ObjectPattern { .. } => {
-                    let value = self.push_value();
-                    self.emit_pattern(param, value, true)?;
-                    self.pop_value();
+            // handler entry: the exception arrives in the accumulator
+            let handler_pc = g.code.len();
+            emit(&mut g.code, Opcode::PopContext, &[try_ctx]);
+            let inner = |g: &mut Self| -> Result<(), CompileError> {
+                if let (Some(param), Some(block)) = (catch_param, catch_block) {
+                    match *g.ast.node(param) {
+                        Node::ArrayPattern { .. } | Node::ObjectPattern { .. } => {
+                            let value = g.push_value();
+                            g.emit_pattern(param, value, true)?;
+                            g.pop_value();
+                        }
+                        Node::Identifier { sym } => {
+                            let scope = g.ast.node_scope(node);
+                            let res = g
+                                .resolved
+                                .resolution_for_decl(scope.expect("catch scope"), sym)
+                                .expect("catch param declared");
+                            g.store_resolution(res);
+                        }
+                        _ => return g.err(param, "catch parameter"),
+                    }
+                    g.stmt(block)?;
                 }
-                Node::Identifier { sym } => {
-                    let res = self
-                        .resolved
-                        .resolution_for_decl(scope.expect("catch scope"), sym)
-                        .expect("catch param declared");
-                    self.store_resolution(res);
-                }
-                _ => return self.err(param, "catch parameter"),
+                Ok(())
+            };
+            let scope = g.ast.node_scope(node);
+            match scope {
+                Some(s) => g.scoped(s, inner)?,
+                None => inner(g)?,
             }
-            self.stmt(block)?;
-            if scope.is_some() {
-                self.scopes.pop();
-            }
-        }
 
-        self.handlers.push(HandlerEntry {
-            try_start,
-            try_end,
-            handler_pc,
-        });
-        end.bind(&self.code);
-        end.patch_all(&mut self.code);
-        self.next_temp -= 1; // try ctx snapshot
-        Ok(())
+            g.handlers.push(HandlerEntry {
+                try_start,
+                try_end,
+                handler_pc,
+            });
+            end.bind(&g.code);
+            end.patch_all(&mut g.code);
+            Ok(())
+        })
     }
 
     // -- function body ---------------------------------------------------------
@@ -3576,9 +3583,7 @@ impl<'a> FunctionGen<'a> {
             let fscope = self.ast.scope(fscope_id);
             if non_simple {
                 let n = params.len() as u32;
-                let staged_base = self.reg_base + self.next_temp;
-                self.next_temp += n;
-                self.max_temps = self.max_temps.max(self.next_temp);
+                let staged_base = self.reserve_temps(n);
                 // stage the incoming arguments (missing ones arrive as
                 // undefined through frame padding)
                 for i in 0..n {
@@ -3631,7 +3636,7 @@ impl<'a> FunctionGen<'a> {
                         self.emit_pattern(p.target, staged, true)?;
                     }
                 }
-                self.next_temp -= n;
+                self.next_temp -= n; // staged parameter window
             } else {
                 // context-allocated parameters: copy the argument into its
                 // slot (captured params and direct-eval scopes force params
@@ -3678,16 +3683,18 @@ impl<'a> FunctionGen<'a> {
             if self.ctor_has_instance_fields() {
                 // InitializeInstanceElements on the bound this:
                 // native(ctor, instance)
-                emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
-                let ctor = self.push_value();
-                emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
-                self.push_value();
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
-                );
-                self.next_temp -= 2;
+                self.with_temps(|g| {
+                    emit(&mut g.code, Opcode::LdaCurrentClosure, &[]);
+                    let ctor = g.push_value();
+                    emit(&mut g.code, Opcode::Load, &[(-1i32) as u32]);
+                    g.push_value();
+                    emit(
+                        &mut g.code,
+                        Opcode::CallRuntime,
+                        &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
+                    );
+                    Ok(())
+                })?;
             }
             emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
             emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
@@ -3700,16 +3707,18 @@ impl<'a> FunctionGen<'a> {
         if info.kind == parser::FunctionKind::BaseClassConstructor
             && self.ctor_has_instance_fields()
         {
-            emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
-            let ctor = self.push_value();
-            self.emit_this_load_own();
-            self.push_value();
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
-            );
-            self.next_temp -= 2;
+            self.with_temps(|g| {
+                emit(&mut g.code, Opcode::LdaCurrentClosure, &[]);
+                let ctor = g.push_value();
+                g.emit_this_load_own();
+                g.push_value();
+                emit(
+                    &mut g.code,
+                    Opcode::CallRuntime,
+                    &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
+                );
+                Ok(())
+            })?;
         }
 
         // the script's completion value starts as undefined; only

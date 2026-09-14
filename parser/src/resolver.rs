@@ -564,11 +564,16 @@ impl<'a> Resolver<'a> {
                     self.walk_node(e);
                 }
             }
-            Node::While { cond, body } => {
+            Node::While {
+                labels: _,
+                cond,
+                body,
+            } => {
                 self.walk_node(cond);
                 self.walk_node(body);
             }
             Node::For {
+                labels: _,
                 init,
                 cond,
                 next,
@@ -585,7 +590,12 @@ impl<'a> Resolver<'a> {
                 }
                 self.walk_node(body);
             }
-            Node::ForIn { left, object, body } => {
+            Node::ForIn {
+                labels: _,
+                left,
+                object,
+                body,
+            } => {
                 self.walk_node(left);
                 self.walk_node(object);
                 self.walk_node(body);
@@ -596,7 +606,11 @@ impl<'a> Resolver<'a> {
                 }
             }
             Node::Throw { expr } => self.walk_node(expr),
-            Node::Switch { disc, cases } => {
+            Node::Switch {
+                labels: _,
+                disc,
+                cases,
+            } => {
                 self.walk_node(disc);
                 for &case in self.ast.list_items(cases) {
                     if let Node::SwitchCase { test, stmts } = *self.ast.node(case) {
@@ -765,14 +779,11 @@ impl<'a> Resolver<'a> {
         // re-created per iteration for captured heads)
         for s in 0..ast.scope_count() {
             let scope = ScopeId(s as u32);
-            if ast.scope(scope).kind != ScopeKind::For
-                || ast.scope(scope).decls.is_empty()
-            {
+            if ast.scope(scope).kind != ScopeKind::For || ast.scope(scope).decls.is_empty() {
                 continue;
             }
             for (d, decl) in ast.scope(scope).decls.iter().enumerate() {
-                let hole_check =
-                    matches!(decl.kind, DeclKind::Let | DeclKind::Const);
+                let hole_check = matches!(decl.kind, DeclKind::Let | DeclKind::Const);
                 slots.insert(
                     (scope, d as u32),
                     Resolution::Context {

@@ -491,7 +491,12 @@ fn if_while_for() {
     assert!(else_.is_none());
 
     let ast = parse("while (a < 10) { a++; }");
-    let While { cond, body } = *stmt(&ast, 0) else {
+    let While {
+        labels: _,
+        cond,
+        body,
+    } = *stmt(&ast, 0)
+    else {
         panic!()
     };
     assert!(matches!(
@@ -505,6 +510,7 @@ fn if_while_for() {
 
     let ast = parse("for (var i = 0; i < 10; i++) {}");
     let For {
+        labels: _,
         init,
         cond,
         next,

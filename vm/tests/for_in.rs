@@ -430,8 +430,14 @@ fn invalid_assignment_targets_are_parse_errors() {
 
 #[test]
 fn c_style_for_still_parses_after_disambiguation() {
-    assert_eq!(run_smi("var n = 0; for (var i = 0; i < 3; i = i + 1) { n = n + 1; } n;"), 3);
-    assert_eq!(run_smi("var x = 0; for (x = 1; x < 2;) { x = x + 1; } x;"), 2);
+    assert_eq!(
+        run_smi("var n = 0; for (var i = 0; i < 3; i = i + 1) { n = n + 1; } n;"),
+        3
+    );
+    assert_eq!(
+        run_smi("var x = 0; for (x = 1; x < 2;) { x = x + 1; } x;"),
+        2
+    );
     assert_eq!(run_smi("for (;;) { break; } 7;"), 7);
 }
 
@@ -439,7 +445,9 @@ fn c_style_for_still_parses_after_disambiguation() {
 fn in_operator_still_works_inside_c_style_for() {
     // `in` inside the C-style head stays a binary operator
     assert_eq!(
-        run_smi("var o = {a: 1}; var n = 0; for (var i = ('a' in o) ? 0 : 5; i < 2; i = i + 1) { n = n + 1; } n;"),
+        run_smi(
+            "var o = {a: 1}; var n = 0; for (var i = ('a' in o) ? 0 : 5; i < 2; i = i + 1) { n = n + 1; } n;"
+        ),
         2
     );
 }
@@ -451,10 +459,7 @@ fn string_index_loads() {
     assert_eq!(run_str("var s = 'ab'; s[1];"), "b");
     assert_eq!(run_str("'ab'[0];"), "a");
     // out of range: undefined
-    assert_eq!(
-        run_smi("var s = 'ab'; (s[5] === undefined) ? 1 : 0;"),
-        1
-    );
+    assert_eq!(run_smi("var s = 'ab'; (s[5] === undefined) ? 1 : 0;"), 1);
     // surrogate pairs: indices are UTF-16 code units
     assert_eq!(
         run_smi(
