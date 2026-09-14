@@ -3,8 +3,7 @@
 //! assignment target.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{ScriptError, Smi, VMString, Value};
-use vm::{Thread, VM};
+use vm::{ScriptError, Smi, VM, VMString, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -12,16 +11,12 @@ fn run(src: &str) -> Result<Value, ScriptError> {
     thread.run_script(src)
 }
 
-fn smi(v: i64) -> Value {
-    Smi::new(v).encode()
-}
-
 fn run_smi(src: &str) -> i64 {
     Smi::decode(run(src).unwrap()).unwrap().value()
 }
 
 fn run_str(src: &str) -> String {
-    let result = run(src).unwrap();
+    run(src).unwrap();
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     // re-run under a live heap to read the string back

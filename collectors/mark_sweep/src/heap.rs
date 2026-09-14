@@ -7,8 +7,8 @@ use core::ptr::{self, NonNull};
 use std::thread::JoinHandle;
 
 use heap_api::{
-    AllocError, CLEARED, GcHost, GlobalVtable, HeapBackend, HeapStats, HeapVtable, RawCell,
-    STRONG_PTR, TAG_MASK, Visitor, WEAK_PTR, Word,
+    AllocError, CLEARED, GcHost, HeapBackend, HeapStats, LocalHeap, RawCell, STRONG_PTR,
+    SharedHeap, TAG_MASK, Visitor, WEAK_PTR, Word,
 };
 
 use heap_utils::{LocalNode, Safepoint};
@@ -803,6 +803,10 @@ struct Tlab {
     end: Cell<*mut u8>,
 }
 
+// SAFETY: the cursors are plain addresses into this thread's bump region;
+// a Tlab is only ever touched by the thread owning the local heap.
+unsafe impl Send for Tlab {}
+
 const TLAB_SIZES: [usize; 2] = [32 * 1024, 8 * 1024];
 const MIN_GC_THRESHOLD: usize = 16 * 1024 * 1024;
 const TRANSIENT_ATTEMPTS: usize = 2;
@@ -941,114 +945,6 @@ impl Drop for MarkSweepLocal {
     }
 }
 
-fn erased_allocate_raw(local: *mut (), layout: Layout) -> Result<NonNull<u8>, AllocError> {
-    unsafe { &*local.cast::<MarkSweepLocal>() }.allocate(layout)
-}
-
-fn erased_write_barrier(local: *const (), _host: Word, slot: &RawCell, value: Word) {
-    let local = unsafe { &*local.cast::<MarkSweepLocal>() };
-    local.state.write_barrier(slot, value);
-}
-
-fn erased_collection_requested(local: *const ()) -> bool {
-    unsafe { (*local.cast::<MarkSweepLocal>()).node.requested() }
-}
-
-fn erased_park_for_collection(local: *const ()) {
-    let local = unsafe { &*local.cast::<MarkSweepLocal>() };
-    local.park_if_requested();
-}
-
-fn erased_force_collect(local: *const ()) {
-    let local = unsafe { &*local.cast::<MarkSweepLocal>() };
-    local.collect();
-}
-
-fn erased_collect_minor(local: *const ()) {
-    let local = unsafe { &*local.cast::<MarkSweepLocal>() };
-    local.collect_minor();
-}
-
-fn erased_gc_in_progress(local: *const ()) -> bool {
-    let local = unsafe { &*local.cast::<MarkSweepLocal>() };
-    local.state.safepoint.is_armed()
-}
-
-fn erased_drop_local(local: *mut ()) {
-    unsafe { drop(Box::from_raw(local.cast::<MarkSweepLocal>())) };
-}
-
-fn erased_global_new_local(shared: *const ()) -> *mut () {
-    let state = shared as *const MarkSweepState;
-    unsafe { Arc::increment_strong_count(state) };
-    let local = MarkSweepLocal::new(unsafe { Arc::from_raw(state) });
-    Box::into_raw(local) as *mut ()
-}
-
-fn erased_set_host(shared: *const (), host: GcHost) {
-    unsafe { (*shared.cast::<MarkSweepState>()).set_host(host) };
-}
-
-fn erased_global_iterate_roots(_shared: *const (), _roots: &mut dyn Visitor) {}
-
-fn erased_global_should_collect(_shared: *const ()) -> bool {
-    false
-}
-
-fn erased_global_gc_in_progress(shared: *const ()) -> bool {
-    unsafe { (*shared.cast::<MarkSweepState>()).safepoint.is_armed() }
-}
-
-fn erased_global_force_collect(shared: *const ()) {
-    unsafe { (*shared.cast::<MarkSweepState>()).collect_now() };
-}
-
-fn erased_global_contains(shared: *const (), addr: Word) -> bool {
-    unsafe { (*shared.cast::<MarkSweepState>()).contains(addr as usize) }
-}
-
-fn erased_global_is_young(shared: *const (), value: Word) -> bool {
-    if value & TAG_MASK != STRONG_PTR {
-        return false;
-    }
-    let state = unsafe { &*(shared as *const MarkSweepState) };
-    let addr = (value & !TAG_MASK) as usize;
-    state.in_reservation(addr) && state.header_of(addr).young()
-}
-
-fn erased_global_stats(shared: *const ()) -> HeapStats {
-    unsafe { (*shared.cast::<MarkSweepState>()).stats() }
-}
-
-fn erased_global_drop_shared(shared: *mut ()) {
-    unsafe { Arc::decrement_strong_count(shared.cast::<MarkSweepState>()) };
-}
-
-static MARK_SWEEP_HEAP_VTABLE: HeapVtable = HeapVtable {
-    allocate_raw: erased_allocate_raw,
-    write_barrier: erased_write_barrier,
-    collection_requested: erased_collection_requested,
-    park_for_collection: erased_park_for_collection,
-    force_collect: erased_force_collect,
-    collect_minor: erased_collect_minor,
-    gc_in_progress: erased_gc_in_progress,
-    drop_local: erased_drop_local,
-};
-
-static MARK_SWEEP_GLOBAL_VTABLE: GlobalVtable = GlobalVtable {
-    local_vtable: &MARK_SWEEP_HEAP_VTABLE,
-    new_local: erased_global_new_local,
-    set_host: erased_set_host,
-    iterate_roots: erased_global_iterate_roots,
-    should_collect: erased_global_should_collect,
-    gc_in_progress: erased_global_gc_in_progress,
-    force_collect: erased_global_force_collect,
-    contains: erased_global_contains,
-    is_young: erased_global_is_young,
-    stats: erased_global_stats,
-    drop_shared: erased_global_drop_shared,
-};
-
 pub struct MarkSweep {
     inner: Arc<MarkSweepState>,
 }
@@ -1065,6 +961,76 @@ impl MarkSweep {
     }
 }
 
+impl LocalHeap for MarkSweepLocal {
+    fn allocate_raw(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+        self.allocate(layout)
+    }
+
+    fn write_barrier(&self, _host: Word, slot: &RawCell, value: Word) {
+        self.state.write_barrier(slot, value);
+    }
+
+    fn collection_requested(&self) -> bool {
+        self.node.requested()
+    }
+
+    fn park_for_collection(&self) {
+        self.park_if_requested();
+    }
+
+    fn force_collect(&self) {
+        self.collect();
+    }
+
+    fn collect_minor(&self) {
+        self.collect_minor();
+    }
+
+    fn gc_in_progress(&self) -> bool {
+        self.state.safepoint.is_armed()
+    }
+}
+
+impl SharedHeap for MarkSweep {
+    fn new_local(&self) -> Box<dyn LocalHeap> {
+        MarkSweepLocal::new(Arc::clone(&self.inner))
+    }
+
+    fn set_host(&self, host: GcHost) {
+        self.inner.set_host(host);
+    }
+
+    fn iterate_roots(&self, _roots: &mut dyn Visitor) {}
+
+    fn should_collect(&self) -> bool {
+        false
+    }
+
+    fn gc_in_progress(&self) -> bool {
+        self.inner.safepoint.is_armed()
+    }
+
+    fn force_collect(&self) {
+        self.inner.collect_now();
+    }
+
+    fn contains(&self, addr: Word) -> bool {
+        self.inner.contains(addr as usize)
+    }
+
+    fn is_young(&self, value: Word) -> bool {
+        if value & TAG_MASK != STRONG_PTR {
+            return false;
+        }
+        let addr = (value & !TAG_MASK) as usize;
+        self.inner.in_reservation(addr) && self.inner.header_of(addr).young()
+    }
+
+    fn stats(&self) -> HeapStats {
+        self.inner.stats()
+    }
+}
+
 impl HeapBackend for MarkSweep {
     type Config = MarkSweepConfig;
 
@@ -1072,8 +1038,7 @@ impl HeapBackend for MarkSweep {
         MarkSweep::new(config)
     }
 
-    fn into_global(self) -> (*mut (), &'static GlobalVtable) {
-        let state = Arc::into_raw(self.inner) as *mut ();
-        (state, &MARK_SWEEP_GLOBAL_VTABLE)
+    fn into_shared(self) -> Arc<dyn SharedHeap> {
+        Arc::new(self)
     }
 }

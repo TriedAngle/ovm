@@ -1,8 +1,10 @@
+use std::sync::Arc;
+
 use crate::{
-    AllocError, FixedArray, Float, GcHost, Global, GlobalVtable, Handle, HandleScope, HandleSet,
-    HeapBackend, HeapObject, HeapPtr, HeapStats, HeapVtable, Map, Object, ObjectInit,
-    ObjectSlotsInit, RawCell, RootHandles, STRONG_PTR, Smi, TAG_MASK, Tagged, TransitionLock,
-    Value, Visitor, Word,
+    AllocError, FixedArray, Float, GcHost, Global, Handle, HandleScope, HandleSet, HeapBackend,
+    HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit, ObjectSlotsInit, RawCell,
+    RootHandles, STRONG_PTR, SharedHeap, Smi, TAG_MASK, Tagged, TransitionLock, Value, Visitor,
+    Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -431,19 +433,16 @@ pub trait EdgeVisitable {
 
 /// Type-erased per-thread heap.
 pub struct Heap {
-    shared: *const (),
-    local: *mut (),
-    vtable: &'static HeapVtable,
+    local: Box<dyn LocalHeap>,
     transition_lock: TransitionLock,
     known: *const KnownCell,
 }
 
 unsafe impl Send for Heap {}
-unsafe impl Sync for Heap {}
 
 impl Heap {
     pub fn allocate_raw(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        (self.vtable.allocate_raw)(self.local, layout)
+        self.local.allocate_raw(layout)
     }
 
     pub fn known(&self) -> &'static WellKnown {
@@ -459,19 +458,20 @@ impl Heap {
     }
 
     pub fn write_barrier(&self, host: Value, slot: &RawCell, value: Value) {
-        (self.vtable.write_barrier)(self.local, host.to_bits(), slot, value.to_bits())
+        self.local
+            .write_barrier(host.to_bits(), slot, value.to_bits())
     }
 
     pub fn collection_requested(&self) -> bool {
-        (self.vtable.collection_requested)(self.local)
+        self.local.collection_requested()
     }
 
     pub fn park_for_collection(&self) {
-        (self.vtable.park_for_collection)(self.local)
+        self.local.park_for_collection()
     }
 
     pub fn gc_in_progress(&self) -> bool {
-        (self.vtable.gc_in_progress)(self.local)
+        self.local.gc_in_progress()
     }
 
     pub fn safepoint_poll(&mut self) {
@@ -481,11 +481,11 @@ impl Heap {
     }
 
     pub fn collect(&mut self) {
-        (self.vtable.force_collect)(self.local);
+        self.local.force_collect();
     }
 
     pub fn collect_minor(&mut self) {
-        (self.vtable.collect_minor)(self.local);
+        self.local.collect_minor();
     }
 
     pub fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
@@ -598,100 +598,75 @@ impl Heap {
     }
 }
 
-impl Drop for Heap {
-    fn drop(&mut self) {
-        (self.vtable.drop_local)(self.local);
+impl core::fmt::Debug for Heap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Heap").finish_non_exhaustive()
     }
 }
 
-impl core::fmt::Debug for Heap {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Heap")
-            .field("local", &self.local)
-            .field("shared", &self.shared)
-            .finish_non_exhaustive()
-    }
-}
 pub struct GlobalHeap {
-    state: *mut (),
-    vtable: &'static GlobalVtable,
+    shared: Arc<dyn SharedHeap>,
     transition_lock: TransitionLock,
 }
 
-unsafe impl Send for GlobalHeap {}
-unsafe impl Sync for GlobalHeap {}
-
 impl GlobalHeap {
-    pub fn new(state: *mut (), vtable: &'static GlobalVtable) -> Self {
+    pub fn new(shared: Arc<dyn SharedHeap>) -> Self {
         Self {
-            state,
-            vtable,
+            shared,
             transition_lock: TransitionLock::new(),
         }
     }
 
     /// Build the shared heap from any backend configuration.
     pub fn from_backend<B: HeapBackend>(config: B::Config) -> Result<Self, AllocError> {
-        let (state, vtable) = B::new(config)?.into_global();
-        Ok(Self::new(state, vtable))
+        Ok(Self::new(B::new(config)?.into_shared()))
     }
 
     pub fn new_local(&self, known: &KnownCell) -> Heap {
-        let local = (self.vtable.new_local)(self.state);
         Heap {
-            shared: self.state,
-            local,
-            vtable: self.vtable.local_vtable,
+            local: self.shared.new_local(),
             transition_lock: self.transition_lock.clone(),
             known: known as *const KnownCell,
         }
     }
 
     pub fn iterate_roots(&self, roots: &mut dyn Visitor) {
-        (self.vtable.iterate_roots)(self.state, roots)
+        self.shared.iterate_roots(roots)
     }
 
     pub fn set_host(&self, host: GcHost) {
-        (self.vtable.set_host)(self.state, host)
+        self.shared.set_host(host)
     }
 
     pub fn should_collect(&self) -> bool {
-        (self.vtable.should_collect)(self.state)
+        self.shared.should_collect()
     }
 
     pub fn gc_in_progress(&self) -> bool {
-        (self.vtable.gc_in_progress)(self.state)
+        self.shared.gc_in_progress()
     }
 
     /// Run one full collection cycle synchronously. Must not be called from
     /// a thread that owns a local heap.
     pub fn collect(&self) {
-        (self.vtable.force_collect)(self.state)
+        self.shared.force_collect()
     }
 
     pub fn contains(&self, addr: Word) -> bool {
-        (self.vtable.contains)(self.state, addr)
+        self.shared.contains(addr)
     }
 
     pub fn is_young(&self, value: Value) -> bool {
-        (self.vtable.is_young)(self.state, value.to_bits())
+        self.shared.is_young(value.to_bits())
     }
 
     pub fn stats(&self) -> HeapStats {
-        (self.vtable.stats)(self.state)
-    }
-}
-
-impl Drop for GlobalHeap {
-    fn drop(&mut self) {
-        (self.vtable.drop_shared)(self.state);
+        self.shared.stats()
     }
 }
 
 impl core::fmt::Debug for GlobalHeap {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("GlobalHeap")
-            .field("state", &self.state)
-            .finish_non_exhaustive()
+        f.debug_struct("GlobalHeap").finish_non_exhaustive()
     }
 }
