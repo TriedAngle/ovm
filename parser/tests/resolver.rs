@@ -10,6 +10,9 @@ fn resolve_src(src: &str) -> (Ast, parser::Resolved) {
 }
 
 /// resolutions of all Identifier nodes with this name, in arena order
+/// (declarator targets resolve like uses: their resolution is the store
+/// target of the declaration — ES 14.7.5's re-evaluated for-in head
+/// relies on it)
 fn resolutions_of(ast: &Ast, r: &parser::Resolved, name: &str) -> Vec<Resolution> {
     (0..ast.node_count())
         .map(|i| NodeId(i as u32))
@@ -23,12 +26,20 @@ fn resolutions_of(ast: &Ast, r: &parser::Resolved, name: &str) -> Vec<Resolution
 #[test]
 fn locals_and_params() {
     let (ast, r) = resolve_src("var x = 1; x; function f(a, b) { return a + b; }");
+    // [0] is the `var x = 1` declarator target (the store site), [1]
+    // the use — both resolve to the same register
     assert_eq!(
         resolutions_of(&ast, &r, "x"),
-        vec![Resolution::Local {
-            reg: 0,
-            hole_check: false
-        }]
+        vec![
+            Resolution::Local {
+                reg: 0,
+                hole_check: false
+            },
+            Resolution::Local {
+                reg: 0,
+                hole_check: false
+            }
+        ]
     );
     assert_eq!(
         resolutions_of(&ast, &r, "a"),
@@ -59,13 +70,22 @@ fn captured_variables_go_to_context() {
         .map(FunctionId)
         .find(|&id| ast.function(id).name.is_some())
         .unwrap();
+    // [0] is the declarator target inside f (depth 0), [1] the use in
+    // the arrow — one function hop from the arrow to f
     assert_eq!(
         resolutions_of(&ast, &r, "x"),
-        vec![Resolution::Context {
-            slot: 0,
-            depth: 1, // one function hop from the arrow to f
-            hole_check: false
-        }]
+        vec![
+            Resolution::Context {
+                slot: 0,
+                depth: 0,
+                hole_check: false
+            },
+            Resolution::Context {
+                slot: 0,
+                depth: 1,
+                hole_check: false
+            }
+        ]
     );
     assert_eq!(r.layout(f).register_count, 0);
     assert_eq!(r.layout(f).context_slots, 1);
@@ -100,9 +120,17 @@ fn let_const_need_hole_checks_var_does_not() {
 #[test]
 fn block_shadowing_resolves_innermost() {
     let (ast, r) = resolve_src("var x = 1; { let x = 2; x; }");
-    // the only x *use* is in the block → the let (hole check on)
+    // [0] is the outer var target (no hole check), [1] the block use →
+    // the let (hole check on)
     assert!(matches!(
         resolutions_of(&ast, &r, "x")[0],
+        Resolution::Local {
+            hole_check: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        resolutions_of(&ast, &r, "x")[1],
         Resolution::Local {
             hole_check: true,
             ..

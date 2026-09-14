@@ -388,9 +388,7 @@ fn other_primitives_delete_as_true() {
 #[test]
 fn nullish_base_throws_typeerror() {
     assert_eq!(
-        run_str(
-            "try { delete null.x; return 'no'; } catch (e) { e.name; }"
-        ),
+        run_str("try { delete null.x; return 'no'; } catch (e) { e.name; }"),
         "TypeError"
     );
     assert_eq!(

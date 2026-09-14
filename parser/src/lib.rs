@@ -121,7 +121,7 @@ pub enum PropKind {
     Field,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Node {
     NumberLiteral(f64),
     StringLiteral(Symbol),
@@ -271,10 +271,12 @@ pub enum Node {
         else_: Option<NodeId>,
     },
     While {
+        labels: Vec<Symbol>,
         cond: NodeId,
         body: NodeId,
     },
     For {
+        labels: Vec<Symbol>,
         init: Option<NodeId>,
         cond: Option<NodeId>,
         next: Option<NodeId>,
@@ -286,6 +288,7 @@ pub enum Node {
     /// re-evaluated per iteration). The object expression evaluates
     /// inside the head scope; `body` runs once per yielded key.
     ForIn {
+        labels: Vec<Symbol>,
         left: NodeId,
         object: NodeId,
         body: NodeId,
@@ -310,6 +313,7 @@ pub enum Node {
         finally_block: Option<NodeId>,
     },
     Switch {
+        labels: Vec<Symbol>,
         disc: NodeId,
         cases: NodeList,
     },
@@ -318,6 +322,8 @@ pub enum Node {
         test: Option<NodeId>,
         stmts: NodeList,
     },
+    /// `label: stmt` where the body is not a loop or switch (those carry
+    /// their label set themselves): a break-only target (ES 14.13)
     Labeled {
         label: Symbol,
         body: NodeId,

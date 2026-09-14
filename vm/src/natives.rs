@@ -485,10 +485,7 @@ const FOR_IN_VISITED: usize = 3;
 /// zero iterations; objects and strings snapshot level 0 of the lazy
 /// chain walk. Other primitives' prototypes are not walked yet (their
 /// own properties are none, so they enumerate empty).
-fn for_in_enumerate(
-    nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let subject = args.get(0).ok_or(VmError::Arity)?;
     let nullish = nctx.heap().no_gc(|nogc| {
         subject == nogc.known().null.value() || subject == nogc.known().undefined.value()
@@ -496,7 +493,9 @@ fn for_in_enumerate(
     if nullish {
         return Ok(nctx.heap().known().undefined.value());
     }
-    let level = nctx.heap().no_gc(|nogc| for_in_initial_level(nogc, subject));
+    let level = nctx
+        .heap()
+        .no_gc(|nogc| for_in_initial_level(nogc, subject));
     let Some(level) = level else {
         return Ok(nctx.heap().known().undefined.value());
     };
@@ -510,12 +509,7 @@ fn for_in_enumerate(
         let enumerator = heap.new_object(
             &scope,
             map,
-            &[
-                level,
-                keys.value(),
-                Smi::new(0).encode(),
-                empty.value(),
-            ],
+            &[level, keys.value(), Smi::new(0).encode(), empty.value()],
         );
         Ok(enumerator.into_tagged().erase())
     })
@@ -599,7 +593,6 @@ fn for_in_level_keys(
                 .min(obj.elements_array(nogc).map(|e| e.len()).unwrap_or(0));
             for i in 0..len {
                 if obj.element_value(nogc, i).is_some() {
-
                     indices.push(i as i64);
                 }
             }
@@ -613,7 +606,6 @@ fn for_in_level_keys(
                 // array-index-range Smi names are index keys; anything
                 // else (negative, ≥ 2^32−1) keeps insertion order
                 if (0..u32::MAX as i64).contains(&v) {
-
                     indices.push(v);
                 } else {
                     names.push(name.value());
@@ -832,7 +824,9 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
         }
         // a FixedArray prototype is the Self-style multi-parent form;
         // the chain walk does not model it (ends the enumeration)
-        Ok(proto.get_as::<FixedArray>(nogc).map_or(Some(proto), |_| None))
+        Ok(proto
+            .get_as::<FixedArray>(nogc)
+            .map_or(Some(proto), |_| None))
     })
 }
 

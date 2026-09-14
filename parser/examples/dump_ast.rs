@@ -127,21 +127,40 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
                 dump(ast, e, indent + 1);
             }
         }
-        Node::While { cond, body } => {
-            println!("{pad}While {at}");
+        Node::While {
+            ref labels,
+            cond,
+            body,
+        } => {
+            let names: Vec<_> = labels.iter().map(|&l| name_of(ast, l)).collect();
+            println!("{pad}While({names:?}) {at}");
             dump(ast, cond, indent + 1);
             dump(ast, body, indent + 1);
         }
         Node::For {
+            ref labels,
             init,
             cond,
             next,
             body,
         } => {
-            println!("{pad}For {at}");
+            let names: Vec<_> = labels.iter().map(|&l| name_of(ast, l)).collect();
+            println!("{pad}For({names:?}) {at}");
             for part in [init, cond, next].into_iter().flatten() {
                 dump(ast, part, indent + 1);
             }
+            dump(ast, body, indent + 1);
+        }
+        Node::ForIn {
+            ref labels,
+            left,
+            object,
+            body,
+        } => {
+            let names: Vec<_> = labels.iter().map(|&l| name_of(ast, l)).collect();
+            println!("{pad}ForIn({names:?}) {at}");
+            dump(ast, left, indent + 1);
+            dump(ast, object, indent + 1);
             dump(ast, body, indent + 1);
         }
         Node::Return { value } => {
@@ -190,8 +209,13 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
             );
             dump(ast, f.body.unwrap(), indent + 1);
         }
-        Node::Switch { disc, cases } => {
-            println!("{pad}Switch {at}");
+        Node::Switch {
+            ref labels,
+            disc,
+            cases,
+        } => {
+            let names: Vec<_> = labels.iter().map(|&l| name_of(ast, l)).collect();
+            println!("{pad}Switch({names:?}) {at}");
             dump(ast, disc, indent + 1);
             for &case in ast.list_items(cases) {
                 dump(ast, case, indent + 1);

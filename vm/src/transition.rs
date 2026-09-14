@@ -421,10 +421,7 @@ impl Transition {
                 .map(|m| m.into_tagged());
             let mut surviving: Vec<(SlotName, SlotFlags, Value)> =
                 Vec::with_capacity(descriptors.len() - 1);
-            let mut values: Vec<Value> = obj
-                .slots
-                .heap_ref(&nogc)
-                .as_slice()[..base]
+            let mut values: Vec<Value> = obj.slots.heap_ref(&nogc).as_slice()[..base]
                 .iter()
                 .map(|slot| slot.inner())
                 .collect();
