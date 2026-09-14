@@ -217,6 +217,9 @@ pub enum Opcode {
     LdaNewTarget, // -> acc
     // the currently executing closure (frame callable)
     LdaCurrentClosure, // -> acc
+    // the frame's current context (PushContext/PopContext operand value);
+    // lets the compiler snapshot it for absolute restores (try handlers)
+    LdaContext, // -> acc
     // accessor member installation: define an accessor half, merging with an
     // existing pair under the same key (ES 14.3.10 MethodDefinitionEvaluation)
     InstallNamedAccessor, // reg (target) idx (name) uimm (flags) ; closure in acc
@@ -403,6 +406,7 @@ impl Opcode {
             b if b == ConstructSuperVia as u8 => ConstructSuperVia,
             b if b == LdaNewTarget as u8 => LdaNewTarget,
             b if b == LdaCurrentClosure as u8 => LdaCurrentClosure,
+            b if b == LdaContext as u8 => LdaContext,
             b if b == InstallNamedAccessor as u8 => InstallNamedAccessor,
             b if b == InstallKeyedAccessor as u8 => InstallKeyedAccessor,
             b if b == SetFunctionNameConst as u8 => SetFunctionNameConst,
@@ -498,7 +502,8 @@ impl Opcode {
             | Self::ThrowSuperAlreadyCalledIfNotHole
             | Self::ConstructSuperAllArgs
             | Self::LdaNewTarget
-            | Self::LdaCurrentClosure => &[],
+            | Self::LdaCurrentClosure
+            | Self::LdaContext => &[],
             Self::LoadNamedPropertyFromSuper => &[Register, Index, Index],
             Self::LoadKeyedPropertyFromSuper => &[Register, Register, Index],
             Self::StoreNamedPropertyToSuper => &[Register, Register, Index, UImmediate, Index],

@@ -1775,6 +1775,11 @@ fn step(
             cache.set_acc(stack.callable_slot(&meta).inner());
             Step::Next
         }
+        Opcode::LdaContext => {
+            let ctx = step_try!(frame_context(heap, stack, &meta));
+            cache.set_acc(ctx);
+            Step::Next
+        }
         Opcode::InstallNamedAccessor | Opcode::InstallKeyedAccessor => {
             // ES 14.3.10: define one accessor half, merging with an existing
             // accessor pair under the same key. acc holds the closure.

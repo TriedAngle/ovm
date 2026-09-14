@@ -43,6 +43,11 @@ struct Breakable {
     label: Option<Symbol>,
     breaks: Label,
     continues: Option<Label>,
+    /// Loops owning a head context: the register holding the context
+    /// current before the loop statement. A break/continue targeting an
+    /// outer breakable from inside such a loop bypasses its context pops,
+    /// so the jump must unwind past it (`PopContext [unwind_ctx]`).
+    unwind_ctx: Option<u32>,
 }
 
 /// A store target ready for the final store: the object (and computed key)
@@ -2843,6 +2848,7 @@ impl<'a> FunctionGen<'a> {
                 label,
                 breaks: Label::new(),
                 continues: Some(Label::new()),
+                unwind_ctx: ctx_save,
             });
             emit(
                 &mut self.code,
@@ -2974,6 +2980,7 @@ impl<'a> FunctionGen<'a> {
             label,
             breaks: Label::new(),
             continues: Some(Label::new()),
+            unwind_ctx: None,
         });
         emit_jump(
             &mut self.code,
@@ -3063,6 +3070,7 @@ impl<'a> FunctionGen<'a> {
                 label,
                 breaks: Label::new(),
                 continues: Some(Label::new()),
+                unwind_ctx: ctx_save,
             });
             if let Some(cond) = cond {
                 self.expr(cond)?;
@@ -3197,6 +3205,7 @@ impl<'a> FunctionGen<'a> {
                     label: Some(label),
                     breaks: Label::new(),
                     continues: None,
+                    unwind_ctx: None,
                 });
                 let result = self.stmt(body);
                 let (mut breaks, _) = self.end_breakable();
@@ -3221,6 +3230,14 @@ impl<'a> FunctionGen<'a> {
             let Some(idx) = idx else {
                 return self.err(node, "break outside a breakable statement");
             };
+            // unwind the context-owning breakables this jump crosses: each
+            // holds the pre-statement context in its save register, so
+            // popping them innermost-first lands at the target's context
+            for b in self.breakables[idx + 1..].iter().rev() {
+                if let Some(reg) = b.unwind_ctx {
+                    emit(&mut self.code, Opcode::PopContext, &[reg]);
+                }
+            }
             let state = &mut self.breakables[idx];
             emit_jump(&mut self.code, Opcode::Jump, &mut state.breaks);
             return Ok(());
@@ -3235,6 +3252,11 @@ impl<'a> FunctionGen<'a> {
         let Some(idx) = idx else {
             return self.err(node, "continue outside a loop");
         };
+        for b in self.breakables[idx + 1..].iter().rev() {
+            if let Some(reg) = b.unwind_ctx {
+                emit(&mut self.code, Opcode::PopContext, &[reg]);
+            }
+        }
         let state = &mut self.breakables[idx];
         emit_jump(
             &mut self.code,
@@ -3263,6 +3285,7 @@ impl<'a> FunctionGen<'a> {
                 label,
                 breaks: Label::new(),
                 continues: None,
+                unwind_ctx: None,
             });
 
             let cases = self.ast.list_items(cases);
@@ -3330,6 +3353,14 @@ impl<'a> FunctionGen<'a> {
         if finally_block.is_some() {
             return self.err(node, "finally blocks");
         }
+        // snapshot the current context: an exception may unwind out of
+        // context-owning constructs (lexical loop heads, class evaluation)
+        // whose PushContext the handler entry bypasses; the handler
+        // restores absolutely so the catch block's context-slot accesses
+        // see the context of the enclosing statement
+        let try_ctx = self.reserve_temp();
+        emit(&mut self.code, Opcode::LdaContext, &[]);
+        emit(&mut self.code, Opcode::Store, &[try_ctx]);
         let try_start = self.code.len();
         self.stmt(try_block)?;
         let try_end = self.code.len();
@@ -3339,6 +3370,7 @@ impl<'a> FunctionGen<'a> {
 
         // handler entry: the exception arrives in the accumulator
         let handler_pc = self.code.len();
+        emit(&mut self.code, Opcode::PopContext, &[try_ctx]);
         if let (Some(param), Some(block)) = (catch_param, catch_block) {
             let scope = self.ast.node_scope(node);
             if let Some(s) = scope {
@@ -3372,6 +3404,7 @@ impl<'a> FunctionGen<'a> {
         });
         end.bind(&self.code);
         end.patch_all(&mut self.code);
+        self.next_temp -= 1; // try ctx snapshot
         Ok(())
     }
 

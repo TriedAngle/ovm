@@ -89,6 +89,16 @@ enum PatCtx {
     CollectParams,
 }
 
+/// Per-function parse context saved by `begin_fn_body`: break/continue
+/// state never crosses function boundaries.
+struct FnParseState {
+    loop_depth: u32,
+    switch_depth: u32,
+    labels: Vec<Symbol>,
+    iter_labels: Vec<Symbol>,
+    pending_labels: Vec<Symbol>,
+}
+
 pub struct Parser<S: CharStream> {
     scanner: Scanner<S>,
     ast: Ast,
@@ -97,6 +107,16 @@ pub struct Parser<S: CharStream> {
     loop_depth: u32,
     /// switch statement nesting (break targets; continue stays loop-only)
     switch_depth: u32,
+    /// labels of enclosing labelled statements (break targets; ES 14.10.1)
+    labels: Vec<Symbol>,
+    /// labels naming enclosing iteration statements (continue targets;
+    /// ES 14.9.1: only a label on the loop itself is continuable)
+    iter_labels: Vec<Symbol>,
+    /// label chain still awaiting its statement (the ES 14.13.1 LabelSet):
+    /// pushed by `parse_labeled_statement`, adopted by the loop it names,
+    /// cleared by any other statement dispatch; duplicates within the
+    /// chain are early errors
+    pending_labels: Vec<Symbol>,
     /// functions currently being parsed (ids into the Ast table); last = innermost
     fn_stack: Vec<FunctionId>,
     /// classes currently being parsed; last = innermost
@@ -119,6 +139,9 @@ impl<S: CharStream> Parser<S> {
             scopes: Vec::new(),
             loop_depth: 0,
             switch_depth: 0,
+            labels: Vec::new(),
+            iter_labels: Vec::new(),
+            pending_labels: Vec::new(),
             fn_stack: Vec::new(),
             class_stack: Vec::new(),
             next_literal_id: 0,
@@ -594,9 +617,42 @@ impl<S: CharStream> Parser<S> {
         let t = self.next()?;
         let label = self.ident_symbol(t)?;
         self.expect(TokenKind::Colon)?;
-        let body = self.parse_statement()?;
+        // ES 14.13.1: a label set may not repeat a label; sibling labels
+        // of separate statements (chain cleared between) may repeat
+        if self.pending_labels.contains(&label) {
+            return Err(ParseError::new(t.span, "duplicate label"));
+        }
+        self.labels.push(label);
+        self.pending_labels.push(label);
+        let body = self.parse_statement();
+        self.labels.pop();
+        self.pending_labels.pop();
+        let body = self.reject_labelled_item(body)?;
         let span = Span::new(t.span.start, self.ast.span(body).end);
         Ok(self.ast.add(Node::Labeled { label, body }, span))
+    }
+
+    /// ES 14.13: a labelled item is a Statement or (sloppy) a function
+    /// declaration — lexical and class declarations are early errors, and
+    /// the labelled function is one in strict code.
+    fn reject_labelled_item(&self, body: Result<NodeId, ParseError>) -> Result<NodeId, ParseError> {
+        let body = body?;
+        let bad = match *self.ast.node(body) {
+            Node::VarDecl { kind, .. } => matches!(kind, VarKind::Let | VarKind::Const),
+            Node::ClassDecl { .. } => true,
+            Node::FunctionDecl { .. } => self
+                .fn_stack
+                .last()
+                .is_some_and(|&f| self.ast.function(f).strict),
+            _ => false,
+        };
+        if bad {
+            return Err(ParseError::new(
+                self.ast.span(body),
+                "illegal declaration as a labelled item",
+            ));
+        }
+        Ok(body)
     }
 
     fn parse_statement(&mut self) -> Result<NodeId, ParseError> {
@@ -625,7 +681,22 @@ impl<S: CharStream> Parser<S> {
         {
             return self.parse_labeled_statement();
         }
+        // loops adopt the pending label chain as their label set (the
+        // labels name the loop itself); every other statement consumes it
+        // as a plain break target only (ES 14.13.1)
+        let labelled_item = !self.pending_labels.is_empty();
+        if !matches!(t.kind, TokenKind::While | TokenKind::For) {
+            self.pending_labels.clear();
+        }
         if let Some(kind) = self.peek_var_kind()? {
+            // a labelled item is a Statement, never a Declaration
+            // (ES 14.13): `l: let …` reads `let` as an identifier
+            // expression (ASI splits `l: let \n x = 1`), while
+            // `const`/`class` bodies stay declarations and fail the
+            // labelled-item check
+            if kind == VarKind::Let && labelled_item {
+                return self.parse_expr_stmt();
+            }
             return self.parse_var_decl(kind, true);
         }
         match t.kind {
@@ -793,9 +864,15 @@ impl<S: CharStream> Parser<S> {
         self.expect(TokenKind::LParen)?;
         let cond = self.parse_expression()?;
         self.expect(TokenKind::RParen)?;
+        // the trailing label chain names this loop: its labels become
+        // continue targets inside the body (ES 14.7.2 LabelSet)
+        let adopted = self.pending_labels.len();
+        self.iter_labels.extend(self.pending_labels.iter().copied());
         self.loop_depth += 1;
         let body = self.parse_statement();
-        self.loop_depth -= 1;
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+        self.iter_labels
+            .truncate(self.iter_labels.len() - adopted);
         let body = self.reject_lexical_loop_body_checked(body)?;
         let end = self.ast.span(body).end;
         Ok(self
@@ -886,9 +963,14 @@ impl<S: CharStream> Parser<S> {
         match head {
             Head::ForIn { left, object } => {
                 self.expect(TokenKind::RParen)?;
+                // the trailing label chain names this loop (ES 14.7.5)
+                let adopted = self.pending_labels.len();
+                self.iter_labels.extend(self.pending_labels.iter().copied());
                 self.loop_depth += 1;
                 let body = self.parse_statement();
-                self.loop_depth -= 1;
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                self.iter_labels
+                    .truncate(self.iter_labels.len() - adopted);
                 self.scopes.pop();
                 let body = self.reject_lexical_loop_body_checked(body)?;
                 let end = self.ast.span(body).end;
@@ -912,9 +994,14 @@ impl<S: CharStream> Parser<S> {
                     Some(self.parse_expression()?)
                 };
                 self.expect(TokenKind::RParen)?;
+                // the trailing label chain names this loop (ES 14.7.4)
+                let adopted = self.pending_labels.len();
+                self.iter_labels.extend(self.pending_labels.iter().copied());
                 self.loop_depth += 1;
                 let body = self.parse_statement();
-                self.loop_depth -= 1;
+                self.loop_depth = self.loop_depth.saturating_sub(1);
+                self.iter_labels
+                    .truncate(self.iter_labels.len() - adopted);
                 self.scopes.pop();
                 let body = self.reject_lexical_loop_body_checked(body)?;
                 let end = self.ast.span(body).end;
@@ -974,6 +1061,30 @@ impl<S: CharStream> Parser<S> {
                 t.span,
                 format!("`{}` outside of a loop", kind.text()),
             ));
+        }
+        // label targets (ES 14.9.1, 14.10.1): `continue` needs the label
+        // on an enclosing iteration statement, `break` on any enclosing
+        // labelled statement (the codegen's label matching must agree)
+        if let Some(sym) = label {
+            let ok = if kind == TokenKind::Continue {
+                self.iter_labels.contains(&sym)
+            } else {
+                self.labels.contains(&sym)
+            };
+            if !ok {
+                return Err(ParseError::new(
+                    t.span,
+                    format!(
+                        "`{}` label does not name an enclosing {}",
+                        kind.text(),
+                        if kind == TokenKind::Continue {
+                            "loop"
+                        } else {
+                            "statement"
+                        }
+                    ),
+                ));
+            }
         }
         self.expect_semicolon()?;
         let node = if kind == TokenKind::Break {
@@ -1052,7 +1163,7 @@ impl<S: CharStream> Parser<S> {
             );
         }
 
-        self.switch_depth -= 1;
+        self.switch_depth = self.switch_depth.saturating_sub(1);
         self.scopes.pop();
         let end = self.expect(TokenKind::RBrace)?.span.end;
         let cases = self.ast.list(&cases);
@@ -1305,8 +1416,10 @@ impl<S: CharStream> Parser<S> {
     /// Push the function scope and declare its parameters. Plain params
     /// become register-backed `Param` decls (with their positional index);
     /// pattern-bound names become `PatternParam` decls (prologue-initialized).
-    /// Returns the outer loop depth for `end_fn_body`.
-    fn begin_fn_body(&mut self, fid: FunctionId) -> u32 {
+    /// Returns the outer statement context for `end_fn_body`: labels never
+    /// cross function boundaries (ES 14.10.1, 14.9.1), and `break` depth
+    /// counters reset per function.
+    fn begin_fn_body(&mut self, fid: FunctionId) -> FnParseState {
         self.fn_stack.push(fid);
         let scope_id = self.push_scope(ScopeKind::Function);
         self.ast.scope_mut(scope_id).function = Some(fid);
@@ -1348,7 +1461,14 @@ impl<S: CharStream> Parser<S> {
                 }
             }
         }
-        std::mem::replace(&mut self.loop_depth, 0)
+        let outer_loop_depth = std::mem::replace(&mut self.loop_depth, 0);
+        FnParseState {
+            loop_depth: outer_loop_depth,
+            switch_depth: std::mem::replace(&mut self.switch_depth, 0),
+            labels: std::mem::take(&mut self.labels),
+            iter_labels: std::mem::take(&mut self.iter_labels),
+            pending_labels: std::mem::take(&mut self.pending_labels),
+        }
     }
 
     fn end_fn_body(
@@ -1356,9 +1476,13 @@ impl<S: CharStream> Parser<S> {
         fid: FunctionId,
         start: u32,
         body: NodeId,
-        saved_loop_depth: u32,
+        saved: FnParseState,
     ) -> Result<(), ParseError> {
-        self.loop_depth = saved_loop_depth;
+        self.loop_depth = saved.loop_depth;
+        self.switch_depth = saved.switch_depth;
+        self.labels = saved.labels;
+        self.iter_labels = saved.iter_labels;
+        self.pending_labels = saved.pending_labels;
         self.scopes.pop();
         self.fn_stack.pop();
         let end = self.ast.span(body).end;
