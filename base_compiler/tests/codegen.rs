@@ -569,10 +569,13 @@ fn throw_and_catch_binds_param() {
         "PushContext 1",
         "LoadConstant #undefined",
         "Store 2", // completion register
+        "LdaContext",
+        "Store 3", // try-entry context snapshot
         "LoadSmi 42",
         "Throw",
-        "Jump 22",
-        "Store 0", // handler: e = exception
+        "Jump 27",
+        "PopContext 3", // handler: restore the snapshotted context
+        "Store 0",     // e = exception
         "Load 0",
         "PopContext 1",
         "Return",
@@ -583,9 +586,9 @@ fn throw_and_catch_binds_param() {
     assert_eq!(out, expect);
     let handlers = &script.functions[0].handlers;
     assert_eq!(handlers.len(), 1);
-    assert_eq!(handlers[0].try_start, 8);
-    assert_eq!(handlers[0].try_end, 11);
-    assert_eq!(handlers[0].handler_pc, 15);
+    assert_eq!(handlers[0].try_start, 11);
+    assert_eq!(handlers[0].try_end, 14);
+    assert_eq!(handlers[0].handler_pc, 18);
 }
 
 #[test]
