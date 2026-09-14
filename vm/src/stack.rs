@@ -38,9 +38,8 @@ pub struct Stack {
     frames: RefCell<Vec<FrameMeta>>,
     /// Register files of fresh frames are initialized to this value
     /// (the hole: uninitialized `let`/`const` reads must be TDZ errors).
-    fill: Value,
-    /// Missing arguments are padded with this value (undefined).
-    undefined: Value,
+    fill: Register,
+    undefined: Register,
 }
 
 impl Stack {
@@ -51,8 +50,8 @@ impl Stack {
                 .collect(),
             top: Cell::new(0),
             frames: RefCell::new(Vec::new()),
-            fill,
-            undefined,
+            fill: unsafe { Register::from_value(fill) },
+            undefined: unsafe { Register::from_value(undefined) },
         }
     }
 
@@ -135,7 +134,7 @@ impl Stack {
                 args.len(),
             );
             // missing arguments are undefined (registers are the hole)
-            let undefined = self.undefined;
+            let undefined = self.undefined.inner();
             for i in args.len()..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -171,7 +170,7 @@ impl Stack {
                 self.slots.as_ptr().add(dst) as *mut Value,
                 count,
             );
-            let undefined = self.undefined;
+            let undefined = self.undefined.inner();
             for i in count..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -206,7 +205,7 @@ impl Stack {
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             );
-            let undefined = self.undefined;
+            let undefined = self.undefined.inner();
             for i in args.len()..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -268,7 +267,7 @@ impl Stack {
             return Err(VmError::StackOverflow);
         }
         for i in 0..register_count {
-            self.slot_unchecked(base + i).store(self.fill);
+            self.slot_unchecked(base + i).store(self.fill.inner());
         }
         self.set_top(base + size);
         Ok(base)
@@ -302,6 +301,8 @@ impl Stack {
 
 impl EdgeVisitable for Stack {
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
+        visitor.visit(self.fill.as_raw());
+        visitor.visit(self.undefined.as_raw());
         for slot in &self.slots[..self.top()] {
             visitor.visit(slot.as_raw());
         }

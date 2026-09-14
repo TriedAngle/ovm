@@ -127,6 +127,7 @@ fn erased_collection_requested(_local: *const ()) -> bool {
 fn erased_park_for_collection(_local: *const ()) {}
 
 fn erased_force_collect(_local: *const ()) {}
+fn erased_collect_minor(_local: *const ()) {}
 
 fn erased_gc_in_progress(_local: *const ()) -> bool {
     false
@@ -188,6 +189,7 @@ static DUMMY_HEAP_VTABLE: HeapVtable = HeapVtable {
     collection_requested: erased_collection_requested,
     park_for_collection: erased_park_for_collection,
     force_collect: erased_force_collect,
+    collect_minor: erased_collect_minor,
     gc_in_progress: erased_gc_in_progress,
     drop_local: erased_drop_local,
 };

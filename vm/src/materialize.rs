@@ -10,6 +10,7 @@ use crate::{
     Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ScopeInfo,
     ScopeInfoInit, VmError,
 };
+
 use base_compiler::{CompiledScript, Constant};
 use parser::FunctionId;
 
@@ -22,37 +23,36 @@ pub fn materialize_script<'s>(
     scope: &'s HandleScope<'_>,
     script: &CompiledScript,
 ) -> Result<Handle<'s, Object>, VmError> {
-    let empty = thread.heap().known().empty_context.value();
+    let empty = thread.heap().known().empty_context;
     materialize_closure(thread, scope, script, empty)
 }
 
-/// Materialize a compiled script whose closure captures `context` instead
-/// of the empty context (direct eval: the caller's frame context).
-pub fn materialize_closure<'s>(
+pub fn materialize_closure<'s, 'c>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
     script: &CompiledScript,
-    context: crate::Value,
-) -> Result<Handle<'s, Object>, VmError> {
+    context: Handle<'c, Context>,
+) -> Result<Handle<'s, Object>, VmError>
+where
+    'c: 's,
+{
     let (vm, heap, state) = thread.split();
     materialize_closure_vm(vm, heap, state, scope, script, context)
 }
 
-/// Native-facing variant (the eval builtin has no `Thread`).
 pub fn materialize_closure_vm<'s>(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
     scope: &'s HandleScope<'_>,
     script: &CompiledScript,
-    context: crate::Value,
+    context: Handle<'s, Context>,
 ) -> Result<Handle<'s, Object>, VmError> {
     let mut infos: Vec<Option<Handle<'s, CallableInfoObject>>> =
         (0..script.functions.len()).map(|_| None).collect();
     let info = materialize_function(vm, heap, state, scope, script, &mut infos, FunctionId(0))?;
 
     let map = heap.known().function_map;
-    let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
     let object = heap
         .new_object(scope, map, &[info.value(), context.value()])
         .into_handle(scope);

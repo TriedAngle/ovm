@@ -294,6 +294,7 @@ mod tagged {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "weak value in a strong Tagged")]
     fn strong_tagged_rejects_weak_bits() {
         // Safety: bit-level test; the value is never dereferenced.

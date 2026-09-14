@@ -2,7 +2,8 @@ use core::alloc::Layout;
 use core::ptr::{self, NonNull};
 
 use heap_api::GcHost;
-use heap_utils::Bitmap;
+
+use crate::chunk::ChunkHeader;
 
 pub const ALIGN: usize = 16;
 
@@ -52,6 +53,29 @@ impl FreeList {
         self.live_bytes
     }
 
+    pub fn from_promotion(addr: usize, size: usize, live: usize) -> Self {
+        let head = addr as *mut FreeHeader;
+        unsafe {
+            *head = FreeHeader {
+                size,
+                next: ptr::null_mut(),
+            };
+        }
+        Self {
+            head,
+            free_bytes: size,
+            live_bytes: live,
+        }
+    }
+
+    pub fn full(live_bytes: usize) -> Self {
+        Self {
+            head: ptr::null_mut(),
+            free_bytes: 0,
+            live_bytes,
+        }
+    }
+
     /// First-fit
     pub fn allocate(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         let need = need_for(layout);
@@ -85,16 +109,16 @@ impl FreeList {
         None
     }
 
-    /// Rebuilds the free list from the mark bitmap
-    pub fn sweep(&mut self, base: NonNull<u8>, size: usize, bitmap: &Bitmap, host: &GcHost) {
-        let start = base.as_ptr() as usize;
-        let end = start + size;
+    /// Rebuilds the free list from the chunk's mark bits
+    pub fn sweep(&mut self, header: &ChunkHeader, usable: usize, host: &GcHost) {
+        let start = header.object_base();
+        let end = start + usable;
         self.head = ptr::null_mut();
         self.free_bytes = 0;
         let mut live = 0usize;
         let mut tail: *mut FreeHeader = ptr::null_mut();
         let mut gap_start = start;
-        for addr in bitmap.iter_set() {
+        for addr in header.mark_iter(usable) {
             let object = unsafe { NonNull::new_unchecked(addr as *mut ()) };
             let object_size = (host.layout_of)(object).size().next_multiple_of(ALIGN);
             let gap = addr - gap_start;

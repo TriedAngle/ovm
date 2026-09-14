@@ -87,6 +87,7 @@ pub struct HeapVtable {
     pub collection_requested: fn(local: *const ()) -> bool,
     pub park_for_collection: fn(local: *const ()),
     pub force_collect: fn(local: *const ()),
+    pub collect_minor: fn(local: *const ()),
     pub gc_in_progress: fn(local: *const ()) -> bool,
     pub drop_local: fn(local: *mut ()),
 }

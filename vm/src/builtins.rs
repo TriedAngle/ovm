@@ -6,7 +6,7 @@
 //! functions (interpreter `CreateClosure`).
 
 use crate::{
-    Convert, FixedArray, GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object,
+    Context, Convert, FixedArray, GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object,
     PropertyDescriptor, SlotFlags, SlotName, Smi, Symbol, VMString, Value, VmError,
 };
 use base_compiler::compile_eval;
@@ -423,7 +423,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // here, capturing the empty context
         {
             let (vm, heap, state) = thread.split();
-            let empty = heap.known().empty_context.value();
+            let empty = heap.known().empty_context;
             let closure = {
                 let mut p = parser::Parser::new(parser::Utf8SliceStream::new(BIND_PRELUDE));
                 p.parse_script().map_err(|e| {
@@ -984,6 +984,7 @@ fn eval_native(
 
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
+        let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
         nctx.call(closure.value(), GcSlice::EMPTY)
     })
@@ -1973,6 +1974,7 @@ fn function_constructor(
     };
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
+        let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
         nctx.call(closure.value(), GcSlice::EMPTY)
     })
