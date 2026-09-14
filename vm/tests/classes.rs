@@ -585,6 +585,36 @@ fn super_property_store() {
         ),
         3
     );
+    // storing over a property `this` already owns (from the base
+    // constructor) overwrites it in place: OrdinarySet's receiver step
+    // (ES 9.1.9.2 step 3.c), never a duplicate add
+    assert_eq!(
+        run_smi(
+            "class A { constructor() { this.x = 1; } }
+             class B extends A { setX() { super.x = 5; } }
+             var b = new B(); b.setX(); b.x;"
+        ),
+        5
+    );
+    // the same define-or-overwrite applies when the parent chain lacks
+    // the name entirely (the walk's implicit default descriptor)
+    assert_eq!(
+        run_smi(
+            "class A {}
+             class B extends A { m() { super.n = 1; super.n = 2; return this.n; } }
+             new B().m();"
+        ),
+        2
+    );
+    // keyed form over an own smi-named property of the receiver
+    assert_eq!(
+        run_smi(
+            "class A { constructor() { this[0] = 1; } }
+             class B extends A { set() { super[0] = 5; } }
+             var b = new B(); b.set(); b[0];"
+        ),
+        5
+    );
 }
 
 #[test]

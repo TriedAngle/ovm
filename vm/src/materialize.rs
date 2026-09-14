@@ -79,10 +79,6 @@ fn materialize_function<'s>(
             Constant::String(bytes) => intern(heap, state, scope, vm, bytes),
             Constant::Smi(v) => crate::Smi::new(*v).encode(),
             Constant::Float(f) => heap.new_number(scope, *f),
-            Constant::Boolean(true) => heap.known().true_object.value(),
-            Constant::Boolean(false) => heap.known().false_object.value(),
-            Constant::Undefined => heap.known().undefined.value(),
-            Constant::Null => heap.known().null.value(),
             Constant::Callable(child) => {
                 let info = materialize_function(vm, heap, state, scope, script, infos, *child)?;
                 info.value()

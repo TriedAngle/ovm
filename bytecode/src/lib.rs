@@ -93,13 +93,67 @@ pub enum RuntimeFn {
     /// when the walk is exhausted; deleted-before-visited and
     /// shadowed keys are skipped inside
     ForInNext,
+    /// (fn, key, prefix) -> fn — ES 8.4.4 SetFunctionName: redefine the
+    /// closure's `name` ({w−, e−, c+}); the prefix discriminant is
+    /// 0 none, 1 "get ", 2 "set " (a Smi)
+    SetFunctionName,
+    /// (target, key, closure, flags) — accessor member installation: define
+    /// one accessor half, merging with an existing pair under the same key
+    /// (ES 14.3.10); flags bit 0 marks the getter half, PropertyFlags bits
+    /// carry enumerability
+    InstallAccessor,
+    /// (obj, key, value, flags) — [[DefineOwnProperty]] with exact
+    /// attributes (class member installation); define sites are
+    /// strict-mode code, so a rejected define throws TypeError. flags are
+    /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair)
+    DefineOwnProperty,
+    /// (obj, proto) -> obj — [[SetPrototypeOf]] (class prototype wiring)
+    SetPrototype,
+    /// (value) -> value — TypeError unless the value is null or a
+    /// constructor (class extends validation, ES 15.7.14)
+    ThrowIfNotConstructorOrNull,
+    /// (value) -> value — TypeError unless the value is an object or null
+    /// (superCtor.prototype validation)
+    ThrowIfNotObjectOrNull,
+    /// (value) -> value — ReferenceError on the hole: `this` access before
+    /// super() in a derived constructor (ES 10.2.2)
+    ThrowSuperNotCalledIfHole,
+    /// (value) -> value — ReferenceError unless the hole: InitializeThisBinding
+    /// guard, super() may run exactly once (ES 10.2.2)
+    ThrowSuperAlreadyCalledIfNotHole,
+    /// (args...) -> instance — super(...): construct the frame's super
+    /// constructor with the frame's new.target (ES 15.4.3); derived parents
+    /// get the hole receiver
+    ConstructSuper,
+    /// () -> instance — super() forwarding the frame's full argument list
+    /// (synthesized default derived constructors, ES 15.7.13)
+    ConstructSuperAllArgs,
+    /// (args..., closure, new_target) -> instance — arrow-delegated
+    /// super(): the constructor closure and its new.target ride the tail
+    /// of the argument window (threaded through .this_function)
+    ConstructSuperVia,
+    /// (name) -> value — direct-eval name load: walk the frame context
+    /// chain by name; unresolved names fall back to the global object
+    LoadDynamicName,
+    /// (value, name) -> value — direct-eval name store: write through to
+    /// the context-chain slot, else the global object
+    StoreDynamicName,
+    /// (first) -> array — a fresh array of the frame's arguments from
+    /// formal index `first` (a Smi)
+    CreateRestParameter,
+    /// (home, recv, key) -> value — super.x load: GetSuperBase of the home
+    /// object, walked with the split receiver/lookup-start (ES 15.4.2)
+    SuperGetProperty,
+    /// (home, recv, key, value, semantics) -> value — super.x store (ES
+    /// 15.4.4); semantics is SUPER_STORE_WRITE_THROUGH or 0 (shadow), a Smi
+    SuperSetProperty,
 }
 
 impl RuntimeFn {
     /// All variants in discriminant order. The array length is the
     /// variant count (type-checked), and the VM registers its table in
     /// this order so registry indices equal discriminants.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 35] = [
         Self::GetIterator,
         Self::IteratorNext,
         Self::IteratorDone,
@@ -119,6 +173,22 @@ impl RuntimeFn {
         Self::DeleteSuperProperty,
         Self::ForInEnumerate,
         Self::ForInNext,
+        Self::SetFunctionName,
+        Self::InstallAccessor,
+        Self::DefineOwnProperty,
+        Self::SetPrototype,
+        Self::ThrowIfNotConstructorOrNull,
+        Self::ThrowIfNotObjectOrNull,
+        Self::ThrowSuperNotCalledIfHole,
+        Self::ThrowSuperAlreadyCalledIfNotHole,
+        Self::ConstructSuper,
+        Self::ConstructSuperAllArgs,
+        Self::ConstructSuperVia,
+        Self::LoadDynamicName,
+        Self::StoreDynamicName,
+        Self::CreateRestParameter,
+        Self::SuperGetProperty,
+        Self::SuperSetProperty,
     ];
 
     pub const COUNT: u16 = Self::ALL.len() as u16;
@@ -136,6 +206,14 @@ pub enum Opcode {
     LoadSmi,      // imm -> acc
     LoadConstant, // idx -> acc
 
+    // well-known singletons: the hottest loaded values skip the
+    // constant-pool round trip (1-byte instructions, no pool slot)
+    LdaZero,      // -> acc (Smi 0)
+    LdaUndefined, // -> acc
+    LdaNull,      // -> acc
+    LdaTrue,      // -> acc
+    LdaFalse,     // -> acc
+
     Move, // reg -> reg
 
     // I don't think we need this right now, LoadConstant should be enough?
@@ -146,20 +224,13 @@ pub enum Opcode {
     LoadContextSlot,   // idx (slot) uimm (depth) -> acc; from the frame context
     StoreContextSlot,  // acc -> idx (slot) uimm (depth); frame context
 
-    // JS [[SetPrototypeOf]]: acc (object) gets reg (prototype) as [[Prototype]]
-    SetPrototype, // reg -> (acc stays the object)
-
     CreateFunctionContext, // idx (constants: the scope's ScopeInfo) -> acc; outer = frame context
     CreateBlockContext,    // uimm (slot count) -> acc; outer = frame context
-    CreateCatchContext,    // reg (exception) -> acc; outer = frame context
     PushContext,           // acc (context) -> frame context; reg <- old context
     PopContext,            // reg (context) -> frame context
     ThrowReferenceErrorIfHole, // acc -> throw ReferenceError if the hole
-    // dynamic name resolution (direct eval): walk the frame context chain
-    // by name; unresolved names fall back to the global object
-    LoadDynamicName,  // idx (name constant) -> acc
-    StoreDynamicName, // acc -> idx (name constant)
-
+    // dynamic name resolution (direct eval) walks the frame context chain
+    // by name through RuntimeFn::Load/StoreDynamicName
     LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
     StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
     // write-through variant: inherited data properties are written at the
@@ -169,15 +240,6 @@ pub enum Opcode {
     LoadKeyedProperty,          // reg (obj) idx (feedback); key in acc -> acc
     StoreKeyedProperty,         // acc -> reg (obj) reg (key) idx (feedback)
     StoreKeyedPropertyNoShadow, // acc -> reg (obj) reg (key) idx (feedback)
-
-    // [[DefineOwnProperty]] with exact attributes (class member
-    // installation): the value in acc is a plain value or, with
-    // PropertyFlags::Accessor, an AccessorPair produced by
-    // CreateAccessorPair. Define sites are strict-mode code: a rejected
-    // define throws a TypeError.
-    CreateAccessorPair,     // reg (get) reg (set) -> acc (AccessorPair)
-    DefineNamedOwnProperty, // acc -> reg (obj) idx (constant pool name) uimm (PropertyFlags bits) idx (feedback)
-    DefineKeyedOwnProperty, // acc -> reg (obj) reg (key) uimm (PropertyFlags bits) idx (feedback)
 
     // for methods the `self` is the first element in the reglist
     Call,           // reg (callee) reglist (base) regcount (count) idx (feedback) -> acc
@@ -193,26 +255,6 @@ pub enum Opcode {
 
     // -- classes -----------------------------------------------------------
 
-    // ES 15.7.14 ClassDefinitionEvaluation: the extends value must be null
-    // or a constructor; the superclass's .prototype must be an object or null
-    ThrowIfNotConstructorOrNull, // acc -> throw TypeError otherwise
-    ThrowIfNotObjectOrNull,      // acc -> throw TypeError otherwise
-    // [[ThisBindingStatus]] guards of derived constructors (ES 10.2.2):
-    // `this` starts as the hole and super() initializes it exactly once
-    ThrowSuperNotCalledIfHole,        // acc -> ReferenceError if the hole
-    ThrowSuperAlreadyCalledIfNotHole, // acc -> ReferenceError if not the hole
-    // super property access: home object + split receiver/lookup-start
-    LoadNamedPropertyFromSuper, // reg (receiver) idx (name) idx (feedback); home object in acc -> acc
-    LoadKeyedPropertyFromSuper, // reg (receiver) reg (key) idx (feedback); home object in acc -> acc
-    StoreNamedPropertyToSuper, // acc (value) -> reg (home) reg (receiver) idx (name) uimm (semantics flags) idx (feedback)
-    StoreKeyedPropertyToSuper, // acc (value) -> reg (home) reg (receiver) reg (key) uimm (semantics flags) idx (feedback)
-    // super(...): construct the current function's [[Prototype]] with the
-    // current frame's new.target (ES 15.4.3); result in acc
-    ConstructSuper,        // reglist (args) regcount (count) -> acc
-    ConstructSuperAllArgs, // forward the current frame's full argument list -> acc
-    // arrow-delegated super(): the constructor closure and its new.target
-    // come from context slots (threaded through .this_function)
-    ConstructSuperVia, // reg (closure) reg (new_target) reglist (args) regcount (count) -> acc
     // new.target of the current frame (undefined for plain calls)
     LdaNewTarget, // -> acc
     // the currently executing closure (frame callable)
@@ -220,14 +262,6 @@ pub enum Opcode {
     // the frame's current context (PushContext/PopContext operand value);
     // lets the compiler snapshot it for absolute restores (try handlers)
     LdaContext, // -> acc
-    // accessor member installation: define an accessor half, merging with an
-    // existing pair under the same key (ES 14.3.10 MethodDefinitionEvaluation)
-    InstallNamedAccessor, // reg (target) idx (name) uimm (flags) ; closure in acc
-    InstallKeyedAccessor, // reg (target) reg (key) uimm (flags) ; closure in acc
-    // ES 8.4.4 SetFunctionName: redefine the closure's `name` ({w−, e−, c+});
-    // the closure stays in the accumulator
-    SetFunctionNameConst, // idx (constant pool name) ; closure in acc
-    SetFunctionNameKey,   // reg (key) uimm (prefix: 0 none, 1 get, 2 set) ; closure in acc
 
     // binary arithmetic: acc = acc op reg
     Add, // reg
@@ -271,7 +305,6 @@ pub enum Opcode {
     LdaHole, // -> acc
     /// jump unless acc is `undefined` (pattern/param default guards)
     JumpIfNotUndefined, // imm (offset)
-    CreateRestParameter, // uimm (first formal parameter index) -> acc
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -362,30 +395,28 @@ impl Opcode {
             b if b == Store as u8 => Store,
             b if b == LoadSmi as u8 => LoadSmi,
             b if b == LoadConstant as u8 => LoadConstant,
+            b if b == LdaZero as u8 => LdaZero,
+            b if b == LdaUndefined as u8 => LdaUndefined,
+            b if b == LdaNull as u8 => LdaNull,
+            b if b == LdaTrue as u8 => LdaTrue,
+            b if b == LdaFalse as u8 => LdaFalse,
             b if b == Move as u8 => Move,
             b if b == LoadGlobal as u8 => LoadGlobal,
             b if b == StoreGlobal as u8 => StoreGlobal,
             b if b == LoadGlobalNoThrow as u8 => LoadGlobalNoThrow,
             b if b == LoadContextSlot as u8 => LoadContextSlot,
             b if b == StoreContextSlot as u8 => StoreContextSlot,
-            b if b == SetPrototype as u8 => SetPrototype,
             b if b == CreateFunctionContext as u8 => CreateFunctionContext,
             b if b == CreateBlockContext as u8 => CreateBlockContext,
-            b if b == CreateCatchContext as u8 => CreateCatchContext,
             b if b == PushContext as u8 => PushContext,
             b if b == PopContext as u8 => PopContext,
             b if b == ThrowReferenceErrorIfHole as u8 => ThrowReferenceErrorIfHole,
-            b if b == LoadDynamicName as u8 => LoadDynamicName,
-            b if b == StoreDynamicName as u8 => StoreDynamicName,
             b if b == LoadNamedProperty as u8 => LoadNamedProperty,
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
             b if b == StoreNamedPropertyNoShadow as u8 => StoreNamedPropertyNoShadow,
             b if b == LoadKeyedProperty as u8 => LoadKeyedProperty,
             b if b == StoreKeyedProperty as u8 => StoreKeyedProperty,
             b if b == StoreKeyedPropertyNoShadow as u8 => StoreKeyedPropertyNoShadow,
-            b if b == CreateAccessorPair as u8 => CreateAccessorPair,
-            b if b == DefineNamedOwnProperty as u8 => DefineNamedOwnProperty,
-            b if b == DefineKeyedOwnProperty as u8 => DefineKeyedOwnProperty,
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
             b if b == CallRuntime as u8 => CallRuntime,
@@ -393,24 +424,9 @@ impl Opcode {
             b if b == CreateEmptyObjectLiteral as u8 => CreateEmptyObjectLiteral,
             b if b == CreateEmptyArrayLiteral as u8 => CreateEmptyArrayLiteral,
             b if b == CreateClosure as u8 => CreateClosure,
-            b if b == ThrowIfNotConstructorOrNull as u8 => ThrowIfNotConstructorOrNull,
-            b if b == ThrowIfNotObjectOrNull as u8 => ThrowIfNotObjectOrNull,
-            b if b == ThrowSuperNotCalledIfHole as u8 => ThrowSuperNotCalledIfHole,
-            b if b == ThrowSuperAlreadyCalledIfNotHole as u8 => ThrowSuperAlreadyCalledIfNotHole,
-            b if b == LoadNamedPropertyFromSuper as u8 => LoadNamedPropertyFromSuper,
-            b if b == LoadKeyedPropertyFromSuper as u8 => LoadKeyedPropertyFromSuper,
-            b if b == StoreNamedPropertyToSuper as u8 => StoreNamedPropertyToSuper,
-            b if b == StoreKeyedPropertyToSuper as u8 => StoreKeyedPropertyToSuper,
-            b if b == ConstructSuper as u8 => ConstructSuper,
-            b if b == ConstructSuperAllArgs as u8 => ConstructSuperAllArgs,
-            b if b == ConstructSuperVia as u8 => ConstructSuperVia,
             b if b == LdaNewTarget as u8 => LdaNewTarget,
             b if b == LdaCurrentClosure as u8 => LdaCurrentClosure,
             b if b == LdaContext as u8 => LdaContext,
-            b if b == InstallNamedAccessor as u8 => InstallNamedAccessor,
-            b if b == InstallKeyedAccessor as u8 => InstallKeyedAccessor,
-            b if b == SetFunctionNameConst as u8 => SetFunctionNameConst,
-            b if b == SetFunctionNameKey as u8 => SetFunctionNameKey,
             b if b == Add as u8 => Add,
             b if b == Sub as u8 => Sub,
             b if b == Mul as u8 => Mul,
@@ -441,7 +457,6 @@ impl Opcode {
             b if b == ReThrow as u8 => ReThrow,
             b if b == LdaHole as u8 => LdaHole,
             b if b == JumpIfNotUndefined as u8 => JumpIfNotUndefined,
-            b if b == CreateRestParameter as u8 => CreateRestParameter,
             _ => return None,
         })
     }
@@ -457,6 +472,10 @@ impl Opcode {
             Self::LoadSmi => &[Immediate],
             Self::LoadConstant => &[Index],
 
+            Self::LdaZero | Self::LdaUndefined | Self::LdaNull | Self::LdaTrue | Self::LdaFalse => {
+                &[]
+            }
+
             Self::Move => &[Register, Register],
 
             Self::LoadGlobal | Self::LoadGlobalNoThrow => &[Index, Index],
@@ -465,14 +484,10 @@ impl Opcode {
             Self::LoadContextSlot => &[Index, UImmediate],
             Self::StoreContextSlot => &[Index, UImmediate],
 
-            Self::SetPrototype => &[Register],
-
             Self::CreateFunctionContext => &[Index],
             Self::CreateBlockContext => &[UImmediate],
-            Self::CreateCatchContext => &[Register],
             Self::PushContext | Self::PopContext => &[Register],
             Self::ThrowReferenceErrorIfHole => &[],
-            Self::LoadDynamicName | Self::StoreDynamicName => &[Index],
 
             Self::LoadNamedProperty => &[Register, Index, Index],
             Self::StoreNamedProperty | Self::StoreNamedPropertyNoShadow => {
@@ -484,10 +499,6 @@ impl Opcode {
                 &[Register, Register, Index]
             }
 
-            Self::CreateAccessorPair => &[Register, Register],
-            Self::DefineNamedOwnProperty => &[Register, Index, UImmediate, Index],
-            Self::DefineKeyedOwnProperty => &[Register, Register, UImmediate, Index],
-
             Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
             Self::CallRuntime => &[Index, RegisterListStart, RegisterCount],
@@ -496,24 +507,7 @@ impl Opcode {
             Self::CreateEmptyObjectLiteral | Self::CreateEmptyArrayLiteral => &[],
             Self::CreateClosure => &[Index],
 
-            Self::ThrowIfNotConstructorOrNull
-            | Self::ThrowIfNotObjectOrNull
-            | Self::ThrowSuperNotCalledIfHole
-            | Self::ThrowSuperAlreadyCalledIfNotHole
-            | Self::ConstructSuperAllArgs
-            | Self::LdaNewTarget
-            | Self::LdaCurrentClosure
-            | Self::LdaContext => &[],
-            Self::LoadNamedPropertyFromSuper => &[Register, Index, Index],
-            Self::LoadKeyedPropertyFromSuper => &[Register, Register, Index],
-            Self::StoreNamedPropertyToSuper => &[Register, Register, Index, UImmediate, Index],
-            Self::StoreKeyedPropertyToSuper => &[Register, Register, Register, UImmediate, Index],
-            Self::ConstructSuper => &[RegisterListStart, RegisterCount],
-            Self::ConstructSuperVia => &[Register, Register, RegisterListStart, RegisterCount],
-            Self::InstallNamedAccessor => &[Register, Index, UImmediate],
-            Self::InstallKeyedAccessor => &[Register, Register, UImmediate],
-            Self::SetFunctionNameConst => &[Index],
-            Self::SetFunctionNameKey => &[Register, UImmediate],
+            Self::LdaNewTarget | Self::LdaCurrentClosure | Self::LdaContext => &[],
 
             Self::Add
             | Self::Sub
@@ -541,7 +535,6 @@ impl Opcode {
             | Self::InstanceOf => &[Register],
 
             Self::LdaHole => &[],
-            Self::CreateRestParameter => &[UImmediate],
         }
     }
 

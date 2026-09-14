@@ -11,8 +11,10 @@ mod label;
 use parser::{Ast, FunctionId};
 
 /// Value table entries. Materialization (in `vm`) converts these into
-/// heap objects: interned strings, `Float`s, oddball singletons, and
-/// shared `CallableInfoObject` templates for closures.
+/// heap objects: interned strings, `Float`s, and shared
+/// `CallableInfoObject` templates for closures. The well-known
+/// singletons (undefined/null/true/false/0) load through their dedicated
+/// `Lda*` opcodes instead of the constant pool.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     /// Interned string (property names, string literals)
@@ -22,11 +24,6 @@ pub enum Constant {
     /// Smi-range integer literals too big for the (at most 2-byte signed)
     /// `LoadSmi` operand: they ride the constant pool instead
     Smi(i64),
-    /// The true/false singletons
-    Boolean(bool),
-    /// `undefined` / `null` singletons
-    Undefined,
-    Null,
     /// `CreateClosure` template: the shared callable info of a nested function
     Callable(FunctionId),
     /// The function context's slot names (parallel to its slots, for
