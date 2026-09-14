@@ -35,7 +35,8 @@ fn handles_read_back_their_values() {
 
     assert_eq!(Smi::decode(a.value()).unwrap().value(), 42);
     assert_eq!(Smi::decode(b.value()).unwrap().value(), -7);
-    assert_eq!(root_count(&data), 2);
+    // +1: the block fill template is a visited root cell
+    assert_eq!(root_count(&data), 3);
 }
 
 #[test]
@@ -63,11 +64,11 @@ fn closed_scope_unroots_its_handles() {
         let inner = handle_scope(&data);
         smi_handle(&inner, 2);
         smi_handle(&inner, 3);
-        assert_eq!(root_count(&data), 3);
+        assert_eq!(root_count(&data), 4);
     }
 
     // inner scope closed: its slots are reclaimed, outer handle survives
-    assert_eq!(root_count(&data), 1);
+    assert_eq!(root_count(&data), 2);
     assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
 }
 
@@ -79,15 +80,15 @@ fn reclaimed_slots_are_reused() {
         for i in 0..10 {
             smi_handle(&scope, i);
         }
-        assert_eq!(root_count(&data), 10);
+        assert_eq!(root_count(&data), 11);
     }
-    assert_eq!(root_count(&data), 0);
+    assert_eq!(root_count(&data), 1);
 
     let scope = handle_scope(&data);
     for i in 0..5 {
         smi_handle(&scope, i * 100);
     }
-    assert_eq!(root_count(&data), 5);
+    assert_eq!(root_count(&data), 6);
     let fourth = scope.handle(Tagged::smi(400).unwrap());
     assert_eq!(Smi::decode(fourth.value()).unwrap().value(), 400);
 }
@@ -102,7 +103,7 @@ fn blocks_extend_when_full() {
         handles.push(scope.handle(Tagged::smi(i).unwrap()));
     }
 
-    assert_eq!(root_count(&data), 1030);
+    assert_eq!(root_count(&data), 1031);
     for (i, handle) in handles.iter().enumerate() {
         assert_eq!(Smi::decode(handle.value()).unwrap().value(), i as i64);
     }
@@ -122,7 +123,7 @@ fn escaped_handle_survives_inner_scope() {
         escapable.escape(h)
     };
 
-    assert_eq!(root_count(&data), 2);
+    assert_eq!(root_count(&data), 3);
     assert_eq!(Smi::decode(escaped.value()).unwrap().value(), 2);
 }
 
@@ -138,7 +139,7 @@ fn escapable_scope_closed_without_escape_reclaims() {
         escapable.handle(Tagged::smi(2).unwrap());
     }
 
-    assert_eq!(root_count(&data), 2);
+    assert_eq!(root_count(&data), 3);
 }
 
 #[test]
@@ -157,6 +158,7 @@ fn strong_handles_are_infallible() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 #[should_panic(expected = "weak value in a strong Tagged")]
 fn weak_bits_rejected_by_the_type_system() {
     use vm::{Object, Tagged, Value, WEAK_PTR};

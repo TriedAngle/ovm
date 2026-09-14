@@ -480,10 +480,12 @@ impl Heap {
         }
     }
 
-    /// Run one full collection cycle synchronously. The caller must hold no
-    /// unrooted objects.
     pub fn collect(&mut self) {
         (self.vtable.force_collect)(self.local);
+    }
+
+    pub fn collect_minor(&mut self) {
+        (self.vtable.collect_minor)(self.local);
     }
 
     pub fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {

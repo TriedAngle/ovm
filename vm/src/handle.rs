@@ -7,7 +7,7 @@ use core::{
 
 use crate::{
     EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, HeapObject, HeapPtr, HeapRef, Map,
-    NoGc, RawCell, Tagged, Value, Visitor,
+    NoGc, RawCell, Register, Tagged, Value, Visitor,
 };
 
 /// A rooted reference to a `T` that survives relocation by the GC.
@@ -102,7 +102,7 @@ struct HandleDataImpl {
     next: *mut Value,
     limit: *mut Value,
     level: usize,
-    fill: Value,
+    fill: Register,
 }
 
 impl HandleDataImpl {
@@ -116,7 +116,7 @@ impl HandleDataImpl {
     }
 
     fn extend(&mut self) {
-        let block = vec![self.fill; HANDLE_BLOCK_SIZE].into_boxed_slice();
+        let block = vec![self.fill.inner(); HANDLE_BLOCK_SIZE].into_boxed_slice();
         self.next = block.as_ptr() as *mut Value;
         self.limit = unsafe { self.next.add(block.len()) };
         self.blocks.push(block);
@@ -138,6 +138,7 @@ impl HandleDataImpl {
     }
 
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
+        visitor.visit(self.fill.as_raw());
         for block in &self.blocks {
             let start = block.as_ptr() as *mut Value;
             let end = unsafe { start.add(block.len()) };
@@ -162,7 +163,7 @@ impl HandleData {
             next: std::ptr::null_mut(),
             limit: std::ptr::null_mut(),
             level: 0,
-            fill,
+            fill: unsafe { Register::from_value(fill) },
         };
         inner.extend();
         Self {

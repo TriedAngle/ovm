@@ -16,8 +16,7 @@ struct StackCacheImpl {
     base: usize,
     register_count: usize,
     active: bool,
-    /// The hole sentinel this cache resets its slots to when deactivated.
-    the_hole: Value,
+    the_hole: Register,
 }
 
 impl StackCache {
@@ -30,7 +29,7 @@ impl StackCache {
             base: 0,
             register_count: 0,
             active: false,
-            the_hole,
+            the_hole: unsafe { Register::from_value(the_hole) },
         }))
     }
 
@@ -70,7 +69,7 @@ impl StackCache {
 
     pub fn deactivate(&self) {
         let cache = self.get();
-        let the_hole = cache.the_hole;
+        let the_hole = cache.the_hole.inner();
         cache.acc.store(the_hole);
         cache.code.store(the_hole);
         cache.constants.store(the_hole);
@@ -121,5 +120,6 @@ impl EdgeVisitable for StackCache {
         visitor.visit(cache.acc.as_raw());
         visitor.visit(cache.code.as_raw());
         visitor.visit(cache.constants.as_raw());
+        visitor.visit(cache.the_hole.as_raw());
     }
 }
