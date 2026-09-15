@@ -1008,3 +1008,196 @@ fn validate_define<'a>(
     }
     Some(DefineAction::Redefine { desc })
 }
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PartialDescriptor {
+    pub value: Option<Value>,
+    pub get: Option<Value>,
+    pub set: Option<Value>,
+    pub writable: Option<bool>,
+    pub enumerable: Option<bool>,
+    pub configurable: Option<bool>,
+}
+
+impl PartialDescriptor {
+    pub fn value(value: Value) -> Self {
+        Self {
+            value: Some(value),
+            ..Self::default()
+        }
+    }
+
+    /// ES 6.2.6.2 IsDataDescriptor.
+    pub fn is_data_descriptor(&self) -> bool {
+        self.value.is_some() || self.writable.is_some()
+    }
+
+    /// ES 6.2.6.1 IsAccessorDescriptor.
+    pub fn is_accessor_descriptor(&self) -> bool {
+        self.get.is_some() || self.set.is_some()
+    }
+
+    /// ES 6.2.6.3 IsGenericDescriptor.
+    pub fn is_generic_descriptor(&self) -> bool {
+        !self.is_data_descriptor() && !self.is_accessor_descriptor()
+    }
+
+    pub fn complete_against(
+        &self,
+        undefined: Value,
+        current: Option<&PropertyDescriptor>,
+    ) -> PropertyDescriptor {
+        // accessor if either side (desc first, then current) says so
+        let accessor = self.is_accessor_descriptor()
+            || !self.is_data_descriptor()
+                && current.is_some_and(|c| matches!(c, PropertyDescriptor::Accessor { .. }));
+
+        if accessor {
+            let cur = match current {
+                Some(PropertyDescriptor::Accessor { get, set, .. }) => (Some(*get), Some(*set)),
+                _ => (None, None),
+            };
+            PropertyDescriptor::Accessor {
+                get: self.get.or(cur.0).unwrap_or(undefined),
+                set: self.set.or(cur.1).unwrap_or(undefined),
+                enumerable: self
+                    .enumerable
+                    .or(current.map(|c| c_enumumerable(c)))
+                    .unwrap_or(false),
+                configurable: self
+                    .configurable
+                    .or(current.map(|c| c_configurable(c)))
+                    .unwrap_or(false),
+            }
+        } else {
+            let cur_value = match current {
+                Some(PropertyDescriptor::Data { value, .. }) => Some(*value),
+                _ => None,
+            };
+            PropertyDescriptor::Data {
+                value: self.value.or(cur_value).unwrap_or(undefined),
+                writable: self
+                    .writable
+                    .or(current.and_then(c_writable))
+                    .unwrap_or(false),
+                enumerable: self
+                    .enumerable
+                    .or(current.map(|c| c_enumumerable(c)))
+                    .unwrap_or(false),
+                configurable: self
+                    .configurable
+                    .or(current.map(|c| c_configurable(c)))
+                    .unwrap_or(false),
+            }
+        }
+    }
+}
+
+impl From<&PropertyDescriptor> for PartialDescriptor {
+    fn from(d: &PropertyDescriptor) -> Self {
+        match *d {
+            PropertyDescriptor::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            } => Self {
+                value: Some(value),
+                get: None,
+                set: None,
+                writable: Some(writable),
+                enumerable: Some(enumerable),
+                configurable: Some(configurable),
+            },
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                enumerable,
+                configurable,
+            } => Self {
+                value: None,
+                get: Some(get),
+                set: Some(set),
+                writable: None,
+                enumerable: Some(enumerable),
+                configurable: Some(configurable),
+            },
+        }
+    }
+}
+
+fn c_enumumerable(d: &PropertyDescriptor) -> bool {
+    match d {
+        PropertyDescriptor::Data { enumerable, .. }
+        | PropertyDescriptor::Accessor { enumerable, .. } => *enumerable,
+    }
+}
+
+fn c_configurable(d: &PropertyDescriptor) -> bool {
+    match d {
+        PropertyDescriptor::Data { configurable, .. }
+        | PropertyDescriptor::Accessor { configurable, .. } => *configurable,
+    }
+}
+
+fn c_writable(d: &PropertyDescriptor) -> Option<bool> {
+    match d {
+        PropertyDescriptor::Data { writable, .. } => Some(*writable),
+        PropertyDescriptor::Accessor { .. } => None,
+    }
+}
+
+pub fn is_compatible_property_descriptor<'a>(
+    nogc: &'a NoGc<'a>,
+    extensible: bool,
+    desc: &PartialDescriptor,
+    current: Option<&PartialDescriptor>,
+) -> bool {
+    let Some(current) = current else {
+        return extensible;
+    };
+
+    if current.configurable != Some(false) {
+        return true;
+    }
+    if desc.configurable == Some(true) {
+        return false;
+    }
+    if let Some(e) = desc.enumerable
+        && e != current.enumerable.unwrap_or(false)
+    {
+        return false;
+    }
+    // a non-configurable property cannot change kind
+    let cur_is_data = current.is_data_descriptor();
+    if !desc.is_generic_descriptor() && desc.is_data_descriptor() != cur_is_data {
+        return false;
+    }
+    let undefined = nogc.known().undefined.value();
+    if cur_is_data && desc.is_data_descriptor() {
+        if current.writable != Some(true) {
+            if desc.writable == Some(true) {
+                return false;
+            }
+            if let Some(v) = desc.value
+                && !Compare::same_value(nogc, v, current.value.unwrap_or(undefined))
+            {
+                return false;
+            }
+        }
+    } else if !cur_is_data && desc.is_accessor_descriptor() {
+        if current.get.unwrap_or(undefined) == undefined
+            && let Some(g) = desc.get
+            && g != undefined
+        {
+            return false;
+        }
+        if current.set.unwrap_or(undefined) == undefined
+            && let Some(s) = desc.set
+            && s != undefined
+        {
+            return false;
+        }
+    }
+    true
+}

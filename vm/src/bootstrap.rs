@@ -96,6 +96,11 @@ pub struct WellKnown {
     /// Hidden for-in enumerator: slots [level, keys, index, visited]
     /// (ES 14.7.5.9 EnumerateObjectProperties; unreachable from JS)
     pub for_in_enumerator_map: Global<Map>,
+    /// Proxy maps (kind PROXY + capability bits copied from the target;
+    /// 0 descriptors, null prototype — a proxy owns nothing directly).
+    pub proxy_map: Global<Map>,
+    pub proxy_callable_map: Global<Map>,
+    pub proxy_constructor_map: Global<Map>,
     pub strings: WellKnownStrings,
 }
 
@@ -156,6 +161,27 @@ define_well_known_strings! {
     null => "null",
     true_ => "true",
     false_ => "false",
+    // property descriptor object fields (ES 6.2.6)
+    get => "get",
+    set => "set",
+    writable => "writable",
+    enumerable => "enumerable",
+    configurable => "configurable",
+    // proxy traps (ES 20.2) + Proxy.revocable surface
+    has => "has",
+    delete_property => "deleteProperty",
+    own_keys => "ownKeys",
+    get_own_property_descriptor => "getOwnPropertyDescriptor",
+    define_property => "defineProperty",
+    get_prototype_of => "getPrototypeOf",
+    set_prototype_of => "setPrototypeOf",
+    is_extensible => "isExtensible",
+    prevent_extensions => "preventExtensions",
+    apply => "apply",
+    construct => "construct",
+    revocable => "revocable",
+    revoke => "revoke",
+    proxy => "proxy",
 }
 
 unsafe fn smi_handle<T>(roots: &RootHandles) -> Global<T> {
@@ -225,6 +251,9 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         array_iterator_prototype: obj,
         iterator_result_map: map,
         for_in_enumerator_map: map,
+        proxy_map: map,
+        proxy_callable_map: map,
+        proxy_constructor_map: map,
         strings: WellKnownStrings::uninit(roots),
     }
 }
@@ -300,7 +329,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
 
     let the_hole_map = heap
         .allocate::<Map>(MapInit {
-            kind: MapKind::OBJECT,
+            kind: MapKind::ODDBALL,
             value_slot_count: 0,
             descriptors: &[],
             prototype: scope.handle(Smi::new(0)),
@@ -317,7 +346,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
 
     let null_map: Handle<'_, Map> = heap
         .allocate::<Map>(MapInit {
-            kind: MapKind::OBJECT,
+            kind: MapKind::ODDBALL,
             value_slot_count: 0,
             descriptors: &[],
             prototype: scope.handle(Smi::new(0)),
@@ -478,14 +507,14 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     );
     let global_object = alloc_object(heap, &scope, roots, object_initial_map);
 
-    let undefined_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
-    let boolean_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
+    let undefined_map = alloc_parent_map(heap, roots, MapKind::ODDBALL, object_prototype);
+    let boolean_map = alloc_parent_map(heap, roots, MapKind::ODDBALL, object_prototype);
 
     let undefined = alloc_object(heap, &scope, roots, undefined_map);
     let false_object = alloc_object(heap, &scope, roots, boolean_map);
     let true_object = alloc_object(heap, &scope, roots, boolean_map);
 
-    let exception_map = alloc_parent_map(heap, roots, MapKind::OBJECT, object_prototype);
+    let exception_map = alloc_parent_map(heap, roots, MapKind::ODDBALL, object_prototype);
     let exception = alloc_object(heap, &scope, roots, exception_map);
 
     let to_primitive_symbol =
@@ -560,6 +589,17 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.string_wrapper_map = error_map;
     known.exception_map = exception_map;
     known.js_array_map = js_array_map;
+
+    known.proxy_map = alloc_map(heap, roots, MapKind::PROXY);
+    known.proxy_callable_map = alloc_map(heap, roots, MapKind::PROXY.union(MapKind::CALLABLE));
+    known.proxy_constructor_map = alloc_map(
+        heap,
+        roots,
+        MapKind::PROXY
+            .union(MapKind::CALLABLE)
+            .union(MapKind::CONSTRUCTOR),
+    );
+
     known.empty_context = empty_context;
     known.empty_scope_info = empty_scope_info;
     known.global_object = global_object;

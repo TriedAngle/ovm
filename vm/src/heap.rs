@@ -558,6 +558,23 @@ impl Heap {
         self.allocate_handle::<Float>(f, scope).value()
     }
 
+    /// CreateArrayFromList (ES 7.3.17): a fresh dense array holding
+    /// `values`. The values must be rooted by the caller (stack,
+    /// GcSlice, or handle block) — they are copied into the backing
+    /// store before any further allocation.
+    pub fn new_array(&mut self, scope: &HandleScope<'_>, values: &[Value]) -> Fresh<'_, Object> {
+        let elements = self.allocate_handle::<FixedArray>(values, scope);
+        self.allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map: self.known().js_array_map,
+                values: &[],
+                elements: elements.erase(),
+                length: values.len(),
+            },
+        )
+    }
+
     pub fn allocate_enter_nogc<T: HeapObject, R>(
         &mut self,
         config: T::Init<'_>,
