@@ -6,7 +6,7 @@
 //! functions (interpreter `CreateClosure`).
 
 use crate::{
-    Context, Convert, FixedArray, GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object,
+    Context, Convert, GcSlice, Handle, HandleScope, Heap, Map, MapInit, MapKind, Object,
     PropertyDescriptor, SlotFlags, SlotName, Smi, Symbol, VMString, Value, VmError,
 };
 use base_compiler::compile_eval;
@@ -52,6 +52,13 @@ pub fn register_builtin_natives(vm: &mut VM) -> BuiltinIndices {
         function_bind: vm.register_native(function_bind),
         function_constructor: vm.register_native(function_constructor),
         array_is_array: vm.register_native(array_is_array),
+        proxy: vm.register_native(proxy_constructor),
+        proxy_revocable: vm.register_native(proxy_revocable),
+        proxy_revoke: vm.register_native(proxy_revoke),
+        object_prevent_extensions: vm.register_native(object_prevent_extensions),
+        object_is_extensible: vm.register_native(object_is_extensible),
+        object_seal: vm.register_native(object_seal),
+        object_freeze: vm.register_native(object_freeze),
     }
 }
 
@@ -91,6 +98,13 @@ pub struct BuiltinIndices {
     pub function_bind: NativeIndex,
     pub function_constructor: NativeIndex,
     pub array_is_array: NativeIndex,
+    pub proxy: NativeIndex,
+    pub proxy_revocable: NativeIndex,
+    pub proxy_revoke: NativeIndex,
+    pub object_prevent_extensions: NativeIndex,
+    pub object_is_extensible: NativeIndex,
+    pub object_seal: NativeIndex,
+    pub object_freeze: NativeIndex,
 }
 
 /// Build the builtin objects and install them on the global object.
@@ -421,32 +435,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         )?;
         // bind is a JS closure (see BIND_PRELUDE); compile and run it once
         // here, capturing the empty context
-        {
-            let (vm, heap, state) = thread.split();
-            let empty = heap.known().empty_context;
-            let closure = {
-                let mut p = parser::Parser::new(parser::Utf8SliceStream::new(BIND_PRELUDE));
-                p.parse_script().map_err(|e| {
-                    eprintln!("bind prelude parse error: {e}");
-                    VmError::Type
-                })?;
-                let ast = p.into_ast();
-                let compiled = base_compiler::compile_script(&ast).map_err(|e| {
-                    eprintln!("bind prelude compile error: {e}");
-                    VmError::Type
-                })?;
-                materialize_closure_vm(vm, heap, state, &scope, &compiled, empty)?
-            };
-            let (vm, heap, state) = thread.split();
-            let result =
-                NativeContext::new(vm, heap, state).call(closure.value(), GcSlice::EMPTY)?;
-            if result == heap.known().exception.value() {
-                state
-                    .take_pending_exception()
-                    .map(|ex| eprintln!("bind prelude threw: {ex:?}"));
-                return Err(VmError::Type);
-            }
-        }
+        run_prelude(thread, &scope, BIND_PRELUDE, "bind prelude")?;
+        // likewise the proxy revoke closure (see REVOKE_PRELUDE)
+        run_prelude(thread, &scope, REVOKE_PRELUDE, "revoke prelude")?;
 
         // ---- eval -------------------------------------------------------------
         let eval_fn = make_native_function(thread, &scope, roots, idx.eval)?;
@@ -739,6 +730,86 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             iterator_symbol.value(),
         )?;
 
+        // ---- Proxy ------------------------------------------------------------
+        // The Proxy constructor is a native function *without* a
+        // `.prototype` property (ES 20.2.1: "Proxy.prototype is
+        // undefined"); `install_constructor` cannot be used.
+        let proxy_fn = make_native_function(thread, &scope, roots, idx.proxy)?;
+        let two = Smi::new(2).encode();
+        define_non_enumerable(thread.heap(), &scope, proxy_fn, wks.length, two)?;
+        let proxy_name = thread.intern(&scope, "Proxy");
+        define_non_enumerable(
+            thread.heap(),
+            &scope,
+            proxy_fn,
+            wks.name,
+            proxy_name.value(),
+        )?;
+        define_data(
+            thread.heap(),
+            &scope,
+            global,
+            SlotName::from(proxy_name.as_tagged()),
+            proxy_fn.value(),
+        )?;
+        // Proxy.revocable: a non-constructor function returning
+        // { proxy, revoke }; the revoke closure is the JS template
+        // installed by REVOKE_PRELUDE (natives cannot carry state).
+        let revocable_fn = make_native_plain_function(thread, &scope, roots, idx.proxy_revocable)?;
+        define_non_enumerable(thread.heap(), &scope, revocable_fn, wks.length, two)?;
+        let revocable_name = thread.intern(&scope, "revocable");
+        define_non_enumerable(
+            thread.heap(),
+            &scope,
+            revocable_fn,
+            wks.name,
+            revocable_name.value(),
+        )?;
+        define_data(
+            thread.heap(),
+            &scope,
+            proxy_fn,
+            SlotName::from(revocable_name.as_tagged()),
+            revocable_fn.value(),
+        )?;
+        // hidden revoke native used by the REVOKE_PRELUDE closure
+        let revoke_fn = make_native_plain_function(thread, &scope, roots, idx.proxy_revoke)?;
+        let revoke_name = thread.intern(&scope, "__revokeProxy");
+        define_data(
+            thread.heap(),
+            &scope,
+            global,
+            SlotName::from(revoke_name.as_tagged()),
+            revoke_fn.value(),
+        )?;
+
+        // ---- Object extensibility statics --------------------------------------
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
+            "preventExtensions",
+            idx.object_prevent_extensions,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
+            "isExtensible",
+            idx.object_is_extensible,
+        )?;
+        install_method(thread, &scope, roots, object_fn, "seal", idx.object_seal)?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
+            "freeze",
+            idx.object_freeze,
+        )?;
+
         // ---- value properties of the global object -----------------------------
         let infinity = thread
             .heap()
@@ -830,6 +901,64 @@ fn make_native_function<'s>(
         )
         .into_global(roots);
     Ok(obj)
+}
+
+/// A non-constructor native function (`Proxy.revocable`-style statics).
+fn make_native_plain_function<'s>(
+    thread: &mut crate::Thread,
+    scope: &'s HandleScope<'_>,
+    roots: &crate::RootHandles,
+    index: NativeIndex,
+) -> Result<crate::Global<Object>, VmError> {
+    let heap = thread.heap();
+    let kind = MapKind::OBJECT
+        .union(MapKind::CALLABLE)
+        .union(MapKind::NATIVE)
+        .union(MapKind::EXTENDABLE);
+    let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
+    let empty_context = heap.known().empty_context;
+    let obj = heap
+        .new_object(
+            scope,
+            map,
+            &[Smi::new(index.0 as i64).encode(), empty_context.value()],
+        )
+        .into_global(roots);
+    Ok(obj)
+}
+
+/// Compile and run a JS prelude once at install time (BIND_PRELUDE,
+/// REVOKE_PRELUDE): its top-level assignments install hidden helpers.
+fn run_prelude(
+    thread: &mut crate::Thread,
+    scope: &HandleScope<'_>,
+    src: &str,
+    name: &str,
+) -> Result<(), VmError> {
+    let (vm, heap, state) = thread.split();
+    let empty = heap.known().empty_context;
+    let closure = {
+        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(src));
+        p.parse_script().map_err(|e| {
+            eprintln!("{name} prelude parse error: {e}");
+            VmError::Type
+        })?;
+        let ast = p.into_ast();
+        let compiled = base_compiler::compile_script(&ast).map_err(|e| {
+            eprintln!("{name} prelude compile error: {e}");
+            VmError::Type
+        })?;
+        materialize_closure_vm(vm, heap, state, scope, &compiled, empty)?
+    };
+    let (vm, heap, state) = thread.split();
+    let result = NativeContext::new(vm, heap, state).call(closure.value(), GcSlice::EMPTY)?;
+    if result == heap.known().exception.value() {
+        state
+            .take_pending_exception()
+            .map(|ex| eprintln!("{name} prelude threw: {ex:?}"));
+        return Err(VmError::Type);
+    }
+    Ok(())
 }
 
 /// A constructor function + its prototype object (with `.constructor`),
@@ -944,6 +1073,31 @@ fn define_data(
     let obj = scope.handle(object.as_tagged());
     let name = scope.handle(name.into().tagged());
     Object::define_own_property(heap, scope, obj, name, PropertyDescriptor::data(value))?;
+    Ok(())
+}
+
+/// {writable: false, enumerable: false, configurable: true} — the spec
+/// attributes of builtin `length`/`name` properties.
+fn define_non_enumerable(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    object: crate::Global<Object>,
+    name: crate::Global<SlotName>,
+    value: Value,
+) -> Result<(), VmError> {
+    let obj = scope.handle(object.as_tagged());
+    Object::define_own_property(
+        heap,
+        scope,
+        obj,
+        name,
+        PropertyDescriptor::Data {
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        },
+    )?;
     Ok(())
 }
 
@@ -1355,20 +1509,7 @@ fn object_get_own_property_names(
     });
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let map = heap.known().js_array_map;
-        let elements = heap.allocate_handle::<FixedArray>(&names, &scope);
-        Ok(heap
-            .allocate_object(
-                &scope,
-                crate::ObjectSlotsInit {
-                    map,
-                    values: &[],
-                    elements: elements.erase(),
-                    length: names.len(),
-                },
-            )
-            .into_tagged()
-            .erase())
+        Ok(heap.new_array(&scope, &names).into_tagged().erase())
     })
 }
 
@@ -1395,7 +1536,9 @@ fn plain_object(
     })
 }
 
-/// `Object.getOwnPropertyDescriptor(O, P)` (ES 20.1.2.5).
+/// `Object.getOwnPropertyDescriptor(O, P)` (ES 20.1.2.5): the shared
+/// raw descriptor reader (`lookup::ordinary_own_descriptor`) converted
+/// to a descriptor object via FromPropertyDescriptor semantics.
 fn object_get_own_property_descriptor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
@@ -1406,84 +1549,18 @@ fn object_get_own_property_descriptor(
     let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
         return Ok(heap.known().exception.value());
     };
-    enum Desc {
-        Data {
-            value: Value,
-            writable: bool,
-            enumerable: bool,
-            configurable: bool,
-        },
-        Accessor {
-            get: Value,
-            set: Value,
-            enumerable: bool,
-            configurable: bool,
-        },
-        /// the JSArray `length` internal slot {w+, e−, c−}
-        Length(Value),
-        Missing,
-    }
-    let desc = heap.no_gc(|nogc| {
-        let key = crate::SlotName::from_value(key);
-        if let crate::Key::Element(i) =
-            crate::classify_key(nogc, key.value()).unwrap_or(crate::Key::Name(key))
-        {
-            if let Some(obj) = target.as_heap_object(nogc)
-                && let Some(v) = obj.as_ref().element_value(nogc, i)
-            {
-                return Desc::Data {
-                    value: v,
-                    writable: true,
-                    enumerable: true,
-                    configurable: true,
-                };
-            }
-        }
-        if let Some(obj) = target.as_heap_object(nogc)
-            && let Some(v) = obj.as_ref().array_length(nogc, key)
-        {
-            return Desc::Length(v);
-        }
-        match target.lookup(nogc, key) {
-            crate::Lookup::Data { slot, flags, .. } => Desc::Data {
-                value: slot.inner(),
-                writable: flags.is_writable(),
-                enumerable: flags.is_enumerable(),
-                configurable: flags.is_configurable(),
-            },
-            crate::Lookup::Accessor {
-                pair,
-                holder,
-                map_index,
-            } => {
-                let flags = holder
-                    .as_ref()
-                    .header
-                    .map
-                    .heap_ref(nogc)
-                    .descriptor(map_index)
-                    .flags();
-                Desc::Accessor {
-                    get: pair.get.inner(),
-                    set: pair.set.inner(),
-                    enumerable: flags.is_enumerable(),
-                    configurable: flags.is_configurable(),
-                }
-            }
-            crate::Lookup::NotFound => Desc::Missing,
-        }
-    });
+    let desc = heap.no_gc(|nogc| crate::lookup::ordinary_own_descriptor(nogc, target, key));
     let undefined = nctx.heap().known().undefined.value();
     let true_v = nctx.heap().known().true_object.value();
     let false_v = nctx.heap().known().false_object.value();
     let bool_ = |b| if b { true_v } else { false_v };
     match desc {
-        Desc::Data {
+        Some(crate::PropertyDescriptor::Data {
             value,
             writable,
             enumerable,
             configurable,
-        } => plain_object(
+        }) => plain_object(
             nctx,
             &[
                 ("value", value),
@@ -1492,21 +1569,12 @@ fn object_get_own_property_descriptor(
                 ("configurable", bool_(configurable)),
             ],
         ),
-        Desc::Length(value) => plain_object(
-            nctx,
-            &[
-                ("value", value),
-                ("writable", bool_(true)),
-                ("enumerable", bool_(false)),
-                ("configurable", bool_(false)),
-            ],
-        ),
-        Desc::Accessor {
+        Some(crate::PropertyDescriptor::Accessor {
             get,
             set,
             enumerable,
             configurable,
-        } => plain_object(
+        }) => plain_object(
             nctx,
             &[
                 ("get", get),
@@ -1515,12 +1583,13 @@ fn object_get_own_property_descriptor(
                 ("configurable", bool_(configurable)),
             ],
         ),
-        Desc::Missing => Ok(undefined),
+        None => Ok(undefined),
     }
 }
 
-/// `Object.defineProperty(O, P, Attributes)` (ES 20.1.2.4): ToPropertyDescriptor
-/// + [[DefineOwnProperty]].
+/// `Object.defineProperty(O, P, Attributes)` (ES 20.1.2.4):
+/// ToPropertyDescriptor + [[DefineOwnProperty]] (through the
+/// `defineProperty` trap for proxy receivers, ES 20.2.5.6).
 fn object_define_property(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
@@ -1532,73 +1601,22 @@ fn object_define_property(
     let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
         return Ok(heap.known().exception.value());
     };
-    if heap.no_gc(|nogc| Convert::is_primitive(nogc, attrs)) {
-        return Err(VmError::Type);
-    }
-    // ToPropertyDescriptor (ES 7.1.6, data descriptors only)
-    let read = |nctx: &mut crate::natives::NativeContext<'_>,
-                name: &str|
-     -> Result<Option<Value>, VmError> {
-        // interned: descriptor lookup matches property names by identity
-        let s = nctx.handle_scope(|nctx, scope| nctx.intern(&scope, name).value());
-        let (vm, heap, state) = nctx.split();
-        match crate::runtime::Runtime::get_property(vm, heap, state, attrs, s)? {
-            crate::runtime::Coercion::Threw => Err(VmError::Type),
-            crate::runtime::Coercion::Value(v) => Ok(Some(v)),
-        }
-    };
-    let undefined = nctx.heap().known().undefined.value();
-    let has_value = read(nctx, "value")?.filter(|v| *v != undefined);
-    let has_get = read(nctx, "get")?.filter(|v| *v != undefined);
-    let has_set = read(nctx, "set")?.filter(|v| *v != undefined);
-    let writable = read(nctx, "writable")?
-        .map(|v| nctx.heap().no_gc(|nogc| Convert::is_truthy(nogc, v)))
-        .unwrap_or(true);
-    let enumerable = read(nctx, "enumerable")?
-        .map(|v| nctx.heap().no_gc(|nogc| Convert::is_truthy(nogc, v)))
-        .unwrap_or(false);
-    let configurable = read(nctx, "configurable")?
-        .map(|v| nctx.heap().no_gc(|nogc| Convert::is_truthy(nogc, v)))
-        .unwrap_or(false);
-    let desc = if let Some(get) = has_get.or(has_set.map(|_| nctx.heap().known().undefined.value()))
-    {
-        // accessor descriptor (ES 7.1.6): the getters/setters must be
-        // callable-or-undefined
-        let get = if has_get.is_some() {
-            get
-        } else {
-            nctx.heap().known().undefined.value()
-        };
-        let set = has_set.unwrap_or_else(|| nctx.heap().known().undefined.value());
-        for half in [get, set] {
-            if half != nctx.heap().known().undefined.value()
-                && !crate::runtime::Runtime::is_callable(nctx.heap(), half)
-            {
-                return Err(VmError::Type);
-            }
-        }
-        PropertyDescriptor::Accessor {
-            get,
-            set,
-            enumerable,
-            configurable,
-        }
-    } else {
-        PropertyDescriptor::Data {
-            value: has_value.unwrap_or_else(|| nctx.heap().known().undefined.value()),
-            writable,
-            enumerable,
-            configurable,
-        }
+    // shared ToPropertyDescriptor; proxies and ordinary targets both
+    // complete/validate inside define_internal
+    let partial = match crate::runtime::Runtime::to_property_descriptor(vm, heap, state, attrs)? {
+        Some(partial) => partial,
+        None => return Ok(heap.known().exception.value()),
     };
     nctx.handle_scope(|nctx, scope| {
-        let target = scope.cast::<Object>(target).ok_or(VmError::Type)?;
-        let key = scope.handle(crate::SlotName::from_value(key).tagged());
-        let defined = Object::define_own_property(nctx.heap(), &scope, target, key, desc)?;
-        if !defined {
-            return Err(VmError::Type);
+        let target = scope.handle(target);
+        let key = scope.handle(key);
+        let (vm, heap, state) = nctx.split();
+        match crate::proxy::define_internal(vm, heap, state, target.value(), key.value(), partial)?
+        {
+            crate::proxy::Flow::Threw => Ok(heap.known().exception.value()),
+            crate::proxy::Flow::Value(false) => Err(VmError::Type),
+            crate::proxy::Flow::Value(true) => Ok(target.value()),
         }
-        Ok(target.value())
     })
 }
 
@@ -1642,19 +1660,7 @@ fn function_bind(
     };
     let array = nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let map = heap.known().js_array_map;
-        let elements = heap.allocate_handle::<FixedArray>(&prepend, &scope);
-        heap.allocate_object(
-            &scope,
-            crate::ObjectSlotsInit {
-                map,
-                values: &[],
-                elements: elements.erase(),
-                length: prepend.len(),
-            },
-        )
-        .into_tagged()
-        .erase()
+        heap.new_array(&scope, &prepend).into_tagged().erase()
     });
     nctx.handle_scope(|nctx, scope| {
         // args[0] is the receiver (undefined for the plain call)
@@ -1780,27 +1786,14 @@ fn array_constructor(
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
         let hole = heap.known().the_hole.value();
-        let (values, length) = match single_len {
+        let (values, _length) = match single_len {
             Some(n) => (vec![hole; n], n),
             None => {
                 let n = argv.len();
                 (argv, n)
             }
         };
-        let map = heap.known().js_array_map;
-        let elements = heap.allocate_handle::<FixedArray>(&values, &scope);
-        Ok(heap
-            .allocate_object(
-                &scope,
-                crate::ObjectSlotsInit {
-                    map,
-                    values: &[],
-                    elements: elements.erase(),
-                    length,
-                },
-            )
-            .into_tagged()
-            .erase())
+        Ok(heap.new_array(&scope, &values).into_tagged().erase())
     })
 }
 
@@ -2022,6 +2015,308 @@ fn error_to_string(
         let colon = vm.interner().intern(heap, &scope, ": ");
         let ab = VMString::concat(heap, &scope, a, colon.value());
         Ok(VMString::concat(heap, &scope, ab.value(), b).value())
+    })
+}
+
+/// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
+/// the map's capability bits mirror the target's so callability is
+/// observable (`typeof`, future `Call`/`Construct` dispatch).
+fn proxy_constructor(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    if !nctx.is_construct() {
+        return Err(VmError::Message("constructor Proxy requires 'new'"));
+    }
+    let target = args.get(1).ok_or(VmError::Type)?;
+    let handler = args.get(2).ok_or(VmError::Type)?;
+    let ok = nctx.heap().no_gc(|nogc| {
+        crate::proxy::is_js_receiver(nogc, target) && crate::proxy::is_js_receiver(nogc, handler)
+    });
+    if !ok {
+        return Err(VmError::Message(
+            "cannot create proxy with a non-object target or handler",
+        ));
+    }
+    nctx.handle_scope(|nctx, scope| {
+        let target = scope.handle(target);
+        let handler = scope.handle(handler);
+        Ok(crate::proxy::allocate(
+            nctx.heap(),
+            target.value(),
+            handler.value(),
+        ))
+    })
+}
+
+/// `Proxy.revocable(target, handler)` (ES 20.2.2.1): returns
+/// `{ proxy, revoke }`; the revoke closure is the JS template installed
+/// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
+/// hidden `__revokeProxy` native).
+fn proxy_revocable(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Type)?;
+    let handler = args.get(2).ok_or(VmError::Type)?;
+    let ok = nctx.heap().no_gc(|nogc| {
+        crate::proxy::is_js_receiver(nogc, target) && crate::proxy::is_js_receiver(nogc, handler)
+    });
+    if !ok {
+        return Err(VmError::Message(
+            "cannot create proxy with a non-object target or handler",
+        ));
+    }
+    nctx.handle_scope(|nctx, scope| {
+        let target = scope.handle(target);
+        let handler = scope.handle(handler);
+        let proxy = scope.handle(crate::proxy::allocate(
+            nctx.heap(),
+            target.value(),
+            handler.value(),
+        ));
+        // Function.prototype.__makeRevoke (installed by REVOKE_PRELUDE)
+        let make_revoke = {
+            let (vm, heap, state) = nctx.split();
+            let name = vm.interner().intern(heap, &scope, "__makeRevoke").value();
+            let proto = heap.known().function_prototype.value();
+            match crate::runtime::Runtime::get_property(vm, heap, state, proto, name)? {
+                crate::runtime::Coercion::Threw => {
+                    return Ok(heap.known().exception.value());
+                }
+                crate::runtime::Coercion::Value(v) => v,
+            }
+        };
+        let make_revoke = scope.handle(make_revoke);
+        let undefined = nctx.heap().known().undefined.value();
+        let (vm, heap, state) = nctx.split();
+        let revoke = NativeContext::new(vm, heap, state).call(
+            make_revoke.value(),
+            scope.stage(&[undefined, proxy.value()]),
+        )?;
+        if revoke == heap.known().exception.value() {
+            return Ok(heap.known().exception.value());
+        }
+        let revoke = scope.handle(revoke);
+        plain_object(
+            nctx,
+            &[("proxy", proxy.value()), ("revoke", revoke.value())],
+        )
+    })
+}
+
+/// Hidden `__revokeProxy(p)`: nulls the proxy's target/handler slots
+/// (idempotent — a null handler already means revoked). Called only by
+/// the REVOKE_PRELUDE closure, which guards it with a done-flag.
+fn proxy_revoke(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let proxy = args.get(1).ok_or(VmError::Arity)?;
+    crate::proxy::revoke(nctx.heap(), proxy);
+    Ok(nctx.heap().known().undefined.value())
+}
+
+/// The revoke-closure template: `done` plays [[RevocableProxy]]'s
+/// cleared-slot role (idempotent revoke), the captured `p` keeps the
+/// proxy reachable.
+const REVOKE_PRELUDE: &str = r#"
+Function.prototype.__makeRevoke = function (p) {
+  var done = false;
+  return function revoke() {
+    if (!done) {
+      done = true;
+      __revokeProxy(p);
+    }
+  };
+};
+"#;
+
+/// `Object.preventExtensions(O)` (ES 20.1.2.16): through the
+/// `preventExtensions` trap for proxies (ES 20.2.5.3).
+fn object_prevent_extensions(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    let nullish = nctx.heap().no_gc(|nogc| {
+        target == nogc.known().null.value() || target == nogc.known().undefined.value()
+    });
+    if nullish {
+        return Err(VmError::Type);
+    }
+    if !nctx
+        .heap()
+        .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
+    {
+        return Ok(target); // primitives returned unchanged
+    }
+    let (vm, heap, state) = nctx.split();
+    match crate::proxy::prevent_extensions(vm, heap, state, target)? {
+        crate::runtime::Coercion::Threw => Ok(heap.known().exception.value()),
+        crate::runtime::Coercion::Value(v) => {
+            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
+                Err(VmError::Message("object is not extensible"))
+            } else {
+                Ok(target)
+            }
+        }
+    }
+}
+
+/// `Object.isExtensible(O)` (ES 20.1.2.14): primitives are `false`;
+/// proxies run the `isExtensible` trap with its must-match invariant.
+fn object_is_extensible(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    if !nctx
+        .heap()
+        .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
+    {
+        return Ok(Convert::boolean(nctx.heap(), false));
+    }
+    let (vm, heap, state) = nctx.split();
+    match crate::proxy::is_extensible(vm, heap, state, target)? {
+        crate::runtime::Coercion::Threw => Ok(heap.known().exception.value()),
+        crate::runtime::Coercion::Value(v) => Ok(v),
+    }
+}
+
+/// SetIntegrityLevel (ES 7.3.15/16) for ordinary objects: clone the map
+/// with `configurable` (and for freeze `writable`) cleared on every
+/// descriptor and EXTENDABLE dropped. Dense array elements keep their
+/// intrinsic attributes (TODO: element sealing with the elements
+/// machinery).
+fn set_integrity_flags(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    obj: Handle<'_, Object>,
+    freeze: bool,
+) {
+    use crate::{Map, MapInit, MapKind, SlotFlags};
+    let (kind, prototype, descriptors) = heap.no_gc(|nogc| {
+        let map = obj.heap_ref(nogc).map_ref(nogc);
+        (
+            map.kind(),
+            map.prototype.inner(),
+            map.descriptors()
+                .iter()
+                .map(|d| (d.name(), d.flags(), d.value.inner()))
+                .collect::<Vec<_>>(),
+        )
+    });
+    let already = !kind.is_extendable()
+        && descriptors.iter().all(|(_, flags, _)| {
+            !flags.is_configurable() && (!freeze || flags.is_accessor() || !flags.is_writable())
+        });
+    if already {
+        return;
+    }
+    let prototype = scope.handle(prototype);
+    let descriptors: Vec<_> = descriptors
+        .into_iter()
+        .map(|(name, flags, value)| {
+            let mut flags = flags;
+            flags = SlotFlags::new(flags.bits() & !SlotFlags::CONFIGURABLE.bits());
+            if freeze && !flags.is_accessor() {
+                flags = SlotFlags::new(flags.bits() & !SlotFlags::WRITABLE.bits());
+            }
+            (name, flags, value)
+        })
+        .collect();
+    heap.allocate_token_enter_nogc(Map::layout_for(descriptors.len()), |token, nogc| {
+        let obj_ref = obj.heap_ref(nogc);
+        let new_map = token.allocate::<Map>(MapInit {
+            kind: MapKind::new(kind.bits() & !MapKind::EXTENDABLE.bits()),
+            value_slot_count: obj_ref.map_ref(nogc).value_slot_count(),
+            descriptors: &descriptors,
+            prototype,
+        });
+        obj_ref
+            .header
+            .map
+            .set(nogc, obj.value(), new_map.into_tagged());
+    });
+}
+
+/// `Object.seal(O)` (ES 20.1.2.17).
+fn object_seal(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    let nullish = nctx.heap().no_gc(|nogc| {
+        target == nogc.known().null.value() || target == nogc.known().undefined.value()
+    });
+    if nullish {
+        return Err(VmError::Type);
+    }
+    if !nctx
+        .heap()
+        .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
+    {
+        return Ok(target);
+    }
+    let (vm, heap, state) = nctx.split();
+    // [[PreventExtensions]] first (traps included)
+    match crate::proxy::prevent_extensions(vm, heap, state, target)? {
+        crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
+        crate::runtime::Coercion::Value(v) => {
+            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
+                return Err(VmError::Message("object is not extensible"));
+            }
+        }
+    }
+    // TODO: per-key [[DefineOwnProperty]] through the defineProperty
+    // trap once ownKeys lands (proxy targets); ordinary targets:
+    let (_, heap, _) = nctx.split();
+    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, target)) {
+        return Ok(target);
+    }
+    nctx.handle_scope(|nctx, scope| {
+        let obj = scope.cast::<Object>(target).expect("checked above");
+        set_integrity_flags(nctx.heap(), &scope, obj, false);
+        Ok(target)
+    })
+}
+
+/// `Object.freeze(O)` (ES 20.1.2.9).
+fn object_freeze(
+    nctx: &mut crate::natives::NativeContext<'_>,
+    args: GcSlice<'_>,
+) -> Result<Value, VmError> {
+    let target = args.get(1).ok_or(VmError::Arity)?;
+    let nullish = nctx.heap().no_gc(|nogc| {
+        target == nogc.known().null.value() || target == nogc.known().undefined.value()
+    });
+    if nullish {
+        return Err(VmError::Type);
+    }
+    if !nctx
+        .heap()
+        .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
+    {
+        return Ok(target);
+    }
+    let (vm, heap, state) = nctx.split();
+    match crate::proxy::prevent_extensions(vm, heap, state, target)? {
+        crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
+        crate::runtime::Coercion::Value(v) => {
+            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
+                return Err(VmError::Message("object is not extensible"));
+            }
+        }
+    }
+    let (_, heap, _) = nctx.split();
+    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, target)) {
+        return Ok(target);
+    }
+    nctx.handle_scope(|nctx, scope| {
+        let obj = scope.cast::<Object>(target).expect("checked above");
+        set_integrity_flags(nctx.heap(), &scope, obj, true);
+        Ok(target)
     })
 }
 

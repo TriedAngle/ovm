@@ -18,6 +18,7 @@ pub mod lookup;
 pub mod materialize;
 pub mod natives;
 pub mod object;
+pub mod proxy;
 pub mod runtime;
 pub mod stack;
 pub mod transition;
@@ -42,21 +43,22 @@ pub use heap::{
 pub use interner::StringInterner;
 pub use lookup::{
     Key, LoadOutcome, Lookup, classify_key, has_property, home_proto, load_outcome,
-    lookup_in_parents, private_find, super_constructor, super_lookup, super_lookup_from_proto,
+    load_outcome_on, lookup_in_parents, ordinary_own_descriptor, private_find, super_constructor,
+    super_lookup, super_lookup_from_proto,
 };
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use object::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
     FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry, HandlerEntryInit, HandlerTable,
     HandlerTableInit, Header, HeapObject, InternedString, Map, MapInit, MapKind, Object,
-    ObjectInit, ObjectKind, ObjectSlotsInit, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags,
-    SlotName, Symbol, VMString, call_target, function_kind_of, object_kind, object_layout,
-    store_array_element, string_content_hash, visit_object,
+    ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit, ProxyObject, ScopeInfo, ScopeInfoInit,
+    SlotDescriptor, SlotFlags, SlotName, Symbol, VMString, call_target, function_kind_of,
+    object_kind, object_layout, store_array_element, string_content_hash, visit_object,
 };
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use transition::{
-    Change, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition, TransitionGuard,
-    TransitionLock, super_store_lookup,
+    Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
+    TransitionGuard, TransitionLock, is_compatible_property_descriptor, super_store_lookup,
 };
 pub use value::{
     HeapPtr, MaybeWeak, PTR_BIT, STRONG_PTR, Smi, TAG_MASK, TAG_SMI, Tagged, Value, WEAK_BIT,

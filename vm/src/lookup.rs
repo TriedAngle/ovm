@@ -82,16 +82,20 @@ pub enum LoadOutcome {
     Getter(Value),
 }
 
-pub fn load_outcome<'a>(
+/// [[Get]] lookup starting at `holder`. Getters found here must be
+/// invoked by the *caller* with the intended `this` — `o.x` passes
+/// `holder = o`; proxy forwarding passes the target as the holder and
+/// the proxy as the getter receiver.
+pub fn load_outcome_on<'a>(
     nogc: &'a NoGc<'a>,
-    receiver: Value,
+    holder: Value,
     name: SlotName,
 ) -> Result<LoadOutcome, VmError> {
     let known = nogc.known();
-    if receiver == known.null.value() || receiver == known.undefined.value() {
+    if holder == known.null.value() || holder == known.undefined.value() {
         return Err(VmError::Type);
     }
-    if let Some(obj) = receiver.as_heap_object(nogc)
+    if let Some(obj) = holder.as_heap_object(nogc)
         && let Some(v) = obj.as_ref().array_length(nogc, name)
     {
         return Ok(LoadOutcome::Value(v));
@@ -99,7 +103,7 @@ pub fn load_outcome<'a>(
     // string primitives expose `length` (UTF-16 code units) as an own
     // property without boxing (ES 5.4.3.1); index loads need a fresh
     // one-character string and stay unsupported here
-    if let Some(s) = receiver.get_as::<crate::VMString>(nogc)
+    if let Some(s) = holder.get_as::<crate::VMString>(nogc)
         && name
             .value()
             .get_as::<InternedString>(nogc)
@@ -108,7 +112,7 @@ pub fn load_outcome<'a>(
         let len = crate::natives::utf16_length(s.as_slice(nogc)) as i64;
         return Ok(LoadOutcome::Value(Smi::new(len).encode()));
     }
-    match receiver.lookup(nogc, name) {
+    match holder.lookup(nogc, name) {
         Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.inner())),
         Lookup::Accessor { pair, .. } => {
             let getter = pair.get.inner();
@@ -120,6 +124,73 @@ pub fn load_outcome<'a>(
         }
         Lookup::NotFound => Ok(LoadOutcome::Value(known.undefined.value())),
     }
+}
+
+pub fn load_outcome<'a>(
+    nogc: &'a NoGc<'a>,
+    receiver: Value,
+    name: SlotName,
+) -> Result<LoadOutcome, VmError> {
+    load_outcome_on(nogc, receiver, name)
+}
+
+/// Ordinary [[GetOwnProperty]] as a full descriptor (ES 10.1.5): dense
+/// array elements, the JSArray `length` slot, and map descriptor rows.
+/// The single raw reader both `Object.getOwnPropertyDescriptor` and the
+/// proxy invariant checks build on.
+pub fn ordinary_own_descriptor<'a>(
+    nogc: &'a NoGc<'a>,
+    obj: Value,
+    key: Value,
+) -> Option<crate::PropertyDescriptor> {
+    if let Ok(Key::Element(i)) = classify_key(nogc, key)
+        && let Some(o) = obj.as_heap_object(nogc)
+        && let Some(v) = o.as_ref().element_value(nogc, i)
+    {
+        return Some(crate::PropertyDescriptor::Data {
+            value: v,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        });
+    }
+    let name = SlotName::from_value(key);
+    let o = obj.as_heap_object(nogc)?;
+    if let Some(v) = o.as_ref().array_length(nogc, name) {
+        return Some(crate::PropertyDescriptor::Data {
+            value: v,
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        });
+    }
+    let map = o.as_ref().map_ref(nogc);
+    for d in map.descriptors() {
+        if d.name() != name {
+            continue;
+        }
+        if d.flags().is_accessor() {
+            let pair = d
+                .value
+                .inner()
+                .get_as::<crate::AccessorPair>(nogc)
+                .expect("accessor descriptor holds a pair");
+            return Some(crate::PropertyDescriptor::Accessor {
+                get: pair.get.inner(),
+                set: pair.set.inner(),
+                enumerable: d.flags().is_enumerable(),
+                configurable: d.flags().is_configurable(),
+            });
+        }
+        let slot = o.as_ref().slot(nogc, d.offset());
+        return Some(crate::PropertyDescriptor::Data {
+            value: slot.inner(),
+            writable: d.flags().is_writable(),
+            enumerable: d.flags().is_enumerable(),
+            configurable: d.flags().is_configurable(),
+        });
+    }
+    None
 }
 
 impl Value {
@@ -137,7 +208,9 @@ impl Value {
 /// ES 7.3.11 HasProperty (the `in` operator): walks the prototype chain
 /// without invoking anything. Element indices consult the array elements
 /// (including their backing-store holes); canonical index strings are
-/// classified first so `"2" in o` and `2 in o` agree.
+/// classified first so `"2" in o` and `2 in o` agree. Arrays anywhere in
+/// the chain own `"length"` through their internal slot (ES 10.4.2.1),
+/// which the descriptor walk cannot see.
 pub fn has_property<'a>(nogc: &'a NoGc<'a>, receiver: Value, name: SlotName) -> bool {
     let name = match classify_key(nogc, name.value()) {
         Ok(Key::Element(i)) => {
@@ -153,7 +226,46 @@ pub fn has_property<'a>(nogc: &'a NoGc<'a>, receiver: Value, name: SlotName) -> 
         }
         _ => name,
     };
-    !matches!(receiver.lookup(nogc, name), Lookup::NotFound)
+    if !matches!(receiver.lookup(nogc, name), Lookup::NotFound) {
+        return true;
+    }
+    // "length" may live in an array's internal slot at any chain level
+    if name
+        .value()
+        .get_as::<InternedString>(nogc)
+        .is_some_and(|n| n.string().as_slice(nogc) == b"length")
+    {
+        return array_length_in_chain(nogc, receiver);
+    }
+    false
+}
+
+/// Whether any object in `receiver`'s prototype chain (receiver
+/// included) is an array — its `length` is an own non-configurable
+/// property invisible to the descriptor walk.
+fn array_length_in_chain<'a>(nogc: &'a NoGc<'a>, receiver: Value) -> bool {
+    let mut current = receiver;
+    loop {
+        let Some(obj) = current.as_heap_object(nogc) else {
+            return false;
+        };
+        if obj.as_ref().is_array(nogc) {
+            return true;
+        }
+        let proto = obj.as_ref().header.map.heap_ref(nogc).prototype.inner();
+        if proto == nogc.known().null.value() || !proto.is_strong_ptr() {
+            return false;
+        }
+        if let Some(parents) = proto.get_as::<FixedArray>(nogc) {
+            for i in 0..parents.len() {
+                if array_length_in_chain(nogc, parents.at(i)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        current = proto;
+    }
 }
 
 impl Map {

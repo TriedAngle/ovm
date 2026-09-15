@@ -10,13 +10,15 @@ pub enum VmError {
     NotExtensible,
     /// Unresolvable binding or TDZ access (spec: ReferenceError).
     Reference,
+    /// TypeError with a custom message (proxy revocation, trap invariants).
+    Message(&'static str),
 }
 
 impl VmError {
     /// Name of the ECMAScript error class this VM error materializes as §20.5.3.2
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Arity | Self::Type | Self::NotExtensible => "TypeError",
+            Self::Arity | Self::Type | Self::NotExtensible | Self::Message(_) => "TypeError",
             Self::Overflow | Self::OutOfBounds | Self::StackOverflow => "RangeError",
             Self::Reference => "ReferenceError",
         }
@@ -32,6 +34,7 @@ impl VmError {
             Self::StackOverflow => "maximum call stack size exceeded",
             Self::NotExtensible => "object is not extensible",
             Self::Reference => "cannot access variable before initialization",
+            Self::Message(m) => m,
         }
     }
 }

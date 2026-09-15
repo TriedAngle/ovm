@@ -19,7 +19,9 @@ pub fn execute(
     state: &ContextState,
     callable: Handle<'_, Object>,
     args: GcSlice<'_>,
-    new_target: Option<Handle<'_, Object>>,
+    // `new.target` of a [[Construct]]; any object (exotic included —
+    // e.g. a constructor proxy) is allowed.
+    new_target: Option<Handle<'_, Value>>,
 ) -> Result<Value, VmError> {
     let stack = &state.stack;
     let cache = &state.cache;
@@ -52,9 +54,29 @@ fn start(
     state: &ContextState,
     callable: Handle<'_, Object>,
     args: GcSlice<'_>,
-    new_target: Option<Handle<'_, Object>>,
+    new_target: Option<Handle<'_, Value>>,
     base_depth: usize,
 ) -> Result<Value, VmError> {
+    // a callable proxy is not a bytecode/native function: dispatch
+    // through its `apply`/`construct` trap with a nested run
+    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, callable.value())) {
+        let argv: Vec<Value> = args.as_slice().to_vec();
+        let callee = callable.value();
+        let result = match new_target {
+            None => crate::proxy::apply(vm, heap, state, callee, &argv),
+            Some(nt) => {
+                // args[0] is the synthesized receiver slot the
+                // Construct opcode prepended; construct takes pure args
+                let real: Vec<Value> = argv.iter().skip(1).copied().collect();
+                let nt = nt.value();
+                crate::proxy::construct(vm, heap, state, callee, &real, nt)
+            }
+        };
+        return match result? {
+            Coercion::Threw => Ok(heap.known().exception.value()),
+            Coercion::Value(v) => Ok(v),
+        };
+    }
     match call_target(&heap.guard(), callable.value()) {
         Some(CallTarget::Native(idx)) => {
             let f = vm.native(NativeIndex(idx));
@@ -144,7 +166,21 @@ fn closure_context<'a>(nogc: &'a NoGc<'a>, callable: Tagged<Object>) -> Value {
         .erase()
 }
 
+/// Result of an inline call attempt (`call_value`).
+enum Called {
+    /// A bytecode frame was pushed; its `Return` produces the value.
+    Frame,
+    /// The callee is not callable.
+    NotCallable,
+    /// The call ran to completion eagerly (proxy `apply`): the value.
+    Immediate(Value),
+    /// The call threw; the pending exception is set.
+    Threw,
+}
+
 fn call_value(
+    vm: &VM,
+    state: &ContextState,
     heap: &mut Heap,
     stack: &Stack,
     cache: &StackCache,
@@ -152,11 +188,21 @@ fn call_value(
     handler_pc: usize,
     f: Value,
     args: &[Value],
-) -> Result<bool, VmError> {
+) -> Result<Called, VmError> {
+    // proxies dispatch through their `apply` trap (or the target call)
+    // via a nested run — their callable state lives on a ProxyObject,
+    // not in function slots
+    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, f)) {
+        let argv: Vec<Value> = args.to_vec();
+        return match crate::proxy::apply(vm, heap, state, f, &argv)? {
+            Coercion::Threw => Ok(Called::Threw),
+            Coercion::Value(v) => Ok(Called::Immediate(v)),
+        };
+    }
     let target = call_target(&heap.guard(), f);
     // TODO: native getters/setters invoke in place instead of pushing a frame
     let Some(CallTarget::Bytecode(target, register_count, kind)) = target else {
-        return Ok(false);
+        return Ok(Called::NotCallable);
     };
     if kind.is_class_constructor() {
         return Err(VmError::Type);
@@ -180,7 +226,7 @@ fn call_value(
         formal_min,
     )?;
     cache.load(stack, callee, heap);
-    Ok(true)
+    Ok(Called::Frame)
 }
 
 /// Result of an exception unwind.
@@ -315,6 +361,7 @@ fn dispatch(
 }
 
 fn apply_store_outcome(
+    vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
     stack: &Stack,
@@ -342,6 +389,8 @@ fn apply_store_outcome(
         }
         StoreOutcome::CallSetter { setter } => {
             call_value(
+                vm,
+                state,
                 heap,
                 stack,
                 cache,
@@ -754,6 +803,26 @@ fn step(
             if !constructible {
                 return Step::Error(VmError::Type);
             }
+            // a constructor proxy dispatches through its `construct`
+            // trap (the target construct synthesizes its own receiver)
+            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, stack.reg(&meta, ops.reg(0)))) {
+                let callee = stack.reg(&meta, ops.reg(0));
+                let count = ops.reg_count(2);
+                let argv: Vec<Value> = stack
+                    .args(&meta, ops.reg_list(1), count)
+                    .as_slice()
+                    .to_vec();
+                return match state.handle_scope(|_scope| {
+                    crate::proxy::construct(vm, heap, state, callee, &argv, callee)
+                }) {
+                    Ok(Coercion::Threw) => Step::PendingThrow,
+                    Ok(Coercion::Value(v)) => {
+                        cache.set_acc(v);
+                        Step::Next
+                    }
+                    Err(err) => Step::Error(err),
+                };
+            }
             state.handle_scope(|scope| {
                 let Some(callee) = scope.cast::<Object>(stack.reg(&meta, ops.reg(0))) else {
                     return Step::Error(VmError::Type);
@@ -939,7 +1008,26 @@ fn step(
             // TODO(strict-mode): ordinary sloppy functions still need nullish
             // receiver substitution and primitive receiver boxing.
             let count = ops.reg_count(2);
-            let target = call_target(&heap.guard(), stack.reg(&meta, ops.reg(0)));
+            let callee = stack.reg(&meta, ops.reg(0));
+            // a callable proxy dispatches through its `apply` trap (or
+            // a nested call of the target)
+            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, callee)) {
+                let argv: Vec<Value> = stack
+                    .args(&meta, ops.reg_list(1), count)
+                    .as_slice()
+                    .to_vec();
+                return match state
+                    .handle_scope(|_scope| crate::proxy::apply(vm, heap, state, callee, &argv))
+                {
+                    Ok(Coercion::Threw) => Step::PendingThrow,
+                    Ok(Coercion::Value(v)) => {
+                        cache.set_acc(v);
+                        Step::Next
+                    }
+                    Err(err) => Step::Error(err),
+                };
+            }
+            let target = call_target(&heap.guard(), callee);
             let Some(target) = target else {
                 return Step::Error(VmError::Type);
             };
@@ -988,15 +1076,33 @@ fn step(
             }
         }
         Opcode::LoadNamedProperty => {
-            let outcome = step_try!(heap.no_gc(|nogc| {
-                let name = callable_name(nogc, stack, &meta, ops.idx(1));
-                load_outcome(nogc, stack.reg(&meta, ops.reg(0)), name)
-            }));
+            let receiver = stack.reg(&meta, ops.reg(0));
+            let name = heap.no_gc(|nogc| callable_name(nogc, stack, &meta, ops.idx(1)));
+            // proxies run their `get` trap outside any no-GC scope
+            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                return match step_try!(crate::proxy::get(
+                    vm,
+                    heap,
+                    state,
+                    receiver,
+                    receiver,
+                    name.value()
+                )) {
+                    Coercion::Threw => Step::PendingThrow,
+                    Coercion::Value(v) => {
+                        cache.set_acc(v);
+                        Step::Next
+                    }
+                };
+            }
+            let outcome = step_try!(heap.no_gc(|nogc| load_outcome(nogc, receiver, name)));
             match outcome {
                 LoadOutcome::Value(v) => cache.set_acc(v),
                 LoadOutcome::Getter(getter) => {
                     let receiver = stack.reg(&meta, ops.reg(0));
-                    let called = step_try!(call_value(
+                    match step_try!(call_value(
+                        vm,
+                        state,
                         heap,
                         stack,
                         cache,
@@ -1004,10 +1110,14 @@ fn step(
                         pc,
                         getter,
                         &[receiver]
-                    ));
-                    if !called {
+                    )) {
+                        Called::Frame => {}
                         // non-callable getter: the load yields undefined
-                        cache.set_acc(heap.known().undefined.value());
+                        Called::NotCallable => {
+                            cache.set_acc(heap.known().undefined.value());
+                        }
+                        Called::Immediate(v) => cache.set_acc(v),
+                        Called::Threw => return Step::PendingThrow,
                     }
                 }
             }
@@ -1019,12 +1129,30 @@ fn step(
                 _ => StoreSemantics::Shadow,
             };
             let receiver = stack.reg(&meta, ops.reg(0));
-            let outcome = step_try!(heap.no_gc(|nogc| {
-                let name = callable_name(nogc, stack, &meta, ops.idx(1));
-                receiver.store_lookup(nogc, name, cache.acc(), semantics)
-            }));
+            let name = heap.no_gc(|nogc| callable_name(nogc, stack, &meta, ops.idx(1)));
+            // proxies run their `set` trap outside any no-GC scope
+            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                return match step_try!(crate::proxy::set(
+                    vm,
+                    heap,
+                    state,
+                    receiver,
+                    name.value(),
+                    cache.acc(),
+                    receiver
+                )) {
+                    Coercion::Threw => Step::PendingThrow,
+                    Coercion::Value(_) => Step::Next,
+                };
+            }
+            let outcome = step_try!(heap.no_gc(|nogc| receiver.store_lookup(
+                nogc,
+                name,
+                cache.acc(),
+                semantics
+            )));
             step_try!(apply_store_outcome(
-                heap, state, stack, cache, meta, pc, receiver, outcome,
+                vm, heap, state, stack, cache, meta, pc, receiver, outcome,
             ));
             Step::Next
         }
@@ -1053,6 +1181,23 @@ fn step(
                     return Step::Next;
                 }
             }
+            // proxies run their `get` trap outside any no-GC scope
+            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                return match step_try!(crate::proxy::get(
+                    vm,
+                    heap,
+                    state,
+                    receiver,
+                    receiver,
+                    cache.acc()
+                )) {
+                    Coercion::Threw => Step::PendingThrow,
+                    Coercion::Value(v) => {
+                        cache.set_acc(v);
+                        Step::Next
+                    }
+                };
+            }
             let outcome = step_try!(heap.no_gc(|nogc| {
                 match classify_key(nogc, cache.acc())? {
                     Key::Element(i) => match receiver
@@ -1074,7 +1219,9 @@ fn step(
             match outcome {
                 LoadOutcome::Value(v) => cache.set_acc(v),
                 LoadOutcome::Getter(getter) => {
-                    let called = step_try!(call_value(
+                    match step_try!(call_value(
+                        vm,
+                        state,
                         heap,
                         stack,
                         cache,
@@ -1082,9 +1229,13 @@ fn step(
                         pc,
                         getter,
                         &[receiver]
-                    ));
-                    if !called {
-                        cache.set_acc(heap.known().undefined.value());
+                    )) {
+                        Called::Frame => {}
+                        Called::NotCallable => {
+                            cache.set_acc(heap.known().undefined.value());
+                        }
+                        Called::Immediate(v) => cache.set_acc(v),
+                        Called::Threw => return Step::PendingThrow,
                     }
                 }
             }
@@ -1101,6 +1252,22 @@ fn step(
                 return Step::PendingThrow;
             };
             stack.set_reg(&meta, ops.reg(1), key);
+            // proxies run their `set` trap outside any no-GC scope
+            // (including array-element stores)
+            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                return match step_try!(crate::proxy::set(
+                    vm,
+                    heap,
+                    state,
+                    receiver,
+                    key,
+                    cache.acc(),
+                    receiver
+                )) {
+                    Coercion::Threw => Step::PendingThrow,
+                    Coercion::Value(_) => Step::Next,
+                };
+            }
             let key = step_try!(classify_key(&heap.guard(), key));
             match key {
                 Key::Element(i) => {
@@ -1125,7 +1292,7 @@ fn step(
                             )
                         }));
                         step_try!(apply_store_outcome(
-                            heap, state, stack, cache, meta, pc, receiver, outcome,
+                            vm, heap, state, stack, cache, meta, pc, receiver, outcome,
                         ));
                     }
                 }
@@ -1134,7 +1301,7 @@ fn step(
                         receiver.store_lookup(nogc, name, cache.acc(), semantics)
                     }));
                     step_try!(apply_store_outcome(
-                        heap, state, stack, cache, meta, pc, receiver, outcome,
+                        vm, heap, state, stack, cache, meta, pc, receiver, outcome,
                     ));
                 }
             }
@@ -1197,10 +1364,23 @@ fn step(
                     if getter == heap.known().undefined.value() {
                         cache.set_acc(heap.known().undefined.value());
                     } else {
-                        let called =
-                            step_try!(call_value(heap, stack, cache, meta, pc, getter, &[global]));
-                        if !called {
-                            cache.set_acc(heap.known().undefined.value());
+                        match step_try!(call_value(
+                            vm,
+                            state,
+                            heap,
+                            stack,
+                            cache,
+                            meta,
+                            pc,
+                            getter,
+                            &[global]
+                        )) {
+                            Called::Frame => {}
+                            Called::NotCallable => {
+                                cache.set_acc(heap.known().undefined.value());
+                            }
+                            Called::Immediate(v) => cache.set_acc(v),
+                            Called::Threw => return Step::PendingThrow,
                         }
                     }
                 }
@@ -1224,7 +1404,7 @@ fn step(
                 global.store_lookup(nogc, name, cache.acc(), StoreSemantics::WriteThrough)
             }));
             step_try!(apply_store_outcome(
-                heap, state, stack, cache, meta, pc, global, outcome,
+                vm, heap, state, stack, cache, meta, pc, global, outcome,
             ));
             Step::Next
         }

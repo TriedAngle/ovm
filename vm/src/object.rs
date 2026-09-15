@@ -296,11 +296,28 @@ pub enum ObjectKind {
     ByteArray = 15,
     /// `elements` points to a `VMString`.
     String = 16,
+    /// A Proxy exotic object (`ProxyObject`): no own properties, all
+    /// internal methods dispatch through handler traps.
+    Proxy = 17,
+    /// Sentinel and odd heap values
+    Oddball = 18,
 }
 
 impl ObjectKind {
     pub const BUILTIN_START: u64 = ObjectKind::BuiltinStart as u64;
     pub const BUILTIN_END: u64 = ObjectKind::BuiltinEnd as u64;
+
+    /// Whether values of this kind are ECMAScript receivers (JSReceiver)
+    pub const fn is_js_receiver(self) -> bool {
+        matches!(
+            self,
+            ObjectKind::Object
+                | ObjectKind::Array
+                | ObjectKind::ByteArray
+                | ObjectKind::String
+                | ObjectKind::Proxy
+        )
+    }
 }
 
 /// Low byte: the `ObjectKind`. Second byte: capability flags
@@ -335,6 +352,8 @@ impl MapKind {
     pub const ARRAY: MapKind = MapKind(ObjectKind::Array as u64);
     pub const BYTE_ARRAY: MapKind = MapKind(ObjectKind::ByteArray as u64);
     pub const STRING: MapKind = MapKind(ObjectKind::String as u64);
+    pub const PROXY: MapKind = MapKind(ObjectKind::Proxy as u64);
+    pub const ODDBALL: MapKind = MapKind(ObjectKind::Oddball as u64);
 
     pub const fn new(bits: u64) -> Self {
         Self(bits)
@@ -370,6 +389,8 @@ impl MapKind {
             Self::ARRAY => ObjectKind::Array,
             Self::BYTE_ARRAY => ObjectKind::ByteArray,
             Self::STRING => ObjectKind::String,
+            Self::PROXY => ObjectKind::Proxy,
+            Self::ODDBALL => ObjectKind::Oddball,
             _ => panic!("invalid object kind"),
         }
     }
@@ -595,6 +616,67 @@ pub fn function_kind_of<'a>(nogc: &'a NoGc<'a>, v: Value) -> Option<FunctionKind
     Some(info.function_kind())
 }
 
+#[repr(C)]
+pub struct ProxyObject {
+    pub header: Header,
+    pub target: GcSlot,
+    pub handler: GcSlot,
+}
+
+pub struct ProxyInit<'a> {
+    pub map: Handle<'a, Map>,
+    pub target: Value,
+    pub handler: Value,
+}
+
+impl ProxyObject {
+    pub fn layout_for() -> Layout {
+        Layout::new::<Self>()
+    }
+
+    /// Whether the proxy has been revoked (handler nulled).
+    pub fn is_revoked<'a>(&self, nogc: &'a NoGc<'a>) -> bool {
+        self.handler.inner() == nogc.known().null.value()
+    }
+
+    /// (target, handler) as raw values; caller checks revocation.
+    pub fn parts(&self) -> (Value, Value) {
+        (self.target.inner(), self.handler.inner())
+    }
+}
+
+impl HeapObject for ProxyObject {
+    const KIND: ObjectKind = ObjectKind::Proxy;
+    type Init<'a> = ProxyInit<'a>;
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Self::layout_for()
+    }
+
+    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header.map.set(nogc, host, config.map.as_tagged());
+        self.target.set(nogc, host, config.target);
+        self.handler.set(nogc, host, config.handler);
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Self::layout_for()
+    }
+}
+
+impl EdgeVisitable for ProxyObject {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.target.as_raw());
+        visitor.visit(self.handler.as_raw());
+    }
+}
+
 /// Store `value` at element index `i` of an array object, growing the
 /// elements backing store and updating `length` when `i` is past the end.
 pub fn store_array_element(
@@ -680,7 +762,11 @@ impl HeapObject for Object {
     fn matches_kind(kind: ObjectKind) -> bool {
         matches!(
             kind,
-            ObjectKind::Object | ObjectKind::Array | ObjectKind::ByteArray | ObjectKind::String
+            ObjectKind::Object
+                | ObjectKind::Array
+                | ObjectKind::ByteArray
+                | ObjectKind::String
+                | ObjectKind::Oddball
         )
     }
     type Init<'a> = ObjectInit<'a>;
@@ -1659,9 +1745,12 @@ pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
             ObjectKind::HandlerTable => (*addr.cast::<HandlerTable>().as_ptr()).layout(),
             ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).layout(),
             ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).layout(),
-            ObjectKind::Object | ObjectKind::Array | ObjectKind::ByteArray | ObjectKind::String => {
-                (*addr.cast::<Object>().as_ptr()).layout()
-            }
+            ObjectKind::Object
+            | ObjectKind::Array
+            | ObjectKind::ByteArray
+            | ObjectKind::String
+            | ObjectKind::Oddball => (*addr.cast::<Object>().as_ptr()).layout(),
+            ObjectKind::Proxy => (*addr.cast::<ProxyObject>().as_ptr()).layout(),
             ObjectKind::BuiltinStart | ObjectKind::BuiltinEnd => {
                 unreachable!("sentinel kind in object header")
             }
@@ -1692,9 +1781,12 @@ pub unsafe fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
             }
             ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).visit_edges(visitor),
             ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).visit_edges(visitor),
-            ObjectKind::Object | ObjectKind::Array | ObjectKind::ByteArray | ObjectKind::String => {
-                (*addr.cast::<Object>().as_ptr()).visit_edges(visitor)
-            }
+            ObjectKind::Object
+            | ObjectKind::Array
+            | ObjectKind::ByteArray
+            | ObjectKind::String
+            | ObjectKind::Oddball => (*addr.cast::<Object>().as_ptr()).visit_edges(visitor),
+            ObjectKind::Proxy => (*addr.cast::<ProxyObject>().as_ptr()).visit_edges(visitor),
             ObjectKind::BuiltinStart | ObjectKind::BuiltinEnd => {
                 unreachable!("sentinel kind in object header")
             }

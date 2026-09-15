@@ -1,7 +1,7 @@
 use crate::{
     CallableInfoObject, Context, Convert, FixedArray, Float, Handle, HandleScope, Heap,
-    LoadOutcome, NoGc, Object, PropertyDescriptor, SlotName, Smi, Symbol, VMString, Value, VmError,
-    load_outcome,
+    LoadOutcome, NoGc, Object, PartialDescriptor, PropertyDescriptor, SlotName, Smi, Symbol,
+    VMString, Value, VmError, load_outcome_on,
 };
 
 use crate::{ContextState, NativeContext, VM};
@@ -243,7 +243,8 @@ impl Runtime {
     }
 
     /// Get a property value with full [[Get]] semantics: accessor getters are
-    /// called (nested run), missing properties yield undefined.
+    /// called (nested run), missing properties yield undefined. Proxy
+    /// receivers run their `get` trap (ES 20.2.5.8).
     pub fn get_property(
         vm: &VM,
         heap: &mut Heap,
@@ -251,8 +252,25 @@ impl Runtime {
         receiver: Value,
         name: Value,
     ) -> Result<Coercion, VmError> {
+        Self::get_property_on(vm, heap, state, receiver, receiver, name)
+    }
+
+    /// Same, with the lookup start (`holder`) split from the getter
+    /// receiver — the proxy forward shape: lookup on the target,
+    /// `this` = the proxy.
+    pub fn get_property_on(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        holder: Value,
+        receiver: Value,
+        name: Value,
+    ) -> Result<Coercion, VmError> {
+        if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, holder)) {
+            return crate::proxy::get(vm, heap, state, holder, receiver, name);
+        }
         let outcome =
-            heap.no_gc(|nogc| load_outcome(nogc, receiver, SlotName::from_value(name)))?;
+            heap.no_gc(|nogc| load_outcome_on(nogc, holder, SlotName::from_value(name)))?;
         match outcome {
             LoadOutcome::Value(v) => Ok(Coercion::Value(v)),
             LoadOutcome::Getter(getter) => {
@@ -269,6 +287,62 @@ impl Runtime {
         }
     }
 
+    pub fn to_property_descriptor(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        attrs: Value,
+    ) -> Result<Option<PartialDescriptor>, VmError> {
+        if heap.no_gc(|nogc| Convert::is_primitive(nogc, attrs)) {
+            return Err(VmError::Type);
+        }
+        state.handle_scope(|scope| {
+            let attrs = scope.handle(attrs);
+            let s = heap.known().strings;
+            let mut reads: Vec<Handle<'_, Value>> = Vec::new();
+            for name in [
+                s.value.value(),
+                s.get.value(),
+                s.set.value(),
+                s.writable.value(),
+                s.enumerable.value(),
+                s.configurable.value(),
+            ] {
+                match Self::get_property(vm, heap, state, attrs.value(), name)? {
+                    Coercion::Threw => return Ok(None),
+                    Coercion::Value(v) => reads.push(scope.handle(v)),
+                }
+            }
+            let at = |i: usize| reads[i].value();
+            let undefined = heap.known().undefined.value();
+            let value = (at(0) != undefined).then_some(at(0));
+            let get = (at(1) != undefined).then_some(at(1));
+            let set = (at(2) != undefined).then_some(at(2));
+            // accessor halves must be callable or undefined
+            if get.is_some() || set.is_some() {
+                for half in [get, set] {
+                    if let Some(h) = half
+                        && h != undefined
+                        && !Self::is_callable(heap, h)
+                    {
+                        return Err(VmError::Type);
+                    }
+                }
+            }
+            Ok(Some(PartialDescriptor {
+                value,
+                get,
+                set,
+                writable: (at(3) != undefined)
+                    .then(|| heap.no_gc(|nogc| Convert::is_truthy(nogc, at(3)))),
+                enumerable: (at(4) != undefined)
+                    .then(|| heap.no_gc(|nogc| Convert::is_truthy(nogc, at(4)))),
+                configurable: (at(5) != undefined)
+                    .then(|| heap.no_gc(|nogc| Convert::is_truthy(nogc, at(5)))),
+            }))
+        })
+    }
+
     pub fn is_callable(heap: &mut Heap, v: Value) -> bool {
         heap.no_gc(|nogc| {
             let Some(obj) = v.as_heap_object(nogc) else {
@@ -278,14 +352,6 @@ impl Runtime {
         })
     }
 
-    /// ToPropertyKey + canonicalization (ES 7.1.21): smis (element
-    /// indices) and symbols pass through; every other value is coerced —
-    /// ToString for primitives, ToPrimitive(hint String) first for objects
-    /// (user code may run) — and the resulting string is re-interned by
-    /// content so identity name comparison matches the interned constants
-    /// of named accesses (`o['a' + 'b']` ≡ `o.ab`, `class A { [1.5]() {} }`
-    /// installs "1.5"). `Ok(None)` means user code threw (pending
-    /// exception).
     pub fn to_property_key(
         vm: &VM,
         heap: &mut Heap,
@@ -416,9 +482,20 @@ impl Runtime {
         state: &ContextState,
         new_target: Handle<'_, Object>,
     ) -> Result<Option<Value>, VmError> {
+        Self::create_construct_receiver_value(vm, heap, state, new_target.value())
+    }
+
+    /// Same, for `new.target` values that may be exotic (a constructor
+    /// proxy): only `Get(new.target, "prototype")` is observed.
+    pub fn create_construct_receiver_value(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        new_target: Value,
+    ) -> Result<Option<Value>, VmError> {
         let proto_name = heap.known().strings.prototype.value();
         state.handle_scope(|scope| {
-            let proto = Self::get_property(vm, heap, state, new_target.value(), proto_name)?;
+            let proto = Self::get_property(vm, heap, state, new_target, proto_name)?;
             let proto = match proto {
                 Coercion::Threw => return Ok(None),
                 Coercion::Value(v) => v,

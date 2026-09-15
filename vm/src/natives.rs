@@ -15,10 +15,10 @@ pub struct NativeContext<'a> {
     heap: &'a mut Heap,
     state: &'a ContextState,
     /// `new.target` of the active [[Construct]] call (ES 9.2.2): the
-    /// invoked constructor, or `None` when called via [[Call]] (where
-    /// `new.target` is undefined).
-    // TODO: the Error family constructors read this once they exist
-    new_target: Option<Handle<'a, Object>>,
+    /// invoked constructor (possibly an exotic object like a proxy),
+    /// or `None` when called via [[Call]] (where `new.target` is
+    /// undefined).
+    new_target: Option<Handle<'a, Value>>,
 }
 
 impl<'a> NativeContext<'a> {
@@ -35,7 +35,7 @@ impl<'a> NativeContext<'a> {
         vm: &'a VM,
         heap: &'a mut Heap,
         state: &'a ContextState,
-        new_target: Option<Handle<'a, Object>>,
+        new_target: Option<Handle<'a, Value>>,
     ) -> Self {
         Self {
             vm,
@@ -106,9 +106,11 @@ impl<'a> NativeContext<'a> {
         let Some(callable) = scope.cast::<Object>(callable) else {
             return Err(VmError::Type);
         };
-        let Some(new_target) = scope.cast::<Object>(new_target) else {
+        // new.target may be exotic (a constructor proxy)
+        if !new_target.is_strong_ptr() {
             return Err(VmError::Type);
-        };
+        }
+        let new_target = scope.handle(new_target);
         crate::interpreter::execute(
             self.vm,
             self.heap,
@@ -316,7 +318,20 @@ fn delete_property(
     let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
         return Ok(nctx.heap().known().exception.value());
     };
-    let ok = delete_property_core(nctx, target, key)?;
+    // proxies run their `deleteProperty` trap (ES 20.2.5.4); the
+    // returned boolean flows through the strict handling below
+    let ok = if nctx
+        .heap()
+        .no_gc(|nogc| crate::proxy::is_proxy(nogc, target))
+    {
+        let (vm, heap, state) = nctx.split();
+        match crate::proxy::delete(vm, heap, state, target, key)? {
+            Coercion::Threw => return Ok(heap.known().exception.value()),
+            Coercion::Value(v) => heap.no_gc(|nogc| Convert::is_truthy(nogc, v)),
+        }
+    } else {
+        delete_property_core(nctx, target, key)?
+    };
     if strict && !ok {
         return Err(VmError::Type);
     }
@@ -957,7 +972,8 @@ fn iterator_value(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Val
     }
 }
 
-/// The `in` operator (ES 14.11.2): (key, obj) -> bool.
+/// The `in` operator (ES 14.11.2): (key, obj) -> bool. Proxy receivers
+/// run their `has` trap (ES 20.2.5.9).
 fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let raw_key = args.get(0).ok_or(VmError::Arity)?;
     let obj = args.get(1).ok_or(VmError::Arity)?;
@@ -965,6 +981,13 @@ fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
     let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
         return Ok(nctx.heap().known().exception.value());
     };
+    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, obj)) {
+        return match crate::proxy::has(vm, heap, state, obj, key)? {
+            Coercion::Threw => Ok(heap.known().exception.value()),
+            Coercion::Value(v) => Ok(v),
+        };
+    }
+    // lookup::has_property covers array `length` slots along the chain
     let has = heap.no_gc(|nogc| crate::lookup::has_property(nogc, obj, SlotName::from_value(key)));
     Ok(Convert::boolean(nctx.heap(), has))
 }
@@ -1539,6 +1562,40 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
     let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
         return Ok(heap.known().exception.value());
     };
+    // proxies run their `defineProperty` trap (ES 20.2.5.6); define
+    // sites are strict-mode: a rejected define throws
+    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+        let partial = heap.no_gc(|nogc| -> Result<crate::PartialDescriptor, VmError> {
+            let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
+            let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
+            if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
+                let pair = value.get_as::<AccessorPair>(nogc).ok_or(VmError::Type)?;
+                let pair = pair.as_ref();
+                Ok(crate::PartialDescriptor {
+                    value: None,
+                    get: Some(pair.get.inner()),
+                    set: Some(pair.set.inner()),
+                    writable: None,
+                    enumerable: Some(enumerable),
+                    configurable: Some(configurable),
+                })
+            } else {
+                Ok(crate::PartialDescriptor {
+                    value: Some(value),
+                    get: None,
+                    set: None,
+                    writable: Some(flags & bytecode::PropertyFlags::ReadOnly.bits() == 0),
+                    enumerable: Some(enumerable),
+                    configurable: Some(configurable),
+                })
+            }
+        })?;
+        return match crate::proxy::define_internal(vm, heap, state, receiver, key, partial)? {
+            crate::proxy::Flow::Threw => Ok(heap.known().exception.value()),
+            crate::proxy::Flow::Value(false) => Err(VmError::Type),
+            crate::proxy::Flow::Value(true) => Ok(receiver),
+        };
+    }
     let (name, desc) = heap.no_gc(|nogc| -> Result<_, VmError> {
         if receiver.as_heap_object(nogc).is_none() {
             return Err(VmError::Type);
