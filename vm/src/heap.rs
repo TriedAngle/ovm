@@ -489,6 +489,8 @@ impl Heap {
     }
 
     pub fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
+        #[cfg(feature = "stress-minor-gc")]
+        self.collect_minor();
         let raw = self
             .allocate_raw(T::layout_for(&config))
             .expect("heap allocation failed (out of memory)");
