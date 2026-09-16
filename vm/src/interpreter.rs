@@ -1163,7 +1163,7 @@ fn step(
             });
             if let Some(i) = string_index {
                 let unit = state.handle_scope(|scope| {
-                    crate::natives::string_char_at(heap, &scope, receiver, i)
+                    crate::builtins::intrinsics::string_char_at(heap, &scope, receiver, i)
                 });
                 if let Some(unit) = unit {
                     cache.set_acc(unit);

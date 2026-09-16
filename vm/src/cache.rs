@@ -33,6 +33,7 @@ impl StackCache {
         }))
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn get(&self) -> &mut StackCacheImpl {
         unsafe { &mut *self.0.get() }
     }

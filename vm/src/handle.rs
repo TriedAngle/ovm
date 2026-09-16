@@ -171,6 +171,7 @@ impl HandleData {
         }
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn inner(&self) -> &mut HandleDataImpl {
         unsafe { &mut *self.inner.get() }
     }
