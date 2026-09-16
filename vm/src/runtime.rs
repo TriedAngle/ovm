@@ -1,7 +1,7 @@
 use crate::{
-    CallableInfoObject, Context, Convert, FixedArray, Float, Handle, HandleScope, Heap,
-    LoadOutcome, NoGc, Object, PartialDescriptor, PropertyDescriptor, SlotName, Smi, Symbol,
-    VMString, Value, VmError, load_outcome_on,
+    CallableInfoObject, Context, Convert, DenseString, FixedArray, Float, Handle, HandleScope,
+    Heap, LoadOutcome, NoGc, Object, PartialDescriptor, PropertyDescriptor, SlotName, Smi, Symbol,
+    Value, VmError, load_outcome_on,
 };
 
 use crate::{ContextState, NativeContext, VM};
@@ -361,7 +361,7 @@ impl Runtime {
         if v.is_smi() || heap.no_gc(|nogc| v.get_as::<Symbol>(nogc).is_some()) {
             return Ok(Some(v));
         }
-        let is_string = heap.no_gc(|nogc| v.get_as::<VMString>(nogc).is_some());
+        let is_string = heap.no_gc(|nogc| v.get_as::<DenseString>(nogc).is_some());
         let primitive = if is_string {
             v
         } else {
@@ -372,20 +372,17 @@ impl Runtime {
         };
         let stringified =
             state.handle_scope(|scope| Convert::to_string(heap, &scope, primitive))?;
-        let bytes = heap.no_gc(|nogc| {
-            stringified
-                .get_as::<VMString>(nogc)
-                .map(|s| s.as_slice(nogc).to_vec())
-        });
-        match bytes {
-            Some(bytes) => {
-                let interned =
-                    state.handle_scope(|scope| vm.interner().intern(heap, &scope, bytes).value());
-                Ok(Some(interned))
+        // named lookup compares interned strings by pointer: canonicalize
+        // exactly once here, then every downstream bits-compare is sound
+        let interned = state.handle_scope(|scope| {
+            let s = scope.cast::<DenseString>(stringified);
+            match s {
+                Some(s) => Ok(vm.interner().intern_value(heap, &scope, &s).value()),
+                // ToString of a symbol primitive throws (ES 6.1.7.1)
+                None => Err(VmError::Type),
             }
-            // ToString of a symbol primitive throws (ES 6.1.7.1)
-            None => Err(VmError::Type),
-        }
+        })?;
+        Ok(Some(interned))
     }
 
     /// ES 13.5.3 typeof: the well-known type string for a value. `null`
@@ -403,7 +400,7 @@ impl Runtime {
                 || v == nogc.known().false_object.value()
             {
                 strings.boolean.value()
-            } else if v.get_as::<VMString>(nogc).is_some() {
+            } else if v.get_as::<DenseString>(nogc).is_some() {
                 strings.string.value()
             } else if v.get_as::<Symbol>(nogc).is_some() {
                 strings.symbol.value()

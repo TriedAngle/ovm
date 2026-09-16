@@ -17,12 +17,14 @@ pub mod interpreter;
 pub mod lookup;
 pub mod materialize;
 pub mod natives;
-pub mod object;
-pub mod proxy;
+pub mod objects;
 pub mod runtime;
 pub mod stack;
 pub mod transition;
 pub mod value;
+
+pub use objects::proxy;
+pub use objects::string;
 
 pub use bootstrap::{
     KnownCell, WellKnown, WellKnownStrings, bootstrap_basics, bootstrap_well_known,
@@ -47,13 +49,14 @@ pub use lookup::{
     super_lookup, super_lookup_from_proto,
 };
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
-pub use object::{
+pub use objects::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
-    FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry, HandlerEntryInit, HandlerTable,
-    HandlerTableInit, Header, HeapObject, InternedString, Map, MapInit, MapKind, Object,
-    ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit, ProxyObject, ScopeInfo, ScopeInfoInit,
-    SlotDescriptor, SlotFlags, SlotName, Symbol, VMString, call_target, function_kind_of,
-    object_kind, object_layout, store_array_element, string_content_hash, visit_object,
+    DenseString, Encoding, FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry,
+    HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map, MapInit, MapKind,
+    Object, ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit, ProxyObject, ScopeInfo,
+    ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol, call_target,
+    decode_wtf8, function_kind_of, object_kind, object_layout, store_array_element,
+    string_content_hash, visit_object,
 };
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use transition::{
@@ -80,11 +83,11 @@ const _: () = {
     use core::mem::size_of;
     assert!(size_of::<Value>() == size_of::<Word>());
     assert!(size_of::<Tagged<Value>>() == size_of::<Word>());
-    assert!(size_of::<Tagged<VMString>>() == size_of::<Word>());
+    assert!(size_of::<Tagged<DenseString>>() == size_of::<Word>());
     assert!(size_of::<GcSlot>() == size_of::<Word>());
     assert!(size_of::<OptionGcSlot<FixedArray>>() == size_of::<Word>());
     assert!(size_of::<GcSlot<Smi>>() == size_of::<Word>());
-    assert!(size_of::<GcSlot<VMString>>() == size_of::<Word>());
+    assert!(size_of::<GcSlot<DenseString>>() == size_of::<Word>());
     assert!(size_of::<Register>() == size_of::<Word>());
     assert!(size_of::<SlotName>() == size_of::<Word>());
 };
@@ -228,12 +231,8 @@ impl Thread {
         &self.state
     }
 
-    pub fn intern<'s>(
-        &mut self,
-        scope: &'s HandleScope<'_>,
-        s: impl AsRef<[u8]>,
-    ) -> Handle<'s, InternedString> {
-        self.vm.interner().intern(&mut self.heap, scope, s)
+    pub fn intern<'s>(&mut self, scope: &'s HandleScope<'_>, s: &str) -> Handle<'s, DenseString> {
+        self.vm.interner().intern_str(&mut self.heap, scope, s)
     }
 
     pub fn set_pending_exception(&mut self, err: VmError) {

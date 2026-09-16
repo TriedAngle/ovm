@@ -185,8 +185,8 @@ fn exception_name(thread: &mut vm::Thread) -> String {
             match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
                 vm::Lookup::Data { slot, .. } => slot
                     .inner()
-                    .get_as::<vm::VMString>(nogc)
-                    .map(|s| String::from_utf8_lossy(s.as_slice(nogc)).into_owned())
+                    .get_as::<vm::DenseString>(nogc)
+                    .map(|s| s.to_rust_string(nogc))
                     .unwrap_or_else(|| "exception".into()),
                 _ => "exception".into(),
             }
@@ -305,7 +305,10 @@ fn main() {
 
 fn real_main() -> i32 {
     // caught panics are counted per test; don't spam stderr for each
-    std::panic::set_hook(Box::new(|_| {}));
+    // (OVM_PANIC_MSG=1 keeps the default hook to debug a specific test)
+    if std::env::var_os("OVM_PANIC_MSG").is_none() {
+        std::panic::set_hook(Box::new(|_| {}));
+    }
     let progress = std::env::var_os("OVM_PROGRESS").is_some();
     let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
     if args.is_empty() {

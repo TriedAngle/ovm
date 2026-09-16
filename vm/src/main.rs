@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{Float, Smi, VMString, Value};
+use vm::{DenseString, Float, Smi, Value};
 use vm::{Thread, VM};
 
 fn main() {
@@ -111,8 +111,8 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
         if let Some(f) = v.get_as::<Float>(nogc) {
             return f.value.get().to_string();
         }
-        if let Some(s) = v.get_as::<VMString>(nogc) {
-            return String::from_utf8_lossy(s.as_slice(nogc)).into_owned();
+        if let Some(s) = v.get_as::<DenseString>(nogc) {
+            return s.to_rust_string(nogc);
         }
         format!("{v:?}")
     })

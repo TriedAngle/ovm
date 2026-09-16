@@ -25,7 +25,8 @@ pub struct WellKnown {
     pub float_map: Global<Map>,
     pub array_map: Global<Map>,
     pub byte_array_map: Global<Map>,
-    pub string_map: Global<Map>,
+    pub dense_latin1_string_map: Global<Map>,
+    pub dense_utf16_string_map: Global<Map>,
     pub symbol_map: Global<Map>,
     pub accessor_pair_map: Global<Map>,
     pub callable_map: Global<Map>,
@@ -125,7 +126,7 @@ macro_rules! define_well_known_strings {
             ) -> Self {
                 Self {
                     $($field: {
-                        let interned = interner.intern(heap, roots, $text);
+                        let interned = interner.intern_str(heap, roots, $text);
                         roots.create_handle(SlotName::from(interned.as_tagged()).tagged())
                     },)*
                 }
@@ -213,7 +214,8 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         float_map: map,
         array_map: map,
         byte_array_map: map,
-        string_map: map,
+        dense_latin1_string_map: map,
+        dense_utf16_string_map: map,
         symbol_map: map,
         accessor_pair_map: map,
         callable_map: map,
@@ -385,7 +387,9 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let float_map = alloc_map(heap, roots, MapKind::FLOAT);
     let array_map = alloc_map(heap, roots, MapKind::FIXED_ARRAY);
     let byte_array_map = alloc_map(heap, roots, MapKind::FIXED_BYTE_ARRAY);
-    let string_map = alloc_map(heap, roots, MapKind::VM_STRING);
+    let dense_latin1_string_map =
+        alloc_map(heap, roots, MapKind::DENSE_STRING.union(MapKind::LATIN1));
+    let dense_utf16_string_map = alloc_map(heap, roots, MapKind::DENSE_STRING);
     let symbol_map = alloc_map(heap, roots, MapKind::SYMBOL);
     let accessor_pair_map = alloc_map(heap, roots, MapKind::ACCESSOR_PAIR);
     let callable_map = alloc_map(heap, roots, MapKind::CALLABLE_INFO);
@@ -433,7 +437,8 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.float_map = float_map;
     known.array_map = array_map;
     known.byte_array_map = byte_array_map;
-    known.string_map = string_map;
+    known.dense_latin1_string_map = dense_latin1_string_map;
+    known.dense_utf16_string_map = dense_utf16_string_map;
     known.symbol_map = symbol_map;
     known.accessor_pair_map = accessor_pair_map;
     known.callable_map = callable_map;

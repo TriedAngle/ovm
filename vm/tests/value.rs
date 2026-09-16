@@ -9,7 +9,7 @@ struct TestObj(u64);
 impl HeapObject for TestObj {
     type Init<'a> = ();
 
-    const KIND: vm::ObjectKind = vm::ObjectKind::VMString;
+    const KIND: vm::ObjectKind = vm::ObjectKind::DenseString;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()

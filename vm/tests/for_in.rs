@@ -3,7 +3,7 @@
 //! assignment target.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{ScriptError, Smi, VM, VMString, Value};
+use vm::{DenseString, ScriptError, Smi, VM, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -22,8 +22,8 @@ fn run_str(src: &str) -> String {
     // re-run under a live heap to read the string back
     let result = thread.run_script(src).unwrap();
     thread.heap().no_gc(|nogc| {
-        let s = result.get_as::<VMString>(nogc).expect("string result");
-        String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
+        let s = result.get_as::<DenseString>(nogc).expect("string result");
+        s.to_rust_string(nogc)
     })
 }
 

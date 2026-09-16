@@ -1,4 +1,4 @@
-use crate::{Convert, Float, NoGc, Smi, VMString, Value, VmError};
+use crate::{Convert, DenseString, Float, NoGc, Smi, Value, VmError};
 
 pub struct Compare;
 
@@ -23,12 +23,13 @@ impl Compare {
             }
             return a == b;
         }
-        // identical bits: same string object, same heap object
+        // identical bits: same interned string, same heap object
         if x == y {
             return true;
         }
-        if let (Some(sx), Some(sy)) = (x.get_as::<VMString>(nogc), y.get_as::<VMString>(nogc)) {
-            return sx.as_slice(nogc) == sy.as_slice(nogc);
+        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(nogc), y.get_as::<DenseString>(nogc))
+        {
+            return sx.as_ref().content_eq(nogc, sy.as_ref());
         }
         false
     }
@@ -44,7 +45,7 @@ impl Compare {
             return Ok(true);
         }
         let is_bool = |v: Value| v == known.true_object.value() || v == known.false_object.value();
-        let is_string = |v: Value| v.get_as::<VMString>(nogc).is_some();
+        let is_string = |v: Value| v.get_as::<DenseString>(nogc).is_some();
         let is_number = |v: Value| v.is_smi() || v.get_as::<Float>(nogc).is_some();
         // number ↔ string: the string parses as a number
         if is_number(x) && is_string(y) {
@@ -74,8 +75,6 @@ impl Compare {
     /// strings compare by content (identity for everything else).
     /// Unlike `strict_equal` (===); used by [[DefineOwnProperty]] validation.
     pub fn same_value<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> bool {
-        // identical bits: same object, same string, same smi, or the very
-        // same NaN heap object
         if x == y {
             return true;
         }
@@ -97,15 +96,24 @@ impl Compare {
             // equal values: +/-0 are distinct
             return !(a == 0.0 && a.is_sign_negative() != b.is_sign_negative());
         }
-        if let (Some(sx), Some(sy)) = (x.get_as::<VMString>(nogc), y.get_as::<VMString>(nogc)) {
-            return sx.as_slice(nogc) == sy.as_slice(nogc);
+        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(nogc), y.get_as::<DenseString>(nogc))
+        {
+            return sx.as_ref().content_eq(nogc, sy.as_ref());
         }
         false
     }
 
+    /// Relational comparison for two string values: UTF-16 code-unit
+    /// order (ES 7.2.13 IsLessThan), encoding-agnostic.
+    fn string_cmp<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Option<core::cmp::Ordering> {
+        let sx = x.get_as::<DenseString>(nogc)?.as_ref();
+        let sy = y.get_as::<DenseString>(nogc)?.as_ref();
+        Some(sx.data(nogc).cmp(&sy.data(nogc)))
+    }
+
     pub fn less_than<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
-        if let (Some(sx), Some(sy)) = (x.get_as::<VMString>(nogc), y.get_as::<VMString>(nogc)) {
-            return Ok(sx.as_slice(nogc) < sy.as_slice(nogc));
+        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+            return Ok(ord == core::cmp::Ordering::Less);
         }
         let a = Convert::to_number(nogc, x)?;
         let b = Convert::to_number(nogc, y)?;
@@ -113,8 +121,8 @@ impl Compare {
     }
 
     pub fn less_than_or_equal<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
-        if let (Some(sx), Some(sy)) = (x.get_as::<VMString>(nogc), y.get_as::<VMString>(nogc)) {
-            return Ok(sx.as_slice(nogc) <= sy.as_slice(nogc));
+        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+            return Ok(ord != core::cmp::Ordering::Greater);
         }
         let a = Convert::to_number(nogc, x)?;
         let b = Convert::to_number(nogc, y)?;
@@ -122,8 +130,8 @@ impl Compare {
     }
 
     pub fn greater_than<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
-        if let (Some(sx), Some(sy)) = (x.get_as::<VMString>(nogc), y.get_as::<VMString>(nogc)) {
-            return Ok(sx.as_slice(nogc) > sy.as_slice(nogc));
+        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+            return Ok(ord == core::cmp::Ordering::Greater);
         }
         let a = Convert::to_number(nogc, x)?;
         let b = Convert::to_number(nogc, y)?;
@@ -135,8 +143,8 @@ impl Compare {
         x: Value,
         y: Value,
     ) -> Result<bool, VmError> {
-        if let (Some(sx), Some(sy)) = (x.get_as::<VMString>(nogc), y.get_as::<VMString>(nogc)) {
-            return Ok(sx.as_slice(nogc) >= sy.as_slice(nogc));
+        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+            return Ok(ord != core::cmp::Ordering::Less);
         }
         let a = Convert::to_number(nogc, x)?;
         let b = Convert::to_number(nogc, y)?;

@@ -1,6 +1,6 @@
 use crate::{
-    AccessorPair, FixedArray, FrameMeta, GcSlot, HeapRef, InternedString, Map, NoGc, Object,
-    SlotFlags, SlotName, Smi, Stack, Symbol, Tagged, Value, VmError,
+    AccessorPair, DenseString, FixedArray, FrameMeta, GcSlot, HeapRef, Map, NoGc, Object,
+    SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, Value, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -36,12 +36,13 @@ pub fn classify_key<'a>(nogc: &'a NoGc<'a>, key: Value) -> Result<Key, VmError> 
         }
         return Ok(Key::Name(SlotName::from(Tagged::from_smi(smi))));
     }
-    if let Some(s) = key.get_as::<InternedString>(nogc) {
+    if let Some(s) = key.get_as::<DenseString>(nogc) {
         // Canonical index strings ("0", "1", … up to 2^32−2) name the same
         // property as their numeric form (ES 6.1.7: ToString(i) is the
         // canonical key); non-canonical spellings ("01", "-0", "1e2") stay
-        // ordinary names
-        if let Some(i) = canonical_index(s.string().as_slice(nogc))
+        // ordinary names. String keys are interned upstream
+        // (ToPropertyKey) — pointer identity identifies the name.
+        if let Some(i) = canonical_index(s.as_ref().data(nogc))
             && i <= u32::MAX as usize - 1
         {
             return Ok(Key::Element(i));
@@ -59,19 +60,20 @@ pub fn classify_key<'a>(nogc: &'a NoGc<'a>, key: Value) -> Result<Key, VmError> 
 /// spelling ("a", "+1") are not indices. The result is NOT
 /// range-checked against 2^32−1 — callers decide whether a value that
 /// large is still an array index.
-pub fn canonical_index(bytes: &[u8]) -> Option<usize> {
-    if bytes.is_empty() || bytes.len() > 10 {
+pub fn canonical_index(data: StringData<'_>) -> Option<usize> {
+    if data.is_empty() || data.len() > 10 {
         return None;
     }
-    if bytes[0] == b'0' {
-        return (bytes.len() == 1).then_some(0);
+    if data.code_unit(0) == b'0' as u16 {
+        return (data.len() == 1).then_some(0);
     }
     let mut n: usize = 0;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
+    for i in 0..data.len() {
+        let c = data.code_unit(i);
+        if !(b'0' as u16..=b'9' as u16).contains(&c) {
             return None;
         }
-        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+        n = n.checked_mul(10)?.checked_add((c - b'0' as u16) as usize)?;
     }
     Some(n)
 }
@@ -103,13 +105,13 @@ pub fn load_outcome_on<'a>(
     // string primitives expose `length` (UTF-16 code units) as an own
     // property without boxing (ES 5.4.3.1); index loads need a fresh
     // one-character string and stay unsupported here
-    if let Some(s) = holder.get_as::<crate::VMString>(nogc)
+    if let Some(s) = holder.get_as::<DenseString>(nogc)
         && name
             .value()
-            .get_as::<InternedString>(nogc)
-            .is_some_and(|n| n.string().as_slice(nogc) == b"length")
+            .get_as::<DenseString>(nogc)
+            .is_some_and(|n| n.as_ref().data(nogc).matches_ascii(b"length"))
     {
-        let len = crate::natives::utf16_length(s.as_slice(nogc)) as i64;
+        let len = s.len() as i64;
         return Ok(LoadOutcome::Value(Smi::new(len).encode()));
     }
     match holder.lookup(nogc, name) {
@@ -232,8 +234,8 @@ pub fn has_property<'a>(nogc: &'a NoGc<'a>, receiver: Value, name: SlotName) -> 
     // "length" may live in an array's internal slot at any chain level
     if name
         .value()
-        .get_as::<InternedString>(nogc)
-        .is_some_and(|n| n.string().as_slice(nogc) == b"length")
+        .get_as::<DenseString>(nogc)
+        .is_some_and(|n| n.as_ref().data(nogc).matches_ascii(b"length"))
     {
         return array_length_in_chain(nogc, receiver);
     }

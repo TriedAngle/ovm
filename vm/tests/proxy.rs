@@ -62,8 +62,8 @@ fn assert_type_error(src: &str) {
             {
                 vm::Lookup::Data { slot, .. } => slot
                     .inner()
-                    .get_as::<vm::VMString>(nogc)
-                    .map(|s| String::from_utf8_lossy(s.as_slice(nogc)).into_owned())
+                    .get_as::<vm::DenseString>(nogc)
+                    .map(|s| s.to_rust_string(nogc))
                     .unwrap_or_default(),
                 _ => String::new(),
             }
@@ -100,9 +100,9 @@ fn constructor_has_no_prototype_and_metadata() {
     let name = thread.run_script("Proxy.name").unwrap();
     thread.heap().no_gc(|nogc| {
         let s = name
-            .get_as::<vm::VMString>(nogc)
+            .get_as::<vm::DenseString>(nogc)
             .expect("Proxy.name is a string");
-        assert_eq!(s.as_slice(nogc), b"Proxy");
+        assert!(s.data(nogc).matches_ascii(b"Proxy"));
     });
 }
 

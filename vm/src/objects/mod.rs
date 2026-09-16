@@ -1,3 +1,8 @@
+pub mod proxy;
+pub mod string;
+
+pub use string::{DenseString, Encoding, StringData, decode_wtf8, string_content_hash};
+
 use core::{
     alloc::Layout,
     cell::{Cell, UnsafeCell},
@@ -278,7 +283,7 @@ pub enum ObjectKind {
     Map = 1,
     FixedArray = 2,
     FixedByteArray = 3,
-    VMString = 4,
+    DenseString = 4,
     AccessorPair = 5,
     CallableInfo = 6,
     Float = 7,
@@ -294,7 +299,7 @@ pub enum ObjectKind {
     Array = 14,
     /// `elements` points to a `FixedByteArray`.
     ByteArray = 15,
-    /// `elements` points to a `VMString`.
+    /// `elements` points to a `DenseString`.
     String = 16,
     /// A Proxy exotic object (`ProxyObject`): no own properties, all
     /// internal methods dispatch through handler traps.
@@ -320,8 +325,9 @@ impl ObjectKind {
     }
 }
 
-/// Low byte: the `ObjectKind`. Second byte: capability flags
-/// (extendable, callable, constructor, native). Constructor implies callable.
+/// Low byte: the `ObjectKind`. Higher bytes: capability flags
+/// (extendable, callable, constructor, native) and representation flags
+/// (Latin1 string payloads). Constructor implies callable.
 /// NATIVE is only valid together with CALLABLE and means slots[0] of the
 /// object is a Smi native registry index instead of a `CallableInfoObject`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -336,11 +342,16 @@ impl MapKind {
     pub const NATIVE: MapKind = MapKind(1 << 11);
     pub const PRIMITIVE_WRAPPER: MapKind = MapKind(1 << 12);
     pub const CLASS_CONSTRUCTOR: MapKind = MapKind(1 << 13);
+    /// Dense-string payload encoding: set = one Latin-1 byte per code
+    /// unit, clear = one UTF-16 code unit. Only meaningful (and always
+    /// accurate) on `DENSE_STRING` maps — future string representations
+    /// get their own kinds/flags.
+    pub const LATIN1: MapKind = MapKind(1 << 14);
 
     pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
     pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
     pub const FIXED_BYTE_ARRAY: MapKind = MapKind(ObjectKind::FixedByteArray as u64);
-    pub const VM_STRING: MapKind = MapKind(ObjectKind::VMString as u64);
+    pub const DENSE_STRING: MapKind = MapKind(ObjectKind::DenseString as u64);
     pub const ACCESSOR_PAIR: MapKind = MapKind(ObjectKind::AccessorPair as u64);
     pub const CALLABLE_INFO: MapKind = MapKind(ObjectKind::CallableInfo as u64);
     pub const FLOAT: MapKind = MapKind(ObjectKind::Float as u64);
@@ -377,7 +388,7 @@ impl MapKind {
             Self::MAP => ObjectKind::Map,
             Self::FIXED_ARRAY => ObjectKind::FixedArray,
             Self::FIXED_BYTE_ARRAY => ObjectKind::FixedByteArray,
-            Self::VM_STRING => ObjectKind::VMString,
+            Self::DENSE_STRING => ObjectKind::DenseString,
             Self::ACCESSOR_PAIR => ObjectKind::AccessorPair,
             Self::CALLABLE_INFO => ObjectKind::CallableInfo,
             Self::FLOAT => ObjectKind::Float,
@@ -538,8 +549,10 @@ impl Object {
         if !self.is_array(nogc) {
             return None;
         }
-        let s = name.value().get_as::<VMString>(nogc)?;
-        (s.as_slice(nogc) == b"length").then(|| self.length.inner())
+        let s = name.value().get_as::<DenseString>(nogc)?.as_ref();
+        s.data(nogc)
+            .matches_ascii(b"length")
+            .then(|| self.length.inner())
     }
 
     /// The object's map (shape).
@@ -957,145 +970,6 @@ impl EdgeVisitable for FixedByteArray {
 }
 
 #[repr(C)]
-pub struct VMString {
-    pub header: Header,
-    pub backing: GcSlot<FixedByteArray>,
-    pub hash: GcSlot<Smi>,
-}
-
-/// Content hash for strings (FNV-1a, masked into smi range).
-/// TODO: decide on a hash algorithm
-pub fn string_content_hash(bytes: &[u8]) -> i64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    (h & ((1 << 62) - 1)) as i64
-}
-
-impl VMString {
-    pub fn from_bytes<'s>(
-        heap: &mut Heap,
-        scope: &'s HandleScope<'_>,
-        bytes: &[u8],
-    ) -> Handle<'s, VMString> {
-        let backing = heap.allocate_handle::<FixedByteArray>(bytes, scope);
-        heap.allocate_handle::<VMString>((backing, string_content_hash(bytes)), scope)
-    }
-
-    pub fn concat<'s>(
-        heap: &mut Heap,
-        scope: &'s HandleScope<'_>,
-        a: Value,
-        b: Value,
-    ) -> Handle<'s, VMString> {
-        let bytes = heap.no_gc(|nogc| {
-            let sa = a
-                .get_as::<VMString>(nogc)
-                .expect("concat operand must be a string");
-            let sb = b
-                .get_as::<VMString>(nogc)
-                .expect("concat operand must be a string");
-            let mut out = Vec::with_capacity(sa.len(nogc) + sb.len(nogc));
-            out.extend_from_slice(sa.as_slice(nogc));
-            out.extend_from_slice(sb.as_slice(nogc));
-            out
-        });
-        Self::from_bytes(heap, scope, &bytes)
-    }
-
-    pub fn backing<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
-        self.backing.heap_ref(nogc)
-    }
-
-    pub fn hash(&self) -> i64 {
-        self.hash.to_smi().value()
-    }
-
-    pub fn len<'a>(&self, nogc: &'a NoGc<'a>) -> usize {
-        self.backing(nogc).len()
-    }
-
-    pub fn as_slice<'a>(&self, nogc: &'a NoGc<'a>) -> &'a [u8] {
-        self.backing(nogc).as_ref().as_slice()
-    }
-
-    pub fn as_str<'a>(&self, nogc: &'a NoGc<'a>) -> Option<&'a str> {
-        core::str::from_utf8(self.as_slice(nogc)).ok()
-    }
-}
-
-impl HeapObject for VMString {
-    const KIND: ObjectKind = ObjectKind::VMString;
-    type Init<'a> = (Handle<'a, FixedByteArray>, i64);
-
-    fn layout_for(_config: &Self::Init<'_>) -> Layout {
-        Layout::new::<Self>()
-    }
-
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
-        let host = self.erase();
-        self.header
-            .map
-            .set(nogc, host, nogc.known().string_map.as_tagged());
-        self.backing.set(nogc, host, config.0.as_tagged());
-        self.hash.set(nogc, host, Smi::new(config.1));
-    }
-
-    fn header(&self) -> &Header {
-        &self.header
-    }
-
-    fn layout(&self) -> Layout {
-        Layout::new::<Self>()
-    }
-}
-
-impl EdgeVisitable for VMString {
-    fn visit_edges(&self, visitor: &mut dyn Visitor) {
-        visitor.visit(self.header.map.as_raw());
-        visitor.visit(self.backing.as_raw());
-    }
-}
-
-#[repr(C)]
-pub struct InternedString(pub VMString);
-
-impl InternedString {
-    pub fn string(&self) -> &VMString {
-        &self.0
-    }
-}
-
-impl HeapObject for InternedString {
-    const KIND: ObjectKind = ObjectKind::VMString;
-    type Init<'a> = (Handle<'a, FixedByteArray>, i64);
-
-    fn layout_for(_config: &Self::Init<'_>) -> Layout {
-        Layout::new::<Self>()
-    }
-
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
-        self.0.init(nogc, config);
-    }
-
-    fn header(&self) -> &Header {
-        self.0.header()
-    }
-
-    fn layout(&self) -> Layout {
-        Layout::new::<Self>()
-    }
-}
-
-impl EdgeVisitable for InternedString {
-    fn visit_edges(&self, visitor: &mut dyn Visitor) {
-        self.0.visit_edges(visitor);
-    }
-}
-
-#[repr(C)]
 pub struct Symbol {
     pub header: Header,
     pub backing: GcSlot<FixedByteArray>,
@@ -1109,22 +983,6 @@ impl Symbol {
     ) -> Handle<'s, Symbol> {
         let backing = heap.allocate_handle::<FixedByteArray>(description, scope);
         heap.allocate_handle::<Symbol>(backing, scope)
-    }
-
-    pub fn backing<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
-        self.backing.heap_ref(nogc)
-    }
-
-    pub fn len<'a>(&self, nogc: &'a NoGc<'a>) -> usize {
-        self.backing(nogc).len()
-    }
-
-    pub fn as_slice<'a>(&self, nogc: &'a NoGc<'a>) -> &'a [u8] {
-        self.backing(nogc).as_ref().as_slice()
-    }
-
-    pub fn as_str<'a>(&self, nogc: &'a NoGc<'a>) -> Option<&'a str> {
-        core::str::from_utf8(self.as_slice(nogc)).ok()
     }
 }
 
@@ -1160,7 +1018,8 @@ impl EdgeVisitable for Symbol {
     }
 }
 
-/// A property name: an interned string, a symbol, or a smi index.
+/// A property name: a string (the interner's canonical instance, by
+/// convention — names compare by pointer), a symbol, or a smi index.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone)]
 pub struct SlotName(Value);
@@ -1179,20 +1038,14 @@ impl SlotName {
     }
 }
 
-impl From<Tagged<VMString>> for SlotName {
-    fn from(string: Tagged<VMString>) -> Self {
-        Self(string.erase())
-    }
-}
-
 impl From<Tagged<Symbol>> for SlotName {
     fn from(symbol: Tagged<Symbol>) -> Self {
         Self(symbol.erase())
     }
 }
 
-impl From<Tagged<InternedString>> for SlotName {
-    fn from(string: Tagged<InternedString>) -> Self {
+impl From<Tagged<DenseString>> for SlotName {
+    fn from(string: Tagged<DenseString>) -> Self {
         Self(string.erase())
     }
 }
@@ -1439,7 +1292,7 @@ impl CallableInfoObject {
 
     pub fn name<'a>(&self, nogc: &'a NoGc<'a>) -> Option<Value> {
         let name = self.name.inner();
-        name.get_as::<VMString>(nogc).map(|_| name)
+        name.get_as::<DenseString>(nogc).map(|_| name)
     }
 
     pub fn formal_parameter_count(&self) -> usize {
@@ -1464,7 +1317,7 @@ impl CallableInfoObject {
     pub fn constant_slot_name<'a>(&self, nogc: &'a NoGc<'a>, idx: usize) -> SlotName {
         let v = self.constants.heap_ref(nogc).at(idx);
         let name = v
-            .get_as::<InternedString>(nogc)
+            .get_as::<DenseString>(nogc)
             .expect("property name constant must be an interned string");
         SlotName::from(name.into_tagged())
     }
@@ -1737,7 +1590,7 @@ pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
             ObjectKind::Map => (*addr.cast::<Map>().as_ptr()).layout(),
             ObjectKind::FixedArray => (*addr.cast::<FixedArray>().as_ptr()).layout(),
             ObjectKind::FixedByteArray => (*addr.cast::<FixedByteArray>().as_ptr()).layout(),
-            ObjectKind::VMString => (*addr.cast::<VMString>().as_ptr()).layout(),
+            ObjectKind::DenseString => (*addr.cast::<DenseString>().as_ptr()).layout(),
             ObjectKind::AccessorPair => (*addr.cast::<AccessorPair>().as_ptr()).layout(),
             ObjectKind::CallableInfo => (*addr.cast::<CallableInfoObject>().as_ptr()).layout(),
             ObjectKind::Float => (*addr.cast::<Float>().as_ptr()).layout(),
@@ -1767,7 +1620,7 @@ pub unsafe fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
             ObjectKind::FixedByteArray => {
                 (*addr.cast::<FixedByteArray>().as_ptr()).visit_edges(visitor)
             }
-            ObjectKind::VMString => (*addr.cast::<VMString>().as_ptr()).visit_edges(visitor),
+            ObjectKind::DenseString => (*addr.cast::<DenseString>().as_ptr()).visit_edges(visitor),
             ObjectKind::AccessorPair => {
                 (*addr.cast::<AccessorPair>().as_ptr()).visit_edges(visitor)
             }

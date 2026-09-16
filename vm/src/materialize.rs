@@ -158,7 +158,8 @@ fn intern(
     vm: &VM,
     s: &[u8],
 ) -> crate::Value {
-    // constant strings are WTF-8 (lone surrogates as the 3-byte pattern);
-    // the interner is byte-based, so they round-trip without loss
-    vm.interner().intern(heap, scope, s).value()
+    let units = crate::decode_wtf8(s).expect("parser produces valid WTF-8 string constants");
+    vm.interner()
+        .intern(heap, scope, crate::StringData::Utf16(&units))
+        .value()
 }

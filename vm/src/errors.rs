@@ -12,8 +12,8 @@ pub fn error_from_vm_error(
     err: VmError,
 ) -> Result<Value, VmError> {
     state.handle_scope(|scope| {
-        let name_value = vm.interner().intern(heap, &scope, err.name());
-        let message_value = vm.interner().intern(heap, &scope, err.message());
+        let name_value = vm.interner().intern_str(heap, &scope, err.name());
+        let message_value = vm.interner().intern_str(heap, &scope, err.message());
 
         // per-class maps carry the right prototype chain (.constructor etc.)
         let map = match err.name() {
