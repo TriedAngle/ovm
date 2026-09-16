@@ -80,11 +80,12 @@ fn native_result_is_boxed_when_not_smi() {
 
 #[test]
 fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let idx = vm.register_native(smi_add);
     let mut thread = vm.attach();
     let args = [smi(0), smi(1)]; // arity error for smi_add
 
-    let result = native_trampoline(smi_add, &mut thread, args.as_ptr(), args.len() as u32);
+    let result = unsafe { native_trampoline(idx.0, &mut thread, args.as_ptr(), args.len() as u32) };
 
     assert_eq!(result, vm.known().exception.value());
     let ex = thread
