@@ -1,0 +1,489 @@
+use core::alloc::Layout;
+
+use crate::{
+    Compare, DenseString, EdgeVisitable, FixedArray, GcSlot, Handle, Header, HeapObject, HeapRef,
+    NoGc, ObjectKind, OptionGcSlot, Smi, Symbol, Tagged, TransitionGuard, Value, Visitor,
+};
+
+#[repr(C)]
+pub struct Map {
+    pub header: Header,
+    pub value_slot_count: GcSlot<Smi>,
+    pub descriptor_count: GcSlot<Smi>,
+    /// Object kind tag (low byte) and capability flags (second byte).
+    pub kind: GcSlot<Smi>,
+    /// The prototype(s) for property lookup:
+    /// - an object: single parent (JS `[[Prototype]]`)
+    /// - a `FixedArray` of objects: multiple parents in priority order (Self-style `parent*`)
+    /// - the hole: no parents (null-proto root)
+    pub prototype: GcSlot,
+    /// Empty, or a `FixedArray` of flat `[name, target_map]` transition pairs.
+    // TODO: make transition targets weak (V8 does this so unused shape subtrees die)
+    pub transitions: OptionGcSlot<FixedArray>,
+    pub descriptors: [SlotDescriptor; 0],
+}
+
+impl Map {
+    pub fn layout_for(descriptor_count: usize) -> Layout {
+        let descriptors_layout =
+            Layout::array::<SlotDescriptor>(descriptor_count).expect("descriptors layout");
+        Layout::new::<Self>()
+            .extend(descriptors_layout)
+            .expect("map layout")
+            .0
+    }
+
+    pub fn value_slot_count(&self) -> usize {
+        self.value_slot_count.to_smi().value() as usize
+    }
+
+    pub fn descriptor_count(&self) -> usize {
+        self.descriptor_count.to_smi().value() as usize
+    }
+
+    pub fn kind(&self) -> MapKind {
+        MapKind::new(self.kind.to_smi().value() as u64)
+    }
+
+    fn data_ptr(&self) -> *mut SlotDescriptor {
+        self.descriptors.as_ptr() as *mut SlotDescriptor
+    }
+
+    pub fn descriptors(&self) -> &[SlotDescriptor] {
+        unsafe { core::slice::from_raw_parts(self.data_ptr(), self.descriptor_count()) }
+    }
+
+    pub fn descriptor(&self, i: usize) -> &SlotDescriptor {
+        debug_assert!(i < self.descriptor_count());
+        unsafe { &*self.data_ptr().add(i) }
+    }
+
+    pub fn find_transition<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        name: SlotName,
+        flags: SlotFlags,
+        pair: Option<(Value, Value)>,
+    ) -> Option<HeapRef<'a, Map>> {
+        let lock = nogc.transition_lock();
+        let guard = lock.acquire();
+        self.find_transition_locked(nogc, name, flags, pair, &guard)
+    }
+
+    pub fn find_transition_locked<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        name: SlotName,
+        flags: SlotFlags,
+        pair: Option<(Value, Value)>,
+        _guard: &TransitionGuard<'_>,
+    ) -> Option<HeapRef<'a, Map>> {
+        let array = self.transitions.heap_ref(nogc)?;
+        let pairs = array.as_slice();
+        debug_assert!(
+            pairs.len() % 2 == 0,
+            "transition pairs are flat [name, map]"
+        );
+        for entry in pairs.chunks_exact(2) {
+            if entry[0].inner() != name.value() {
+                continue;
+            }
+
+            let target = entry[1]
+                .inner()
+                .get_as::<Map>(nogc)
+                .expect("transition target must be a map");
+
+            // adds append the property (last descriptor), redefines keep
+            // its index: either way the descriptor row for `name` must
+            // carry the requested flags. This lets adds and redefines
+            // share one transition tree — identical shapes, identical maps.
+            let Some(row) = target
+                .descriptors()
+                .iter()
+                .find(|d| d.name() == name && d.flags() == flags)
+            else {
+                continue;
+            };
+
+            // accessor rows embed the AccessorPair: the cached map is only
+            // reusable when the pair is identical (same-name accessors with
+            // different pairs get separate tree entries)
+            if let Some((get, set)) = pair {
+                let matches = row
+                    .value
+                    .inner()
+                    .get_as::<AccessorPair>(nogc)
+                    .is_some_and(|p| {
+                        Compare::same_value(nogc, get, p.get.inner())
+                            && Compare::same_value(nogc, set, p.set.inner())
+                    });
+                if !matches {
+                    continue;
+                }
+            }
+            return Some(target);
+        }
+        None
+    }
+
+    /// Find the recorded remove-transition for `name`: a child map that
+    /// lacks the descriptor and holds exactly one fewer. Add and redefine
+    /// transitions key their pair by the target's own descriptor row for
+    /// `name`; a removal target has no such row, so the two pair
+    /// populations sharing one name never collide.
+    pub fn find_remove_transition_locked<'a>(
+        &self,
+        nogc: &'a NoGc<'a>,
+        name: SlotName,
+        _guard: &TransitionGuard<'_>,
+    ) -> Option<HeapRef<'a, Map>> {
+        let array = self.transitions.heap_ref(nogc)?;
+        let pairs = array.as_slice();
+        debug_assert!(
+            pairs.len() % 2 == 0,
+            "transition pairs are flat [name, map]"
+        );
+        for entry in pairs.chunks_exact(2) {
+            if entry[0].inner() != name.value() {
+                continue;
+            }
+            let target = entry[1]
+                .inner()
+                .get_as::<Map>(nogc)
+                .expect("transition target must be a map");
+            if target.descriptor_count() + 1 == self.descriptor_count()
+                && !target.descriptors().iter().any(|d| d.name() == name)
+            {
+                return Some(target);
+            }
+        }
+        None
+    }
+}
+
+pub struct MapInit<'a> {
+    pub kind: MapKind,
+    pub value_slot_count: usize,
+    pub descriptors: &'a [(SlotName, SlotFlags, Value)],
+    /// the hole = no prototype (null-proto for JS maps).
+    /// Handled because `Map` allocation may move the prototype.
+    pub prototype: Handle<'a, Value>,
+}
+
+impl HeapObject for Map {
+    const KIND: ObjectKind = ObjectKind::Map;
+    type Init<'a> = MapInit<'a>;
+
+    fn layout_for(config: &Self::Init<'_>) -> Layout {
+        Self::layout_for(config.descriptors.len())
+    }
+
+    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(nogc, host, nogc.known().map_map.as_tagged());
+        self.value_slot_count
+            .set(nogc, host, Smi::new(config.value_slot_count as i64));
+        self.descriptor_count
+            .set(nogc, host, Smi::new(config.descriptors.len() as i64));
+        self.kind
+            .set(nogc, host, Smi::new(config.kind.bits() as i64));
+        self.prototype.set(nogc, host, config.prototype.value());
+        self.transitions.clear(nogc.heap());
+        for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
+            let d = self.descriptor(i);
+            d.name.set(nogc, host, name.tagged());
+            d.flags.set(nogc, host, Smi::new(flags.bits() as i64));
+            d.value.set(nogc, host, *value);
+        }
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Self::layout_for(self.descriptor_count())
+    }
+}
+
+impl EdgeVisitable for Map {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.prototype.as_raw());
+        visitor.visit(self.transitions.as_raw());
+        for d in self.descriptors() {
+            visitor.visit(d.name.as_raw());
+            visitor.visit(d.value.as_raw());
+        }
+    }
+}
+
+/// Low byte: the `ObjectKind`. Higher bytes: capability flags
+/// (extendable, callable, constructor, native) and representation flags
+/// (Latin1 string payloads). Constructor implies callable.
+/// NATIVE is only valid together with CALLABLE and means slots[0] of the
+/// object is a Smi native registry index instead of a `CallableInfoObject`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct MapKind(u64);
+
+impl MapKind {
+    const KIND_MASK: u64 = 0xff;
+
+    pub const EXTENDABLE: MapKind = MapKind(1 << 8);
+    pub const CALLABLE: MapKind = MapKind(1 << 9);
+    pub const CONSTRUCTOR: MapKind = MapKind(1 << 10);
+    pub const NATIVE: MapKind = MapKind(1 << 11);
+    pub const PRIMITIVE_WRAPPER: MapKind = MapKind(1 << 12);
+    pub const CLASS_CONSTRUCTOR: MapKind = MapKind(1 << 13);
+    /// Dense-string payload encoding: set = one Latin-1 byte per code
+    /// unit, clear = one UTF-16 code unit. Only meaningful (and always
+    /// accurate) on `DENSE_STRING` maps — future string representations
+    /// get their own kinds/flags.
+    pub const LATIN1: MapKind = MapKind(1 << 14);
+
+    pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
+    pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
+    pub const FIXED_BYTE_ARRAY: MapKind = MapKind(ObjectKind::FixedByteArray as u64);
+    pub const DENSE_STRING: MapKind = MapKind(ObjectKind::DenseString as u64);
+    pub const ACCESSOR_PAIR: MapKind = MapKind(ObjectKind::AccessorPair as u64);
+    pub const CALLABLE_INFO: MapKind = MapKind(ObjectKind::CallableInfo as u64);
+    pub const FLOAT: MapKind = MapKind(ObjectKind::Float as u64);
+    pub const SYMBOL: MapKind = MapKind(ObjectKind::Symbol as u64);
+    pub const HANDLER_TABLE: MapKind = MapKind(ObjectKind::HandlerTable as u64);
+    pub const CONTEXT: MapKind = MapKind(ObjectKind::Context as u64);
+    pub const SCOPE_INFO: MapKind = MapKind(ObjectKind::ScopeInfo as u64);
+    pub const OBJECT: MapKind = MapKind(ObjectKind::Object as u64);
+    pub const ARRAY: MapKind = MapKind(ObjectKind::Array as u64);
+    pub const BYTE_ARRAY: MapKind = MapKind(ObjectKind::ByteArray as u64);
+    pub const STRING: MapKind = MapKind(ObjectKind::String as u64);
+    pub const PROXY: MapKind = MapKind(ObjectKind::Proxy as u64);
+    pub const ODDBALL: MapKind = MapKind(ObjectKind::Oddball as u64);
+
+    pub const fn new(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, flags: Self) -> bool {
+        self.0 & flags.0 == flags.0
+    }
+
+    // TODO: consider transmute with debug assert
+    pub const fn kind(self) -> ObjectKind {
+        match Self(self.0 & Self::KIND_MASK) {
+            Self::MAP => ObjectKind::Map,
+            Self::FIXED_ARRAY => ObjectKind::FixedArray,
+            Self::FIXED_BYTE_ARRAY => ObjectKind::FixedByteArray,
+            Self::DENSE_STRING => ObjectKind::DenseString,
+            Self::ACCESSOR_PAIR => ObjectKind::AccessorPair,
+            Self::CALLABLE_INFO => ObjectKind::CallableInfo,
+            Self::FLOAT => ObjectKind::Float,
+            Self::SYMBOL => ObjectKind::Symbol,
+            Self::HANDLER_TABLE => ObjectKind::HandlerTable,
+            Self::CONTEXT => ObjectKind::Context,
+            Self::SCOPE_INFO => ObjectKind::ScopeInfo,
+            Self::OBJECT => ObjectKind::Object,
+            Self::ARRAY => ObjectKind::Array,
+            Self::BYTE_ARRAY => ObjectKind::ByteArray,
+            Self::STRING => ObjectKind::String,
+            Self::PROXY => ObjectKind::Proxy,
+            Self::ODDBALL => ObjectKind::Oddball,
+            _ => panic!("invalid object kind"),
+        }
+    }
+
+    pub const fn is_builtin(self) -> bool {
+        let kind = self.0 & Self::KIND_MASK;
+        kind > ObjectKind::BUILTIN_START && kind < ObjectKind::BUILTIN_END
+    }
+
+    pub const fn is_extendable(self) -> bool {
+        self.0 & Self::EXTENDABLE.0 != 0
+    }
+
+    pub const fn is_callable(self) -> bool {
+        self.0 & Self::CALLABLE.0 != 0
+    }
+
+    pub const fn is_native(self) -> bool {
+        self.0 & Self::NATIVE.0 != 0
+    }
+
+    pub const fn is_constructor(self) -> bool {
+        self.0 & Self::CONSTRUCTOR.0 != 0
+    }
+
+    pub const fn is_class_constructor(self) -> bool {
+        self.0 & Self::CLASS_CONSTRUCTOR.0 != 0
+    }
+}
+
+/// Descriptor flags. Data values live in the object's slots (the descriptor
+/// holds a Smi offset); accessors embed the `AccessorPair` in the descriptor.
+/// Writability is the WRITABLE attribute bit — there is no separate const kind.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SlotFlags(u64);
+
+impl SlotFlags {
+    pub const ACCESSOR: SlotFlags = SlotFlags(1 << 0);
+    pub const WRITABLE: SlotFlags = SlotFlags(1 << 1);
+    pub const CONFIGURABLE: SlotFlags = SlotFlags(1 << 2);
+    pub const ENUMERABLE: SlotFlags = SlotFlags(1 << 3);
+
+    /// The plain data slot: no flags set.
+    pub const VALUE: SlotFlags = SlotFlags(0);
+
+    pub const fn new(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn is_accessor(self) -> bool {
+        self.0 & Self::ACCESSOR.0 != 0
+    }
+
+    pub const fn is_writable(self) -> bool {
+        self.0 & Self::WRITABLE.0 != 0
+    }
+
+    pub const fn is_configurable(self) -> bool {
+        self.0 & Self::CONFIGURABLE.0 != 0
+    }
+
+    pub const fn is_enumerable(self) -> bool {
+        self.0 & Self::ENUMERABLE.0 != 0
+    }
+}
+
+#[repr(C)]
+pub struct SlotDescriptor {
+    pub name: GcSlot<SlotName>,
+    pub flags: GcSlot<Smi>,
+    pub value: GcSlot,
+}
+
+impl SlotDescriptor {
+    pub fn name(&self) -> SlotName {
+        SlotName(self.name.inner())
+    }
+
+    pub fn flags(&self) -> SlotFlags {
+        SlotFlags::new(self.flags.to_smi().value() as u64)
+    }
+
+    pub fn offset(&self) -> usize {
+        Smi::decode(self.value.inner())
+            .expect("slot offset")
+            .value() as usize
+    }
+}
+
+/// A property name: a string (the interner's canonical instance, by
+/// convention — names compare by pointer), a symbol, or a smi index.
+#[repr(transparent)]
+#[derive(Debug, Copy, Clone)]
+pub struct SlotName(Value);
+
+impl SlotName {
+    pub fn value(self) -> Value {
+        self.0
+    }
+
+    pub fn from_value(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub fn tagged(self) -> Tagged<SlotName> {
+        unsafe { Tagged::from_value_unchecked(self.0) }
+    }
+}
+
+impl From<Tagged<Symbol>> for SlotName {
+    fn from(symbol: Tagged<Symbol>) -> Self {
+        Self(symbol.erase())
+    }
+}
+
+impl From<Tagged<DenseString>> for SlotName {
+    fn from(string: Tagged<DenseString>) -> Self {
+        Self(string.erase())
+    }
+}
+
+impl From<Tagged<Smi>> for SlotName {
+    fn from(smi: Tagged<Smi>) -> Self {
+        Self(smi.erase())
+    }
+}
+
+impl From<Handle<'_, SlotName>> for SlotName {
+    fn from(name: Handle<'_, SlotName>) -> Self {
+        Self::from_value(name.value())
+    }
+}
+
+impl PartialEq for SlotName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for SlotName {}
+
+#[repr(C)]
+pub struct AccessorPair {
+    pub header: Header,
+    pub get: GcSlot,
+    pub set: GcSlot,
+}
+
+impl HeapObject for AccessorPair {
+    const KIND: ObjectKind = ObjectKind::AccessorPair;
+    type Init<'a> = (Value, Value);
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Layout::new::<Self>()
+    }
+
+    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header
+            .map
+            .set(nogc, host, nogc.known().accessor_pair_map.as_tagged());
+        self.get.set(nogc, host, config.0);
+        self.set.set(nogc, host, config.1);
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Layout::new::<Self>()
+    }
+}
+
+impl EdgeVisitable for AccessorPair {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.get.as_raw());
+        visitor.visit(self.set.as_raw());
+    }
+}
