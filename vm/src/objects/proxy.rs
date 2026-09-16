@@ -1,11 +1,74 @@
+use core::alloc::Layout;
+
 use crate::{
-    Compare, ContextState, Convert, Handle, HandleScope, Heap, Key, Lookup, Map, NativeContext,
-    NoGc, Object, PartialDescriptor, PropertyDescriptor, ProxyObject, SlotName, VM, Value, VmError,
-    is_compatible_property_descriptor,
+    Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap,
+    HeapObject, Key, Lookup, Map, NativeContext, NoGc, Object, ObjectKind, PartialDescriptor,
+    PropertyDescriptor, SlotName, VM, Value, Visitor, VmError, is_compatible_property_descriptor,
     lookup::has_property,
     runtime::{Coercion, Runtime},
     store_array_element,
 };
+
+#[repr(C)]
+pub struct ProxyObject {
+    pub header: Header,
+    pub target: GcSlot,
+    pub handler: GcSlot,
+}
+
+pub struct ProxyInit<'a> {
+    pub map: Handle<'a, Map>,
+    pub target: Value,
+    pub handler: Value,
+}
+
+impl ProxyObject {
+    pub fn layout_for() -> Layout {
+        Layout::new::<Self>()
+    }
+
+    /// Whether the proxy has been revoked (handler nulled).
+    pub fn is_revoked<'a>(&self, nogc: &'a NoGc<'a>) -> bool {
+        self.handler.inner() == nogc.known().null.value()
+    }
+
+    /// (target, handler) as raw values; caller checks revocation.
+    pub fn parts(&self) -> (Value, Value) {
+        (self.target.inner(), self.handler.inner())
+    }
+}
+
+impl HeapObject for ProxyObject {
+    const KIND: ObjectKind = ObjectKind::Proxy;
+    type Init<'a> = ProxyInit<'a>;
+
+    fn layout_for(_config: &Self::Init<'_>) -> Layout {
+        Self::layout_for()
+    }
+
+    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+        let host = self.erase();
+        self.header.map.set(nogc, host, config.map.as_tagged());
+        self.target.set(nogc, host, config.target);
+        self.handler.set(nogc, host, config.handler);
+    }
+
+    fn header(&self) -> &Header {
+        &self.header
+    }
+
+    fn layout(&self) -> Layout {
+        Self::layout_for()
+    }
+}
+
+impl EdgeVisitable for ProxyObject {
+    fn visit_edges(&self, visitor: &mut dyn Visitor) {
+        visitor.visit(self.header.map.as_raw());
+        visitor.visit(self.target.as_raw());
+        visitor.visit(self.handler.as_raw());
+    }
+}
 
 /// `Ok(Flow::Threw)` means user code threw and the pending exception is
 /// set (the caller surfaces the exception sentinel).
