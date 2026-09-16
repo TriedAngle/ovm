@@ -224,6 +224,17 @@ fn wtf8_string_contents() {
             vec![0xED, 0xA0, 0x80],       // lone surrogate: WTF-8 3-byte pattern
         ]
     );
+
+    // \xNN is a code point escape: high values encode as UTF-8, never a
+    // raw byte (the content must stay valid WTF-8)
+    let mut sc = Scanner::new(Utf8SliceStream::new(r"'\xE9'"));
+    let t = sc.next_token().expect("scan error");
+    assert_eq!(
+        sc.symbols()
+            .get(parser::Symbol(t.value.symbol().unwrap()))
+            .to_vec(),
+        vec![0xC3, 0xA9] // U+00E9
+    );
 }
 
 #[test]

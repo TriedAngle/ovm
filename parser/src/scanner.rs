@@ -679,7 +679,9 @@ impl<S: CharStream> Scanner<S> {
             c if c == b'x' as u32 => {
                 self.stream.advance();
                 let v = self.scan_hex(2)?;
-                out.push(v as u8);
+                // \xNN names a code point (0xNN), not a raw byte: encode
+                // it so "\xE9" equals "é" and the content stays valid WTF-8
+                push_wtf8(out, v);
                 return Ok(());
             }
             c if c == b'u' as u32 => {

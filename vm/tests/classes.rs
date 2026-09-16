@@ -5,8 +5,8 @@
 //! calls) plus the observable edge cases.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
+use vm::{DenseString, SlotName, Smi, Value};
 use vm::{ScriptError, Thread, VM};
-use vm::{SlotName, Smi, VMString, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -39,8 +39,8 @@ fn run_bool(src: &str) -> bool {
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
     thread.heap().no_gc(|nogc| {
-        let s = result.get_as::<VMString>(nogc).expect("string result");
-        String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
+        let s = result.get_as::<DenseString>(nogc).expect("string result");
+        s.to_rust_string(nogc)
     })
 }
 
@@ -65,9 +65,9 @@ fn run_error_name(src: &str) -> String {
                 vm::Lookup::Data { slot, .. } => {
                     let s = slot
                         .inner()
-                        .get_as::<VMString>(nogc)
+                        .get_as::<DenseString>(nogc)
                         .expect("error name is a string");
-                    String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
+                    s.to_rust_string(nogc)
                 }
                 _ => panic!("error object must have a name property"),
             }

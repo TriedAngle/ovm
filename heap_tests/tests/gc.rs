@@ -1,6 +1,6 @@
 use heap_tests::for_each_backend;
 
-use vm::{FixedArray, HeapBackend, SlotName, Smi, VMString};
+use vm::{DenseString, FixedArray, HeapBackend, SlotName, Smi};
 
 fn well_known_survive_cycles<B: HeapBackend>()
 where
@@ -21,7 +21,8 @@ where
         known.smi_map.value(),
         known.float_map.value(),
         known.array_map.value(),
-        known.string_map.value(),
+        known.dense_latin1_string_map.value(),
+        known.dense_utf16_string_map.value(),
         known.object_prototype.value(),
         known.object_initial_map.value(),
         known.empty_fixed_array.value(),
@@ -53,7 +54,7 @@ where
     let mut thread = vm.attach();
 
     thread.handle_scope(|t, scope| {
-        let string = VMString::from_bytes(t.heap(), &scope, b"survivor");
+        let string = DenseString::from_latin1(t.heap(), &scope, b"survivor");
         let array = t
             .heap()
             .allocate_handle::<FixedArray>(&[Smi::new(42).encode(), string.value()], &scope);
@@ -69,7 +70,7 @@ where
             assert_eq!(Smi::decode(array.at(0)).unwrap().value(), 42);
             assert_eq!(array.at(1), string.value());
             let string = string.heap_ref(nogc);
-            assert_eq!(string.as_slice(nogc), b"survivor");
+            assert!(string.data(nogc).matches_ascii(b"survivor"));
         });
     });
 }

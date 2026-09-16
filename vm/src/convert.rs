@@ -1,4 +1,4 @@
-use crate::{Float, HandleScope, Heap, NoGc, Smi, Symbol, VMString, Value, VmError};
+use crate::{DenseString, Float, HandleScope, Heap, NoGc, Smi, StringData, Symbol, Value, VmError};
 
 pub struct Convert;
 
@@ -25,8 +25,8 @@ impl Convert {
             // -0.0 compares equal to 0.0; NaN compares unequal to everything
             return x != 0.0 && !x.is_nan();
         }
-        if let Some(s) = v.get_as::<VMString>(nogc) {
-            return s.len(nogc) != 0;
+        if let Some(s) = v.get_as::<DenseString>(nogc) {
+            return !s.is_empty();
         }
         true
     }
@@ -51,43 +51,47 @@ impl Convert {
         if let Some(f) = v.get_as::<Float>(nogc) {
             return Ok(f.value.get());
         }
-        if let Some(s) = v.get_as::<VMString>(nogc) {
-            return Ok(Self::string_to_number(s.as_slice(nogc)).unwrap_or(f64::NAN));
+        if let Some(s) = v.get_as::<DenseString>(nogc) {
+            return Ok(Self::string_to_number(s.data(nogc)).unwrap_or(f64::NAN));
         }
         Err(VmError::Type)
     }
 
     /// StringNumericLiteral → f64 (ES 7.1.4.1). `None` means NaN (invalid
     /// numeric content); empty or all-whitespace input is +0.
-    fn string_to_number(bytes: &[u8]) -> Option<f64> {
-        let mut s = bytes;
-        while let Some((b, rest)) = s.split_first() {
-            if b.is_ascii_whitespace() {
-                s = rest;
-            } else {
-                break;
-            }
+    fn string_to_number(data: StringData<'_>) -> Option<f64> {
+        // ES trims the same whitespace set as before the re-encoding;
+        // the numeric grammar itself is pure ASCII
+        let is_ws = |c: u16| c == 0x20 || (0x09..=0x0d).contains(&c);
+        let unit = |i: usize| data.code_unit(i);
+        let mut lo = 0usize;
+        let mut hi = data.len();
+        while lo < hi && is_ws(unit(lo)) {
+            lo += 1;
         }
-        while let Some((b, rest)) = s.split_last() {
-            if b.is_ascii_whitespace() {
-                s = rest;
-            } else {
-                break;
-            }
+        while hi > lo && is_ws(unit(hi - 1)) {
+            hi -= 1;
         }
-        if s.is_empty() {
+        let matches = |lit: &[u8]| {
+            hi - lo == lit.len() && (lo..hi).zip(lit).all(|(i, &b)| unit(i) == b as u16)
+        };
+        if hi == lo {
             return Some(0.0);
         }
-        if s == b"Infinity" || s == b"+Infinity" {
+        if matches(b"Infinity") || matches(b"+Infinity") {
             return Some(f64::INFINITY);
         }
-        if s == b"-Infinity" {
+        if matches(b"-Infinity") {
             return Some(f64::NEG_INFINITY);
         }
-        if s == b"NaN" {
+        if matches(b"NaN") {
             return Some(f64::NAN);
         }
-        let text = core::str::from_utf8(s).ok()?;
+        // any unit above 0x7F cannot participate in a numeric literal
+        let bytes: Vec<u8> = (lo..hi)
+            .map(|i| u8::try_from(unit(i)).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        let text = core::str::from_utf8(&bytes).ok()?;
         text.parse::<f64>().ok()
     }
 
@@ -115,7 +119,7 @@ impl Convert {
             || v == known.true_object.value()
             || v == known.false_object.value()
             || v.get_as::<Float>(nogc).is_some()
-            || v.get_as::<VMString>(nogc).is_some()
+            || v.get_as::<DenseString>(nogc).is_some()
             || v.get_as::<Symbol>(nogc).is_some()
     }
 
@@ -124,9 +128,7 @@ impl Convert {
     /// TypeError. The oddball identity strings come from the string table.
     pub fn to_string(heap: &mut Heap, scope: &HandleScope<'_>, v: Value) -> Result<Value, VmError> {
         if let Some(smi) = Smi::decode(v) {
-            return Ok(
-                VMString::from_bytes(heap, scope, smi.value().to_string().as_bytes()).value(),
-            );
+            return Ok(DenseString::from_utf8(heap, scope, &smi.value().to_string()).value());
         }
         let known = heap.known();
         if v == known.undefined.value() {
@@ -147,7 +149,7 @@ impl Convert {
             Other,
         }
         let kind = heap.no_gc(|nogc| {
-            if v.get_as::<VMString>(nogc).is_some() {
+            if v.get_as::<DenseString>(nogc).is_some() {
                 PrimitiveString::IsString
             } else if let Some(f) = v.get_as::<Float>(nogc) {
                 PrimitiveString::Float(f.value.get())
@@ -168,7 +170,7 @@ impl Convert {
                 } else {
                     format!("{x}")
                 };
-                Ok(VMString::from_bytes(heap, scope, text.as_bytes()).value())
+                Ok(DenseString::from_utf8(heap, scope, &text).value())
             }
             // symbols (and anything else reaching this point) are a TypeError
             PrimitiveString::Other => Err(VmError::Type),

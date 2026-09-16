@@ -2,7 +2,7 @@
 //! instance and static, plus the private-name semantics of ES 7.3.26–33.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{Smi, VM, VMString, Value};
+use vm::{DenseString, Smi, VM, Value};
 
 fn run(src: &str) -> Result<Value, vm::ScriptError> {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -19,8 +19,8 @@ fn run_str(src: &str) -> String {
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
     thread.heap().no_gc(|nogc| {
-        let s = v.get_as::<VMString>(nogc).expect("string result");
-        String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
+        let s = v.get_as::<DenseString>(nogc).expect("string result");
+        s.to_rust_string(nogc)
     })
 }
 

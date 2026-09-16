@@ -6,8 +6,8 @@
 //! functions (interpreter `CreateClosure`).
 
 use crate::{
-    Context, Convert, GcSlice, Handle, HandleScope, Heap, Map, MapInit, MapKind, Object,
-    PropertyDescriptor, SlotFlags, SlotName, Smi, Symbol, VMString, Value, VmError,
+    Context, Convert, DenseString, GcSlice, Handle, HandleScope, Heap, Map, MapInit, MapKind,
+    Object, PropertyDescriptor, SlotFlags, SlotName, Smi, Symbol, Value, VmError,
 };
 use base_compiler::compile_eval;
 
@@ -1114,8 +1114,8 @@ fn eval_native(
         let (_vm, heap, _) = nctx.split();
         let s = Convert::to_string(heap, &scope, src)?;
         heap.no_gc(|nogc| {
-            s.get_as::<VMString>(nogc)
-                .and_then(|s| s.as_str(nogc).map(|s| s.to_owned()))
+            s.get_as::<DenseString>(nogc)
+                .map(|s| s.to_rust_string(nogc))
                 .ok_or(VmError::Type)
         })
     })?;
@@ -1321,7 +1321,7 @@ fn make_error(
         let (vm, heap, _) = nctx.split();
         let message = match args.get(1) {
             Some(v) => Convert::to_string(heap, &scope, v)?,
-            None => vm.interner().intern(heap, &scope, "").value(),
+            None => vm.interner().intern_str(heap, &scope, "").value(),
         };
         let map = match class {
             "TypeError" => heap.known().type_error_map,
@@ -1331,7 +1331,7 @@ fn make_error(
         let obj = heap.new_object(&scope, map, &[]).into_handle(&scope);
         let name = heap.known().strings.name;
         let message_key = heap.known().strings.message;
-        let class_value = vm.interner().intern(heap, &scope, class);
+        let class_value = vm.interner().intern_str(heap, &scope, class);
         let message_value = scope.handle(message);
         Object::define_own_property(
             heap,
@@ -1905,19 +1905,19 @@ fn symbol_constructor(
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     let desc = args.get(1);
-    let bytes = nctx.heap().no_gc(|nogc| {
-        desc.and_then(|d| {
-            d.get_as::<VMString>(nogc)
-                .map(|s| s.as_slice(nogc).to_vec())
-        })
+    let desc_text = nctx.heap().no_gc(|nogc| {
+        desc.and_then(|d| d.get_as::<DenseString>(nogc))
+            .map(|s| s.to_rust_string(nogc))
     });
     nctx.handle_scope(|nctx, scope| {
-        let mut text = b"Symbol(".to_vec();
-        if let Some(d) = &bytes {
-            text.extend_from_slice(d);
+        let mut text = String::from("Symbol(");
+        if let Some(d) = &desc_text {
+            text.push_str(d);
         }
-        text.push(b')');
-        Ok(Symbol::new(nctx.heap(), &scope, &text).as_tagged().erase())
+        text.push(')');
+        Ok(Symbol::new(nctx.heap(), &scope, text.as_bytes())
+            .as_tagged()
+            .erase())
     })
 }
 
@@ -1939,8 +1939,8 @@ fn function_constructor(
             Convert::to_string(nctx.heap(), &scope, a)
         })?;
         parts.push(nctx.heap().no_gc(|nogc| {
-            s.get_as::<VMString>(nogc)
-                .map(|x| String::from_utf8_lossy(x.as_slice(nogc)).into_owned())
+            s.get_as::<DenseString>(nogc)
+                .map(|x| x.to_rust_string(nogc))
                 .unwrap_or_default()
         }));
     }
@@ -2012,9 +2012,9 @@ fn error_to_string(
         let (vm, heap, _) = nctx.split();
         let a = Convert::to_string(heap, &scope, name)?;
         let b = Convert::to_string(heap, &scope, message)?;
-        let colon = vm.interner().intern(heap, &scope, ": ");
-        let ab = VMString::concat(heap, &scope, a, colon.value());
-        Ok(VMString::concat(heap, &scope, ab.value(), b).value())
+        let colon = vm.interner().intern_str(heap, &scope, ": ");
+        let ab = DenseString::concat(heap, &scope, a, colon.value());
+        Ok(DenseString::concat(heap, &scope, ab.value(), b).value())
     })
 }
 
@@ -2078,7 +2078,10 @@ fn proxy_revocable(
         // Function.prototype.__makeRevoke (installed by REVOKE_PRELUDE)
         let make_revoke = {
             let (vm, heap, state) = nctx.split();
-            let name = vm.interner().intern(heap, &scope, "__makeRevoke").value();
+            let name = vm
+                .interner()
+                .intern_str(heap, &scope, "__makeRevoke")
+                .value();
             let proto = heap.known().function_prototype.value();
             match crate::runtime::Runtime::get_property(vm, heap, state, proto, name)? {
                 crate::runtime::Coercion::Threw => {
@@ -2327,7 +2330,7 @@ fn get_property(
     receiver: Value,
     name: &str,
 ) -> Result<Value, VmError> {
-    let name = state.handle_scope(|scope| vm.interner().intern(heap, &scope, name).value());
+    let name = state.handle_scope(|scope| vm.interner().intern_str(heap, &scope, name).value());
     match Runtime::get_property(vm, heap, state, receiver, name)? {
         crate::runtime::Coercion::Value(v) => Ok(v),
         crate::runtime::Coercion::Threw => Ok(heap.known().exception.value()),

@@ -1,16 +1,41 @@
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Mutex;
 
 use crate::{
-    EdgeVisitable, FixedByteArray, Handle, HandleSet, Heap, InternedString, Visitor,
-    heap::WeakGcCell, string_content_hash,
+    DenseString, EdgeVisitable, Handle, HandleSet, Heap, NoGc, StringData, Visitor,
+    string_content_hash,
 };
 
+use crate::heap::WeakGcCell;
+
+enum InternKey {
+    Latin1(Box<[u8]>),
+    Utf16(Box<[u16]>),
+}
+
+impl InternKey {
+    fn from_data(data: StringData<'_>) -> Self {
+        match data {
+            StringData::Latin1(b) => InternKey::Latin1(b.into()),
+            StringData::Utf16(u) if u.iter().all(|&c| c <= 0xFF) => {
+                InternKey::Latin1(u.iter().map(|&c| c as u8).collect())
+            }
+            StringData::Utf16(u) => InternKey::Utf16(u.into()),
+        }
+    }
+
+    fn data(&self) -> StringData<'_> {
+        match self {
+            InternKey::Latin1(b) => StringData::Latin1(b),
+            InternKey::Utf16(u) => StringData::Utf16(u),
+        }
+    }
+}
+
+type InternTable = HashMap<i64, Vec<(InternKey, WeakGcCell<DenseString>)>>;
+
 pub struct StringInterner {
-    /// keys are WTF-8: lone surrogates from JS string literals appear as
-    /// their 3-byte encoding, so keys are raw bytes, not `str`
-    table: Mutex<HashMap<Box<[u8]>, WeakGcCell<InternedString>>>,
+    table: Mutex<InternTable>,
 }
 
 impl StringInterner {
@@ -24,59 +49,111 @@ impl StringInterner {
         &self,
         heap: &mut Heap,
         scope: &'s impl HandleSet,
-        s: impl AsRef<[u8]>,
-    ) -> Handle<'s, InternedString> {
-        let s = s.as_ref();
-
-        {
+        data: StringData<'_>,
+    ) -> Handle<'s, DenseString> {
+        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|nogc| {
+            let hash = string_content_hash(data);
             let mut table = self.table.lock().unwrap();
-            if let Some(entry) = table.get(s) {
-                match handle_from_entry(heap, scope, entry) {
-                    Some(h) => return h,
-                    None => {
-                        // dead entry: prune and fall through to re-intern
-                        table.remove(s);
-                    }
-                }
+            match probe_unlocked(nogc, scope, &mut table, hash, data) {
+                Some(handle) => Ok(handle),
+                None => Err((InternKey::from_data(data), hash)),
             }
+        });
+        match staged {
+            Ok(handle) => handle,
+            Err((key, hash)) => self.insert_new(heap, scope, key, hash),
         }
+    }
 
-        let backing = heap.allocate::<FixedByteArray>(s).into_handle(scope);
-        let hash = string_content_hash(s);
+    pub fn intern_str<'s>(
+        &self,
+        heap: &mut Heap,
+        scope: &'s impl HandleSet,
+        s: &str,
+    ) -> Handle<'s, DenseString> {
+        if s.is_ascii() {
+            return self.intern(heap, scope, StringData::Latin1(s.as_bytes()));
+        }
+        let units: Vec<u16> = s.encode_utf16().collect();
+        self.intern(heap, scope, StringData::Utf16(&units))
+    }
+
+    pub fn intern_value<'s>(
+        &self,
+        heap: &mut Heap,
+        scope: &'s impl HandleSet,
+        s: &Handle<'_, DenseString>,
+    ) -> Handle<'s, DenseString> {
+        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|nogc| {
+            let r = s.heap_ref(nogc);
+            let hash = r.hash(nogc);
+            let mut table = self.table.lock().unwrap();
+            let data = r.data(nogc);
+            match probe_unlocked(nogc, scope, &mut table, hash, data) {
+                Some(handle) => Ok(handle),
+                None => Err((InternKey::from_data(data), hash)),
+            }
+        });
+        match staged {
+            Ok(handle) => handle,
+            Err((key, hash)) => self.insert_new(heap, scope, key, hash),
+        }
+    }
+
+    fn insert_new<'s>(
+        &self,
+        heap: &mut Heap,
+        scope: &'s impl HandleSet,
+        key: InternKey,
+        hash: i64,
+    ) -> Handle<'s, DenseString> {
         let handle = heap
-            .allocate::<InternedString>((backing, hash))
+            .allocate::<DenseString>((key.data(), hash))
             .into_handle(scope);
-
         let mut table = self.table.lock().unwrap();
-        match table.entry(s.into()) {
-            Entry::Occupied(mut e) => match handle_from_entry(heap, scope, e.get()) {
-                Some(h) => h,
-                // the entry died mid-race => replace it
-                None => {
-                    e.insert(WeakGcCell::new_strong(handle.get()));
-                    handle
-                }
-            },
-            Entry::Vacant(e) => {
-                e.insert(WeakGcCell::new_strong(handle.get()));
+        let raced = heap.no_gc(|nogc| probe_unlocked(nogc, scope, &mut table, hash, key.data()));
+        match raced {
+            Some(existing) => existing,
+            None => {
+                table
+                    .entry(hash)
+                    .or_default()
+                    .push((key, WeakGcCell::new_strong(handle.get())));
                 handle
             }
         }
     }
 }
 
-fn handle_from_entry<'s>(
-    heap: &mut Heap,
+fn probe_unlocked<'s, 'g>(
+    nogc: &'g NoGc<'g>,
     scope: &'s impl HandleSet,
-    entry: &WeakGcCell<InternedString>,
-) -> Option<Handle<'s, InternedString>> {
-    heap.no_gc(|nogc| entry.upgrade(nogc).map(|r| r.into_handle(scope)))
+    table: &mut InternTable,
+    hash: i64,
+    data: StringData<'_>,
+) -> Option<Handle<'s, DenseString>> {
+    let bucket = table.get_mut(&hash)?;
+    let mut i = 0;
+    while i < bucket.len() {
+        if bucket[i].0.data().eq(&data) {
+            if let Some(r) = bucket[i].1.upgrade(nogc) {
+                return Some(r.into_handle(scope));
+            }
+            // dead entry: prune and keep scanning
+            bucket.swap_remove(i);
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 impl EdgeVisitable for StringInterner {
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
-        for cell in self.table.lock().unwrap().values() {
-            visitor.visit(cell.as_raw());
+        for bucket in self.table.lock().unwrap().values() {
+            for (_, cell) in bucket {
+                visitor.visit(cell.as_raw());
+            }
         }
     }
 }

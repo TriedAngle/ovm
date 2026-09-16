@@ -1,7 +1,7 @@
 //! End-to-end: parse → resolve → compile → materialize → run.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{Float, FunctionKind, Lookup, SlotName, Smi, VMString, Value};
+use vm::{DenseString, Float, FunctionKind, Lookup, SlotName, Smi, Value};
 use vm::{ScriptError, Thread, VM};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
@@ -54,8 +54,8 @@ fn run_num(src: &str) -> f64 {
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
     thread.heap().no_gc(|nogc| {
-        let s = result.get_as::<VMString>(nogc).expect("string result");
-        String::from_utf8(s.as_slice(nogc).to_vec()).unwrap()
+        let s = result.get_as::<DenseString>(nogc).expect("string result");
+        s.to_rust_string(nogc)
     })
 }
 

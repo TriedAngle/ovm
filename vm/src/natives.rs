@@ -1,11 +1,11 @@
 use core::ptr::NonNull;
 
 use crate::{
-    AccessorPair, Context, Convert, FixedArray, GcSlice, Handle, HandleScope, Heap, HeapRef,
-    InternedString, Key, LoadOutcome, Lookup, NoGc, Object, ObjectSlotsInit, PropertyDescriptor,
-    SlotName, Smi, StoreOutcome, StoreSemantics, Symbol, Tagged, VMString, Value, VmError,
-    classify_key, function_kind_of, home_proto, load_outcome, private_find, runtime::Coercion,
-    super_constructor, super_lookup_from_proto, super_store_lookup,
+    AccessorPair, Context, Convert, DenseString, FixedArray, GcSlice, Handle, HandleScope, Heap,
+    HeapRef, Key, LoadOutcome, Lookup, NoGc, Object, ObjectSlotsInit, PropertyDescriptor, SlotName,
+    Smi, StoreOutcome, StoreSemantics, StringData, Symbol, Tagged, Value, VmError, classify_key,
+    function_kind_of, home_proto, load_outcome, private_find, runtime::Coercion, super_constructor,
+    super_lookup_from_proto, super_store_lookup,
 };
 
 use crate::{ContextState, Thread, VM};
@@ -66,12 +66,8 @@ impl<'a> NativeContext<'a> {
         self.heap
     }
 
-    pub fn intern<'s>(
-        &mut self,
-        scope: &'s HandleScope<'_>,
-        s: impl AsRef<[u8]>,
-    ) -> Handle<'s, InternedString> {
-        self.vm.interner().intern(self.heap, scope, s)
+    pub fn intern<'s>(&mut self, scope: &'s HandleScope<'_>, s: &str) -> Handle<'s, DenseString> {
+        self.vm.interner().intern_str(self.heap, scope, s)
     }
 
     pub fn set_pending_exception(&mut self, err: VmError) {
@@ -374,105 +370,36 @@ fn delete_property_core(
 /// 10.4.3.3/4 StringGetOwnProperty). Deleting those yields false; every
 /// other primitive property deletes as absent (true).
 fn string_exotic_own<'a>(nogc: &'a NoGc<'a>, target: Value, key: Value) -> bool {
-    let Some(s) = target.get_as::<VMString>(nogc) else {
+    let Some(s) = target.get_as::<DenseString>(nogc) else {
         return false;
     };
     if let Some(idx) = Smi::decode(key) {
         let i = idx.value();
-        return i >= 0 && (i as u64) < utf16_length(s.as_slice(nogc)) as u64;
+        return i >= 0 && (i as u64) < s.len() as u64;
     }
-    let Some(name) = key.get_as::<InternedString>(nogc) else {
+    let Some(name) = key.get_as::<DenseString>(nogc) else {
         return false; // symbols own nothing on primitives
     };
-    let bytes = name.string().as_slice(nogc);
-    bytes == b"length"
-        || crate::lookup::canonical_index(bytes).is_some_and(|i| i < utf16_length(s.as_slice(nogc)))
-}
-
-/// WTF-8 bytes → UTF-16 code-unit count: BMP code points (1-3 byte
-/// sequences) are one unit, supplementary code points (4-byte sequences)
-/// are two.
-pub(crate) fn utf16_length(bytes: &[u8]) -> usize {
-    let mut units = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        let width = match b {
-            0x00..=0x7F => 1,
-            0x80..=0xDF => 2,
-            0xE0..=0xEF => 3,
-            _ => 4,
-        };
-        units += usize::from(width == 4) + 1;
-        i += width;
-    }
-    units
-}
-
-/// The WTF-8 encoding of UTF-16 code unit `i` of a string, or `None`
-/// when `i` is out of range (ES 6.1.4: string indices are code units).
-/// A surrogate half of a 4-byte sequence re-encodes as its own 3-byte
-/// WTF-8 (CESU-8 style) sequence.
-pub(crate) fn utf16_unit_at(bytes: &[u8], i: usize) -> Option<Vec<u8>> {
-    let mut unit = 0usize;
-    let mut off = 0usize;
-    while off < bytes.len() {
-        let b = bytes[off];
-        let width = match b {
-            0x00..=0x7F => 1,
-            0x80..=0xDF => 2,
-            0xE0..=0xEF => 3,
-            _ => 4,
-        };
-        if width == 4 {
-            // two code units: the surrogate halves of the code point
-            let cp = {
-                let w1 = (bytes[off] as u32) & 0x07;
-                let w2 = (bytes[off + 1] as u32) & 0x3F;
-                let w3 = (bytes[off + 2] as u32) & 0x3F;
-                let w4 = (bytes[off + 3] as u32) & 0x3F;
-                (w1 << 18) | (w2 << 12) | (w3 << 6) | w4
-            };
-            let v = cp - 0x1_0000;
-            let surrogates = [(0xD800 + (v >> 10)) as u32, (0xDC00 + (v & 0x3FF)) as u32];
-            for &s in &surrogates {
-                if unit == i {
-                    return Some(vec![
-                        0xE0 | (s >> 12) as u8,
-                        0x80 | ((s >> 6) as u8 & 0x3F),
-                        0x80 | (s as u8 & 0x3F),
-                    ]);
-                }
-                unit += 1;
-            }
-            off += 4;
-            continue;
-        }
-        if unit == i {
-            return Some(bytes[off..off + width].to_vec());
-        }
-        unit += 1;
-        off += width;
-    }
-    None
+    let data = name.as_ref().data(nogc);
+    data.matches_ascii(b"length")
+        || crate::lookup::canonical_index(data).is_some_and(|i| i < s.len())
 }
 
 /// The one-code-unit string at index `i` of a string value, freshly
 /// allocated (string comparisons are by content, so identity never
 /// shows). `None` when the receiver is not a string or `i` is out of
-/// range.
+/// range (ES 6.1.4: string indices are code units).
 pub(crate) fn string_char_at(
     heap: &mut Heap,
     scope: &crate::HandleScope<'_>,
     receiver: Value,
     i: usize,
 ) -> Option<Value> {
-    let bytes = heap.no_gc(|nogc| {
-        let s = receiver.get_as::<VMString>(nogc)?;
-        let bytes = utf16_unit_at(s.as_slice(nogc), i)?;
-        Some(bytes)
+    let units = heap.no_gc(|nogc| {
+        let s = receiver.get_as::<DenseString>(nogc)?;
+        (i < s.len()).then(|| [s.code_unit(nogc, i)])
     })?;
-    Some(VMString::from_bytes(heap, scope, &bytes).value())
+    Some(DenseString::from_units(heap, scope, &units).value())
 }
 
 /// Sloppy `delete x` on an unresolved name (ES 13.5.1.2 step 5 →
@@ -557,7 +484,7 @@ fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
 /// `Number.prototype` etc. are observable (ES 14.7.5.9: the walk starts
 /// at ToObject(subject)). `None` when the prototype is unreachable.
 fn for_in_initial_level<'a>(nogc: &'a NoGc<'a>, subject: Value) -> Option<Value> {
-    if subject.get_as::<VMString>(nogc).is_some() {
+    if subject.get_as::<DenseString>(nogc).is_some() {
         return Some(subject);
     }
     if !Convert::is_primitive(nogc, subject) {
@@ -610,11 +537,11 @@ fn for_in_level_keys(
     let (mut indices, names) = heap.no_gc(|nogc| {
         let mut indices: Vec<i64> = Vec::new();
         let mut names: Vec<Value> = Vec::new();
-        if let Some(s) = level.get_as::<VMString>(nogc) {
+        if let Some(s) = level.get_as::<DenseString>(nogc) {
             // string exotic: the only own string keys are the indices
             // ("length" is non-enumerable; the wrapper's own "length"
             // shadowing String.prototype additions is not modeled)
-            indices.extend(0..utf16_length(s.as_slice(nogc)) as i64);
+            indices.extend(0..s.len() as i64);
             return (indices, names);
         }
         let Some(obj) = level.as_heap_object(nogc) else {
@@ -653,26 +580,14 @@ fn for_in_level_keys(
             // canonical index strings classify as index keys (a store
             // through them creates a Smi-named descriptor, but object
             // literals and defines can still reach here)
-            let is_index = name
+            let index = name
                 .value()
-                .get_as::<InternedString>(nogc)
-                .is_some_and(|s| {
-                    crate::lookup::canonical_index(s.string().as_slice(nogc))
-                        .is_some_and(|i| i <= u32::MAX as usize - 1)
-                });
-            if is_index {
-                let v = crate::lookup::canonical_index(
-                    name.value()
-                        .get_as::<InternedString>(nogc)
-                        .unwrap()
-                        .string()
-                        .as_slice(nogc),
-                )
-                .unwrap() as i64;
-
-                indices.push(v);
-            } else {
-                names.push(name.value());
+                .get_as::<DenseString>(nogc)
+                .and_then(|s| crate::lookup::canonical_index(s.as_ref().data(nogc)))
+                .filter(|i| *i <= u32::MAX as usize - 1);
+            match index {
+                Some(i) => indices.push(i as i64),
+                None => names.push(name.value()),
             }
         }
         (indices, names)
@@ -683,8 +598,11 @@ fn for_in_level_keys(
     // intern the index keys to canonical strings
     let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + names.len());
     for i in indices {
-        let bytes = i.to_string().into_bytes();
-        keys.push(vm.interner().intern(heap, scope, bytes).value());
+        keys.push(
+            vm.interner()
+                .intern_str(heap, scope, &i.to_string())
+                .value(),
+        );
     }
     keys.extend(names.iter().copied());
     Ok(keys)
@@ -827,7 +745,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
 /// (Self-style) and null prototypes end the walk.
 fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<Value>, VmError> {
     heap.no_gc(|nogc| {
-        if level.get_as::<VMString>(nogc).is_some() {
+        if level.get_as::<DenseString>(nogc).is_some() {
             // String.prototype via the global object (both plain data
             // lookups; no user code can run)
             let global = nogc.known().global_object.value();
@@ -872,9 +790,9 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
 fn for_in_own_state<'a>(nogc: &'a NoGc<'a>, level: Value, key: Value) -> Option<bool> {
     match crate::lookup::classify_key(nogc, key).ok()? {
         crate::Key::Element(i) => {
-            if let Some(s) = level.get_as::<VMString>(nogc) {
+            if let Some(s) = level.get_as::<DenseString>(nogc) {
                 // string indices are enumerable own properties
-                return Some((i as u64) < utf16_length(s.as_slice(nogc)) as u64);
+                return Some((i as u64) < s.len() as u64);
             }
             let obj = level.as_heap_object(nogc)?;
             let obj = obj.as_ref();
@@ -1102,14 +1020,16 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
 
 /// A fresh private name: (description) -> Symbol.
 fn create_private_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    let desc = args.get(0).ok_or(VmError::Arity)?;
-    let bytes = nctx.heap().no_gc(|nogc| {
-        desc.get_as::<VMString>(nogc)
-            .map(|s| s.as_slice(nogc).to_vec())
+    let desc = args.get(0);
+    let text = nctx.heap().no_gc(|nogc| {
+        desc.and_then(|d| d.get_as::<DenseString>(nogc))
+            .map(|s| s.to_rust_string(nogc))
     });
     nctx.handle_scope(|nctx, scope| {
-        let desc = bytes.unwrap_or_default();
-        Ok(Symbol::new(nctx.heap(), &scope, &desc).as_tagged().erase())
+        let desc = text.unwrap_or_default();
+        Ok(Symbol::new(nctx.heap(), &scope, desc.as_bytes())
+            .as_tagged()
+            .erase())
     })
 }
 
@@ -1293,18 +1213,15 @@ fn dynamic_slot<'a>(
     context: &mut HeapRef<'a, Context>,
     name: Value,
 ) -> Result<&'a crate::GcSlot, VmError> {
-    let name_str = name.get_as::<VMString>(nogc).ok_or(VmError::Type)?;
-    let name_hash = name_str.hash();
-    let name_bytes = name_str.as_slice(nogc);
+    // both sides are interned (constant pool / ScopeInfo names), so
+    // pointer identity decides — no content comparison in lookup
+    name.get_as::<DenseString>(nogc).ok_or(VmError::Type)?;
     loop {
         let ctx = context.as_ref();
         let names = ctx.scope_info.heap_ref(nogc).as_ref().names.heap_ref(nogc);
         for i in 0..names.len() {
-            let candidate = names.at(i);
-            if let Some(s) = candidate.get_as::<VMString>(nogc) {
-                if s.hash() == name_hash && s.as_slice(nogc) == name_bytes {
-                    return Ok(ctx.slots.heap_ref(nogc).as_ref().element_slot(i));
-                }
+            if names.at(i) == name {
+                return Ok(ctx.slots.heap_ref(nogc).as_ref().element_slot(i));
             }
         }
         match ctx.outer.heap_ref(nogc) {
@@ -1426,22 +1343,27 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
     let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
         return Ok(heap.known().exception.value());
     };
-    let text = state.handle_scope(|scope| Convert::to_string(heap, &scope, key))?;
-    let prefix_bytes: &[u8] = match prefix {
-        1 => b"get ",
-        2 => b"set ",
-        _ => b"",
-    };
-    let bytes = heap.no_gc(|nogc| {
-        let mut full = prefix_bytes.to_vec();
-        full.extend_from_slice(
-            text.get_as::<VMString>(nogc)
+    let units = state.handle_scope(|scope| -> Result<Vec<u16>, VmError> {
+        let text = Convert::to_string(heap, &scope, key)?;
+        Ok(heap.no_gc(|nogc| {
+            let s = text
+                .get_as::<DenseString>(nogc)
                 .expect("ToString yields a string")
-                .as_slice(nogc),
-        );
-        full
+                .as_ref();
+            let mut full: Vec<u16> = match prefix {
+                1 => b"get ".iter().map(|&b| b as u16).collect(),
+                2 => b"set ".iter().map(|&b| b as u16).collect(),
+                _ => Vec::new(),
+            };
+            s.data(nogc).write_units(&mut full);
+            full
+        }))
+    })?;
+    let name = state.handle_scope(|scope| {
+        vm.interner()
+            .intern(heap, &scope, StringData::Utf16(&units))
+            .value()
     });
-    let name = state.handle_scope(|scope| vm.interner().intern(heap, &scope, bytes).value());
     let defined = state.handle_scope(|scope| {
         let Some(fn_obj) = scope.cast::<Object>(fn_value) else {
             return Err(VmError::Type);

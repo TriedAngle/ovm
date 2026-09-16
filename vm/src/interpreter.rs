@@ -1,10 +1,10 @@
 use bytecode::{Opcode, Operands, decode, jump_target};
 
 use crate::{
-    CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, FixedArray, GcSlice,
-    Handle, Heap, Key, LoadOutcome, Lookup, NoGc, Object, PropertyDescriptor, ScopeInfo, SlotName,
-    Smi, StoreOutcome, StoreSemantics, Tagged, VMString, Value, call_target, classify_key,
-    function_kind_of, load_outcome, store_array_element,
+    CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, DenseString,
+    FixedArray, GcSlice, Handle, Heap, Key, LoadOutcome, Lookup, NoGc, Object, PropertyDescriptor,
+    ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value, call_target,
+    classify_key, function_kind_of, load_outcome, store_array_element,
 };
 
 use crate::{
@@ -19,8 +19,6 @@ pub fn execute(
     state: &ContextState,
     callable: Handle<'_, Object>,
     args: GcSlice<'_>,
-    // `new.target` of a [[Construct]]; any object (exotic included —
-    // e.g. a constructor proxy) is allowed.
     new_target: Option<Handle<'_, Value>>,
 ) -> Result<Value, VmError> {
     let stack = &state.stack;
@@ -28,8 +26,6 @@ pub fn execute(
 
     let saved_top = stack.top();
     let was_active = cache.is_active();
-    // a nested run reuses the cache; the caller's accumulator is dead across
-    // the call (the call result overwrites it), so it needs no save/restore
     if was_active {
         stack.suspend_frame(cache.frame_meta());
     }
@@ -57,16 +53,12 @@ fn start(
     new_target: Option<Handle<'_, Value>>,
     base_depth: usize,
 ) -> Result<Value, VmError> {
-    // a callable proxy is not a bytecode/native function: dispatch
-    // through its `apply`/`construct` trap with a nested run
     if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, callable.value())) {
         let argv: Vec<Value> = args.as_slice().to_vec();
         let callee = callable.value();
         let result = match new_target {
             None => crate::proxy::apply(vm, heap, state, callee, &argv),
             Some(nt) => {
-                // args[0] is the synthesized receiver slot the
-                // Construct opcode prepended; construct takes pure args
                 let real: Vec<Value> = argv.iter().skip(1).copied().collect();
                 let nt = nt.value();
                 crate::proxy::construct(vm, heap, state, callee, &real, nt)
@@ -132,9 +124,6 @@ fn callable_name<'a>(nogc: &'a NoGc<'a>, stack: &Stack, meta: &FrameMeta, idx: u
     info.constant_slot_name(nogc, idx)
 }
 
-/// The frame's current context: the frame header's context slot (per-frame,
-/// recursion-safe; the closure-context slot of the function object is the
-/// immutable captured context used to initialize it).
 fn frame_context(heap: &mut Heap, stack: &Stack, meta: &FrameMeta) -> Result<Value, VmError> {
     let _ = heap;
     Ok(stack.context_slot(meta).inner())
@@ -504,15 +493,15 @@ fn step(
                     };
                     let is_string = heap.no_gc(|nogc| {
                         (
-                            lhs.get_as::<VMString>(nogc).is_some(),
-                            rhs.get_as::<VMString>(nogc).is_some(),
+                            lhs.get_as::<DenseString>(nogc).is_some(),
+                            rhs.get_as::<DenseString>(nogc).is_some(),
                         )
                     });
                     if is_string.0 || is_string.1 {
                         let s = step_try!(state.handle_scope(|scope| {
                             let a = Convert::to_string(heap, &scope, lhs)?;
                             let b = Convert::to_string(heap, &scope, rhs)?;
-                            Ok::<_, VmError>(VMString::concat(heap, &scope, a, b).value())
+                            Ok::<_, VmError>(DenseString::concat(heap, &scope, a, b).value())
                         }));
                         cache.set_acc(s);
                     } else {
@@ -1169,7 +1158,7 @@ fn step(
             // content, so identity is unobservable. Out-of-range and
             // non-string receivers fall through to the ordinary path.
             let string_index = heap.no_gc(|nogc| match classify_key(nogc, key) {
-                Ok(Key::Element(i)) if receiver.get_as::<VMString>(nogc).is_some() => Some(i),
+                Ok(Key::Element(i)) if receiver.get_as::<DenseString>(nogc).is_some() => Some(i),
                 _ => None,
             });
             if let Some(i) = string_index {

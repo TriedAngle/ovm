@@ -1,10 +1,10 @@
 use bytecode::{Opcode, PropertyFlags, emit};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
-    AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray,
-    FixedByteArray, Float, FunctionKind, GcSlice, Handle, HandleScope, HeapPtr, Lookup, Map,
-    MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit,
-    SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, VMString, Value, string_content_hash,
+    AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, DenseString,
+    FixedArray, FixedByteArray, Float, FunctionKind, GcSlice, Handle, HandleScope, HeapPtr, Lookup,
+    Map, MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo, ScopeInfoInit,
+    SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Value,
 };
 use vm::{NativeContext, NativeIndex, Thread, VM, VmError};
 
@@ -141,7 +141,7 @@ fn run_program_ctx(
 ) -> Result<Value, VmError> {
     thread.handle_scope(|thread, scope| {
         let dummy: Vec<vm::Value> = (0..slot_count)
-            .map(|i| thread.intern(&scope, format!("slot{i}")))
+            .map(|i| thread.intern(&scope, &format!("slot{i}")))
             .map(|h| h.value())
             .collect();
         let names = thread.heap().allocate_handle::<FixedArray>(&dummy, &scope);
@@ -2061,13 +2061,7 @@ fn equal_strict_compares_numbers_strings_and_objects() {
             .value();
         let one_float = thread.heap().allocate_handle::<Float>(1.0, &scope).value();
         let mk_string = |thread: &mut Thread, scope: &HandleScope<'_>, s: &str| {
-            let backing = thread
-                .heap()
-                .allocate_handle::<FixedByteArray>(s.as_bytes(), scope);
-            thread
-                .heap()
-                .allocate_handle::<VMString>((backing, string_content_hash(s.as_bytes())), scope)
-                .value()
+            DenseString::from_utf8(thread.heap(), scope, s).value()
         };
         let ab1 = mk_string(thread, &scope, "ab");
         let ab2 = mk_string(thread, &scope, "ab");
@@ -3024,7 +3018,7 @@ fn closure_captures_function_context_end_to_end() {
 fn proto_object<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
-    p: vm::Handle<'s, vm::InternedString>,
+    p: vm::Handle<'s, vm::DenseString>,
 ) -> vm::Handle<'s, Object> {
     let the_hole = thread.heap().known().the_hole;
     let map = thread.heap().allocate_handle::<Map>(
@@ -3401,9 +3395,9 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
         .unwrap();
         thread.heap().no_gc(|nogc| {
             let s = r
-                .get_as::<VMString>(nogc)
+                .get_as::<DenseString>(nogc)
                 .expect("concat result must be a string");
-            assert_eq!(s.as_str(nogc), Some("x1"));
+            assert_eq!(s.to_rust_string(nogc), "x1");
         });
     });
 }
@@ -3427,9 +3421,9 @@ fn add_concatenates_strings() {
                 run_program(&mut *thread, binary_op_program(Opcode::Add), 0, &[lhs, rhs]).unwrap();
             thread.heap().no_gc(|nogc| {
                 let s = r
-                    .get_as::<VMString>(nogc)
+                    .get_as::<DenseString>(nogc)
                     .expect("concat result must be a string");
-                assert_eq!(s.as_str(nogc), Some(expected), "{lhs:?} + {rhs:?}");
+                assert_eq!(s.to_rust_string(nogc), expected, "{lhs:?} + {rhs:?}");
             });
         }
     });

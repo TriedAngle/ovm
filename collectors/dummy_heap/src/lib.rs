@@ -297,7 +297,8 @@ mod tests {
             k.float_map.value(),
             k.array_map.value(),
             k.byte_array_map.value(),
-            k.string_map.value(),
+            k.dense_latin1_string_map.value(),
+            k.dense_utf16_string_map.value(),
             k.symbol_map.value(),
             k.accessor_pair_map.value(),
             k.callable_map.value(),
@@ -343,7 +344,7 @@ mod tests {
         use core::alloc::Layout;
         use core::ptr::NonNull;
         use vm::{
-            Float, Map, ObjectKind, RawCell, STRONG_PTR, TAG_MASK, VMString, Visitor, Word,
+            DenseString, Float, Map, ObjectKind, RawCell, STRONG_PTR, TAG_MASK, Visitor, Word,
             object_kind, object_layout, visit_object,
         };
 
@@ -368,7 +369,7 @@ mod tests {
 
         let float = heap.allocate_handle::<Float>(1.5, &scope);
         let bytes = heap.allocate_handle::<FixedByteArray>(&[1u8, 2, 3], &scope);
-        let string = VMString::from_bytes(&mut heap, &scope, b"ab");
+        let string = DenseString::from_latin1(&mut heap, &scope, b"ab");
         let map = alloc_map(
             &mut heap,
             &roots,
@@ -393,13 +394,16 @@ mod tests {
         heap.no_gc(|nogc| unsafe {
             assert_eq!(object_kind(nn(float_addr)), ObjectKind::Float);
             assert_eq!(object_kind(nn(bytes_addr)), ObjectKind::FixedByteArray);
-            assert_eq!(object_kind(nn(string_addr)), ObjectKind::VMString);
+            assert_eq!(object_kind(nn(string_addr)), ObjectKind::DenseString);
             assert_eq!(object_kind(nn(map_addr)), ObjectKind::Map);
             assert_eq!(object_kind(nn(arr_addr)), ObjectKind::FixedArray);
 
             assert_eq!(object_layout(nn(float_addr)), Layout::new::<Float>());
             assert_eq!(object_layout(nn(bytes_addr)), FixedByteArray::layout_for(3));
-            assert_eq!(object_layout(nn(string_addr)), Layout::new::<VMString>());
+            assert_eq!(
+                object_layout(nn(string_addr)),
+                <DenseString as vm::HeapObject>::layout_for(&(vm::StringData::Latin1(b"ab"), 0,))
+            );
             assert_eq!(object_layout(nn(map_addr)), Map::layout_for(2));
             assert_eq!(object_layout(nn(arr_addr)), FixedArray::layout_for(2));
 
@@ -419,14 +423,11 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, Change, Float, Global, Heap, HeapPtr, Lookup, Map, MapInit, MapKind, Object,
-        ObjectSlotsInit, RootHandles, SlotFlags, SlotName, StoreOutcome, StoreSemantics, Tagged,
-        Transition, Value, VmError,
+        AccessorPair, Change, DenseString, Float, Global, Heap, HeapPtr, Lookup, Map, MapInit,
+        MapKind, Object, ObjectSlotsInit, RootHandles, SlotFlags, SlotName, StoreOutcome,
+        StoreSemantics, Tagged, Transition, Value, VmError,
     };
-    use vm::{
-        FixedArray, FixedByteArray, HandleData, HandleScope, InternedString, Smi,
-        string_content_hash,
-    };
+    use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Smi};
 
     fn scope(data: &HandleData) -> HandleScope<'_> {
         unsafe { HandleScope::from_raw(NonNull::from(data)) }
@@ -522,7 +523,8 @@ mod tests {
                 known.float_map,
                 known.array_map,
                 known.byte_array_map,
-                known.string_map,
+                known.dense_latin1_string_map,
+                known.dense_utf16_string_map,
                 known.symbol_map,
                 known.accessor_pair_map,
                 known.callable_map,
@@ -1434,14 +1436,7 @@ mod tests {
         let neg_zero = heap.allocate_handle::<Float>(-0.0, &scope).value();
         let pos_zero = heap.allocate_handle::<Float>(0.0, &scope).value();
         let one_float = heap.allocate_handle::<Float>(1.0, &scope).value();
-        let mut mk_string = |s: &str| {
-            let backing = heap
-                .allocate::<FixedByteArray>(s.as_bytes())
-                .into_handle(&scope);
-            heap.allocate::<InternedString>((backing, string_content_hash(s.as_bytes())))
-                .into_handle(&scope)
-                .value()
-        };
+        let mut mk_string = |s: &str| DenseString::from_utf8(&mut heap, &scope, s).value();
         let ab1 = mk_string("ab");
         let ab2 = mk_string("ab");
         let ac = mk_string("ac");
