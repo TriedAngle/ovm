@@ -908,27 +908,38 @@ fn step(
             Step::Next
         }
         Opcode::Equal => {
-            // IsLooselyEqual: objects are ToPrimitive'd (hint default) first
-            let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(
-                vm,
-                heap,
-                state,
-                cache.acc(),
-                Hint::Default
-            ));
-            let x = match x {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Default));
-            let y = match y {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let r = step_try!(Compare::equal(&heap.guard(), x, y));
-            cache.set_acc(Convert::boolean(heap, r));
-            Step::Next
+            // IsLooselyEqual: objects are ToPrimitive'd (hint default)
+            // first; the coercions run user code (valueOf/toString), so
+            // the left result stays rooted and the right operand is
+            // re-read from its register instead of a raw copy
+            state.handle_scope(|scope| {
+                let other_reg = ops.reg(0);
+                let x = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    cache.acc(),
+                    Hint::Default
+                ));
+                let x = match x {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let y = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    stack.reg(&meta, other_reg),
+                    Hint::Default
+                ));
+                let y = match y {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let r = step_try!(Compare::equal(&heap.guard(), x.value(), y.value()));
+                cache.set_acc(Convert::boolean(heap, r));
+                Step::Next
+            })
         }
         Opcode::LessThan => {
             // Abstract Relational Comparison: objects ToPrimitive'd with
