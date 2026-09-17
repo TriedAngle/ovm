@@ -136,8 +136,10 @@ impl StackCache {
         self.get().acc.read(heap)
     }
 
-    pub fn set_acc(&self, v: impl Into<Value>) {
-        self.get().acc.store(v);
+    /// Store a value into the accumulator. Anchored/rooted values only:
+    /// pass a `Tagged`, or a `Handle::as_tagged(heap)`.
+    pub fn set_acc<'a, T: 'a>(&self, v: impl Into<Tagged<'a, T>>) {
+        self.get().acc.store(v.into().erase());
     }
 }
 

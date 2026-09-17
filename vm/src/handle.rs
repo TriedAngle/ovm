@@ -220,24 +220,16 @@ impl<'d> HandleScope<'d> {
         unsafe { Handle::from_location(NonNull::new_unchecked(slot)) }
     }
 
-    /// Root a copy of `args` in contiguous scope slots. The argument
-    /// values may be anchored anywhere: rooting only writes words.
-    pub fn stage(&self, args: &[Tagged<'_, Value>]) -> GcSlice<'_> {
-        let words: Vec<Value> = args.iter().map(|v| v.erase()).collect();
-        self.stage_words(&words)
-    }
-
-    /// Stage raw words. Crate-internal: every word must be a currently
-    /// valid value (read under a still-live heap borrow, no GC since) —
-    /// the words are copied into rooted slots immediately.
-    pub fn stage_words(&self, words: &[Value]) -> GcSlice<'_> {
+    /// Root a copy of `values` in contiguous scope slots. The values may be
+    /// anchored anywhere: rooting only writes words.
+    pub fn stage<'x, T>(&self, values: &[Tagged<'x, T>]) -> GcSlice<'_> {
         let inner = unsafe { &*self.data.as_ptr() }.inner();
-        let start = inner.allocate_block(words.len());
-        for (i, v) in words.iter().enumerate() {
+        let start = inner.allocate_block(values.len());
+        for (i, v) in values.iter().enumerate() {
             debug_assert!(!v.is_weak_ptr(), "weak value staged for a call");
-            unsafe { *start.add(i) = *v };
+            unsafe { *start.add(i) = v.erase() };
         }
-        unsafe { GcSlice::from_slice(core::slice::from_raw_parts(start, words.len())) }
+        unsafe { GcSlice::from_slice(core::slice::from_raw_parts(start, values.len())) }
     }
 
     pub fn cast<T: HeapObject>(&self, value: Tagged<'_, Value>) -> Option<Handle<'_, T>> {

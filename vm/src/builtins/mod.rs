@@ -52,8 +52,9 @@ use crate::{
     Tagged, Value, VmError,
 };
 
+use crate::Float;
+use crate::NativeIndex;
 use crate::VM;
-use crate::natives::NativeIndex;
 
 /// Register the builtin natives.
 pub fn register_builtin_natives(vm: &mut VM) -> BuiltinIndices {
@@ -181,13 +182,11 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             idx.number_to_string,
         )?;
         // static data properties on the Number constructor
-        let pos_inf = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::INFINITY));
-        let neg_inf =
-            roots.create_handle(thread.heap().allocate::<crate::Float>(f64::NEG_INFINITY));
-        let max_value = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::MAX));
-        let min_value =
-            roots.create_handle(thread.heap().allocate::<crate::Float>(f64::MIN_POSITIVE));
-        let number_nan = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::NAN));
+        let pos_inf = roots.create_handle(thread.heap().allocate::<Float>(f64::INFINITY));
+        let neg_inf = roots.create_handle(thread.heap().allocate::<Float>(f64::NEG_INFINITY));
+        let max_value = roots.create_handle(thread.heap().allocate::<Float>(f64::MAX));
+        let min_value = roots.create_handle(thread.heap().allocate::<Float>(f64::MIN_POSITIVE));
+        let number_nan = roots.create_handle(thread.heap().allocate::<Float>(f64::NAN));
         for (name, value) in [
             ("POSITIVE_INFINITY", pos_inf),
             ("NEGATIVE_INFINITY", neg_inf),
@@ -844,8 +843,8 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         )?;
 
         // ---- value properties of the global object -----------------------------
-        let infinity = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::INFINITY));
-        let nan = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::NAN));
+        let infinity = roots.create_handle(thread.heap().allocate::<Float>(f64::INFINITY));
+        let nan = roots.create_handle(thread.heap().allocate::<Float>(f64::NAN));
         let undefined = thread.heap().known().undefined;
         for name in ["Infinity", "NaN", "undefined"] {
             let n = thread.intern(&scope, name);

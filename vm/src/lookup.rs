@@ -1,6 +1,7 @@
 use crate::{
-    AccessorPair, DenseString, FixedArray, FrameMeta, GcSlot, Heap, HeapRef, Map, Object,
-    SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, Value, VmError,
+    AccessorPair, DenseString, FixedArray, FrameMeta, GcSlot, HandleScope, Heap, HeapRef, Map,
+    Object, PropertyDescriptor, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, Value,
+    VmError,
 };
 
 pub enum Lookup<'a> {
@@ -149,15 +150,15 @@ pub fn load_outcome<'a>(
 /// `scope`, so it survives GC safepoints.
 pub fn ordinary_own_descriptor<'a, 's>(
     heap: &'a Heap,
-    scope: &'s crate::HandleScope<'_>,
+    scope: &'s HandleScope<'_>,
     obj: Tagged<'a, Value>,
     key: Tagged<'a, Value>,
-) -> Option<crate::PropertyDescriptor<'s>> {
+) -> Option<PropertyDescriptor<'s>> {
     if let Ok(Key::Element(i)) = classify_key(heap, key)
         && let Some(o) = obj.as_heap_object()
         && let Some(v) = o.as_ref().element_value(heap, i)
     {
-        return Some(crate::PropertyDescriptor::Data {
+        return Some(PropertyDescriptor::Data {
             value: scope.handle(v),
             writable: true,
             enumerable: true,
@@ -167,7 +168,7 @@ pub fn ordinary_own_descriptor<'a, 's>(
     let name = key.as_name();
     let o = obj.as_heap_object()?;
     if let Some(v) = o.as_ref().array_length(heap, name) {
-        return Some(crate::PropertyDescriptor::Data {
+        return Some(PropertyDescriptor::Data {
             value: scope.handle(v),
             writable: true,
             enumerable: false,
@@ -183,9 +184,9 @@ pub fn ordinary_own_descriptor<'a, 's>(
             let pair = d
                 .value
                 .get(heap)
-                .get_as::<crate::AccessorPair>()
+                .get_as::<AccessorPair>()
                 .expect("accessor descriptor holds a pair");
-            return Some(crate::PropertyDescriptor::Accessor {
+            return Some(PropertyDescriptor::Accessor {
                 get: scope.handle(pair.get.get(heap)),
                 set: scope.handle(pair.set.get(heap)),
                 enumerable: d.flags().is_enumerable(),
@@ -193,7 +194,7 @@ pub fn ordinary_own_descriptor<'a, 's>(
             });
         }
         let slot = o.as_ref().slot(heap, d.offset());
-        return Some(crate::PropertyDescriptor::Data {
+        return Some(PropertyDescriptor::Data {
             value: scope.handle(slot.get(heap)),
             writable: d.flags().is_writable(),
             enumerable: d.flags().is_enumerable(),

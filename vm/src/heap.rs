@@ -8,6 +8,7 @@ use crate::{
 
 use crate::bootstrap::{KnownCell, WellKnown};
 
+use crate::WEAK_PTR;
 use core::{alloc::Layout, cell::Cell, marker::PhantomData, ops::FnOnce, ptr::NonNull};
 
 /// Direct reference to a heap object, valid only within the borrow of
@@ -205,7 +206,7 @@ impl<T: HeapObject> WeakGcCell<T> {
     // if a WeakGcCell is always weak, then upgrading it doesn't actually upgrade but only pretend
     pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<HeapRef<'a, T>> {
         let word = self.cell.load();
-        if word == crate::WEAK_PTR {
+        if word == WEAK_PTR {
             return None;
         }
         let strong = Value::from_bits(word & !TAG_MASK | STRONG_PTR);

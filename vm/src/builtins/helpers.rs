@@ -1,6 +1,9 @@
 //! Install helpers: map/function-object allocation and property-definition
 //! utilities shared by the builtin installation in `mod.rs`.
 
+use crate::Global;
+use crate::RootHandles;
+use crate::Thread;
 use crate::materialize::materialize_closure_vm;
 use crate::natives::{NativeContext, NativeIndex};
 use crate::{
@@ -11,21 +14,21 @@ use crate::{
 pub fn alloc_map(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    roots: &crate::RootHandles,
+    roots: &RootHandles,
     kind: MapKind,
-    prototype: crate::Global<Object>,
-) -> Result<crate::Global<Map>, VmError> {
+    prototype: Global<Object>,
+) -> Result<Global<Map>, VmError> {
     alloc_map_with_slots(heap, scope, roots, kind, prototype, 0)
 }
 
 pub fn alloc_map_with_slots(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    roots: &crate::RootHandles,
+    roots: &RootHandles,
     kind: MapKind,
-    prototype: crate::Global<Object>,
+    prototype: Global<Object>,
     value_slot_count: usize,
-) -> Result<crate::Global<Map>, VmError> {
+) -> Result<Global<Map>, VmError> {
     // Safety: fresh root-slot word, rooted below before any allocation.
     let proto =
         scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(prototype.read_unchecked()) });
@@ -40,11 +43,11 @@ pub fn alloc_map_with_slots(
 /// A native function object: `CALLABLE | CONSTRUCTOR | NATIVE`, slots[0] =
 /// native index, slots[1] = empty context, [[Prototype]] = Function.prototype.
 pub fn make_native_function(
-    thread: &mut crate::Thread,
+    thread: &mut Thread,
     scope: &HandleScope<'_>,
-    roots: &crate::RootHandles,
+    roots: &RootHandles,
     index: NativeIndex,
-) -> Result<crate::Global<Object>, VmError> {
+) -> Result<Global<Object>, VmError> {
     let heap = thread.heap();
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
@@ -67,11 +70,11 @@ pub fn make_native_function(
 
 /// A non-constructor native function (`Proxy.revocable`-style statics).
 pub fn make_native_plain_function(
-    thread: &mut crate::Thread,
+    thread: &mut Thread,
     scope: &HandleScope<'_>,
-    roots: &crate::RootHandles,
+    roots: &RootHandles,
     index: NativeIndex,
-) -> Result<crate::Global<Object>, VmError> {
+) -> Result<Global<Object>, VmError> {
     let heap = thread.heap();
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
@@ -94,7 +97,7 @@ pub fn make_native_plain_function(
 /// Compile and run a JS prelude once at install time (BIND_PRELUDE,
 /// REVOKE_PRELUDE): its top-level assignments install hidden helpers.
 pub fn run_prelude(
-    thread: &mut crate::Thread,
+    thread: &mut Thread,
     scope: &HandleScope<'_>,
     src: &str,
     name: &str,
@@ -132,13 +135,13 @@ pub fn run_prelude(
 /// A constructor function + its prototype object (with `.constructor`),
 /// the function installed on the global object under `name`.
 pub fn install_constructor(
-    thread: &mut crate::Thread,
+    thread: &mut Thread,
     scope: &HandleScope<'_>,
-    roots: &crate::RootHandles,
+    roots: &RootHandles,
     index: NativeIndex,
     name: &str,
-    proto_parent: crate::Global<Object>,
-) -> Result<(crate::Global<Object>, crate::Global<Object>), VmError> {
+    proto_parent: Global<Object>,
+) -> Result<(Global<Object>, Global<Object>), VmError> {
     let name_str = thread.intern(scope, name);
     let fn_obj = make_native_function(thread, scope, roots, index)?;
 
@@ -178,10 +181,10 @@ pub fn install_constructor(
 }
 
 pub fn install_method(
-    thread: &mut crate::Thread,
+    thread: &mut Thread,
     scope: &HandleScope<'_>,
-    roots: &crate::RootHandles,
-    receiver: crate::Global<Object>,
+    roots: &RootHandles,
+    receiver: Global<Object>,
     name: &str,
     index: NativeIndex,
 ) -> Result<(), VmError> {
@@ -200,7 +203,7 @@ pub fn install_method(
 pub fn define_method_prop(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    object: crate::Global<Object>,
+    object: Global<Object>,
     name: Handle<'_, SlotName>,
     value: Handle<'_, Value>,
 ) -> Result<(), VmError> {
@@ -222,7 +225,7 @@ pub fn define_method_prop(
 pub fn define_data(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    object: crate::Global<Object>,
+    object: Global<Object>,
     name: Handle<'_, SlotName>,
     value: Handle<'_, Value>,
 ) -> Result<(), VmError> {
@@ -235,7 +238,7 @@ pub fn define_data(
 pub fn define_non_enumerable(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    object: crate::Global<Object>,
+    object: Global<Object>,
     name: Handle<'_, SlotName>,
     value: Handle<'_, Value>,
 ) -> Result<(), VmError> {

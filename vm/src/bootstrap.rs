@@ -556,9 +556,10 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let function_prototype = roots.create_handle(heap.new_object(
         &scope,
         function_prototype_map,
-        scope.stage_words(&[unsafe { empty_info.read_unchecked() }, unsafe {
-            empty_context.read_unchecked()
-        }]),
+        scope.stage(&[
+            empty_info.as_tagged(&*heap).erase_type(),
+            empty_context.as_tagged(&*heap).erase_type(),
+        ]),
     ));
 
     known.undefined = undefined;

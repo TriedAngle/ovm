@@ -170,22 +170,24 @@ pub fn store_array_element(
     })?;
 
     if grows {
-        let mut values = Vec::new();
-        heap.no_gc(|heap| {
-            let obj = receiver.heap_ref(heap);
-            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+        let staged = {
+            let heap_ref: &Heap = heap;
+            let obj = receiver.heap_ref(heap_ref);
+            let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
             let keep = obj.as_ref().length().min(elements.len());
             let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
-            values = Vec::with_capacity(capacity);
+            let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(capacity);
             for k in 0..keep {
-                values.push(elements.at(heap, k).erase());
+                values.push(elements.at(heap_ref, k));
             }
-            // Safety: fresh root-slot read under the anchor.
-            values.resize(capacity, unsafe { heap.known().the_hole.read_unchecked() });
-            Ok::<_, VmError>(())
-        })?;
-        values[i] = value.as_tagged(heap).erase();
-        let elements = heap.allocate_handle::<FixedArray>(scope.stage_words(&values), scope);
+            values.resize(
+                capacity,
+                heap_ref.known().the_hole.as_tagged(heap_ref).erase_type(),
+            );
+            values[i] = value.as_tagged(heap_ref).erase_type();
+            scope.stage(&values)
+        };
+        let elements = heap.allocate_handle::<FixedArray>(staged, scope);
         heap.no_gc(|heap| {
             let obj = receiver.heap_ref(heap);
             obj.elements
