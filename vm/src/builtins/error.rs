@@ -1,5 +1,7 @@
 //! ES 20.5: Error constructors, Error.prototype.toString, and error
 //! object materialization.
+use crate::natives::NativeContext;
+use crate::runtime::Coercion;
 
 use crate::{
     ContextState, Convert, DenseString, GcSlice, Heap, Object, PropertyDescriptor, Tagged, VM,
@@ -7,28 +9,28 @@ use crate::{
 };
 
 pub fn error_constructor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "Error")
 }
 
 pub fn type_error_constructor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "TypeError")
 }
 
 pub fn reference_error_constructor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "ReferenceError")
 }
 
 pub fn make_error(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
     class: &str,
 ) -> Result<Value, VmError> {
@@ -39,7 +41,7 @@ pub fn make_error(
         let message = match heap.no_gc(|heap| args.get(heap, 1).map(|v| v.erase())) {
             // Safety: fresh argument word, consumed before any allocation.
             Some(v) => {
-                let v = unsafe { Tagged::<Value>::from_value_unchecked(v) };
+                let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
                 scope.handle(Convert::to_string(heap, &scope, v)?)
             }
             None => scope.handle(
@@ -54,6 +56,7 @@ pub fn make_error(
             "ReferenceError" => heap.known().reference_error_map,
             _ => heap.known().error_map,
         };
+
         let obj = heap
             .new_object(&scope, map, GcSlice::EMPTY)
             .into_handle(&scope);
@@ -80,10 +83,7 @@ pub fn make_error(
     })
 }
 
-pub fn error_to_string(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn error_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // both [[Get]]s below run user code (getters): the receiver must
         // stay rooted across them
@@ -103,12 +103,10 @@ pub fn error_to_string(
         // concats read them
         // Safety: fresh words from the lookups above, consumed before any
         // allocation.
-        let a = scope.handle(Convert::to_string(heap, &scope, unsafe {
-            Tagged::<Value>::from_value_unchecked(name)
-        })?);
-        let b = scope.handle(Convert::to_string(heap, &scope, unsafe {
-            Tagged::<Value>::from_value_unchecked(message)
-        })?);
+        let name = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(name) });
+        let a = scope.handle(Convert::to_string(heap, &scope, name)?);
+        let message = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(message) });
+        let b = scope.handle(Convert::to_string(heap, &scope, message)?);
         let colon = vm.interner().intern_str(heap, &scope, ": ");
         let ab = DenseString::concat(heap, &scope, a, colon.erase());
         let ab = scope.handle(ab.as_tagged(heap).erase_type());
@@ -126,17 +124,18 @@ pub fn get_property(
     receiver: Value,
     name: &str,
 ) -> Result<Value, VmError> {
-    let name = state.handle_scope(|scope| {
-        // Safety: fresh rooted-slot word, consumed below.
-        unsafe {
+    state.handle_scope(|scope| {
+        let name = scope.handle(
             vm.interner()
                 .intern_str(heap, &scope, name)
-                .read_unchecked()
+                .as_tagged(heap)
+                .erase_type(),
+        );
+        // Safety: caller-supplied word, fresh at entry.
+        let receiver = scope.handle(unsafe { receiver.assume_valid(heap) });
+        match Runtime::get_property(vm, heap, state, receiver, name)? {
+            Coercion::Value(v) => Ok(v.erase()),
+            Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).erase()),
         }
-    });
-    match Runtime::get_property(vm, heap, state, receiver, name)? {
-        crate::runtime::Coercion::Value(v) => Ok(v),
-        // Safety: fresh root-slot word read for the immediate return.
-        crate::runtime::Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
-    }
+    })
 }

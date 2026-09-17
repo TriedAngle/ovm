@@ -1,6 +1,7 @@
 //! ES 23.1 + 23.1.5: the Array constructor, Array.isArray,
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
+use crate::natives::NativeContext;
 use crate::{Convert, GcSlice, Smi, Tagged, Value, VmError};
 
 /// `Array(...)`: call and construct behave the same (ES 23.1.1.1). No
@@ -8,28 +9,23 @@ use crate::{Convert, GcSlice, Smi, Tagged, Value, VmError};
 /// non-integer numbers are a RangeError); otherwise the arguments are the
 /// elements.
 pub fn array_constructor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let argv: Vec<Value> = nctx.heap().no_gc(|heap| {
-        (1..args.len())
-            .filter_map(|i| args.get(heap, i).map(|v| v.erase()))
-            .collect()
-    });
-    let single_len = match argv.as_slice() {
-        [v] => match Smi::decode(*v) {
-            Some(s) if s.value() >= 0 => {
-                Some(usize::try_from(s.value()).map_err(|_| VmError::OutOfBounds)?)
-            }
-            Some(_) => return Err(VmError::OutOfBounds), // Array(-1): RangeError
-            None => None,
-        },
-        _ => None,
-    };
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        // Safety: fresh root-slot word read for the immediate staging.
-        let hole = unsafe { heap.known().the_hole.read_unchecked() };
+        let argv: Vec<Tagged<'_, Value>> = args.iter(heap).skip(1).collect();
+        let single_len = match argv.as_slice() {
+            [v] => match Smi::decode(v.erase()) {
+                Some(s) if s.value() >= 0 => {
+                    Some(usize::try_from(s.value()).map_err(|_| VmError::OutOfBounds)?)
+                }
+                Some(_) => return Err(VmError::OutOfBounds), // Array(-1): RangeError
+                None => None,
+            },
+            _ => None,
+        };
+        let hole = heap.known().the_hole.as_tagged(heap).erase_type();
         let (values, _length) = match single_len {
             Some(n) => (vec![hole; n], n),
             None => {
@@ -37,17 +33,15 @@ pub fn array_constructor(
                 (argv, n)
             }
         };
-        let staged = scope.stage_words(&values);
+
+        let staged = scope.stage(&values);
         Ok(heap.new_array(&scope, staged).erase_type().erase())
     })
 }
 
 /// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):
 /// returns a fresh array-iterator over the receiver (CreateArrayIterator).
-pub fn array_values(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn array_values(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let (receiver, is_array) = nctx.heap().no_gc(|heap| {
         let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
         let is_array = receiver
@@ -76,7 +70,7 @@ pub fn array_values(
 /// `%ArrayIteratorPrototype%.next` (ES 23.1.5.2.1): one step over the
 /// iterated array, producing `{ value, done }`.
 pub fn array_iterator_next(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
@@ -94,14 +88,15 @@ pub fn array_iterator_next(
             if slots.len() < 2 {
                 return Err(VmError::Type);
             }
-            Ok((slots.at(heap, 0).erase(), slots.at(heap, 1).erase()))
+            Ok((scope.handle(slots.at(heap, 0)), slots.at(heap, 1).erase()))
         })?;
         let Some(index) = Smi::decode(index) else {
             return Err(VmError::Type);
         };
         let done = {
             let len = heap.no_gc(|heap| {
-                unsafe { array.assume_valid(heap) }
+                array
+                    .as_tagged(heap)
                     .as_heap_object()
                     .map(|o| o.as_ref().length())
                     .unwrap_or(0)
@@ -110,23 +105,23 @@ pub fn array_iterator_next(
         };
         let (value, done_value) = if done {
             (
-                // Safety: fresh root-slot words read for the immediate staging.
-                unsafe { heap.known().undefined.read_unchecked() },
-                unsafe { heap.known().true_object.read_unchecked() },
+                scope.handle(heap.known().undefined.as_tagged(heap).erase_type()),
+                scope.handle(heap.known().true_object.as_tagged(heap).erase_type()),
             )
         } else {
             // element reads see holes as undefined
             let v = heap.no_gc(|heap| {
-                unsafe { array.assume_valid(heap) }
-                    .as_heap_object()
-                    .and_then(|o| o.as_ref().element_value(heap, index.value() as usize))
-                    .map(|v| v.erase())
-                    .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase())
+                scope.handle(
+                    array
+                        .as_tagged(heap)
+                        .as_heap_object()
+                        .and_then(|o| o.as_ref().element_value(heap, index.value() as usize))
+                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase_type()),
+                )
             });
             (
                 v,
-                // Safety: fresh root-slot word read for the immediate staging.
-                unsafe { heap.known().false_object.read_unchecked() },
+                scope.handle(heap.known().false_object.as_tagged(heap).erase_type()),
             )
         };
         // advance the index slot
@@ -140,7 +135,14 @@ pub fn array_iterator_next(
         })?;
         let map = heap.known().iterator_result_map;
         Ok(heap
-            .new_object(&scope, map, scope.stage_words(&[value, done_value]))
+            .new_object(
+                &scope,
+                map,
+                scope.stage(&[
+                    value.as_tagged(heap).erase_type(),
+                    done_value.as_tagged(heap).erase_type(),
+                ]),
+            )
             .erase_type()
             .erase())
     })
@@ -148,7 +150,7 @@ pub fn array_iterator_next(
 
 /// `%ArrayIteratorPrototype%[@@iterator]`: returns the receiver.
 pub fn array_iterator_symbol_iterator(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.heap()
@@ -156,10 +158,7 @@ pub fn array_iterator_symbol_iterator(
 }
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).
-pub fn array_is_array(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn array_is_array(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.heap().no_gc(|heap| {
         let is_array = args
             .get(heap, 1)

@@ -1,6 +1,7 @@
 use core::alloc::Layout;
 
 use crate::lookup::has_property;
+use crate::lookup::ordinary_own_descriptor;
 use crate::runtime::{Coercion, Runtime};
 use crate::{
     Compare, ContextState, Convert, EdgeVisitable, FixedArray, GcSlice, GcSlot, Handle,
@@ -214,54 +215,46 @@ fn get_trap<'s>(
     handler: &Handle<'_, Value>,
     trap: Trap,
 ) -> Result<TrapLookup<'s>, VmError> {
-    let name = scope.handle(trap.name(heap));
-    match Runtime::get_property(
-        vm,
-        heap,
-        state,
-        unsafe { handler.read_unchecked() },
-        name.as_tagged(heap).erase(),
-    )? {
+    let name = scope.handle(trap.name(heap).erase_type());
+    match Runtime::get_property(vm, heap, state, *handler, name)? {
         Coercion::Threw => Ok(TrapLookup::Threw),
         Coercion::Value(v) => {
+            let v = scope.handle(v);
             let nullish = heap.no_gc(|heap| {
-                v == heap.known().undefined.as_tagged(heap).erase()
-                    || v == heap.known().null.as_tagged(heap).erase()
+                v.as_tagged(heap).erase() == heap.known().undefined.as_tagged(heap).erase()
+                    || v.as_tagged(heap).erase() == heap.known().null.as_tagged(heap).erase()
             });
             if nullish {
                 Ok(TrapLookup::None)
             } else {
-                Ok(TrapLookup::Trap(
-                    scope.handle(unsafe { v.assume_valid(heap) }),
-                ))
+                Ok(TrapLookup::Trap(v))
             }
         }
     }
 }
 
-fn call_trap(
+fn call_trap<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     trap: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     if !Runtime::is_callable(heap, unsafe { trap.read_unchecked() }) {
         return Err(VmError::Message("proxy trap is not a function"));
     }
-    let words: Vec<Value> = args.iter().map(|h| unsafe { h.read_unchecked() }).collect();
-    let result = NativeContext::new(vm, heap, state)
-        // Safety: fresh handle-slot word under the live scope borrow.
-        .call(
-            unsafe { Tagged::from_value_unchecked(trap.read_unchecked()) },
-            scope.stage_words(&words),
-        )?;
+    let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
+    let staged = scope.stage(&words);
+    let result = NativeContext::new(vm, heap, state).call_rooted(*trap, staged)?;
     let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
     if result == exception {
         Ok(Coercion::Threw)
     } else {
-        Ok(Coercion::Value(result))
+        // Safety: the call just returned; no GC since.
+        Ok(Coercion::Value(unsafe {
+            Tagged::from_value_unchecked(result)
+        }))
     }
 }
 
@@ -331,12 +324,7 @@ fn own_descriptor_h<'s>(
 ) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
     if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
         let desc = heap.no_gc(|heap| {
-            crate::lookup::ordinary_own_descriptor(
-                heap,
-                scope,
-                obj.as_tagged(heap),
-                key.as_tagged(heap),
-            )
+            ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), key.as_tagged(heap))
         });
         return Ok(Flow::Value(desc.as_ref().map(PartialDescriptor::from)));
     }
@@ -363,11 +351,10 @@ fn own_descriptor_h<'s>(
         TrapLookup::None => own_descriptor_h(vm, heap, state, scope, &target, key),
         TrapLookup::Trap(t) => {
             let result = call_trap(vm, heap, state, scope, &t, &[handler, target, *key])?;
-            let Coercion::Value(result) = result else {
-                return Ok(Flow::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Flow::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            // Safety: fresh call result, rooted before the coercion below.
-            let result = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(result) });
             let is_undefined = heap.no_gc(|heap| {
                 result
                     .as_tagged(heap)
@@ -427,11 +414,12 @@ fn is_extensible_h(
         TrapLookup::None => is_extensible_h(vm, heap, state, scope, &target),
         TrapLookup::Trap(t) => {
             let result = call_trap(vm, heap, state, scope, &t, &[handler, target])?;
-            let Coercion::Value(result) = result else {
-                return Ok(Flow::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Flow::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
             Ok(Flow::Value(heap.no_gc(|heap| {
-                Convert::is_truthy(heap, unsafe { result.assume_valid(heap) })
+                Convert::is_truthy(heap, result.as_tagged(heap))
             })))
         }
     }
@@ -492,13 +480,7 @@ fn descriptor_object(
             fields.push((s.configurable, scope.handle(Convert::boolean(heap, b))));
         }
         for (name, value) in fields {
-            crate::Object::define_own_property(
-                heap,
-                &scope,
-                obj,
-                name,
-                PropertyDescriptor::data(value),
-            )?;
+            Object::define_own_property(heap, &scope, obj, name, PropertyDescriptor::data(value))?;
         }
         Ok(unsafe { obj.read_unchecked() })
     })
@@ -534,22 +516,24 @@ fn define_array_element(
     })?;
 
     if grows {
-        let mut values = Vec::new();
-        heap.no_gc(|heap| -> Result<(), VmError> {
-            let obj = receiver.heap_ref(heap);
-            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+        let staged = {
+            let heap_ref: &Heap = heap;
+            let obj = receiver.heap_ref(heap_ref);
+            let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
             let keep = obj.as_ref().length().min(elements.len());
             let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
-            values = Vec::with_capacity(capacity);
+            let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(capacity);
             for k in 0..keep {
-                values.push(elements.at(heap, k).erase());
+                values.push(elements.at(heap_ref, k));
             }
-            // Safety: fresh root-slot read under the anchor.
-            values.resize(capacity, unsafe { heap.known().the_hole.read_unchecked() });
-            Ok(())
-        })?;
-        values[i] = unsafe { value.read_unchecked() };
-        let elements = heap.allocate_handle::<FixedArray>(scope.stage_words(&values), scope);
+            values.resize(
+                capacity,
+                heap_ref.known().the_hole.as_tagged(heap_ref).erase_type(),
+            );
+            values[i] = value.as_tagged(heap_ref);
+            scope.stage(&values)
+        };
+        let elements = heap.allocate_handle::<FixedArray>(staged, scope);
         heap.no_gc(|heap| {
             let obj = receiver.heap_ref(heap);
             obj.as_ref().elements.set(
@@ -638,34 +622,29 @@ fn define_internal_h<'s>(
         return Ok(Flow::Value(true));
     }
     let current = heap.no_gc(|heap| {
-        crate::lookup::ordinary_own_descriptor(
-            heap,
-            scope,
-            obj.as_tagged(heap),
-            name.as_tagged(heap),
-        )
+        ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap))
     });
     let full = partial.complete_against(undefined, current.as_ref());
     let obj_ref = scope
         .cast::<Object>(obj.as_tagged(heap))
         .expect("non-proxy target is an object");
     let name_ref: Handle<'_, SlotName> = scope.handle(name.as_tagged(heap).as_name());
-    let defined = crate::Object::define_own_property(heap, scope, obj_ref, name_ref, full)?;
+    let defined = Object::define_own_property(heap, scope, obj_ref, name_ref, full)?;
     Ok(Flow::Value(defined))
 }
 
 /// OrdinarySet (receiver-aware) for an ordinary target with a proxy
 /// (or arbitrary) receiver: the spec's define-on-receiver shape.
-fn ordinary_set_forward(
+fn ordinary_set_forward<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     target: &Handle<'_, Value>,
     receiver: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
     value: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     // array element keys on arrays route through the define path
     // (which stores into the backing store)
     let classified = heap.no_gc(|heap| {
@@ -711,7 +690,7 @@ fn ordinary_set_forward(
         }
     });
     match lookup {
-        SetLookup::DataReadonly => Ok(Coercion::Value(Convert::boolean(heap, false).erase())),
+        SetLookup::DataReadonly => Ok(Coercion::Value(Convert::boolean(heap, false))),
         SetLookup::DataWritable | SetLookup::NotFound => {
             let partial = create_data_partial(scope, value);
             let flow = define_internal_h(vm, heap, state, scope, receiver, name, partial)?;
@@ -720,31 +699,29 @@ fn ordinary_set_forward(
         SetLookup::Setter(setter) => {
             let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
             if setter == undefined {
-                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
+                return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
             let setter = scope.handle(unsafe { setter.assume_valid(heap) });
-            let words = [unsafe { receiver.read_unchecked() }, unsafe {
-                value.read_unchecked()
-            }];
-            let result = NativeContext::new(vm, heap, state).call(
-                // Safety: fresh handle-slot word.
-                unsafe { Tagged::from_value_unchecked(setter.read_unchecked()) },
-                scope.stage_words(&words),
-            )?;
+            let words = [
+                receiver.as_tagged(heap).erase_type(),
+                value.as_tagged(heap).erase_type(),
+            ];
+            let staged = scope.stage(&words);
+            let result = NativeContext::new(vm, heap, state).call_rooted(setter, staged)?;
             let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
             if result == exception {
                 Ok(Coercion::Threw)
             } else {
-                Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
+                Ok(Coercion::Value(Convert::boolean(heap, true)))
             }
         }
     }
 }
 
-fn define_flow_to_coercion(heap: &Heap, flow: Flow<bool>) -> Result<Coercion, VmError> {
+fn define_flow_to_coercion<'a>(heap: &'a Heap, flow: Flow<bool>) -> Result<Coercion<'a>, VmError> {
     Ok(match flow {
         Flow::Threw => Coercion::Threw,
-        Flow::Value(b) => Coercion::Value(Convert::boolean(heap, b).erase()),
+        Flow::Value(b) => Coercion::Value(Convert::boolean(heap, b)),
     })
 }
 
@@ -753,31 +730,26 @@ fn define_flow_to_coercion(heap: &Heap, flow: Flow<bool>) -> Result<Coercion, Vm
 /// Proxy `[[Get]]` (ES 20.2.5.8). `receiver` is the [[Get]] receiver —
 /// the proxy itself at entry points, the *original* receiver when
 /// forwarding through a chain of proxies.
-pub fn get(
+pub fn get<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
-    proxy: Tagged<'_, Value>,
-    receiver: Tagged<'_, Value>,
-    name: Tagged<'_, Value>,
-) -> Result<Coercion, VmError> {
-    state.handle_scope(|scope| {
-        let proxy = scope.handle(proxy);
-        let receiver = scope.handle(receiver);
-        let name = scope.handle(name);
-        get_h(vm, heap, state, &scope, &proxy, &receiver, &name)
-    })
+    proxy: Handle<'_, Value>,
+    receiver: Handle<'_, Value>,
+    name: Handle<'_, Value>,
+) -> Result<Coercion<'a>, VmError> {
+    state.handle_scope(|scope| get_h(vm, heap, state, &scope, &proxy, &receiver, &name))
 }
 
-fn get_h(
+fn get_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     receiver: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::Get)?;
     match get_trap(vm, heap, state, scope, &handler, Trap::Get)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
@@ -785,15 +757,7 @@ fn get_h(
             // forward: lookup on the target, getter `this` = the
             // original receiver (a proxy target re-enters its own
             // `get` trap with the same receiver)
-            Runtime::get_property_on(
-                vm,
-                heap,
-                state,
-                // Safety: fresh handle-slot words, rooted until consumed.
-                unsafe { target.read_unchecked() },
-                unsafe { receiver.read_unchecked() },
-                unsafe { name.read_unchecked() },
-            )
+            Runtime::get_property_on(vm, heap, state, target, *receiver, *name)
         }
         TrapLookup::Trap(t) => {
             let result = call_trap(
@@ -804,10 +768,10 @@ fn get_h(
                 &t,
                 &[handler, target, *name, *receiver],
             )?;
-            let Coercion::Value(result) = result else {
-                return Ok(Coercion::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            let result = scope.handle(unsafe { result.assume_valid(heap) });
             // invariant (steps 9-11): a trap cannot lie about
             // non-configurable data / accessor properties
             let desc = own_descriptor_h(vm, heap, state, scope, &target, name)?;
@@ -840,21 +804,21 @@ fn get_h(
                     Ok(())
                 })?;
             }
-            Ok(Coercion::Value(unsafe { result.read_unchecked() }))
+            Ok(Coercion::Value(result.as_tagged(heap)))
         }
     }
 }
 
 /// Proxy `[[Set]]` (ES 20.2.5.10).
-pub fn set(
+pub fn set<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     proxy: Tagged<'_, Value>,
     name: Tagged<'_, Value>,
     value: Tagged<'_, Value>,
     receiver: Tagged<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     state.handle_scope(|scope| {
         let proxy = scope.handle(proxy);
         let name = scope.handle(name);
@@ -864,16 +828,16 @@ pub fn set(
     })
 }
 
-fn set_h(
+fn set_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
     value: &Handle<'_, Value>,
     receiver: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::Set)?;
     match get_trap(vm, heap, state, scope, &handler, Trap::Set)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
@@ -893,14 +857,14 @@ fn set_h(
                 &t,
                 &[handler, target, *name, *value, *receiver],
             )?;
-            let Coercion::Value(result) = result else {
-                return Ok(Coercion::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            let truthy =
-                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            let truthy = heap.no_gc(|heap| Convert::is_truthy(heap, result.as_tagged(heap)));
             if !truthy {
                 // [[Set]] returned false; sloppy stores ignore it
-                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
+                return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
             // invariant (steps 11-13)
             let desc = own_descriptor_h(vm, heap, state, scope, &target, name)?;
@@ -932,19 +896,19 @@ fn set_h(
                     Ok(())
                 })?;
             }
-            Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
+            Ok(Coercion::Value(Convert::boolean(heap, true)))
         }
     }
 }
 
 /// Proxy `[[HasProperty]]` (ES 20.2.5.9).
-pub fn has(
+pub fn has<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     proxy: Tagged<'_, Value>,
     name: Tagged<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     state.handle_scope(|scope| {
         let proxy = scope.handle(proxy);
         let name = scope.handle(name);
@@ -952,14 +916,14 @@ pub fn has(
     })
 }
 
-fn has_h(
+fn has_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::Has)?;
     match get_trap(vm, heap, state, scope, &handler, Trap::Has)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
@@ -970,18 +934,18 @@ fn has_h(
                 let found = heap.no_gc(|heap| {
                     has_property(heap, target.as_tagged(heap), name.as_tagged(heap).as_name())
                 });
-                Ok(Coercion::Value(Convert::boolean(heap, found).erase()))
+                Ok(Coercion::Value(Convert::boolean(heap, found)))
             }
         }
         TrapLookup::Trap(t) => {
             let result = call_trap(vm, heap, state, scope, &t, &[handler, target, *name])?;
-            let Coercion::Value(result) = result else {
-                return Ok(Coercion::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            let truthy =
-                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            let truthy = heap.no_gc(|heap| Convert::is_truthy(heap, result.as_tagged(heap)));
             if truthy {
-                return Ok(Coercion::Value(Convert::boolean(heap, true).erase()));
+                return Ok(Coercion::Value(Convert::boolean(heap, true)));
             }
             // invariant (steps 10-12): cannot hide non-configurable
             // or existing-on-non-extensible-target properties
@@ -1005,20 +969,20 @@ fn has_h(
                     ));
                 }
             }
-            Ok(Coercion::Value(Convert::boolean(heap, false).erase()))
+            Ok(Coercion::Value(Convert::boolean(heap, false)))
         }
     }
 }
 
 /// Proxy `[[Delete]]` (ES 20.2.5.4). The strict-mode false→TypeError
 /// translation is the caller's (`delete` sloppy/strict natives).
-pub fn delete(
+pub fn delete<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     proxy: Tagged<'_, Value>,
     key: Tagged<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     state.handle_scope(|scope| {
         let proxy = scope.handle(proxy);
         let key = scope.handle(key);
@@ -1026,14 +990,14 @@ pub fn delete(
     })
 }
 
-fn delete_h(
+fn delete_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     key: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::DeleteProperty)?;
     match get_trap(vm, heap, state, scope, &handler, Trap::DeleteProperty)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
@@ -1044,19 +1008,19 @@ fn delete_h(
                 let target_obj = scope
                     .cast::<Object>(target.as_tagged(heap))
                     .expect("ordinary target");
-                let deleted = crate::Object::delete_own_property(heap, scope, target_obj, *key)?;
-                Ok(Coercion::Value(Convert::boolean(heap, deleted).erase()))
+                let deleted = Object::delete_own_property(heap, scope, target_obj, *key)?;
+                Ok(Coercion::Value(Convert::boolean(heap, deleted)))
             }
         }
         TrapLookup::Trap(t) => {
             let result = call_trap(vm, heap, state, scope, &t, &[handler, target, *key])?;
-            let Coercion::Value(result) = result else {
-                return Ok(Coercion::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            let truthy =
-                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            let truthy = heap.no_gc(|heap| Convert::is_truthy(heap, result.as_tagged(heap)));
             if !truthy {
-                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
+                return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
             // invariant: cannot claim deletion of non-configurable
             // (or existing-on-non-extensible-target) properties
@@ -1080,7 +1044,7 @@ fn delete_h(
                     ));
                 }
             }
-            Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
+            Ok(Coercion::Value(Convert::boolean(heap, true)))
         }
     }
 }
@@ -1126,10 +1090,11 @@ fn proxy_define_h(
                 &t,
                 &[handler, target, *name, desc_obj],
             )?;
-            let Coercion::Value(result) = result else {
-                return Ok(Flow::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Flow::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            if !heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) })) {
+            if !heap.no_gc(|heap| Convert::is_truthy(heap, result.as_tagged(heap))) {
                 return Ok(Flow::Value(false));
             }
             // extensible first (a proxy target's trap allocates)
@@ -1190,28 +1155,27 @@ fn proxy_define_h(
 
 /// Proxy `[[Call]]` (ES 20.2.5.15): the `apply` trap, or a plain call
 /// of the target. `args` includes the receiver (`this`) at index 0.
-pub fn apply(
+pub fn apply<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
-    proxy: Tagged<'_, Value>,
-    args: &[Tagged<'_, Value>],
-) -> Result<Coercion, VmError> {
+    proxy: Handle<'_, Value>,
+    args: GcSlice<'_>,
+) -> Result<Coercion<'a>, VmError> {
     state.handle_scope(|scope| {
-        let proxy = scope.handle(proxy);
-        let args: Vec<Handle<'_, Value>> = args.iter().map(|a| scope.handle(*a)).collect();
+        let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
         apply_h(vm, heap, state, &scope, &proxy, &args)
     })
 }
 
-fn apply_h(
+fn apply_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::Apply)?;
     let this_arg = match args.first() {
         Some(h) => *h,
@@ -1220,31 +1184,29 @@ fn apply_h(
     match get_trap(vm, heap, state, scope, &handler, Trap::Apply)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => {
-            let mut all: Vec<Value> = Vec::with_capacity(args.len());
-            all.push(unsafe { this_arg.read_unchecked() });
+            let mut all: Vec<Tagged<'_, Value>> = Vec::with_capacity(args.len());
+            all.push(this_arg.as_tagged(heap).erase_type());
             for h in &args[1..] {
-                all.push(unsafe { h.read_unchecked() });
+                all.push(h.as_tagged(heap).erase_type());
             }
-            let result = NativeContext::new(vm, heap, state).call(
-                // Safety: fresh handle-slot word.
-                unsafe { Tagged::from_value_unchecked(target.read_unchecked()) },
-                scope.stage_words(&all),
-            )?;
+            let staged = scope.stage(&all);
+            let result = NativeContext::new(vm, heap, state).call_rooted(target, staged)?;
             let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
             if result == exception {
                 Ok(Coercion::Threw)
             } else {
-                Ok(Coercion::Value(result))
+                // Safety: the call just returned; no GC since.
+                Ok(Coercion::Value(unsafe {
+                    Tagged::from_value_unchecked(result)
+                }))
             }
         }
         TrapLookup::Trap(t) => {
             // args: (target, thisArg, argumentsList)
-            let words: Vec<Value> = args[1..]
-                .iter()
-                .map(|h| unsafe { h.read_unchecked() })
-                .collect();
+            let words: Vec<Tagged<'_, Value>> =
+                args[1..].iter().map(|h| h.as_tagged(heap)).collect();
             let arr = heap
-                .new_array(scope, scope.stage_words(&words))
+                .new_array(scope, scope.stage(&words))
                 .into_handle(scope)
                 .erase();
             let result = call_trap(
@@ -1263,31 +1225,29 @@ fn apply_h(
 /// Proxy `[[Construct]]` (ES 20.2.5.5): the `construct` trap, or a
 /// construct of the target with the original `new.target`. `args` are
 /// the constructor arguments (no synthesized receiver).
-pub fn construct(
+pub fn construct<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
-    proxy: Tagged<'_, Value>,
-    args: &[Tagged<'_, Value>],
-    new_target: Tagged<'_, Value>,
-) -> Result<Coercion, VmError> {
+    proxy: Handle<'_, Value>,
+    args: GcSlice<'_>,
+    new_target: Handle<'_, Value>,
+) -> Result<Coercion<'a>, VmError> {
     state.handle_scope(|scope| {
-        let proxy = scope.handle(proxy);
-        let args: Vec<Handle<'_, Value>> = args.iter().map(|a| scope.handle(*a)).collect();
-        let new_target = scope.handle(new_target);
+        let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
         construct_h(vm, heap, state, &scope, &proxy, &args, &new_target)
     })
 }
 
-fn construct_h(
+fn construct_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
     new_target: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::Construct)?;
     match get_trap(vm, heap, state, scope, &handler, Trap::Construct)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
@@ -1323,37 +1283,37 @@ fn construct_h(
                 };
                 scope.handle(unsafe { r.assume_valid(heap) })
             };
-            let mut all: Vec<Value> = Vec::with_capacity(args.len() + 1);
-            all.push(unsafe { receiver.read_unchecked() });
+            let mut all: Vec<Tagged<'_, Value>> = Vec::with_capacity(args.len() + 1);
+            all.push(receiver.as_tagged(heap).erase_type());
             for h in args {
-                all.push(unsafe { h.read_unchecked() });
+                all.push(h.as_tagged(heap).erase_type());
             }
-            let result = NativeContext::new(vm, heap, state).call_construct(
-                // Safety: fresh handle-slot word.
-                unsafe { Tagged::from_value_unchecked(target.read_unchecked()) },
-                // Safety: fresh handle-slot word.
-                unsafe { Tagged::from_value_unchecked(new_target.read_unchecked()) },
-                scope.stage_words(&all),
+            let staged = scope.stage(&all);
+            let result = NativeContext::new(vm, heap, state).call_construct_rooted(
+                target,
+                *new_target,
+                staged,
             )?;
             let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
             if result == exception {
                 return Ok(Coercion::Threw);
             }
+            // Safety: the construct just returned; no GC since.
             let result = scope.handle(unsafe { result.assume_valid(heap) });
             if heap.no_gc(|heap| Convert::is_primitive(heap, result.as_tagged(heap))) {
                 if derived {
                     // a derived constructor may only return objects
                     return Err(VmError::Type);
                 }
-                return Ok(Coercion::Value(unsafe { receiver.read_unchecked() }));
+                return Ok(Coercion::Value(receiver.as_tagged(heap)));
             }
-            Ok(Coercion::Value(unsafe { result.read_unchecked() }))
+            Ok(Coercion::Value(result.as_tagged(heap)))
         }
         TrapLookup::Trap(t) => {
             // args: (target, argumentsList, newTarget)
-            let words: Vec<Value> = args.iter().map(|h| unsafe { h.read_unchecked() }).collect();
+            let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
             let arr = heap
-                .new_array(scope, scope.stage_words(&words))
+                .new_array(scope, scope.stage(&words))
                 .into_handle(scope)
                 .erase();
             let result = call_trap(
@@ -1364,17 +1324,17 @@ fn construct_h(
                 &t,
                 &[handler, target, arr, *new_target],
             )?;
-            let Coercion::Value(result) = result else {
-                return Ok(Coercion::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            let result = scope.handle(unsafe { result.assume_valid(heap) });
             // invariant: the trap must return an object
             if heap.no_gc(|heap| Convert::is_primitive(heap, result.as_tagged(heap))) {
                 return Err(VmError::Message(
                     "proxy construct trap must return an object",
                 ));
             }
-            Ok(Coercion::Value(unsafe { result.read_unchecked() }))
+            Ok(Coercion::Value(result.as_tagged(heap)))
         }
     }
 }
@@ -1419,31 +1379,31 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
 
 /// Proxy `[[PreventExtensions]]` (ES 20.2.5.3), plus the ordinary path —
 /// the `Object.preventExtensions` implementation.
-pub fn prevent_extensions(
+pub fn prevent_extensions<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     obj: Tagged<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     state.handle_scope(|scope| {
         let obj = scope.handle(obj);
         prevent_extensions_h(vm, heap, state, &scope, &obj)
     })
 }
 
-fn prevent_extensions_h(
+fn prevent_extensions_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
         let Some(obj) = scope.cast::<Object>(obj.as_tagged(heap)) else {
             return Err(VmError::Type);
         };
         ordinary_prevent_extensions(heap, scope, obj);
-        return Ok(Coercion::Value(Convert::boolean(heap, true).erase()));
+        return Ok(Coercion::Value(Convert::boolean(heap, true)));
     }
     let (target, handler) = heap
         .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
@@ -1459,11 +1419,12 @@ fn prevent_extensions_h(
         TrapLookup::None => prevent_extensions_h(vm, heap, state, scope, &target),
         TrapLookup::Trap(t) => {
             let result = call_trap(vm, heap, state, scope, &t, &[handler, target])?;
-            let Coercion::Value(result) = result else {
-                return Ok(Coercion::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            if !heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) })) {
-                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
+            if !heap.no_gc(|heap| Convert::is_truthy(heap, result.as_tagged(heap))) {
+                return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
             // invariant: returning true requires a non-extensible target
             let ext = is_extensible_h(vm, heap, state, scope, &target)?;
@@ -1475,39 +1436,39 @@ fn prevent_extensions_h(
                     "proxy preventExtensions trap returned true for an extensible target",
                 ));
             }
-            Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
+            Ok(Coercion::Value(Convert::boolean(heap, true)))
         }
     }
 }
 
 /// `Object.isExtensible` (ES 20.1.2.14) including the proxy trap and
 /// its must-match-target invariant (ES 20.2.5.2 step 8).
-pub fn is_extensible(
+pub fn is_extensible<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     obj: Tagged<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     state.handle_scope(|scope| {
         let obj = scope.handle(obj);
         is_extensible_entry_h(vm, heap, state, &scope, &obj)
     })
 }
 
-fn is_extensible_entry_h(
+fn is_extensible_entry_h<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
-) -> Result<Coercion, VmError> {
+) -> Result<Coercion<'a>, VmError> {
     if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
         let extensible = heap.no_gc(|heap| {
             obj.as_tagged(heap)
                 .as_heap_object()
                 .is_some_and(|o| o.as_ref().map_ref(heap).kind().is_extendable())
         });
-        return Ok(Coercion::Value(Convert::boolean(heap, extensible).erase()));
+        return Ok(Coercion::Value(Convert::boolean(heap, extensible)));
     }
     let (target, handler) = heap
         .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
@@ -1523,11 +1484,11 @@ fn is_extensible_entry_h(
         TrapLookup::None => is_extensible_entry_h(vm, heap, state, scope, &target),
         TrapLookup::Trap(t) => {
             let result = call_trap(vm, heap, state, scope, &t, &[handler, target])?;
-            let Coercion::Value(result) = result else {
-                return Ok(Coercion::Threw);
+            let result = match result {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
             };
-            let trap_bool =
-                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            let trap_bool = heap.no_gc(|heap| Convert::is_truthy(heap, result.as_tagged(heap)));
             let target_bool = is_extensible_h(vm, heap, state, scope, &target)?;
             let Flow::Value(target_bool) = target_bool else {
                 return Ok(Coercion::Threw);
@@ -1537,7 +1498,7 @@ fn is_extensible_entry_h(
                     "proxy isExtensible trap must match the target's extensibility",
                 ));
             }
-            Ok(Coercion::Value(Convert::boolean(heap, trap_bool).erase()))
+            Ok(Coercion::Value(Convert::boolean(heap, trap_bool)))
         }
     }
 }

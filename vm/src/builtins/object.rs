@@ -1,4 +1,16 @@
 //! ES 20.1: the Object constructor, statics, and prototype methods.
+use crate::Key;
+use crate::Lookup;
+use crate::lookup::ordinary_own_descriptor;
+use crate::natives::NativeContext;
+use crate::proxy::Flow;
+use crate::proxy::define_internal;
+use crate::proxy::is_extensible;
+use crate::proxy::is_js_receiver;
+use crate::proxy::is_proxy;
+use crate::proxy::prevent_extensions;
+use crate::runtime::Coercion;
+use crate::runtime::Runtime;
 
 use crate::{
     Convert, GcSlice, Handle, HandleScope, Heap, Object, PropertyDescriptor, SlotName, Smi, Tagged,
@@ -7,7 +19,7 @@ use crate::{
 
 /// Stub: `Object.prototype.toString` returns "[object Object]".
 pub fn object_to_string(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     _args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -22,7 +34,7 @@ pub fn object_to_string(
 /// implemented yet); `new Object()`: the interpreter prepends the fresh
 /// receiver, so [[Construct]] just returns it.
 pub fn object_constructor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     if nctx.is_construct() {
@@ -49,7 +61,7 @@ pub fn object_constructor(
 /// arguments are a TypeError until ToObject boxing exists (ES5 behavior;
 /// ES2015+ boxes them).
 pub fn object_get_prototype_of(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.heap().no_gc(|heap| {
@@ -73,6 +85,7 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
     let Some(obj) = target.as_heap_object() else {
         return keys;
     };
+
     if obj.as_ref().is_array(heap) {
         let len = obj.as_ref().length().min(
             obj.as_ref()
@@ -95,7 +108,7 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
 /// `Object.prototype.hasOwnProperty(key)` (ES 20.4.3.2, own properties
 /// only).
 pub fn object_has_own_property(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -110,12 +123,12 @@ pub fn object_has_own_property(
         // Safety: fresh argument word, rooted below before any allocation.
         let receiver = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_receiver) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(
+        let Some(key) = Runtime::to_property_key(
             vm,
             heap,
             state,
             // Safety: fresh argument word, fresh at entry.
-            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
             // Safety: fresh root-slot word read for the immediate return.
@@ -126,15 +139,15 @@ pub fn object_has_own_property(
         let receiver = receiver.as_tagged(heap).erase();
         let has = heap.no_gc(|heap| {
             let key = key.as_tagged(heap);
-            if let crate::Key::Element(i) =
-                crate::classify_key(heap, key.erase_type()).unwrap_or(crate::Key::Name(key))
+            if let Key::Element(i) =
+                crate::classify_key(heap, key.erase_type()).unwrap_or(Key::Name(key))
                 && let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
                 return true;
             }
             match unsafe { receiver.assume_valid(heap) }.lookup(heap, key) {
-                crate::Lookup::NotFound => false,
+                Lookup::NotFound => false,
                 // the array `length` internal slot counts as an own property
                 _ => true,
             }
@@ -147,7 +160,7 @@ pub fn object_has_own_property(
 
 /// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
 pub fn object_property_is_enumerable(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -162,12 +175,12 @@ pub fn object_property_is_enumerable(
         // Safety: fresh argument word, rooted below before any allocation.
         let receiver = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_receiver) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(
+        let Some(key) = Runtime::to_property_key(
             vm,
             heap,
             state,
             // Safety: fresh argument word, fresh at entry.
-            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
             // Safety: fresh root-slot word read for the immediate return.
@@ -178,16 +191,16 @@ pub fn object_property_is_enumerable(
         let receiver = receiver.as_tagged(heap).erase();
         let enumerable = heap.no_gc(|heap| {
             let key = key.as_tagged(heap);
-            if let crate::Key::Element(i) =
-                crate::classify_key(heap, key.erase_type()).unwrap_or(crate::Key::Name(key))
+            if let Key::Element(i) =
+                crate::classify_key(heap, key.erase_type()).unwrap_or(Key::Name(key))
                 && let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
                 return true; // array elements are enumerable
             }
             match unsafe { receiver.assume_valid(heap) }.lookup(heap, key) {
-                crate::Lookup::Data { flags, .. } => flags.is_enumerable(),
-                crate::Lookup::Accessor {
+                Lookup::Data { flags, .. } => flags.is_enumerable(),
+                Lookup::Accessor {
                     holder, map_index, ..
                 } => holder
                     .as_ref()
@@ -197,7 +210,7 @@ pub fn object_property_is_enumerable(
                     .descriptor(map_index)
                     .flags()
                     .is_enumerable(),
-                crate::Lookup::NotFound => false,
+                Lookup::NotFound => false,
             }
         });
         Ok(nctx
@@ -208,7 +221,7 @@ pub fn object_property_is_enumerable(
 
 /// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
 pub fn object_get_own_property_names(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before the
@@ -229,14 +242,19 @@ pub fn object_get_own_property_names(
     });
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let staged = scope.stage_words(&names);
+        let staged = scope.stage(
+            &names
+                .iter()
+                .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
+                .collect::<Vec<_>>(),
+        );
         Ok(heap.new_array(&scope, staged).erase_type().erase())
     })
 }
 
 /// Build a plain `{ key: value, ... }` object from static field names.
 pub fn plain_object(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     fields: &[(&'static str, Handle<'_, Value>)],
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -266,7 +284,7 @@ pub fn plain_object(
 /// raw descriptor reader (`lookup::ordinary_own_descriptor`) converted
 /// to a descriptor object via FromPropertyDescriptor semantics.
 pub fn object_get_own_property_descriptor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -281,12 +299,12 @@ pub fn object_get_own_property_descriptor(
         // Safety: fresh argument word, rooted below before any allocation.
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(
+        let Some(key) = Runtime::to_property_key(
             vm,
             heap,
             state,
             // Safety: fresh argument word, fresh at entry.
-            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
             // Safety: fresh root-slot word read for the immediate return.
@@ -295,7 +313,7 @@ pub fn object_get_own_property_descriptor(
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
         let desc = heap.no_gc(|heap| {
-            crate::lookup::ordinary_own_descriptor(
+            ordinary_own_descriptor(
                 heap,
                 &scope,
                 target.as_tagged(heap),
@@ -313,7 +331,7 @@ pub fn object_get_own_property_descriptor(
         });
         let bool_ = |b| if b { true_v } else { false_v };
         match desc {
-            Some(crate::PropertyDescriptor::Data {
+            Some(PropertyDescriptor::Data {
                 value,
                 writable,
                 enumerable,
@@ -327,7 +345,7 @@ pub fn object_get_own_property_descriptor(
                     ("configurable", bool_(configurable)),
                 ],
             ),
-            Some(crate::PropertyDescriptor::Accessor {
+            Some(PropertyDescriptor::Accessor {
                 get,
                 set,
                 enumerable,
@@ -350,7 +368,7 @@ pub fn object_get_own_property_descriptor(
 /// ToPropertyDescriptor + [[DefineOwnProperty]] (through the
 /// `defineProperty` trap for proxy receivers, ES 20.2.5.6).
 pub fn object_define_property(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -368,12 +386,12 @@ pub fn object_define_property(
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let attrs = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_attrs) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(
+        let Some(key) = Runtime::to_property_key(
             vm,
             heap,
             state,
             // Safety: fresh argument word, fresh at entry.
-            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
             // Safety: fresh root-slot word read for the immediate return.
@@ -383,16 +401,14 @@ pub fn object_define_property(
         let key = scope.handle(key);
         // shared ToPropertyDescriptor; proxies and ordinary targets both
         // complete/validate inside define_internal
-        let partial = match crate::runtime::Runtime::to_property_descriptor(
-            vm, heap, state, &scope, attrs,
-        )? {
+        let partial = match Runtime::to_property_descriptor(vm, heap, state, &scope, attrs)? {
             Some(partial) => partial,
             // Safety: fresh root-slot word read for the immediate return.
             None => return Ok(unsafe { heap.known().exception.read_unchecked() }),
         };
         let (vm, heap, state) = nctx.split();
         // Safety: fresh rooted-slot words, consumed by the call.
-        match crate::proxy::define_internal(
+        match define_internal(
             vm,
             heap,
             state,
@@ -403,15 +419,15 @@ pub fn object_define_property(
             partial,
         )? {
             // Safety: fresh root-slot word read for the immediate return.
-            crate::proxy::Flow::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
-            crate::proxy::Flow::Value(false) => Err(VmError::Type),
-            crate::proxy::Flow::Value(true) => Ok(unsafe { target.read_unchecked() }),
+            Flow::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
+            Flow::Value(false) => Err(VmError::Type),
+            Flow::Value(true) => Ok(unsafe { target.read_unchecked() }),
         }
     })
 }
 
 pub fn object_set_prototype_of(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     let (target, proto) = nctx.heap().no_gc(|heap| {
@@ -425,9 +441,8 @@ pub fn object_set_prototype_of(
         let undefined = heap.known().undefined.as_tagged(heap).erase();
         (
             target == null || target == undefined,
-            !crate::Convert::is_primitive(heap, unsafe { target.assume_valid(heap) }),
-            proto == null
-                || !crate::Convert::is_primitive(heap, unsafe { proto.assume_valid(heap) }),
+            !Convert::is_primitive(heap, unsafe { target.assume_valid(heap) }),
+            proto == null || !Convert::is_primitive(heap, unsafe { proto.assume_valid(heap) }),
         )
     });
     // RequireObjectCoercible(O)
@@ -447,7 +462,7 @@ pub fn object_set_prototype_of(
         let target_obj = scope
             .cast::<Object>(target_h.as_tagged(&*nctx.heap()))
             .expect("target checked to be an object");
-        crate::Object::set_prototype(nctx.heap(), &scope, target_obj, proto_h)?;
+        Object::set_prototype(nctx.heap(), &scope, target_obj, proto_h)?;
         Ok(target)
     })
 }
@@ -455,7 +470,7 @@ pub fn object_set_prototype_of(
 /// `Object.preventExtensions(O)` (ES 20.1.2.16): through the
 /// `preventExtensions` trap for proxies (ES 20.2.5.3).
 pub fn object_prevent_extensions(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -480,20 +495,19 @@ pub fn object_prevent_extensions(
         // code: keep it rooted across the call
         if !nctx
             .heap()
-            .no_gc(|heap| crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
+            .no_gc(|heap| is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
         {
             return Ok(target); // primitives returned unchanged
         }
         let (vm, heap, state) = nctx.split();
         // Safety: fresh rooted-slot word, consumed by the call.
         let target = unsafe { Tagged::<Value>::from_value_unchecked(target) };
-        match crate::proxy::prevent_extensions(vm, heap, state, target)? {
+        match prevent_extensions(vm, heap, state, target)? {
             // Safety: fresh root-slot word read for the immediate return.
-            crate::runtime::Coercion::Threw => {
-                Ok(unsafe { heap.known().exception.read_unchecked() })
-            }
-            crate::runtime::Coercion::Value(v) => {
-                if !heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { v.assume_valid(heap) })) {
+            Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
+            Coercion::Value(v) => {
+                let v = scope.handle(v);
+                if !heap.no_gc(|heap| Convert::is_truthy(heap, v.as_tagged(heap))) {
                     Err(VmError::Message("object is not extensible"))
                 } else {
                     // re-read through the handle: the trap above ran user
@@ -508,7 +522,7 @@ pub fn object_prevent_extensions(
 /// `Object.isExtensible(O)` (ES 20.1.2.14): primitives are `false`;
 /// proxies run the `isExtensible` trap with its must-match invariant.
 pub fn object_is_extensible(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     let target = nctx
@@ -516,7 +530,7 @@ pub fn object_is_extensible(
         .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
     if !nctx
         .heap()
-        .no_gc(|heap| crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
+        .no_gc(|heap| is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
     {
         return Ok(nctx
             .heap()
@@ -525,10 +539,10 @@ pub fn object_is_extensible(
     let (vm, heap, state) = nctx.split();
     // Safety: fresh argument word, consumed by the call.
     let target = unsafe { Tagged::<Value>::from_value_unchecked(target) };
-    match crate::proxy::is_extensible(vm, heap, state, target)? {
+    match is_extensible(vm, heap, state, target)? {
         // Safety: fresh root-slot word read for the immediate return.
-        crate::runtime::Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
-        crate::runtime::Coercion::Value(v) => Ok(v),
+        Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
+        Coercion::Value(v) => Ok(v.erase()),
     }
 }
 
@@ -600,10 +614,7 @@ pub fn set_integrity_flags(
 }
 
 /// `Object.seal(O)` (ES 20.1.2.17).
-pub fn object_seal(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
     // re-reads under `no_gc` anchors.
     let target = nctx
@@ -624,7 +635,7 @@ pub fn object_seal(
         let target = target_handle.as_tagged(&*nctx.heap()).erase();
         if !nctx
             .heap()
-            .no_gc(|heap| crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
+            .no_gc(|heap| is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
         {
             return Ok(target);
         }
@@ -632,14 +643,15 @@ pub fn object_seal(
         // Safety: fresh rooted-slot word, consumed by the call.
         let t = unsafe { Tagged::<Value>::from_value_unchecked(target) };
         // [[PreventExtensions]] first (traps included)
-        match crate::proxy::prevent_extensions(vm, heap, state, t)? {
+        match prevent_extensions(vm, heap, state, t)? {
             // Safety: fresh root-slot word read for the immediate return.
-            crate::runtime::Coercion::Threw => {
+            Coercion::Threw => {
                 // Safety: fresh root-slot word read for the immediate return.
                 return Ok(unsafe { heap.known().exception.read_unchecked() });
             }
-            crate::runtime::Coercion::Value(v) => {
-                if !heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { v.assume_valid(heap) })) {
+            Coercion::Value(v) => {
+                let v = scope.handle(v);
+                if !heap.no_gc(|heap| Convert::is_truthy(heap, v.as_tagged(heap))) {
                     return Err(VmError::Message("object is not extensible"));
                 }
             }
@@ -649,7 +661,7 @@ pub fn object_seal(
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
         let target = target_handle.as_tagged(heap).erase();
-        if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { target.assume_valid(heap) })) {
+        if heap.no_gc(|heap| is_proxy(heap, unsafe { target.assume_valid(heap) })) {
             return Ok(target);
         }
         let obj = scope
@@ -662,10 +674,7 @@ pub fn object_seal(
 }
 
 /// `Object.freeze(O)` (ES 20.1.2.9).
-pub fn object_freeze(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
     // re-reads under `no_gc` anchors.
     let target = nctx
@@ -686,20 +695,21 @@ pub fn object_freeze(
         let target = target_handle.as_tagged(&*nctx.heap()).erase();
         if !nctx
             .heap()
-            .no_gc(|heap| crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
+            .no_gc(|heap| is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
         {
             return Ok(target);
         }
         let (vm, heap, state) = nctx.split();
         // Safety: fresh rooted-slot word, consumed by the call.
         let t = unsafe { Tagged::<Value>::from_value_unchecked(target) };
-        match crate::proxy::prevent_extensions(vm, heap, state, t)? {
-            crate::runtime::Coercion::Threw => {
+        match prevent_extensions(vm, heap, state, t)? {
+            Coercion::Threw => {
                 // Safety: fresh root-slot word read for the immediate return.
                 return Ok(unsafe { heap.known().exception.read_unchecked() });
             }
-            crate::runtime::Coercion::Value(v) => {
-                if !heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { v.assume_valid(heap) })) {
+            Coercion::Value(v) => {
+                let v = scope.handle(v);
+                if !heap.no_gc(|heap| Convert::is_truthy(heap, v.as_tagged(heap))) {
                     return Err(VmError::Message("object is not extensible"));
                 }
             }
@@ -707,7 +717,7 @@ pub fn object_freeze(
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
         let target = target_handle.as_tagged(heap).erase();
-        if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { target.assume_valid(heap) })) {
+        if heap.no_gc(|heap| is_proxy(heap, unsafe { target.assume_valid(heap) })) {
             return Ok(target);
         }
         let obj = scope

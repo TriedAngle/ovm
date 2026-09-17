@@ -275,7 +275,12 @@ impl Thread {
         // Safety: caller-owned argument words staged into rooted slots
         // before anything can allocate.
         self.state.handle_scope(|scope| {
-            let args = scope.stage_words(args);
+            let args = scope.stage(
+                &args
+                    .iter()
+                    .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
+                    .collect::<Vec<_>>(),
+            );
             interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args, None)
         })
     }
@@ -289,8 +294,17 @@ impl Thread {
         // stage a rooted copy: the native may keep reading it across its
         // own allocations
         // Safety: caller-owned words staged before any allocation.
-        self.state
-            .handle_scope(|scope| f(&mut nctx, scope.stage_words(args)))
+        self.state.handle_scope(|scope| {
+            f(
+                &mut nctx,
+                scope.stage(
+                    &args
+                        .iter()
+                        .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        })
     }
 
     pub fn run_script(&mut self, src: &str) -> Result<Value, ScriptError> {

@@ -1,10 +1,11 @@
 //! ES 22.1: the String constructor and prototype methods.
 
 use super::helpers::wrapper_value;
+use crate::natives::NativeContext;
 use crate::{Convert, GcSlice, Tagged, Value, VmError};
 
 pub fn string_constructor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -15,34 +16,27 @@ pub fn string_constructor(
             .no_gc(|heap| args.get(heap, 1).map(|v| v.erase()))
             // Safety: fresh root-slot word read for the immediate use.
             .unwrap_or_else(|| unsafe { heap.known().undefined.read_unchecked() });
-        let arg = unsafe { Tagged::<Value>::from_value_unchecked(arg) };
-        let s = Convert::to_string(heap, &scope, arg)?;
-        let s = s.erase();
+        let arg = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(arg) });
+        let s = scope.handle(Convert::to_string(heap, &scope, arg)?);
         if !construct {
-            return Ok(s);
+            return Ok(s.as_tagged(heap).erase());
         }
         let map = heap.known().string_wrapper_map;
         Ok(heap
-            .new_object(&scope, map, scope.stage_words(&[s]))
+            .new_object(&scope, map, scope.stage(&[s.as_tagged(heap).erase_type()]))
             .erase_type()
             .erase())
     })
 }
 
-pub fn string_value_of(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn string_value_of(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.heap().no_gc(|heap| {
         let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
         wrapper_value(heap, receiver)
     })
 }
 
-pub fn string_to_string(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn string_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.heap().no_gc(|heap| {
         let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
         wrapper_value(heap, receiver)

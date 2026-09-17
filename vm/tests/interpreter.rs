@@ -128,7 +128,7 @@ fn run_program(
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -157,7 +157,7 @@ fn create_closure_of_kind(
             .allocate_handle::<FixedByteArray>(body, &scope);
         let constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -362,7 +362,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
             .allocate_handle::<FixedByteArray>(&callee_program, &scope);
         let callee_constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,
@@ -798,7 +798,7 @@ fn define_own_property_accessor_invokes_getter() {
             .allocate_handle::<FixedByteArray>(&body, &scope);
         let constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -2794,7 +2794,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
             .allocate_handle::<FixedByteArray>(&callee_program, &scope);
         let callee_consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,
@@ -2884,7 +2884,7 @@ fn create_closure_shares_callable_info_template() {
         let callee_bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let callee_consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,
@@ -3153,7 +3153,7 @@ fn closure_captures_function_context_end_to_end() {
             .allocate_handle::<FixedByteArray>(&callee_program, &scope);
         let callee_consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,

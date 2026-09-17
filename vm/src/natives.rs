@@ -6,6 +6,8 @@
 use core::ptr::NonNull;
 
 use crate::builtins::intrinsics::runtime_fn;
+use crate::errors::error_from_vm_error;
+use crate::interpreter::execute;
 use crate::{
     ContextState, DenseString, GcSlice, Handle, HandleScope, Heap, Object, Tagged, Thread, VM,
     Value, VmError,
@@ -75,7 +77,7 @@ impl<'a> NativeContext<'a> {
     }
 
     pub fn set_pending_exception(&mut self, err: VmError) {
-        let ex = crate::errors::error_from_vm_error(self.vm, self.heap, self.state, err)
+        let ex = error_from_vm_error(self.vm, self.heap, self.state, err)
             .expect("error materialization must not fail");
         self.state.set_pending_exception(ex);
     }
@@ -99,7 +101,7 @@ impl<'a> NativeContext<'a> {
         let Some(callable) = scope.cast::<Object>(callable) else {
             return Err(VmError::Type);
         };
-        crate::interpreter::execute(self.vm, self.heap, self.state, callable, args, None)
+        execute(self.vm, self.heap, self.state, callable, args, None)
     }
 
     /// Invoke a callable that is already rooted in a handle. This is the
@@ -114,7 +116,7 @@ impl<'a> NativeContext<'a> {
         let Some(callable) = callable else {
             return Err(VmError::Type);
         };
-        crate::interpreter::execute(self.vm, self.heap, self.state, callable, args, None)
+        execute(self.vm, self.heap, self.state, callable, args, None)
     }
 
     /// Invoke `callable` as a constructor with `new.target` = `new_target`:
@@ -136,7 +138,35 @@ impl<'a> NativeContext<'a> {
             return Err(VmError::Type);
         }
         let new_target = scope.handle(new_target);
-        crate::interpreter::execute(
+        execute(
+            self.vm,
+            self.heap,
+            self.state,
+            callable,
+            args,
+            Some(new_target),
+        )
+    }
+
+    /// Rooted [`Self::call_construct`]: callable and new.target are handles,
+    /// so no caller-side anchor is needed.
+    pub fn call_construct_rooted<'s>(
+        &mut self,
+        callable: Handle<'_, Value>,
+        new_target: Handle<'_, Value>,
+        args: GcSlice<'s>,
+    ) -> Result<Value, VmError> {
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
+        let Some(callable) = scope.cast::<Object>(callable.as_tagged(&*self.heap)) else {
+            return Err(VmError::Type);
+        };
+        // new.target may be exotic (a constructor proxy)
+        let new_target = new_target.as_tagged(&*self.heap);
+        if !new_target.is_strong_ptr() {
+            return Err(VmError::Type);
+        }
+        let new_target = scope.handle(new_target);
+        execute(
             self.vm,
             self.heap,
             self.state,
@@ -183,9 +213,8 @@ pub unsafe extern "C" fn native_trampoline(
     match f(&mut nctx, args) {
         Ok(v) => v,
         Err(e) => {
-            let ex =
-                crate::errors::error_from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
-                    .expect("error materialization must not fail");
+            let ex = error_from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
+                .expect("error materialization must not fail");
             thread.state.set_pending_exception(ex);
             // Safety: singleton word read for immediate return; the
             // singletons are promoted old-gen and never move.

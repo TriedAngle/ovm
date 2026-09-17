@@ -31,7 +31,7 @@ pub const NEW_TARGET_OFFSET: usize = 3;
 /// Parameters are addressed with negative register indices.
 ///
 /// The stack only tracks *suspended* frames: the frame currently being executed
-/// lives in the [`StackCache`](crate::StackCache) and is pushed here when a call suspends it.
+/// lives in the [`StackCache`](StackCache) and is pushed here when a call suspends it.
 pub struct Stack {
     slots: Box<[Register]>,
     top: Cell<usize>,
@@ -68,9 +68,16 @@ impl Stack {
         unsafe { &*self.slots.as_ptr().add(index) }
     }
 
-    pub fn value_slice(&self, base: usize, count: usize) -> &[Value] {
+    pub fn value_slice(&self, base: usize, count: usize) -> GcSlice<'_> {
         let slots = &self.slots[base..base + count];
-        unsafe { core::slice::from_raw_parts(slots.as_ptr() as *const Value, count) }
+        // Safety: stack slots are GC-visited, so the words stay current for
+        // as long as the returned slice is alive.
+        unsafe {
+            GcSlice::from_slice(core::slice::from_raw_parts(
+                slots.as_ptr() as *const Value,
+                count,
+            ))
+        }
     }
 
     /// The frame's callable, re-read under a heap borrow.
@@ -127,12 +134,12 @@ impl Stack {
     }
 
     pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> GcSlice<'_> {
-        unsafe { GcSlice::from_slice(self.value_slice(Self::reg_index(meta, reg_base), count)) }
+        self.value_slice(Self::reg_index(meta, reg_base), count)
     }
 
     pub fn push_initial_frame(
         &self,
-        callable: Tagged<Object>,
+        callable: Tagged<'_, Value>,
         register_count: usize,
         context: Tagged<'_, Value>,
         new_target: Tagged<'_, Value>,
@@ -164,7 +171,7 @@ impl Stack {
         &self,
         caller: FrameMeta,
         handler_pc: usize,
-        callable: Tagged<Object>,
+        callable: Tagged<'_, Value>,
         register_count: usize,
         context: Tagged<'_, Value>,
         src_reg_base: i32,
@@ -205,20 +212,20 @@ impl Stack {
         &self,
         caller: FrameMeta,
         handler_pc: usize,
-        callable: Tagged<Object>,
+        callable: Tagged<'_, Value>,
         register_count: usize,
         context: Tagged<'_, Value>,
-        args: &[Value],
+        args: GcSlice<'_>,
         new_target: Tagged<'_, Value>,
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
         let padded = args.len().max(formal_min);
         let base = self.reserve(register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
-        debug_assert!(args.iter().all(|v| !v.is_weak_ptr()));
+        debug_assert!(args.words().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
             core::ptr::copy_nonoverlapping(
-                args.as_ptr(),
+                args.words().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             );
@@ -262,7 +269,7 @@ impl Stack {
             )
         }
         // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
-        let staged = unsafe { GcSlice::from_slice(self.value_slice(dst, args.len())) };
+        let staged = self.value_slice(dst, args.len());
         Ok((saved_top, staged))
     }
 
@@ -300,7 +307,7 @@ impl Stack {
         &self,
         base: usize,
         register_count: usize,
-        callable: Tagged<'_, Object>,
+        callable: Tagged<'_, Value>,
         context: Tagged<'_, Value>,
         new_target: Tagged<'_, Value>,
         argc: usize,

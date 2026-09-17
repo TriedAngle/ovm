@@ -3,13 +3,18 @@
 
 use super::object::plain_object;
 use crate::natives::NativeContext;
+use crate::proxy::allocate;
+use crate::proxy::is_js_receiver;
+use crate::proxy::revoke;
+use crate::runtime::Coercion;
+use crate::runtime::Runtime;
 use crate::{GcSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
 /// observable (`typeof`, future `Call`/`Construct` dispatch).
 pub fn proxy_constructor(
-    nctx: &mut crate::natives::NativeContext<'_>,
+    nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     if !nctx.is_construct() {
@@ -22,8 +27,8 @@ pub fn proxy_constructor(
         ))
     })?;
     let ok = nctx.heap().no_gc(|heap| {
-        crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
-            && crate::proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
+        is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            && is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     });
     if !ok {
         return Err(VmError::Message(
@@ -31,7 +36,7 @@ pub fn proxy_constructor(
         ));
     }
     nctx.handle_scope(|nctx, scope| {
-        Ok(crate::proxy::allocate(
+        Ok(allocate(
             nctx.heap(),
             &scope,
             // Safety: fresh argument words, consumed by the allocation.
@@ -46,10 +51,7 @@ pub fn proxy_constructor(
 /// `{ proxy, revoke }`; the revoke closure is the JS template installed
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
 /// hidden `__revokeProxy` native).
-pub fn proxy_revocable(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let (target, handler) = nctx.heap().no_gc(|heap| {
         Ok((
             args.get(heap, 1).ok_or(VmError::Type)?.erase(),
@@ -57,8 +59,8 @@ pub fn proxy_revocable(
         ))
     })?;
     let ok = nctx.heap().no_gc(|heap| {
-        crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
-            && crate::proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
+        is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            && is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     });
     if !ok {
         return Err(VmError::Message(
@@ -66,7 +68,7 @@ pub fn proxy_revocable(
         ));
     }
     nctx.handle_scope(|nctx, scope| {
-        let proxy = scope.handle(crate::proxy::allocate(
+        let proxy = scope.handle(allocate(
             nctx.heap(),
             &scope,
             // Safety: fresh argument words, consumed by the allocation.
@@ -77,23 +79,19 @@ pub fn proxy_revocable(
         let make_revoke = {
             let (vm, heap, state) = nctx.split();
             // Safety: fresh interned word, consumed by the lookup.
-            let name = unsafe {
-                vm.interner()
-                    .intern_str(heap, &scope, "__makeRevoke")
-                    .read_unchecked()
-            };
-            let proto = unsafe { heap.known().function_prototype.read_unchecked() };
-            match crate::runtime::Runtime::get_property(vm, heap, state, proto, name)? {
-                crate::runtime::Coercion::Threw => {
+            let name = vm
+                .interner()
+                .intern_str(heap, &scope, "__makeRevoke")
+                .erase();
+            let proto = heap.known().function_prototype.erase();
+            match Runtime::get_property(vm, heap, state, proto, name)? {
+                Coercion::Threw => {
                     // Safety: fresh root-slot word read for the return.
                     return Ok(unsafe { heap.known().exception.read_unchecked() });
                 }
-                crate::runtime::Coercion::Value(v) => v,
+                Coercion::Value(v) => scope.handle(v),
             }
         };
-        // Safety: fresh word from the lookup above, rooted below.
-        let make_revoke =
-            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(make_revoke) });
         // Safety: fresh rooted-slot words staged for the call.
         let undefined = unsafe { nctx.heap().known().undefined.read_unchecked() };
         let proxy_word = unsafe { proxy.read_unchecked() };
@@ -101,7 +99,10 @@ pub fn proxy_revocable(
         let revoke = NativeContext::new(vm, heap, state).call(
             // Safety: fresh rooted-slot word, consumed by the call.
             unsafe { Tagged::<Value>::from_value_unchecked(make_revoke.read_unchecked()) },
-            scope.stage_words(&[undefined, proxy_word]),
+            scope.stage(&[
+                unsafe { Tagged::<Value>::from_value_unchecked(undefined) },
+                unsafe { Tagged::<Value>::from_value_unchecked(proxy_word) },
+            ]),
         )?;
         if revoke == unsafe { heap.known().exception.read_unchecked() } {
             return Ok(revoke);
@@ -115,14 +116,11 @@ pub fn proxy_revocable(
 /// Hidden `__revokeProxy(p)`: nulls the proxy's target/handler slots
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
-pub fn proxy_revoke(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn proxy_revoke(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let proxy = nctx
         .heap()
         .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
-    crate::proxy::revoke(
+    revoke(
         nctx.heap(),
         // Safety: fresh argument word, consumed with no allocation delay.
         unsafe { Tagged::<Value>::from_value_unchecked(proxy) },

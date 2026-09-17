@@ -8,12 +8,15 @@
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
     Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ScopeInfo,
-    ScopeInfoInit, Value, VmError,
+    ScopeInfoInit, Tagged, Value, VmError,
 };
 
 use base_compiler::{CompiledScript, Constant};
 use parser::FunctionId;
 
+use crate::DenseString;
+use crate::Smi;
+use crate::StringData;
 use crate::{ContextState, Thread, VM};
 
 /// Materialize a compiled script into a closure object (function map,
@@ -53,9 +56,10 @@ pub fn materialize_closure_vm<'s>(
     let info = materialize_function(vm, heap, state, scope, script, &mut infos, FunctionId(0))?;
 
     let map = heap.known().function_map;
-    let slots = scope.stage_words(&[unsafe { info.read_unchecked() }, unsafe {
-        context.read_unchecked()
-    }]);
+    let slots = scope.stage(&[
+        info.as_tagged(heap).erase_type(),
+        context.as_tagged(heap).erase_type(),
+    ]);
     let object = heap.new_object(scope, map, slots).into_handle(scope);
     Ok(object)
 }
@@ -78,7 +82,7 @@ fn materialize_function<'s>(
     for constant in &function.constants {
         let value = match constant {
             Constant::String(bytes) => intern(heap, state, scope, vm, bytes).erase(),
-            Constant::Smi(v) => scope.handle(crate::Smi::new(*v)),
+            Constant::Smi(v) => scope.handle(Smi::new(*v)),
             Constant::Float(f) => scope.handle(heap.new_number(scope, *f)),
             Constant::Callable(child) => {
                 let info = materialize_function(vm, heap, state, scope, script, infos, *child)?;
@@ -89,11 +93,9 @@ fn materialize_function<'s>(
                     .iter()
                     .map(|n| intern(heap, state, scope, vm, n).erase())
                     .collect();
-                let words: Vec<Value> = interned
-                    .iter()
-                    .map(|h| unsafe { h.read_unchecked() })
-                    .collect();
-                let names = heap.allocate_handle::<FixedArray>(scope.stage_words(&words), scope);
+                let words: Vec<Tagged<'_, Value>> =
+                    interned.iter().map(|h| h.as_tagged(heap)).collect();
+                let names = heap.allocate_handle::<FixedArray>(scope.stage(&words), scope);
                 // one shared ScopeInfo per compiled scope; every activation
                 // of the scope references it from its context
                 heap.allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, scope)
@@ -106,11 +108,8 @@ fn materialize_function<'s>(
     }
 
     let bytecode = heap.allocate_handle::<FixedByteArray>(&function.bytecode, scope);
-    let words: Vec<Value> = constants
-        .iter()
-        .map(|h| unsafe { h.read_unchecked() })
-        .collect();
-    let constants = heap.allocate_handle::<FixedArray>(scope.stage_words(&words), scope);
+    let words: Vec<Tagged<'_, Value>> = constants.iter().map(|h| h.as_tagged(heap)).collect();
+    let constants = heap.allocate_handle::<FixedArray>(scope.stage(&words), scope);
     let handlers = if function.handlers.is_empty() {
         None
     } else {
@@ -131,7 +130,7 @@ fn materialize_function<'s>(
         },
         scope,
     );
-    let name: Option<Handle<'s, crate::DenseString>> = function
+    let name: Option<Handle<'s, DenseString>> = function
         .name
         .as_deref()
         .map(|name| intern(heap, state, scope, vm, name));
@@ -166,8 +165,7 @@ fn intern<'s>(
     scope: &'s HandleScope<'_>,
     vm: &VM,
     s: &[u8],
-) -> Handle<'s, crate::DenseString> {
+) -> Handle<'s, DenseString> {
     let units = crate::decode_wtf8(s).expect("parser produces valid WTF-8 string constants");
-    vm.interner()
-        .intern(heap, scope, crate::StringData::Utf16(&units))
+    vm.interner().intern(heap, scope, StringData::Utf16(&units))
 }

@@ -2,6 +2,11 @@ use core::{marker::PhantomData, ptr::NonNull};
 
 use crate::{Header, Heap, HeapObject, HeapRef, Map, Object, VmError};
 
+// imports flattened
+use crate::Handle;
+use crate::HandleSet;
+use crate::SlotName;
+
 // The word/tag representation is shared with the heap ABI crate; the VM
 // layers the typed Value/Tagged/HeapPtr wrappers on top of it.
 pub use heap_api::{PTR_BIT, STRONG_PTR, TAG_MASK, TAG_SMI, WEAK_BIT, WEAK_PTR, Word};
@@ -334,7 +339,7 @@ impl<'a> Tagged<'a, Value> {
     /// Narrow an anchored value word to a property-name tag (type-level
     /// only: a name is an interned string, a symbol or a Smi, compared
     /// by word identity).
-    pub fn as_name(self) -> Tagged<'a, crate::SlotName> {
+    pub fn as_name(self) -> Tagged<'a, SlotName> {
         Tagged {
             raw: self.raw,
             _phantom: PhantomData,
@@ -382,7 +387,7 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
     }
 
     /// A rooted copy: the value may now cross GC safepoints.
-    pub fn into_handle<'s>(self, scope: &'s impl crate::HandleSet) -> crate::Handle<'s, T>
+    pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T>
     where
         T: 's,
     {

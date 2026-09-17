@@ -1,5 +1,5 @@
 use crate::{
-    DenseString, Float, HandleScope, Heap, Smi, StringData, Symbol, Tagged, Value, VmError,
+    DenseString, Float, Handle, HandleScope, Heap, Smi, StringData, Symbol, Tagged, Value, VmError,
 };
 
 pub struct Convert;
@@ -133,7 +133,7 @@ impl Convert {
     pub fn to_string<'a>(
         heap: &'a mut Heap,
         scope: &HandleScope<'_>,
-        v: Tagged<'_, Value>,
+        v: Handle<'_, Value>,
     ) -> Result<Tagged<'a, Value>, VmError> {
         enum PrimitiveString {
             Smi(i64),
@@ -145,8 +145,6 @@ impl Convert {
             False,
             Other,
         }
-        // root before classifying: the string arms allocate afterwards
-        let v = scope.handle(v);
         let kind = heap.no_gc(|heap| {
             let vt = v.as_tagged(heap);
             let known = heap.known();

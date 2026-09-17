@@ -1,13 +1,11 @@
 //! ES 19: function properties of the global object (eval, isNaN).
 
 use crate::materialize::materialize_closure_vm;
+use crate::natives::NativeContext;
 use crate::{Context, Convert, DenseString, GcSlice, Tagged, Value, VmError, runtime::Runtime};
 use base_compiler::compile_eval;
 
-pub fn eval_native(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
+pub fn eval_native(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // root the caller context before the allocating ToString below
         // Safety: register/root-slot words, fresh at entry.
@@ -17,7 +15,7 @@ pub fn eval_native(
         let (_vm, heap, _) = nctx.split();
         let src = heap.no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
         // Safety: fresh argument word, consumed before any allocation.
-        let src = unsafe { Tagged::<Value>::from_value_unchecked(src) };
+        let src = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(src) });
         let s = Convert::to_string(heap, &scope, src)?;
         let s = s.erase();
         let text = heap.no_gc(|heap| {
@@ -54,27 +52,28 @@ pub fn eval_native(
         nctx.call(
             // Safety: fresh rooted-slot word, consumed by the call.
             unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
-            crate::GcSlice::EMPTY,
+            GcSlice::EMPTY,
         )
     })
 }
 
 /// `isNaN(x)`: ToNumber(x) is NaN.
-pub fn is_nan(
-    nctx: &mut crate::natives::NativeContext<'_>,
-    args: GcSlice<'_>,
-) -> Result<Value, VmError> {
-    let arg = nctx.heap().no_gc(|heap| {
-        args.get(heap, 1)
-            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase_type())
-            .erase()
-    });
-    let (vm, heap, state) = nctx.split();
-    let n = match Runtime::to_numeric(vm, heap, state, arg)? {
-        Some(n) => n,
+pub fn is_nan(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+    let n = nctx.handle_scope(|nctx, scope| {
+        let (vm, heap, state) = nctx.split();
+        let arg = heap.no_gc(|heap| {
+            let v = args
+                .get(heap, 1)
+                .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase_type());
+            scope.handle(v)
+        });
+        Runtime::to_numeric(vm, heap, state, arg)
+    })?;
+    let Some(n) = n else {
         // Safety: fresh root-slot word read for the immediate return.
-        None => return Ok(unsafe { heap.known().exception.read_unchecked() }),
+        return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
     };
+
     Ok(nctx
         .heap()
         .no_gc(|heap| Convert::boolean(heap, n.is_nan()).erase()))

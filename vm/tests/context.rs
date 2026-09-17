@@ -104,7 +104,7 @@ fn closure_object_carries_typed_context() {
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
         let constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage::<vm::Value>(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
