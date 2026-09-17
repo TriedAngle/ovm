@@ -314,19 +314,17 @@ impl MarkSweepState {
     }
 
     fn collect_internal(&self, requester: Option<&MarkSweepLocal>) {
-        // minors own the remembered set: run one first so the major never
-        // starts with pending bits — after its sweep, bits of dead objects
-        // would dangle into freed and reused memory
-        self.collect_minor_internal(requester);
         let host = self.host();
         self.safepoint
             .stop_the_world(requester.map(|local| &local.node), || {
                 self.finish_sweeping(&host);
-                // mark AND sweep inside the pause: mutators must not run
-                // between the two — a root staged in that window points
-                // at an object the mark never saw, and the concurrent
-                // sweeper would free it (roots younger than the mark)
-                let completed = self.full_collect_stw(&host);
+                let completed = {
+                    let mut heap = self.alloc.lock().unwrap();
+                    self.mark(&heap, &host);
+                    heap.flag_all_pending();
+                    heap.set_sweep_block(false);
+                    heap.take_completed_live()
+                };
                 if let Some(live) = completed {
                     self.update_threshold(live);
                 }

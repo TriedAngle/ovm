@@ -1,8 +1,8 @@
 //! ES 20.1: the Object constructor, statics, and prototype methods.
 
 use crate::{
-    Convert, GcSlice, Handle, HandleScope, Heap, Object, PropertyDescriptor, SlotName,
-    Smi, Value, VmError,
+    Convert, GcSlice, Handle, HandleScope, Heap, Object, PropertyDescriptor, SlotName, Smi, Value,
+    VmError,
 };
 
 /// Stub: `Object.prototype.toString` returns "[object Object]".
@@ -182,9 +182,19 @@ pub(crate) fn plain_object(
     fields: &[(&'static str, Value)],
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
+        // root every field value up front: the object allocation and the
+        // per-field interning/defines below allocate, which would leave
+        // raw copies stale
+        let rooted: Vec<(&'static str, Handle<'_, Value>)> = fields
+            .iter()
+            .map(|(name, value)| (*name, scope.handle(*value)))
+            .collect();
         let map = nctx.heap().known().object_initial_map;
-        let obj = nctx.heap().new_object(&scope, map, GcSlice::EMPTY).into_handle(&scope);
-        for (name, value) in fields {
+        let obj = nctx
+            .heap()
+            .new_object(&scope, map, GcSlice::EMPTY)
+            .into_handle(&scope);
+        for (name, value) in rooted {
             let name = nctx.intern(&scope, name);
             let name = scope.handle(SlotName::from(name.as_tagged()).tagged());
             Object::define_own_property(
@@ -192,7 +202,7 @@ pub(crate) fn plain_object(
                 &scope,
                 obj,
                 name,
-                PropertyDescriptor::data(*value),
+                PropertyDescriptor::data(value.value()),
             )?;
         }
         Ok(obj.value())
@@ -206,48 +216,54 @@ pub(crate) fn object_get_own_property_descriptor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let target = args.get(1).ok_or(VmError::Arity)?;
+    let raw_target = args.get(1).ok_or(VmError::Arity)?;
     let raw_key = args.get(2).ok_or(VmError::Arity)?;
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    let desc = heap.no_gc(|nogc| crate::lookup::ordinary_own_descriptor(nogc, target, key));
-    let undefined = nctx.heap().known().undefined.value();
-    let true_v = nctx.heap().known().true_object.value();
-    let false_v = nctx.heap().known().false_object.value();
-    let bool_ = |b| if b { true_v } else { false_v };
-    match desc {
-        Some(crate::PropertyDescriptor::Data {
-            value,
-            writable,
-            enumerable,
-            configurable,
-        }) => plain_object(
-            nctx,
-            &[
-                ("value", value),
-                ("writable", bool_(writable)),
-                ("enumerable", bool_(enumerable)),
-                ("configurable", bool_(configurable)),
-            ],
-        ),
-        Some(crate::PropertyDescriptor::Accessor {
-            get,
-            set,
-            enumerable,
-            configurable,
-        }) => plain_object(
-            nctx,
-            &[
-                ("get", get),
-                ("set", set),
-                ("enumerable", bool_(enumerable)),
-                ("configurable", bool_(configurable)),
-            ],
-        ),
-        None => Ok(undefined),
-    }
+    nctx.handle_scope(|nctx, scope| {
+        // the key coercion allocates (Float keys intern a string): the
+        // target must stay rooted across it
+        let target = scope.handle(raw_target);
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(heap.known().exception.value());
+        };
+        let desc =
+            heap.no_gc(|nogc| crate::lookup::ordinary_own_descriptor(nogc, target.value(), key));
+        let undefined = nctx.heap().known().undefined.value();
+        let true_v = nctx.heap().known().true_object.value();
+        let false_v = nctx.heap().known().false_object.value();
+        let bool_ = |b| if b { true_v } else { false_v };
+        match desc {
+            Some(crate::PropertyDescriptor::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            }) => plain_object(
+                nctx,
+                &[
+                    ("value", value),
+                    ("writable", bool_(writable)),
+                    ("enumerable", bool_(enumerable)),
+                    ("configurable", bool_(configurable)),
+                ],
+            ),
+            Some(crate::PropertyDescriptor::Accessor {
+                get,
+                set,
+                enumerable,
+                configurable,
+            }) => plain_object(
+                nctx,
+                &[
+                    ("get", get),
+                    ("set", set),
+                    ("enumerable", bool_(enumerable)),
+                    ("configurable", bool_(configurable)),
+                ],
+            ),
+            None => Ok(undefined),
+        }
+    })
 }
 
 /// `Object.defineProperty(O, P, Attributes)` (ES 20.1.2.4):
@@ -257,22 +273,31 @@ pub(crate) fn object_define_property(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let target = args.get(1).ok_or(VmError::Arity)?;
+    let raw_target = args.get(1).ok_or(VmError::Arity)?;
     let raw_key = args.get(2).ok_or(VmError::Arity)?;
     let attrs = args.get(3).ok_or(VmError::Arity)?;
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    // shared ToPropertyDescriptor; proxies and ordinary targets both
-    // complete/validate inside define_internal
-    let partial = match crate::runtime::Runtime::to_property_descriptor(vm, heap, state, attrs)? {
-        Some(partial) => partial,
-        None => return Ok(heap.known().exception.value()),
-    };
     nctx.handle_scope(|nctx, scope| {
-        let target = scope.handle(target);
+        // root the target, key, and descriptor: the key coercion and the
+        // descriptor conversion below allocate (user getters run), which
+        // would leave raw copies stale
+        let target = scope.handle(raw_target);
+        let attrs = scope.handle(attrs);
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(heap.known().exception.value());
+        };
         let key = scope.handle(key);
+        // shared ToPropertyDescriptor; proxies and ordinary targets both
+        // complete/validate inside define_internal
+        let partial = match crate::runtime::Runtime::to_property_descriptor(
+            vm,
+            heap,
+            state,
+            attrs.value(),
+        )? {
+            Some(partial) => partial,
+            None => return Ok(heap.known().exception.value()),
+        };
         let (vm, heap, state) = nctx.split();
         match crate::proxy::define_internal(vm, heap, state, target.value(), key.value(), partial)?
         {

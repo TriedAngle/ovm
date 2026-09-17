@@ -1233,7 +1233,6 @@ pub fn construct(
 /// EXTENDABLE bit (maps are shared, so the clone isolates the object).
 fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Handle<'_, Object>) {
     use crate::{
-    GcSlice,
     MapInit,
     MapKind,
 };

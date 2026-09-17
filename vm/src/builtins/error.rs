@@ -1,7 +1,10 @@
 //! ES 20.5: Error constructors, Error.prototype.toString, and error
 //! object materialization.
 
-use crate::{ContextState, Convert, DenseString, GcSlice, Heap, Object, PropertyDescriptor, Value, VM, VmError, runtime::Runtime};
+use crate::{
+    ContextState, Convert, DenseString, GcSlice, Heap, Object, PropertyDescriptor, VM, Value,
+    VmError, runtime::Runtime,
+};
 
 pub(crate) fn error_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
@@ -31,20 +34,23 @@ pub(crate) fn make_error(
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, _) = nctx.split();
+        // root the message right away: the allocations below (new_object,
+        // interning) would leave a raw copy stale
         let message = match args.get(1) {
-            Some(v) => Convert::to_string(heap, &scope, v)?,
-            None => vm.interner().intern_str(heap, &scope, "").value(),
+            Some(v) => scope.handle(Convert::to_string(heap, &scope, v)?),
+            None => scope.handle(vm.interner().intern_str(heap, &scope, "").value()),
         };
         let map = match class {
             "TypeError" => heap.known().type_error_map,
             "ReferenceError" => heap.known().reference_error_map,
             _ => heap.known().error_map,
         };
-        let obj = heap.new_object(&scope, map, GcSlice::EMPTY).into_handle(&scope);
+        let obj = heap
+            .new_object(&scope, map, GcSlice::EMPTY)
+            .into_handle(&scope);
         let name = heap.known().strings.name;
         let message_key = heap.known().strings.message;
         let class_value = vm.interner().intern_str(heap, &scope, class);
-        let message_value = scope.handle(message);
         Object::define_own_property(
             heap,
             &scope,
@@ -57,7 +63,7 @@ pub(crate) fn make_error(
             &scope,
             obj,
             message_key,
-            PropertyDescriptor::data(message_value.value()),
+            PropertyDescriptor::data(message.value()),
         )?;
         Ok(obj.value())
     })
@@ -73,11 +79,14 @@ pub(crate) fn error_to_string(
     let message = get_property(vm, heap, state, receiver, "message")?;
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, _) = nctx.split();
-        let a = Convert::to_string(heap, &scope, name)?;
-        let b = Convert::to_string(heap, &scope, message)?;
+        // each to_string/intern allocates: root both halves before the
+        // concats read them
+        let a = scope.handle(Convert::to_string(heap, &scope, name)?);
+        let b = scope.handle(Convert::to_string(heap, &scope, message)?);
         let colon = vm.interner().intern_str(heap, &scope, ": ");
-        let ab = DenseString::concat(heap, &scope, a, colon.value());
-        Ok(DenseString::concat(heap, &scope, ab.value(), b).value())
+        let ab = DenseString::concat(heap, &scope, a.value(), colon.value());
+        let ab = scope.handle(ab.value());
+        Ok(DenseString::concat(heap, &scope, ab.value(), b.value()).value())
     })
 }
 

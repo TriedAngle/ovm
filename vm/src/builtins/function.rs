@@ -1,8 +1,8 @@
 //! ES 20.2: the Function constructor, Function.prototype
 //! toString/call/apply/bind, and the bind-closure prelude.
 
-use crate::{Context, Convert, DenseString, GcSlice, Smi, Value, VmError};
 use crate::materialize::materialize_closure_vm;
+use crate::{Context, Convert, DenseString, GcSlice, Smi, Value, VmError};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
@@ -38,33 +38,41 @@ pub(crate) fn function_bind(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let f = args.get(0).ok_or(VmError::Arity)?;
-    if !crate::runtime::Runtime::is_callable(nctx.heap(), f) {
+    let raw_f = args.get(0).ok_or(VmError::Arity)?;
+    if !crate::runtime::Runtime::is_callable(nctx.heap(), raw_f) {
         return Err(VmError::Type);
     }
-    let this_arg = args
+    let raw_this_arg = args
         .get(1)
         .unwrap_or_else(|| nctx.heap().known().undefined.value());
     let prepend: Vec<Value> = args.as_slice().iter().skip(2).copied().collect();
-    // Function.prototype.__makeBound (installed by BIND_PRELUDE)
-    let make_bound = {
-        let name = nctx.handle_scope(|nctx, scope| nctx.intern(&scope, "__makeBound").value());
-        let (vm, heap, state) = nctx.split();
-        let proto = heap.known().function_prototype.value();
-        match crate::runtime::Runtime::get_property(vm, heap, state, proto, name)? {
-            crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
-            crate::runtime::Coercion::Value(v) => v,
-        }
-    };
-    let array = nctx.handle_scope(|nctx, scope| {
-        let (_, heap, _) = nctx.split();
-        let staged = scope.stage(&prepend);
-        heap.new_array(&scope, staged).into_tagged().erase()
-    });
     nctx.handle_scope(|nctx, scope| {
+        // everything below allocates (interning, the [[Get]] for
+        // __makeBound, the prepend array, the call): keep the raw inputs
+        // rooted and re-read at the point of use
+        let f = scope.handle(raw_f);
+        let this_arg = scope.handle(raw_this_arg);
+        // Function.prototype.__makeBound (installed by BIND_PRELUDE)
+        let make_bound = {
+            let name = nctx.intern(&scope, "__makeBound");
+            let (vm, heap, state) = nctx.split();
+            let proto = heap.known().function_prototype.value();
+            match crate::runtime::Runtime::get_property(vm, heap, state, proto, name.value())? {
+                crate::runtime::Coercion::Threw => {
+                    return Ok(heap.known().exception.value())
+                }
+                crate::runtime::Coercion::Value(v) => scope.handle(v),
+            }
+        };
+        let staged = scope.stage(&prepend);
+        let (_, heap, _) = nctx.split();
+        let array = scope.handle(heap.new_array(&scope, staged).into_tagged().erase());
         // args[0] is the receiver (undefined for the plain call)
         let recv = nctx.heap().known().undefined.value();
-        nctx.call(make_bound, scope.stage(&[recv, f, this_arg, array]))
+        nctx.call(
+            make_bound.value(),
+            scope.stage(&[recv, f.value(), this_arg.value(), array.value()]),
+        )
     })
 }
 
@@ -180,7 +188,9 @@ pub(crate) fn function_constructor(
             }
         };
         let (vm, heap, state) = nctx.split();
-        let context = scope.cast::<Context>(context.value()).ok_or(VmError::Type)?;
+        let context = scope
+            .cast::<Context>(context.value())
+            .ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
         nctx.call(closure.value(), GcSlice::EMPTY)
     })

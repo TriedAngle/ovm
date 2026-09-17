@@ -1,25 +1,7 @@
 use crate::{
-    CallableInfoObject,
-    Context,
-    Convert,
-    DenseString,
-    FixedArray,
-    Float,
-    GcSlice,
-    Handle,
-    HandleScope,
-    Heap,
-    load_outcome_on,
-    LoadOutcome,
-    NoGc,
-    Object,
-    PartialDescriptor,
-    PropertyDescriptor,
-    SlotName,
-    Smi,
-    Symbol,
-    Value,
-    VmError,
+    CallableInfoObject, Context, Convert, DenseString, FixedArray, Float, GcSlice, Handle,
+    HandleScope, Heap, LoadOutcome, NoGc, Object, PartialDescriptor, PropertyDescriptor, SlotName,
+    Smi, Symbol, Value, VmError, load_outcome_on,
 };
 
 use crate::{ContextState, NativeContext, VM};
@@ -161,71 +143,86 @@ impl Runtime {
         if heap.no_gc(|nogc| Convert::is_primitive(nogc, value)) {
             return Ok(Coercion::Value(value));
         }
-        let known = heap.known();
-        let exception = known.exception.value();
+        // the receiver stays rooted throughout: method lookups and calls
+        // below run user code (getters, valueOf/toString), which allocates
+        // and would leave a raw copy dangling
+        state.handle_scope(|scope| {
+            let value = scope.handle(value);
+            let known = heap.known();
+            let exception = known.exception.value();
 
-        // 1. exotic @@toPrimitive (GetMethod)
-        let exotic = Self::get_property(vm, heap, state, value, known.to_primitive_symbol.value())?;
-        let exotic = match exotic {
-            Coercion::Threw => return Ok(Coercion::Threw),
-            Coercion::Value(v) => v,
-        };
-        if exotic != known.undefined.value() && exotic != known.null.value() {
-            if !Self::is_callable(heap, exotic) {
-                // GetMethod: a non-callable, non-nullish method is a TypeError
-                return Err(VmError::Type);
-            }
-            let hint_string = match hint {
-                Hint::Default => known.strings.default.value(),
-                Hint::Number => known.strings.number.value(),
-                Hint::String => known.strings.string.value(),
-            };
-            let result = state.handle_scope(|scope| {
-                NativeContext::new(vm, heap, state).call(exotic, scope.stage(&[hint_string]))
-            })?;
-            if result == exception {
-                return Ok(Coercion::Threw);
-            }
-            return if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
-                Ok(Coercion::Value(result))
-            } else {
-                Err(VmError::Type)
-            };
-        }
-
-        // 2. OrdinaryToPrimitive: hint string → toString first, else valueOf first
-        let method_names: [Value; 2] = if hint == Hint::String {
-            [
-                known.strings.to_string.value(),
-                known.strings.value_of.value(),
-            ]
-        } else {
-            [
-                known.strings.value_of.value(),
-                known.strings.to_string.value(),
-            ]
-        };
-        for name in method_names {
-            let method = Self::get_property(vm, heap, state, value, name)?;
-            let method = match method {
+            // 1. exotic @@toPrimitive (GetMethod)
+            let exotic = Self::get_property(
+                vm,
+                heap,
+                state,
+                value.value(),
+                known.to_primitive_symbol.value(),
+            )?;
+            let exotic = match exotic {
                 Coercion::Threw => return Ok(Coercion::Threw),
-                Coercion::Value(v) => v,
+                Coercion::Value(v) => scope.handle(v),
             };
-            if !Self::is_callable(heap, method) {
-                continue;
+            if exotic.value() != known.undefined.value() && exotic.value() != known.null.value() {
+                if !Self::is_callable(heap, exotic.value()) {
+                    // GetMethod: a non-callable, non-nullish method is a TypeError
+                    return Err(VmError::Type);
+                }
+                let hint_string = match hint {
+                    Hint::Default => known.strings.default.value(),
+                    Hint::Number => known.strings.number.value(),
+                    Hint::String => known.strings.string.value(),
+                };
+                let result = state.handle_scope(|scope| {
+                    NativeContext::new(vm, heap, state)
+                        .call(exotic.value(), scope.stage(&[hint_string]))
+                })?;
+                if result == exception {
+                    return Ok(Coercion::Threw);
+                }
+                return if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
+                    Ok(Coercion::Value(result))
+                } else {
+                    Err(VmError::Type)
+                };
             }
-            let result = state.handle_scope(|scope| {
-                NativeContext::new(vm, heap, state).call(method, scope.stage(&[value]))
-            })?;
-            if result == exception {
-                return Ok(Coercion::Threw);
+
+            // 2. OrdinaryToPrimitive: hint string → toString first, else valueOf first
+            let method_names: [Value; 2] = if hint == Hint::String {
+                [
+                    known.strings.to_string.value(),
+                    known.strings.value_of.value(),
+                ]
+            } else {
+                [
+                    known.strings.value_of.value(),
+                    known.strings.to_string.value(),
+                ]
+            };
+            for name in method_names {
+                let method = Self::get_property(vm, heap, state, value.value(), name)?;
+                let method = match method {
+                    Coercion::Threw => return Ok(Coercion::Threw),
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                if !Self::is_callable(heap, method.value()) {
+                    continue;
+                }
+                let receiver = value.value();
+                let result = state.handle_scope(|scope| {
+                    NativeContext::new(vm, heap, state)
+                        .call(method.value(), scope.stage(&[receiver]))
+                })?;
+                if result == exception {
+                    return Ok(Coercion::Threw);
+                }
+                if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
+                    return Ok(Coercion::Value(result));
+                }
+                // object result: try the next method name
             }
-            if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
-                return Ok(Coercion::Value(result));
-            }
-            // object result: try the next method name
-        }
-        Err(VmError::Type)
+            Err(VmError::Type)
+        })
     }
 
     /// ToNumeric (ES 7.1.3): ToPrimitive with hint Number, then ToNumber.
@@ -250,12 +247,18 @@ impl Runtime {
         b: Value,
         op: fn(f64, f64) -> f64,
     ) -> Result<Option<Value>, VmError> {
-        let a = Self::to_numeric(vm, heap, state, a)?;
-        let Some(a) = a else { return Ok(None) };
-        let b = Self::to_numeric(vm, heap, state, b)?;
-        let Some(b) = b else { return Ok(None) };
-        let r = op(a, b);
-        Ok(Some(state.handle_scope(|scope| heap.new_number(&scope, r))))
+        // to_numeric runs user code (valueOf): the second operand must
+        // stay rooted across the first one's coercion
+        state.handle_scope(|scope| {
+            let b = scope.handle(b);
+            let a = Self::to_numeric(vm, heap, state, a)?;
+            let Some(a) = a else { return Ok(None) };
+            let b = Self::to_numeric(vm, heap, state, b.value())?;
+            let Some(b) = b else { return Ok(None) };
+            let r = op(a, b);
+            let v = heap.new_number(&scope, r);
+            Ok(Some(v))
+        })
     }
 
     /// Get a property value with full [[Get]] semantics: accessor getters are
@@ -386,13 +389,14 @@ impl Runtime {
                 Coercion::Value(p) => p,
             }
         };
-        let stringified =
-            state.handle_scope(|scope| Convert::to_string(heap, &scope, primitive))?;
         // named lookup compares interned strings by pointer: canonicalize
-        // exactly once here, then every downstream bits-compare is sound
+        // exactly once here, then every downstream bits-compare is sound.
+        // to_string allocates (Float → string, ToString of objects), so
+        // its result must be rooted and re-cast inside one scope — a raw
+        // copy crossing the scope boundary goes stale
         let interned = state.handle_scope(|scope| {
-            let s = scope.cast::<DenseString>(stringified);
-            match s {
+            let stringified = Convert::to_string(heap, &scope, primitive)?;
+            match scope.cast::<DenseString>(stringified) {
                 Some(s) => Ok(vm.interner().intern_value(heap, &scope, &s).value()),
                 // ToString of a symbol primitive throws (ES 6.1.7.1)
                 None => Err(VmError::Type),
@@ -445,20 +449,24 @@ impl Runtime {
         if !Self::is_callable(heap, callable) {
             return Err(VmError::Type);
         }
-        // 4. P = Get(C, "prototype") — full [[Get]], getters may run user code
-        let proto_name = heap.known().strings.prototype.value();
-        let proto = Self::get_property(vm, heap, state, callable, proto_name)?;
-        let proto = match proto {
-            Coercion::Threw => return Ok(None),
-            Coercion::Value(v) => v,
-        };
-        // 5. P must be an object
-        if heap.no_gc(|nogc| Convert::is_primitive(nogc, proto)) {
-            return Err(VmError::Type);
-        }
-        Ok(Some(heap.no_gc(|nogc| {
-            Self::has_proto_in_chain(nogc, object, proto)
-        })))
+        // 4. P = Get(C, "prototype") — full [[Get]], getters may run user
+        // code: the object must stay rooted across it
+        state.handle_scope(|scope| {
+            let object = scope.handle(object);
+            let proto_name = heap.known().strings.prototype.value();
+            let proto = Self::get_property(vm, heap, state, callable, proto_name)?;
+            let proto = match proto {
+                Coercion::Threw => return Ok(None),
+                Coercion::Value(v) => v,
+            };
+            // 5. P must be an object
+            if heap.no_gc(|nogc| Convert::is_primitive(nogc, proto)) {
+                return Err(VmError::Type);
+            }
+            Ok(Some(heap.no_gc(|nogc| {
+                Self::has_proto_in_chain(nogc, object.value(), proto)
+            })))
+        })
     }
 
     /// OrdinaryHasInstance step 6: walk the prototype chain of `object`.
