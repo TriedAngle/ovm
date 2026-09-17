@@ -45,27 +45,34 @@ pub enum StoreSemantics {
     Shadow,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum StoreOutcome {
+#[derive(Debug, Copy, Clone)]
+pub enum StoreOutcome<'s> {
     Done,
-    Transition { receiver: Value, name: SlotName },
-    CallSetter { setter: Value },
+    /// The receiver and name are already rooted in the caller's scope, so
+    /// the transition can be applied after this no-GC lookup region ends.
+    Transition {
+        receiver: Handle<'s, Object>,
+        name: Handle<'s, SlotName>,
+    },
+    CallSetter {
+        setter: Handle<'s, Value>,
+    },
 }
 
 impl<'a> Tagged<'a, Value> {
-    pub fn store_lookup(
+    pub fn store_lookup<'s>(
         self,
         heap: &'a Heap,
-        name: SlotName,
+        scope: &'s HandleScope<'_>,
+        name: Tagged<'a, SlotName>,
         value: Tagged<'a, Value>,
         semantics: StoreSemantics,
-    ) -> Result<StoreOutcome, VmError> {
+    ) -> Result<StoreOutcome<'s>, VmError> {
         // TODO(strict-mode): take the active function's language mode and
         // distinguish throwing strict failures from ignored sloppy failures.
-        let receiver = self.erase();
         // null/undefined have no [[Prototype]]: property access throws
-        if receiver == heap.known().null.as_tagged(heap).erase()
-            || receiver == heap.known().undefined.as_tagged(heap).erase()
+        if self.ptr_eq(heap.known().null.as_tagged(heap).erase_type())
+            || self.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type())
         {
             return Err(VmError::Type);
         }
@@ -73,14 +80,9 @@ impl<'a> Tagged<'a, Value> {
         // smis are not property stores' targets: sloppy-mode stores onto
         // primitives are silently ignored (strict throws — deferred with
         // the other language-mode TODOs)
-        if let Some(obj) = self.as_heap_object() {
-            let kind = obj.as_ref().header.map.heap_ref(heap).kind().kind();
-            if !Object::matches_kind(kind) {
-                return Ok(StoreOutcome::Done);
-            }
-        } else {
+        let Some(receiver) = scope.cast::<Object>(self) else {
             return Ok(StoreOutcome::Done);
-        }
+        };
         match self.lookup(heap, name) {
             Lookup::Data {
                 slot,
@@ -92,32 +94,31 @@ impl<'a> Tagged<'a, Value> {
                     return Err(VmError::Type);
                 }
                 let host = holder.as_ref().erase();
-                if semantics == StoreSemantics::Shadow && host != receiver {
+                if semantics == StoreSemantics::Shadow && host != self.erase() {
                     // inherited writable data property: JS creates an own
                     // property on the receiver
-                    if !receiver.is_strong_ptr() {
-                        return Err(VmError::Type);
-                    }
-                    return Ok(StoreOutcome::Transition { receiver, name });
+                    return Ok(StoreOutcome::Transition {
+                        receiver,
+                        name: scope.handle(name),
+                    });
                 }
                 slot.set(heap, host, value);
                 Ok(StoreOutcome::Done)
             }
-            Lookup::NotFound => {
-                // adding a property requires a heap receiver
-                if !receiver.is_strong_ptr() {
-                    return Err(VmError::Type);
-                }
-                Ok(StoreOutcome::Transition { receiver, name })
-            }
+            Lookup::NotFound => Ok(StoreOutcome::Transition {
+                receiver,
+                name: scope.handle(name),
+            }),
             Lookup::Accessor { pair, .. } => {
-                let setter = pair.set.get(heap).erase();
+                let setter = pair.set.get(heap);
                 // no setter (undefined sentinel): sloppy-mode writes to a
                 // setter-less accessor are silently ignored
-                if setter == heap.known().undefined.as_tagged(heap).erase() {
+                if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type()) {
                     return Ok(StoreOutcome::Done);
                 }
-                Ok(StoreOutcome::CallSetter { setter })
+                Ok(StoreOutcome::CallSetter {
+                    setter: scope.handle(setter),
+                })
             }
         }
     }
@@ -132,22 +133,23 @@ impl<'a> Tagged<'a, Value> {
 ///   setters run with the receiver, misses define on the receiver
 /// - `WriteThrough` (Self-style): inherited writable data properties
 ///   are written at the holder instead of shadowing
-pub fn super_store_lookup<'a>(
+pub fn super_store_lookup<'a, 's>(
     heap: &'a Heap,
+    scope: &'s HandleScope<'_>,
     proto: Option<Tagged<'a, Value>>,
     recv: Tagged<'a, Value>,
-    name: SlotName,
+    name: Tagged<'a, SlotName>,
     value: Tagged<'a, Value>,
     semantics: StoreSemantics,
-) -> Result<StoreOutcome, VmError> {
-    if recv.erase() == heap.known().null.as_tagged(heap).erase()
-        || recv.erase() == heap.known().undefined.as_tagged(heap).erase()
+) -> Result<StoreOutcome<'s>, VmError> {
+    if recv.ptr_eq(heap.known().null.as_tagged(heap).erase_type())
+        || recv.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type())
     {
         return Err(VmError::Type);
     }
     let Some(proto) = proto else {
         // non-object home: no parent chain, define on the receiver
-        return super_store_on_receiver(heap, recv, name, value);
+        return super_store_on_receiver(heap, scope, recv, name, value);
     };
     match lookup_in_parents(heap, proto, name) {
         Lookup::Data {
@@ -168,16 +170,18 @@ pub fn super_store_lookup<'a>(
                 // receiver (`this`) differs from the holder by
                 // construction: OrdinarySet creates an own property on
                 // the receiver
-                StoreSemantics::Shadow => super_store_on_receiver(heap, recv, name, value),
+                StoreSemantics::Shadow => super_store_on_receiver(heap, scope, recv, name, value),
             }
         }
-        Lookup::NotFound => super_store_on_receiver(heap, recv, name, value),
+        Lookup::NotFound => super_store_on_receiver(heap, scope, recv, name, value),
         Lookup::Accessor { pair, .. } => {
-            let setter = pair.set.get(heap).erase();
-            if setter == heap.known().undefined.as_tagged(heap).erase() {
+            let setter = pair.set.get(heap);
+            if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type()) {
                 return Ok(StoreOutcome::Done);
             }
-            Ok(StoreOutcome::CallSetter { setter })
+            Ok(StoreOutcome::CallSetter {
+                setter: scope.handle(setter),
+            })
         }
     }
 }
@@ -189,15 +193,16 @@ pub fn super_store_lookup<'a>(
 /// overwritten in place, and only a true miss defines a fresh own
 /// property. An own accessor (or non-writable own data property)
 /// rejects the `{value}` define: a TypeError at these strict sites.
-fn super_store_on_receiver<'a>(
+fn super_store_on_receiver<'a, 's>(
     heap: &'a Heap,
+    scope: &'s HandleScope<'_>,
     recv: Tagged<'a, Value>,
-    name: SlotName,
+    name: Tagged<'a, SlotName>,
     value: Tagged<'a, Value>,
-) -> Result<StoreOutcome, VmError> {
-    if !recv.is_strong_ptr() {
+) -> Result<StoreOutcome<'s>, VmError> {
+    let Some(receiver) = scope.cast::<Object>(recv) else {
         return Err(VmError::Type);
-    }
+    };
     match recv.lookup(heap, name) {
         // already owned (the nearest hit is the receiver itself, not an
         // inherited one): overwrite the slot instead of re-adding it
@@ -220,8 +225,8 @@ fn super_store_on_receiver<'a>(
         }
         // not owned by the receiver: define a fresh own property
         _ => Ok(StoreOutcome::Transition {
-            receiver: recv.erase(),
-            name,
+            receiver,
+            name: scope.handle(name),
         }),
     }
 }
@@ -251,16 +256,9 @@ impl Transition {
 
         // shared child map: reuse it instead of growing the tree
         if let Some(target) = heap.no_gc(|heap| {
-            let pair_values =
-                pair.map(|(get, set)| (get.as_tagged(heap).erase(), set.as_tagged(heap).erase()));
+            let pair_values = pair.map(|(get, set)| (get.as_tagged(heap), set.as_tagged(heap)));
             parent(heap)
-                .find_transition_locked(
-                    heap,
-                    SlotName::from_value(unsafe { name.read_unchecked() }),
-                    flags,
-                    pair_values,
-                    &guard,
-                )
+                .find_transition_locked(heap, name.as_tagged(heap), flags, pair_values, &guard)
                 .map(|m| m.into_handle(scope))
         }) {
             return target;
@@ -273,7 +271,11 @@ impl Transition {
                     Change::Append => None,
                     Change::Replace { index } => {
                         let d = &parent_ref.descriptors()[index];
-                        Some((d.flags(), d.value.get(heap).erase()))
+                        // accessor rows embed the pair, not a slot offset
+                        let offset = (!d.flags().is_accessor()).then(|| {
+                            Smi::decode(d.value.get(heap).erase()).expect("data row offset")
+                        });
+                        Some((d.flags(), offset))
                     }
                 };
                 (
@@ -292,11 +294,12 @@ impl Transition {
                 Change::Replace { .. } => old_row.expect("replace row").0.is_accessor(),
             };
         let row_offset = match change {
-            Change::Replace { .. } if !grow && !flags.is_accessor() => {
-                Smi::decode(old_row.expect("replace row").1)
-                    .expect("data row offset")
-                    .value() as usize
-            }
+            Change::Replace { .. } if !grow && !flags.is_accessor() => old_row
+                .expect("replace row")
+                .1
+                .expect("data row offset")
+                .value()
+                as usize,
             _ => value_slot_count,
         };
         let appends = usize::from(matches!(change, Change::Append));
@@ -312,7 +315,7 @@ impl Transition {
 
         heap.allocate_token_enter_heap(total, |token, heap| {
             let parent_ref = parent(heap);
-            let name_word = SlotName::from_value(unsafe { name.read_unchecked() });
+            let name_word = name.as_tagged(heap);
             let row_value = match pair {
                 Some((get, set)) => {
                     scope.handle(token.allocate::<AccessorPair>((get, set)).erase_type())
@@ -320,14 +323,22 @@ impl Transition {
                 None => scope.handle(Smi::new(row_offset as i64)),
             };
 
-            let mut descriptors: Vec<(SlotName, SlotFlags, Handle<'_, Value>)> = parent_ref
-                .descriptors()
-                .iter()
-                .map(|d| (d.name(), d.flags(), scope.handle(d.value.get(heap))))
-                .collect();
+            let mut descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
+                parent_ref
+                    .descriptors()
+                    .iter()
+                    .map(|d| {
+                        (
+                            scope.handle(d.name(heap)),
+                            d.flags(),
+                            scope.handle(d.value.get(heap)),
+                        )
+                    })
+                    .collect();
+            let name_handle = scope.handle(name_word);
             match change {
-                Change::Append => descriptors.push((name_word, flags, row_value)),
-                Change::Replace { index } => descriptors[index] = (name_word, flags, row_value),
+                Change::Append => descriptors.push((name_handle, flags, row_value)),
+                Change::Replace { index } => descriptors[index] = (name_handle, flags, row_value),
             }
             let child = token.allocate::<Map>(MapInit {
                 kind,
@@ -336,13 +347,13 @@ impl Transition {
                 prototype,
             });
 
-            let mut pairs: Vec<Value> = Vec::with_capacity(pairs_len + 2);
+            let mut pairs: Vec<Tagged<'_, Value>> = Vec::with_capacity(pairs_len + 2);
             if let Some(old) = parent_ref.transitions.heap_ref(heap) {
-                pairs.extend(old.as_slice().iter().map(|slot| slot.inner()));
+                pairs.extend(old.as_slice().iter().map(|slot| slot.get(heap)));
             }
-            pairs.push(name_word.value());
-            pairs.push(child.erase());
-            let pairs = token.allocate::<FixedArray>(scope.stage_words(&pairs));
+            pairs.push(name_word.erase_type());
+            pairs.push(child.erase_type());
+            let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
             parent_ref.transitions.set(heap, parent_ref.erase(), pairs);
 
             child.into_handle(scope)
@@ -363,25 +374,20 @@ impl Transition {
             let receiver_ref = receiver.heap_ref(heap);
             let target = receiver_ref
                 .map_ref(heap)
-                .find_transition(
-                    heap,
-                    SlotName::from_value(unsafe { name.read_unchecked() }),
-                    flags,
-                    None,
-                )
+                .find_transition(heap, name.as_tagged(heap), flags, None)
                 .expect("transition recorded above");
-            let mut values: Vec<Value> = Vec::with_capacity(slot_count);
+            let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(slot_count);
             values.extend(
                 receiver_ref
                     .slots
                     .heap_ref(heap)
                     .as_slice()
                     .iter()
-                    .map(|slot| slot.inner()),
+                    .map(|slot| slot.get(heap)),
             );
-            values.push(value.as_tagged(heap).erase());
+            values.push(value.as_tagged(heap));
             debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
-            let slots = token.allocate::<FixedArray>(scope.stage_words(&values));
+            let slots = token.allocate::<FixedArray>(scope.stage(&values));
             let host = receiver.as_tagged(heap).erase();
             receiver_ref.slots.set(heap, host, slots);
             receiver_ref
@@ -400,16 +406,10 @@ impl Transition {
     ) {
         heap.no_gc(|heap| {
             let receiver_ref = receiver.heap_ref(heap);
-            let pair_words =
-                pair.map(|(get, set)| (get.as_tagged(heap).erase(), set.as_tagged(heap).erase()));
+            let pair_values = pair.map(|(get, set)| (get.as_tagged(heap), set.as_tagged(heap)));
             let target = receiver_ref
                 .map_ref(heap)
-                .find_transition(
-                    heap,
-                    SlotName::from_value(unsafe { name.read_unchecked() }),
-                    flags,
-                    pair_words,
-                )
+                .find_transition(heap, name.as_tagged(heap), flags, pair_values)
                 .expect("transition recorded above");
             receiver_ref.header.map.set(
                 heap,
@@ -419,16 +419,18 @@ impl Transition {
         });
     }
 
-    fn write_slot(heap: &mut Heap, receiver: Handle<Object>, index: usize, value: Value) {
+    fn write_slot(
+        heap: &mut Heap,
+        receiver: Handle<Object>,
+        index: usize,
+        value: Handle<'_, Value>,
+    ) {
         heap.no_gc(|heap| {
-            // Safety: the word came from a rooted read with no allocation
-            // in between (define paths never allocate before this write).
-            let value = unsafe { value.assume_valid(heap) };
             let offset = receiver.heap_ref(heap).map_ref(heap).descriptors()[index].offset();
             receiver.heap_ref(heap).slot(heap, offset).set(
                 heap,
                 receiver.as_tagged(heap).erase(),
-                value,
+                value.as_tagged(heap),
             );
         });
     }
@@ -455,13 +457,13 @@ impl Transition {
         let guard = lock.acquire();
 
         let (existing, kind, prototype, surviving, values, pairs_len) = heap.no_gc(|heap| {
-            let name_word = SlotName::from_value(unsafe { name.read_unchecked() });
+            let name_word = name.as_tagged(heap);
             let obj = receiver.heap_ref(heap);
             let parent = obj.map_ref(heap);
             let descriptors = parent.descriptors();
             let index = descriptors
                 .iter()
-                .position(|d| d.name() == name_word)
+                .position(|d| d.name(heap).ptr_eq(name_word))
                 .expect("caller verified the descriptor exists");
             // the structural region is everything below the first
             // descriptor-owned slot (function info/context; empty for
@@ -475,11 +477,13 @@ impl Transition {
             let existing = parent
                 .find_remove_transition_locked(heap, name_word, &guard)
                 .map(|m| m.into_handle(scope));
-            let mut surviving: Vec<(SlotName, SlotFlags, Handle<'_, Value>)> =
+            // names are rooted here and re-anchored in the allocating
+            // closure: a Tagged cannot escape this no-GC region
+            let mut surviving: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
                 Vec::with_capacity(descriptors.len() - 1);
-            let mut values: Vec<Value> = obj.slots.heap_ref(heap).as_slice()[..base]
+            let mut values: Vec<Handle<'_, Value>> = obj.slots.heap_ref(heap).as_slice()[..base]
                 .iter()
-                .map(|slot| slot.inner())
+                .map(|slot| scope.handle(slot.get(heap)))
                 .collect();
             for (i, d) in descriptors.iter().enumerate() {
                 if i == index {
@@ -487,13 +491,17 @@ impl Transition {
                 }
                 if d.flags().is_accessor() {
                     // accessors embed their pair in the descriptor row
-                    surviving.push((d.name(), d.flags(), scope.handle(d.value.get(heap))));
+                    surviving.push((
+                        scope.handle(d.name(heap)),
+                        d.flags(),
+                        scope.handle(d.value.get(heap)),
+                    ));
                 } else {
                     // data rows re-dense their offsets; the value rides
                     // along in slot order
-                    values.push(obj.slot(heap, d.offset()).inner());
+                    values.push(scope.handle(obj.slot(heap, d.offset()).get(heap)));
                     surviving.push((
-                        d.name(),
+                        scope.handle(d.name(heap)),
                         d.flags(),
                         scope.handle(Smi::new(values.len() as i64 - 1)),
                     ));
@@ -512,7 +520,11 @@ impl Transition {
 
         if let Some(existing) = existing {
             // shared child map: only this receiver's slots need compacting
-            let values = scope.stage_words(&values);
+            let values = heap.no_gc(|heap| {
+                let anchored: Vec<Tagged<'_, Value>> =
+                    values.iter().map(|h| h.as_tagged(heap)).collect();
+                scope.stage(&anchored)
+            });
             heap.allocate_token_enter_heap(FixedArray::layout_for(values.len()), |token, heap| {
                 let obj = receiver.heap_ref(heap);
                 let slots = token.allocate::<FixedArray>(values);
@@ -527,7 +539,11 @@ impl Transition {
         let pairs_layout = FixedArray::layout_for(pairs_len + 2);
         let slots_layout = FixedArray::layout_for(values.len());
         let total = AllocToken::total_for(&[map_layout, pairs_layout, slots_layout]);
-        let values = scope.stage_words(&values);
+        let values = heap.no_gc(|heap| {
+            let anchored: Vec<Tagged<'_, Value>> =
+                values.iter().map(|h| h.as_tagged(heap)).collect();
+            scope.stage(&anchored)
+        });
         heap.allocate_token_enter_heap(total, |token, heap| {
             let obj = receiver.heap_ref(heap);
             let parent = obj.map_ref(heap);
@@ -537,14 +553,14 @@ impl Transition {
                 descriptors: &surviving,
                 prototype,
             });
-            let name_word = SlotName::from_value(unsafe { name.read_unchecked() });
-            let mut pairs: Vec<Value> = Vec::with_capacity(pairs_len + 2);
+            let name_word = name.as_tagged(heap);
+            let mut pairs: Vec<Tagged<'_, Value>> = Vec::with_capacity(pairs_len + 2);
             if let Some(old) = parent.transitions.heap_ref(heap) {
-                pairs.extend(old.as_slice().iter().map(|slot| slot.inner()));
+                pairs.extend(old.as_slice().iter().map(|slot| slot.get(heap)));
             }
-            pairs.push(name_word.value());
-            pairs.push(child.erase());
-            let pairs = token.allocate::<FixedArray>(scope.stage_words(&pairs));
+            pairs.push(name_word.erase_type());
+            pairs.push(child.erase_type());
+            let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
             parent.transitions.set(heap, parent.erase(), pairs);
             let slots = token.allocate::<FixedArray>(values);
             let host = receiver.as_tagged(heap).erase();
@@ -558,16 +574,12 @@ impl Transition {
         scope: &HandleScope<'_>,
         receiver: Handle<Object>,
         name: Handle<SlotName>,
-        desc: PropertyDescriptor,
+        desc: PropertyDescriptor<'_>,
         change: Change,
     ) {
         let flags = desc.flags();
         match desc {
             PropertyDescriptor::Data { value, .. } => {
-                // Safety: descriptor words are fresh at entry (no
-                // allocation happens before this rooting).
-                let value = scope.handle(unsafe { value.assume_valid(&*heap) });
-
                 let grow = match change {
                     Change::Append => true,
                     Change::Replace { index } => heap.no_gc(|heap| {
@@ -591,14 +603,11 @@ impl Transition {
                     let Change::Replace { index } = change else {
                         unreachable!("appends always grow")
                     };
-                    Self::write_slot(heap, receiver, index, value.as_tagged(heap).erase());
+                    Self::write_slot(heap, receiver, index, value);
                     Self::swap_map(heap, receiver, name, flags, None);
                 }
             }
             PropertyDescriptor::Accessor { get, set, .. } => {
-                // Safety: as above.
-                let get = scope.handle(unsafe { get.assume_valid(&*heap) });
-                let set = scope.handle(unsafe { set.assume_valid(&*heap) });
                 Self::target(
                     heap,
                     scope,
@@ -614,24 +623,24 @@ impl Transition {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum PropertyDescriptor {
+#[derive(Debug, Copy, Clone)]
+pub enum PropertyDescriptor<'s> {
     Data {
-        value: Value,
+        value: Handle<'s, Value>,
         writable: bool,
         enumerable: bool,
         configurable: bool,
     },
     Accessor {
-        get: Value,
-        set: Value,
+        get: Handle<'s, Value>,
+        set: Handle<'s, Value>,
         enumerable: bool,
         configurable: bool,
     },
 }
 
-impl PropertyDescriptor {
-    pub const fn data(value: Value) -> Self {
+impl<'s> PropertyDescriptor<'s> {
+    pub const fn data(value: Handle<'s, Value>) -> Self {
         Self::Data {
             value,
             writable: true,
@@ -678,13 +687,13 @@ impl PropertyDescriptor {
     }
 }
 
-enum DefineAction {
+enum DefineAction<'s> {
     /// Valid, nothing to change.
     Nothing,
     /// data→data with unchanged attributes: write the existing slot.
-    WriteDataSlot { value: Value },
+    WriteDataSlot { value: Handle<'s, Value> },
     /// Replace the descriptor with the new one (data or accessor).
-    Redefine { desc: PropertyDescriptor },
+    Redefine { desc: PropertyDescriptor<'s> },
 }
 
 impl Object {
@@ -693,7 +702,7 @@ impl Object {
         scope: &HandleScope<'_>,
         receiver: Handle<Object>,
         name: Handle<SlotName>,
-        desc: PropertyDescriptor,
+        desc: PropertyDescriptor<'_>,
     ) -> Result<bool, VmError> {
         heap.no_gc(|heap| {
             debug_assert!(
@@ -702,7 +711,7 @@ impl Object {
                     .map_ref(heap)
                     .descriptors()
                     .iter()
-                    .any(|d| d.name() == SlotName::from_value(unsafe { name.read_unchecked() })),
+                    .any(|d| d.name(heap).ptr_eq(name.as_tagged(heap))),
                 "add_own_property requires the name to be absent from the receiver's own map"
             );
         });
@@ -718,7 +727,7 @@ impl Object {
         scope: &HandleScope<'_>,
         receiver: Handle<Object>,
         name: Handle<SlotName>,
-        desc: PropertyDescriptor,
+        desc: PropertyDescriptor<'_>,
     ) -> Result<bool, VmError> {
         let current = heap.no_gc(|heap| {
             receiver
@@ -727,8 +736,8 @@ impl Object {
                 .descriptors()
                 .iter()
                 .enumerate()
-                .find(|(_, d)| d.name() == SlotName::from_value(unsafe { name.read_unchecked() }))
-                .map(|(index, d)| (index, d.flags(), d.value.get(heap).erase()))
+                .find(|(_, d)| d.name(heap).ptr_eq(name.as_tagged(heap)))
+                .map(|(index, d)| (index, d.flags(), scope.handle(d.value.get(heap))))
         });
         let Some((index, cur_flags, cur_desc_value)) = current else {
             return Self::add_own_property(heap, scope, receiver, name, desc);
@@ -749,28 +758,6 @@ impl Object {
         Ok(true)
     }
 
-    pub fn add_own_property_values(
-        heap: &mut Heap,
-        scope: &HandleScope<'_>,
-        receiver: Value,
-        name: SlotName,
-        desc: PropertyDescriptor,
-    ) -> Result<bool, VmError> {
-        let (receiver, name) = root_define_inputs(scope, heap, receiver, name);
-        Self::add_own_property(heap, scope, receiver, name, desc)
-    }
-
-    pub fn define_own_property_values(
-        heap: &mut Heap,
-        scope: &HandleScope<'_>,
-        receiver: Value,
-        name: SlotName,
-        desc: PropertyDescriptor,
-    ) -> Result<bool, VmError> {
-        let (receiver, name) = root_define_inputs(scope, heap, receiver, name);
-        Self::define_own_property(heap, scope, receiver, name, desc)
-    }
-
     /// `[[Delete]]` for ordinary and array-exotic objects (ES 10.1.10.1
     /// OrdinaryDelete): absent properties and punched holes delete as
     /// `true`, non-configurable ones as `false`, configurable ones are
@@ -779,16 +766,17 @@ impl Object {
         heap: &mut Heap,
         scope: &HandleScope<'_>,
         receiver: Handle<Object>,
-        key: Value,
+        key: Handle<'_, Value>,
     ) -> Result<bool, VmError> {
-        match heap.no_gc(|heap| classify_key(heap, unsafe { key.assume_valid(heap) }))? {
-            Key::Element(i) => {
-                // array elements live in the elements backing store,
-                // outside the descriptors: delete punches a hole
-                let is_array = heap.no_gc(|heap| receiver.heap_ref(heap).as_ref().is_array(heap));
-                if is_array {
-                    heap.no_gc(|heap| {
-                        let obj = receiver.heap_ref(heap);
+        // classification and the array-element fast path share one no-GC
+        // region; the Tagged name cannot escape it, so it is rooted inside
+        let name = heap.no_gc(|heap| -> Result<Option<Handle<'_, SlotName>>, VmError> {
+            match classify_key(heap, key.as_tagged(heap))? {
+                Key::Element(i) => {
+                    // array elements live in the elements backing store,
+                    // outside the descriptors: delete punches a hole
+                    let obj = receiver.heap_ref(heap);
+                    if obj.as_ref().is_array(heap) {
                         // indices at/past `length` were never own properties
                         if i < obj.as_ref().length()
                             && let Some(elements) = obj.as_ref().elements_array(heap)
@@ -800,23 +788,26 @@ impl Object {
                                 heap.known().the_hole.as_tagged(heap).erase_type(),
                             );
                         }
-                        Ok(())
-                    })?;
-                    return Ok(true);
+                        return Ok(None);
+                    }
+                    // other receivers hold numeric keys as named descriptors
+                    let smi_name: Tagged<'_, SlotName> = Tagged::from(Smi::new(i as i64));
+                    Ok(Some(scope.handle(smi_name)))
                 }
-                // other receivers hold numeric keys as named descriptors
-                let name = SlotName::from(Tagged::from_smi(Smi::new(i as i64)));
-                Self::delete_named_property(heap, scope, receiver, name)
+                Key::Name(name) => Ok(Some(scope.handle(name))),
             }
-            Key::Name(name) => Self::delete_named_property(heap, scope, receiver, name),
-        }
+        })?;
+        let Some(name) = name else {
+            return Ok(true);
+        };
+        Self::delete_named_property(heap, scope, receiver, name)
     }
 
     fn delete_named_property(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
         receiver: Handle<Object>,
-        name: SlotName,
+        name: Handle<SlotName>,
     ) -> Result<bool, VmError> {
         // array `length` lives in a dedicated slot outside the
         // descriptors and is non-configurable (ES 10.4.2)
@@ -824,7 +815,7 @@ impl Object {
             receiver
                 .heap_ref(heap)
                 .as_ref()
-                .array_length(heap, name)
+                .array_length(heap, name.as_tagged(heap))
                 .is_some()
         }) {
             return Ok(false);
@@ -837,13 +828,12 @@ impl Object {
                 .map_ref(heap)
                 .descriptors()
                 .iter()
-                .find(|d| d.name() == name)
+                .find(|d| d.name(heap).ptr_eq(name.as_tagged(heap)))
                 .map(|d| d.flags().is_configurable())
         });
         if configurable != Some(true) {
             return Ok(configurable.is_none());
         }
-        let name = scope.handle(unsafe { name.tagged(&*heap) });
         Transition::remove_property(heap, scope, receiver, name);
         Ok(true)
     }
@@ -877,57 +867,47 @@ impl Object {
     pub fn set_prototype(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
-        receiver: Value,
-        proto: Value,
+        receiver: Handle<Object>,
+        proto: Handle<Value>,
     ) -> Result<(), VmError> {
-        // Safety: caller-supplied word, fresh at entry.
-        let receiver_handle = scope
-            .cast::<Object>(unsafe { receiver.assume_valid(&*heap) })
-            .ok_or(VmError::Type)?;
-
-        let is_null = proto == heap.known().null.as_tagged(&*heap).erase();
-        if !is_null && !proto.is_strong_ptr() {
+        let is_null = heap.no_gc(|heap| {
+            proto
+                .as_tagged(heap)
+                .ptr_eq(heap.known().null.as_tagged(heap).erase_type())
+        });
+        if !is_null && !heap.no_gc(|heap| proto.as_tagged(heap).is_strong_ptr()) {
             // silently ignore non-object prototypes (sloppy-mode semantics)
             return Ok(());
         }
 
         if heap.no_gc(|heap| {
-            receiver_handle
+            receiver
                 .heap_ref(heap)
                 .map_ref(heap)
                 .prototype
                 .get(heap)
-                .erase()
-                == proto
+                .ptr_eq(proto.as_tagged(heap))
         }) {
             return Ok(());
         }
-        if !heap.no_gc(|heap| {
-            receiver_handle
-                .heap_ref(heap)
-                .map_ref(heap)
-                .kind()
-                .is_extendable()
-        }) {
+        if !heap.no_gc(|heap| receiver.heap_ref(heap).map_ref(heap).kind().is_extendable()) {
             return Err(VmError::NotExtensible);
         }
 
         // cycle check: the receiver must not appear in any proposed chain
         // (FixedArray prototypes contribute one chain per element)
         heap.no_gc(|heap| -> Result<(), VmError> {
-            let null = heap.known().null.as_tagged(heap).erase();
-            let this = receiver_handle.as_tagged(heap).erase();
-            // Safety: `proto` was read by the caller with no allocation
-            // since entry.
-            let start = unsafe { proto.assume_valid(heap) };
+            let null = heap.known().null.as_tagged(heap).erase_type();
+            let this = receiver.as_tagged(heap).erase_type();
+            let start = proto.as_tagged(heap);
             fn walk<'b>(
                 heap: &'b Heap,
-                null: Value,
-                this: Value,
+                null: Tagged<'b, Value>,
+                this: Tagged<'b, Value>,
                 mut p: Tagged<'b, Value>,
             ) -> Result<(), VmError> {
-                while p.is_strong_ptr() && p.erase() != null {
-                    if p.erase() == this {
+                while p.is_strong_ptr() && !p.ptr_eq(null) {
+                    if p.ptr_eq(this) {
                         return Err(VmError::Type);
                     }
                     let Some(o) = p.as_heap_object() else {
@@ -947,61 +927,45 @@ impl Object {
             Ok(())
         })?;
 
-        // Safety: as above.
-        let proto_handle = scope.handle(unsafe { proto.assume_valid(&*heap) });
-
-        let descriptor_count = heap.no_gc(|heap| {
-            receiver_handle
-                .heap_ref(heap)
-                .map_ref(heap)
-                .descriptor_count()
-        });
+        let descriptor_count =
+            heap.no_gc(|heap| receiver.heap_ref(heap).map_ref(heap).descriptor_count());
 
         heap.allocate_token_enter_heap(Map::layout_for(descriptor_count), |token, heap| {
-            let obj = receiver_handle.heap_ref(heap);
+            let obj = receiver.heap_ref(heap);
             let map = obj.map_ref(heap);
             let kind = map.kind();
             let value_slot_count = map.value_slot_count();
-            let descriptors: Vec<(SlotName, SlotFlags, Handle<'_, Value>)> = map
+            let descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> = map
                 .descriptors()
                 .iter()
-                .map(|d| (d.name(), d.flags(), scope.handle(d.value.get(heap))))
+                .map(|d| {
+                    (
+                        scope.handle(d.name(heap)),
+                        d.flags(),
+                        scope.handle(d.value.get(heap)),
+                    )
+                })
                 .collect();
             let new_map = token.allocate::<Map>(MapInit {
                 kind,
                 value_slot_count,
                 descriptors: &descriptors,
-                prototype: proto_handle,
+                prototype: proto,
             });
-            let host = receiver_handle.as_tagged(heap).erase();
+            let host = receiver.as_tagged(heap).erase();
             obj.header.map.set(heap, host, new_map);
             Ok(())
         })
     }
 }
 
-fn root_define_inputs<'s>(
-    scope: &'s HandleScope<'_>,
-    heap: &Heap,
-    receiver: Value,
-    name: SlotName,
-) -> (Handle<'s, Object>, Handle<'s, SlotName>) {
-    // store paths only reach here for object receivers (lookup dispatch)
-    // Safety: both words are fresh caller reads (no allocation since).
-    let receiver = scope
-        .cast::<Object>(unsafe { receiver.assume_valid(heap) })
-        .expect("store receiver is an object");
-    let name = scope.handle(unsafe { name.tagged(heap) });
-    (receiver, name)
-}
-
-fn validate_define<'a>(
+fn validate_define<'a, 's>(
     heap: &'a Heap,
     receiver: HeapRef<'a, Object>,
     cur_flags: SlotFlags,
-    cur_desc_value: Value,
-    desc: PropertyDescriptor,
-) -> Option<DefineAction> {
+    cur_desc_value: Handle<'s, Value>,
+    desc: PropertyDescriptor<'s>,
+) -> Option<DefineAction<'s>> {
     let cur_configurable = cur_flags.is_configurable();
 
     if cur_flags.is_accessor() {
@@ -1020,20 +984,13 @@ fn validate_define<'a>(
         if configurable || enumerable != cur_flags.is_enumerable() {
             return None;
         }
-        // Safety: descriptor words and the descriptor-row slot are fresh
-        // reads under the anchor `heap`.
-        let cur_pair = unsafe { cur_desc_value.assume_valid(heap) }
+        let cur_pair = cur_desc_value
+            .as_tagged(heap)
             .get_as::<AccessorPair>()
             .expect("accessor descriptor must hold a pair");
-        if !Compare::same_value(
-            heap,
-            unsafe { get.assume_valid(heap) },
-            cur_pair.get.get(heap),
-        ) || !Compare::same_value(
-            heap,
-            unsafe { set.assume_valid(heap) },
-            cur_pair.set.get(heap),
-        ) {
+        if !Compare::same_value(heap, get.as_tagged(heap), cur_pair.get.get(heap))
+            || !Compare::same_value(heap, set.as_tagged(heap), cur_pair.set.get(heap))
+        {
             return None;
         }
         return Some(DefineAction::Nothing);
@@ -1064,11 +1021,12 @@ fn validate_define<'a>(
                 return None;
             }
 
-            let offset = cur_desc_value.to_i64().unwrap() as usize;
-            // Safety: as above.
+            let offset = Smi::decode(cur_desc_value.as_tagged(heap).erase())
+                .expect("data row offset")
+                .value() as usize;
             if !Compare::same_value(
                 heap,
-                unsafe { value.assume_valid(heap) },
+                value.as_tagged(heap),
                 receiver.slot(heap, offset).get(heap),
             ) {
                 return None;
@@ -1083,17 +1041,17 @@ fn validate_define<'a>(
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct PartialDescriptor {
-    pub value: Option<Value>,
-    pub get: Option<Value>,
-    pub set: Option<Value>,
+pub struct PartialDescriptor<'s> {
+    pub value: Option<Handle<'s, Value>>,
+    pub get: Option<Handle<'s, Value>>,
+    pub set: Option<Handle<'s, Value>>,
     pub writable: Option<bool>,
     pub enumerable: Option<bool>,
     pub configurable: Option<bool>,
 }
 
-impl PartialDescriptor {
-    pub fn value(value: Value) -> Self {
+impl<'s> PartialDescriptor<'s> {
+    pub fn value(value: Handle<'s, Value>) -> Self {
         Self {
             value: Some(value),
             ..Self::default()
@@ -1117,9 +1075,9 @@ impl PartialDescriptor {
 
     pub fn complete_against(
         &self,
-        undefined: Value,
-        current: Option<&PropertyDescriptor>,
-    ) -> PropertyDescriptor {
+        undefined: Handle<'s, Value>,
+        current: Option<&PropertyDescriptor<'s>>,
+    ) -> PropertyDescriptor<'s> {
         // accessor if either side (desc first, then current) says so
         let accessor = self.is_accessor_descriptor()
             || !self.is_data_descriptor()
@@ -1166,8 +1124,8 @@ impl PartialDescriptor {
     }
 }
 
-impl From<&PropertyDescriptor> for PartialDescriptor {
-    fn from(d: &PropertyDescriptor) -> Self {
+impl<'s> From<&PropertyDescriptor<'s>> for PartialDescriptor<'s> {
+    fn from(d: &PropertyDescriptor<'s>) -> Self {
         match *d {
             PropertyDescriptor::Data {
                 value,
@@ -1199,21 +1157,21 @@ impl From<&PropertyDescriptor> for PartialDescriptor {
     }
 }
 
-fn c_enumumerable(d: &PropertyDescriptor) -> bool {
+fn c_enumumerable(d: &PropertyDescriptor<'_>) -> bool {
     match d {
         PropertyDescriptor::Data { enumerable, .. }
         | PropertyDescriptor::Accessor { enumerable, .. } => *enumerable,
     }
 }
 
-fn c_configurable(d: &PropertyDescriptor) -> bool {
+fn c_configurable(d: &PropertyDescriptor<'_>) -> bool {
     match d {
         PropertyDescriptor::Data { configurable, .. }
         | PropertyDescriptor::Accessor { configurable, .. } => *configurable,
     }
 }
 
-fn c_writable(d: &PropertyDescriptor) -> Option<bool> {
+fn c_writable(d: &PropertyDescriptor<'_>) -> Option<bool> {
     match d {
         PropertyDescriptor::Data { writable, .. } => Some(*writable),
         PropertyDescriptor::Accessor { .. } => None,
@@ -1223,8 +1181,8 @@ fn c_writable(d: &PropertyDescriptor) -> Option<bool> {
 pub fn is_compatible_property_descriptor(
     heap: &Heap,
     extensible: bool,
-    desc: &PartialDescriptor,
-    current: Option<&PartialDescriptor>,
+    desc: &PartialDescriptor<'_>,
+    current: Option<&PartialDescriptor<'_>>,
 ) -> bool {
     let Some(current) = current else {
         return extensible;
@@ -1246,8 +1204,7 @@ pub fn is_compatible_property_descriptor(
     if !desc.is_generic_descriptor() && desc.is_data_descriptor() != cur_is_data {
         return false;
     }
-    let undefined_t = heap.known().undefined.as_tagged(heap);
-    let undefined = undefined_t.erase();
+    let undefined = heap.known().undefined.as_tagged(heap).erase_type();
     if cur_is_data && desc.is_data_descriptor() {
         if current.writable != Some(true) {
             if desc.writable == Some(true) {
@@ -1256,27 +1213,25 @@ pub fn is_compatible_property_descriptor(
             if let Some(v) = desc.value
                 && !Compare::same_value(
                     heap,
-                    // Safety: descriptor words are read fresh under the
-                    // anchor by the callers of this check.
-                    unsafe { v.assume_valid(heap) },
-                    current.value.map_or(undefined_t.erase_type(), |w| unsafe {
-                        w.assume_valid(heap)
-                    }),
+                    v.as_tagged(heap),
+                    current.value.map_or(undefined, |w| w.as_tagged(heap)),
                 )
             {
                 return false;
             }
         }
     } else if !cur_is_data && desc.is_accessor_descriptor() {
-        if current.get.unwrap_or(undefined) == undefined
+        let is_absent =
+            |h: Option<Handle<'_, Value>>| h.is_none_or(|h| h.as_tagged(heap).ptr_eq(undefined));
+        if is_absent(current.get)
             && let Some(g) = desc.get
-            && g != undefined
+            && !g.as_tagged(heap).ptr_eq(undefined)
         {
             return false;
         }
-        if current.set.unwrap_or(undefined) == undefined
+        if is_absent(current.set)
             && let Some(s) = desc.set
-            && s != undefined
+            && !s.as_tagged(heap).ptr_eq(undefined)
         {
             return false;
         }

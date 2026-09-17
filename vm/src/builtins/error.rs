@@ -65,16 +65,14 @@ pub(crate) fn make_error(
             &scope,
             obj,
             name,
-            // Safety: fresh rooted-slot word; the define roots its inputs.
-            PropertyDescriptor::data(unsafe { class_value.read_unchecked() }),
+            PropertyDescriptor::data(class_value.erase()),
         )?;
         Object::define_own_property(
             heap,
             &scope,
             obj,
             message_key,
-            // Safety: fresh rooted-slot word; the define roots its inputs.
-            PropertyDescriptor::data(unsafe { message.read_unchecked() }),
+            PropertyDescriptor::data(message.erase()),
         )?;
         // Safety: fresh rooted-slot word, returned without an
         // intervening allocation.

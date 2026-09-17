@@ -69,10 +69,7 @@ fn throws_named(src: &str, want: &str) -> bool {
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 return false;
             };
-            match o
-                .as_ref()
-                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
-            {
+            match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => slot
                     .get(heap)
                     .get_as::<DenseString>()

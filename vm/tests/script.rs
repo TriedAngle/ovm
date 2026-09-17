@@ -1,7 +1,7 @@
 //! End-to-end: parse → resolve → compile → materialize → run.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{DenseString, Float, FunctionKind, Lookup, SlotName, Smi, Value};
+use vm::{DenseString, Float, FunctionKind, Lookup, Smi, Value};
 use vm::{ScriptError, Thread, VM};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
@@ -293,7 +293,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                 Some(expected_name.as_tagged(heap).erase())
             );
 
-            match function.lookup(heap, SlotName::from(name.as_tagged(heap))) {
+            match function.lookup(heap, name.as_tagged(heap).into()) {
                 Lookup::Data { slot, flags, .. } => {
                     assert_eq!(
                         slot.get(heap).erase(),
@@ -305,7 +305,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                 }
                 _ => panic!("function must have a data name property"),
             }
-            match function.lookup(heap, SlotName::from(length.as_tagged(heap))) {
+            match function.lookup(heap, length.as_tagged(heap).into()) {
                 Lookup::Data { slot, flags, .. } => {
                     assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 2);
                     assert!(!flags.is_writable());
@@ -314,7 +314,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                 }
                 _ => panic!("function must have a data length property"),
             }
-            match function.lookup(heap, SlotName::from(prototype.as_tagged(heap))) {
+            match function.lookup(heap, prototype.as_tagged(heap).into()) {
                 Lookup::Data { slot, flags, .. } => {
                     assert!(flags.is_writable());
                     assert!(!flags.is_enumerable());
@@ -324,7 +324,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                     };
                     match prototype
                         .as_ref()
-                        .lookup(heap, SlotName::from(constructor.as_tagged(heap)))
+                        .lookup(heap, constructor.as_tagged(heap).into())
                     {
                         Lookup::Data { slot, flags, .. } => {
                             assert_eq!(slot.get(heap).erase(), function_value);
@@ -374,10 +374,7 @@ fn tdz_throws_on_let_before_init() {
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
-            {
+            match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => {
                     assert_eq!(slot.get(heap).erase(), expected.as_tagged(heap).erase())
                 }

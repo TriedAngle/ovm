@@ -20,14 +20,12 @@ pub enum Lookup<'a> {
 }
 
 /// A runtime property key: a smi element index or a name (interned string / symbol).
-/// `SlotName` is a pointer-keyed raw word (names are held rooted by the maps
-/// that own them — hazard accepted, see `SlotName::from_value`).
-pub enum Key {
+pub enum Key<'a> {
     Element(usize),
-    Name(SlotName),
+    Name(Tagged<'a, SlotName>),
 }
 
-pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key, VmError> {
+pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key<'a>, VmError> {
     if let Some(smi) = Smi::decode(key.erase()) {
         // ES 6.1.7: an array index is 0 ≤ i < 2^32−1; anything else (incl.
         // 4294967295 itself) is an ordinary named property
@@ -36,7 +34,7 @@ pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key, V
                 .map(Key::Element)
                 .map_err(|_| VmError::OutOfBounds);
         }
-        return Ok(Key::Name(SlotName::from(Tagged::from_smi(smi))));
+        return Ok(Key::Name(Tagged::from(smi)));
     }
     if let Some(s) = key.get_as::<DenseString>() {
         // Canonical index strings ("0", "1", … up to 2^32−2) name the same
@@ -49,10 +47,10 @@ pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key, V
         {
             return Ok(Key::Element(i));
         }
-        return Ok(Key::Name(SlotName::from(s.into_tagged())));
+        return Ok(Key::Name(s.into_tagged().into()));
     }
     if let Some(s) = key.get_as::<Symbol>() {
-        return Ok(Key::Name(SlotName::from(s.into_tagged())));
+        return Ok(Key::Name(s.into_tagged().into()));
     }
     Err(VmError::Type)
 }
@@ -93,7 +91,7 @@ pub enum LoadOutcome<'a> {
 pub fn load_outcome_on<'a>(
     heap: &'a Heap,
     holder: Tagged<'a, Value>,
-    name: SlotName,
+    name: Tagged<'a, SlotName>,
 ) -> Result<LoadOutcome<'a>, VmError> {
     let known = heap.known();
     if holder.erase() == known.null.as_tagged(heap).erase()
@@ -110,7 +108,7 @@ pub fn load_outcome_on<'a>(
     // property without boxing (ES 5.4.3.1); index loads need a fresh
     // one-character string and stay unsupported here
     if let Some(s) = holder.get_as::<DenseString>()
-        && unsafe { name.tagged(heap) }
+        && name
             .erase_type()
             .get_as::<DenseString>()
             .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
@@ -139,38 +137,38 @@ pub fn load_outcome_on<'a>(
 pub fn load_outcome<'a>(
     heap: &'a Heap,
     receiver: Tagged<'a, Value>,
-    name: SlotName,
+    name: Tagged<'a, SlotName>,
 ) -> Result<LoadOutcome<'a>, VmError> {
     load_outcome_on(heap, receiver, name)
 }
 
 /// Ordinary [[GetOwnProperty]] as a full descriptor (ES 10.1.5): dense
 /// array elements, the JSArray `length` slot, and map descriptor rows.
-/// The single raw reader both `Object.getOwnPropertyDescriptor` and the
-/// proxy invariant checks build on.
-/// The returned descriptor holds raw words copied out of traced slots —
-/// they must be consumed (stored / re-rooted) before the next GC.
-pub fn ordinary_own_descriptor<'a>(
+/// The single reader both `Object.getOwnPropertyDescriptor` and the
+/// proxy invariant checks build on. The returned descriptor is rooted in
+/// `scope`, so it survives GC safepoints.
+pub fn ordinary_own_descriptor<'a, 's>(
     heap: &'a Heap,
+    scope: &'s crate::HandleScope<'_>,
     obj: Tagged<'a, Value>,
     key: Tagged<'a, Value>,
-) -> Option<crate::PropertyDescriptor> {
+) -> Option<crate::PropertyDescriptor<'s>> {
     if let Ok(Key::Element(i)) = classify_key(heap, key)
         && let Some(o) = obj.as_heap_object()
         && let Some(v) = o.as_ref().element_value(heap, i)
     {
         return Some(crate::PropertyDescriptor::Data {
-            value: v.erase(),
+            value: scope.handle(v),
             writable: true,
             enumerable: true,
             configurable: true,
         });
     }
-    let name = SlotName::from_value(key.erase());
+    let name = key.as_name();
     let o = obj.as_heap_object()?;
     if let Some(v) = o.as_ref().array_length(heap, name) {
         return Some(crate::PropertyDescriptor::Data {
-            value: v.erase(),
+            value: scope.handle(v),
             writable: true,
             enumerable: false,
             configurable: false,
@@ -178,7 +176,7 @@ pub fn ordinary_own_descriptor<'a>(
     }
     let map = o.as_ref().map_ref(heap);
     for d in map.descriptors() {
-        if d.name() != name {
+        if !d.name(heap).ptr_eq(name) {
             continue;
         }
         if d.flags().is_accessor() {
@@ -188,15 +186,15 @@ pub fn ordinary_own_descriptor<'a>(
                 .get_as::<crate::AccessorPair>()
                 .expect("accessor descriptor holds a pair");
             return Some(crate::PropertyDescriptor::Accessor {
-                get: pair.get.get(heap).erase(),
-                set: pair.set.get(heap).erase(),
+                get: scope.handle(pair.get.get(heap)),
+                set: scope.handle(pair.set.get(heap)),
                 enumerable: d.flags().is_enumerable(),
                 configurable: d.flags().is_configurable(),
             });
         }
         let slot = o.as_ref().slot(heap, d.offset());
         return Some(crate::PropertyDescriptor::Data {
-            value: slot.get(heap).erase(),
+            value: scope.handle(slot.get(heap)),
             writable: d.flags().is_writable(),
             enumerable: d.flags().is_enumerable(),
             configurable: d.flags().is_configurable(),
@@ -209,7 +207,7 @@ impl<'a> Tagged<'a, Value> {
     /// Property lookup on any value: non-objects (Smis) find nothing. The
     /// smi map has no descriptors and a null prototype, so this matches the
     /// old smi-map walk; primitives with named properties need boxing first.
-    pub fn lookup(self, heap: &'a Heap, name: SlotName) -> Lookup<'a> {
+    pub fn lookup(self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
         let Some(obj) = self.as_heap_object() else {
             return Lookup::NotFound;
         };
@@ -223,12 +221,16 @@ impl<'a> Tagged<'a, Value> {
 /// classified first so `"2" in o` and `2 in o` agree. Arrays anywhere in
 /// the chain own `"length"` through their internal slot (ES 10.4.2.1),
 /// which the descriptor walk cannot see.
-pub fn has_property<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>, name: SlotName) -> bool {
-    let name = match classify_key(heap, unsafe { name.tagged(heap) }.erase_type()) {
+pub fn has_property<'a>(
+    heap: &'a Heap,
+    receiver: Tagged<'a, Value>,
+    name: Tagged<'a, SlotName>,
+) -> bool {
+    let name = match classify_key(heap, name.erase_type()) {
         Ok(Key::Element(i)) => {
             // non-array receivers keep index keys as Smi-named
             // descriptors; canonicalize so the named walk finds them
-            let smi_name = SlotName::from(Tagged::from_smi(Smi::new(i as i64)));
+            let smi_name: Tagged<'a, SlotName> = Tagged::from(Smi::new(i as i64));
             if let Some(obj) = receiver.as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -242,7 +244,7 @@ pub fn has_property<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>, name: SlotN
         return true;
     }
     // "length" may live in an array's internal slot at any chain level
-    if unsafe { name.tagged(heap) }
+    if name
         .erase_type()
         .get_as::<DenseString>()
         .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
@@ -285,10 +287,10 @@ impl Map {
         &'a self,
         heap: &'a Heap,
         receiver: HeapRef<'a, Object>,
-        name: SlotName,
+        name: Tagged<'a, SlotName>,
     ) -> Lookup<'a> {
         for (index, d) in self.descriptors().iter().enumerate() {
-            if d.name() == name {
+            if d.name(heap).ptr_eq(name) {
                 if d.flags().is_accessor() {
                     return Lookup::Accessor {
                         holder: receiver,
@@ -317,7 +319,7 @@ impl Map {
 pub fn lookup_in_parents<'a>(
     heap: &'a Heap,
     proto: Tagged<'a, Value>,
-    name: SlotName,
+    name: Tagged<'a, SlotName>,
 ) -> Lookup<'a> {
     if proto.erase() == heap.known().null.as_tagged(heap).erase() {
         return Lookup::NotFound;
@@ -365,7 +367,7 @@ fn super_start_from_proto<'a>(heap: &'a Heap, proto: Option<Tagged<'a, Value>>) 
 pub fn super_lookup<'a>(
     heap: &'a Heap,
     value: Tagged<'a, Value>,
-    name: SlotName,
+    name: Tagged<'a, SlotName>,
 ) -> Result<LoadOutcome<'a>, VmError> {
     let proto = home_proto(heap, value);
     super_lookup_from_proto(heap, proto, name)
@@ -377,7 +379,7 @@ pub fn super_lookup<'a>(
 pub fn super_lookup_from_proto<'a>(
     heap: &'a Heap,
     proto: Option<Tagged<'a, Value>>,
-    name: SlotName,
+    name: Tagged<'a, SlotName>,
 ) -> Result<LoadOutcome<'a>, VmError> {
     match super_start_from_proto(heap, proto) {
         // single parent: full load semantics
@@ -448,7 +450,7 @@ pub fn private_find<'a>(
     let o = obj.as_heap_object()?;
     let map = o.as_ref().header.map.heap_ref(heap);
     for d in map.descriptors() {
-        if d.name() == SlotName::from_value(key.erase()) && !d.flags().is_accessor() {
+        if d.name(heap).ptr_eq(key.as_name()) && !d.flags().is_accessor() {
             return Some(o.as_ref().slot(heap, d.offset()));
         }
     }
@@ -456,7 +458,7 @@ pub fn private_find<'a>(
 }
 
 impl Object {
-    pub fn lookup<'a>(&'a self, heap: &'a Heap, name: SlotName) -> Lookup<'a> {
+    pub fn lookup<'a>(&'a self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
         self.header
             .map
             .heap_ref(heap)

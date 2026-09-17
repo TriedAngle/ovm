@@ -2,7 +2,7 @@
 //! toString/call/apply/bind, and the bind-closure prelude.
 
 use crate::materialize::materialize_closure_vm;
-use crate::{Context, Convert, DenseString, GcSlice, SlotName, Smi, Tagged, Value, VmError};
+use crate::{Context, Convert, DenseString, GcSlice, Smi, Tagged, Value, VmError};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
@@ -145,9 +145,7 @@ pub(crate) fn function_apply(
                             .array_length(
                                 heap,
                                 // Safety: fresh root-slot word for a name read.
-                                SlotName::from_value(unsafe {
-                                    heap.known().strings.length.read_unchecked()
-                                }),
+                                heap.known().strings.length.as_tagged(heap),
                             )
                             .and_then(|v| Smi::decode(v.erase()).map(|s| s.value() as usize))
                             .unwrap_or(0)

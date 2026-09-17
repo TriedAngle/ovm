@@ -331,6 +331,16 @@ impl<'a> Tagged<'a, Value> {
         Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
     }
 
+    /// Narrow an anchored value word to a property-name tag (type-level
+    /// only: a name is an interned string, a symbol or a Smi, compared
+    /// by word identity).
+    pub fn as_name(self) -> Tagged<'a, crate::SlotName> {
+        Tagged {
+            raw: self.raw,
+            _phantom: PhantomData,
+        }
+    }
+
     pub fn as_heap_object(self) -> Option<HeapRef<'a, Object>> {
         let ptr = HeapPtr::decode_strong(self.raw)?;
         // Safety: anchor `'a` proves no GC ran since the load.

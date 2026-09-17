@@ -128,11 +128,7 @@ macro_rules! define_well_known_strings {
                 Self {
                     $($field: {
                         let interned = interner.intern_str(heap, roots, $text);
-                        heap.no_gc(|heap| {
-                            roots.create_handle(unsafe {
-                                SlotName::from(interned.as_tagged(heap)).tagged(heap)
-                            })
-                        })
+                        heap.no_gc(|heap| roots.create_handle(interned.as_tagged(heap)))
                     },)*
                 }
             }

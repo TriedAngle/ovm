@@ -48,6 +48,18 @@ unsafe fn anchored<'a>(heap: &'a Heap, v: Value) -> Tagged<'a, Value> {
     unsafe { v.assume_valid(heap) }
 }
 
+/// A name tag re-anchored under a live heap borrow.
+fn name<'a>(heap: &'a Heap, w: Value) -> Tagged<'a, SlotName> {
+    unsafe { w.assume_valid(heap) }.as_name()
+}
+
+/// A name tag from a raw word with no live borrow (map fixtures built
+/// right before their allocation). Tests only: no collection may run
+/// between the word's last load and its consumption.
+fn raw_name(w: Value) -> Tagged<'static, SlotName> {
+    unsafe { Tagged::from_value_unchecked(w) }.as_name()
+}
+
 /// Assert a run escaped uncaught: the sentinel is returned and the pending
 /// exception is a materialized error object of the given class name.
 fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &str) -> Value {
@@ -62,10 +74,7 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
             let Some(o) = unsafe { anchored(heap, ex) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(heap, SlotName::from(name.as_tagged(heap)))
-            {
+            match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(slot.get(heap).erase(), expected_name, "error class name");
                 }
@@ -642,7 +651,7 @@ fn define_named_own_property_attributes_and_value() {
                 // Safety: `obj` is a strong, live reference and no collection
                 // can happen inside the no-GC scope.
                 let o = unsafe { ptr.cast::<Object>().as_ref() };
-                match o.lookup(heap, SlotName::from_value(m)) {
+                match o.lookup(heap, name(heap, m)) {
                     Lookup::Data { slot, flags, .. } => {
                         assert_eq!(
                             slot.get(heap).erase(),
@@ -753,7 +762,7 @@ fn define_keyed_own_property_string_and_smi_keys() {
         let expected_flags = SlotFlags::VALUE
             .union(SlotFlags::WRITABLE)
             .union(SlotFlags::CONFIGURABLE);
-        match o.lookup(heap, SlotName::from_value(x)) {
+        match o.lookup(heap, name(heap, x)) {
             Lookup::Data { slot, flags, .. } => {
                 assert_eq!(slot.get(heap).erase(), smi(5));
                 assert_eq!(flags, expected_flags);
@@ -761,7 +770,7 @@ fn define_keyed_own_property_string_and_smi_keys() {
             _ => panic!("x must be a data property"),
         }
         // a smi key defines a plain named property, not an element
-        match o.lookup(heap, SlotName::from_value(smi(3))) {
+        match o.lookup(heap, name(heap, smi(3))) {
             Lookup::Data { slot, flags, .. } => {
                 assert_eq!(slot.get(heap).erase(), smi(6));
                 assert_eq!(flags, expected_flags);
@@ -853,7 +862,7 @@ fn define_own_property_accessor_invokes_getter() {
         // Safety: `obj` is a strong, live reference and no collection can
         // happen inside the no-GC scope.
         let o = unsafe { ptr.cast::<Object>().as_ref() };
-        match o.lookup(heap, SlotName::from_value(p)) {
+        match o.lookup(heap, name(heap, p)) {
             Lookup::Accessor { pair, .. } => {
                 assert_eq!(pair.get.get(heap).erase(), getter);
             }
@@ -863,7 +872,7 @@ fn define_own_property_accessor_invokes_getter() {
             .map_ref(heap)
             .descriptors()
             .iter()
-            .find(|d| d.name() == SlotName::from_value(p))
+            .find(|d| d.name(heap).ptr_eq(name(heap, p)))
             .map(|d| d.flags())
             .expect("p descriptor");
         assert_eq!(
@@ -1088,7 +1097,11 @@ fn transition_object_program(
             MapInit {
                 kind,
                 value_slot_count: 1,
-                descriptors: &[(SlotName::from_value(x), x_flags, scope.handle(Smi::new(0)))],
+                descriptors: &[(
+                    scope.handle(raw_name(x)),
+                    x_flags,
+                    scope.handle(Smi::new(0)),
+                )],
                 prototype: the_hole.erase(),
             },
             &scope,
@@ -1238,7 +1251,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 kind: MapKind::OBJECT,
                 value_slot_count: 1,
                 descriptors: &[(
-                    SlotName::from_value(p_word),
+                    scope.handle(raw_name(p_word)),
                     WRITABLE_VALUE,
                     scope.handle(Smi::new(0)),
                 )],
@@ -1602,12 +1615,12 @@ fn accessor_object_program(
                 value_slot_count: 1,
                 descriptors: &[
                     (
-                        SlotName::from_value(y_word),
+                        scope.handle(raw_name(y_word)),
                         WRITABLE_VALUE,
                         scope.handle(Smi::new(0)),
                     ),
                     (
-                        SlotName::from_value(x_word),
+                        scope.handle(raw_name(x_word)),
                         SlotFlags::ACCESSOR,
                         pair.erase(),
                     ),
@@ -1768,7 +1781,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 kind: EXTENDABLE,
                 value_slot_count: 1,
                 descriptors: &[(
-                    SlotName::from_value(y_word),
+                    scope.handle(raw_name(y_word)),
                     WRITABLE_VALUE,
                     scope.handle(Smi::new(0)),
                 )],
@@ -1810,11 +1823,14 @@ fn store_new_accessor_property_defines_own_accessor() {
         };
         let name = {
             let heap = &*thread.heap();
-            scope.handle(unsafe { SlotName::from_value(x_word).tagged(heap) })
+            scope.handle(name(heap, x_word))
         };
-        let w11 = word(&*thread.heap(), getter);
-        let get_word = w11;
-        let set_word = global_word(&mut *thread, |k| k.undefined);
+        let get_word = scope.handle(unsafe {
+            Tagged::<Value>::from_value_unchecked(word(&*thread.heap(), getter))
+        });
+        let set_word = scope.handle(unsafe {
+            Tagged::<Value>::from_value_unchecked(global_word(&mut *thread, |k| k.undefined))
+        });
         Object::define_own_property(
             thread.heap(),
             &scope,
@@ -2700,7 +2716,6 @@ fn empty_object_literal_inherits_from_object_prototype() {
 
     let result = thread.handle_scope(|thread, scope| {
         let p = intern_word(&mut *thread, &scope, "p");
-        let name = SlotName::from_value(p);
         let proto = global_word(&mut *thread, |k| k.object_prototype);
 
         // host-side: %Object.prototype%.p = 1
@@ -2709,7 +2724,8 @@ fn empty_object_literal_inherits_from_object_prototype() {
             .no_gc(|heap| {
                 unsafe { anchored(heap, proto) }.store_lookup(
                     heap,
-                    name,
+                    &scope,
+                    name(heap, p),
                     Smi::new(1).into_tagged(),
                     StoreSemantics::Shadow,
                 )
@@ -2717,12 +2733,13 @@ fn empty_object_literal_inherits_from_object_prototype() {
             .unwrap();
         match outcome {
             StoreOutcome::Transition { receiver, name } => {
-                Object::define_own_property_values(
+                let value = scope.handle(Smi::new(1));
+                Object::define_own_property(
                     thread.heap(),
                     &scope,
                     receiver,
                     name,
-                    PropertyDescriptor::data(smi(1)),
+                    PropertyDescriptor::data(value),
                 )
                 .expect("the transition receiver is fresh and extensible");
             }
@@ -2936,7 +2953,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
         assert!(method.map_ref(heap).kind().is_callable());
         assert!(!method.map_ref(heap).kind().is_constructor());
         assert!(matches!(
-            method.lookup(heap, SlotName::from_value(prototype)),
+            method.lookup(heap, name(heap, prototype)),
             Lookup::NotFound
         ));
     });
@@ -2981,9 +2998,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
         assert!(kind.is_constructor());
         assert!(kind.is_class_constructor());
         assert!(matches!(
-            constructor
-                .as_ref()
-                .lookup(heap, SlotName::from_value(prototype)),
+            constructor.as_ref().lookup(heap, name(heap, prototype)),
             Lookup::NotFound
         ));
     });
@@ -3202,12 +3217,16 @@ fn proto_object<'s>(
     p: vm::Handle<'s, vm::DenseString>,
 ) -> vm::Handle<'s, Object> {
     let the_hole = thread.heap().known().the_hole;
-    let p_name = SlotName::from(p.as_tagged(&*thread.heap()));
+    let p_name = raw_name(p.as_tagged(&*thread.heap()).erase());
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: EXTENDABLE,
             value_slot_count: 1,
-            descriptors: &[(p_name, WRITABLE_VALUE, scope.handle(Smi::new(0)))],
+            descriptors: &[(
+                scope.handle(p_name),
+                WRITABLE_VALUE,
+                scope.handle(Smi::new(0)),
+            )],
             prototype: the_hole.erase(),
         },
         scope,
@@ -3466,17 +3485,22 @@ fn set_property_fn(
     thread: &mut Thread,
     scope: &HandleScope<'_>,
     obj: Value,
-    name: Value,
+    name_word: Value,
     program: &[u8],
     constants: &[Value],
 ) {
     let f = make_callable(thread, scope, program, constants);
-    Object::define_own_property_values(
+    let obj = scope
+        .cast::<Object>(unsafe { obj.assume_valid(&*thread.heap()) })
+        .expect("object");
+    let name_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), name_word));
+    let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(f) });
+    Object::define_own_property(
         thread.heap(),
         scope,
         obj,
-        SlotName::from_value(name),
-        PropertyDescriptor::data(f),
+        name_h,
+        PropertyDescriptor::data(value),
     )
     .expect("defining a fresh own property must succeed");
 }
@@ -3706,14 +3730,17 @@ fn to_primitive_calls_getter_accessors() {
             &[],
         );
         let getter = make_callable(thread, &scope, &program_return_constant(), &[inner]);
-        let (name, get_word, set_word) = {
-            let heap = &*thread.heap();
-            (
-                scope.handle(unsafe { SlotName::from(value_of.as_tagged(heap)).tagged(heap) }),
-                getter,
-                heap.known().undefined.as_tagged(heap).erase(),
-            )
-        };
+        let name_tag: Tagged<'_, SlotName> = value_of.as_tagged(&*thread.heap()).into();
+        let name: Handle<'_, SlotName> = scope.handle(name_tag);
+        let get_word = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(getter) });
+        let set_word = scope.handle(
+            thread
+                .heap()
+                .known()
+                .undefined
+                .as_tagged(&*thread.heap())
+                .erase_type(),
+        );
         Object::define_own_property(
             thread.heap(),
             &scope,
@@ -3933,20 +3960,23 @@ fn instance_of_walks_prototype_chain() {
         // F with a .prototype object
         let f = make_callable(thread, &scope, &program_return_1(), &[]);
         let f_proto_h = empty_object(thread, &scope);
-        let f_proto = word(&*thread.heap(), f_proto_h);
-        Object::define_own_property_values(
+        let f_obj = scope
+            .cast::<Object>(unsafe { f.assume_valid(&*thread.heap()) })
+            .expect("callable object");
+        let prototype_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), prototype));
+        Object::define_own_property(
             thread.heap(),
             &scope,
-            f,
-            SlotName::from_value(prototype),
-            PropertyDescriptor::data(f_proto),
+            f_obj,
+            prototype_h,
+            PropertyDescriptor::data(f_proto_h.erase()),
         )
         .expect("defining a fresh own property must succeed");
 
         // obj inherits F.prototype; plain {} does not
         let obj_h = empty_object(thread, &scope);
         let obj = word(&*thread.heap(), obj_h);
-        Object::set_prototype(thread.heap(), &scope, obj, f_proto).unwrap();
+        Object::set_prototype(thread.heap(), &scope, obj_h, f_proto_h.erase()).unwrap();
         let plain_h = empty_object(thread, &scope);
         let plain = word(&*thread.heap(), plain_h);
 
@@ -3978,12 +4008,17 @@ fn instance_of_walks_prototype_chain() {
 
         // a non-object .prototype is a TypeError
         let f2 = make_callable(thread, &scope, &program_return_1(), &[]);
-        Object::define_own_property_values(
+        let f2_obj = scope
+            .cast::<Object>(unsafe { f2.assume_valid(&*thread.heap()) })
+            .expect("callable object");
+        let prototype_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), prototype));
+        let value = scope.handle(Smi::new(42));
+        Object::define_own_property(
             thread.heap(),
             &scope,
-            f2,
-            SlotName::from_value(prototype),
-            PropertyDescriptor::data(smi(42)),
+            f2_obj,
+            prototype_h,
+            PropertyDescriptor::data(value),
         )
         .expect("defining a fresh own property must succeed");
         let r = run_program(
@@ -4019,13 +4054,16 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
             &[],
         );
         let g_proto_h = empty_object(thread, &scope);
-        let g_proto = word(&*thread.heap(), g_proto_h);
-        Object::define_own_property_values(
+        let g_obj = scope
+            .cast::<Object>(unsafe { g.assume_valid(&*thread.heap()) })
+            .expect("callable object");
+        let prototype_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), prototype));
+        Object::define_own_property(
             thread.heap(),
             &scope,
-            g,
-            SlotName::from_value(prototype),
-            PropertyDescriptor::data(g_proto),
+            g_obj,
+            prototype_h,
+            PropertyDescriptor::data(g_proto_h.erase()),
         )
         .expect("defining a fresh own property must succeed");
 
@@ -4089,32 +4127,27 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
         let outcome = nctx.heap().no_gc(|heap| {
             unsafe { anchored(heap, global) }.store_lookup(
                 heap,
-                SlotName::from(name.as_tagged(heap)),
+                &scope,
+                name.as_tagged(heap).into(),
                 flag,
                 StoreSemantics::WriteThrough,
             )
         })?;
         match outcome {
             StoreOutcome::Done => {}
-            StoreOutcome::Transition { .. } => {
-                let name_word = {
-                    let heap = &*nctx.heap();
-                    SlotName::from(name.as_tagged(heap))
-                };
-                Object::define_own_property_values(
+            StoreOutcome::Transition { receiver, name } => {
+                let value = scope.handle(flag);
+                Object::define_own_property(
                     nctx.heap(),
                     &scope,
-                    global,
-                    name_word,
-                    PropertyDescriptor::data(flag.erase()),
+                    receiver,
+                    name,
+                    PropertyDescriptor::data(value),
                 )?;
             }
             StoreOutcome::CallSetter { setter } => {
                 nctx.handle_scope(|nctx, scope| {
-                    nctx.call(
-                        unsafe { Tagged::from_value_unchecked(setter) },
-                        stage_values(&scope, &[global, flag.erase()]),
-                    )
+                    nctx.call_rooted(setter, stage_values(&scope, &[global, flag.erase()]))
                 })?;
             }
         }
@@ -4170,12 +4203,16 @@ fn shadow_setup<'s>(
 ) -> (Handle<'s, Object>, Handle<'s, Object>, Value) {
     let the_hole = thread.heap().known().the_hole;
     let p = thread.intern(scope, "p");
-    let p_name = SlotName::from(p.as_tagged(&*thread.heap()));
+    let p_name = raw_name(p.as_tagged(&*thread.heap()).erase());
     let parent_map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: MapKind::OBJECT,
             value_slot_count: 1,
-            descriptors: &[(p_name, WRITABLE_VALUE, scope.handle(Smi::new(0)))],
+            descriptors: &[(
+                scope.handle(p_name),
+                WRITABLE_VALUE,
+                scope.handle(Smi::new(0)),
+            )],
             prototype: the_hole.erase(),
         },
         scope,
@@ -4266,7 +4303,7 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
             let child_ref = child.heap_ref(heap);
             assert_eq!(child_ref.header.map.heap_ref(heap).descriptor_count(), 0);
             let parent_ref = parent.heap_ref(heap);
-            match parent_ref.as_ref().lookup(heap, SlotName::from_value(p)) {
+            match parent_ref.as_ref().lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 1);
                 }
@@ -4300,21 +4337,21 @@ fn shadow_store_defines_default_attributes() {
             let map = child_ref.header.map.heap_ref(heap);
             assert_eq!(map.descriptor_count(), 1);
             let d = map.descriptor(0);
-            assert_eq!(d.name(), SlotName::from_value(p));
+            assert!(d.name(heap).ptr_eq(name(heap, p)));
             assert_eq!(d.offset(), 0);
             // [[Set]] shadowing defines with the assignment defaults
             assert!(d.flags().is_writable());
             assert!(d.flags().is_enumerable());
             assert!(d.flags().is_configurable());
             // the own slot wins, the parent keeps its value
-            match child_ref.as_ref().lookup(heap, SlotName::from_value(p)) {
+            match child_ref.as_ref().lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 2);
                 }
                 _ => panic!("expected own data property"),
             }
             let parent_ref = parent.heap_ref(heap);
-            match parent_ref.as_ref().lookup(heap, SlotName::from_value(p)) {
+            match parent_ref.as_ref().lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 1);
                 }

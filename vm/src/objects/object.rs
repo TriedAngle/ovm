@@ -49,15 +49,15 @@ impl Object {
     /// The JSArray `length` internal slot, when `self` is an array named
     /// `name`: it lives outside the map descriptors, so descriptor walks
     /// must consult this first. `None` for any other name or non-array.
-    pub fn array_length<'a>(&'a self, heap: &'a Heap, name: SlotName) -> Option<Tagged<'a, Value>> {
+    pub fn array_length<'a>(
+        &'a self,
+        heap: &'a Heap,
+        name: Tagged<'a, SlotName>,
+    ) -> Option<Tagged<'a, Value>> {
         if !self.is_array(heap) {
             return None;
         }
-        // Safety: names are held rooted by the maps that own them.
-        let s = unsafe { name.tagged(heap) }
-            .erase_type()
-            .get_as::<DenseString>()?
-            .as_ref();
+        let s = name.erase_type().get_as::<DenseString>()?.as_ref();
         s.data(heap)
             .matches_ascii(b"length")
             .then(|| self.length.get(heap).erase_type())
