@@ -177,16 +177,19 @@ fn exception_name(thread: &mut vm::Thread) -> String {
         let Some(ex) = thread.take_pending_exception() else {
             return "exception".into();
         };
-        let name_key = thread.intern(&scope, "name").value();
-        thread.heap().no_gc(|nogc| {
-            let Some(o) = ex.as_heap_object(nogc) else {
+        let name_key = thread.intern(&scope, "name");
+        thread.heap().no_gc(|heap| {
+            let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 return "exception".into();
             };
-            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
+            match o
+                .as_ref()
+                .lookup(heap, vm::SlotName::from(name_key.as_tagged(heap)))
+            {
                 vm::Lookup::Data { slot, .. } => slot
-                    .inner()
-                    .get_as::<vm::DenseString>(nogc)
-                    .map(|s| s.to_rust_string(nogc))
+                    .get(heap)
+                    .get_as::<vm::DenseString>()
+                    .map(|s| s.to_rust_string(heap))
                     .unwrap_or_else(|| "exception".into()),
                 _ => "exception".into(),
             }
@@ -269,7 +272,13 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).expect("vm");
     let mut thread = vm.attach();
     match thread.run_script(&code) {
-        Ok(v) if v == thread.heap().known().exception.value() => {
+        Ok(v)
+            if {
+                thread
+                    .heap()
+                    .no_gc(|heap| v == heap.known().exception.as_tagged(heap).erase())
+            } =>
+        {
             let name = exception_name(&mut thread);
             stats
                 .fail

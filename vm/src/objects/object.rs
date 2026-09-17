@@ -1,8 +1,8 @@
 use core::alloc::Layout;
 
 use crate::{
-    CallableInfoObject, Context, DenseString, EdgeVisitable, FixedArray, FunctionKind, GcSlice, GcSlot,
-    Handle, HandleScope, Header, Heap, HeapObject, HeapRef, Map, NoGc, ObjectKind, SlotName, Smi,
+    CallableInfoObject, Context, DenseString, EdgeVisitable, FixedArray, FunctionKind, GcSlice,
+    GcSlot, Handle, HandleScope, Header, Heap, HeapObject, HeapRef, Map, ObjectKind, SlotName, Smi,
     Tagged, Value, Visitor, VmError,
 };
 
@@ -19,86 +19,89 @@ impl Object {
         Layout::new::<Self>()
     }
 
-    pub fn callable_info<'a>(
-        &'a self,
-        guard: &'a NoGc<'a>,
-    ) -> Option<HeapRef<'a, CallableInfoObject>> {
-        if !self.header.map.heap_ref(guard).kind().is_callable() {
+    pub fn callable_info<'a>(&'a self, heap: &'a Heap) -> Option<HeapRef<'a, CallableInfoObject>> {
+        if !self.header.map.heap_ref(heap).kind().is_callable() {
             return None;
         }
-        let info = self.slots.heap_ref(guard).at(0);
-        info.get_as(guard)
+        let info = self.slots.heap_ref(heap).at(heap, 0);
+        info.get_as::<CallableInfoObject>()
     }
 
-    pub fn closure_context<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<HeapRef<'a, Context>> {
-        if !self.header.map.heap_ref(guard).kind().is_callable() {
+    pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<HeapRef<'a, Context>> {
+        if !self.header.map.heap_ref(heap).kind().is_callable() {
             return None;
         }
-        self.slots.heap_ref(guard).at(1).get_as(guard)
+        self.slots.heap_ref(heap).at(heap, 1).get_as::<Context>()
     }
 
-    pub fn native_index<'a>(&'a self, guard: &'a NoGc<'a>) -> Option<usize> {
-        if !self.header.map.heap_ref(guard).kind().is_native() {
+    pub fn native_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
+        if !self.header.map.heap_ref(heap).kind().is_native() {
             return None;
         }
-        let idx = Smi::decode(self.slots.heap_ref(guard).at(0))?.value();
+        let idx = Smi::decode(self.slots.heap_ref(heap).at(heap, 0).erase())?.value();
         usize::try_from(idx).ok()
     }
 
-    pub fn is_array<'a>(&'a self, nogc: &'a NoGc<'a>) -> bool {
-        self.header.map.heap_ref(nogc).kind().kind() == ObjectKind::Array
+    pub fn is_array<'a>(&'a self, heap: &'a Heap) -> bool {
+        self.header.map.heap_ref(heap).kind().kind() == ObjectKind::Array
     }
 
     /// The JSArray `length` internal slot, when `self` is an array named
     /// `name`: it lives outside the map descriptors, so descriptor walks
     /// must consult this first. `None` for any other name or non-array.
-    pub fn array_length<'a>(&'a self, nogc: &'a NoGc<'a>, name: SlotName) -> Option<Value> {
-        if !self.is_array(nogc) {
+    pub fn array_length<'a>(&'a self, heap: &'a Heap, name: SlotName) -> Option<Tagged<'a, Value>> {
+        if !self.is_array(heap) {
             return None;
         }
-        let s = name.value().get_as::<DenseString>(nogc)?.as_ref();
-        s.data(nogc)
+        // Safety: names are held rooted by the maps that own them.
+        let s = unsafe { name.tagged(heap) }
+            .erase_type()
+            .get_as::<DenseString>()?
+            .as_ref();
+        s.data(heap)
             .matches_ascii(b"length")
-            .then(|| self.length.inner())
+            .then(|| self.length.get(heap).erase_type())
     }
 
     /// The object's map (shape).
-    pub fn map_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, Map> {
-        self.header.map.heap_ref(nogc)
+    pub fn map_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, Map> {
+        self.header.map.heap_ref(heap)
     }
 
     /// Whether the object's map allows adding new properties.
-    pub fn is_extendable<'a>(&self, nogc: &'a NoGc<'a>) -> bool {
-        self.map_ref(nogc).kind().is_extendable()
+    pub fn is_extendable(&self, heap: &Heap) -> bool {
+        self.map_ref(heap).kind().is_extendable()
     }
 
     /// The slot holding the value of the data slot at `offset`.
-    pub fn slot<'a>(&self, nogc: &'a NoGc<'a>, offset: usize) -> &'a GcSlot {
-        self.slots.heap_ref(nogc).as_ref().element_slot(offset)
+    pub fn slot<'a>(&self, heap: &'a Heap, offset: usize) -> &'a GcSlot {
+        self.slots.heap_ref(heap).as_ref().element_slot(offset)
     }
 
     pub fn length(&self) -> usize {
         self.length.to_smi().value() as usize
     }
 
-    pub fn elements_array<'a>(&'a self, nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, FixedArray>> {
-        self.elements.inner().get_as::<FixedArray>(nogc)
+    pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<HeapRef<'a, FixedArray>> {
+        // Safety: fresh slot read under the anchor.
+        unsafe { self.elements.inner().assume_valid(heap) }.get_as::<FixedArray>()
     }
 
     /// Fast element read for array objects: `None` if `self` is not an
     /// array, the index is past the end, or the slot is a hole — the
     /// caller must fall back to a named property lookup.
-    pub fn element_value<'a>(&'a self, nogc: &'a NoGc<'a>, i: usize) -> Option<Value> {
-        if !self.is_array(nogc) || i >= self.length() {
+    pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
+        if !self.is_array(heap) || i >= self.length() {
             return None;
         }
-        let elements = self.elements_array(nogc)?;
+        let elements = self.elements_array(heap)?;
         if i >= elements.len() {
             // `length` can exceed the backing store: those indices are holes
             return None;
         }
-        let v = elements.at(i);
-        if v == nogc.known().the_hole.value() {
+        let v = elements.at(heap, i);
+        // Safety: fresh root-slot read under the anchor.
+        if v.erase() == unsafe { heap.known().the_hole.read_unchecked() } {
             return None;
         }
         Some(v)
@@ -106,21 +109,21 @@ impl Object {
 }
 
 /// What kind of callable a value refers to.
-pub enum CallTarget {
-    Bytecode(Tagged<Object>, usize, FunctionKind),
+pub enum CallTarget<'a> {
+    Bytecode(Tagged<'a, Object>, usize, FunctionKind),
     Native(usize),
 }
 
-pub fn call_target<'a>(nogc: &'a NoGc<'a>, f: Value) -> Option<CallTarget> {
-    let obj = f.as_heap_object(nogc)?;
-    let kind = obj.as_ref().header.map.heap_ref(nogc).kind();
+pub fn call_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
+    let obj = f.as_heap_object()?;
+    let kind = obj.as_ref().header.map.heap_ref(heap).kind();
     if !kind.is_callable() {
         return None;
     }
     if kind.is_native() {
-        return Some(CallTarget::Native(obj.as_ref().native_index(nogc)?));
+        return Some(CallTarget::Native(obj.as_ref().native_index(heap)?));
     }
-    let info = obj.as_ref().callable_info(nogc)?;
+    let info = obj.as_ref().callable_info(heap)?;
     let register_count = info.register_count.to_smi().value() as usize;
     Some(CallTarget::Bytecode(
         obj.into_tagged(),
@@ -130,9 +133,9 @@ pub fn call_target<'a>(nogc: &'a NoGc<'a>, f: Value) -> Option<CallTarget> {
 }
 
 /// The callee's function kind, when it is a bytecode function.
-pub fn function_kind_of<'a>(nogc: &'a NoGc<'a>, v: Value) -> Option<FunctionKind> {
-    let obj = v.as_heap_object(nogc)?;
-    let info = obj.as_ref().callable_info(nogc)?;
+pub fn function_kind_of<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> Option<FunctionKind> {
+    let obj = v.as_heap_object()?;
+    let info = obj.as_ref().callable_info(heap)?;
     Some(info.function_kind())
 }
 
@@ -141,16 +144,18 @@ pub fn function_kind_of<'a>(nogc: &'a NoGc<'a>, v: Value) -> Option<FunctionKind
 pub fn store_array_element(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    receiver: Value,
+    receiver: Tagged<'_, Value>,
     i: usize,
-    value: Value,
+    value: Tagged<'_, Value>,
 ) -> Result<(), VmError> {
     let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
+    // root up front: the grow path allocates
     let receiver = scope.cast::<Object>(receiver).ok_or(VmError::Type)?;
+    let value = scope.handle(value);
 
-    let grows = heap.no_gc(|nogc| {
-        let obj = receiver.heap_ref(nogc);
-        if !obj.as_ref().is_array(nogc) {
+    let grows = heap.no_gc(|heap| {
+        let obj = receiver.heap_ref(heap);
+        if !obj.as_ref().is_array(heap) {
             return Err(VmError::Type);
         }
         // grow only when the store index is past the physical backing
@@ -158,42 +163,44 @@ pub fn store_array_element(
         // with headroom must not reallocate every time
         let capacity = obj
             .as_ref()
-            .elements_array(nogc)
+            .elements_array(heap)
             .map(|e| e.len())
             .unwrap_or(0);
         Ok(i >= capacity)
     })?;
 
     if grows {
-        let mut values = heap.no_gc(|nogc| {
-            let obj = receiver.heap_ref(nogc);
-            let elements = obj.as_ref().elements_array(nogc).ok_or(VmError::Type)?;
+        let mut values = Vec::new();
+        heap.no_gc(|heap| {
+            let obj = receiver.heap_ref(heap);
+            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
             let keep = obj.as_ref().length().min(elements.len());
             let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
-            let mut values = Vec::with_capacity(capacity);
+            values = Vec::with_capacity(capacity);
             for k in 0..keep {
-                values.push(elements.at(k));
+                values.push(elements.at(heap, k).erase());
             }
-            values.resize(capacity, nogc.known().the_hole.value());
-            Ok::<_, VmError>(values)
+            // Safety: fresh root-slot read under the anchor.
+            values.resize(capacity, unsafe { heap.known().the_hole.read_unchecked() });
+            Ok::<_, VmError>(())
         })?;
-        values[i] = value;
-        let elements = heap.allocate_handle::<FixedArray>(scope.stage(&values), scope);
-        heap.no_gc(|nogc| {
-            let obj = receiver.heap_ref(nogc);
+        values[i] = value.as_tagged(&*heap).erase();
+        let elements = heap.allocate_handle::<FixedArray>(scope.stage_words(&values), scope);
+        heap.no_gc(|heap| {
+            let obj = receiver.heap_ref(heap);
             obj.elements
-                .set(nogc, obj.erase(), elements.as_tagged().erase());
-            obj.length.set(nogc, obj.erase(), Smi::new(new_len as i64));
+                .set(heap, obj.erase(), elements.as_tagged(heap).erase_type());
+            obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
         });
     } else {
-        heap.no_gc(|nogc| {
-            let obj = receiver.heap_ref(nogc);
-            let elements = obj.as_ref().elements_array(nogc).ok_or(VmError::Type)?;
-            elements.set(nogc, i, value);
+        heap.no_gc(|heap| {
+            let obj = receiver.heap_ref(heap);
+            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+            elements.set(heap, i, value.as_tagged(heap));
             // a store inside the physical capacity but past the logical
             // length still extends the array
             if i >= obj.as_ref().length() {
-                obj.length.set(nogc, obj.erase(), Smi::new(new_len as i64));
+                obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
             }
             Ok::<_, VmError>(())
         })?;
@@ -234,12 +241,13 @@ impl HeapObject for Object {
         Self::layout_for()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
-        self.header.map.set(nogc, host, config.map.as_tagged());
-        self.slots.set(nogc, host, config.slots.as_tagged());
-        self.elements.set(nogc, host, config.elements.erase());
-        self.length.set(nogc, host, Smi::new(config.length as i64));
+        self.header.map.set(heap, host, config.map.as_tagged(heap));
+        self.slots.set(heap, host, config.slots.as_tagged(heap));
+        self.elements
+            .set(heap, host, config.elements.as_tagged(heap));
+        self.length.set(heap, host, Smi::new(config.length as i64));
     }
 
     fn header(&self) -> &Header {

@@ -1,15 +1,13 @@
-use crate::{
-    GcSlice,
-    Heap,
-    Object,
-    PropertyDescriptor,
-    Value,
-    VmError,
-};
+use crate::{GcSlice, Heap, Object, PropertyDescriptor, Value, VmError};
 
 use crate::{ContextState, VM};
 
-/// Materialize a VM error as an ECMAScript error object
+/// Materialize a VM error as an ECMAScript error object.
+///
+/// Returns a raw word that is fresh at the return point (the last
+/// statement is a read under a shared reborrow, no allocation after):
+/// callers store it into rooted memory (the pending-exception register)
+/// immediately.
 #[cold]
 #[inline(never)]
 pub fn error_from_vm_error(
@@ -29,25 +27,24 @@ pub fn error_from_vm_error(
             "RangeError" => heap.known().range_error_map,
             _ => heap.known().error_map,
         };
-        let obj = heap.new_object(&scope, map, GcSlice::EMPTY).into_handle(&scope);
+        let obj = heap
+            .new_object(&scope, map, GcSlice::EMPTY)
+            .into_handle(&scope);
         let name = heap.known().strings.name;
         let message = heap.known().strings.message;
-        let name_value = scope.handle(name_value.value());
-        let message_value = scope.handle(message_value.value());
-        Object::define_own_property(
-            heap,
-            &scope,
-            obj,
-            name,
-            PropertyDescriptor::data(name_value.value()),
-        )?;
+        // root fresh copies before the (allocating) defines below
+        let name_value = scope.handle(name_value.as_tagged(&*heap));
+        let message_value = scope.handle(message_value.as_tagged(&*heap));
+        let name_word = name_value.as_tagged(&*heap).erase();
+        Object::define_own_property(heap, &scope, obj, name, PropertyDescriptor::data(name_word))?;
+        let message_word = message_value.as_tagged(&*heap).erase();
         Object::define_own_property(
             heap,
             &scope,
             obj,
             message,
-            PropertyDescriptor::data(message_value.value()),
+            PropertyDescriptor::data(message_word),
         )?;
-        Ok(obj.value())
+        Ok(obj.as_tagged(&*heap).erase())
     })
 }

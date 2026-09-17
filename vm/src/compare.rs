@@ -1,20 +1,20 @@
-use crate::{Convert, DenseString, Float, NoGc, Smi, Value, VmError};
+use crate::{Convert, DenseString, Float, Heap, Smi, Tagged, Value, VmError};
 
 pub struct Compare;
 
 impl Compare {
-    pub fn strict_equal<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> bool {
-        let x_num = x.is_smi() || x.get_as::<Float>(nogc).is_some();
-        let y_num = y.is_smi() || y.get_as::<Float>(nogc).is_some();
+    pub fn strict_equal<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {
+        let x_num = x.is_smi() || x.get_as::<Float>().is_some();
+        let y_num = y.is_smi() || y.get_as::<Float>().is_some();
         if x_num || y_num {
             // both must be numbers (Float === "1" is false, no parsing);
             // NaN is unequal to everything (even itself), -0 equals +0
             if !x_num || !y_num {
                 return false;
             }
-            let number_value = |v: Value| match v.get_as::<Float>(nogc) {
+            let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>() {
                 Some(f) => f.value.get(),
-                None => v.to_i64().unwrap() as f64,
+                None => v.erase().to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);
@@ -24,47 +24,67 @@ impl Compare {
             return a == b;
         }
         // identical bits: same interned string, same heap object
-        if x == y {
+        if x.erase() == y.erase() {
             return true;
         }
-        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(nogc), y.get_as::<DenseString>(nogc))
-        {
-            return sx.as_ref().content_eq(nogc, sy.as_ref());
+        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(), y.get_as::<DenseString>()) {
+            return sx.as_ref().content_eq(heap, sy.as_ref());
         }
         false
     }
 
     /// ES IsLooselyEqual (==) for primitives.
-    pub fn equal<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
-        let known = nogc.known();
-        if Self::strict_equal(nogc, x, y) {
+    pub fn equal<'a>(
+        heap: &'a Heap,
+        x: Tagged<'a, Value>,
+        y: Tagged<'a, Value>,
+    ) -> Result<bool, VmError> {
+        let known = heap.known();
+        if Self::strict_equal(heap, x, y) {
             return Ok(true);
         }
-        let nullish = |v: Value| v == known.null.value() || v == known.undefined.value();
+        let nullish = |v: Tagged<'_, Value>| {
+            v.erase() == known.null.as_tagged(heap).erase()
+                || v.erase() == known.undefined.as_tagged(heap).erase()
+        };
         if nullish(x) && nullish(y) {
             return Ok(true);
         }
-        let is_bool = |v: Value| v == known.true_object.value() || v == known.false_object.value();
-        let is_string = |v: Value| v.get_as::<DenseString>(nogc).is_some();
-        let is_number = |v: Value| v.is_smi() || v.get_as::<Float>(nogc).is_some();
+        let is_bool = |v: Tagged<'_, Value>| {
+            v.erase() == known.true_object.as_tagged(heap).erase()
+                || v.erase() == known.false_object.as_tagged(heap).erase()
+        };
+        let is_string = |v: Tagged<'_, Value>| v.get_as::<DenseString>().is_some();
+        let is_number = |v: Tagged<'_, Value>| v.is_smi() || v.get_as::<Float>().is_some();
         // number ↔ string: the string parses as a number
         if is_number(x) && is_string(y) {
-            return Ok(Convert::to_number(nogc, x)? == Convert::to_number(nogc, y)?);
+            return Ok(Convert::to_number(heap, x)? == Convert::to_number(heap, y)?);
         }
         if is_string(x) && is_number(y) {
-            return Ok(Convert::to_number(nogc, x)? == Convert::to_number(nogc, y)?);
+            return Ok(Convert::to_number(heap, x)? == Convert::to_number(heap, y)?);
         }
         // booleans become numbers (exactly representable as smis, no allocation)
         if is_bool(x) {
-            let n = Smi::new(if x == known.true_object.value() { 1 } else { 0 }).encode();
-            return Self::equal(nogc, n, y);
+            let n = Smi::new(if x.erase() == known.true_object.as_tagged(heap).erase() {
+                1
+            } else {
+                0
+            })
+            .into_tagged();
+            return Self::equal(heap, n, y);
         }
         if is_bool(y) {
-            let n = Smi::new(if y == known.true_object.value() { 1 } else { 0 }).encode();
-            return Self::equal(nogc, x, n);
+            let n = Smi::new(if y.erase() == known.true_object.as_tagged(heap).erase() {
+                1
+            } else {
+                0
+            })
+            .into_tagged();
+            return Self::equal(heap, x, n);
         }
-        let is_object =
-            |v: Value| !v.is_smi() && !is_bool(v) && !nullish(v) && !is_string(v) && !is_number(v);
+        let is_object = |v: Tagged<'_, Value>| {
+            !v.is_smi() && !is_bool(v) && !nullish(v) && !is_string(v) && !is_number(v)
+        };
         if is_object(x) || is_object(y) {
             return Err(VmError::Type);
         }
@@ -74,16 +94,16 @@ impl Compare {
     /// ES SameValue (7.2.11): NaN equals NaN, +0 and -0 are distinct, and
     /// strings compare by content (identity for everything else).
     /// Unlike `strict_equal` (===); used by [[DefineOwnProperty]] validation.
-    pub fn same_value<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> bool {
-        if x == y {
+    pub fn same_value<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {
+        if x.erase() == y.erase() {
             return true;
         }
-        let x_num = x.is_smi() || x.get_as::<Float>(nogc).is_some();
-        let y_num = y.is_smi() || y.get_as::<Float>(nogc).is_some();
+        let x_num = x.is_smi() || x.get_as::<Float>().is_some();
+        let y_num = y.is_smi() || y.get_as::<Float>().is_some();
         if x_num && y_num {
-            let number_value = |v: Value| match v.get_as::<Float>(nogc) {
+            let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>() {
                 Some(f) => f.value.get(),
-                None => v.to_i64().unwrap() as f64,
+                None => v.erase().to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);
@@ -96,58 +116,73 @@ impl Compare {
             // equal values: +/-0 are distinct
             return !(a == 0.0 && a.is_sign_negative() != b.is_sign_negative());
         }
-        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(nogc), y.get_as::<DenseString>(nogc))
-        {
-            return sx.as_ref().content_eq(nogc, sy.as_ref());
+        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(), y.get_as::<DenseString>()) {
+            return sx.as_ref().content_eq(heap, sy.as_ref());
         }
         false
     }
 
     /// Relational comparison for two string values: UTF-16 code-unit
     /// order (ES 7.2.13 IsLessThan), encoding-agnostic.
-    fn string_cmp<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Option<core::cmp::Ordering> {
-        let sx = x.get_as::<DenseString>(nogc)?.as_ref();
-        let sy = y.get_as::<DenseString>(nogc)?.as_ref();
-        Some(sx.data(nogc).cmp(&sy.data(nogc)))
+    fn string_cmp<'a>(
+        heap: &'a Heap,
+        x: Tagged<'a, Value>,
+        y: Tagged<'a, Value>,
+    ) -> Option<core::cmp::Ordering> {
+        let sx = x.get_as::<DenseString>()?.as_ref();
+        let sy = y.get_as::<DenseString>()?.as_ref();
+        Some(sx.data(heap).cmp(&sy.data(heap)))
     }
 
-    pub fn less_than<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
-        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+    pub fn less_than<'a>(
+        heap: &'a Heap,
+        x: Tagged<'a, Value>,
+        y: Tagged<'a, Value>,
+    ) -> Result<bool, VmError> {
+        if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord == core::cmp::Ordering::Less);
         }
-        let a = Convert::to_number(nogc, x)?;
-        let b = Convert::to_number(nogc, y)?;
+        let a = Convert::to_number(heap, x)?;
+        let b = Convert::to_number(heap, y)?;
         Ok(a < b)
     }
 
-    pub fn less_than_or_equal<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
-        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+    pub fn less_than_or_equal<'a>(
+        heap: &'a Heap,
+        x: Tagged<'a, Value>,
+        y: Tagged<'a, Value>,
+    ) -> Result<bool, VmError> {
+        if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord != core::cmp::Ordering::Greater);
         }
-        let a = Convert::to_number(nogc, x)?;
-        let b = Convert::to_number(nogc, y)?;
+        let a = Convert::to_number(heap, x)?;
+        let b = Convert::to_number(heap, y)?;
         Ok(a <= b)
     }
 
-    pub fn greater_than<'a>(nogc: &'a NoGc<'a>, x: Value, y: Value) -> Result<bool, VmError> {
-        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+    pub fn greater_than<'a>(
+        heap: &'a Heap,
+        x: Tagged<'a, Value>,
+        y: Tagged<'a, Value>,
+    ) -> Result<bool, VmError> {
+        if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord == core::cmp::Ordering::Greater);
         }
-        let a = Convert::to_number(nogc, x)?;
-        let b = Convert::to_number(nogc, y)?;
+        let a = Convert::to_number(heap, x)?;
+        let b = Convert::to_number(heap, y)?;
         Ok(a > b)
     }
 
     pub fn greater_than_or_equal<'a>(
-        nogc: &'a NoGc<'a>,
-        x: Value,
-        y: Value,
+        heap: &'a Heap,
+        x: Tagged<'a, Value>,
+        y: Tagged<'a, Value>,
     ) -> Result<bool, VmError> {
-        if let Some(ord) = Self::string_cmp(nogc, x, y) {
+        if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord != core::cmp::Ordering::Less);
         }
-        let a = Convert::to_number(nogc, x)?;
-        let b = Convert::to_number(nogc, y)?;
+        let a = Convert::to_number(heap, x)?;
+        let b = Convert::to_number(heap, y)?;
         Ok(a >= b)
     }
 }

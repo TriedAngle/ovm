@@ -17,18 +17,21 @@ fn run_smi(src: &str) -> i64 {
     Smi::decode(run(src).unwrap()).unwrap().value()
 }
 
+#[allow(dead_code)]
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
-    let known = thread.heap().known();
-    if result == known.true_object.value() {
+    let heap = thread.heap();
+    let known = heap.known();
+    if result == known.true_object.as_tagged(heap).erase() {
         true
-    } else if result == known.false_object.value() {
+    } else if result == known.false_object.as_tagged(heap).erase() {
         false
     } else {
         panic!("expected boolean result, got {result:?}");
     }
 }
 
+#[allow(dead_code)]
 fn run_value(src: &str) -> (vm::Value, vm::Thread) {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
@@ -42,28 +45,31 @@ fn assert_type_error(src: &str) {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script(src).expect("script must complete");
-    assert_eq!(
-        result,
-        thread.heap().known().exception.value(),
-        "expected an uncaught exception"
-    );
+    {
+        let heap = thread.heap();
+        assert_eq!(
+            result,
+            heap.known().exception.as_tagged(heap).erase(),
+            "expected an uncaught exception"
+        );
+    }
     let ex = thread
         .take_pending_exception()
         .expect("pending exception set");
     thread.handle_scope(|thread, scope| {
-        let name_key = thread.intern(&scope, "name").value();
-        let name = thread.heap().no_gc(|nogc| {
-            let Some(obj) = ex.as_heap_object(nogc) else {
+        let name_handle = thread.intern(&scope, "name");
+        let name = thread.heap().no_gc(|heap| {
+            let Some(obj) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("exception is not an object");
             };
             match obj
                 .as_ref()
-                .lookup(nogc, vm::SlotName::from_value(name_key))
+                .lookup(heap, vm::SlotName::from(name_handle.as_tagged(heap)))
             {
                 vm::Lookup::Data { slot, .. } => slot
-                    .inner()
-                    .get_as::<vm::DenseString>(nogc)
-                    .map(|s| s.to_rust_string(nogc))
+                    .get(heap)
+                    .get_as::<vm::DenseString>()
+                    .map(|s| s.to_rust_string(heap))
                     .unwrap_or_default(),
                 _ => String::new(),
             }
@@ -88,7 +94,7 @@ fn constructor_validates_target_and_handler() {
     // calling without new throws
     assert_type_error("Proxy({}, {})");
     // callable/non-callable map bits mirror the target
-    assert_eq!(run("typeof new Proxy({}, {})").is_ok(), true);
+    assert!(run("typeof new Proxy({}, {})").is_ok());
 }
 
 #[test]
@@ -98,11 +104,11 @@ fn constructor_has_no_prototype_and_metadata() {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let name = thread.run_script("Proxy.name").unwrap();
-    thread.heap().no_gc(|nogc| {
-        let s = name
-            .get_as::<vm::DenseString>(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { name.assume_valid(heap) }
+            .get_as::<vm::DenseString>()
             .expect("Proxy.name is a string");
-        assert!(s.data(nogc).matches_ascii(b"Proxy"));
+        assert!(s.data(heap).matches_ascii(b"Proxy"));
     });
 }
 

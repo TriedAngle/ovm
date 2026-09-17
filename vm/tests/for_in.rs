@@ -21,9 +21,11 @@ fn run_str(src: &str) -> String {
     let mut thread = vm.attach();
     // re-run under a live heap to read the string back
     let result = thread.run_script(src).unwrap();
-    thread.heap().no_gc(|nogc| {
-        let s = result.get_as::<DenseString>(nogc).expect("string result");
-        s.to_rust_string(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { result.assume_valid(heap) }
+            .get_as::<DenseString>()
+            .expect("string result");
+        s.to_rust_string(heap)
     })
 }
 

@@ -1,7 +1,7 @@
 use core::alloc::Layout;
 
 use crate::{
-    EdgeVisitable, FixedByteArray, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, NoGc,
+    EdgeVisitable, FixedByteArray, GcSlot, Handle, HandleScope, Header, Heap, HeapObject,
     ObjectKind, Visitor,
 };
 
@@ -30,12 +30,12 @@ impl HeapObject for Symbol {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().symbol_map.as_tagged());
-        self.backing.set(nogc, host, *config);
+            .set(heap, host, heap.known().symbol_map.as_tagged(heap));
+        self.backing.set(heap, host, config.as_tagged(heap));
     }
 
     fn header(&self) -> &Header {

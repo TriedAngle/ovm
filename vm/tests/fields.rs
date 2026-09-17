@@ -18,9 +18,11 @@ fn run_str(src: &str) -> String {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
-    thread.heap().no_gc(|nogc| {
-        let s = v.get_as::<DenseString>(nogc).expect("string result");
-        s.to_rust_string(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { v.assume_valid(heap) }
+            .get_as::<DenseString>()
+            .expect("string result");
+        s.to_rust_string(heap)
     })
 }
 
@@ -28,14 +30,18 @@ fn run_bool(src: &str) -> bool {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
-    v == thread.heap().known().true_object.value()
+    let heap = thread.heap();
+    v == heap.known().true_object.as_tagged(heap).erase()
 }
 
 fn throws(src: &str) -> bool {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     match thread.run_script(src) {
-        Ok(v) => v == thread.heap().known().exception.value(),
+        Ok(v) => {
+            let heap = thread.heap();
+            v == heap.known().exception.as_tagged(heap).erase()
+        }
         Err(_) => true,
     }
 }

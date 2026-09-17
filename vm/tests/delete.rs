@@ -18,10 +18,10 @@ fn run_smi(src: &str) -> i64 {
 
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc| {
-        if result == nogc.known().true_object.value() {
+    thread.heap().no_gc(|heap| {
+        if result == heap.known().true_object.as_tagged(heap).erase() {
             true
-        } else if result == nogc.known().false_object.value() {
+        } else if result == heap.known().false_object.as_tagged(heap).erase() {
             false
         } else {
             panic!("expected boolean result, got {result:?}");
@@ -38,9 +38,11 @@ fn run_value(src: &str) -> (Value, Thread) {
 
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc| {
-        let s = result.get_as::<DenseString>(nogc).expect("string result");
-        s.to_rust_string(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { result.assume_valid(heap) }
+            .get_as::<DenseString>()
+            .expect("string result");
+        s.to_rust_string(heap)
     })
 }
 

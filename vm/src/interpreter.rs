@@ -2,9 +2,9 @@ use bytecode::{Opcode, Operands, decode, jump_target};
 
 use crate::{
     CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, DenseString,
-    FixedArray, GcSlice, Handle, Heap, Key, LoadOutcome, Lookup, NoGc, Object, PropertyDescriptor,
-    ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value, call_target,
-    classify_key, function_kind_of, load_outcome, store_array_element,
+    FixedArray, FunctionKind, GcSlice, Handle, Heap, Key, LoadOutcome, Lookup, Object,
+    PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value,
+    call_target, classify_key, function_kind_of, load_outcome, store_array_element,
 };
 
 use crate::{
@@ -53,36 +53,62 @@ fn start(
     new_target: Option<Handle<'_, Value>>,
     base_depth: usize,
 ) -> Result<Value, VmError> {
-    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, callable.value())) {
+    // Safety: entry handle word, consumed before any allocation.
+    let callee_word = unsafe { callable.read_unchecked() };
+    if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { callee_word.assume_valid(heap) })) {
         // no raw copies: stage the args into GC-visited stack memory —
         // trap lookups may run user getters, so raw Vecs would go stale
         return state.handle_scope(|scope| {
-            let argv = args.as_slice();
-            let callee = callable.value();
+            let staged = scope.stage_words(args.words());
+            let argv: Vec<_> = staged
+                .words()
+                .iter()
+                // Safety: fresh rooted-slot words, rooted by the callee
+                // before its first allocation.
+                .map(|w| unsafe { Tagged::from_value_unchecked(*w) })
+                .collect();
             let result = match new_target {
-                None => crate::proxy::apply(vm, heap, state, callee, argv),
+                None => crate::proxy::apply(
+                    vm,
+                    heap,
+                    state,
+                    // Safety: entry word, no GC since the is_proxy check.
+                    unsafe { Tagged::from_value_unchecked(callee_word) },
+                    &argv,
+                ),
                 Some(nt) => {
-                    let real: Vec<Value> = argv.iter().skip(1).copied().collect();
-                    let nt = nt.value();
+                    let real: Vec<Value> = staged.words().iter().skip(1).copied().collect();
+                    let staged = scope.stage_words(&real);
+                    let words: Vec<_> = staged
+                        .words()
+                        .iter()
+                        // Safety: fresh rooted-slot words.
+                        .map(|w| unsafe { Tagged::from_value_unchecked(*w) })
+                        .collect();
                     crate::proxy::construct(
                         vm,
                         heap,
                         state,
-                        callee,
-                        scope.stage(&real).as_slice(),
-                        nt,
+                        // Safety: entry word, no GC since the is_proxy check.
+                        unsafe { Tagged::from_value_unchecked(callee_word) },
+                        &words,
+                        // Safety: entry handle word.
+                        unsafe { Tagged::from_value_unchecked(nt.read_unchecked()) },
                     )
                 }
             };
             match result {
-                Ok(Coercion::Threw) => Ok(heap.known().exception.value()),
+                // Safety: old-gen singleton word, returned for an
+                // immediate store/compare by the caller.
+                Ok(Coercion::Threw) => Ok(unsafe { heap.known().exception.read_unchecked() }),
                 Ok(Coercion::Value(v)) => Ok(v),
                 Err(e) => Err(e),
             }
         });
     }
-    match call_target(&heap.guard(), callable.value()) {
-        Some(CallTarget::Native(idx)) => {
+    match classify_callee(&*heap, callee_word) {
+        Callee::NotCallable => Err(VmError::Type),
+        Callee::Native(idx) => {
             let f = vm.native(NativeIndex(idx));
             let (saved_top, fargs) = state.stack.stage_args(args)?;
             let mut nctx = NativeContext::with_new_target(vm, heap, state, new_target);
@@ -90,81 +116,101 @@ fn start(
             state.stack.set_top(saved_top);
             result
         }
-        Some(CallTarget::Bytecode(target, register_count, kind)) => {
+        Callee::Bytecode(register_count, kind) => {
             if new_target.is_none() && kind.is_class_constructor() {
                 return Err(VmError::Type);
             }
             // derived constructors receive TheHole as their receiver: `this`
             // stays uninitialized until super() binds it (ES 10.2.2)
             let stack = &state.stack;
-            let context = closure_context(&heap.guard(), target);
-            let formal_min = heap.no_gc(|nogc| {
-                callable
-                    .value()
-                    .as_heap_object(nogc)
-                    .and_then(|obj| obj.as_ref().callable_info(nogc))
+            // one shared anchor covers every read feeding the frame push;
+            // the push itself never allocates, so the anchor may span it
+            let frame = {
+                let heap = &*heap;
+                let target = callable.as_tagged(heap);
+                let context = closure_context(heap, target);
+                let formal_min = target
+                    .erase_type()
+                    .as_heap_object()
+                    .and_then(|obj| obj.as_ref().callable_info(heap))
                     .map(|info| info.formal_parameter_count() + 1)
-                    .unwrap_or(1)
-            });
-            let new_target_value = new_target
-                .map(|nt| nt.value())
-                .unwrap_or_else(|| heap.known().undefined.value());
-            let frame = stack.push_initial_frame(
-                target,
-                register_count,
-                context,
-                new_target_value,
-                args,
-                formal_min,
-            )?;
+                    .unwrap_or(1);
+                let new_target_value = match &new_target {
+                    Some(nt) => nt.as_tagged(heap).erase_type(),
+                    None => heap.known().undefined.as_tagged(heap).erase_type(),
+                };
+                stack.push_initial_frame(
+                    target,
+                    register_count,
+                    context,
+                    new_target_value,
+                    args,
+                    formal_min,
+                )?
+            };
             state.cache.enter(stack, frame, heap);
             dispatch(vm, heap, state, base_depth)
         }
-        None => Err(VmError::Type),
     }
 }
 
-fn callable_name<'a>(nogc: &'a NoGc<'a>, stack: &Stack, meta: &FrameMeta, idx: usize) -> SlotName {
-    let callable = stack.callable_slot(meta).inner();
-    let Some(callable) = callable.as_heap_object(nogc) else {
+/// Callee classification for the call paths: the anchored `CallTarget`
+/// payloads erased to plain data so no anchor crosses an allocation.
+enum Callee {
+    NotCallable,
+    Native(usize),
+    Bytecode(usize, FunctionKind),
+}
+
+fn classify_callee(heap: &Heap, f: Value) -> Callee {
+    // Safety: caller-supplied word, fresh at entry.
+    match call_target(heap, unsafe { f.assume_valid(heap) }) {
+        Some(CallTarget::Native(idx)) => Callee::Native(idx),
+        Some(CallTarget::Bytecode(_, register_count, kind)) => {
+            Callee::Bytecode(register_count, kind)
+        }
+        None => Callee::NotCallable,
+    }
+}
+
+fn callable_name(heap: &Heap, stack: &Stack, meta: &FrameMeta, idx: usize) -> SlotName {
+    let callable = stack.callable_slot(meta).read(heap);
+    let Some(callable) = callable.as_heap_object() else {
         panic!("frame callable must be an object");
     };
     let info = callable
         .as_ref()
-        .callable_info(nogc)
+        .callable_info(heap)
         .expect("frame callable must have callable info");
-    info.constant_slot_name(nogc, idx)
+    info.constant_slot_name(heap, idx)
 }
 
-fn frame_context(heap: &mut Heap, stack: &Stack, meta: &FrameMeta) -> Result<Value, VmError> {
-    let _ = heap;
+fn frame_context(stack: &Stack, meta: &FrameMeta) -> Result<Value, VmError> {
+    // rooted memory: the word is current and stays valid until the next GC
     Ok(stack.context_slot(meta).inner())
 }
 
 fn set_frame_context(
-    heap: &mut Heap,
     stack: &Stack,
     meta: &FrameMeta,
-    context: Value,
+    context: Tagged<'_, Value>,
 ) -> Result<(), VmError> {
-    heap.no_gc(|nogc| {
-        context.get_as::<Context>(nogc).ok_or(VmError::Type)?;
-        stack.context_slot(meta).store(context);
-        Ok(())
-    })
+    context.get_as::<Context>().ok_or(VmError::Type)?;
+    stack.context_slot(meta).store(context);
+    Ok(())
 }
 
 /// The closure context a freshly pushed frame starts with: the callee's
 /// immutable captured context (its closure slot).
-fn closure_context<'a>(nogc: &'a NoGc<'a>, callable: Tagged<Object>) -> Value {
-    let Some(obj) = callable.erase().as_heap_object(nogc) else {
+fn closure_context<'a>(heap: &'a Heap, callable: Tagged<'a, Object>) -> Tagged<'a, Value> {
+    let Some(obj) = callable.erase_type().as_heap_object() else {
         panic!("callable must be an object");
     };
     obj.as_ref()
-        .closure_context(nogc)
+        .closure_context(heap)
         .expect("callable must have a closure context")
         .into_tagged()
-        .erase()
+        .erase_type()
 }
 
 /// Result of an inline call attempt (`call_value`).
@@ -193,40 +239,57 @@ fn call_value(
     // proxies dispatch through their `apply` trap (or the target call)
     // via a nested run — their callable state lives on a ProxyObject,
     // not in function slots
-    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, f)) {
+    if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { f.assume_valid(heap) })) {
         return state.handle_scope(|scope| {
             // staged: trap lookups may run user getters
-            let argv = args.to_vec();
-            match crate::proxy::apply(vm, heap, state, f, scope.stage(&argv).as_slice())? {
+            let staged = scope.stage_words(args);
+            let argv: Vec<_> = staged
+                .words()
+                .iter()
+                // Safety: fresh rooted-slot words.
+                .map(|w| unsafe { Tagged::from_value_unchecked(*w) })
+                .collect();
+            match crate::proxy::apply(
+                vm,
+                heap,
+                state,
+                // Safety: entry word, no GC since the is_proxy check.
+                unsafe { Tagged::from_value_unchecked(f) },
+                &argv,
+            )? {
                 Coercion::Threw => Ok(Called::Threw),
                 Coercion::Value(v) => Ok(Called::Immediate(v)),
             }
         });
     }
-    let target = call_target(&heap.guard(), f);
     // TODO: native getters/setters invoke in place instead of pushing a frame
-    let Some(CallTarget::Bytecode(target, register_count, kind)) = target else {
+    let Callee::Bytecode(register_count, kind) = classify_callee(&*heap, f) else {
         return Ok(Called::NotCallable);
     };
     if kind.is_class_constructor() {
         return Err(VmError::Type);
     }
-    let context = closure_context(&heap.guard(), target);
-    let undefined = heap.known().undefined.value();
-    let formal_min = heap.no_gc(|nogc| {
-        f.as_heap_object(nogc)
-            .and_then(|obj| obj.as_ref().callable_info(nogc))
+    let context = closure_context(&*heap, unsafe { Tagged::from_value_unchecked(f) }).erase();
+    // Safety: old-gen singleton word.
+    let undefined = unsafe { heap.known().undefined.read_unchecked() };
+    let formal_min = heap.no_gc(|heap| {
+        unsafe { f.assume_valid(heap) }
+            .as_heap_object()
+            .and_then(|obj| obj.as_ref().callable_info(heap))
             .map(|info| info.formal_parameter_count() + 1)
             .unwrap_or(1)
     });
     let callee = stack.push_frame_with_args(
         meta,
         handler_pc,
-        target,
+        // Safety: entry word, no GC since the classify reads above.
+        unsafe { Tagged::from_value_unchecked(f) },
         register_count,
-        context,
+        // Safety: closure-context word read above, no GC since.
+        unsafe { Tagged::from_value_unchecked(context) },
         args,
-        undefined,
+        // Safety: old-gen singleton word.
+        unsafe { Tagged::from_value_unchecked(undefined) },
         formal_min,
     )?;
     cache.load(stack, callee, heap);
@@ -253,16 +316,16 @@ fn exception_dispatch(
     let stack = &state.stack;
     let cache = &state.cache;
     loop {
-        let handled = heap.no_gc(|nogc| {
+        let handled = heap.no_gc(|heap| {
             let Some(obj) = stack
                 .callable_slot(&cache.frame_meta())
-                .inner()
-                .as_heap_object(nogc)
+                .read(heap)
+                .as_heap_object()
             else {
                 return None;
             };
-            let info = obj.as_ref().callable_info(nogc)?;
-            info.handlers.heap_ref(nogc)?.lookup(pc)
+            let info = obj.as_ref().callable_info(heap)?;
+            info.handlers.heap_ref(heap)?.lookup(pc)
         });
         if let Some(handler_pc) = handled {
             let ex = state
@@ -326,7 +389,7 @@ fn dispatch(
     let mut trace = 0;
     loop {
         let pc = cache.pc();
-        let (op, ops, next_pc) = decode(cache.code_ref(&heap.guard()).as_slice(), pc);
+        let (op, ops, next_pc) = decode(cache.code_ref(&*heap).as_slice(), pc);
         if std::env::var("OVM_TRACE").is_ok() {
             trace += 1;
             if trace > 200000 {
@@ -336,7 +399,7 @@ fn dispatch(
                 "pc={pc} base={} rc={} op={op:?} acc={:?}",
                 cache.frame_meta().base,
                 cache.frame_meta().register_count,
-                cache.acc(),
+                cache.acc(&*heap),
             );
         }
         cache.set_pc(next_pc);
@@ -350,16 +413,21 @@ fn dispatch(
                 state.set_pending_exception(v);
                 match exception_dispatch(heap, state, base_depth, pc) {
                     Unwind::Caught(ex) => cache.set_acc(ex),
-                    Unwind::Escaped => return Ok(heap.known().exception.value()),
+                    // Safety: old-gen singleton word.
+                    Unwind::Escaped => {
+                        return Ok(unsafe { heap.known().exception.read_unchecked() });
+                    }
                 }
             }
             Step::PendingThrow => match exception_dispatch(heap, state, base_depth, pc) {
                 Unwind::Caught(ex) => cache.set_acc(ex),
-                Unwind::Escaped => return Ok(heap.known().exception.value()),
+                // Safety: old-gen singleton word.
+                Unwind::Escaped => return Ok(unsafe { heap.known().exception.read_unchecked() }),
             },
             Step::Error(err) => match raise(vm, heap, state, base_depth, err, pc) {
                 Unwind::Caught(ex) => cache.set_acc(ex),
-                Unwind::Escaped => return Ok(heap.known().exception.value()),
+                // Safety: old-gen singleton word.
+                Unwind::Escaped => return Ok(unsafe { heap.known().exception.read_unchecked() }),
             },
         }
     }
@@ -378,21 +446,25 @@ fn apply_store_outcome(
 ) -> Result<(), VmError> {
     match outcome {
         StoreOutcome::Transition { receiver, name } => {
-            let result = state.handle_scope(|scope| {
+            // fresh word for the descriptor, read at the call
+            let value = cache.acc(&*heap).erase();
+
+            state.handle_scope(|scope| {
                 Object::add_own_property_values(
                     heap,
                     &scope,
                     receiver,
                     name,
-                    PropertyDescriptor::data(cache.acc()),
+                    PropertyDescriptor::data(value),
                 )
                 // TODO(strict-mode): a false result must throw in strict code;
                 // the current store path preserves its existing sloppy result.
                 .map(|_| ())
-            });
-            result
+            })
         }
         StoreOutcome::CallSetter { setter } => {
+            // fresh word for the argument, read at the call
+            let value = cache.acc(&*heap).erase();
             call_value(
                 vm,
                 state,
@@ -402,11 +474,28 @@ fn apply_store_outcome(
                 meta,
                 pc,
                 setter,
-                &[receiver, cache.acc()],
+                &[receiver, value],
             )?;
             Ok(())
         }
         StoreOutcome::Done => Ok(()),
+    }
+}
+
+/// A `LoadOutcome` with its anchored payloads erased to raw words, so it
+/// can leave the `no_gc` region that produced it. Each word must be
+/// consumed (stored or rooted) before the next allocation.
+enum LoadResult {
+    Value(Value),
+    Getter(Value),
+}
+
+impl LoadResult {
+    fn of(outcome: LoadOutcome<'_>) -> Self {
+        match outcome {
+            LoadOutcome::Value(v) => LoadResult::Value(v.erase()),
+            LoadOutcome::Getter(g) => LoadResult::Getter(g.erase()),
+        }
     }
 }
 
@@ -427,7 +516,7 @@ fn step(
         Opcode::Return => {
             // a nested run stops above the frame suspended on its entry
             if stack.frame_depth() == base_depth {
-                return Step::Return(cache.acc());
+                return Step::Return(cache.acc(&*heap).erase());
             }
             let caller = stack
                 .pop_frame(meta.base)
@@ -436,16 +525,15 @@ fn step(
             Step::Next
         }
         Opcode::Load => {
-            cache.set_acc(stack.reg(&meta, ops.reg(0)));
+            cache.set_acc(stack.reg(&*heap, &meta, ops.reg(0)));
             Step::Next
         }
         Opcode::Store => {
-            stack.set_reg(&meta, ops.reg(0), cache.acc());
+            stack.set_reg(&meta, ops.reg(0), cache.acc(&*heap));
             Step::Next
         }
         Opcode::Move => {
-            let v = stack.reg(&meta, ops.reg(1));
-            stack.set_reg(&meta, ops.reg(0), v);
+            stack.set_reg(&meta, ops.reg(0), stack.reg(&*heap, &meta, ops.reg(1)));
             Step::Next
         }
         Opcode::LoadSmi => {
@@ -453,7 +541,7 @@ fn step(
             Step::Next
         }
         Opcode::LoadConstant => {
-            let v = cache.constants_ref(&heap.guard()).at(ops.idx(0));
+            let v = heap.no_gc(|heap| cache.constants_ref(heap).at(heap, ops.idx(0)).erase());
             cache.set_acc(v);
             Step::Next
         }
@@ -462,19 +550,23 @@ fn step(
             Step::Next
         }
         Opcode::LdaUndefined => {
-            cache.set_acc(heap.known().undefined.value());
+            // Safety: old-gen singleton word.
+            cache.set_acc(unsafe { heap.known().undefined.read_unchecked() });
             Step::Next
         }
         Opcode::LdaNull => {
-            cache.set_acc(heap.known().null.value());
+            // Safety: old-gen singleton word.
+            cache.set_acc(unsafe { heap.known().null.read_unchecked() });
             Step::Next
         }
         Opcode::LdaTrue => {
-            cache.set_acc(heap.known().true_object.value());
+            // Safety: old-gen singleton word.
+            cache.set_acc(unsafe { heap.known().true_object.read_unchecked() });
             Step::Next
         }
         Opcode::LdaFalse => {
-            cache.set_acc(heap.known().false_object.value());
+            // Safety: old-gen singleton word.
+            cache.set_acc(unsafe { heap.known().false_object.read_unchecked() });
             Step::Next
         }
         Opcode::Add => {
@@ -482,14 +574,14 @@ fn step(
             // below may run user code, and a held raw value would go
             // stale — registers are GC-visited and always read fresh
             let other_reg = ops.reg(0);
+            let acc_word = cache.acc(&*heap).erase();
+            let other_word = stack.reg(&*heap, &meta, other_reg).erase();
             let mut result = None;
-            if let (Some(a), Some(b)) = (cache.acc().to_i64(), stack.reg(&meta, other_reg).to_i64())
+            if let (Some(a), Some(b)) = (acc_word.to_i64(), other_word.to_i64())
+                && let Some(r) = a.checked_add(b)
+                && Smi::in_range(r)
             {
-                if let Some(r) = a.checked_add(b) {
-                    if Smi::in_range(r) {
-                        result = Some(Smi::new(r).encode());
-                    }
-                }
+                result = Some(Smi::new(r).encode());
             }
             match result {
                 Some(v) => {
@@ -505,44 +597,64 @@ fn step(
                             vm,
                             heap,
                             state,
-                            cache.acc(),
+                            acc_word,
                             Hint::Default
                         ));
                         let lhs = match lhs {
                             Coercion::Threw => return Step::PendingThrow,
-                            Coercion::Value(v) => scope.handle(v),
+                            // Safety: fresh word from the coercion.
+                            Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                         };
+                        // re-read the register: the coercion above may
+                        // have run user code
+                        let other_word = stack.reg(&*heap, &meta, other_reg).erase();
                         let rhs = step_try!(Runtime::to_primitive(
                             vm,
                             heap,
                             state,
-                            stack.reg(&meta, other_reg),
+                            other_word,
                             Hint::Default
                         ));
                         let rhs = match rhs {
                             Coercion::Threw => return Step::PendingThrow,
-                            Coercion::Value(v) => scope.handle(v),
+                            // Safety: fresh word from the coercion.
+                            Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                         };
-                        let is_string = heap.no_gc(|nogc| {
+                        let is_string = heap.no_gc(|heap| {
                             (
-                                lhs.value().get_as::<DenseString>(nogc).is_some(),
-                                rhs.value().get_as::<DenseString>(nogc).is_some(),
+                                lhs.as_tagged(heap).get_as::<DenseString>().is_some(),
+                                rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
                             )
                         });
                         if is_string.0 || is_string.1 {
                             let s = step_try!((|| -> Result<Value, VmError> {
-                                let a = Convert::to_string(heap, &scope, lhs.value())?;
+                                // Safety: fresh rooted-slot word.
+                                let a = Convert::to_string(heap, &scope, unsafe {
+                                    Tagged::from_value_unchecked(lhs.read_unchecked())
+                                })?
+                                .erase();
                                 // to_string of the sibling allocates: keep
                                 // this side rooted until the concat reads it
-                                let a = scope.handle(a);
-                                let b = Convert::to_string(heap, &scope, rhs.value())?;
-                                Ok(DenseString::concat(heap, &scope, a.value(), b).value())
+                                // Safety: fresh word from to_string.
+                                let a = scope.handle(unsafe { a.assume_valid(&*heap) });
+                                // Safety: fresh rooted-slot word.
+                                let b = Convert::to_string(heap, &scope, unsafe {
+                                    Tagged::from_value_unchecked(rhs.read_unchecked())
+                                })?
+                                .erase();
+                                // Safety: fresh word from to_string.
+                                let b = scope.handle(unsafe { b.assume_valid(&*heap) });
+                                // Safety: fresh rooted-slot word, returned
+                                // for an immediate store.
+                                Ok(unsafe {
+                                    DenseString::concat(heap, &scope, a, b).read_unchecked()
+                                })
                             })());
                             cache.set_acc(s);
                         } else {
-                            let r = step_try!(heap.no_gc(|nogc| {
-                                let a = Convert::to_number(nogc, lhs.value())?;
-                                let b = Convert::to_number(nogc, rhs.value())?;
+                            let r = step_try!(heap.no_gc(|heap| {
+                                let a = Convert::to_number(heap, lhs.as_tagged(heap))?;
+                                let b = Convert::to_number(heap, rhs.as_tagged(heap))?;
                                 // IEEE `-0 + -0` yields +0; the spec demands -0
                                 let r = a + b;
                                 let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative()
@@ -553,8 +665,7 @@ fn step(
                                 };
                                 Ok::<_, VmError>(r)
                             }));
-                            let v = heap.new_number(&scope, r);
-                            cache.set_acc(v);
+                            cache.set_acc(heap.new_number(&scope, r));
                         }
                         Step::Next
                     })
@@ -562,14 +673,14 @@ fn step(
             }
         }
         Opcode::Sub => {
-            let other = stack.reg(&meta, ops.reg(0));
+            let acc_word = cache.acc(&*heap).erase();
+            let other = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             let mut result = None;
-            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
-                if let Some(r) = a.checked_sub(b) {
-                    if Smi::in_range(r) {
-                        result = Some(Smi::new(r).encode());
-                    }
-                }
+            if let (Some(a), Some(b)) = (acc_word.to_i64(), other.to_i64())
+                && let Some(r) = a.checked_sub(b)
+                && Smi::in_range(r)
+            {
+                result = Some(Smi::new(r).encode());
             }
             match result {
                 Some(v) => cache.set_acc(v),
@@ -578,7 +689,7 @@ fn step(
                         vm,
                         heap,
                         state,
-                        cache.acc(),
+                        acc_word,
                         other,
                         |a, b| a - b
                     ));
@@ -591,14 +702,14 @@ fn step(
             Step::Next
         }
         Opcode::Mul => {
-            let other = stack.reg(&meta, ops.reg(0));
+            let acc_word = cache.acc(&*heap).erase();
+            let other = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             let mut result = None;
-            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
-                if let Some(r) = a.checked_mul(b) {
-                    if Smi::in_range(r) {
-                        result = Some(Smi::new(r).encode());
-                    }
-                }
+            if let (Some(a), Some(b)) = (acc_word.to_i64(), other.to_i64())
+                && let Some(r) = a.checked_mul(b)
+                && Smi::in_range(r)
+            {
+                result = Some(Smi::new(r).encode());
             }
             match result {
                 Some(v) => cache.set_acc(v),
@@ -607,7 +718,7 @@ fn step(
                         vm,
                         heap,
                         state,
-                        cache.acc(),
+                        acc_word,
                         other,
                         |a, b| a * b
                     ));
@@ -622,14 +733,15 @@ fn step(
         Opcode::Div => {
             // JS division is IEEE double division: 7/2 = 3.5, x/0 = ±Infinity
             // or NaN, MIN/-1 overflows to a double.
-            let other = stack.reg(&meta, ops.reg(0));
+            let acc_word = cache.acc(&*heap).erase();
+            let other = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             let mut result = None;
-            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
-                if b != 0 && a % b == 0 {
-                    if let Some(r) = a.checked_div(b) {
-                        result = Some(Smi::new(r).encode());
-                    }
-                }
+            if let (Some(a), Some(b)) = (acc_word.to_i64(), other.to_i64())
+                && b != 0
+                && a % b == 0
+                && let Some(r) = a.checked_div(b)
+            {
+                result = Some(Smi::new(r).encode());
             }
             match result {
                 Some(v) => cache.set_acc(v),
@@ -638,7 +750,7 @@ fn step(
                         vm,
                         heap,
                         state,
-                        cache.acc(),
+                        acc_word,
                         other,
                         |a, b| a / b
                     ));
@@ -652,12 +764,13 @@ fn step(
         }
         Opcode::Mod => {
             // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.
-            let other = stack.reg(&meta, ops.reg(0));
+            let acc_word = cache.acc(&*heap).erase();
+            let other = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             let mut result = None;
-            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
-                if b != 0 {
-                    result = Some(Smi::new(a % b).encode());
-                }
+            if let (Some(a), Some(b)) = (acc_word.to_i64(), other.to_i64())
+                && b != 0
+            {
+                result = Some(Smi::new(a % b).encode());
             }
             match result {
                 Some(v) => cache.set_acc(v),
@@ -666,7 +779,7 @@ fn step(
                         vm,
                         heap,
                         state,
-                        cache.acc(),
+                        acc_word,
                         other,
                         |a, b| a % b
                     ));
@@ -681,12 +794,13 @@ fn step(
         Opcode::Exp => {
             // JS exponentiation is always IEEE double math; the result only
             // needs a Smi tag when it is an in-range integer.
-            let other = stack.reg(&meta, ops.reg(0));
+            let acc_word = cache.acc(&*heap).erase();
+            let other = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             let v = step_try!(Runtime::numeric_op(
                 vm,
                 heap,
                 state,
-                cache.acc(),
+                acc_word,
                 other,
                 |a, b| a.powf(b)
             ));
@@ -698,43 +812,73 @@ fn step(
         }
         Opcode::BitwiseOr => {
             // ToInt32 semantics on the (integer) smi inputs
-            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as i32;
+            let a = step_try!(cache.acc(&*heap).erase().to_i64().ok_or(VmError::Type)) as i32;
+            let b = step_try!(
+                stack
+                    .reg(&*heap, &meta, ops.reg(0))
+                    .erase()
+                    .to_i64()
+                    .ok_or(VmError::Type)
+            ) as i32;
             cache.set_acc(Smi::new((a | b) as i64).encode());
             Step::Next
         }
         Opcode::BitwiseXor => {
-            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as i32;
+            let a = step_try!(cache.acc(&*heap).erase().to_i64().ok_or(VmError::Type)) as i32;
+            let b = step_try!(
+                stack
+                    .reg(&*heap, &meta, ops.reg(0))
+                    .erase()
+                    .to_i64()
+                    .ok_or(VmError::Type)
+            ) as i32;
             cache.set_acc(Smi::new((a ^ b) as i64).encode());
             Step::Next
         }
         Opcode::BitwiseAnd => {
-            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as i32;
+            let a = step_try!(cache.acc(&*heap).erase().to_i64().ok_or(VmError::Type)) as i32;
+            let b = step_try!(
+                stack
+                    .reg(&*heap, &meta, ops.reg(0))
+                    .erase()
+                    .to_i64()
+                    .ok_or(VmError::Type)
+            ) as i32;
             cache.set_acc(Smi::new((a & b) as i64).encode());
             Step::Next
         }
         Opcode::ShiftLeft => {
             // ToInt32(lhs) << (ToUint32(rhs) & 31), truncated to int32
-            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
-            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
-                .value() as u32;
-            cache.set_acc(Smi::new((a.wrapping_shl(b & 31) as i32) as i64).encode());
+            let a = step_try!(Smi::decode(cache.acc(&*heap).erase()).ok_or(VmError::Type)).value()
+                as i32;
+            let b = step_try!(
+                Smi::decode(stack.reg(&*heap, &meta, ops.reg(0)).erase()).ok_or(VmError::Type)
+            )
+            .value() as u32;
+            cache.set_acc(Smi::new(a.wrapping_shl(b & 31) as i64).encode());
             Step::Next
         }
         Opcode::ShiftRight => {
             // ToInt32(lhs) >> (ToUint32(rhs) & 31), sign-extending
-            let a = step_try!(Smi::decode(cache.acc()).ok_or(VmError::Type)).value() as i32;
-            let b = step_try!(Smi::decode(stack.reg(&meta, ops.reg(0))).ok_or(VmError::Type))
-                .value() as u32;
-            cache.set_acc(Smi::new((a.wrapping_shr(b & 31) as i32) as i64).encode());
+            let a = step_try!(Smi::decode(cache.acc(&*heap).erase()).ok_or(VmError::Type)).value()
+                as i32;
+            let b = step_try!(
+                Smi::decode(stack.reg(&*heap, &meta, ops.reg(0)).erase()).ok_or(VmError::Type)
+            )
+            .value() as u32;
+            cache.set_acc(Smi::new(a.wrapping_shr(b & 31) as i64).encode());
             Step::Next
         }
         Opcode::ShiftRightLogical => {
             // ToUint32(lhs) >>> (ToUint32(rhs) & 31): always non-negative
-            let a = step_try!(cache.acc().to_i64().ok_or(VmError::Type)) as u32;
-            let b = step_try!(stack.reg(&meta, ops.reg(0)).to_i64().ok_or(VmError::Type)) as u32;
+            let a = step_try!(cache.acc(&*heap).erase().to_i64().ok_or(VmError::Type)) as u32;
+            let b = step_try!(
+                stack
+                    .reg(&*heap, &meta, ops.reg(0))
+                    .erase()
+                    .to_i64()
+                    .ok_or(VmError::Type)
+            ) as u32;
             cache.set_acc(Smi::new(a.wrapping_shr(b & 31) as i64).encode());
             Step::Next
         }
@@ -748,42 +892,45 @@ fn step(
             Step::Next
         }
         Opcode::JumpIfTruthy => {
-            if Convert::is_truthy(&heap.guard(), cache.acc()) {
+            if Convert::is_truthy(&*heap, cache.acc(&*heap)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
         }
         Opcode::JumpIfFalsy => {
-            if !Convert::is_truthy(&heap.guard(), cache.acc()) {
+            if !Convert::is_truthy(&*heap, cache.acc(&*heap)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
         }
         Opcode::TestReferenceEqual => {
-            let other = stack.reg(&meta, ops.reg(0));
+            let other = stack.reg(&*heap, &meta, ops.reg(0));
             let known = heap.known();
-            cache.set_acc(if other == cache.acc() {
-                known.true_object.value()
+            cache.set_acc(if other.erase() == cache.acc(&*heap).erase() {
+                // Safety: old-gen singleton word.
+                unsafe { known.true_object.read_unchecked() }
             } else {
-                known.false_object.value()
+                // Safety: old-gen singleton word.
+                unsafe { known.false_object.read_unchecked() }
             });
             Step::Next
         }
         Opcode::TestTypeof => {
-            cache.set_acc(Runtime::type_of(heap, cache.acc()));
+            cache.set_acc(Runtime::type_of(&*heap, cache.acc(&*heap)));
             Step::Next
         }
         Opcode::Negate => {
-            if let Some(v) = cache.acc().to_i64() {
+            let acc_word = cache.acc(&*heap).erase();
+            if let Some(v) = acc_word.to_i64() {
                 cache.set_acc(if v == 0 {
-                    state.handle_scope(|scope| heap.new_number(&scope, -0.0))
+                    state.handle_scope(|scope| heap.new_number(&scope, -0.0).erase())
                 } else if v == Smi::MIN {
-                    state.handle_scope(|scope| heap.new_number(&scope, -(v as f64)))
+                    state.handle_scope(|scope| heap.new_number(&scope, -(v as f64)).erase())
                 } else {
                     Smi::new(-v).encode()
                 });
             } else {
-                let n = step_try!(Runtime::to_numeric(vm, heap, state, cache.acc()));
+                let n = step_try!(Runtime::to_numeric(vm, heap, state, acc_word));
                 let Some(n) = n else {
                     return Step::PendingThrow;
                 };
@@ -791,21 +938,22 @@ fn step(
                     let r = -n;
                     // preserve -0.0: `-0` must not fold into Smi 0
                     if r == 0.0 && r.is_sign_negative() {
-                        heap.new_number(&scope, -0.0)
+                        heap.new_number(&scope, -0.0).erase()
                     } else {
-                        heap.new_number(&scope, r)
+                        heap.new_number(&scope, r).erase()
                     }
                 }));
             }
             Step::Next
         }
         Opcode::InstanceOf => {
-            let other = stack.reg(&meta, ops.reg(0));
-            let r = step_try!(Runtime::instance_of(vm, heap, state, cache.acc(), other));
+            let acc_word = cache.acc(&*heap).erase();
+            let other = stack.reg(&*heap, &meta, ops.reg(0)).erase();
+            let r = step_try!(Runtime::instance_of(vm, heap, state, acc_word, other));
             let Some(r) = r else {
                 return Step::PendingThrow;
             };
-            cache.set_acc(Convert::boolean(heap, r));
+            cache.set_acc(Convert::boolean(&*heap, r));
             Step::Next
         }
         Opcode::Construct => {
@@ -815,14 +963,14 @@ fn step(
             // the callee runs with the receiver as `this`, and an object
             // result wins over the receiver. Derived class constructors get
             // TheHole instead: `this` is bound by their super() call.
-            let (constructible, derived) = heap.no_gc(|nogc| {
-                let callee = stack.reg(&meta, ops.reg(0));
-                let Some(obj) = callee.as_heap_object(nogc) else {
+            let (constructible, derived) = heap.no_gc(|heap| {
+                let callee = stack.reg(heap, &meta, ops.reg(0));
+                let Some(obj) = callee.as_heap_object() else {
                     return (false, false);
                 };
-                let kind = obj.as_ref().header.map.heap_ref(nogc).kind();
+                let kind = obj.as_ref().header.map.heap_ref(heap).kind();
                 let derived = kind.is_class_constructor()
-                    && function_kind_of(nogc, callee)
+                    && function_kind_of(heap, callee)
                         .is_some_and(|k| k.is_derived_class_constructor());
                 (kind.is_constructor(), derived)
             });
@@ -831,22 +979,31 @@ fn step(
             }
             // a constructor proxy dispatches through its `construct`
             // trap (the target construct synthesizes its own receiver)
-            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, stack.reg(&meta, ops.reg(0)))) {
-                let callee = stack.reg(&meta, ops.reg(0));
+            if heap.no_gc(|heap| crate::proxy::is_proxy(heap, stack.reg(heap, &meta, ops.reg(0)))) {
+                // Safety: fresh register word, no GC since.
+                let callee_word = stack.reg(&*heap, &meta, ops.reg(0)).erase();
                 let count = ops.reg_count(2);
                 return match state.handle_scope(|scope| {
                     // staged: trap lookups may run user getters
-                    let argv = stack
-                        .args(&meta, ops.reg_list(1), count)
-                        .as_slice()
-                        .to_vec();
+                    let callee = scope.handle(unsafe { callee_word.assume_valid(&*heap) });
+                    let argv: Vec<Value> =
+                        stack.args(&meta, ops.reg_list(1), count).words().to_vec();
+                    let staged = scope.stage_words(&argv);
+                    let words: Vec<_> = staged
+                        .words()
+                        .iter()
+                        // Safety: fresh rooted-slot words.
+                        .map(|w| unsafe { Tagged::from_value_unchecked(*w) })
+                        .collect();
                     crate::proxy::construct(
                         vm,
                         heap,
                         state,
-                        callee,
-                        scope.stage(&argv).as_slice(),
-                        callee,
+                        // Safety: fresh rooted-slot word.
+                        unsafe { Tagged::from_value_unchecked(callee.read_unchecked()) },
+                        &words,
+                        // Safety: fresh rooted-slot word.
+                        unsafe { Tagged::from_value_unchecked(callee.read_unchecked()) },
                     )
                 }) {
                     Ok(Coercion::Threw) => Step::PendingThrow,
@@ -858,14 +1015,19 @@ fn step(
                 };
             }
             state.handle_scope(|scope| {
-                let Some(callee) = scope.cast::<Object>(stack.reg(&meta, ops.reg(0))) else {
+                let Some(callee) = scope.cast::<Object>(stack.reg(&*heap, &meta, ops.reg(0)))
+                else {
                     return Step::Error(VmError::Type);
                 };
                 let (receiver, allocated) = if derived {
-                    (scope.handle(heap.known().the_hole.value()), false)
+                    (
+                        scope.handle(heap.known().the_hole.as_tagged(&*heap).erase_type()),
+                        false,
+                    )
                 } else {
                     match Runtime::create_construct_receiver(vm, heap, state, callee) {
-                        Ok(Some(r)) => (scope.handle(r), true),
+                        // Safety: fresh word from the receiver synthesis.
+                        Ok(Some(r)) => (scope.handle(unsafe { r.assume_valid(&*heap) }), true),
                         Ok(None) => return Step::PendingThrow,
                         Err(err) => return Step::Error(err),
                     }
@@ -874,37 +1036,44 @@ fn step(
                 // synthesized and prepended
                 let count = ops.reg_count(2);
                 let mut args = Vec::with_capacity(count + 1);
-                args.push(receiver.value());
-                args.extend_from_slice(stack.args(&meta, ops.reg_list(1), count).as_slice());
+                // Safety: fresh rooted-slot word.
+                args.push(unsafe { receiver.read_unchecked() });
+                args.extend_from_slice(stack.args(&meta, ops.reg_list(1), count).words());
+                let staged = scope.stage_words(&args);
+                // Safety: fresh rooted-slot words, consumed by the call.
+                let callee_word = unsafe { callee.read_unchecked() };
                 let result = match NativeContext::new(vm, heap, state).call_construct(
-                    callee.value(),
-                    callee.value(),
-                    scope.stage(&args),
+                    unsafe { Tagged::from_value_unchecked(callee_word) },
+                    unsafe { Tagged::from_value_unchecked(callee_word) },
+                    staged,
                 ) {
                     Ok(r) => r,
                     Err(err) => return Step::Error(err),
                 };
-                if result == heap.known().exception.value() {
+                if result == unsafe { heap.known().exception.read_unchecked() } {
                     return Step::PendingThrow;
                 }
-                cache.set_acc(if Convert::is_primitive(&heap.guard(), result) {
-                    if allocated {
-                        receiver.value()
+                cache.set_acc(
+                    if Convert::is_primitive(&*heap, unsafe { result.assume_valid(&*heap) }) {
+                        if allocated {
+                            // Safety: fresh rooted-slot word.
+                            unsafe { receiver.read_unchecked() }
+                        } else {
+                            // a derived constructor returned a primitive: only
+                            // reachable via `return <primitive>` (ES 9.2.2.1)
+                            return Step::Error(VmError::Type);
+                        }
                     } else {
-                        // a derived constructor returned a primitive: only
-                        // reachable via `return <primitive>` (ES 9.2.2.1)
-                        return Step::Error(VmError::Type);
-                    }
-                } else {
-                    result
-                });
+                        result
+                    },
+                );
                 Step::Next
             })
         }
         Opcode::EqualStrict => {
-            let other = stack.reg(&meta, ops.reg(0));
-            let r = Compare::strict_equal(&heap.guard(), cache.acc(), other);
-            cache.set_acc(Convert::boolean(heap, r));
+            let other = stack.reg(&*heap, &meta, ops.reg(0));
+            let r = Compare::strict_equal(&*heap, cache.acc(&*heap), other);
+            cache.set_acc(Convert::boolean(&*heap, r));
             Step::Next
         }
         Opcode::Equal => {
@@ -914,30 +1083,38 @@ fn step(
             // re-read from its register instead of a raw copy
             state.handle_scope(|scope| {
                 let other_reg = ops.reg(0);
+                let acc_word = cache.acc(&*heap).erase();
                 let x = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    cache.acc(),
+                    acc_word,
                     Hint::Default
                 ));
                 let x = match x {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
+                let other_word = stack.reg(&*heap, &meta, other_reg).erase();
                 let y = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    stack.reg(&meta, other_reg),
+                    other_word,
                     Hint::Default
                 ));
                 let y = match y {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
-                let r = step_try!(Compare::equal(&heap.guard(), x.value(), y.value()));
-                cache.set_acc(Convert::boolean(heap, r));
+                let r = step_try!(Compare::equal(
+                    &*heap,
+                    x.as_tagged(&*heap),
+                    y.as_tagged(&*heap)
+                ));
+                cache.set_acc(Convert::boolean(&*heap, r));
                 Step::Next
             })
         }
@@ -948,30 +1125,38 @@ fn step(
             // from its register instead of a raw copy
             state.handle_scope(|scope| {
                 let other_reg = ops.reg(0);
+                let acc_word = cache.acc(&*heap).erase();
                 let x = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    cache.acc(),
+                    acc_word,
                     Hint::Number
                 ));
                 let x = match x {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
+                let other_word = stack.reg(&*heap, &meta, other_reg).erase();
                 let y = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    stack.reg(&meta, other_reg),
+                    other_word,
                     Hint::Number
                 ));
                 let y = match y {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
-                let r = step_try!(Compare::less_than(&heap.guard(), x.value(), y.value()));
-                cache.set_acc(Convert::boolean(heap, r));
+                let r = step_try!(Compare::less_than(
+                    &*heap,
+                    x.as_tagged(&*heap),
+                    y.as_tagged(&*heap)
+                ));
+                cache.set_acc(Convert::boolean(&*heap, r));
                 Step::Next
             })
         }
@@ -982,30 +1167,38 @@ fn step(
             // from its register instead of a raw copy
             state.handle_scope(|scope| {
                 let other_reg = ops.reg(0);
+                let acc_word = cache.acc(&*heap).erase();
                 let x = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    cache.acc(),
+                    acc_word,
                     Hint::Number
                 ));
                 let x = match x {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
+                let other_word = stack.reg(&*heap, &meta, other_reg).erase();
                 let y = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    stack.reg(&meta, other_reg),
+                    other_word,
                     Hint::Number
                 ));
                 let y = match y {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
-                let r = step_try!(Compare::less_than_or_equal(&heap.guard(), x.value(), y.value()));
-                cache.set_acc(Convert::boolean(heap, r));
+                let r = step_try!(Compare::less_than_or_equal(
+                    &*heap,
+                    x.as_tagged(&*heap),
+                    y.as_tagged(&*heap)
+                ));
+                cache.set_acc(Convert::boolean(&*heap, r));
                 Step::Next
             })
         }
@@ -1016,30 +1209,38 @@ fn step(
             // from its register instead of a raw copy
             state.handle_scope(|scope| {
                 let other_reg = ops.reg(0);
+                let acc_word = cache.acc(&*heap).erase();
                 let x = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    cache.acc(),
+                    acc_word,
                     Hint::Number
                 ));
                 let x = match x {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
+                let other_word = stack.reg(&*heap, &meta, other_reg).erase();
                 let y = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    stack.reg(&meta, other_reg),
+                    other_word,
                     Hint::Number
                 ));
                 let y = match y {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
-                let r = step_try!(Compare::greater_than(&heap.guard(), x.value(), y.value()));
-                cache.set_acc(Convert::boolean(heap, r));
+                let r = step_try!(Compare::greater_than(
+                    &*heap,
+                    x.as_tagged(&*heap),
+                    y.as_tagged(&*heap)
+                ));
+                cache.set_acc(Convert::boolean(&*heap, r));
                 Step::Next
             })
         }
@@ -1050,34 +1251,42 @@ fn step(
             // from its register instead of a raw copy
             state.handle_scope(|scope| {
                 let other_reg = ops.reg(0);
+                let acc_word = cache.acc(&*heap).erase();
                 let x = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    cache.acc(),
+                    acc_word,
                     Hint::Number
                 ));
                 let x = match x {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
+                let other_word = stack.reg(&*heap, &meta, other_reg).erase();
                 let y = step_try!(Runtime::to_primitive(
                     vm,
                     heap,
                     state,
-                    stack.reg(&meta, other_reg),
+                    other_word,
                     Hint::Number
                 ));
                 let y = match y {
                     Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
+                    // Safety: fresh word from the coercion.
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
                 };
-                let r = step_try!(Compare::greater_than_or_equal(&heap.guard(), x.value(), y.value()));
-                cache.set_acc(Convert::boolean(heap, r));
+                let r = step_try!(Compare::greater_than_or_equal(
+                    &*heap,
+                    x.as_tagged(&*heap),
+                    y.as_tagged(&*heap)
+                ));
+                cache.set_acc(Convert::boolean(&*heap, r));
                 Step::Next
             })
         }
-        Opcode::Throw | Opcode::ReThrow => Step::Throw(cache.acc()),
+        Opcode::Throw | Opcode::ReThrow => Step::Throw(cache.acc(&*heap).erase()),
         Opcode::CallRuntime => {
             // operand 0 is a RuntimeFn discriminant: the fixed
             // runtime-helper table (vm::natives::runtime_fn) registered at
@@ -1087,7 +1296,10 @@ fn step(
             let mut nctx = NativeContext::new(vm, heap, state);
             let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
             match result {
-                Ok(v) if v == heap.known().exception.value() => Step::PendingThrow,
+                // Safety: old-gen singleton word.
+                Ok(v) if v == unsafe { heap.known().exception.read_unchecked() } => {
+                    Step::PendingThrow
+                }
                 Ok(v) => {
                     cache.set_acc(v);
                     Step::Next
@@ -1100,17 +1312,33 @@ fn step(
             // TODO(strict-mode): ordinary sloppy functions still need nullish
             // receiver substitution and primitive receiver boxing.
             let count = ops.reg_count(2);
-            let callee = stack.reg(&meta, ops.reg(0));
+            // Safety: fresh register word, no GC since.
+            let callee_word = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             // a callable proxy dispatches through its `apply` trap (or
             // a nested call of the target)
-            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, callee)) {
+            if heap.no_gc(|heap| {
+                crate::proxy::is_proxy(heap, unsafe { callee_word.assume_valid(heap) })
+            }) {
                 return match state.handle_scope(|scope| {
                     // staged: trap lookups may run user getters
-                    let argv = stack
-                        .args(&meta, ops.reg_list(1), count)
-                        .as_slice()
-                        .to_vec();
-                    crate::proxy::apply(vm, heap, state, callee, scope.stage(&argv).as_slice())
+                    let argv: Vec<Value> =
+                        stack.args(&meta, ops.reg_list(1), count).words().to_vec();
+                    let staged = scope.stage_words(&argv);
+                    let words: Vec<_> = staged
+                        .words()
+                        .iter()
+                        // Safety: fresh rooted-slot words.
+                        .map(|w| unsafe { Tagged::from_value_unchecked(*w) })
+                        .collect();
+                    crate::proxy::apply(
+                        vm,
+                        heap,
+                        state,
+                        // Safety: register word read above; the callee
+                        // roots it before its first allocation.
+                        unsafe { Tagged::from_value_unchecked(callee_word) },
+                        &words,
+                    )
                 }) {
                     Ok(Coercion::Threw) => Step::PendingThrow,
                     Ok(Coercion::Value(v)) => {
@@ -1120,17 +1348,17 @@ fn step(
                     Err(err) => Step::Error(err),
                 };
             }
-            let target = call_target(&heap.guard(), callee);
-            let Some(target) = target else {
-                return Step::Error(VmError::Type);
-            };
-            match target {
-                CallTarget::Native(idx) => {
+            match classify_callee(&*heap, callee_word) {
+                Callee::NotCallable => Step::Error(VmError::Type),
+                Callee::Native(idx) => {
                     let f = vm.native(NativeIndex(idx));
                     let mut nctx = NativeContext::new(vm, heap, state);
                     let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
                     match result {
-                        Ok(v) if v == heap.known().exception.value() => Step::PendingThrow,
+                        // Safety: old-gen singleton word.
+                        Ok(v) if v == unsafe { heap.known().exception.read_unchecked() } => {
+                            Step::PendingThrow
+                        }
                         Ok(v) => {
                             cache.set_acc(v);
                             Step::Next
@@ -1138,29 +1366,38 @@ fn step(
                         Err(err) => Step::Error(err),
                     }
                 }
-                CallTarget::Bytecode(target, register_count, kind) => {
+                Callee::Bytecode(register_count, kind) => {
                     if kind.is_class_constructor() {
                         return Step::Error(VmError::Type);
                     }
-                    let context = closure_context(&heap.guard(), target);
-                    let undefined = heap.known().undefined.value();
-                    let formal_min = heap.no_gc(|nogc| {
-                        stack
-                            .reg(&meta, ops.reg(0))
-                            .as_heap_object(nogc)
-                            .and_then(|obj| obj.as_ref().callable_info(nogc))
+                    let context = closure_context(
+                        &*heap,
+                        // Safety: register word read above, no GC since.
+                        unsafe { Tagged::from_value_unchecked(callee_word) },
+                    )
+                    .erase();
+                    // Safety: old-gen singleton word.
+                    let undefined = unsafe { heap.known().undefined.read_unchecked() };
+                    let formal_min = heap.no_gc(|heap| {
+                        unsafe { callee_word.assume_valid(heap) }
+                            .as_heap_object()
+                            .and_then(|obj| obj.as_ref().callable_info(heap))
                             .map(|info| info.formal_parameter_count() + 1)
                             .unwrap_or(1)
                     });
                     let callee = step_try!(stack.push_frame(
                         meta,
                         pc,
-                        target,
+                        // Safety: register word read above, no GC since.
+                        unsafe { Tagged::from_value_unchecked(callee_word) },
                         register_count,
-                        context,
+                        // Safety: closure-context word read above, no GC
+                        // since.
+                        unsafe { Tagged::from_value_unchecked(context) },
                         ops.reg_list(1),
                         count,
-                        undefined,
+                        // Safety: old-gen singleton word.
+                        unsafe { Tagged::from_value_unchecked(undefined) },
                         formal_min,
                     ));
                     cache.load(stack, callee, heap);
@@ -1169,17 +1406,22 @@ fn step(
             }
         }
         Opcode::LoadNamedProperty => {
-            let receiver = stack.reg(&meta, ops.reg(0));
-            let name = heap.no_gc(|nogc| callable_name(nogc, stack, &meta, ops.idx(1)));
+            let name = heap.no_gc(|heap| callable_name(heap, stack, &meta, ops.idx(1)));
+            // Safety: fresh register word, no GC since.
+            let receiver_word = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             // proxies run their `get` trap outside any no-GC scope
-            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+            if heap.no_gc(|heap| {
+                crate::proxy::is_proxy(heap, unsafe { receiver_word.assume_valid(heap) })
+            }) {
                 return match step_try!(crate::proxy::get(
                     vm,
                     heap,
                     state,
-                    receiver,
-                    receiver,
-                    name.value()
+                    // Safety: fresh register word, no GC since.
+                    unsafe { Tagged::from_value_unchecked(receiver_word) },
+                    unsafe { Tagged::from_value_unchecked(receiver_word) },
+                    // Safety: name held rooted by the owning constants pool.
+                    unsafe { Tagged::from_value_unchecked(name.value()) },
                 )) {
                     Coercion::Threw => Step::PendingThrow,
                     Coercion::Value(v) => {
@@ -1188,11 +1430,14 @@ fn step(
                     }
                 };
             }
-            let outcome = step_try!(heap.no_gc(|nogc| load_outcome(nogc, receiver, name)));
+            let outcome = step_try!(heap.no_gc(|heap| {
+                load_outcome(heap, unsafe { receiver_word.assume_valid(heap) }, name)
+                    .map(LoadResult::of)
+            }));
             match outcome {
-                LoadOutcome::Value(v) => cache.set_acc(v),
-                LoadOutcome::Getter(getter) => {
-                    let receiver = stack.reg(&meta, ops.reg(0));
+                LoadResult::Value(v) => cache.set_acc(v),
+                LoadResult::Getter(getter) => {
+                    let receiver = stack.reg(&*heap, &meta, ops.reg(0)).erase();
                     match step_try!(call_value(
                         vm,
                         state,
@@ -1207,7 +1452,8 @@ fn step(
                         Called::Frame => {}
                         // non-callable getter: the load yields undefined
                         Called::NotCallable => {
-                            cache.set_acc(heap.known().undefined.value());
+                            // Safety: old-gen singleton word.
+                            cache.set_acc(unsafe { heap.known().undefined.read_unchecked() });
                         }
                         Called::Immediate(v) => cache.set_acc(v),
                         Called::Threw => return Step::PendingThrow,
@@ -1221,31 +1467,49 @@ fn step(
                 Opcode::StoreNamedPropertyNoShadow => StoreSemantics::WriteThrough,
                 _ => StoreSemantics::Shadow,
             };
-            let receiver = stack.reg(&meta, ops.reg(0));
-            let name = heap.no_gc(|nogc| callable_name(nogc, stack, &meta, ops.idx(1)));
+            let name = heap.no_gc(|heap| callable_name(heap, stack, &meta, ops.idx(1)));
+            // Safety: fresh register word, no GC since.
+            let receiver_word = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             // proxies run their `set` trap outside any no-GC scope
-            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+            if heap.no_gc(|heap| {
+                crate::proxy::is_proxy(heap, unsafe { receiver_word.assume_valid(heap) })
+            }) {
+                // fresh acc word read for the trap call
+                let value_word = cache.acc(&*heap).erase();
                 return match step_try!(crate::proxy::set(
                     vm,
                     heap,
                     state,
-                    receiver,
-                    name.value(),
-                    cache.acc(),
-                    receiver
+                    // Safety: fresh register word, no GC since.
+                    unsafe { Tagged::from_value_unchecked(receiver_word) },
+                    // Safety: name held rooted by the owning constants pool.
+                    unsafe { Tagged::from_value_unchecked(name.value()) },
+                    // Safety: fresh acc word, no GC since.
+                    unsafe { Tagged::from_value_unchecked(value_word) },
+                    unsafe { Tagged::from_value_unchecked(receiver_word) },
                 )) {
                     Coercion::Threw => Step::PendingThrow,
                     Coercion::Value(_) => Step::Next,
                 };
             }
-            let outcome = step_try!(heap.no_gc(|nogc| receiver.store_lookup(
-                nogc,
-                name,
-                cache.acc(),
-                semantics
-            )));
+            let outcome = step_try!(heap.no_gc(|heap| {
+                unsafe { receiver_word.assume_valid(heap) }.store_lookup(
+                    heap,
+                    name,
+                    cache.acc(heap),
+                    semantics,
+                )
+            }));
             step_try!(apply_store_outcome(
-                vm, heap, state, stack, cache, meta, pc, receiver, outcome,
+                vm,
+                heap,
+                state,
+                stack,
+                cache,
+                meta,
+                pc,
+                receiver_word,
+                outcome,
             ));
             Step::Next
         }
@@ -1253,29 +1517,36 @@ fn step(
             // the key coercion allocates (to_property_key interns): the
             // receiver must stay rooted across it
             state.handle_scope(|scope| {
-                let receiver = scope.handle(stack.reg(&meta, ops.reg(0)));
-                let raw_key = cache.acc();
+                let receiver = scope.handle(stack.reg(&*heap, &meta, ops.reg(0)));
+                let raw_key = cache.acc(&*heap).erase();
                 let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key))
                 else {
                     return Step::PendingThrow;
                 };
                 cache.set_acc(key);
                 // re-read through the handle: the coercion above allocated
-                let receiver = receiver.value();
+                // Safety: fresh rooted-slot word.
+                let receiver_word = unsafe { receiver.read_unchecked() };
                 // string primitives expose their code units as index
                 // properties (ES 5.4.3.1): `"ab"[1]` is "b". The one-unit
                 // string is allocated fresh — string comparison is by
                 // content, so identity is unobservable. Out-of-range and
                 // non-string receivers fall through to the ordinary path.
-                let string_index = heap.no_gc(|nogc| match classify_key(nogc, key) {
-                    Ok(Key::Element(i)) if receiver.get_as::<DenseString>(nogc).is_some() => {
-                        Some(i)
+                let string_index = heap.no_gc(|heap| {
+                    match classify_key(heap, unsafe { key.assume_valid(heap) }) {
+                        Ok(Key::Element(i))
+                            if unsafe { receiver_word.assume_valid(heap) }
+                                .get_as::<DenseString>()
+                                .is_some() =>
+                        {
+                            Some(i)
+                        }
+                        _ => None,
                     }
-                    _ => None,
                 });
                 if let Some(i) = string_index {
                     let unit = state.handle_scope(|scope| {
-                        crate::builtins::intrinsics::string_char_at(heap, &scope, receiver, i)
+                        crate::builtins::intrinsics::string_char_at(heap, &scope, receiver_word, i)
                     });
                     if let Some(unit) = unit {
                         cache.set_acc(unit);
@@ -1283,14 +1554,20 @@ fn step(
                     }
                 }
                 // proxies run their `get` trap outside any no-GC scope
-                if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                if heap.no_gc(|heap| {
+                    crate::proxy::is_proxy(heap, unsafe { receiver_word.assume_valid(heap) })
+                }) {
+                    // fresh acc word (the interned key) read for the trap call
+                    let key_word = cache.acc(&*heap).erase();
                     return match step_try!(crate::proxy::get(
                         vm,
                         heap,
                         state,
-                        receiver,
-                        receiver,
-                        cache.acc()
+                        // Safety: fresh rooted-slot word.
+                        unsafe { Tagged::from_value_unchecked(receiver_word) },
+                        unsafe { Tagged::from_value_unchecked(receiver_word) },
+                        // Safety: fresh acc word, no GC since.
+                        unsafe { Tagged::from_value_unchecked(key_word) },
                     )) {
                         Coercion::Threw => Step::PendingThrow,
                         Coercion::Value(v) => {
@@ -1299,27 +1576,33 @@ fn step(
                         }
                     };
                 }
-                let outcome = step_try!(heap.no_gc(|nogc| {
-                    match classify_key(nogc, cache.acc())? {
-                        Key::Element(i) => match receiver
-                            .as_heap_object(nogc)
-                            .and_then(|obj| obj.as_ref().element_value(nogc, i))
-                        {
-                            Some(v) => Ok(LoadOutcome::Value(v)),
-                            // past the end, a hole, or a non-array receiver:
-                            // fall back to an ordinary property lookup
-                            None => load_outcome(
-                                nogc,
-                                receiver,
-                                SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                            ),
-                        },
-                        Key::Name(name) => load_outcome(nogc, receiver, name),
+                let outcome = step_try!(heap.no_gc(|heap| {
+                    let receiver = unsafe { receiver_word.assume_valid(heap) };
+                    match classify_key(heap, cache.acc(heap))? {
+                        Key::Element(i) => {
+                            match receiver
+                                .as_heap_object()
+                                .and_then(|obj| obj.as_ref().element_value(heap, i))
+                            {
+                                Some(v) => Ok(LoadResult::Value(v.erase())),
+                                // past the end, a hole, or a non-array receiver:
+                                // fall back to an ordinary property lookup
+                                None => load_outcome(
+                                    heap,
+                                    receiver,
+                                    SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                                )
+                                .map(LoadResult::of),
+                            }
+                        }
+                        Key::Name(name) => load_outcome(heap, receiver, name).map(LoadResult::of),
                     }
                 }));
                 match outcome {
-                    LoadOutcome::Value(v) => cache.set_acc(v),
-                    LoadOutcome::Getter(getter) => {
+                    LoadResult::Value(v) => cache.set_acc(v),
+                    LoadResult::Getter(getter) => {
+                        // Safety: fresh rooted-slot word.
+                        let receiver = unsafe { receiver.read_unchecked() };
                         match step_try!(call_value(
                             vm,
                             state,
@@ -1329,11 +1612,12 @@ fn step(
                             meta,
                             pc,
                             getter,
-                            &[receiver],
+                            &[receiver]
                         )) {
                             Called::Frame => {}
                             Called::NotCallable => {
-                                cache.set_acc(heap.known().undefined.value());
+                                // Safety: old-gen singleton word.
+                                cache.set_acc(unsafe { heap.known().undefined.read_unchecked() });
                             }
                             Called::Immediate(v) => cache.set_acc(v),
                             Called::Threw => return Step::PendingThrow,
@@ -1351,8 +1635,8 @@ fn step(
                     Opcode::StoreKeyedPropertyNoShadow => StoreSemantics::WriteThrough,
                     _ => StoreSemantics::Shadow,
                 };
-                let receiver = scope.handle(stack.reg(&meta, ops.reg(0)));
-                let raw = stack.reg(&meta, ops.reg(1));
+                let receiver = scope.handle(stack.reg(&*heap, &meta, ops.reg(0)));
+                let raw = stack.reg(&*heap, &meta, ops.reg(1)).erase();
                 let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
                     return Step::PendingThrow;
                 };
@@ -1360,57 +1644,99 @@ fn step(
                 // the receiver is re-read through its handle at every
                 // use: the key coercion above allocated and may have moved
                 // it (a raw snapshot would go stale)
-                let receiver = receiver.value();
+                // Safety: fresh rooted-slot word.
+                let receiver_word = unsafe { receiver.read_unchecked() };
                 // proxies run their `set` trap outside any no-GC scope
                 // (including array-element stores)
-                if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                if heap.no_gc(|heap| {
+                    crate::proxy::is_proxy(heap, unsafe { receiver_word.assume_valid(heap) })
+                }) {
+                    // fresh acc word read for the trap call
+                    let value_word = cache.acc(&*heap).erase();
                     return match step_try!(crate::proxy::set(
                         vm,
                         heap,
                         state,
-                        receiver,
-                        key,
-                        cache.acc(),
-                        receiver
+                        // Safety: fresh rooted-slot word.
+                        unsafe { Tagged::from_value_unchecked(receiver_word) },
+                        // Safety: key fresh from the coercion, rooted by
+                        // the callee before its first allocation.
+                        unsafe { Tagged::from_value_unchecked(key) },
+                        // Safety: fresh acc word, no GC since.
+                        unsafe { Tagged::from_value_unchecked(value_word) },
+                        unsafe { Tagged::from_value_unchecked(receiver_word) },
                     )) {
                         Coercion::Threw => Step::PendingThrow,
                         Coercion::Value(_) => Step::Next,
                     };
                 }
-                let key = step_try!(classify_key(&heap.guard(), key));
+                let key = step_try!(classify_key(&*heap, unsafe { key.assume_valid(&*heap) }));
                 match key {
                     Key::Element(i) => {
-                        let is_array = heap.no_gc(|nogc| {
-                            let Some(obj) = receiver.as_heap_object(nogc) else {
+                        let is_array = heap.no_gc(|heap| {
+                            let Some(obj) =
+                                unsafe { receiver_word.assume_valid(heap) }.as_heap_object()
+                            else {
                                 return false;
                             };
-                            obj.as_ref().is_array(nogc)
+                            obj.as_ref().is_array(heap)
                         });
                         if is_array {
+                            // fresh acc word read for the store
+                            let value_word = cache.acc(&*heap).erase();
                             step_try!(state.handle_scope(|scope| {
-                                store_array_element(heap, &scope, receiver, i, cache.acc())
+                                store_array_element(
+                                    heap,
+                                    &scope,
+                                    // Safety: fresh rooted-slot word.
+                                    unsafe { Tagged::from_value_unchecked(receiver_word) },
+                                    i,
+                                    // Safety: fresh acc word, no GC since.
+                                    unsafe { Tagged::from_value_unchecked(value_word) },
+                                )
                             }));
                         } else {
                             // numeric property on a non-array receiver
-                            let outcome = step_try!(heap.no_gc(|nogc| {
-                                receiver.store_lookup(
-                                    nogc,
+                            let outcome = step_try!(heap.no_gc(|heap| {
+                                unsafe { receiver_word.assume_valid(heap) }.store_lookup(
+                                    heap,
                                     SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                                    cache.acc(),
+                                    cache.acc(heap),
                                     semantics,
                                 )
                             }));
                             step_try!(apply_store_outcome(
-                                vm, heap, state, stack, cache, meta, pc, receiver, outcome,
+                                vm,
+                                heap,
+                                state,
+                                stack,
+                                cache,
+                                meta,
+                                pc,
+                                receiver_word,
+                                outcome,
                             ));
                         }
                     }
                     Key::Name(name) => {
-                        let outcome = step_try!(heap.no_gc(|nogc| {
-                            receiver.store_lookup(nogc, name, cache.acc(), semantics)
+                        let outcome = step_try!(heap.no_gc(|heap| {
+                            unsafe { receiver_word.assume_valid(heap) }.store_lookup(
+                                heap,
+                                name,
+                                cache.acc(heap),
+                                semantics,
+                            )
                         }));
                         step_try!(apply_store_outcome(
-                            vm, heap, state, stack, cache, meta, pc, receiver, outcome,
+                            vm,
+                            heap,
+                            state,
+                            stack,
+                            cache,
+                            meta,
+                            pc,
+                            receiver_word,
+                            outcome,
                         ));
                     }
                 }
@@ -1419,16 +1745,16 @@ fn step(
         }
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
-                heap.new_object(&scope, heap.known().object_initial_map, GcSlice::EMPTY)
+                let map = heap.known().object_initial_map;
+                heap.new_object(&scope, map, GcSlice::EMPTY).erase()
             });
-            cache.set_acc(obj.erase());
+            cache.set_acc(obj);
             Step::Next
         }
         Opcode::CreateEmptyArrayLiteral => {
             let obj = state.handle_scope(|scope| {
-                heap.new_object(&scope, heap.known().js_array_map, GcSlice::EMPTY)
-                    .into_tagged()
-                    .erase()
+                let map = heap.known().js_array_map;
+                heap.new_object(&scope, map, GcSlice::EMPTY).erase()
             });
             cache.set_acc(obj);
             Step::Next
@@ -1436,18 +1762,31 @@ fn step(
         Opcode::CreateClosure => {
             // constants[idx] is the shared callable-info template (SFI-like);
             // the closure captures the current frame's context
-            let info = step_try!(heap.no_gc(|nogc| {
-                let v = cache.constants_ref(nogc).at(ops.idx(0));
-                v.get_as::<CallableInfoObject>(nogc)
+            let info = step_try!(heap.no_gc(|heap| {
+                cache
+                    .constants_ref(heap)
+                    .at(heap, ops.idx(0))
+                    .get_as::<CallableInfoObject>()
                     .map(|r| r.into_tagged().erase())
                     .ok_or(VmError::Type)
             }));
-            let context = step_try!(frame_context(heap, stack, &meta));
+            let context = step_try!(frame_context(stack, &meta));
             let obj = state.handle_scope(|scope| {
-                let Some(info) = scope.cast::<CallableInfoObject>(info) else {
+                // Safety: fresh anchored constant read, no GC since.
+                let Some(info) =
+                    scope.cast::<CallableInfoObject>(unsafe { info.assume_valid(&*heap) })
+                else {
                     return Err(VmError::Type);
                 };
-                Runtime::create_closure(heap, &scope, info, context)
+                Runtime::create_closure(
+                    heap,
+                    &scope,
+                    info,
+                    // Safety: fresh register-slot word, rooted by the
+                    // callee before its first allocation.
+                    unsafe { Tagged::from_value_unchecked(context) },
+                )
+                .map(|r| r.erase())
             });
             let obj = step_try!(obj);
             cache.set_acc(obj);
@@ -1459,10 +1798,11 @@ fn step(
                 Getter(Value),
                 Missing,
             }
-            let global = heap.known().global_object.value();
-            let lookup = heap.no_gc(|nogc| {
-                let name = callable_name(nogc, stack, &meta, ops.idx(0));
-                match global.lookup(nogc, name) {
+            // Safety: old-gen root-slot word.
+            let global = unsafe { heap.known().global_object.read_unchecked() };
+            let lookup = heap.no_gc(|heap| {
+                let name = callable_name(heap, stack, &meta, ops.idx(0));
+                match unsafe { global.assume_valid(heap) }.lookup(heap, name) {
                     Lookup::Data { slot, .. } => GlobalLoad::Data(slot.inner()),
                     Lookup::Accessor { pair, .. } => GlobalLoad::Getter(pair.get.inner()),
                     Lookup::NotFound => GlobalLoad::Missing,
@@ -1471,8 +1811,10 @@ fn step(
             match lookup {
                 GlobalLoad::Data(v) => cache.set_acc(v),
                 GlobalLoad::Getter(getter) => {
-                    if getter == heap.known().undefined.value() {
-                        cache.set_acc(heap.known().undefined.value());
+                    // Safety: old-gen singleton word.
+                    if getter == unsafe { heap.known().undefined.read_unchecked() } {
+                        // Safety: old-gen singleton word.
+                        cache.set_acc(unsafe { heap.known().undefined.read_unchecked() });
                     } else {
                         match step_try!(call_value(
                             vm,
@@ -1487,7 +1829,8 @@ fn step(
                         )) {
                             Called::Frame => {}
                             Called::NotCallable => {
-                                cache.set_acc(heap.known().undefined.value());
+                                // Safety: old-gen singleton word.
+                                cache.set_acc(unsafe { heap.known().undefined.read_unchecked() });
                             }
                             Called::Immediate(v) => cache.set_acc(v),
                             Called::Threw => return Step::PendingThrow,
@@ -1499,7 +1842,8 @@ fn step(
                         // unresolvable reference: GetValue throws ReferenceError
                         return Step::Error(VmError::Reference);
                     }
-                    cache.set_acc(heap.known().undefined.value());
+                    // Safety: old-gen singleton word.
+                    cache.set_acc(unsafe { heap.known().undefined.read_unchecked() });
                 }
             }
             // TODO: full semantics: lookup the script-context table first
@@ -1508,10 +1852,16 @@ fn step(
             Step::Next
         }
         Opcode::StoreGlobal => {
-            let global = heap.known().global_object.value();
-            let outcome = step_try!(heap.no_gc(|nogc| {
-                let name = callable_name(nogc, stack, &meta, ops.idx(0));
-                global.store_lookup(nogc, name, cache.acc(), StoreSemantics::WriteThrough)
+            // Safety: old-gen root-slot word.
+            let global = unsafe { heap.known().global_object.read_unchecked() };
+            let outcome = step_try!(heap.no_gc(|heap| {
+                let name = callable_name(heap, stack, &meta, ops.idx(0));
+                unsafe { global.assume_valid(heap) }.store_lookup(
+                    heap,
+                    name,
+                    cache.acc(heap),
+                    StoreSemantics::WriteThrough,
+                )
             }));
             step_try!(apply_store_outcome(
                 vm, heap, state, stack, cache, meta, pc, global, outcome,
@@ -1521,90 +1871,99 @@ fn step(
         Opcode::CreateFunctionContext => {
             // constants[idx] is the scope's shared ScopeInfo (its `names`
             // array is parallel to the context's slots)
-            let scope_info = step_try!(heap.no_gc(|nogc| {
+            let scope_info = step_try!(heap.no_gc(|heap| {
                 cache
-                    .constants_ref(nogc)
-                    .at(ops.idx(0))
-                    .get_as::<ScopeInfo>(nogc)
+                    .constants_ref(heap)
+                    .at(heap, ops.idx(0))
+                    .get_as::<ScopeInfo>()
                     .map(|r| r.into_tagged().erase())
                     .ok_or(VmError::Type)
             }));
-            let count = step_try!(heap.no_gc(|nogc| {
-                scope_info
-                    .get_as::<ScopeInfo>(nogc)
-                    .map(|r| r.as_ref().names.heap_ref(nogc).len())
+            let count = step_try!(heap.no_gc(|heap| {
+                unsafe { scope_info.assume_valid(heap) }
+                    .get_as::<ScopeInfo>()
+                    .map(|r| r.as_ref().names.heap_ref(heap).len())
                     .ok_or(VmError::Type)
             }));
-            let hole = heap.known().the_hole.value();
+            // Safety: old-gen singleton word.
+            let hole = unsafe { heap.known().the_hole.read_unchecked() };
             let values = vec![hole; count];
-            let outer = step_try!(frame_context(heap, stack, &meta));
+            let outer = step_try!(frame_context(stack, &meta));
             let ctx = state.handle_scope(|scope| {
+                // Safety: fresh register-slot word, no GC since.
                 let outer = scope
-                    .cast::<Context>(outer)
+                    .cast::<Context>(unsafe { outer.assume_valid(&*heap) })
                     .expect("frame context slot holds a Context");
+                // Safety: fresh anchored constant read, no GC since.
                 let scope_info = scope
-                    .cast::<ScopeInfo>(scope_info)
+                    .cast::<ScopeInfo>(unsafe { scope_info.assume_valid(&*heap) })
                     .expect("constants slot holds a ScopeInfo");
-                let slots = heap.allocate_handle::<FixedArray>(scope.stage(&values), &scope);
+                let values = scope.stage_words(&values);
+                let slots = heap.allocate_handle::<FixedArray>(values, &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
                     slots,
                     scope_info,
                 })
+                .erase()
             });
-            cache.set_acc(ctx.erase());
+            cache.set_acc(ctx);
             Step::Next
         }
         Opcode::CreateBlockContext => {
             let count = ops.uimm(0) as usize;
-            let hole = heap.known().the_hole.value();
+            // Safety: old-gen singleton word.
+            let hole = unsafe { heap.known().the_hole.read_unchecked() };
             let values = vec![hole; count];
-            let outer = step_try!(frame_context(heap, stack, &meta));
+            let outer = step_try!(frame_context(stack, &meta));
             let ctx = state.handle_scope(|scope| {
+                // Safety: fresh register-slot word, no GC since.
                 let outer = scope
-                    .cast::<Context>(outer)
+                    .cast::<Context>(unsafe { outer.assume_valid(&*heap) })
                     .expect("frame context slot holds a Context");
-                let slots = heap.allocate_handle::<FixedArray>(scope.stage(&values), &scope);
+                let values = scope.stage_words(&values);
+                let slots = heap.allocate_handle::<FixedArray>(values, &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
                     slots,
                     scope_info: heap.known().empty_scope_info,
                 })
+                .erase()
             });
-            cache.set_acc(ctx.erase());
+            cache.set_acc(ctx);
             Step::Next
         }
         Opcode::PushContext => {
-            let old = step_try!(frame_context(heap, stack, &meta));
+            let old = step_try!(frame_context(stack, &meta));
             stack.set_reg(&meta, ops.reg(0), old);
-            step_try!(set_frame_context(heap, stack, &meta, cache.acc()));
+            step_try!(set_frame_context(stack, &meta, cache.acc(&*heap)));
             Step::Next
         }
         Opcode::PopContext => {
-            let context = stack.reg(&meta, ops.reg(0));
-            step_try!(set_frame_context(heap, stack, &meta, context));
+            let context = stack.reg(&*heap, &meta, ops.reg(0));
+            step_try!(set_frame_context(stack, &meta, context));
             Step::Next
         }
         Opcode::ThrowReferenceErrorIfHole => {
-            if cache.acc() == heap.known().the_hole.value() {
+            if cache.acc(&*heap).erase() == unsafe { heap.known().the_hole.read_unchecked() } {
                 return Step::Error(VmError::Reference);
             }
             Step::Next
         }
         Opcode::LoadContextSlot => {
             let depth = ops.uimm(1);
-            let v = step_try!(heap.no_gc(|nogc| {
+            let v = step_try!(heap.no_gc(|heap| {
                 let mut context = stack
                     .context_slot(&meta)
-                    .inner()
-                    .get_as::<Context>(nogc)
+                    .read(heap)
+                    .get_as::<Context>()
                     .ok_or(VmError::Type)?;
                 for _ in 0..depth {
-                    context = context.as_ref().outer.heap_ref(nogc).ok_or(VmError::Type)?;
+                    context = context.as_ref().outer.heap_ref(heap).ok_or(VmError::Type)?;
                 }
                 Ok(context
                     .slots
-                    .heap_ref(nogc)
+                    .heap_ref(heap)
                     .as_ref()
                     .element_slot(ops.idx(0))
                     .inner())
@@ -1613,22 +1972,23 @@ fn step(
             Step::Next
         }
         Opcode::StoreContextSlot => {
-            step_try!(heap.no_gc(|nogc| {
+            step_try!(heap.no_gc(|heap| {
                 let mut context = stack
                     .context_slot(&meta)
-                    .inner()
-                    .get_as::<Context>(nogc)
+                    .read(heap)
+                    .get_as::<Context>()
                     .ok_or(VmError::Type)?;
                 for _ in 0..ops.uimm(1) {
-                    context = context.as_ref().outer.heap_ref(nogc).ok_or(VmError::Type)?;
+                    context = context.as_ref().outer.heap_ref(heap).ok_or(VmError::Type)?;
                 }
+                // Safety: fresh anchored slot read.
                 let host = context.clone().into_tagged().erase();
                 context
                     .slots
-                    .heap_ref(nogc)
+                    .heap_ref(heap)
                     .as_ref()
                     .element_slot(ops.idx(0))
-                    .set(nogc, host, cache.acc());
+                    .set(heap, host, cache.acc(heap));
                 Ok(())
             }));
             Step::Next
@@ -1642,16 +2002,17 @@ fn step(
             Step::Next
         }
         Opcode::LdaContext => {
-            let ctx = step_try!(frame_context(heap, stack, &meta));
+            let ctx = step_try!(frame_context(stack, &meta));
             cache.set_acc(ctx);
             Step::Next
         }
         Opcode::LdaHole => {
-            cache.set_acc(heap.known().the_hole.value());
+            // Safety: old-gen singleton word.
+            cache.set_acc(unsafe { heap.known().the_hole.read_unchecked() });
             Step::Next
         }
         Opcode::JumpIfNotUndefined => {
-            if cache.acc() != heap.known().undefined.value() {
+            if cache.acc(&*heap).erase() != unsafe { heap.known().undefined.read_unchecked() } {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next

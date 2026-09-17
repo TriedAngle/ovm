@@ -39,8 +39,7 @@ pub use handle::{
     EscapableHandleScope, GcSlice, Handle, HandleData, HandleScope, HandleSet, RootHandles,
 };
 pub use heap::{
-    AllocToken, EdgeVisitable, Fresh, GcSlot, GlobalHeap, Heap, HeapRef, NoGc, OptionGcSlot,
-    Register, WordType,
+    AllocToken, EdgeVisitable, GcSlot, GlobalHeap, Heap, HeapRef, OptionGcSlot, Register, WordType,
 };
 pub use interner::StringInterner;
 pub use lookup::{
@@ -271,8 +270,10 @@ impl Thread {
 
         // don't leak pending exception if it exists
         let _ = self.state.take_pending_exception();
+        // Safety: caller-owned argument words staged into rooted slots
+        // before anything can allocate.
         self.state.handle_scope(|scope| {
-            let args = scope.stage(args);
+            let args = scope.stage_words(args);
             interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args, None)
         })
     }
@@ -285,8 +286,9 @@ impl Thread {
         let mut nctx = NativeContext::new(&self.vm, &mut self.heap, &self.state);
         // stage a rooted copy: the native may keep reading it across its
         // own allocations
+        // Safety: caller-owned words staged before any allocation.
         self.state
-            .handle_scope(|scope| f(&mut nctx, scope.stage(args)))
+            .handle_scope(|scope| f(&mut nctx, scope.stage_words(args)))
     }
 
     pub fn run_script(&mut self, src: &str) -> Result<Value, ScriptError> {
@@ -417,8 +419,9 @@ impl VM {
 
     pub fn attach(&self) -> Thread {
         let heap = self.shared.heap.new_local(&self.shared.known);
-        let the_hole = heap.known().the_hole.value();
-        let undefined = heap.known().undefined.value();
+        // Safety: root-slot reads stored straight into rooted fill cells.
+        let the_hole = unsafe { heap.known().the_hole.read_unchecked() };
+        let undefined = unsafe { heap.known().undefined.read_unchecked() };
         let state = Arc::new(ContextState {
             handles: HandleData::new(the_hole),
             stack: Stack::new(STACK_SLOTS, the_hole, undefined),

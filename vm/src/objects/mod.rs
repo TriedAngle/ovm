@@ -29,7 +29,7 @@ pub use symbol::Symbol;
 use core::{alloc::Layout, ptr::NonNull};
 
 use crate::{
-    EdgeVisitable, GcSlot, HeapPtr, NoGc, STRONG_PTR, Tagged, Value, Visitor, WEAK_PTR, Word,
+    EdgeVisitable, GcSlot, Heap, HeapPtr, STRONG_PTR, Tagged, Value, Visitor, WEAK_PTR, Word,
 };
 
 pub trait HeapObject: 'static {
@@ -43,7 +43,9 @@ pub trait HeapObject: 'static {
 
     fn layout_for(config: &Self::Init<'_>) -> Layout;
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>);
+    /// Initialize the fresh object. `heap` is borrowed for the duration
+    /// of the call only: no allocation is possible inside.
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>);
 
     fn header(&self) -> &Header;
 
@@ -72,8 +74,8 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn map(&self) -> Tagged<Map> {
-        self.map.get()
+    pub fn map<'a>(&self, heap: &'a Heap) -> Tagged<'a, Map> {
+        self.map.get(heap)
     }
 }
 
@@ -128,8 +130,9 @@ impl ObjectKind {
 
 pub unsafe fn object_kind(addr: NonNull<()>) -> ObjectKind {
     let header = unsafe { &*addr.cast::<Header>().as_ptr() };
-    let map = header.map.get();
-    let map_ref = unsafe { HeapPtr::<Map>::from(map).as_ref() };
+    // Safety: GC-callback context; raw header read.
+    let map = header.map.inner();
+    let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
     map_ref.kind().kind()
 }
 

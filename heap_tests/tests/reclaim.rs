@@ -1,5 +1,5 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{FixedArray, GcSlice, VM};
+use vm::{FixedArray, VM};
 
 fn vm() -> VM {
     heap_tests::vm::<MarkSweep>(MarkSweepConfig::default())
@@ -13,7 +13,7 @@ fn unrooted_allocations_are_freed() {
         let used0 = vm.heap().stats().used;
         thread_handle_scope(t, |t, scope| {
             for _ in 0..4 {
-                let smis = vec![vm::Smi::new(0).encode(); 8192];
+                let smis = vec![vm::Smi::new(0).into_tagged(); 8192];
                 let _ = t
                     .heap()
                     .allocate_handle::<FixedArray>(scope.stage(&smis), &scope);
@@ -44,11 +44,11 @@ fn weak_to_dead_is_cleared_and_does_not_retain() {
     let vm = vm();
     let mut thread = vm.attach();
     let index = thread.handle_scope(|t, scope| {
-        let smis = vec![vm::Smi::new(0).encode(); 4096];
+        let smis = vec![vm::Smi::new(0).into_tagged(); 4096];
         let target = t
             .heap()
             .allocate_handle::<FixedArray>(scope.stage(&smis), &scope);
-        let index = vm.track_weak(target.value());
+        let index = vm.track_weak(target.as_tagged(&*t.heap()).erase());
         assert!(!vm.weak_value(index).is_cleared());
         index
     });
@@ -72,15 +72,15 @@ fn weak_to_live_stays_uncleared() {
     thread.handle_scope(|t, scope| {
         let target = t
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[vm::Smi::new(1).encode()]), &scope);
-        let index = vm.track_weak(target.value());
+            .allocate_handle::<FixedArray>(scope.stage(&[vm::Smi::new(1).into_tagged()]), &scope);
+        let index = vm.track_weak(target.as_tagged(&*t.heap()).erase());
 
         t.heap().collect();
 
         assert!(!vm.weak_value(index).is_cleared());
         assert_eq!(
             vm.weak_value(index).to_bits() & !vm::TAG_MASK,
-            target.value().to_bits() & !vm::TAG_MASK
+            target.as_tagged(&*t.heap()).erase().to_bits() & !vm::TAG_MASK
         );
     });
 }

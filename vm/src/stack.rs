@@ -1,6 +1,6 @@
 use core::cell::{Cell, RefCell};
 
-use crate::{EdgeVisitable, GcSlice, Object, Register, Smi, Tagged, Value, Visitor};
+use crate::{EdgeVisitable, GcSlice, Heap, Object, Register, Smi, Tagged, Value, Visitor};
 
 use crate::VmError;
 
@@ -73,12 +73,28 @@ impl Stack {
         unsafe { core::slice::from_raw_parts(slots.as_ptr() as *const Value, count) }
     }
 
+    /// The frame's callable, re-read under a heap borrow.
+    pub fn callable<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Object> {
+        // Safety: frame callable slots hold strong object pointers.
+        unsafe { self.callable_slot(meta).read(heap).cast::<Object>() }
+    }
+
     pub fn callable_slot(&self, meta: &FrameMeta) -> &Register {
         self.slot_unchecked(meta.base + meta.register_count + CALLABLE_OFFSET)
     }
 
+    /// The frame's current context, re-read under a heap borrow.
+    pub fn context<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Value> {
+        self.context_slot(meta).read(heap)
+    }
+
     pub fn context_slot(&self, meta: &FrameMeta) -> &Register {
         self.slot_unchecked(meta.base + meta.register_count + CONTEXT_OFFSET)
+    }
+
+    /// The frame's `new.target`, re-read under a heap borrow.
+    pub fn new_target<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Value> {
+        self.new_target_slot(meta).read(heap)
     }
 
     pub fn new_target_slot(&self, meta: &FrameMeta) -> &Register {
@@ -87,10 +103,9 @@ impl Stack {
 
     /// The frame's actual argument count, receiver included.
     pub fn argc(&self, meta: &FrameMeta) -> usize {
-        let raw = self
-            .slot_unchecked(meta.base + meta.register_count + ARGC_OFFSET)
-            .inner();
-        Smi::decode(raw).expect("argc header holds a Smi").value() as usize
+        self.slot_unchecked(meta.base + meta.register_count + ARGC_OFFSET)
+            .read_smi()
+            .value() as usize
     }
 
     fn reg_index(meta: &FrameMeta, i: i32) -> usize {
@@ -101,11 +116,13 @@ impl Stack {
         }
     }
 
-    pub fn reg(&self, meta: &FrameMeta, i: i32) -> Value {
-        self.slot_unchecked(Self::reg_index(meta, i)).inner()
+    /// Read a register under a heap borrow: rooted memory is updated in
+    /// place by the GC, so the word is current and valid for `'a`.
+    pub fn reg<'a>(&self, _heap: &'a Heap, meta: &FrameMeta, i: i32) -> Tagged<'a, Value> {
+        self.slot_unchecked(Self::reg_index(meta, i)).read(_heap)
     }
 
-    pub fn set_reg(&self, meta: &FrameMeta, i: i32, v: Value) {
+    pub fn set_reg(&self, meta: &FrameMeta, i: i32, v: impl Into<Value>) {
         self.slot_unchecked(Self::reg_index(meta, i)).store(v);
     }
 
@@ -117,8 +134,8 @@ impl Stack {
         &self,
         callable: Tagged<Object>,
         register_count: usize,
-        context: Value,
-        new_target: Value,
+        context: Tagged<'_, Value>,
+        new_target: Tagged<'_, Value>,
         args: GcSlice<'_>,
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
@@ -126,10 +143,10 @@ impl Stack {
         let padded = args.len().max(formal_min);
         let base = self.reserve(register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
-        debug_assert!(args.as_slice().iter().all(|v| !v.is_weak_ptr()));
+        debug_assert!(args.words().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
             core::ptr::copy_nonoverlapping(
-                args.as_slice().as_ptr(),
+                args.words().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             );
@@ -149,10 +166,10 @@ impl Stack {
         handler_pc: usize,
         callable: Tagged<Object>,
         register_count: usize,
-        context: Value,
+        context: Tagged<'_, Value>,
         src_reg_base: i32,
         count: usize,
-        new_target: Value,
+        new_target: Tagged<'_, Value>,
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
         let padded = count.max(formal_min);
@@ -190,9 +207,9 @@ impl Stack {
         handler_pc: usize,
         callable: Tagged<Object>,
         register_count: usize,
-        context: Value,
+        context: Tagged<'_, Value>,
         args: &[Value],
-        new_target: Value,
+        new_target: Tagged<'_, Value>,
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
         let padded = args.len().max(formal_min);
@@ -239,7 +256,7 @@ impl Stack {
         }
         unsafe {
             core::ptr::copy_nonoverlapping(
-                args.as_slice().as_ptr(),
+                args.words().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             )
@@ -283,9 +300,9 @@ impl Stack {
         &self,
         base: usize,
         register_count: usize,
-        callable: Tagged<Object>,
-        context: Value,
-        new_target: Value,
+        callable: Tagged<'_, Object>,
+        context: Tagged<'_, Value>,
+        new_target: Tagged<'_, Value>,
         argc: usize,
     ) -> FrameMeta {
         self.slot_unchecked(base + register_count + CALLABLE_OFFSET)

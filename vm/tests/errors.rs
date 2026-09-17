@@ -1,27 +1,39 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Value};
+use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Tagged, Value};
 use vm::{Thread, VM, VmError};
 
 /// Read a data property by interned name value.
 fn get_prop(thread: &mut Thread, obj: Value, name: Value) -> Value {
-    thread.heap().no_gc(|nogc| {
-        let Some(o) = obj.as_heap_object(nogc) else {
+    thread.heap().no_gc(|heap| {
+        let Some(o) = unsafe { obj.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
-        match o.as_ref().lookup(nogc, SlotName::from_value(name)) {
-            Lookup::Data { slot, .. } => slot.inner(),
+        match o.as_ref().lookup(heap, SlotName::from_value(name)) {
+            Lookup::Data { slot, .. } => slot.get(heap).erase(),
             _ => panic!("expected a data property"),
         }
     })
 }
 
+/// A rooted copy of `word`, staged immediately (no allocation between
+/// the read and the staging).
+fn as_tagged_unchecked(word: Value) -> Tagged<'static, Value> {
+    // Safety: only used same-statement under a live anchor in these tests.
+    unsafe { Tagged::from_value_unchecked(word) }
+}
+
 fn error_and_props(thread: &mut Thread, err: VmError) -> (Value, Value, Value) {
     let obj = thread.error_object(err).unwrap();
     let (name_key, name_val, message_key) = thread.handle_scope(|thread, scope| {
-        let name_key = thread.intern(&scope, "name").value();
-        let message_key = thread.intern(&scope, "message").value();
-        let name_val = thread.intern(&scope, err.name()).value();
-        (name_key, name_val, message_key)
+        let name_key = thread.intern(&scope, "name");
+        let message_key = thread.intern(&scope, "message");
+        let name_val = thread.intern(&scope, err.name());
+        let heap = &*thread.heap();
+        (
+            name_key.as_tagged(heap).erase(),
+            name_val.as_tagged(heap).erase(),
+            message_key.as_tagged(heap).erase(),
+        )
     });
     let name = get_prop(thread, obj, name_key);
     let message = get_prop(thread, obj, message_key);
@@ -43,7 +55,11 @@ fn error_names_map_to_spec_classes() {
         (VmError::StackOverflow, "RangeError"),
     ] {
         let (_, name, _) = error_and_props(&mut thread, err);
-        let expected = thread.handle_scope(|thread, scope| thread.intern(&scope, expected).value());
+        let expected = thread.handle_scope(|thread, scope| {
+            let e = thread.intern(&scope, expected);
+            let heap = &*thread.heap();
+            e.as_tagged(heap).erase()
+        });
         assert_eq!(name, expected, "{err:?}");
     }
 }
@@ -55,9 +71,12 @@ fn error_object_carries_name_and_message() {
 
     let (_, name, message) = error_and_props(&mut thread, VmError::Type);
     let (type_error, msg) = thread.handle_scope(|thread, scope| {
+        let type_error = thread.intern(&scope, "TypeError");
+        let msg = thread.intern(&scope, "invalid operand type");
+        let heap = &*thread.heap();
         (
-            thread.intern(&scope, "TypeError").value(),
-            thread.intern(&scope, "invalid operand type").value(),
+            type_error.as_tagged(heap).erase(),
+            msg.as_tagged(heap).erase(),
         )
     });
     assert_eq!(name, type_error);
@@ -86,16 +105,16 @@ fn error_objects_are_distinct_but_share_shapes() {
     // both started from the well-known error map and added the same
     // properties in the same order: the transition cache must yield one
     // shared final shape
-    let maps = thread.heap().no_gc(|nogc| {
-        let Some(a) = a.as_heap_object(nogc) else {
+    let maps = thread.heap().no_gc(|heap| {
+        let Some(a) = unsafe { a.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
-        let Some(b) = b.as_heap_object(nogc) else {
+        let Some(b) = unsafe { b.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
         (
-            a.as_ref().header.map.get().erase(),
-            b.as_ref().header.map.get().erase(),
+            a.as_ref().header.map.get(heap).erase(),
+            b.as_ref().header.map.get(heap).erase(),
         )
     });
     assert_eq!(maps.0, maps.1);
@@ -108,17 +127,20 @@ fn error_properties_are_writable() {
 
     let (obj, _, _) = error_and_props(&mut thread, VmError::Type);
     let (name_key, custom) = thread.handle_scope(|thread, scope| {
+        let name_key = thread.intern(&scope, "name");
+        let custom = thread.intern(&scope, "MyError");
+        let heap = &*thread.heap();
         (
-            thread.intern(&scope, "name").value(),
-            thread.intern(&scope, "MyError").value(),
+            name_key.as_tagged(heap).erase(),
+            custom.as_tagged(heap).erase(),
         )
     });
 
-    let outcome = thread.heap().no_gc(|nogc| {
-        obj.store_lookup(
-            nogc,
+    let outcome = thread.heap().no_gc(|heap| {
+        as_tagged_unchecked(obj).store_lookup(
+            heap,
             SlotName::from_value(name_key),
-            custom,
+            as_tagged_unchecked(custom),
             StoreSemantics::WriteThrough,
         )
     });
@@ -133,34 +155,40 @@ fn error_objects_are_extendable() {
 
     let (obj, _, _) = error_and_props(&mut thread, VmError::Type);
     let (extra_key, extra_val) = thread.handle_scope(|thread, scope| {
+        let extra_key = thread.intern(&scope, "extra");
+        let extra_val = thread.intern(&scope, "payload");
+        let heap = &*thread.heap();
         (
-            thread.intern(&scope, "extra").value(),
-            thread.intern(&scope, "payload").value(),
+            extra_key.as_tagged(heap).erase(),
+            extra_val.as_tagged(heap).erase(),
         )
     });
 
     // store_lookup on a missing property must propose a transition
     // (proof of extendability), and completing it adds the own property
-    let outcome = thread.heap().no_gc(|nogc| {
-        obj.store_lookup(
-            nogc,
+    let outcome = thread.heap().no_gc(|heap| {
+        as_tagged_unchecked(obj).store_lookup(
+            heap,
             SlotName::from_value(extra_key),
-            extra_val,
+            as_tagged_unchecked(extra_val),
             StoreSemantics::WriteThrough,
         )
     });
     match outcome {
         Ok(StoreOutcome::Transition { receiver, name }) => {
             thread.handle_scope(|thread, scope| {
-                let receiver = scope.cast::<vm::Object>(receiver).unwrap();
-                let name = scope.handle(name.tagged());
-                let value = scope.handle(extra_val);
+                let receiver = scope
+                    .cast::<vm::Object>(as_tagged_unchecked(receiver))
+                    .unwrap();
+                let name = scope.handle(unsafe { name.tagged(&*thread.heap()) });
+                let value = scope.handle(as_tagged_unchecked(extra_val));
+                let value_word = value.as_tagged(&*thread.heap()).erase();
                 vm::Object::define_own_property(
                     thread.heap(),
                     &scope,
                     receiver,
                     name,
-                    PropertyDescriptor::data(value.value()),
+                    PropertyDescriptor::data(value_word),
                 )
                 .unwrap();
             });
@@ -172,13 +200,13 @@ fn error_objects_are_extendable() {
 
 /// The object this object's map links to via its `prototype` slot.
 fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
-    thread.heap().no_gc(|nogc| {
-        let Some(o) = obj.as_heap_object(nogc) else {
+    thread.heap().no_gc(|heap| {
+        let Some(o) = unsafe { obj.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
-        let map = o.as_ref().header.map.heap_ref(nogc).as_ref();
-        let proto = map.prototype.inner();
-        if proto == nogc.known().null.value() {
+        let map = o.as_ref().header.map.heap_ref(heap).as_ref();
+        let proto = map.prototype.get(heap).erase();
+        if proto == heap.known().null.as_tagged(heap).erase() {
             None
         } else {
             Some(proto)
@@ -193,15 +221,16 @@ fn startup_prototype_hierarchy() {
 
     let (error_obj, _, _) = error_and_props(&mut thread, VmError::Type);
     let (error_prototype, object_prototype, undefined, null, true_v, false_v, the_hole) = {
-        let k = thread.heap().known();
+        let heap = thread.heap();
+        let k = heap.known();
         (
-            k.error_prototype.value(),
-            k.object_prototype.value(),
-            k.undefined.value(),
-            k.null.value(),
-            k.true_object.value(),
-            k.false_object.value(),
-            k.the_hole.value(),
+            k.error_prototype.as_tagged(heap).erase(),
+            k.object_prototype.as_tagged(heap).erase(),
+            k.undefined.as_tagged(heap).erase(),
+            k.null.as_tagged(heap).erase(),
+            k.true_object.as_tagged(heap).erase(),
+            k.false_object.as_tagged(heap).erase(),
+            k.the_hole.as_tagged(heap).erase(),
         )
     };
 

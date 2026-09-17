@@ -1,41 +1,18 @@
 use std::sync::Arc;
 
-use crate::{AllocError, FixedArray, Float, GcHost, GcSlice, Global, Handle, HandleScope, HandleSet, HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit, ObjectSlotsInit, RawCell, RootHandles, SharedHeap, Smi, STRONG_PTR, TAG_MASK, Tagged, TransitionLock, Value, Visitor, Word,
+use crate::{
+    AllocError, FixedArray, Float, GcHost, GcSlice, Handle, HandleScope, HandleSet, HeapBackend,
+    HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit, ObjectSlotsInit, RawCell,
+    STRONG_PTR, SharedHeap, Smi, TAG_MASK, Tagged, TransitionLock, Value, Visitor, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
 
 use core::{alloc::Layout, cell::Cell, marker::PhantomData, ops::FnOnce, ptr::NonNull};
-pub struct NoGc<'a> {
-    heap: &'a Heap,
-    _phantom: PhantomData<&'a mut &'a ()>,
-}
 
-impl<'a> NoGc<'a> {
-    pub(crate) fn new(heap: &'a Heap) -> Self {
-        Self {
-            heap,
-            _phantom: PhantomData,
-        }
-    }
-
-    /// The heap this guard protects, for read access and slot writes.
-    pub fn heap(&self) -> &'a Heap {
-        self.heap
-    }
-}
-
-/// Non-allocating heap calls go through the guard: while it is alive the
-/// heap is borrowed, so no collection can happen.
-impl core::ops::Deref for NoGc<'_> {
-    type Target = Heap;
-
-    fn deref(&self) -> &Heap {
-        self.heap
-    }
-}
-
-/// Direct reference to a heap object, valid only within a no-GC scope.
+/// Direct reference to a heap object, valid only within the borrow of
+/// the heap it was created under (the same anchor a `Tagged<'a, _>`
+/// carries).
 pub struct HeapRef<'scope, T: HeapObject> {
     ptr: HeapPtr<T>,
     _phantom: PhantomData<&'scope T>,
@@ -73,8 +50,9 @@ impl<'scope, T: HeapObject> HeapRef<'scope, T> {
         self.ptr
     }
 
-    pub fn into_tagged(self) -> Tagged<T> {
-        Tagged::from_ptr(self.ptr)
+    pub fn into_tagged(self) -> Tagged<'scope, T> {
+        // Safety: `HeapRef` proves the pointer is valid for `'scope`.
+        unsafe { Tagged::from_value_unchecked(self.ptr.encode_strong()) }
     }
 
     pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T> {
@@ -87,66 +65,6 @@ impl<T: HeapObject> core::ops::Deref for HeapRef<'_, T> {
 
     fn deref(&self) -> &T {
         unsafe { self.ptr.as_ref() }
-    }
-}
-
-pub struct Fresh<'scope, T> {
-    ptr: NonNull<T>,
-    _phantom: PhantomData<&'scope T>,
-}
-
-impl<T> Clone for Fresh<'_, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for Fresh<'_, T> {}
-
-impl<T> core::fmt::Debug for Fresh<'_, T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "Fresh({:#x})", self.ptr.as_ptr() as Word)
-    }
-}
-
-impl<'scope, T> Fresh<'scope, T> {
-    pub(crate) fn new(ptr: NonNull<T>) -> Self {
-        Self {
-            ptr,
-            _phantom: PhantomData,
-        }
-    }
-
-    pub const fn as_ptr(self) -> *mut T {
-        self.ptr.as_ptr()
-    }
-}
-
-impl<'scope, T: HeapObject> Fresh<'scope, T> {
-    pub fn into_ptr(self) -> HeapPtr<T> {
-        unsafe { HeapPtr::new(self.ptr.as_ptr()) }
-    }
-
-    pub fn into_tagged(self) -> Tagged<T> {
-        Tagged::from_ptr(self.into_ptr())
-    }
-
-    pub fn erase(self) -> Value {
-        self.into_tagged().erase()
-    }
-
-    pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T> {
-        scope.create_handle(self.into_tagged())
-    }
-
-    pub fn into_global(self, roots: &RootHandles) -> Global<T> {
-        roots.create_handle(self.into_tagged())
-    }
-
-    pub fn heap_ref<'a>(self, _guard: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        HeapRef {
-            ptr: self.into_ptr(),
-            _phantom: PhantomData,
-        }
     }
 }
 
@@ -175,31 +93,31 @@ impl<'heap> AllocToken<'heap> {
         Layout::from_size_align(end, 16).expect("token layout")
     }
 
-    pub fn allocate<T: HeapObject>(&self, config: T::Init<'_>) -> Fresh<'heap, T> {
+    pub fn allocate<T: HeapObject>(&self, config: T::Init<'_>) -> Tagged<'heap, T> {
         let mut ptr = self.bump(T::layout_for(&config)).cast::<T>();
         // the token's reservation already proves no GC can happen here
-        let nogc = NoGc::new(&*self.heap);
-        unsafe { ptr.as_mut() }.init(&nogc, &config);
-        Fresh {
-            ptr,
-            _phantom: PhantomData,
-        }
+        unsafe { ptr.as_mut() }.init(self.heap(), &config);
+        // Safety: fresh strong pointer; the token's heap borrow is the
+        // anchor and no GC can run while it is outstanding.
+        unsafe { Tagged::from_value_unchecked(HeapPtr::<T>::new(ptr.as_ptr()).encode_strong()) }
     }
 
     pub fn allocate_ref<'g, T: HeapObject>(
         &self,
         config: T::Init<'_>,
-        _guard: &'g NoGc<'g>,
+        _heap: &'g Heap,
     ) -> HeapRef<'g, T> {
         HeapRef {
-            ptr: self.allocate(config).into_ptr(),
+            ptr: self
+                .allocate(config)
+                .as_ptr()
+                .expect("fresh strong pointer"),
             _phantom: PhantomData,
         }
     }
 
-    pub fn enter_no_gc<R>(&self, f: impl for<'a> FnOnce(&'a mut NoGc<'a>) -> R) -> R {
-        let mut guard = NoGc::new(&*self.heap);
-        f(&mut guard)
+    pub fn enter_no_gc<R>(&self, f: impl for<'a> FnOnce(&'a Heap) -> R) -> R {
+        f(self.heap())
     }
 
     pub fn remaining(&self) -> usize {
@@ -246,10 +164,10 @@ unsafe impl<T: HeapObject> Sync for WeakGcCell<T> {}
 
 impl<T: HeapObject> WeakGcCell<T> {
     pub fn new(ptr: HeapPtr<T>) -> Self {
+        // Safety: constructing the storage word of a weak cell.
+        let tagged = unsafe { Tagged::<T>::from_value_unchecked(ptr.encode_strong()) };
         Self {
-            cell: unsafe {
-                RawCell::from_word(Tagged::from_ptr(ptr).make_weak().erase().to_bits())
-            },
+            cell: unsafe { RawCell::from_word(tagged.make_weak().erase().to_bits()) },
             _phantom: PhantomData,
         }
     }
@@ -258,7 +176,14 @@ impl<T: HeapObject> WeakGcCell<T> {
     /// it as reachable until we decide to weaken selected entries.
     pub fn new_strong(ptr: HeapPtr<T>) -> Self {
         Self {
-            cell: unsafe { RawCell::from_word(Tagged::from_ptr(ptr).erase().to_bits()) },
+            cell: unsafe {
+                // Safety: constructing the storage word of a cell.
+                RawCell::from_word(
+                    Tagged::<T>::from_value_unchecked(ptr.encode_strong())
+                        .erase()
+                        .to_bits(),
+                )
+            },
             _phantom: PhantomData,
         }
     }
@@ -273,13 +198,14 @@ impl<T: HeapObject> WeakGcCell<T> {
 
     // TODO: this maybe doens't make much sense
     // if a WeakGcCell is always weak, then upgrading it doesn't actually upgrade but only pretend
-    pub fn upgrade<'a>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
+    pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<HeapRef<'a, T>> {
         let word = self.cell.load();
         if word == crate::WEAK_PTR {
             return None;
         }
         let strong = Value::from_bits(word & !TAG_MASK | STRONG_PTR);
-        Some(unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(strong).into()) })
+        // Safety: anchored read of a cell the GC keeps up to date.
+        Some(unsafe { HeapRef::from_ptr(Tagged::<T>::from_value_unchecked(strong).into()) })
     }
 }
 
@@ -295,10 +221,6 @@ impl WordType for Smi {
     const IS_HEAP: bool = false;
 }
 
-impl<T: HeapObject + 'static> WordType for Tagged<T> {
-    const IS_HEAP: bool = true;
-}
-
 #[repr(transparent)]
 pub struct GcSlot<T = Value> {
     cell: RawCell,
@@ -312,20 +234,27 @@ impl<T> GcSlot<T> {
         }
     }
 
-    pub fn get(&self) -> Tagged<T> {
-        unsafe { Tagged::from_value_unchecked(self.inner()) }
+    /// Re-read the slot under a heap borrow: the word is current (the GC
+    /// updates slots in place) and valid for `'a` because no collection
+    /// can run while the borrow lives.
+    pub fn get<'a>(&self, _heap: &'a Heap) -> Tagged<'a, T> {
+        // Safety: see method docs.
+        unsafe { Tagged::from_value_unchecked(Value::from_bits(self.cell.load())) }
     }
 
-    pub fn inner(&self) -> Value {
+    pub(crate) fn inner(&self) -> Value {
         Value::from_bits(self.cell.load())
     }
 
-    pub fn set(&self, nogc: &NoGc<'_>, host: impl Into<Value>, value: impl Into<Tagged<T>>) {
+    pub fn set<'x>(&self, heap: &Heap, host: impl Into<Value>, value: impl Into<Tagged<'x, T>>)
+    where
+        T: 'x,
+    {
         let host = host.into();
         let v = value.into().erase();
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         if v.is_ptr() {
-            nogc.write_barrier(host, self.as_raw(), v);
+            heap.write_barrier(host, self.as_raw(), v);
         }
         self.cell.store_raw(v.to_bits());
     }
@@ -346,10 +275,14 @@ impl GcSlot<Smi> {
 }
 
 impl<T: HeapObject> GcSlot<T> {
-    /// Reads the slot as a heap reference valid for the no-GC scope.
-    pub fn heap_ref<'a>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        // Safe: `T` is this slot's declared type.
-        unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(self.inner()).into()) }
+    /// Reads the slot as a heap reference valid under the current heap borrow.
+    pub fn heap_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, T> {
+        // Safe: `T` is this slot's declared type; the anchor proves no GC
+        // ran since the read.
+        self.get(heap)
+            .as_ptr()
+            .map(|ptr| unsafe { HeapRef::from_ptr(ptr) })
+            .expect("strong slot contents")
     }
 }
 
@@ -369,7 +302,7 @@ impl<T> OptionGcSlot<T> {
         }
     }
 
-    pub fn inner(&self) -> Value {
+    pub(crate) fn inner(&self) -> Value {
         self.slot.inner()
     }
 
@@ -377,23 +310,28 @@ impl<T> OptionGcSlot<T> {
         self.slot.as_raw()
     }
 
-    pub fn set(&self, nogc: &NoGc<'_>, host: impl Into<Value>, value: impl Into<Tagged<T>>) {
-        self.slot.set(nogc, host, value);
+    pub fn set<'x>(&self, heap: &Heap, host: impl Into<Value>, value: impl Into<Tagged<'x, T>>)
+    where
+        T: 'x,
+    {
+        self.slot.set(heap, host, value);
     }
 
     pub fn clear(&self, heap: &Heap) {
+        // Safety: fresh root-slot read for a word store.
         self.slot
             .cell
-            .store_raw(heap.known().the_hole.value().to_bits());
+            .store_raw(unsafe { heap.known().the_hole.read_unchecked() }.to_bits());
     }
 }
 
 impl<T: HeapObject> OptionGcSlot<T> {
-    pub fn heap_ref<'a>(&self, nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
-        if self.inner() == nogc.known().the_hole.value() {
+    pub fn heap_ref<'a>(&self, heap: &'a Heap) -> Option<HeapRef<'a, T>> {
+        // Safety: fresh root-slot read for a word comparison.
+        if self.inner() == unsafe { heap.known().the_hole.read_unchecked() } {
             return None;
         }
-        Some(self.slot.heap_ref(nogc))
+        Some(self.slot.heap_ref(heap))
     }
 }
 
@@ -405,17 +343,28 @@ impl Register {
         Self(unsafe { RawCell::from_word(v.to_bits()) })
     }
 
-    pub fn inner(&self) -> Value {
+    /// Re-read the register under a heap borrow. Registers live in rooted
+    /// memory that the GC updates in place, so the word is current; the
+    /// anchor proves no GC runs before its use.
+    pub fn read<'a>(&self, _heap: &'a Heap) -> Tagged<'a, Value> {
+        // Safety: see method docs.
+        unsafe { Tagged::from_value_unchecked(Value::from_bits(self.0.load())) }
+    }
+
+    /// Registers holding Smis (frame headers) can be read without an
+    /// anchor: Smis never dangle.
+    pub fn read_smi(&self) -> Smi {
+        Smi::decode(Value::from_bits(self.0.load())).expect("register holds a Smi")
+    }
+
+    pub(crate) fn inner(&self) -> Value {
         Value::from_bits(self.0.load())
     }
 
-    pub fn store(&self, v: Value) {
+    pub fn store(&self, v: impl Into<Value>) {
+        let v = v.into();
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         self.0.store_raw(v.to_bits());
-    }
-
-    pub fn heap_ref<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        unsafe { HeapRef::from_ptr(Tagged::from_value_unchecked(self.inner()).into()) }
     }
 
     pub fn as_raw(&self) -> &RawCell {
@@ -486,7 +435,10 @@ impl Heap {
         self.local.collect_minor();
     }
 
-    pub fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
+    /// Allocate a fresh `T`. The returned `Tagged` is anchored at this
+    /// borrow: any further allocation (or anything else requiring
+    /// `&mut Heap`) requires rooting it first.
+    pub fn allocate<'a, T: HeapObject>(&'a mut self, config: T::Init<'_>) -> Tagged<'a, T> {
         #[cfg(feature = "stress-minor-gc")]
         if self.stress_armed.load(std::sync::atomic::Ordering::Acquire) {
             self.collect_minor();
@@ -495,9 +447,11 @@ impl Heap {
             .allocate_raw(T::layout_for(&config))
             .expect("heap allocation failed (out of memory)");
         let mut ptr = raw.cast::<T>();
-        let nogc = NoGc::new(self);
-        unsafe { ptr.as_mut() }.init(&nogc, &config);
-        Fresh::new(ptr)
+        // Safety: raw memory just reserved; no GC can run inside init
+        // (the &mut borrow is still outstanding).
+        unsafe { ptr.as_mut() }.init(self, &config);
+        // Safety: fresh strong pointer, anchored at this borrow.
+        unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
     }
 
     pub fn allocate_handle<'s, T: HeapObject>(
@@ -513,11 +467,11 @@ impl Heap {
         &mut self,
         handles: &'a impl HandleSet,
         config: ObjectSlotsInit<'a, '_>,
-    ) -> Fresh<'_, Object> {
-        let slots = if config.values.is_empty() {
+    ) -> Tagged<'_, Object> {
+        let slots: Handle<'a, FixedArray> = if config.values.is_empty() {
             self.known().empty_fixed_array
         } else {
-            handles.create_handle(self.allocate::<FixedArray>(config.values).into_tagged())
+            handles.create_handle(self.allocate::<FixedArray>(config.values))
         };
         self.allocate::<Object>(ObjectInit {
             map: config.map,
@@ -532,7 +486,7 @@ impl Heap {
         handles: &'a impl HandleSet,
         map: Handle<'a, Map>,
         values: GcSlice<'a>,
-    ) -> Fresh<'_, Object> {
+    ) -> Tagged<'_, Object> {
         self.allocate_object(
             handles,
             ObjectSlotsInit {
@@ -547,7 +501,7 @@ impl Heap {
     /// A number value: a Smi when the double is an in-range integer, a
     /// freshly boxed Float otherwise. `-0.0` always boxes (it must not
     /// collapse into `+0`).
-    pub fn new_number(&mut self, scope: &HandleScope<'_>, f: f64) -> Value {
+    pub fn new_number<'a>(&'a mut self, scope: &HandleScope<'_>, f: f64) -> Tagged<'a, Value> {
         let r = f as i64; // saturating cast; the round-trip check rejects out-of-range values
         if f.is_finite()
             && f.fract() == 0.0
@@ -555,14 +509,20 @@ impl Heap {
             && (r as f64) == f
             && !(f == 0.0 && f.is_sign_negative())
         {
-            return Smi::new(r).encode();
+            return Smi::new(r).into_tagged();
         }
-        self.allocate_handle::<Float>(f, scope).value()
+        self.allocate_handle::<Float>(f, scope)
+            .as_tagged(&*self)
+            .erase_type()
     }
 
     /// CreateArrayFromList (ES 7.3.17): a fresh dense array holding
     /// `values` (a GC-visited slice: stage raw values first).
-    pub fn new_array(&mut self, scope: &HandleScope<'_>, values: GcSlice<'_>) -> Fresh<'_, Object> {
+    pub fn new_array(
+        &mut self,
+        scope: &HandleScope<'_>,
+        values: GcSlice<'_>,
+    ) -> Tagged<'_, Object> {
         let elements = self.allocate_handle::<FixedArray>(values, scope);
         self.allocate_object(
             scope,
@@ -575,15 +535,19 @@ impl Heap {
         )
     }
 
-    pub fn allocate_enter_nogc<T: HeapObject, R>(
+    pub fn allocate_enter_heap<T: HeapObject, R>(
         &mut self,
         config: T::Init<'_>,
-        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a mut NoGc<'a>) -> R,
+        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a Heap) -> R,
     ) -> R {
-        let ptr = self.allocate(config).into_ptr();
-        self.no_gc(move |nogc| {
+        let ptr = self
+            .allocate(config)
+            .as_ptr()
+            .expect("fresh strong pointer");
+        self.no_gc(|heap| {
+            // Safety: fresh allocation, anchored at `heap`.
             let r = unsafe { HeapRef::from_ptr(ptr) };
-            f(r, nogc)
+            f(r, heap)
         })
     }
 
@@ -596,22 +560,20 @@ impl Heap {
         AllocToken::new(self, raw, total)
     }
 
-    pub fn allocate_token_enter_nogc<R>(
+    pub fn allocate_token_enter_heap<R>(
         &mut self,
         total: Layout,
-        f: impl for<'a> FnOnce(&AllocToken<'_>, &'a mut NoGc<'a>) -> R,
+        f: impl for<'a> FnOnce(&AllocToken<'_>, &'a Heap) -> R,
     ) -> R {
         let token = self.allocate_token(total);
-        token.enter_no_gc(|nogc| f(&token, nogc))
+        token.enter_no_gc(|heap| f(&token, heap))
     }
 
-    pub fn guard(&mut self) -> NoGc<'_> {
-        NoGc::new(self)
-    }
-
-    pub fn no_gc<R>(&mut self, f: impl for<'a> FnOnce(&'a mut NoGc<'a>) -> R) -> R {
-        let mut guard = NoGc::new(self);
-        f(&mut guard)
+    /// Borrow the heap for a run of non-allocating operations: the
+    /// `&'a Heap` handed to `f` is the anchor every `Tagged<'a, _>` in
+    /// the scope is tied to, and nothing anchored can escape `f`.
+    pub fn no_gc<R>(&mut self, f: impl for<'a> FnOnce(&'a Heap) -> R) -> R {
+        f(&*self)
     }
 }
 
@@ -647,7 +609,8 @@ impl GlobalHeap {
     /// here on every allocation triggers a minor collection first.
     #[cfg(feature = "stress-minor-gc")]
     pub fn arm_gc_stress(&self) {
-        self.stress_armed.store(true, std::sync::atomic::Ordering::Release);
+        self.stress_armed
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn new_local(&self, known: &KnownCell) -> Heap {

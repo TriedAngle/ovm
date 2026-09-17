@@ -17,20 +17,21 @@ fn run_smi(vm: &VM, src: &str) -> i64 {
 fn run_str(vm: &VM, src: &str) -> String {
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
-    thread.heap().no_gc(|nogc| {
-        let s = result
-            .get_as::<vm::DenseString>(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { result.assume_valid(heap) }
+            .get_as::<vm::DenseString>()
             .expect("string result");
-        s.to_rust_string(nogc)
+        s.to_rust_string(heap)
     })
 }
 
 fn run_bool(vm: &VM, src: &str) -> bool {
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
-    if result == thread.heap().known().true_object.value() {
+    let heap = thread.heap();
+    if result == heap.known().true_object.as_tagged(heap).erase() {
         true
-    } else if result == thread.heap().known().false_object.value() {
+    } else if result == heap.known().false_object.as_tagged(heap).erase() {
         false
     } else {
         panic!("expected boolean, got {result:?}");
@@ -154,15 +155,18 @@ fn eval_completion_values() {
     // every stop-the-world collection of the threads still running)
     {
         let (result, mut thread) = run_value(&vm, "eval('{ let x = 1; }');");
-        assert_eq!(result, thread.heap().known().undefined.value());
+        let heap = thread.heap();
+        assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
     }
     {
         let (result, mut thread) = run_value(&vm, "eval('function fn() {}{}');");
-        assert_eq!(result, thread.heap().known().undefined.value());
+        let heap = thread.heap();
+        assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
     }
     {
         let (result, mut thread) = run_value(&vm, "eval('var x = 1;');");
-        assert_eq!(result, thread.heap().known().undefined.value());
+        let heap = thread.heap();
+        assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
     }
 }
 

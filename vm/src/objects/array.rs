@@ -1,6 +1,9 @@
 use core::alloc::Layout;
 
-use crate::{EdgeVisitable, GcSlot, GcSlice, Header, HeapObject, NoGc, ObjectKind, Smi, Value, Visitor};
+use crate::{
+    EdgeVisitable, GcSlice, GcSlot, Header, Heap, HeapObject, ObjectKind, Smi, Tagged, Value,
+    Visitor,
+};
 
 #[repr(C)]
 pub struct FixedArray {
@@ -35,12 +38,12 @@ impl FixedArray {
         unsafe { &*self.values.as_ptr().add(i) }
     }
 
-    pub fn at(&self, i: usize) -> Value {
-        self.element_slot(i).get().erase()
+    pub fn at<'a>(&self, heap: &'a Heap, i: usize) -> Tagged<'a, Value> {
+        self.element_slot(i).get(heap)
     }
 
-    pub fn set(&self, nogc: &NoGc<'_>, i: usize, v: Value) {
-        self.element_slot(i).set(nogc, self.erase(), v);
+    pub fn set(&self, heap: &Heap, i: usize, v: Tagged<'_, Value>) {
+        self.element_slot(i).set(heap, self.erase(), v);
     }
 }
 
@@ -52,14 +55,16 @@ impl HeapObject for FixedArray {
         Self::layout_for(config.len())
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().array_map.as_tagged());
-        self.size.set(nogc, host, Smi::new(config.len() as i64));
-        for (i, v) in config.iter().enumerate() {
-            self.element_slot(i).set(nogc, host, *v);
+            .set(heap, host, heap.known().array_map.as_tagged(heap));
+        self.size.set(heap, host, Smi::new(config.len() as i64));
+        // Safety: copying words out of rooted memory during init; no GC
+        // can run before the new array is rooted by the caller.
+        for (i, v) in config.iter(heap).enumerate() {
+            self.element_slot(i).set(heap, host, v);
         }
     }
 

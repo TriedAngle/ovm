@@ -2,7 +2,7 @@ use core::alloc::Layout;
 
 use crate::{
     DenseString, EdgeVisitable, FixedArray, FixedByteArray, GcSlot, Handle, HandlerTable, Header,
-    HeapObject, NoGc, ObjectKind, OptionGcSlot, SlotName, Smi, Value, Visitor,
+    Heap, HeapObject, ObjectKind, OptionGcSlot, SlotName, Smi, Tagged, Value, Visitor,
 };
 
 #[repr(C)]
@@ -102,25 +102,31 @@ impl HeapObject for CallableInfoObject {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().callable_map.as_tagged());
-        self.bytecode.set(nogc, host, config.bytecode.as_tagged());
-        self.constants.set(nogc, host, config.constants.as_tagged());
+            .set(heap, host, heap.known().callable_map.as_tagged(heap));
+        self.bytecode
+            .set(heap, host, config.bytecode.as_tagged(heap));
+        self.constants
+            .set(heap, host, config.constants.as_tagged(heap));
         self.register_count
-            .set(nogc, host, Smi::new(config.register_count as i64));
+            .set(heap, host, Smi::new(config.register_count as i64));
         match config.handlers {
-            Some(handlers) => self.handlers.set(nogc, host, handlers),
-            None => self.handlers.clear(nogc.heap()),
+            Some(handlers) => self.handlers.set(heap, host, handlers.as_tagged(heap)),
+            None => self.handlers.clear(heap),
         }
-        self.name.set(nogc, host, nogc.known().the_hole.value());
-        self.formal_parameter_count.set(nogc, host, Smi::new(0));
-        self.formal_length.set(nogc, host, Smi::new(0));
+        self.name.set(
+            heap,
+            host,
+            heap.known().the_hole.as_tagged(heap).erase_type(),
+        );
+        self.formal_parameter_count.set(heap, host, Smi::new(0));
+        self.formal_length.set(heap, host, Smi::new(0));
         self.kind
-            .set(nogc, host, Smi::new(FunctionKind::Normal as i64));
-        self.strict.set(nogc, host, Smi::new(0));
+            .set(heap, host, Smi::new(FunctionKind::Normal as i64));
+        self.strict.set(heap, host, Smi::new(0));
     }
 
     fn header(&self) -> &Header {
@@ -145,14 +151,14 @@ impl EdgeVisitable for CallableInfoObject {
 impl CallableInfoObject {
     pub fn set_metadata(
         &self,
-        nogc: &NoGc<'_>,
-        name: Option<Value>,
+        heap: &Heap,
+        name: Option<Tagged<'_, Value>>,
         formal_parameter_count: usize,
         kind: FunctionKind,
         strict: bool,
     ) {
         self.set_metadata_full(
-            nogc,
+            heap,
             name,
             formal_parameter_count,
             formal_parameter_count,
@@ -163,8 +169,8 @@ impl CallableInfoObject {
 
     pub fn set_metadata_full(
         &self,
-        nogc: &NoGc<'_>,
-        name: Option<Value>,
+        heap: &Heap,
+        name: Option<Tagged<'_, Value>>,
         formal_parameter_count: usize,
         formal_length: usize,
         kind: FunctionKind,
@@ -172,21 +178,23 @@ impl CallableInfoObject {
     ) {
         let host = self.erase();
         self.name.set(
-            nogc,
+            heap,
             host,
-            name.unwrap_or_else(|| nogc.known().the_hole.value()),
+            name.unwrap_or_else(|| heap.known().the_hole.as_tagged(heap).erase_type()),
         );
         self.formal_parameter_count
-            .set(nogc, host, Smi::new(formal_parameter_count as i64));
+            .set(heap, host, Smi::new(formal_parameter_count as i64));
         self.formal_length
-            .set(nogc, host, Smi::new(formal_length as i64));
-        self.kind.set(nogc, host, Smi::new(kind as i64));
-        self.strict.set(nogc, host, Smi::new(i64::from(strict)));
+            .set(heap, host, Smi::new(formal_length as i64));
+        self.kind.set(heap, host, Smi::new(kind as i64));
+        self.strict.set(heap, host, Smi::new(i64::from(strict)));
     }
 
-    pub fn name<'a>(&self, nogc: &'a NoGc<'a>) -> Option<Value> {
-        let name = self.name.inner();
-        name.get_as::<DenseString>(nogc).map(|_| name)
+    pub fn name<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
+        self.name.get(heap).get_as::<DenseString>().map(|_| {
+            // Safety: fresh slot read under the anchor.
+            unsafe { Tagged::from_value_unchecked(self.name.inner()) }
+        })
     }
 
     pub fn formal_parameter_count(&self) -> usize {
@@ -208,10 +216,10 @@ impl CallableInfoObject {
 
     /// Decode a constant-pool property name.
     // TODO: this must handle also non constants and non interned strings and symbols
-    pub fn constant_slot_name<'a>(&self, nogc: &'a NoGc<'a>, idx: usize) -> SlotName {
-        let v = self.constants.heap_ref(nogc).at(idx);
+    pub fn constant_slot_name(&self, heap: &Heap, idx: usize) -> SlotName {
+        let v = self.constants.heap_ref(heap).at(heap, idx);
         let name = v
-            .get_as::<DenseString>(nogc)
+            .get_as::<DenseString>()
             .expect("property name constant must be an interned string");
         SlotName::from(name.into_tagged())
     }

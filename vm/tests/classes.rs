@@ -27,9 +27,10 @@ fn run_value(src: &str) -> (Value, Thread) {
 
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
-    if result == thread.heap().known().true_object.value() {
+    let heap = thread.heap();
+    if result == heap.known().true_object.as_tagged(heap).erase() {
         true
-    } else if result == thread.heap().known().false_object.value() {
+    } else if result == heap.known().false_object.as_tagged(heap).erase() {
         false
     } else {
         panic!("expected boolean result, got {result:?}");
@@ -38,9 +39,11 @@ fn run_bool(src: &str) -> bool {
 
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc| {
-        let s = result.get_as::<DenseString>(nogc).expect("string result");
-        s.to_rust_string(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { result.assume_valid(heap) }
+            .get_as::<DenseString>()
+            .expect("string result");
+        s.to_rust_string(heap)
     })
 }
 
@@ -48,26 +51,30 @@ fn run_str(src: &str) -> String {
 /// error's `name` (e.g. "TypeError", "ReferenceError").
 fn run_error_name(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    assert_eq!(
-        result,
-        thread.heap().known().exception.value(),
-        "script must terminate with an uncaught error"
-    );
+    {
+        let heap = thread.heap();
+        assert_eq!(
+            result,
+            heap.known().exception.as_tagged(heap).erase(),
+            "script must terminate with an uncaught error"
+        );
+    }
     assert!(thread.has_pending_exception());
     let ex = thread.take_pending_exception().expect("pending exception");
     thread.handle_scope(|thread, scope| {
-        let name_key = thread.intern(&scope, "name").value();
-        thread.heap().no_gc(|nogc| {
-            let o = ex
-                .as_heap_object(nogc)
+        let name = thread.intern(&scope, "name");
+        thread.heap().no_gc(|heap| {
+            let name_key = SlotName::from(name.as_tagged(heap));
+            let o = unsafe { ex.assume_valid(heap) }
+                .as_heap_object()
                 .expect("pending exception must be an object");
-            match o.as_ref().lookup(nogc, SlotName::from_value(name_key)) {
+            match o.as_ref().lookup(heap, name_key) {
                 vm::Lookup::Data { slot, .. } => {
                     let s = slot
-                        .inner()
-                        .get_as::<DenseString>(nogc)
+                        .get(heap)
+                        .get_as::<DenseString>()
                         .expect("error name is a string");
-                    s.to_rust_string(nogc)
+                    s.to_rust_string(heap)
                 }
                 _ => panic!("error object must have a name property"),
             }

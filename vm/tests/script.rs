@@ -28,23 +28,30 @@ fn run_value(src: &str) -> (Value, Thread) {
 
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
-    if result == thread.heap().known().true_object.value() {
+    let heap = thread.heap();
+    if result == heap.known().true_object.as_tagged(heap).erase() {
         true
-    } else if result == thread.heap().known().false_object.value() {
+    } else if result == heap.known().false_object.as_tagged(heap).erase() {
         false
     } else {
         panic!("expected boolean result, got {result:?}");
     }
 }
 
+/// The exception sentinel word for `thread`'s heap.
+fn exception_word(thread: &mut Thread) -> Value {
+    let heap = thread.heap();
+    heap.known().exception.as_tagged(heap).erase()
+}
+
 fn run_num(src: &str) -> f64 {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc| {
+    thread.heap().no_gc(|heap| {
         if let Some(smi) = Smi::decode(result) {
             return smi.value() as f64;
         }
-        result
-            .get_as::<Float>(nogc)
+        unsafe { result.assume_valid(heap) }
+            .get_as::<Float>()
             .expect("number result")
             .value
             .get()
@@ -53,15 +60,18 @@ fn run_num(src: &str) -> f64 {
 
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|nogc| {
-        let s = result.get_as::<DenseString>(nogc).expect("string result");
-        s.to_rust_string(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { result.assume_valid(heap) }
+            .get_as::<DenseString>()
+            .expect("string result");
+        s.to_rust_string(heap)
     })
 }
 
 fn run_undefined(src: &str) -> Value {
     let (result, mut thread) = run_value(src);
-    assert_eq!(result, thread.heap().known().undefined.value());
+    let heap = thread.heap();
+    assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
     result
 }
 
@@ -261,57 +271,63 @@ fn constructors_without_builtins_still_evaluate() {
 fn function_metadata_and_public_properties_survive_materialization() {
     let (function, mut thread) = run_value("(function named(a, b) { 'use strict'; });");
     thread.handle_scope(|thread, scope| {
-        let name = thread.intern(&scope, "name").value();
-        let length = thread.intern(&scope, "length").value();
-        let prototype = thread.intern(&scope, "prototype").value();
-        let constructor = thread.intern(&scope, "constructor").value();
-        let expected_name = thread.intern(&scope, "named").value();
-        thread.heap().no_gc(|nogc| {
+        let name = thread.intern(&scope, "name");
+        let length = thread.intern(&scope, "length");
+        let prototype = thread.intern(&scope, "prototype");
+        let constructor = thread.intern(&scope, "constructor");
+        let expected_name = thread.intern(&scope, "named");
+        thread.heap().no_gc(|heap| {
             let function_value = function;
-            let Some(function) = function.as_heap_object(nogc) else {
+            let Some(function) = unsafe { function.assume_valid(heap) }.as_heap_object() else {
                 panic!("result must be a function object")
             };
             let function = function.as_ref();
             let info = function
-                .callable_info(nogc)
+                .callable_info(heap)
                 .expect("function must carry callable info");
             assert_eq!(info.function_kind(), FunctionKind::Normal);
             assert_eq!(info.formal_parameter_count(), 2);
             assert!(info.is_strict());
-            assert_eq!(info.name(nogc), Some(expected_name));
+            assert_eq!(
+                info.name(heap).map(|v| v.erase()),
+                Some(expected_name.as_tagged(heap).erase())
+            );
 
-            match function.lookup(nogc, SlotName::from_value(name)) {
+            match function.lookup(heap, SlotName::from(name.as_tagged(heap))) {
                 Lookup::Data { slot, flags, .. } => {
-                    assert_eq!(slot.inner(), expected_name);
+                    assert_eq!(
+                        slot.get(heap).erase(),
+                        expected_name.as_tagged(heap).erase()
+                    );
                     assert!(!flags.is_writable());
                     assert!(!flags.is_enumerable());
                     assert!(flags.is_configurable());
                 }
                 _ => panic!("function must have a data name property"),
             }
-            match function.lookup(nogc, SlotName::from_value(length)) {
+            match function.lookup(heap, SlotName::from(length.as_tagged(heap))) {
                 Lookup::Data { slot, flags, .. } => {
-                    assert_eq!(Smi::decode(slot.inner()).unwrap().value(), 2);
+                    assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 2);
                     assert!(!flags.is_writable());
                     assert!(!flags.is_enumerable());
                     assert!(flags.is_configurable());
                 }
                 _ => panic!("function must have a data length property"),
             }
-            match function.lookup(nogc, SlotName::from_value(prototype)) {
+            match function.lookup(heap, SlotName::from(prototype.as_tagged(heap))) {
                 Lookup::Data { slot, flags, .. } => {
                     assert!(flags.is_writable());
                     assert!(!flags.is_enumerable());
                     assert!(!flags.is_configurable());
-                    let Some(prototype) = slot.inner().as_heap_object(nogc) else {
+                    let Some(prototype) = slot.get(heap).as_heap_object() else {
                         panic!("function prototype must be an object")
                     };
                     match prototype
                         .as_ref()
-                        .lookup(nogc, SlotName::from_value(constructor))
+                        .lookup(heap, SlotName::from(constructor.as_tagged(heap)))
                     {
                         Lookup::Data { slot, flags, .. } => {
-                            assert_eq!(slot.inner(), function_value);
+                            assert_eq!(slot.get(heap).erase(), function_value);
                             assert!(flags.is_writable());
                             assert!(!flags.is_enumerable());
                             assert!(flags.is_configurable());
@@ -332,12 +348,12 @@ fn arrows_and_methods_are_not_constructible() {
     let result = thread
         .run_script("var arrow = () => 1; var method = ({ m() { return 2; } }).m; new arrow();")
         .unwrap();
-    assert_eq!(result, thread.heap().known().exception.value());
+    assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
     let _ = thread.take_pending_exception();
 
     let result = thread.run_script("new ({ m() {} }).m();").unwrap();
-    assert_eq!(result, thread.heap().known().exception.value());
+    assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
 }
 
@@ -348,18 +364,23 @@ fn tdz_throws_on_let_before_init() {
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script("let x = x;").unwrap();
-    assert_eq!(result, thread.heap().known().exception.value());
+    assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
     let ex = thread.take_pending_exception().expect("pending exception");
     thread.handle_scope(|thread, scope| {
-        let name_key = thread.intern(&scope, "name").value();
-        let expected = thread.intern(&scope, "ReferenceError").value();
-        thread.heap().no_gc(|nogc| {
-            let Some(o) = ex.as_heap_object(nogc) else {
+        let name = thread.intern(&scope, "name");
+        let expected = thread.intern(&scope, "ReferenceError");
+        thread.heap().no_gc(|heap| {
+            let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
-                vm::Lookup::Data { slot, .. } => assert_eq!(slot.inner(), expected),
+            match o
+                .as_ref()
+                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
+            {
+                vm::Lookup::Data { slot, .. } => {
+                    assert_eq!(slot.get(heap).erase(), expected.as_tagged(heap).erase())
+                }
                 _ => panic!("error object must have a name property"),
             }
         });
@@ -367,7 +388,7 @@ fn tdz_throws_on_let_before_init() {
 
     // the hole survives frame reuse: run twice in a row
     let result = thread.run_script("let x = x;").unwrap();
-    assert_eq!(result, thread.heap().known().exception.value());
+    assert_eq!(result, exception_word(&mut thread));
     thread.take_pending_exception();
 }
 
@@ -376,7 +397,7 @@ fn uncaught_throw_escapes_as_exception() {
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_script("throw 42;").unwrap();
-    assert_eq!(result, thread.heap().known().exception.value());
+    assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
     thread.take_pending_exception();
 }
@@ -478,7 +499,7 @@ fn repl_mode_keeps_nested_scopes_local() {
     thread.run_script_repl("{ let inner = 5; }").unwrap();
     // `inner` was block-scoped: gone with the block, this throws
     let result = thread.run_script_repl("inner;").unwrap();
-    assert_eq!(result, thread.heap().known().exception.value());
+    assert_eq!(result, exception_word(&mut thread));
     thread.take_pending_exception();
 }
 
@@ -488,7 +509,7 @@ fn script_mode_top_level_bindings_do_not_persist() {
     let mut thread = vm.attach();
     thread.run_script("let x = 10;").unwrap();
     let result = thread.run_script("x;").unwrap();
-    assert_eq!(result, thread.heap().known().exception.value());
+    assert_eq!(result, exception_word(&mut thread));
     thread.take_pending_exception();
 }
 

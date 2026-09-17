@@ -1,7 +1,7 @@
 use core::alloc::Layout;
 
 use crate::{
-    EdgeVisitable, FixedArray, GcSlot, Handle, Header, HeapObject, NoGc, ObjectKind, OptionGcSlot,
+    EdgeVisitable, FixedArray, GcSlot, Handle, Header, Heap, HeapObject, ObjectKind, OptionGcSlot,
     Smi, Visitor,
 };
 
@@ -25,12 +25,12 @@ impl HeapObject for ScopeInfo {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().scope_info_map.as_tagged());
-        self.names.set(nogc, host, config.names.as_tagged());
+            .set(heap, host, heap.known().scope_info_map.as_tagged(heap));
+        self.names.set(heap, host, config.names.as_tagged(heap));
     }
 
     fn header(&self) -> &Header {
@@ -71,18 +71,18 @@ impl HeapObject for Context {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().context_map.as_tagged());
+            .set(heap, host, heap.known().context_map.as_tagged(heap));
         match config.outer {
-            Some(outer) => self.outer.set(nogc, host, outer),
-            None => self.outer.clear(nogc.heap()),
+            Some(outer) => self.outer.set(heap, host, outer.as_tagged(heap)),
+            None => self.outer.clear(heap),
         }
-        self.slots.set(nogc, host, config.slots.as_tagged());
+        self.slots.set(heap, host, config.slots.as_tagged(heap));
         self.scope_info
-            .set(nogc, host, config.scope_info.as_tagged());
+            .set(heap, host, config.scope_info.as_tagged(heap));
     }
 
     fn header(&self) -> &Header {
@@ -190,19 +190,19 @@ impl HeapObject for HandlerTable {
         Self::layout_for(config.entries.len())
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().handler_table_map.as_tagged());
+            .set(heap, host, heap.known().handler_table_map.as_tagged(heap));
         self.size
-            .set(nogc, host, Smi::new(config.entries.len() as i64));
+            .set(heap, host, Smi::new(config.entries.len() as i64));
         for (i, e) in config.entries.iter().enumerate() {
             let slot = unsafe { &*self.entry_ptr().add(i) };
-            slot.try_start.set(nogc, host, Smi::new(e.try_start as i64));
-            slot.try_end.set(nogc, host, Smi::new(e.try_end as i64));
+            slot.try_start.set(heap, host, Smi::new(e.try_start as i64));
+            slot.try_end.set(heap, host, Smi::new(e.try_end as i64));
             slot.handler_pc
-                .set(nogc, host, Smi::new(e.handler_pc as i64));
+                .set(heap, host, Smi::new(e.handler_pc as i64));
         }
     }
 

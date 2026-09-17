@@ -12,10 +12,13 @@ fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
-fn smi_add(_nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    let (a, b) = match (args.get(1), args.get(2)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return Err(VmError::Arity),
+fn smi_add(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+    let (a, b) = {
+        let heap = &*nctx.heap();
+        match (args.get(heap, 1), args.get(heap, 2)) {
+            (Some(a), Some(b)) => (a.erase(), b.erase()),
+            _ => return Err(VmError::Arity),
+        }
     };
     let (a, b) = (
         Smi::decode(a).ok_or(VmError::Type)?,
@@ -49,16 +52,16 @@ fn registered_native_invokes_and_checks_types() {
 #[test]
 fn native_result_is_boxed_when_not_smi() {
     fn fadd(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-        let (a, b) = match (args.get(1), args.get(2)) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Err(VmError::Arity),
-        };
-        let sum = nctx.heap().no_gc(|nogc| {
-            let fa = a.get_as::<Float>(nogc).ok_or(VmError::Type)?.value.get();
-            let fb = b.get_as::<Float>(nogc).ok_or(VmError::Type)?.value.get();
-            Ok::<_, VmError>(fa + fb)
+        let sum = nctx.heap().no_gc(|heap| {
+            let (a, b) = match (args.get(heap, 1), args.get(heap, 2)) {
+                (Some(a), Some(b)) => (a, b),
+                _ => return Err(VmError::Arity),
+            };
+            let fa = a.get_as::<Float>().ok_or(VmError::Type)?.value.get();
+            let fb = b.get_as::<Float>().ok_or(VmError::Type)?.value.get();
+            Ok::<f64, VmError>(fa + fb)
         })?;
-        nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum)))
+        nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum).erase()))
     }
 
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -67,9 +70,13 @@ fn native_result_is_boxed_when_not_smi() {
     let fa = float(&mut thread, 1.5);
     let fb = float(&mut thread, 2.25);
     let r = thread.run_native(fadd, &[smi(0), fa, fb]).unwrap();
-    let out = thread
-        .heap()
-        .no_gc(|nogc| r.get_as::<Float>(nogc).unwrap().value.get());
+    let out = thread.heap().no_gc(|heap| {
+        unsafe { r.assume_valid(heap) }
+            .get_as::<Float>()
+            .unwrap()
+            .value
+            .get()
+    });
     assert_eq!(out, 3.75);
 
     assert_eq!(
@@ -87,7 +94,11 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
     let result = unsafe { native_trampoline(idx.0, &mut thread, args.as_ptr(), args.len() as u32) };
 
-    assert_eq!(result, vm.known().exception.value());
+    let exception_word = {
+        let heap = thread.heap();
+        heap.known().exception.as_tagged(heap).erase()
+    };
+    assert_eq!(result, exception_word);
     let ex = thread
         .take_pending_exception()
         .expect("pending exception set");
@@ -95,35 +106,44 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
     // the pending value is a materialized TypeError object (Arity -> TypeError)
     let name = thread.handle_scope(|thread, scope| {
-        let name = thread.intern(&scope, "name").value();
-        let type_error = thread.intern(&scope, "TypeError").value();
-        thread.heap().no_gc(|nogc| {
-            let Some(o) = ex.as_heap_object(nogc) else {
+        let name = thread.intern(&scope, "name");
+        let type_error = thread.intern(&scope, "TypeError");
+        let (name_ok, type_error_word) = thread.heap().no_gc(|heap| {
+            let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name)) {
+            match o
+                .as_ref()
+                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
+            {
                 vm::Lookup::Data { slot, .. } => {
-                    assert_eq!(slot.inner(), type_error);
+                    let name_ok = slot.get(heap).erase() == type_error.as_tagged(heap).erase();
+                    (name_ok, type_error.as_tagged(heap).erase())
                 }
                 _ => panic!("error object must have a name property"),
             }
         });
-        type_error
+        assert!(name_ok, "error object must have a name property");
+        type_error_word
     });
-    assert_eq!(name, {
-        thread.handle_scope(|thread, scope| thread.intern(&scope, "TypeError").value())
+    let expected = thread.handle_scope(|thread, scope| {
+        let type_error = thread.intern(&scope, "TypeError");
+        let heap = &*thread.heap();
+        type_error.as_tagged(heap).erase()
     });
+    assert_eq!(name, expected);
 }
 
 #[test]
 fn register_native_appends_after_well_known() {
-    fn double(_nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-        match (args.get(1), args.get(2)) {
-            (Some(v), _) => {
-                let v = Smi::decode(v).ok_or(VmError::Type)?;
+    fn double(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+        let heap = &*nctx.heap();
+        match args.get(heap, 1) {
+            Some(v) => {
+                let v = Smi::decode(v.erase()).ok_or(VmError::Type)?;
                 Ok(Smi::new(v.value() * 2).encode())
             }
-            _ => Err(VmError::Arity),
+            None => Err(VmError::Arity),
         }
     }
 
