@@ -22,8 +22,8 @@ pub fn proxy_constructor(
     }
     let (target, handler) = nctx.heap().no_gc(|heap| {
         Ok((
-            args.get(heap, 1).ok_or(VmError::Type)?.erase(),
-            args.get(heap, 2).ok_or(VmError::Type)?.erase(),
+            args.get(heap, 1).ok_or(VmError::Type)?.raw(),
+            args.get(heap, 2).ok_or(VmError::Type)?.raw(),
         ))
     })?;
     let ok = nctx.heap().no_gc(|heap| {
@@ -43,7 +43,7 @@ pub fn proxy_constructor(
             unsafe { Tagged::<Value>::from_value_unchecked(target) },
             unsafe { Tagged::<Value>::from_value_unchecked(handler) },
         )
-        .erase())
+        .raw())
     })
 }
 
@@ -54,8 +54,8 @@ pub fn proxy_constructor(
 pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let (target, handler) = nctx.heap().no_gc(|heap| {
         Ok((
-            args.get(heap, 1).ok_or(VmError::Type)?.erase(),
-            args.get(heap, 2).ok_or(VmError::Type)?.erase(),
+            args.get(heap, 1).ok_or(VmError::Type)?.raw(),
+            args.get(heap, 2).ok_or(VmError::Type)?.raw(),
         ))
     })?;
     let ok = nctx.heap().no_gc(|heap| {
@@ -119,7 +119,7 @@ pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
 pub fn proxy_revoke(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let proxy = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
     revoke(
         nctx.heap(),
         // Safety: fresh argument word, consumed with no allocation delay.

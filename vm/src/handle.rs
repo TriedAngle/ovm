@@ -212,11 +212,11 @@ impl<'d> HandleScope<'d> {
     pub fn handle<'x, T: 'x>(&self, value: impl Into<Tagged<'x, T>>) -> Handle<'_, T> {
         let value = value.into();
         debug_assert!(
-            !value.erase().is_weak_ptr(),
+            !value.raw().is_weak_ptr(),
             "weak value cannot be rooted in a handle"
         );
         let slot = unsafe { &*self.data.as_ptr() }.inner().allocate_slot();
-        unsafe { *slot = value.erase() };
+        unsafe { *slot = value.raw() };
         unsafe { Handle::from_location(NonNull::new_unchecked(slot)) }
     }
 
@@ -227,13 +227,13 @@ impl<'d> HandleScope<'d> {
         let start = inner.allocate_block(values.len());
         for (i, v) in values.iter().enumerate() {
             debug_assert!(!v.is_weak_ptr(), "weak value staged for a call");
-            unsafe { *start.add(i) = v.erase() };
+            unsafe { *start.add(i) = v.raw() };
         }
         unsafe { GcSlice::from_slice(core::slice::from_raw_parts(start, values.len())) }
     }
 
     pub fn cast<T: HeapObject>(&self, value: Tagged<'_, Value>) -> Option<Handle<'_, T>> {
-        let ptr = HeapPtr::decode_strong(value.erase())?;
+        let ptr = HeapPtr::decode_strong(value.raw())?;
         // Safety: raw header read for a kind check.
         let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.inner();
         let kind = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() }
@@ -335,7 +335,7 @@ impl RootHandles {
         let i = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(i < self.slots.len(), "root handle table exhausted");
         let slot = GcSlot::raw_get(&self.slots[i]);
-        unsafe { *slot = value.erase() };
+        unsafe { *slot = value.raw() };
         unsafe { Handle::from_location(NonNull::new_unchecked(slot)) }
     }
 }

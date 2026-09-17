@@ -57,8 +57,8 @@ pub fn materialize_closure_vm<'s>(
 
     let map = heap.known().function_map;
     let slots = scope.stage(&[
-        info.as_tagged(heap).erase_type(),
-        context.as_tagged(heap).erase_type(),
+        info.as_tagged(heap).erase(),
+        context.as_tagged(heap).erase(),
     ]);
     let object = heap.new_object(scope, map, slots).into_handle(scope);
     Ok(object)
@@ -148,7 +148,7 @@ fn materialize_function<'s>(
     heap.no_gc(|heap| {
         info.heap_ref(heap).set_metadata_full(
             heap,
-            name.map(|h| h.as_tagged(heap).erase_type()),
+            name.map(|h| h.as_tagged(heap).erase()),
             function.formal_parameter_count as usize,
             function.formal_length as usize,
             kind,

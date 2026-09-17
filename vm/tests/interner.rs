@@ -16,8 +16,8 @@ fn interning_deduplicates_and_preserves_content() {
         let (ab_eq, ac_ne) = {
             let heap = &*ctx.heap();
             (
-                a.as_tagged(heap).erase().to_bits() == b.as_tagged(heap).erase().to_bits(),
-                a.as_tagged(heap).erase().to_bits() != c.as_tagged(heap).erase().to_bits(),
+                a.as_tagged(heap).raw().to_bits() == b.as_tagged(heap).raw().to_bits(),
+                a.as_tagged(heap).raw().to_bits() != c.as_tagged(heap).raw().to_bits(),
             )
         };
         assert!(ab_eq);
@@ -38,7 +38,7 @@ fn interning_deduplicates_and_preserves_content() {
         let d = ctx.intern(&scope, &text);
         let bits_eq = {
             let heap = &*ctx.heap();
-            a.as_tagged(heap).erase().to_bits() == d.as_tagged(heap).erase().to_bits()
+            a.as_tagged(heap).raw().to_bits() == d.as_tagged(heap).raw().to_bits()
         };
         assert!(bits_eq);
     });
@@ -60,8 +60,8 @@ fn interning_compresses_utf16_to_latin1() {
         let canonical = vm.interner().intern_value(ctx.heap(), &scope, &again);
         let bits_eq = {
             let heap = &*ctx.heap();
-            latin1_content.as_tagged(heap).erase().to_bits()
-                == canonical.as_tagged(heap).erase().to_bits()
+            latin1_content.as_tagged(heap).raw().to_bits()
+                == canonical.as_tagged(heap).raw().to_bits()
         };
         assert!(bits_eq);
 
@@ -90,7 +90,7 @@ fn interning_is_thread_safe() {
     let expected = ctx.handle_scope(|ctx, scope| {
         let shared = ctx.intern(&scope, "shared");
         let heap = &*ctx.heap();
-        shared.as_tagged(heap).erase().to_bits()
+        shared.as_tagged(heap).raw().to_bits()
     });
 
     let mut threads = Vec::new();
@@ -101,7 +101,7 @@ fn interning_is_thread_safe() {
             ctx.handle_scope(|ctx, scope| {
                 let shared = ctx.intern(&scope, "shared");
                 let heap = &*ctx.heap();
-                shared.as_tagged(heap).erase().to_bits()
+                shared.as_tagged(heap).raw().to_bits()
             })
         }));
     }

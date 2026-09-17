@@ -16,7 +16,7 @@ pub fn array_constructor(
         let (_, heap, _) = nctx.split();
         let argv: Vec<Tagged<'_, Value>> = args.iter(heap).skip(1).collect();
         let single_len = match argv.as_slice() {
-            [v] => match Smi::decode(v.erase()) {
+            [v] => match Smi::decode(v.raw()) {
                 Some(s) if s.value() >= 0 => {
                     Some(usize::try_from(s.value()).map_err(|_| VmError::OutOfBounds)?)
                 }
@@ -25,7 +25,7 @@ pub fn array_constructor(
             },
             _ => None,
         };
-        let hole = heap.known().the_hole.as_tagged(heap).erase_type();
+        let hole = heap.known().the_hole.as_tagged(heap).erase();
         let (values, _length) = match single_len {
             Some(n) => (vec![hole; n], n),
             None => {
@@ -35,7 +35,7 @@ pub fn array_constructor(
         };
 
         let staged = scope.stage(&values);
-        Ok(heap.new_array(&scope, staged).erase_type().erase())
+        Ok(heap.new_array(&scope, staged).erase().raw())
     })
 }
 
@@ -47,7 +47,7 @@ pub fn array_values(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         let is_array = receiver
             .as_heap_object()
             .is_some_and(|o| o.as_ref().is_array(heap));
-        Ok::<_, VmError>((receiver.erase(), is_array))
+        Ok::<_, VmError>((receiver.raw(), is_array))
     })?;
     if !is_array {
         // Array.prototype[Symbol.iterator] called on a non-array: per spec
@@ -62,8 +62,8 @@ pub fn array_values(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         let recv = unsafe { Tagged::<Value>::from_value_unchecked(receiver) };
         Ok(heap
             .new_object(&scope, map, scope.stage(&[recv, Smi::new(0).into_tagged()]))
-            .erase_type()
-            .erase())
+            .erase()
+            .raw())
     })
 }
 
@@ -77,7 +77,7 @@ pub fn array_iterator_next(
     // final re-reads under `no_gc` anchors.
     let receiver = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()))?;
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
         let (array, index) = heap.no_gc(|heap| {
@@ -88,7 +88,7 @@ pub fn array_iterator_next(
             if slots.len() < 2 {
                 return Err(VmError::Type);
             }
-            Ok((scope.handle(slots.at(heap, 0)), slots.at(heap, 1).erase()))
+            Ok((scope.handle(slots.at(heap, 0)), slots.at(heap, 1).raw()))
         })?;
         let Some(index) = Smi::decode(index) else {
             return Err(VmError::Type);
@@ -105,8 +105,8 @@ pub fn array_iterator_next(
         };
         let (value, done_value) = if done {
             (
-                scope.handle(heap.known().undefined.as_tagged(heap).erase_type()),
-                scope.handle(heap.known().true_object.as_tagged(heap).erase_type()),
+                scope.handle(heap.known().undefined.as_tagged(heap).erase()),
+                scope.handle(heap.known().true_object.as_tagged(heap).erase()),
             )
         } else {
             // element reads see holes as undefined
@@ -116,12 +116,12 @@ pub fn array_iterator_next(
                         .as_tagged(heap)
                         .as_heap_object()
                         .and_then(|o| o.as_ref().element_value(heap, index.value() as usize))
-                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase_type()),
+                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase()),
                 )
             });
             (
                 v,
-                scope.handle(heap.known().false_object.as_tagged(heap).erase_type()),
+                scope.handle(heap.known().false_object.as_tagged(heap).erase()),
             )
         };
         // advance the index slot
@@ -139,12 +139,12 @@ pub fn array_iterator_next(
                 &scope,
                 map,
                 scope.stage(&[
-                    value.as_tagged(heap).erase_type(),
-                    done_value.as_tagged(heap).erase_type(),
+                    value.as_tagged(heap).erase(),
+                    done_value.as_tagged(heap).erase(),
                 ]),
             )
-            .erase_type()
-            .erase())
+            .erase()
+            .raw())
     })
 }
 
@@ -154,7 +154,7 @@ pub fn array_iterator_symbol_iterator(
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.heap()
-        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))
+        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()))
 }
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).
@@ -165,6 +165,6 @@ pub fn array_is_array(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
             .ok_or(VmError::Arity)?
             .as_heap_object()
             .is_some_and(|o| o.as_ref().is_array(heap));
-        Ok(Convert::boolean(heap, is_array).erase())
+        Ok(Convert::boolean(heap, is_array).raw())
     })
 }

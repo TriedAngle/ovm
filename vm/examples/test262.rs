@@ -273,7 +273,7 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
             if {
                 thread
                     .heap()
-                    .no_gc(|heap| v == heap.known().exception.as_tagged(heap).erase())
+                    .no_gc(|heap| v == heap.known().exception.as_tagged(heap).raw())
             } =>
         {
             let name = exception_name(&mut thread);

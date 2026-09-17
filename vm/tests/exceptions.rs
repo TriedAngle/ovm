@@ -44,8 +44,8 @@ fn callable(
     let values = {
         let heap = &*thread.heap();
         scope.stage(&[
-            info.as_tagged(heap).erase_type(),
-            empty_context.as_tagged(heap).erase_type(),
+            info.as_tagged(heap).erase(),
+            empty_context.as_tagged(heap).erase(),
         ])
     };
     thread
@@ -59,7 +59,7 @@ fn callable(
                 length: 0,
             },
         )
-        .erase()
+        .raw()
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn throw_any_value_escapes_as_sentinel() {
     });
     let exception_word = {
         let heap = thread.heap();
-        heap.known().exception.as_tagged(heap).erase()
+        heap.known().exception.as_tagged(heap).raw()
     };
     assert_eq!(result, Ok(exception_word));
     assert_eq!(
@@ -240,7 +240,7 @@ fn rethrow_from_finally_escapes_past_its_own_handler() {
     });
     let exception_word = {
         let heap = thread.heap();
-        heap.known().exception.as_tagged(heap).erase()
+        heap.known().exception.as_tagged(heap).raw()
     };
     assert_eq!(result, Ok(exception_word));
     assert_eq!(thread.take_pending_exception(), Some(smi(3)));
@@ -268,14 +268,14 @@ fn stack_overflow_during_call_is_throwable() {
     });
     let exception_word = {
         let heap = thread.heap();
-        heap.known().exception.as_tagged(heap).erase()
+        heap.known().exception.as_tagged(heap).raw()
     };
     assert_eq!(result, Ok(exception_word));
     let ex = thread.take_pending_exception().expect("pending exception");
     let expected = thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "RangeError");
         let heap = &*thread.heap();
-        name.as_tagged(heap).erase()
+        name.as_tagged(heap).raw()
     });
     thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name");
@@ -286,7 +286,7 @@ fn stack_overflow_during_call_is_throwable() {
             match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => {
                     assert_eq!(
-                        slot.get(heap).erase(),
+                        slot.get(heap).raw(),
                         expected,
                         "stack overflow -> RangeError"
                     );

@@ -9,17 +9,17 @@ impl Convert {
     /// everything else is truthy.
     pub fn is_truthy(heap: &Heap, v: Tagged<'_, Value>) -> bool {
         let known = heap.known();
-        if let Some(smi) = Smi::decode(v.erase()) {
+        if let Some(smi) = Smi::decode(v.raw()) {
             return smi.value() != 0;
         }
-        if v.erase() == known.false_object.as_tagged(heap).erase()
-            || v.erase() == known.undefined.as_tagged(heap).erase()
-            || v.erase() == known.null.as_tagged(heap).erase()
-            || v.erase() == known.the_hole.as_tagged(heap).erase()
+        if v.raw() == known.false_object.as_tagged(heap).raw()
+            || v.raw() == known.undefined.as_tagged(heap).raw()
+            || v.raw() == known.null.as_tagged(heap).raw()
+            || v.raw() == known.the_hole.as_tagged(heap).raw()
         {
             return false;
         }
-        if v.erase() == known.true_object.as_tagged(heap).erase() {
+        if v.raw() == known.true_object.as_tagged(heap).raw() {
             return true;
         }
         if let Some(f) = v.get_as::<Float>() {
@@ -35,21 +35,21 @@ impl Convert {
 
     pub fn to_number(heap: &Heap, v: Tagged<'_, Value>) -> Result<f64, VmError> {
         let known = heap.known();
-        if let Some(smi) = Smi::decode(v.erase()) {
+        if let Some(smi) = Smi::decode(v.raw()) {
             return Ok(smi.value() as f64);
         }
-        if v.erase() == known.undefined.as_tagged(heap).erase()
-            || v.erase() == known.the_hole.as_tagged(heap).erase()
+        if v.raw() == known.undefined.as_tagged(heap).raw()
+            || v.raw() == known.the_hole.as_tagged(heap).raw()
         {
             return Ok(f64::NAN);
         }
-        if v.erase() == known.null.as_tagged(heap).erase() {
+        if v.raw() == known.null.as_tagged(heap).raw() {
             return Ok(0.0);
         }
-        if v.erase() == known.false_object.as_tagged(heap).erase() {
+        if v.raw() == known.false_object.as_tagged(heap).raw() {
             return Ok(0.0);
         }
-        if v.erase() == known.true_object.as_tagged(heap).erase() {
+        if v.raw() == known.true_object.as_tagged(heap).raw() {
             return Ok(1.0);
         }
         if let Some(f) = v.get_as::<Float>() {
@@ -103,9 +103,9 @@ impl Convert {
     pub fn boolean<'a>(heap: &'a Heap, b: bool) -> Tagged<'a, Value> {
         let known = heap.known();
         if b {
-            known.true_object.as_tagged(heap).erase_type()
+            known.true_object.as_tagged(heap).erase()
         } else {
-            known.false_object.as_tagged(heap).erase_type()
+            known.false_object.as_tagged(heap).erase()
         }
     }
 
@@ -116,10 +116,10 @@ impl Convert {
         if v.is_smi() {
             return true;
         }
-        v.erase() == known.undefined.as_tagged(heap).erase()
-            || v.erase() == known.null.as_tagged(heap).erase()
-            || v.erase() == known.true_object.as_tagged(heap).erase()
-            || v.erase() == known.false_object.as_tagged(heap).erase()
+        v.raw() == known.undefined.as_tagged(heap).raw()
+            || v.raw() == known.null.as_tagged(heap).raw()
+            || v.raw() == known.true_object.as_tagged(heap).raw()
+            || v.raw() == known.false_object.as_tagged(heap).raw()
             || v.get_as::<Float>().is_some()
             || v.get_as::<DenseString>().is_some()
             || v.get_as::<Symbol>().is_some()
@@ -148,16 +148,16 @@ impl Convert {
         let kind = heap.no_gc(|heap| {
             let vt = v.as_tagged(heap);
             let known = heap.known();
-            let word = vt.erase();
+            let word = vt.raw();
             if let Some(smi) = Smi::decode(word) {
                 PrimitiveString::Smi(smi.value())
-            } else if word == known.undefined.as_tagged(heap).erase() {
+            } else if word == known.undefined.as_tagged(heap).raw() {
                 PrimitiveString::Undefined
-            } else if word == known.null.as_tagged(heap).erase() {
+            } else if word == known.null.as_tagged(heap).raw() {
                 PrimitiveString::Null
-            } else if word == known.true_object.as_tagged(heap).erase() {
+            } else if word == known.true_object.as_tagged(heap).raw() {
                 PrimitiveString::True
-            } else if word == known.false_object.as_tagged(heap).erase() {
+            } else if word == known.false_object.as_tagged(heap).raw() {
                 PrimitiveString::False
             } else if vt.get_as::<DenseString>().is_some() {
                 PrimitiveString::IsString
@@ -170,16 +170,16 @@ impl Convert {
         match kind {
             PrimitiveString::Smi(n) => {
                 let s = DenseString::from_utf8(heap, scope, &n.to_string());
-                Ok(s.as_tagged(heap).erase_type())
+                Ok(s.as_tagged(heap).erase())
             }
             // strings are their own stringification
             PrimitiveString::IsString => Ok(v.as_tagged(heap)),
             PrimitiveString::Undefined => {
-                Ok(heap.known().strings.undefined.as_tagged(heap).erase_type())
+                Ok(heap.known().strings.undefined.as_tagged(heap).erase())
             }
-            PrimitiveString::Null => Ok(heap.known().strings.null.as_tagged(heap).erase_type()),
-            PrimitiveString::True => Ok(heap.known().strings.true_.as_tagged(heap).erase_type()),
-            PrimitiveString::False => Ok(heap.known().strings.false_.as_tagged(heap).erase_type()),
+            PrimitiveString::Null => Ok(heap.known().strings.null.as_tagged(heap).erase()),
+            PrimitiveString::True => Ok(heap.known().strings.true_.as_tagged(heap).erase()),
+            PrimitiveString::False => Ok(heap.known().strings.false_.as_tagged(heap).erase()),
             PrimitiveString::Float(x) => {
                 let text = if x.is_nan() {
                     "NaN".to_string()
@@ -191,7 +191,7 @@ impl Convert {
                     format!("{x}")
                 };
                 let s = DenseString::from_utf8(heap, scope, &text);
-                Ok(s.as_tagged(heap).erase_type())
+                Ok(s.as_tagged(heap).erase())
             }
             // symbols (and anything else reaching this point) are a TypeError
             PrimitiveString::Other => Err(VmError::Type),

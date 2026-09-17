@@ -8,16 +8,13 @@ use base_compiler::compile_eval;
 pub fn eval_native(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // root the caller context before the allocating ToString below
-        // Safety: register/root-slot words, fresh at entry.
-        let context = scope.handle(unsafe {
-            Tagged::<Value>::from_value_unchecked(nctx.current_context().ok_or(VmError::Type)?)
-        });
-        let (_vm, heap, _) = nctx.split();
-        let src = heap.no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
+        let (_vm, heap, state) = nctx.split();
+        let context = scope.handle(state.current_context(heap).ok_or(VmError::Type)?);
+        let src = heap.no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
         // Safety: fresh argument word, consumed before any allocation.
         let src = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(src) });
         let s = Convert::to_string(heap, &scope, src)?;
-        let s = s.erase();
+        let s = s.raw();
         let text = heap.no_gc(|heap| {
             // Safety: fresh word, no allocation since the read.
             unsafe { s.assume_valid(heap) }
@@ -64,7 +61,7 @@ pub fn is_nan(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, 
         let arg = heap.no_gc(|heap| {
             let v = args
                 .get(heap, 1)
-                .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase_type());
+                .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
             scope.handle(v)
         });
         Runtime::to_numeric(vm, heap, state, arg)
@@ -76,5 +73,5 @@ pub fn is_nan(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, 
 
     Ok(nctx
         .heap()
-        .no_gc(|heap| Convert::boolean(heap, n.is_nan()).erase()))
+        .no_gc(|heap| Convert::boolean(heap, n.is_nan()).raw()))
 }

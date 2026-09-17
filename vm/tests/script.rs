@@ -29,9 +29,9 @@ fn run_value(src: &str) -> (Value, Thread) {
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
     let heap = thread.heap();
-    if result == heap.known().true_object.as_tagged(heap).erase() {
+    if result == heap.known().true_object.as_tagged(heap).raw() {
         true
-    } else if result == heap.known().false_object.as_tagged(heap).erase() {
+    } else if result == heap.known().false_object.as_tagged(heap).raw() {
         false
     } else {
         panic!("expected boolean result, got {result:?}");
@@ -41,7 +41,7 @@ fn run_bool(src: &str) -> bool {
 /// The exception sentinel word for `thread`'s heap.
 fn exception_word(thread: &mut Thread) -> Value {
     let heap = thread.heap();
-    heap.known().exception.as_tagged(heap).erase()
+    heap.known().exception.as_tagged(heap).raw()
 }
 
 fn run_num(src: &str) -> f64 {
@@ -71,7 +71,7 @@ fn run_str(src: &str) -> String {
 fn run_undefined(src: &str) -> Value {
     let (result, mut thread) = run_value(src);
     let heap = thread.heap();
-    assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
+    assert_eq!(result, heap.known().undefined.as_tagged(heap).raw());
     result
 }
 
@@ -289,16 +289,13 @@ fn function_metadata_and_public_properties_survive_materialization() {
             assert_eq!(info.formal_parameter_count(), 2);
             assert!(info.is_strict());
             assert_eq!(
-                info.name(heap).map(|v| v.erase()),
-                Some(expected_name.as_tagged(heap).erase())
+                info.name(heap).map(|v| v.raw()),
+                Some(expected_name.as_tagged(heap).raw())
             );
 
             match function.lookup(heap, name.as_tagged(heap).into()) {
                 Lookup::Data { slot, flags, .. } => {
-                    assert_eq!(
-                        slot.get(heap).erase(),
-                        expected_name.as_tagged(heap).erase()
-                    );
+                    assert_eq!(slot.get(heap).raw(), expected_name.as_tagged(heap).raw());
                     assert!(!flags.is_writable());
                     assert!(!flags.is_enumerable());
                     assert!(flags.is_configurable());
@@ -307,7 +304,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
             }
             match function.lookup(heap, length.as_tagged(heap).into()) {
                 Lookup::Data { slot, flags, .. } => {
-                    assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 2);
+                    assert_eq!(Smi::decode(slot.get(heap).raw()).unwrap().value(), 2);
                     assert!(!flags.is_writable());
                     assert!(!flags.is_enumerable());
                     assert!(flags.is_configurable());
@@ -327,7 +324,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                         .lookup(heap, constructor.as_tagged(heap).into())
                     {
                         Lookup::Data { slot, flags, .. } => {
-                            assert_eq!(slot.get(heap).erase(), function_value);
+                            assert_eq!(slot.get(heap).raw(), function_value);
                             assert!(flags.is_writable());
                             assert!(!flags.is_enumerable());
                             assert!(flags.is_configurable());
@@ -376,7 +373,7 @@ fn tdz_throws_on_let_before_init() {
             };
             match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => {
-                    assert_eq!(slot.get(heap).erase(), expected.as_tagged(heap).erase())
+                    assert_eq!(slot.get(heap).raw(), expected.as_tagged(heap).raw())
                 }
                 _ => panic!("error object must have a name property"),
             }

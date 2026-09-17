@@ -15,21 +15,21 @@ where
     let heap = &*thread.heap();
     let known = vm.known();
     let values = [
-        known.map_map.as_tagged(heap).erase(),
-        known.the_hole.as_tagged(heap).erase(),
-        known.undefined.as_tagged(heap).erase(),
-        known.null.as_tagged(heap).erase(),
-        known.smi_map.as_tagged(heap).erase(),
-        known.float_map.as_tagged(heap).erase(),
-        known.array_map.as_tagged(heap).erase(),
-        known.dense_latin1_string_map.as_tagged(heap).erase(),
-        known.dense_utf16_string_map.as_tagged(heap).erase(),
-        known.object_prototype.as_tagged(heap).erase(),
-        known.object_initial_map.as_tagged(heap).erase(),
-        known.empty_fixed_array.as_tagged(heap).erase(),
-        known.empty_context.as_tagged(heap).erase(),
-        known.strings.length.as_tagged(heap).erase(),
-        known.strings.prototype.as_tagged(heap).erase(),
+        known.map_map.as_tagged(heap).raw(),
+        known.the_hole.as_tagged(heap).raw(),
+        known.undefined.as_tagged(heap).raw(),
+        known.null.as_tagged(heap).raw(),
+        known.smi_map.as_tagged(heap).raw(),
+        known.float_map.as_tagged(heap).raw(),
+        known.array_map.as_tagged(heap).raw(),
+        known.dense_latin1_string_map.as_tagged(heap).raw(),
+        known.dense_utf16_string_map.as_tagged(heap).raw(),
+        known.object_prototype.as_tagged(heap).raw(),
+        known.object_initial_map.as_tagged(heap).raw(),
+        known.empty_fixed_array.as_tagged(heap).raw(),
+        known.empty_context.as_tagged(heap).raw(),
+        known.strings.length.as_tagged(heap).raw(),
+        known.strings.prototype.as_tagged(heap).raw(),
     ];
     for value in values {
         assert!(value.is_strong_ptr());
@@ -42,8 +42,8 @@ where
         let heap = &*t.heap();
         assert_eq!(
             // Interned names compare by word identity.
-            again.as_tagged(heap).erase().to_bits(),
-            known.strings.length.as_tagged(heap).erase().to_bits()
+            again.as_tagged(heap).raw().to_bits(),
+            known.strings.length.as_tagged(heap).raw().to_bits()
         );
         let _ = scope;
     });
@@ -61,26 +61,23 @@ where
         {
             let staged = {
                 let heap = &*t.heap();
-                scope.stage(&[
-                    Smi::new(42).into_tagged(),
-                    string.as_tagged(heap).erase_type(),
-                ])
+                scope.stage(&[Smi::new(42).into_tagged(), string.as_tagged(heap).erase()])
             };
             let array = t.heap().allocate_handle::<FixedArray>(staged, &scope);
             let before = (
-                string.as_tagged(&*t.heap()).erase().to_bits(),
-                array.as_tagged(&*t.heap()).erase().to_bits(),
+                string.as_tagged(&*t.heap()).raw().to_bits(),
+                array.as_tagged(&*t.heap()).raw().to_bits(),
             );
 
             t.heap().collect();
             t.heap().collect();
 
-            assert_eq!(string.as_tagged(&*t.heap()).erase().to_bits(), before.0);
-            assert_eq!(array.as_tagged(&*t.heap()).erase().to_bits(), before.1);
+            assert_eq!(string.as_tagged(&*t.heap()).raw().to_bits(), before.0);
+            assert_eq!(array.as_tagged(&*t.heap()).raw().to_bits(), before.1);
             t.heap().no_gc(|heap| {
                 let array = array.heap_ref(heap);
-                assert_eq!(Smi::decode(array.at(heap, 0).erase()).unwrap().value(), 42);
-                assert_eq!(array.at(heap, 1).erase(), string.as_tagged(heap).erase());
+                assert_eq!(Smi::decode(array.at(heap, 0).raw()).unwrap().value(), 42);
+                assert_eq!(array.at(heap, 1).raw(), string.as_tagged(heap).raw());
                 let string = string.heap_ref(heap);
                 assert!(string.data(heap).matches_ascii(b"survivor"));
             });

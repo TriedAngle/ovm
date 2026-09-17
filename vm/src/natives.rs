@@ -185,8 +185,8 @@ impl<'a> NativeContext<'a> {
     }
 
     /// The current frame's context (direct eval chains to it).
-    pub fn current_context(&self) -> Option<Value> {
-        self.state.current_context()
+    pub fn current_context<'h>(&self, heap: &'h Heap) -> Option<Tagged<'h, Value>> {
+        self.state.current_context(heap)
     }
 }
 

@@ -26,7 +26,7 @@ fn empty_context_is_the_well_known_root() {
     let heap = thread.heap();
     assert_eq!(
         outer,
-        heap.known().the_hole.as_tagged(heap).erase(),
+        heap.known().the_hole.as_tagged(heap).raw(),
         "no outer context"
     );
     assert_eq!(len, 0, "no context slots");
@@ -65,7 +65,7 @@ fn contexts_chain_through_outer() {
         let (own, via_outer) = thread.heap().no_gc(|heap| {
             let o = outer.heap_ref(heap).as_ref();
             (
-                o.slots.heap_ref(heap).at(heap, 0).erase(),
+                o.slots.heap_ref(heap).at(heap, 0).raw(),
                 o.outer
                     .heap_ref(heap)
                     .expect("outer context")
@@ -73,7 +73,7 @@ fn contexts_chain_through_outer() {
                     .slots
                     .heap_ref(heap)
                     .at(heap, 0)
-                    .erase(),
+                    .raw(),
             )
         });
         assert_eq!(own.to_i64().unwrap(), 7);
@@ -119,8 +119,8 @@ fn closure_object_carries_typed_context() {
         let values = {
             let heap = &*thread.heap();
             scope.stage(&[
-                info.as_tagged(heap).erase_type(),
-                context.as_tagged(heap).erase_type(),
+                info.as_tagged(heap).erase(),
+                context.as_tagged(heap).erase(),
             ])
         };
         let obj = thread
@@ -142,7 +142,7 @@ fn closure_object_carries_typed_context() {
                 .as_ref()
                 .closure_context(heap)
                 .expect("context must be typed as Context");
-            context.slots.heap_ref(heap).at(heap, 0).erase()
+            context.slots.heap_ref(heap).at(heap, 0).raw()
         });
         assert_eq!(slot0.to_i64().unwrap(), 9);
     });

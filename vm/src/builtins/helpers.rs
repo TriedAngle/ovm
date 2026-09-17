@@ -266,5 +266,5 @@ pub fn wrapper_value(heap: &Heap, receiver: Tagged<'_, Value>) -> Result<Value, 
     if !map.kind().contains(MapKind::PRIMITIVE_WRAPPER) {
         return Err(VmError::Type);
     }
-    Ok(obj.as_ref().slots.heap_ref(heap).at(heap, 0).erase())
+    Ok(obj.as_ref().slots.heap_ref(heap).at(heap, 0).raw())
 }

@@ -33,13 +33,13 @@ impl Runtime {
         heap: &'a mut Heap,
         scope: &HandleScope<'_>,
         info: Handle<'_, CallableInfoObject>,
-        context: Tagged<'_, Value>,
+        context: Handle<'_, Context>,
     ) -> Result<Tagged<'a, Value>, VmError> {
         let (kind, source_name, formal_length) = heap.no_gc(|heap| {
             let info = info.heap_ref(heap);
             (
                 info.function_kind(),
-                info.name(heap).map(|name| name.erase()),
+                info.name(heap).map(|name| name.raw()),
                 info.formal_length(),
             )
         });
@@ -47,32 +47,31 @@ impl Runtime {
             // Safety: the word was read under an anchor one statement ago;
             // no allocation has run since.
             Some(name) => scope.handle(unsafe { name.assume_valid(heap) }),
-            None => heap.no_gc(|heap| {
-                scope.handle(heap.known().strings.empty.as_tagged(heap).erase_type())
-            }),
+            None => {
+                heap.no_gc(|heap| scope.handle(heap.known().strings.empty.as_tagged(heap).erase()))
+            }
         };
         let map = match kind {
             kind if kind.is_class_constructor() => heap.known().class_constructor_map,
             kind if kind.is_constructible() => heap.known().function_map,
             _ => heap.known().non_constructor_function_map,
         };
-        let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
         // class constructors carry a third hidden slot: the instance-field
         // array ([key0, init0, ...]); undefined until SetClassFields
         let function = if kind.is_class_constructor() {
             let args = heap.no_gc(|heap| {
                 scope.stage(&[
-                    info.as_tagged(heap).erase_type(),
-                    context.as_tagged(heap).erase_type(),
-                    heap.known().undefined.as_tagged(heap).erase_type(),
+                    info.as_tagged(heap).erase(),
+                    context.as_tagged(heap).erase(),
+                    heap.known().undefined.as_tagged(heap).erase(),
                 ])
             });
             heap.new_object(scope, map, args).into_handle(scope)
         } else {
             let args = heap.no_gc(|heap| {
                 scope.stage(&[
-                    info.as_tagged(heap).erase_type(),
-                    context.as_tagged(heap).erase_type(),
+                    info.as_tagged(heap).erase(),
+                    context.as_tagged(heap).erase(),
                 ])
             });
             heap.new_object(scope, map, args).into_handle(scope)
@@ -151,7 +150,7 @@ impl Runtime {
 
         // fresh word under a final shared reborrow; anchored at the `&mut`
         // borrow, so callers must store or root it before allocating
-        Ok(function.as_tagged(heap).erase_type())
+        Ok(function.as_tagged(heap).erase())
     }
 
     /// ES 7.1.1 ToPrimitive. Primitives pass through untouched. `value` is a
@@ -171,29 +170,24 @@ impl Runtime {
         // below run user code (getters, valueOf/toString), which allocates
         // and would leave a raw copy dangling
         state.handle_scope(|scope| {
-            let (exception, to_primitive_symbol, undefined, null) = heap.no_gc(|heap| {
+            let (exception, undefined, null) = heap.no_gc(|heap| {
                 let known = heap.known();
                 (
-                    known.exception.as_tagged(heap).erase(),
-                    known.to_primitive_symbol.as_tagged(heap).erase(),
-                    known.undefined.as_tagged(heap).erase(),
-                    known.null.as_tagged(heap).erase(),
+                    known.exception.as_tagged(heap).raw(),
+                    known.undefined.as_tagged(heap).raw(),
+                    known.null.as_tagged(heap).raw(),
                 )
             });
 
-            let to_primitive_symbol = scope.handle(
-                heap.known()
-                    .to_primitive_symbol
-                    .as_tagged(heap)
-                    .erase_type(),
-            );
+            let to_primitive_symbol =
+                scope.handle(heap.known().to_primitive_symbol.as_tagged(heap).erase());
             // 1. exotic @@toPrimitive (GetMethod)
             let exotic = Self::get_property(vm, heap, state, value, to_primitive_symbol)?;
             let exotic = match exotic {
                 Coercion::Threw => return Ok(Coercion::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let exotic_word = exotic.as_tagged(heap).erase();
+            let exotic_word = exotic.as_tagged(heap).raw();
             if exotic_word != undefined && exotic_word != null {
                 if !Self::is_callable(heap, exotic_word) {
                     // GetMethod: a non-callable, non-nullish method is a TypeError
@@ -202,9 +196,9 @@ impl Runtime {
                 let hint_string = heap.no_gc(|heap| {
                     let s = heap.known().strings;
                     match hint {
-                        Hint::Default => s.default.as_tagged(heap).erase(),
-                        Hint::Number => s.number.as_tagged(heap).erase(),
-                        Hint::String => s.string.as_tagged(heap).erase(),
+                        Hint::Default => s.default.as_tagged(heap).raw(),
+                        Hint::Number => s.number.as_tagged(heap).raw(),
+                        Hint::String => s.string.as_tagged(heap).raw(),
                     }
                 });
                 let args =
@@ -230,13 +224,13 @@ impl Runtime {
                 let s = heap.known().strings;
                 if hint == Hint::String {
                     [
-                        scope.handle(s.to_string.as_tagged(heap).erase_type()),
-                        scope.handle(s.value_of.as_tagged(heap).erase_type()),
+                        scope.handle(s.to_string.as_tagged(heap).erase()),
+                        scope.handle(s.value_of.as_tagged(heap).erase()),
                     ]
                 } else {
                     [
-                        scope.handle(s.value_of.as_tagged(heap).erase_type()),
-                        scope.handle(s.to_string.as_tagged(heap).erase_type()),
+                        scope.handle(s.value_of.as_tagged(heap).erase()),
+                        scope.handle(s.to_string.as_tagged(heap).erase()),
                     ]
                 }
             });
@@ -246,11 +240,11 @@ impl Runtime {
                     Coercion::Threw => return Ok(Coercion::Threw),
                     Coercion::Value(v) => scope.handle(v),
                 };
-                let method_word = method.as_tagged(heap).erase();
+                let method_word = method.as_tagged(heap).raw();
                 if !Self::is_callable(heap, method_word) {
                     continue;
                 }
-                let receiver = value.as_tagged(heap).erase();
+                let receiver = value.as_tagged(heap).raw();
                 let args =
                     scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(receiver) }]);
                 let result = NativeContext::new(vm, heap, state).call_rooted(method, args)?;
@@ -313,7 +307,7 @@ impl Runtime {
             let Some(b) = b else { return Ok(None) };
             let r = op(a, b);
             let v = heap.new_number(&scope, r);
-            Ok(Some(v.erase()))
+            Ok(Some(v.raw()))
         })
     }
 
@@ -345,7 +339,7 @@ impl Runtime {
             return get(vm, heap, state, holder, receiver, name);
         }
         state.handle_scope(|scope| -> Result<Coercion<'a>, VmError> {
-            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).raw());
             let loaded = {
                 let heap_ref: &Heap = heap;
                 load_outcome_on(
@@ -357,11 +351,11 @@ impl Runtime {
             match loaded {
                 // Safety: fresh load outcome, no GC since.
                 LoadOutcome::Value(v) => Ok(Coercion::Value(unsafe {
-                    Tagged::from_value_unchecked(v.erase())
+                    Tagged::from_value_unchecked(v.raw())
                 })),
                 LoadOutcome::Getter(getter) => {
                     let getter = scope.handle(getter);
-                    let args = scope.stage(&[receiver.as_tagged(&*heap).erase_type()]);
+                    let args = scope.stage(&[receiver.as_tagged(&*heap).erase()]);
                     let result = NativeContext::new(vm, heap, state).call_rooted(getter, args)?;
                     if result == exception {
                         Ok(Coercion::Threw)
@@ -397,7 +391,7 @@ impl Runtime {
                 s.enumerable,
                 s.configurable,
             ]
-            .map(|n| scope.handle(n.as_tagged(heap).erase_type()))
+            .map(|n| scope.handle(n.as_tagged(heap).erase()))
         });
         let mut reads: Vec<Handle<'_, Value>> = Vec::new();
         for name in names {
@@ -408,7 +402,7 @@ impl Runtime {
             }
         }
         let (present, truthy) = heap.no_gc(|heap| {
-            let undef = heap.known().undefined.as_tagged(heap).erase_type();
+            let undef = heap.known().undefined.as_tagged(heap).erase();
             let present = [
                 !reads[0].as_tagged(heap).ptr_eq(undef),
                 !reads[1].as_tagged(heap).ptr_eq(undef),
@@ -431,7 +425,7 @@ impl Runtime {
         if get.is_some() || set.is_some() {
             for half in [get, set] {
                 if let Some(h) = half
-                    && !heap.no_gc(|heap| Self::is_callable(heap, h.as_tagged(heap).erase()))
+                    && !heap.no_gc(|heap| Self::is_callable(heap, h.as_tagged(heap).raw()))
                 {
                     return Err(VmError::Type);
                 }
@@ -467,7 +461,7 @@ impl Runtime {
         v: Handle<'_, Value>,
     ) -> Result<Option<Tagged<'a, SlotName>>, VmError> {
         // Smis are pointer-free: valid at any lifetime, no rooting needed.
-        if let Some(smi) = Smi::decode(v.as_tagged(heap).erase()) {
+        if let Some(smi) = Smi::decode(v.as_tagged(heap).raw()) {
             return Ok(Some(Tagged::from(smi)));
         }
         state.handle_scope(|scope| {
@@ -502,29 +496,29 @@ impl Runtime {
     pub fn type_of<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> Tagged<'a, Value> {
         let strings = heap.known().strings;
         if v.is_smi() || v.get_as::<Float>().is_some() {
-            strings.number.as_tagged(heap).erase_type()
-        } else if v.erase() == heap.known().undefined.as_tagged(heap).erase()
-            || v.erase() == heap.known().the_hole.as_tagged(heap).erase()
+            strings.number.as_tagged(heap).erase()
+        } else if v.raw() == heap.known().undefined.as_tagged(heap).raw()
+            || v.raw() == heap.known().the_hole.as_tagged(heap).raw()
         {
-            strings.undefined.as_tagged(heap).erase_type()
-        } else if v.erase() == heap.known().null.as_tagged(heap).erase() {
-            strings.object.as_tagged(heap).erase_type()
-        } else if v.erase() == heap.known().true_object.as_tagged(heap).erase()
-            || v.erase() == heap.known().false_object.as_tagged(heap).erase()
+            strings.undefined.as_tagged(heap).erase()
+        } else if v.raw() == heap.known().null.as_tagged(heap).raw() {
+            strings.object.as_tagged(heap).erase()
+        } else if v.raw() == heap.known().true_object.as_tagged(heap).raw()
+            || v.raw() == heap.known().false_object.as_tagged(heap).raw()
         {
-            strings.boolean.as_tagged(heap).erase_type()
+            strings.boolean.as_tagged(heap).erase()
         } else if v.get_as::<DenseString>().is_some() {
-            strings.string.as_tagged(heap).erase_type()
+            strings.string.as_tagged(heap).erase()
         } else if v.get_as::<Symbol>().is_some() {
-            strings.symbol.as_tagged(heap).erase_type()
+            strings.symbol.as_tagged(heap).erase()
         } else if let Some(obj) = v.as_heap_object() {
             if obj.as_ref().header.map.heap_ref(heap).kind().is_callable() {
-                strings.function.as_tagged(heap).erase_type()
+                strings.function.as_tagged(heap).erase()
             } else {
-                strings.object.as_tagged(heap).erase_type()
+                strings.object.as_tagged(heap).erase()
             }
         } else {
-            strings.object.as_tagged(heap).erase_type()
+            strings.object.as_tagged(heap).erase()
         }
     }
 
@@ -547,8 +541,7 @@ impl Runtime {
             // Safety: caller-supplied word, fresh at entry.
             let object = scope.handle(unsafe { object.assume_valid(heap) });
             let proxy_callable = scope.handle(unsafe { callable.assume_valid(heap) });
-            let proto_name =
-                scope.handle(heap.known().strings.prototype.as_tagged(heap).erase_type());
+            let proto_name = scope.handle(heap.known().strings.prototype.as_tagged(heap).erase());
             let proto = Self::get_property(vm, heap, state, proxy_callable, proto_name)?;
             let proto = match proto {
                 Coercion::Threw => return Ok(None),
@@ -577,7 +570,7 @@ impl Runtime {
         if proto.ptr_eq(target) {
             return true;
         }
-        if proto.erase() == heap.known().null.as_tagged(heap).erase() {
+        if proto.raw() == heap.known().null.as_tagged(heap).raw() {
             return false;
         }
         if let Some(parents) = proto.get_as::<FixedArray>() {
@@ -602,7 +595,7 @@ impl Runtime {
         state: &ContextState,
         new_target: Handle<'_, Object>,
     ) -> Result<Option<Value>, VmError> {
-        let new_target = new_target.as_tagged(heap).erase();
+        let new_target = new_target.as_tagged(heap).raw();
         Self::create_construct_receiver_value(vm, heap, state, new_target)
     }
 
@@ -615,8 +608,7 @@ impl Runtime {
         new_target: Value,
     ) -> Result<Option<Value>, VmError> {
         state.handle_scope(|scope| {
-            let proto_name =
-                scope.handle(heap.known().strings.prototype.as_tagged(heap).erase_type());
+            let proto_name = scope.handle(heap.known().strings.prototype.as_tagged(heap).erase());
             let new_target = scope.handle(unsafe { new_target.assume_valid(heap) });
             let proto = Self::get_property(vm, heap, state, new_target, proto_name)?;
             let proto = match proto {
@@ -634,7 +626,7 @@ impl Runtime {
             }
             // fresh word at return: callers store it to a register (rooted
             // memory) immediately
-            Ok(Some(obj.as_tagged(heap).erase()))
+            Ok(Some(obj.as_tagged(heap).raw()))
         })
     }
 }

@@ -14,7 +14,7 @@ fn smi(v: i64) -> Value {
 
 /// A handle's current word, read under a heap anchor.
 fn word<'s, T>(heap: &Heap, h: Handle<'s, T>) -> Value {
-    h.as_tagged(heap).erase()
+    h.as_tagged(heap).raw()
 }
 
 /// A well-known global's word for `thread`'s heap.
@@ -23,14 +23,14 @@ fn global_word<T>(
     pick: impl FnOnce(&vm::WellKnown) -> vm::Global<T>,
 ) -> Value {
     let heap = thread.heap();
-    pick(heap.known()).as_tagged(heap).erase()
+    pick(heap.known()).as_tagged(heap).raw()
 }
 
 /// An interned string's word.
 fn intern_word(thread: &mut Thread, scope: &HandleScope<'_>, s: &str) -> Value {
     let interned = thread.intern(scope, s);
     let heap = &*thread.heap();
-    interned.as_tagged(heap).erase()
+    interned.as_tagged(heap).raw()
 }
 
 /// Stage raw words: every call site in this file stages words loaded or
@@ -76,7 +76,7 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
             };
             match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 Lookup::Data { slot, .. } => {
-                    assert_eq!(slot.get(heap).erase(), expected_name, "error class name");
+                    assert_eq!(slot.get(heap).raw(), expected_name, "error class name");
                 }
                 _ => panic!("error object must have a name property"),
             }
@@ -202,7 +202,7 @@ fn run_program_ctx(
             .map(|i| {
                 let h = thread.intern(&scope, &format!("slot{i}"));
                 let heap = &*thread.heap();
-                h.as_tagged(heap).erase()
+                h.as_tagged(heap).raw()
             })
             .collect();
         let names = thread
@@ -255,7 +255,7 @@ fn call_runtime_passes_receiver_and_args() {
         let (a, b) = {
             let heap = &*nctx.heap();
             match (args.get(heap, 1), args.get(heap, 2)) {
-                (Some(a), Some(b)) => (a.erase(), b.erase()),
+                (Some(a), Some(b)) => (a.raw(), b.raw()),
                 _ => return Err(VmError::Arity),
             }
         };
@@ -432,18 +432,9 @@ fn array_literal_built_with_manual_stores() {
         assert!(a.is_array(heap));
         assert_eq!(a.length(), 3);
         let elements = a.elements_array(heap).expect("array elements");
-        assert_eq!(
-            Smi::decode(elements.at(heap, 0).erase()).unwrap().value(),
-            1
-        );
-        assert_eq!(
-            Smi::decode(elements.at(heap, 1).erase()).unwrap().value(),
-            2
-        );
-        assert_eq!(
-            Smi::decode(elements.at(heap, 2).erase()).unwrap().value(),
-            3
-        );
+        assert_eq!(Smi::decode(elements.at(heap, 0).raw()).unwrap().value(), 1);
+        assert_eq!(Smi::decode(elements.at(heap, 1).raw()).unwrap().value(), 2);
+        assert_eq!(Smi::decode(elements.at(heap, 2).raw()).unwrap().value(), 3);
     });
 }
 
@@ -497,19 +488,13 @@ fn array_literal_with_holes_keeps_length() {
         let a = a.as_ref();
         assert_eq!(a.length(), 3);
         let elements = a.elements_array(heap).expect("array elements");
+        assert_eq!(Smi::decode(elements.at(heap, 0).raw()).unwrap().value(), 1);
         assert_eq!(
-            Smi::decode(elements.at(heap, 0).erase()).unwrap().value(),
-            1
-        );
-        assert_eq!(
-            elements.at(heap, 1).erase(),
-            heap.known().the_hole.as_tagged(heap).erase(),
+            elements.at(heap, 1).raw(),
+            heap.known().the_hole.as_tagged(heap).raw(),
             "elided index stays a hole"
         );
-        assert_eq!(
-            Smi::decode(elements.at(heap, 2).erase()).unwrap().value(),
-            2
-        );
+        assert_eq!(Smi::decode(elements.at(heap, 2).raw()).unwrap().value(), 2);
     });
 }
 
@@ -566,15 +551,15 @@ fn object_literal_built_with_manual_stores() {
             // Safety: anchored slot read under `heap`.
             let slots = unsafe { slots.as_ref() };
             (
-                Smi::decode(slots.at(heap, 0).erase()).unwrap().value(),
-                Smi::decode(slots.at(heap, 1).erase()).unwrap().value(),
-                o.header.map.get(heap).erase(),
+                Smi::decode(slots.at(heap, 0).raw()).unwrap().value(),
+                Smi::decode(slots.at(heap, 1).raw()).unwrap().value(),
+                o.header.map.get(heap).raw(),
             )
         };
         (
             read(heap, obj1),
             read(heap, obj2),
-            heap.known().object_initial_map.as_tagged(heap).erase(),
+            heap.known().object_initial_map.as_tagged(heap).raw(),
         )
     });
     assert_eq!((x1, y1), (7, 9));
@@ -653,11 +638,7 @@ fn define_named_own_property_attributes_and_value() {
                 let o = unsafe { ptr.cast::<Object>().as_ref() };
                 match o.lookup(heap, name(heap, m)) {
                     Lookup::Data { slot, flags, .. } => {
-                        assert_eq!(
-                            slot.get(heap).erase(),
-                            smi(8),
-                            "re-define updates the value"
-                        );
+                        assert_eq!(slot.get(heap).raw(), smi(8), "re-define updates the value");
                         assert_eq!(
                             flags,
                             SlotFlags::VALUE
@@ -665,7 +646,7 @@ fn define_named_own_property_attributes_and_value() {
                                 .union(SlotFlags::CONFIGURABLE),
                             "method attributes {{w, e-, c}}"
                         );
-                        o.header.map.get(heap).erase()
+                        o.header.map.get(heap).raw()
                     }
                     _ => panic!("m must be a data property"),
                 }
@@ -764,7 +745,7 @@ fn define_keyed_own_property_string_and_smi_keys() {
             .union(SlotFlags::CONFIGURABLE);
         match o.lookup(heap, name(heap, x)) {
             Lookup::Data { slot, flags, .. } => {
-                assert_eq!(slot.get(heap).erase(), smi(5));
+                assert_eq!(slot.get(heap).raw(), smi(5));
                 assert_eq!(flags, expected_flags);
             }
             _ => panic!("x must be a data property"),
@@ -772,7 +753,7 @@ fn define_keyed_own_property_string_and_smi_keys() {
         // a smi key defines a plain named property, not an element
         match o.lookup(heap, name(heap, smi(3))) {
             Lookup::Data { slot, flags, .. } => {
-                assert_eq!(slot.get(heap).erase(), smi(6));
+                assert_eq!(slot.get(heap).raw(), smi(6));
                 assert_eq!(flags, expected_flags);
             }
             _ => panic!("the smi key must be a named data property"),
@@ -864,7 +845,7 @@ fn define_own_property_accessor_invokes_getter() {
         let o = unsafe { ptr.cast::<Object>().as_ref() };
         match o.lookup(heap, name(heap, p)) {
             Lookup::Accessor { pair, .. } => {
-                assert_eq!(pair.get.get(heap).erase(), getter);
+                assert_eq!(pair.get.get(heap).raw(), getter);
             }
             _ => panic!("p must be an accessor property"),
         }
@@ -1432,11 +1413,11 @@ fn jump_if_truthy_follows_toboolean() {
             let heap = thread.heap();
             let k = heap.known();
             (
-                k.undefined.as_tagged(heap).erase(),
-                k.null.as_tagged(heap).erase(),
-                k.true_object.as_tagged(heap).erase(),
-                k.false_object.as_tagged(heap).erase(),
-                k.the_hole.as_tagged(heap).erase(),
+                k.undefined.as_tagged(heap).raw(),
+                k.null.as_tagged(heap).raw(),
+                k.true_object.as_tagged(heap).raw(),
+                k.false_object.as_tagged(heap).raw(),
+                k.the_hole.as_tagged(heap).raw(),
             )
         };
         let hello = intern_word(&mut *thread, &scope, "hello");
@@ -1522,10 +1503,10 @@ fn test_reference_equal_compares_identity() {
         let heap = thread.heap();
         let k = heap.known();
         (
-            k.true_object.as_tagged(heap).erase(),
-            k.false_object.as_tagged(heap).erase(),
-            k.undefined.as_tagged(heap).erase(),
-            k.null.as_tagged(heap).erase(),
+            k.true_object.as_tagged(heap).raw(),
+            k.false_object.as_tagged(heap).raw(),
+            k.undefined.as_tagged(heap).raw(),
+            k.null.as_tagged(heap).raw(),
         )
     };
 
@@ -1951,7 +1932,7 @@ fn bytecode_fn(
                 length: 0,
             },
         )
-        .erase()
+        .raw()
 }
 
 fn forty_two(_: &mut NativeContext<'_>, _: GcSlice<'_>) -> Result<Value, VmError> {
@@ -2031,7 +2012,7 @@ fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result
 
         let exception_word = {
             let heap = &*nctx.heap();
-            heap.known().exception.as_tagged(heap).erase()
+            heap.known().exception.as_tagged(heap).raw()
         };
         match nctx.call(
             unsafe { Tagged::from_value_unchecked(caller) },
@@ -2209,7 +2190,7 @@ fn equal_strict_compares_numbers_strings_and_objects() {
         let mk_string = |thread: &mut Thread, scope: &HandleScope<'_>, s: &str| {
             let h = DenseString::from_utf8(thread.heap(), scope, s);
             let heap = &*thread.heap();
-            h.as_tagged(heap).erase()
+            h.as_tagged(heap).raw()
         };
         let ab1 = mk_string(thread, &scope, "ab");
         let ab2 = mk_string(thread, &scope, "ab");
@@ -2914,15 +2895,15 @@ fn create_closure_shares_callable_info_template() {
             .callable_info(heap)
             .expect("closure carries a callable info");
         // the info is shared, not copied per closure
-        assert_eq!(info.into_tagged().erase(), template);
+        assert_eq!(info.into_tagged().raw(), template);
         // the closure's context slot is the caller's (empty) context
         let context = o
             .as_ref()
             .closure_context(heap)
             .expect("closure carries a context");
         assert_eq!(
-            context.into_tagged().erase(),
-            heap.known().empty_context.as_tagged(heap).erase()
+            context.into_tagged().raw(),
+            heap.known().empty_context.as_tagged(heap).raw()
         );
     });
 }
@@ -3217,7 +3198,7 @@ fn proto_object<'s>(
     p: vm::Handle<'s, vm::DenseString>,
 ) -> vm::Handle<'s, Object> {
     let the_hole = thread.heap().known().the_hole;
-    let p_name = raw_name(p.as_tagged(&*thread.heap()).erase());
+    let p_name = raw_name(p.as_tagged(&*thread.heap()).raw());
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: EXTENDABLE,
@@ -3739,7 +3720,7 @@ fn to_primitive_calls_getter_accessors() {
                 .known()
                 .undefined
                 .as_tagged(&*thread.heap())
-                .erase_type(),
+                .erase(),
         );
         Object::define_own_property(
             thread.heap(),
@@ -4122,7 +4103,7 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
         let name = nctx.intern(&scope, "constructProbe");
         let global = {
             let heap = &*nctx.heap();
-            heap.known().global_object.as_tagged(heap).erase()
+            heap.known().global_object.as_tagged(heap).raw()
         };
         let outcome = nctx.heap().no_gc(|heap| {
             unsafe { anchored(heap, global) }.store_lookup(
@@ -4147,13 +4128,13 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
             }
             StoreOutcome::CallSetter { setter } => {
                 nctx.handle_scope(|nctx, scope| {
-                    nctx.call_rooted(setter, stage_values(&scope, &[global, flag.erase()]))
+                    nctx.call_rooted(setter, stage_values(&scope, &[global, flag.raw()]))
                 })?;
             }
         }
         Ok(())
     })?;
-    Ok(flag.erase())
+    Ok(flag.raw())
 }
 
 #[test]
@@ -4203,7 +4184,7 @@ fn shadow_setup<'s>(
 ) -> (Handle<'s, Object>, Handle<'s, Object>, Value) {
     let the_hole = thread.heap().known().the_hole;
     let p = thread.intern(scope, "p");
-    let p_name = raw_name(p.as_tagged(&*thread.heap()).erase());
+    let p_name = raw_name(p.as_tagged(&*thread.heap()).raw());
     let parent_map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: MapKind::OBJECT,
@@ -4260,7 +4241,7 @@ fn shadow_setup<'s>(
         .into_handle(scope);
     let p_word = {
         let heap = &*thread.heap();
-        p.as_tagged(heap).erase()
+        p.as_tagged(heap).raw()
     };
     (child, parent, p_word)
 }
@@ -4305,7 +4286,7 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
             let parent_ref = parent.heap_ref(heap);
             match parent_ref.as_ref().lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
-                    assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 1);
+                    assert_eq!(Smi::decode(slot.get(heap).raw()).unwrap().value(), 1);
                 }
                 _ => panic!("parent must keep its writable property"),
             }
@@ -4346,14 +4327,14 @@ fn shadow_store_defines_default_attributes() {
             // the own slot wins, the parent keeps its value
             match child_ref.as_ref().lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
-                    assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 2);
+                    assert_eq!(Smi::decode(slot.get(heap).raw()).unwrap().value(), 2);
                 }
                 _ => panic!("expected own data property"),
             }
             let parent_ref = parent.heap_ref(heap);
             match parent_ref.as_ref().lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
-                    assert_eq!(Smi::decode(slot.get(heap).erase()).unwrap().value(), 1);
+                    assert_eq!(Smi::decode(slot.get(heap).raw()).unwrap().value(), 1);
                 }
                 _ => panic!("parent must keep its writable property"),
             }

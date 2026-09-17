@@ -5,7 +5,7 @@ use vm::{Float, GcSlice, Smi, Value};
 use vm::{Thread, VM, VmError};
 
 fn float(thread: &mut Thread, v: f64) -> Value {
-    thread.heap().allocate::<Float>(v).erase()
+    thread.heap().allocate::<Float>(v).raw()
 }
 
 fn smi(v: i64) -> Value {
@@ -16,7 +16,7 @@ fn smi_add(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmE
     let (a, b) = {
         let heap = &*nctx.heap();
         match (args.get(heap, 1), args.get(heap, 2)) {
-            (Some(a), Some(b)) => (a.erase(), b.erase()),
+            (Some(a), Some(b)) => (a.raw(), b.raw()),
             _ => return Err(VmError::Arity),
         }
     };
@@ -61,7 +61,7 @@ fn native_result_is_boxed_when_not_smi() {
             let fb = b.get_as::<Float>().ok_or(VmError::Type)?.value.get();
             Ok::<f64, VmError>(fa + fb)
         })?;
-        nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum).erase()))
+        nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum).raw()))
     }
 
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -96,7 +96,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
     let exception_word = {
         let heap = thread.heap();
-        heap.known().exception.as_tagged(heap).erase()
+        heap.known().exception.as_tagged(heap).raw()
     };
     assert_eq!(result, exception_word);
     let ex = thread
@@ -114,8 +114,8 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
             };
             match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => {
-                    let name_ok = slot.get(heap).erase() == type_error.as_tagged(heap).erase();
-                    (name_ok, type_error.as_tagged(heap).erase())
+                    let name_ok = slot.get(heap).raw() == type_error.as_tagged(heap).raw();
+                    (name_ok, type_error.as_tagged(heap).raw())
                 }
                 _ => panic!("error object must have a name property"),
             }
@@ -126,7 +126,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
     let expected = thread.handle_scope(|thread, scope| {
         let type_error = thread.intern(&scope, "TypeError");
         let heap = &*thread.heap();
-        type_error.as_tagged(heap).erase()
+        type_error.as_tagged(heap).raw()
     });
     assert_eq!(name, expected);
 }
@@ -137,7 +137,7 @@ fn register_native_appends_after_well_known() {
         let heap = &*nctx.heap();
         match args.get(heap, 1) {
             Some(v) => {
-                let v = Smi::decode(v.erase()).ok_or(VmError::Type)?;
+                let v = Smi::decode(v.raw()).ok_or(VmError::Type)?;
                 Ok(Smi::new(v.value() * 2).encode())
             }
             None => Err(VmError::Arity),

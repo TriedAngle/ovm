@@ -22,9 +22,9 @@ fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
     let heap = thread.heap();
     let known = heap.known();
-    if result == known.true_object.as_tagged(heap).erase() {
+    if result == known.true_object.as_tagged(heap).raw() {
         true
-    } else if result == known.false_object.as_tagged(heap).erase() {
+    } else if result == known.false_object.as_tagged(heap).raw() {
         false
     } else {
         panic!("expected boolean result, got {result:?}");
@@ -49,7 +49,7 @@ fn assert_type_error(src: &str) {
         let heap = thread.heap();
         assert_eq!(
             result,
-            heap.known().exception.as_tagged(heap).erase(),
+            heap.known().exception.as_tagged(heap).raw(),
             "expected an uncaught exception"
         );
     }

@@ -38,7 +38,7 @@ impl Object {
         if !self.header.map.heap_ref(heap).kind().is_native() {
             return None;
         }
-        let idx = Smi::decode(self.slots.heap_ref(heap).at(heap, 0).erase())?.value();
+        let idx = Smi::decode(self.slots.heap_ref(heap).at(heap, 0).raw())?.value();
         usize::try_from(idx).ok()
     }
 
@@ -57,10 +57,10 @@ impl Object {
         if !self.is_array(heap) {
             return None;
         }
-        let s = name.erase_type().get_as::<DenseString>()?.as_ref();
+        let s = name.erase().get_as::<DenseString>()?.as_ref();
         s.data(heap)
             .matches_ascii(b"length")
-            .then(|| self.length.get(heap).erase_type())
+            .then(|| self.length.get(heap).erase())
     }
 
     /// The object's map (shape).
@@ -101,7 +101,7 @@ impl Object {
         }
         let v = elements.at(heap, i);
         // Safety: fresh root-slot read under the anchor.
-        if v.erase() == unsafe { heap.known().the_hole.read_unchecked() } {
+        if v.raw() == unsafe { heap.known().the_hole.read_unchecked() } {
             return None;
         }
         Some(v)
@@ -182,16 +182,16 @@ pub fn store_array_element(
             }
             values.resize(
                 capacity,
-                heap_ref.known().the_hole.as_tagged(heap_ref).erase_type(),
+                heap_ref.known().the_hole.as_tagged(heap_ref).erase(),
             );
-            values[i] = value.as_tagged(heap_ref).erase_type();
+            values[i] = value.as_tagged(heap_ref).erase();
             scope.stage(&values)
         };
         let elements = heap.allocate_handle::<FixedArray>(staged, scope);
         heap.no_gc(|heap| {
             let obj = receiver.heap_ref(heap);
             obj.elements
-                .set(heap, obj.erase(), elements.as_tagged(heap).erase_type());
+                .set(heap, obj.erase(), elements.as_tagged(heap).erase());
             obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
         });
     } else {

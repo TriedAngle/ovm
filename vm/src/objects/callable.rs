@@ -117,11 +117,8 @@ impl HeapObject for CallableInfoObject {
             Some(handlers) => self.handlers.set(heap, host, handlers.as_tagged(heap)),
             None => self.handlers.clear(heap),
         }
-        self.name.set(
-            heap,
-            host,
-            heap.known().the_hole.as_tagged(heap).erase_type(),
-        );
+        self.name
+            .set(heap, host, heap.known().the_hole.as_tagged(heap).erase());
         self.formal_parameter_count.set(heap, host, Smi::new(0));
         self.formal_length.set(heap, host, Smi::new(0));
         self.kind
@@ -180,7 +177,7 @@ impl CallableInfoObject {
         self.name.set(
             heap,
             host,
-            name.unwrap_or_else(|| heap.known().the_hole.as_tagged(heap).erase_type()),
+            name.unwrap_or_else(|| heap.known().the_hole.as_tagged(heap).erase()),
         );
         self.formal_parameter_count
             .set(heap, host, Smi::new(formal_parameter_count as i64));

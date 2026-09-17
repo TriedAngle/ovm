@@ -40,12 +40,12 @@ pub fn object_constructor(
     if nctx.is_construct() {
         return nctx
             .heap()
-            .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()));
+            .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()));
     }
     let arg = nctx.heap().no_gc(|heap| {
         args.get(heap, 1)
-            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase_type())
-            .erase()
+            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase())
+            .raw()
     });
     if nctx
         .heap()
@@ -100,7 +100,7 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
         }
     }
     for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
-        keys.push(d.name(heap).erase());
+        keys.push(d.name(heap).raw());
     }
     keys
 }
@@ -114,8 +114,8 @@ pub fn object_has_own_property(
     nctx.handle_scope(|nctx, scope| {
         let (raw_receiver, raw_key) = nctx.heap().no_gc(|heap| {
             Ok((
-                args.get(heap, 0).ok_or(VmError::Arity)?.erase(),
-                args.get(heap, 1).ok_or(VmError::Arity)?.erase(),
+                args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
+                args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
             ))
         })?;
         // the key coercion allocates (float/wrapper keys intern or run
@@ -136,11 +136,11 @@ pub fn object_has_own_property(
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
-        let receiver = receiver.as_tagged(heap).erase();
+        let receiver = receiver.as_tagged(heap).raw();
         let has = heap.no_gc(|heap| {
             let key = key.as_tagged(heap);
             if let Key::Element(i) =
-                crate::classify_key(heap, key.erase_type()).unwrap_or(Key::Name(key))
+                crate::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -152,9 +152,7 @@ pub fn object_has_own_property(
                 _ => true,
             }
         });
-        Ok(nctx
-            .heap()
-            .no_gc(|heap| Convert::boolean(heap, has).erase()))
+        Ok(nctx.heap().no_gc(|heap| Convert::boolean(heap, has).raw()))
     })
 }
 
@@ -166,8 +164,8 @@ pub fn object_property_is_enumerable(
     nctx.handle_scope(|nctx, scope| {
         let (raw_receiver, raw_key) = nctx.heap().no_gc(|heap| {
             Ok((
-                args.get(heap, 0).ok_or(VmError::Arity)?.erase(),
-                args.get(heap, 1).ok_or(VmError::Arity)?.erase(),
+                args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
+                args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
             ))
         })?;
         // the key coercion allocates (float/wrapper keys intern or run
@@ -188,11 +186,11 @@ pub fn object_property_is_enumerable(
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
-        let receiver = receiver.as_tagged(heap).erase();
+        let receiver = receiver.as_tagged(heap).raw();
         let enumerable = heap.no_gc(|heap| {
             let key = key.as_tagged(heap);
             if let Key::Element(i) =
-                crate::classify_key(heap, key.erase_type()).unwrap_or(Key::Name(key))
+                crate::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -215,7 +213,7 @@ pub fn object_property_is_enumerable(
         });
         Ok(nctx
             .heap()
-            .no_gc(|heap| Convert::boolean(heap, enumerable).erase()))
+            .no_gc(|heap| Convert::boolean(heap, enumerable).raw()))
     })
 }
 
@@ -228,7 +226,7 @@ pub fn object_get_own_property_names(
     // walk re-reads it under `no_gc` anchors.
     let target = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
     let names: Vec<Value> = nctx.heap().no_gc(|heap| {
         let mut keys = own_property_keys(heap, unsafe { target.assume_valid(heap) });
         // arrays also list "length" (and it sorts with the strings)
@@ -248,7 +246,7 @@ pub fn object_get_own_property_names(
                 .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
                 .collect::<Vec<_>>(),
         );
-        Ok(heap.new_array(&scope, staged).erase_type().erase())
+        Ok(heap.new_array(&scope, staged).erase().raw())
     })
 }
 
@@ -290,8 +288,8 @@ pub fn object_get_own_property_descriptor(
     nctx.handle_scope(|nctx, scope| {
         let (raw_target, raw_key) = nctx.heap().no_gc(|heap| {
             Ok((
-                args.get(heap, 1).ok_or(VmError::Arity)?.erase(),
-                args.get(heap, 2).ok_or(VmError::Arity)?.erase(),
+                args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+                args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
             ))
         })?;
         // the key coercion allocates (Float keys intern a string): the
@@ -318,7 +316,7 @@ pub fn object_get_own_property_descriptor(
                 &scope,
                 target.as_tagged(heap),
                 // fresh rooted name word re-read under the anchor
-                key.as_tagged(heap).erase_type(),
+                key.as_tagged(heap).erase(),
             )
         });
         // root the oddball singletons once for the descriptor fields
@@ -374,9 +372,9 @@ pub fn object_define_property(
     nctx.handle_scope(|nctx, scope| {
         let (raw_target, raw_key, raw_attrs) = nctx.heap().no_gc(|heap| {
             Ok((
-                args.get(heap, 1).ok_or(VmError::Arity)?.erase(),
-                args.get(heap, 2).ok_or(VmError::Arity)?.erase(),
-                args.get(heap, 3).ok_or(VmError::Arity)?.erase(),
+                args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+                args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
+                args.get(heap, 3).ok_or(VmError::Arity)?.raw(),
             ))
         })?;
         // root the target, key, and descriptor: the key coercion and the
@@ -432,13 +430,13 @@ pub fn object_set_prototype_of(
 ) -> Result<Value, VmError> {
     let (target, proto) = nctx.heap().no_gc(|heap| {
         Ok((
-            args.get(heap, 1).ok_or(VmError::Arity)?.erase(),
-            args.get(heap, 2).ok_or(VmError::Arity)?.erase(),
+            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+            args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
         ))
     })?;
     let (nullish, target_is_object, proto_ok) = nctx.heap().no_gc(|heap| {
-        let null = heap.known().null.as_tagged(heap).erase();
-        let undefined = heap.known().undefined.as_tagged(heap).erase();
+        let null = heap.known().null.as_tagged(heap).raw();
+        let undefined = heap.known().undefined.as_tagged(heap).raw();
         (
             target == null || target == undefined,
             !Convert::is_primitive(heap, unsafe { target.assume_valid(heap) }),
@@ -478,13 +476,13 @@ pub fn object_prevent_extensions(
         let raw_target = scope.handle(unsafe {
             Tagged::<Value>::from_value_unchecked(
                 nctx.heap()
-                    .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?,
+                    .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?,
             )
         });
-        let target = raw_target.as_tagged(&*nctx.heap()).erase();
+        let target = raw_target.as_tagged(&*nctx.heap()).raw();
         let nullish = nctx.heap().no_gc(|heap| {
-            let null = heap.known().null.as_tagged(heap).erase();
-            let undefined = heap.known().undefined.as_tagged(heap).erase();
+            let null = heap.known().null.as_tagged(heap).raw();
+            let undefined = heap.known().undefined.as_tagged(heap).raw();
             // Safety: fresh rooted-slot word re-read under the anchor.
             target == null || target == undefined
         });
@@ -512,7 +510,7 @@ pub fn object_prevent_extensions(
                 } else {
                     // re-read through the handle: the trap above ran user
                     // code and may have moved the receiver
-                    Ok(raw_target.as_tagged(heap).erase())
+                    Ok(raw_target.as_tagged(heap).raw())
                 }
             }
         }
@@ -527,14 +525,14 @@ pub fn object_is_extensible(
 ) -> Result<Value, VmError> {
     let target = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
     if !nctx
         .heap()
         .no_gc(|heap| is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
     {
         return Ok(nctx
             .heap()
-            .no_gc(|heap| Convert::boolean(heap, false).erase()));
+            .no_gc(|heap| Convert::boolean(heap, false).raw()));
     }
     let (vm, heap, state) = nctx.split();
     // Safety: fresh argument word, consumed by the call.
@@ -542,7 +540,7 @@ pub fn object_is_extensible(
     match is_extensible(vm, heap, state, target)? {
         // Safety: fresh root-slot word read for the immediate return.
         Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
-        Coercion::Value(v) => Ok(v.erase()),
+        Coercion::Value(v) => Ok(v.raw()),
     }
 }
 
@@ -609,7 +607,7 @@ pub fn set_integrity_flags(
         obj_ref
             .header
             .map
-            .set(heap, obj.as_tagged(heap).erase(), new_map);
+            .set(heap, obj.as_tagged(heap).raw(), new_map);
     });
 }
 
@@ -619,10 +617,10 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
     // re-reads under `no_gc` anchors.
     let target = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
     let nullish = nctx.heap().no_gc(|heap| {
-        let null = heap.known().null.as_tagged(heap).erase();
-        let undefined = heap.known().undefined.as_tagged(heap).erase();
+        let null = heap.known().null.as_tagged(heap).raw();
+        let undefined = heap.known().undefined.as_tagged(heap).raw();
         target == null || target == undefined
     });
     if nullish {
@@ -632,7 +630,7 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let target_handle = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(target) });
-        let target = target_handle.as_tagged(&*nctx.heap()).erase();
+        let target = target_handle.as_tagged(&*nctx.heap()).raw();
         if !nctx
             .heap()
             .no_gc(|heap| is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
@@ -660,7 +658,7 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
         // trap once ownKeys lands (proxy targets); ordinary targets:
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
-        let target = target_handle.as_tagged(heap).erase();
+        let target = target_handle.as_tagged(heap).raw();
         if heap.no_gc(|heap| is_proxy(heap, unsafe { target.assume_valid(heap) })) {
             return Ok(target);
         }
@@ -669,7 +667,7 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
             .expect("checked above");
         set_integrity_flags(heap, &scope, obj, false);
         // re-read through the handle: traps may have moved the receiver
-        Ok(target_handle.as_tagged(heap).erase())
+        Ok(target_handle.as_tagged(heap).raw())
     })
 }
 
@@ -679,10 +677,10 @@ pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
     // re-reads under `no_gc` anchors.
     let target = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
     let nullish = nctx.heap().no_gc(|heap| {
-        let null = heap.known().null.as_tagged(heap).erase();
-        let undefined = heap.known().undefined.as_tagged(heap).erase();
+        let null = heap.known().null.as_tagged(heap).raw();
+        let undefined = heap.known().undefined.as_tagged(heap).raw();
         target == null || target == undefined
     });
     if nullish {
@@ -692,7 +690,7 @@ pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let target_handle = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(target) });
-        let target = target_handle.as_tagged(&*nctx.heap()).erase();
+        let target = target_handle.as_tagged(&*nctx.heap()).raw();
         if !nctx
             .heap()
             .no_gc(|heap| is_js_receiver(heap, unsafe { target.assume_valid(heap) }))
@@ -716,7 +714,7 @@ pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
         }
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
-        let target = target_handle.as_tagged(heap).erase();
+        let target = target_handle.as_tagged(heap).raw();
         if heap.no_gc(|heap| is_proxy(heap, unsafe { target.assume_valid(heap) })) {
             return Ok(target);
         }
@@ -725,6 +723,6 @@ pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
             .expect("checked above");
         set_integrity_flags(heap, &scope, obj, true);
         // re-read through the handle: traps may have moved the receiver
-        Ok(target_handle.as_tagged(heap).erase())
+        Ok(target_handle.as_tagged(heap).raw())
     })
 }

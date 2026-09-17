@@ -11,8 +11,8 @@ pub fn boolean_constructor(
     let value = nctx.heap().no_gc(|heap| {
         let arg = args
             .get(heap, 1)
-            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase_type());
-        Convert::boolean(heap, Convert::is_truthy(heap, arg)).erase()
+            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+        Convert::boolean(heap, Convert::is_truthy(heap, arg)).raw()
     });
     if !nctx.is_construct() {
         return Ok(value);
@@ -26,8 +26,8 @@ pub fn boolean_constructor(
                 map,
                 scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(value) }]),
             )
-            .erase_type()
-            .erase())
+            .erase()
+            .raw())
     })
 }
 
@@ -50,6 +50,6 @@ pub fn boolean_to_string(
         let (_vm, heap, _) = nctx.split();
         // Safety: fresh word read above, consumed before any allocation.
         let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
-        Convert::to_string(heap, &scope, v).map(|s| s.erase())
+        Convert::to_string(heap, &scope, v).map(|s| s.raw())
     })
 }
