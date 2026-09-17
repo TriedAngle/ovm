@@ -98,34 +98,22 @@ pub enum Trap {
 }
 
 impl Trap {
-    fn name(self, heap: &Heap) -> SlotName {
+    fn name<'a>(self, heap: &'a Heap) -> Tagged<'a, SlotName> {
         let s = heap.known().strings;
         match self {
-            Self::Get => SlotName::from_value(unsafe { s.get.read_unchecked() }),
-            Self::Set => SlotName::from_value(unsafe { s.set.read_unchecked() }),
-            Self::Has => SlotName::from_value(unsafe { s.has.read_unchecked() }),
-            Self::DeleteProperty => {
-                SlotName::from_value(unsafe { s.delete_property.read_unchecked() })
-            }
-            Self::GetOwnPropertyDescriptor => {
-                SlotName::from_value(unsafe { s.get_own_property_descriptor.read_unchecked() })
-            }
-            Self::DefineProperty => {
-                SlotName::from_value(unsafe { s.define_property.read_unchecked() })
-            }
-            Self::GetPrototypeOf => {
-                SlotName::from_value(unsafe { s.get_prototype_of.read_unchecked() })
-            }
-            Self::SetPrototypeOf => {
-                SlotName::from_value(unsafe { s.set_prototype_of.read_unchecked() })
-            }
-            Self::IsExtensible => SlotName::from_value(unsafe { s.is_extensible.read_unchecked() }),
-            Self::PreventExtensions => {
-                SlotName::from_value(unsafe { s.prevent_extensions.read_unchecked() })
-            }
-            Self::OwnKeys => SlotName::from_value(unsafe { s.own_keys.read_unchecked() }),
-            Self::Apply => SlotName::from_value(unsafe { s.apply.read_unchecked() }),
-            Self::Construct => SlotName::from_value(unsafe { s.construct.read_unchecked() }),
+            Self::Get => s.get.as_tagged(heap),
+            Self::Set => s.set.as_tagged(heap),
+            Self::Has => s.has.as_tagged(heap),
+            Self::DeleteProperty => s.delete_property.as_tagged(heap),
+            Self::GetOwnPropertyDescriptor => s.get_own_property_descriptor.as_tagged(heap),
+            Self::DefineProperty => s.define_property.as_tagged(heap),
+            Self::GetPrototypeOf => s.get_prototype_of.as_tagged(heap),
+            Self::SetPrototypeOf => s.set_prototype_of.as_tagged(heap),
+            Self::IsExtensible => s.is_extensible.as_tagged(heap),
+            Self::PreventExtensions => s.prevent_extensions.as_tagged(heap),
+            Self::OwnKeys => s.own_keys.as_tagged(heap),
+            Self::Apply => s.apply.as_tagged(heap),
+            Self::Construct => s.construct.as_tagged(heap),
         }
     }
 }
@@ -226,13 +214,13 @@ fn get_trap<'s>(
     handler: &Handle<'_, Value>,
     trap: Trap,
 ) -> Result<TrapLookup<'s>, VmError> {
-    let name = heap.no_gc(|heap| trap.name(heap));
+    let name = scope.handle(trap.name(&*heap));
     match Runtime::get_property(
         vm,
         heap,
         state,
         unsafe { handler.read_unchecked() },
-        name.value(),
+        name.as_tagged(&*heap).erase(),
     )? {
         Coercion::Threw => Ok(TrapLookup::Threw),
         Coercion::Value(v) => {
@@ -320,38 +308,44 @@ fn revoked_error(trap: Trap) -> VmError {
     })
 }
 
-pub fn internal_own_descriptor(
+pub fn internal_own_descriptor<'s>(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
+    scope: &'s HandleScope<'_>,
     obj: Tagged<'_, Value>,
     key: Tagged<'_, Value>,
-) -> Result<Flow<Option<PartialDescriptor>>, VmError> {
-    state.handle_scope(|scope| {
-        let obj = scope.handle(obj);
-        let key = scope.handle(key);
-        own_descriptor_h(vm, heap, state, &scope, &obj, &key)
-    })
+) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
+    let obj = scope.handle(obj);
+    let key = scope.handle(key);
+    own_descriptor_h(vm, heap, state, scope, &obj, &key)
 }
 
-fn own_descriptor_h(
+fn own_descriptor_h<'s>(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    scope: &HandleScope<'_>,
+    scope: &'s HandleScope<'_>,
     obj: &Handle<'_, Value>,
     key: &Handle<'_, Value>,
-) -> Result<Flow<Option<PartialDescriptor>>, VmError> {
+) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
     if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
         let desc = heap.no_gc(|heap| {
-            crate::lookup::ordinary_own_descriptor(heap, obj.as_tagged(heap), key.as_tagged(heap))
+            crate::lookup::ordinary_own_descriptor(
+                heap,
+                scope,
+                obj.as_tagged(heap),
+                key.as_tagged(heap),
+            )
         });
         return Ok(Flow::Value(desc.as_ref().map(PartialDescriptor::from)));
     }
     let (target, handler) = heap
         .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    let revoked = heap.no_gc(|heap| {
+        unsafe { handler.assume_valid(heap) }.ptr_eq(heap.known().null.as_tagged(heap).erase_type())
+    });
     if revoked {
         return Err(revoked_error(Trap::GetOwnPropertyDescriptor));
     }
@@ -372,11 +366,17 @@ fn own_descriptor_h(
             let Coercion::Value(result) = result else {
                 return Ok(Flow::Threw);
             };
-            let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
-            if result == undefined {
+            // Safety: fresh call result, rooted before the coercion below.
+            let result = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(result) });
+            let is_undefined = heap.no_gc(|heap| {
+                result
+                    .as_tagged(heap)
+                    .ptr_eq(heap.known().undefined.as_tagged(heap).erase_type())
+            });
+            if is_undefined {
                 return Ok(Flow::Value(None));
             }
-            match Runtime::to_property_descriptor(vm, heap, state, result)? {
+            match Runtime::to_property_descriptor(vm, heap, state, scope, result)? {
                 Some(partial) => Ok(Flow::Value(Some(partial))),
                 None => Ok(Flow::Threw),
             }
@@ -439,60 +439,13 @@ fn is_extensible_h(
 
 // ---- forwards (trap absent → run the operation on the target) ---------------
 
-/// A rooted partial descriptor: value-ish fields are handle-rooted so
-/// the payload survives trap calls and descriptor-object allocation.
-struct RootedPartial<'s> {
-    value: Option<Handle<'s, Value>>,
-    get: Option<Handle<'s, Value>>,
-    set: Option<Handle<'s, Value>>,
-    writable: Option<bool>,
-    enumerable: Option<bool>,
-    configurable: Option<bool>,
-}
-
-impl<'s> RootedPartial<'s> {
-    fn new(scope: &'s HandleScope<'_>, heap: &Heap, partial: &PartialDescriptor) -> Self {
-        Self {
-            value: partial
-                .value
-                .map(|v| scope.handle(unsafe { v.assume_valid(heap) })),
-            get: partial
-                .get
-                .map(|v| scope.handle(unsafe { v.assume_valid(heap) })),
-            set: partial
-                .set
-                .map(|v| scope.handle(unsafe { v.assume_valid(heap) })),
-            writable: partial.writable,
-            enumerable: partial.enumerable,
-            configurable: partial.configurable,
-        }
-    }
-
-    fn is_data_descriptor(&self) -> bool {
-        self.partial().is_data_descriptor()
-    }
-
-    /// The words are fresh reads out of rooted slots; the result must be
-    /// consumed within the same expression (no allocation in between).
-    fn partial(&self) -> PartialDescriptor {
-        PartialDescriptor {
-            value: self.value.map(|h| unsafe { h.read_unchecked() }),
-            get: self.get.map(|h| unsafe { h.read_unchecked() }),
-            set: self.set.map(|h| unsafe { h.read_unchecked() }),
-            writable: self.writable,
-            enumerable: self.enumerable,
-            configurable: self.configurable,
-        }
-    }
-}
-
 /// CreateDataProperty-style full descriptor ({w,e,c} true) — the payload
 /// of OrdinarySet's receiver-define step.
 fn create_data_partial<'s>(
     _scope: &'s HandleScope<'_>,
     value: &Handle<'s, Value>,
-) -> RootedPartial<'s> {
-    RootedPartial {
+) -> PartialDescriptor<'s> {
+    PartialDescriptor {
         value: Some(*value),
         get: None,
         set: None,
@@ -505,57 +458,46 @@ fn create_data_partial<'s>(
 /// FromPropertyDescriptor (ES 6.2.6.4): a descriptor object carrying
 /// exactly the fields present in the partial (what a
 /// `defineProperty`/`getOwnPropertyDescriptor` trap receives/returns).
-/// Allocates, so the payload must be rooted (`RootedPartial`).
+/// Allocates, so the payload is handle-rooted (`PartialDescriptor`).
 fn descriptor_object(
     heap: &mut Heap,
     state: &ContextState,
-    partial: &RootedPartial<'_>,
+    partial: &PartialDescriptor<'_>,
 ) -> Result<Value, VmError> {
     state.handle_scope(|scope| {
         let obj = heap
             .new_object(&scope, heap.known().object_initial_map, GcSlice::EMPTY)
             .into_handle(&scope);
+        // the well-known field names are persistent roots: they cross the
+        // define allocations without further rooting
         let s = heap.known().strings;
         // spec field order: value, writable, get, set, enumerable, configurable
-        let mut fields: Vec<(SlotName, Handle<'_, Value>)> = Vec::new();
-        if let Some(v) = &partial.value {
-            fields.push((
-                SlotName::from_value(unsafe { s.value.read_unchecked() }),
-                *v,
-            ));
+        let mut fields: Vec<(Handle<'_, SlotName>, Handle<'_, Value>)> = Vec::new();
+        if let Some(v) = partial.value {
+            fields.push((s.value, v));
         }
         if let Some(b) = partial.writable {
-            fields.push((
-                SlotName::from_value(unsafe { s.writable.read_unchecked() }),
-                scope.handle(Convert::boolean(&*heap, b)),
-            ));
+            fields.push((s.writable, scope.handle(Convert::boolean(&*heap, b))));
         }
-        if let Some(v) = &partial.get {
-            fields.push((SlotName::from_value(unsafe { s.get.read_unchecked() }), *v));
+        if let Some(v) = partial.get {
+            fields.push((s.get, v));
         }
-        if let Some(v) = &partial.set {
-            fields.push((SlotName::from_value(unsafe { s.set.read_unchecked() }), *v));
+        if let Some(v) = partial.set {
+            fields.push((s.set, v));
         }
         if let Some(b) = partial.enumerable {
-            fields.push((
-                SlotName::from_value(unsafe { s.enumerable.read_unchecked() }),
-                scope.handle(Convert::boolean(&*heap, b)),
-            ));
+            fields.push((s.enumerable, scope.handle(Convert::boolean(&*heap, b))));
         }
         if let Some(b) = partial.configurable {
-            fields.push((
-                SlotName::from_value(unsafe { s.configurable.read_unchecked() }),
-                scope.handle(Convert::boolean(&*heap, b)),
-            ));
+            fields.push((s.configurable, scope.handle(Convert::boolean(&*heap, b))));
         }
         for (name, value) in fields {
-            let name = scope.handle(unsafe { name.tagged(&*heap) });
             crate::Object::define_own_property(
                 heap,
                 &scope,
                 obj,
                 name,
-                PropertyDescriptor::data(unsafe { value.read_unchecked() }),
+                PropertyDescriptor::data(value),
             )?;
         }
         Ok(unsafe { obj.read_unchecked() })
@@ -641,34 +583,34 @@ fn define_array_element(
 /// trap (with full spec validation), ordinary objects complete the
 /// partial against their current descriptor and define through the
 /// transition machinery.
-pub fn define_internal(
+pub fn define_internal<'s>(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
+    scope: &'s HandleScope<'_>,
     obj: Tagged<'_, Value>,
     name: Tagged<'_, Value>,
-    partial: PartialDescriptor,
+    partial: PartialDescriptor<'s>,
 ) -> Result<Flow<bool>, VmError> {
-    state.handle_scope(|scope| {
-        let obj = scope.handle(obj);
-        let name = scope.handle(name);
-        define_internal_h(vm, heap, state, &scope, &obj, &name, partial)
-    })
+    let obj = scope.handle(obj);
+    let name = scope.handle(name);
+    define_internal_h(vm, heap, state, scope, &obj, &name, partial)
 }
 
-fn define_internal_h(
+fn define_internal_h<'s>(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    scope: &HandleScope<'_>,
+    scope: &'s HandleScope<'_>,
     obj: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
-    partial: PartialDescriptor,
+    partial: PartialDescriptor<'s>,
 ) -> Result<Flow<bool>, VmError> {
     if heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
         return proxy_define_h(vm, heap, state, scope, obj, name, partial);
     }
-    let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
+    let undefined =
+        heap.no_gc(|heap| scope.handle(heap.known().undefined.as_tagged(heap).erase_type()));
     // dense array elements: element defines land in the backing
     // store, not as descriptors
     let element = heap.no_gc(|heap| {
@@ -689,7 +631,6 @@ fn define_internal_h(
         let PropertyDescriptor::Data { value, .. } = completed else {
             return Err(VmError::Type);
         };
-        let value = scope.handle(unsafe { value.assume_valid(&*heap) });
         let array = scope
             .cast::<Object>(obj.as_tagged(&*heap))
             .expect("array checked above");
@@ -697,18 +638,19 @@ fn define_internal_h(
         return Ok(Flow::Value(true));
     }
     let current = heap.no_gc(|heap| {
-        crate::lookup::ordinary_own_descriptor(heap, obj.as_tagged(heap), name.as_tagged(heap))
+        crate::lookup::ordinary_own_descriptor(
+            heap,
+            scope,
+            obj.as_tagged(heap),
+            name.as_tagged(heap),
+        )
     });
-    // no allocation between reading `current` and the define call
-    // (the define path roots its inputs before allocating)
     let full = partial.complete_against(undefined, current.as_ref());
-    let defined = crate::Object::define_own_property_values(
-        heap,
-        scope,
-        unsafe { obj.read_unchecked() },
-        SlotName::from_value(unsafe { name.read_unchecked() }),
-        full,
-    )?;
+    let obj_ref = scope
+        .cast::<Object>(obj.as_tagged(&*heap))
+        .expect("non-proxy target is an object");
+    let name_ref: Handle<'_, SlotName> = scope.handle(name.as_tagged(&*heap).as_name());
+    let defined = crate::Object::define_own_property(heap, scope, obj_ref, name_ref, full)?;
     Ok(Flow::Value(defined))
 }
 
@@ -740,7 +682,7 @@ fn ordinary_set_forward(
     });
     if let (true, true) = classified {
         let partial = create_data_partial(scope, value);
-        let flow = define_internal_h(vm, heap, state, scope, receiver, name, partial.partial())?;
+        let flow = define_internal_h(vm, heap, state, scope, receiver, name, partial)?;
         return define_flow_to_coercion(heap, flow);
     }
 
@@ -755,7 +697,7 @@ fn ordinary_set_forward(
     let lookup = heap.no_gc(|heap| {
         match target
             .as_tagged(heap)
-            .lookup(heap, SlotName::from_value(unsafe { name.read_unchecked() }))
+            .lookup(heap, name.as_tagged(heap).as_name())
         {
             Lookup::Data { flags, .. } => {
                 if flags.is_writable() {
@@ -772,8 +714,7 @@ fn ordinary_set_forward(
         SetLookup::DataReadonly => Ok(Coercion::Value(Convert::boolean(heap, false).erase())),
         SetLookup::DataWritable | SetLookup::NotFound => {
             let partial = create_data_partial(scope, value);
-            let flow =
-                define_internal_h(vm, heap, state, scope, receiver, name, partial.partial())?;
+            let flow = define_internal_h(vm, heap, state, scope, receiver, name, partial)?;
             define_flow_to_coercion(heap, flow)
         }
         SetLookup::Setter(setter) => {
@@ -875,20 +816,22 @@ fn get_h(
             };
             if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
                 heap.no_gc(|heap| -> Result<(), VmError> {
-                    let undefined = heap.known().undefined.as_tagged(heap).erase();
+                    let undefined = heap.known().undefined.as_tagged(heap).erase_type();
                     if d.is_data_descriptor()
                         && d.writable == Some(false)
-                        && !Compare::same_value(heap, result.as_tagged(heap), unsafe {
-                            d.value.unwrap_or(undefined).assume_valid(heap)
-                        })
+                        && !Compare::same_value(
+                            heap,
+                            result.as_tagged(heap),
+                            d.value.map_or(undefined, |h| h.as_tagged(heap)),
+                        )
                     {
                         return Err(VmError::Message(
                             "proxy get trap must match a non-writable, non-configurable property",
                         ));
                     }
                     if d.is_accessor_descriptor()
-                        && d.get.as_ref().is_some_and(|g| *g == undefined)
-                        && result.as_tagged(heap).erase() != undefined
+                        && d.get.is_some_and(|g| g.as_tagged(heap).ptr_eq(undefined))
+                        && !result.as_tagged(heap).ptr_eq(undefined)
                     {
                         return Err(VmError::Message(
                             "proxy get trap must return undefined for an accessor without a getter",
@@ -966,13 +909,13 @@ fn set_h(
             };
             if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
                 heap.no_gc(|heap| -> Result<(), VmError> {
-                    let undefined = heap.known().undefined.as_tagged(heap).erase();
+                    let undefined = heap.known().undefined.as_tagged(heap).erase_type();
                     if d.is_data_descriptor()
                         && d.writable == Some(false)
                         && !Compare::same_value(
                             heap,
                             value.as_tagged(heap),
-                            unsafe { d.value.unwrap_or(undefined).assume_valid(heap) },
+                            d.value.map_or(undefined, |h| h.as_tagged(heap)),
                         )
                     {
                         return Err(VmError::Message(
@@ -980,7 +923,7 @@ fn set_h(
                         ));
                     }
                     if d.is_accessor_descriptor()
-                        && d.set.as_ref().is_some_and(|s| *s == undefined)
+                        && d.set.is_some_and(|s| s.as_tagged(heap).ptr_eq(undefined))
                     {
                         return Err(VmError::Message(
                             "proxy set trap may not report success for an accessor without a setter",
@@ -1025,11 +968,7 @@ fn has_h(
                 has_h(vm, heap, state, scope, &target, name)
             } else {
                 let found = heap.no_gc(|heap| {
-                    has_property(
-                        heap,
-                        target.as_tagged(heap),
-                        SlotName::from_value(unsafe { name.read_unchecked() }),
-                    )
+                    has_property(heap, target.as_tagged(heap), name.as_tagged(heap).as_name())
                 });
                 Ok(Coercion::Value(Convert::boolean(heap, found).erase()))
             }
@@ -1105,10 +1044,7 @@ fn delete_h(
                 let target_obj = scope
                     .cast::<Object>(target.as_tagged(&*heap))
                     .expect("ordinary target");
-                let deleted =
-                    crate::Object::delete_own_property(heap, scope, target_obj, unsafe {
-                        key.read_unchecked()
-                    })?;
+                let deleted = crate::Object::delete_own_property(heap, scope, target_obj, *key)?;
                 Ok(Coercion::Value(Convert::boolean(heap, deleted).erase()))
             }
         }
@@ -1175,13 +1111,10 @@ fn proxy_define_h(
     partial: PartialDescriptor,
 ) -> Result<Flow<bool>, VmError> {
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::DefineProperty)?;
-    let partial = RootedPartial::new(scope, &*heap, &partial);
 
     match get_trap(vm, heap, state, scope, &handler, Trap::DefineProperty)? {
         TrapLookup::Threw => Ok(Flow::Threw),
-        TrapLookup::None => {
-            define_internal_h(vm, heap, state, scope, &target, name, partial.partial())
-        }
+        TrapLookup::None => define_internal_h(vm, heap, state, scope, &target, name, partial),
         TrapLookup::Trap(t) => {
             let desc_obj = descriptor_object(heap, state, &partial)?;
             let desc_obj = scope.handle(unsafe { desc_obj.assume_valid(&*heap) });
@@ -1224,7 +1157,7 @@ fn proxy_define_h(
                 }
                 Some(d) => {
                     let compatible = heap.no_gc(|heap| {
-                        let p = partial.partial();
+                        let p = partial;
                         is_compatible_property_descriptor(heap, extensible, &p, Some(d))
                     });
                     if !compatible {
@@ -1452,18 +1385,20 @@ fn construct_h(
 /// EXTENDABLE bit (maps are shared, so the clone isolates the object).
 fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Handle<'_, Object>) {
     use crate::{MapInit, MapKind};
-    let (kind, prototype, descriptors) = heap.no_gc(|heap| {
+    let (kind, prototype, rows) = heap.no_gc(|heap| {
         let map = obj.heap_ref(heap).map_ref(heap);
         (
             map.kind(),
-            map.prototype.inner(),
+            scope.handle(map.prototype.get(heap)),
+            // names are rooted here and re-anchored in the allocating
+            // closure: a Tagged cannot escape this no-GC region
             map.descriptors()
                 .iter()
                 .map(|d| {
                     (
-                        d.name(),
+                        scope.handle(d.name(heap)),
                         d.flags(),
-                        scope.handle(unsafe { d.value.inner().assume_valid(heap) }),
+                        scope.handle(d.value.get(heap)),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -1472,13 +1407,12 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
     if !kind.is_extendable() {
         return; // already non-extensible (idempotent)
     }
-    let prototype = scope.handle(unsafe { prototype.assume_valid(&*heap) });
-    heap.allocate_token_enter_heap(Map::layout_for(descriptors.len()), |token, heap| {
+    heap.allocate_token_enter_heap(Map::layout_for(rows.len()), |token, heap| {
         let obj_ref = obj.heap_ref(heap);
         let new_map = token.allocate::<Map>(MapInit {
             kind: MapKind::new(kind.bits() & !MapKind::EXTENDABLE.bits()),
             value_slot_count: obj_ref.map_ref(heap).value_slot_count(),
-            descriptors: &descriptors,
+            descriptors: &rows,
             prototype,
         });
         obj_ref.header.map.set(heap, obj_ref.erase(), new_map);

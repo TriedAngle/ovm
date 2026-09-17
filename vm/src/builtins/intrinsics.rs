@@ -124,10 +124,19 @@ fn delete_property(
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let target = target.as_tagged(&*nctx.heap()).erase();
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
         };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         // proxies run their `deleteProperty` trap (ES 20.2.5.4); the
         // returned boolean flows through the strict handling below
         let ok = if nctx
@@ -137,12 +146,13 @@ fn delete_property(
             let (vm, heap, state) = nctx.split();
             // Safety: fresh rooted-slot word (re-read above) plus a fresh
             // coercion result, both consumed by the trap call.
+            let key_word = unsafe { key.read_unchecked() };
             match crate::proxy::delete(
                 vm,
                 heap,
                 state,
                 unsafe { Tagged::<Value>::from_value_unchecked(target) },
-                unsafe { Tagged::<Value>::from_value_unchecked(key) },
+                unsafe { Tagged::<Value>::from_value_unchecked(key_word) },
             )? {
                 // Safety: fresh root-slot word read for the immediate return.
                 Coercion::Threw => return Ok(unsafe { heap.known().exception.read_unchecked() }),
@@ -151,7 +161,8 @@ fn delete_property(
                 }
             }
         } else {
-            delete_property_core(nctx, target, key)?
+            // Safety: fresh rooted name word, consumed by the delete.
+            delete_property_core(nctx, target, unsafe { key.read_unchecked() })?
         };
         if strict && !ok {
             return Err(VmError::Type);
@@ -197,6 +208,8 @@ fn delete_property_core(
                 unsafe { target.assume_valid(&*nctx.heap()) },
             )
             .expect("non-primitive receivers are objects");
+        // Safety: caller-supplied word, rooted before the delete.
+        let key = scope.handle(unsafe { key.assume_valid(&*nctx.heap()) });
         Object::delete_own_property(nctx.heap(), &scope, receiver, key)
     })
 }
@@ -366,22 +379,30 @@ fn for_in_initial_level(heap: &Heap, subject: Tagged<'_, Value>) -> Option<Value
     };
     let global = heap.known().global_object.as_tagged(heap).erase();
     let strings = heap.known().strings;
-    // Safety: fresh root-slot words read for the pointer-keyed names.
-    let name = SlotName::from_value(match ctor_name {
-        "Number" => unsafe { strings.number_ctor.read_unchecked() },
-        "Boolean" => unsafe { strings.boolean_ctor.read_unchecked() },
-        _ => unsafe { strings.symbol_ctor.read_unchecked() },
-    });
-    // Safety: root-slot / walk words, still fresh (no allocation since).
-    let ctor =
-        match crate::lookup::load_outcome(heap, unsafe { global.assume_valid(heap) }, name).ok()? {
-            crate::LoadOutcome::Value(v) if v.is_strong_ptr() => v.erase(),
-            _ => return None,
-        };
-    // Safety: fresh root-slot word read for the pointer-keyed name.
-    let proto_name =
-        SlotName::from_value(unsafe { heap.known().strings.prototype.read_unchecked() });
-    match crate::lookup::load_outcome(heap, unsafe { ctor.assume_valid(heap) }, proto_name).ok()? {
+    // Safety: fresh root-slot words read for the lookups.
+    let ctor_handle = match ctor_name {
+        "Number" => strings.number_ctor,
+        "Boolean" => strings.boolean_ctor,
+        _ => strings.symbol_ctor,
+    };
+    let ctor = match crate::lookup::load_outcome(
+        heap,
+        unsafe { global.assume_valid(heap) },
+        ctor_handle.as_tagged(heap),
+    )
+    .ok()?
+    {
+        crate::LoadOutcome::Value(v) if v.is_strong_ptr() => v.erase(),
+        _ => return None,
+    };
+    match crate::lookup::load_outcome(
+        heap,
+        unsafe { ctor.assume_valid(heap) },
+        // Safety: fresh root-slot word read for the lookup.
+        heap.known().strings.prototype.as_tagged(heap),
+    )
+    .ok()?
+    {
         crate::LoadOutcome::Value(p) if p.is_strong_ptr() => Some(p.erase()),
         _ => None,
     }
@@ -429,38 +450,33 @@ fn for_in_level_keys(
         }
 
         for d in obj.map_ref(heap).descriptors() {
-            let name = d.name();
+            let name = d.name(heap);
 
-            if let Some(smi) = Smi::decode(name.value()) {
+            if let Some(smi) = Smi::decode(name.erase()) {
                 let v = smi.value();
                 // array-index-range Smi names are index keys; anything
                 // else (negative, ≥ 2^32−1) keeps insertion order
                 if (0..u32::MAX as i64).contains(&v) {
                     indices.push(v);
                 } else {
-                    names.push(name.value());
+                    names.push(name.erase());
                 }
                 continue;
             }
-            // Safety: pointer-keyed name word re-anchored for the check.
-            if unsafe { name.tagged(heap) }
-                .erase_type()
-                .get_as::<Symbol>()
-                .is_some()
-            {
+            if name.erase_type().get_as::<Symbol>().is_some() {
                 continue; // symbols are never yielded
             }
             // canonical index strings classify as index keys (a store
             // through them creates a Smi-named descriptor, but object
             // literals and defines can still reach here)
-            let index = unsafe { name.tagged(heap) }
+            let index = name
                 .erase_type()
                 .get_as::<DenseString>()
                 .and_then(|s| crate::lookup::canonical_index(s.as_ref().data(heap)))
                 .filter(|i| *i < u32::MAX as usize);
             match index {
                 Some(i) => indices.push(i as i64),
-                None => names.push(name.value()),
+                None => names.push(name.erase()),
             }
         }
         (indices, names)
@@ -694,13 +710,11 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
             // lookups; no user code can run)
             // Safety: fresh root-slot words read for the lookups.
             let global = heap.known().global_object.as_tagged(heap).erase();
-            let string_name =
-                SlotName::from_value(unsafe { heap.known().strings.string.read_unchecked() });
             let Some(string_ctor) = crate::lookup::load_outcome(
                 heap,
                 // Safety: root-slot word, still fresh.
                 unsafe { global.assume_valid(heap) },
-                string_name,
+                heap.known().strings.string.as_tagged(heap),
             )
             .ok()
             .and_then(|o| match o {
@@ -709,14 +723,12 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
             }) else {
                 return Ok(None);
             };
-            // Safety: fresh root-slot word read for the pointer-keyed name.
-            let proto_name =
-                SlotName::from_value(unsafe { heap.known().strings.prototype.read_unchecked() });
             let proto = crate::lookup::load_outcome(
                 heap,
                 // Safety: walk word, still fresh (no allocation since).
                 unsafe { string_ctor.assume_valid(heap) },
-                proto_name,
+                // Safety: fresh root-slot word read for the lookup.
+                heap.known().strings.prototype.as_tagged(heap),
             )
             .ok()
             .and_then(|o| match o {
@@ -763,11 +775,11 @@ fn for_in_own_state(heap: &Heap, level: Value, key: Value) -> Option<bool> {
                 return obj.element_value(heap, i).is_some().then_some(true);
             }
             // plain objects keep index keys as Smi-named descriptors
-            let name = SlotName::from(Tagged::from_smi(Smi::new(i as i64)));
+            let name = Tagged::<SlotName>::from(Smi::new(i as i64));
             obj.map_ref(heap)
                 .descriptors()
                 .iter()
-                .find(|d| d.name() == name)
+                .find(|d| d.name(heap).ptr_eq(name))
                 .map(|d| d.flags().is_enumerable())
         }
         crate::Key::Name(name) => {
@@ -780,7 +792,7 @@ fn for_in_own_state(heap: &Heap, level: Value, key: Value) -> Option<bool> {
             obj.map_ref(heap)
                 .descriptors()
                 .iter()
-                .find(|d| d.name() == name)
+                .find(|d| d.name(heap).ptr_eq(name))
                 .map(|d| d.flags().is_enumerable())
         }
     }
@@ -836,11 +848,10 @@ fn iterator_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Valu
             )
         });
         let (vm, heap, state) = nctx.split();
-        // Safety: fresh root-slot word read for the pointer-keyed name.
-        let next_name = SlotName::from_value(unsafe { heap.known().strings.next.read_unchecked() });
+        // Safety: fresh root-slot word read for the lookup.
+        let next_name = unsafe { heap.known().strings.next.read_unchecked() };
         let iter_word = iter.as_tagged(&*heap).erase();
-        let next =
-            crate::runtime::Runtime::get_property(vm, heap, state, iter_word, next_name.value())?;
+        let next = crate::runtime::Runtime::get_property(vm, heap, state, iter_word, next_name)?;
         let next = match next {
             // Safety: fresh root-slot word read for the immediate return.
             Coercion::Threw => {
@@ -878,9 +889,9 @@ fn iterator_done(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Valu
         .heap()
         .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
     let (vm, heap, state) = nctx.split();
-    // Safety: fresh root-slot word read for the pointer-keyed name.
-    let done_name = SlotName::from_value(unsafe { heap.known().strings.done.read_unchecked() });
-    let done = crate::runtime::Runtime::get_property(vm, heap, state, result, done_name.value())?;
+    // Safety: fresh root-slot word read for the lookup.
+    let done_name = unsafe { heap.known().strings.done.read_unchecked() };
+    let done = crate::runtime::Runtime::get_property(vm, heap, state, result, done_name)?;
     match done {
         // Safety: fresh root-slot word read for the immediate return.
         Coercion::Threw => Ok(unsafe { nctx.heap().known().exception.read_unchecked() }),
@@ -902,9 +913,9 @@ fn iterator_value(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Val
         .heap()
         .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
     let (vm, heap, state) = nctx.split();
-    // Safety: fresh root-slot word read for the pointer-keyed name.
-    let value_name = SlotName::from_value(unsafe { heap.known().strings.value.read_unchecked() });
-    match crate::runtime::Runtime::get_property(vm, heap, state, result, value_name.value())? {
+    // Safety: fresh root-slot word read for the lookup.
+    let value_name = unsafe { heap.known().strings.value.read_unchecked() };
+    match crate::runtime::Runtime::get_property(vm, heap, state, result, value_name)? {
         // Safety: fresh root-slot word read for the immediate return.
         Coercion::Threw => Ok(unsafe { nctx.heap().known().exception.read_unchecked() }),
         Coercion::Value(v) => Ok(v),
@@ -929,20 +940,30 @@ fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
         // Safety: fresh argument word, rooted below before any allocation.
         let obj = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_obj) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
         };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         let obj = obj.as_tagged(&*heap).erase();
         if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { obj.assume_valid(heap) })) {
             // Safety: fresh rooted-slot word plus a fresh coercion
             // result, both consumed by the trap call.
+            let key_word = unsafe { key.read_unchecked() };
             return match crate::proxy::has(
                 vm,
                 heap,
                 state,
                 unsafe { Tagged::<Value>::from_value_unchecked(obj) },
-                unsafe { Tagged::<Value>::from_value_unchecked(key) },
+                unsafe { Tagged::<Value>::from_value_unchecked(key_word) },
             )? {
                 // Safety: fresh root-slot word read for the immediate return.
                 Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
@@ -955,7 +976,7 @@ fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
                 heap,
                 // Safety: fresh rooted-slot word re-read under the anchor.
                 unsafe { obj.assume_valid(heap) },
-                SlotName::from_value(key),
+                key.as_tagged(heap),
             )
         });
         Ok(nctx
@@ -1014,8 +1035,14 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 let (vm, heap, state) = nctx.split();
                 let mut out = Vec::with_capacity(excluded.len());
                 for k in excluded {
-                    match crate::runtime::Runtime::to_property_key(vm, heap, state, k)? {
-                        Some(k) => out.push(k),
+                    match crate::runtime::Runtime::to_property_key(
+                        vm,
+                        heap,
+                        state,
+                        // Safety: fresh argument word, fresh at entry.
+                        unsafe { Tagged::<Value>::from_value_unchecked(k) },
+                    )? {
+                        Some(k) => out.push(k.erase()),
                         None => return Ok((true, target_handle.as_tagged(&*heap).erase())),
                     }
                 }
@@ -1046,7 +1073,7 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 }
                 for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
                     if d.flags().is_enumerable() {
-                        keys.push(d.name().value());
+                        keys.push(d.name(heap).erase());
                     }
                 }
             });
@@ -1079,7 +1106,7 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 let exists = heap.no_gc(|heap| {
                     !matches!(
                         unsafe { target_handle.read_unchecked().assume_valid(heap) }
-                            .lookup(heap, SlotName::from_value(key_word)),
+                            .lookup(heap, key.as_tagged(heap).as_name()),
                         Lookup::NotFound
                     )
                 });
@@ -1088,15 +1115,16 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 }
                 // Safety: fresh call result, rooted below before any allocation.
                 let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(value) });
-                let target_word = target_handle.as_tagged(&*heap).erase();
-                let key_word = key.as_tagged(&*heap).erase();
-                Object::add_own_property_values(
+                let target_obj = scope
+                    .cast::<Object>(target_handle.as_tagged(&*heap))
+                    .expect("copy target is an object");
+                let key_name: Handle<'_, SlotName> = scope.handle(key.as_tagged(&*heap).as_name());
+                Object::add_own_property(
                     heap,
                     &scope,
-                    // Safety: fresh rooted-slot words; the define roots its inputs.
-                    target_word,
-                    SlotName::from_value(key_word),
-                    PropertyDescriptor::data(unsafe { value.read_unchecked() }),
+                    target_obj,
+                    key_name,
+                    PropertyDescriptor::data(value),
                 )?;
             }
             Ok((false, target_handle.as_tagged(&*heap).erase()))
@@ -1252,7 +1280,13 @@ fn init_instance_fields(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
             // computed keys need ToPropertyKey canonicalization
             let key = {
                 let (vm, heap, state) = nctx.split();
-                match crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? {
+                match crate::runtime::Runtime::to_property_key(
+                    vm,
+                    heap,
+                    state,
+                    // Safety: fresh walk word, no GC since the read.
+                    unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+                )? {
                     Some(k) => k,
                     None => return Ok(true),
                 }
@@ -1260,7 +1294,7 @@ fn init_instance_fields(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
             // the initializer call allocates (user code): the key must
             // stay rooted across it
             // Safety: fresh coercion result, rooted below.
-            let key = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(key) });
+            let key = scope.handle(key);
             // re-read the initializer after the coercion (it allocated)
             let init = nctx.heap().no_gc(|heap| {
                 unsafe { fields.read_unchecked().assume_valid(heap) }
@@ -1281,24 +1315,21 @@ fn init_instance_fields(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
             }
             // Safety: fresh call result, rooted below.
             let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(value) });
-            let defined = {
-                let heap = nctx.heap();
-                let instance_word = instance.as_tagged(&*heap).erase();
-                Object::define_own_property_values(
-                    heap,
-                    &scope,
-                    // Safety: fresh rooted-slot words; the define roots
-                    // its inputs.
-                    instance_word,
-                    SlotName::from_value(unsafe { key.read_unchecked() }),
-                    PropertyDescriptor::Data {
-                        value: unsafe { value.read_unchecked() },
-                        writable: true,
-                        enumerable: true,
-                        configurable: true,
-                    },
-                )?
-            };
+            let instance_obj = scope
+                .cast::<Object>(instance.as_tagged(&*nctx.heap()))
+                .expect("class instance is an object");
+            let defined = Object::define_own_property(
+                nctx.heap(),
+                &scope,
+                instance_obj,
+                key,
+                PropertyDescriptor::Data {
+                    value,
+                    writable: true,
+                    enumerable: true,
+                    configurable: true,
+                },
+            )?;
             if !defined {
                 return Err(VmError::Type);
             }
@@ -1399,17 +1430,21 @@ fn frame_super_parts(heap: &mut Heap, state: &ContextState) -> Result<(Value, Va
 fn apply_store_outcome(
     nctx: &mut NativeContext<'_>,
     receiver: Value,
-    outcome: StoreOutcome,
+    outcome: StoreOutcome<'_>,
     value: Value,
 ) -> Result<bool, VmError> {
     match outcome {
-        StoreOutcome::Transition { receiver, name } => {
+        StoreOutcome::Transition {
+            receiver: recv,
+            name,
+        } => {
             nctx.handle_scope(|nctx, scope| {
-                Object::add_own_property_values(
+                // Safety: caller-supplied value word, rooted before the define.
+                let value = scope.handle(unsafe { value.assume_valid(&*nctx.heap()) });
+                Object::add_own_property(
                     nctx.heap(),
                     &scope,
-                    // Safety: fresh walk words; the define roots its inputs.
-                    receiver,
+                    recv,
                     name,
                     PropertyDescriptor::data(value),
                 )
@@ -1421,12 +1456,15 @@ fn apply_store_outcome(
         StoreOutcome::CallSetter { setter } => {
             // Safety: fresh root-slot word read for the comparison below.
             let exception = unsafe { nctx.heap().known().exception.read_unchecked() };
-            // Safety: fresh walk word, consumed by the call.
             let result = nctx.handle_scope(|nctx, scope| {
                 nctx.call(
-                    unsafe { Tagged::<Value>::from_value_unchecked(setter) },
+                    // Safety: rooted-slot word, consumed by the call.
+                    unsafe { Tagged::<Value>::from_value_unchecked(setter.read_unchecked()) },
                     // Safety: caller-supplied words, staged for the call.
-                    scope.stage_words(&[receiver, value]),
+                    scope.stage(&[
+                        unsafe { Tagged::<Value>::from_value_unchecked(receiver) },
+                        unsafe { Tagged::<Value>::from_value_unchecked(value) },
+                    ]),
                 )
             })?;
             Ok(result == exception)
@@ -1450,7 +1488,8 @@ fn get_property_lenient(
             match load_outcome(
                 heap,
                 unsafe { receiver.assume_valid(heap) },
-                SlotName::from_value(name),
+                // Safety: caller-supplied name word, fresh at entry.
+                unsafe { name.assume_valid(heap) }.as_name(),
             )? {
                 LoadOutcome::Value(v) => Ok((Some(v.erase()), None)),
                 LoadOutcome::Getter(g) => Ok((None, Some(g.erase()))),
@@ -1504,12 +1543,21 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
         // Safety: fresh argument word, rooted below before any allocation.
         let fn_value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(fn_value) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
         };
-        // Safety: fresh coercion result, consumed before any allocation.
-        let key = unsafe { Tagged::<Value>::from_value_unchecked(key) };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
+        // Safety: fresh rooted name word, consumed before any allocation.
+        let key = unsafe { Tagged::<Value>::from_value_unchecked(key.read_unchecked()) };
         let units = state.handle_scope(|scope| -> Result<Vec<u16>, VmError> {
             let text = Convert::to_string(heap, &scope, key)?;
             let text = text.erase();
@@ -1544,9 +1592,11 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
             // the closure's own placeholder is never writable nor an accessor,
             // so only explicit member defines match here
             let explicit = heap.no_gc(|heap| {
-                // Safety: fresh root-slot word read for the pointer-keyed name.
-                let plain = SlotName::from_value(unsafe { name_key.read_unchecked() });
-                match fn_obj.heap_ref(heap).as_ref().lookup(heap, plain) {
+                match fn_obj
+                    .heap_ref(heap)
+                    .as_ref()
+                    .lookup(heap, name_key.as_tagged(heap))
+                {
                     Lookup::Data { flags, .. } => flags.is_writable(),
                     Lookup::Accessor { .. } => true,
                     Lookup::NotFound => false,
@@ -1556,14 +1606,14 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
             if explicit {
                 true
             } else {
+                // Safety: interned word, rooted before the define.
+                let name = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(name) });
                 Object::define_own_property(
                     heap,
                     &scope,
                     fn_obj,
                     name_key,
                     PropertyDescriptor::Data {
-                        // Safety: fresh rooted-slot word; the define roots
-                        // its inputs.
                         value: name,
                         writable: false,
                         enumerable: false,
@@ -1603,10 +1653,19 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let closure = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_closure) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
         };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         let is_getter = flags & 1 != 0;
         let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
         let (name, desc) = heap.no_gc(|heap| -> Result<_, VmError> {
@@ -1614,50 +1673,49 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
             if target.as_tagged(heap).as_heap_object().is_none() {
                 return Err(VmError::Type);
             }
-            // Safety: fresh coercion result, consumed here.
-            let name = match classify_key(heap, unsafe { key.assume_valid(heap) })? {
-                Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+            let name = match classify_key(heap, key.as_tagged(heap).erase_type())? {
+                Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
             // existing own accessor half, if any (own descriptors only)
-            // Safety: fresh root-slot word for the oddball singleton.
-            let undefined = unsafe { heap.known().undefined.read_unchecked() };
-            let mut get = undefined;
-            let mut set = undefined;
+            let mut get = heap.known().undefined.as_tagged(heap).erase_type();
+            let mut set = get;
             if let Some(obj) = target.as_tagged(heap).as_heap_object() {
                 for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
-                    if d.name() == name && d.flags().is_accessor() {
-                        // Safety: fresh slot word, consumed here.
-                        let pair =
-                            unsafe { Tagged::<Value>::from_value_unchecked(d.value.inner()) }
-                                .get_as::<AccessorPair>()
-                                .map(|p| (p.as_ref().get.inner(), p.as_ref().set.inner()))
-                                .expect("accessor descriptor holds a pair");
-                        (get, set) = pair;
+                    if d.name(heap).ptr_eq(name) && d.flags().is_accessor() {
+                        let pair = d
+                            .value
+                            .get(heap)
+                            .get_as::<AccessorPair>()
+                            .expect("accessor descriptor holds a pair");
+                        get = pair.get.get(heap);
+                        set = pair.set.get(heap);
                         break;
                     }
                 }
             }
             // Safety: fresh rooted-slot word for the new half.
-            let closure_word = closure.as_tagged(heap).erase();
+            let closure_word = closure.as_tagged(heap).erase_type();
             if is_getter {
                 get = closure_word;
             } else {
                 set = closure_word;
             }
             Ok((
-                name,
+                // the name must outlive this no-GC scope: root it
+                scope.handle(name),
                 PropertyDescriptor::Accessor {
-                    get,
-                    set,
+                    get: scope.handle(get),
+                    set: scope.handle(set),
                     enumerable,
                     configurable: true,
                 },
             ))
         })?;
-        // Safety: fresh rooted-slot words; the define roots its inputs.
-        let target_word = target.as_tagged(&*heap).erase();
-        let defined = Object::define_own_property_values(heap, &scope, target_word, name, desc)?;
+        let target_obj = scope
+            .cast::<Object>(target.as_tagged(&*heap))
+            .expect("checked object above");
+        let defined = Object::define_own_property(heap, &scope, target_obj, name, desc)?;
         if !defined {
             return Err(VmError::Type);
         }
@@ -1689,37 +1747,42 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         let receiver = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_receiver) });
         let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_value) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
         };
-        // re-read through the handles: the coercion above allocated
-        // (wrapper/float keys intern a string) and may have moved them
-        let receiver = receiver.as_tagged(&*heap).erase();
-        let value = value.as_tagged(&*heap).erase();
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         // proxies run their `defineProperty` trap (ES 20.2.5.6); define
         // sites are strict-mode: a rejected define throws
-        if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { receiver.assume_valid(heap) })) {
+        if heap.no_gc(|heap| crate::proxy::is_proxy(heap, receiver.as_tagged(heap))) {
             let partial = heap.no_gc(|heap| -> Result<crate::PartialDescriptor, VmError> {
                 let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
                 let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
                 if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
-                    // Safety: fresh handle word, consumed here.
-                    let pair = unsafe { value.assume_valid(heap) }
+                    let pair = value
+                        .as_tagged(heap)
                         .get_as::<AccessorPair>()
                         .ok_or(VmError::Type)?;
                     let pair = pair.as_ref();
                     Ok(crate::PartialDescriptor {
                         value: None,
-                        get: Some(pair.get.inner()),
-                        set: Some(pair.set.inner()),
+                        get: Some(scope.handle(pair.get.get(heap))),
+                        set: Some(scope.handle(pair.set.get(heap))),
                         writable: None,
                         enumerable: Some(enumerable),
                         configurable: Some(configurable),
                     })
                 } else {
                     Ok(crate::PartialDescriptor {
-                        value: Some(value),
+                        value: Some(scope.handle(value.as_tagged(heap))),
                         get: None,
                         set: None,
                         writable: Some(flags & bytecode::PropertyFlags::ReadOnly.bits() == 0),
@@ -1728,78 +1791,91 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
                     })
                 }
             })?;
-            // Safety: fresh handle words, consumed by the trap call.
+            // Safety: rooted handle words, consumed by the trap call.
+            let recv_word = unsafe { receiver.read_unchecked() };
+            let key_word = unsafe { key.read_unchecked() };
             return match crate::proxy::define_internal(
                 vm,
                 heap,
                 state,
-                unsafe { Tagged::<Value>::from_value_unchecked(receiver) },
-                unsafe { Tagged::<Value>::from_value_unchecked(key) },
+                &scope,
+                unsafe { Tagged::<Value>::from_value_unchecked(recv_word) },
+                unsafe { Tagged::<Value>::from_value_unchecked(key_word) },
                 partial,
             )? {
                 // Safety: fresh root-slot word read for the immediate return.
                 crate::proxy::Flow::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
                 crate::proxy::Flow::Value(false) => Err(VmError::Type),
-                crate::proxy::Flow::Value(true) => Ok(receiver),
+                crate::proxy::Flow::Value(true) => Ok(receiver.as_tagged(&*heap).erase()),
             };
         }
         let (name, desc) = heap.no_gc(|heap| -> Result<_, VmError> {
-            if unsafe { receiver.assume_valid(heap) }
-                .as_heap_object()
-                .is_none()
-            {
+            if receiver.as_tagged(heap).as_heap_object().is_none() {
                 return Err(VmError::Type);
             }
-            // Safety: fresh coercion result, consumed here.
-            let name = match classify_key(heap, unsafe { key.assume_valid(heap) })? {
-                Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+            // Safety: fresh rooted name word re-read under the anchor.
+            let name = match classify_key(heap, key.as_tagged(heap).erase_type())? {
+                Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
             let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
             let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
             let desc = if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
-                // Safety: fresh handle word, consumed here.
-                let pair = unsafe { value.assume_valid(heap) }
+                let pair = value
+                    .as_tagged(heap)
                     .get_as::<AccessorPair>()
                     .ok_or(VmError::Type)?;
                 let pair = pair.as_ref();
                 PropertyDescriptor::Accessor {
-                    get: pair.get.inner(),
-                    set: pair.set.inner(),
+                    get: scope.handle(pair.get.get(heap)),
+                    set: scope.handle(pair.set.get(heap)),
                     enumerable,
                     configurable,
                 }
             } else {
                 PropertyDescriptor::Data {
-                    value,
+                    value: scope.handle(value.as_tagged(heap)),
                     writable: flags & bytecode::PropertyFlags::ReadOnly.bits() == 0,
                     enumerable,
                     configurable,
                 }
             };
-            Ok((name, desc))
+            Ok((scope.handle(name), desc))
         })?;
-        // Safety: fresh handle words; the define roots its inputs.
-        let defined = Object::define_own_property_values(heap, &scope, receiver, name, desc)?;
+        let receiver_obj = scope
+            .cast::<Object>(receiver.as_tagged(&*heap))
+            .expect("checked object above");
+        let defined = Object::define_own_property(heap, &scope, receiver_obj, name, desc)?;
         if !defined {
             return Err(VmError::Type);
         }
-        Ok(receiver)
+        Ok(receiver.as_tagged(&*heap).erase())
     })
 }
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
 fn set_prototype(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    // Safety: fresh argument words, consumed below.
-    let (obj, proto) = nctx.heap().no_gc(|heap| {
-        Ok((
-            args.get(heap, 0).ok_or(VmError::Arity)?.erase(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.erase(),
-        ))
-    })?;
-    let (_, heap, state) = nctx.split();
-    state.handle_scope(|scope| Object::set_prototype(heap, &scope, obj, proto))?;
-    Ok(obj)
+    nctx.handle_scope(|nctx, scope| {
+        // Safety: fresh argument words, rooted below before any allocation.
+        let obj = scope.handle(unsafe {
+            Tagged::<Value>::from_value_unchecked(
+                nctx.heap()
+                    .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?,
+            )
+        });
+        let proto = scope.handle(unsafe {
+            Tagged::<Value>::from_value_unchecked(
+                nctx.heap()
+                    .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?,
+            )
+        });
+        let obj_ref = scope
+            .cast::<Object>(obj.as_tagged(&*nctx.heap()))
+            .expect("obj is an object");
+        Object::set_prototype(nctx.heap(), &scope, obj_ref, proto)?;
+        // Safety: fresh root-slot word read for the immediate return.
+        Ok(unsafe { obj.read_unchecked() })
+    })
 }
 
 /// Class extends validation (ES 15.7.14 step 15.e): (value) -> value,
@@ -2137,18 +2213,22 @@ fn store_dynamic_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
         None => {
             // Safety: fresh root-slot word, consumed below.
             let global = unsafe { nctx.heap().known().global_object.read_unchecked() };
-            let outcome = nctx.heap().no_gc(|heap| {
-                // Safety: fresh root-slot word, consumed here.
-                unsafe { global.assume_valid(heap) }.store_lookup(
-                    heap,
-                    // Safety: fresh root-slot word read for the name.
-                    SlotName::from_value(name),
-                    // Safety: caller-supplied word, fresh at entry, stored here.
-                    unsafe { value.assume_valid(heap) },
-                    StoreSemantics::WriteThrough,
-                )
+            let threw = nctx.handle_scope(|nctx, scope| -> Result<bool, VmError> {
+                let outcome = nctx.heap().no_gc(|heap| {
+                    // Safety: fresh root-slot word, consumed here.
+                    unsafe { global.assume_valid(heap) }.store_lookup(
+                        heap,
+                        &scope,
+                        // Safety: caller-supplied name word, fresh at entry.
+                        unsafe { name.assume_valid(heap) }.as_name(),
+                        // Safety: caller-supplied word, fresh at entry, stored here.
+                        unsafe { value.assume_valid(heap) },
+                        StoreSemantics::WriteThrough,
+                    )
+                })?;
+                apply_store_outcome(nctx, global, outcome, value)
             })?;
-            if apply_store_outcome(nctx, global, outcome, value)? {
+            if threw {
                 // Safety: fresh root-slot word read for the immediate return.
                 return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
             }
@@ -2244,10 +2324,19 @@ fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
         let home = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(home) });
         let recv = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_recv) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         // re-read through the handles: the coercion above allocated
         let recv = recv.as_tagged(&*heap).erase();
         // (plain value, getter) — both raw fresh words
@@ -2256,8 +2345,8 @@ fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
             nctx.heap()
                 .no_gc(|heap| -> Result<(Option<Value>, Option<Value>), VmError> {
                     let proto = home_proto(heap, home.as_tagged(heap));
-                    let name = match classify_key(heap, unsafe { key.assume_valid(heap) })? {
-                        Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                    let name = match classify_key(heap, key.as_tagged(heap).erase_type())? {
+                        Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                         Key::Name(name) => name,
                     };
                     Ok(match super_lookup_from_proto(heap, proto, name)? {
@@ -2317,38 +2406,47 @@ fn super_set_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
         let recv = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_recv) });
         let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_value) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
-        // re-read through the handles: the coercion above allocated
-        let recv = recv.as_tagged(&*heap).erase();
-        let value = value.as_tagged(&*heap).erase();
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
+        // Safety: rooted handle words, consumed below.
+        let recv_word = unsafe { recv.read_unchecked() };
+        let value_word = unsafe { value.read_unchecked() };
         let semantics = if semantics_flag & bytecode::SUPER_STORE_WRITE_THROUGH != 0 {
             StoreSemantics::WriteThrough
         } else {
             StoreSemantics::Shadow
         };
-        // Safety: fresh anchored handle words plus a fresh coercion result.
         let outcome = nctx.heap().no_gc(|heap| {
             let proto = home_proto(heap, home.as_tagged(heap));
-            let name = match classify_key(heap, unsafe { key.assume_valid(heap) })? {
-                Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+            let name = match classify_key(heap, key.as_tagged(heap).erase_type())? {
+                Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
             super_store_lookup(
                 heap,
+                &scope,
                 proto,
-                unsafe { recv.assume_valid(heap) },
+                unsafe { Tagged::<Value>::from_value_unchecked(recv_word) },
                 name,
-                unsafe { value.assume_valid(heap) },
+                unsafe { Tagged::<Value>::from_value_unchecked(value_word) },
                 semantics,
             )
         })?;
-        if apply_store_outcome(nctx, recv, outcome, value)? {
+        if apply_store_outcome(nctx, recv_word, outcome, value_word)? {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
         }
-        Ok(value)
+        Ok(value_word)
     })
 }

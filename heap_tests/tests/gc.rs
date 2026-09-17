@@ -1,6 +1,6 @@
 use heap_tests::for_each_backend;
 
-use vm::{DenseString, FixedArray, HeapBackend, SlotName, Smi};
+use vm::{DenseString, FixedArray, HeapBackend, Smi};
 
 fn well_known_survive_cycles<B: HeapBackend>()
 where
@@ -41,10 +41,8 @@ where
         let again = t.intern(&scope, "length");
         let heap = &*t.heap();
         assert_eq!(
-            // Safety: fresh rooted-slot words under the live borrow.
-            unsafe { SlotName::from(again.as_tagged(heap)).tagged(heap) }
-                .erase()
-                .to_bits(),
+            // Interned names compare by word identity.
+            again.as_tagged(heap).erase().to_bits(),
             known.strings.length.as_tagged(heap).erase().to_bits()
         );
         let _ = scope;

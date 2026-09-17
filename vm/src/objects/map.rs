@@ -61,9 +61,9 @@ impl Map {
     pub fn find_transition<'a>(
         &self,
         heap: &'a Heap,
-        name: SlotName,
+        name: Tagged<'a, SlotName>,
         flags: SlotFlags,
-        pair: Option<(Value, Value)>,
+        pair: Option<(Tagged<'a, Value>, Tagged<'a, Value>)>,
     ) -> Option<HeapRef<'a, Map>> {
         let lock = heap.transition_lock();
         let guard = lock.acquire();
@@ -73,9 +73,9 @@ impl Map {
     pub fn find_transition_locked<'a>(
         &self,
         heap: &'a Heap,
-        name: SlotName,
+        name: Tagged<'a, SlotName>,
         flags: SlotFlags,
-        pair: Option<(Value, Value)>,
+        pair: Option<(Tagged<'a, Value>, Tagged<'a, Value>)>,
         _guard: &TransitionGuard<'_>,
     ) -> Option<HeapRef<'a, Map>> {
         let array = self.transitions.heap_ref(heap)?;
@@ -85,13 +85,12 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            if entry[0].inner() != name.value() {
+            if !entry[0].get(heap).ptr_eq(name.erase_type()) {
                 continue;
             }
 
-            // Safety: word freshly read from a traced slot under the
-            // anchored borrow `heap`.
-            let target = unsafe { Tagged::<'_, Value>::from_value_unchecked(entry[1].inner()) }
+            let target = entry[1]
+                .get(heap)
                 .get_as::<Map>()
                 .expect("transition target must be a map");
 
@@ -102,7 +101,7 @@ impl Map {
             let Some(row) = target
                 .descriptors()
                 .iter()
-                .find(|d| d.name() == name && d.flags() == flags)
+                .find(|d| d.name(heap).ptr_eq(name) && d.flags() == flags)
             else {
                 continue;
             };
@@ -111,16 +110,13 @@ impl Map {
             // reusable when the pair is identical (same-name accessors with
             // different pairs get separate tree entries)
             if let Some((get, set)) = pair {
-                // Safety: caller-supplied pair words read fresh under the
-                // anchor; slot reads likewise.
-                let matches = unsafe { row.value.inner().assume_valid(heap) }
+                let matches = row
+                    .value
+                    .get(heap)
                     .get_as::<AccessorPair>()
                     .is_some_and(|p| {
-                        Compare::same_value(heap, unsafe { get.assume_valid(heap) }, unsafe {
-                            p.get.inner().assume_valid(heap)
-                        }) && Compare::same_value(heap, unsafe { set.assume_valid(heap) }, unsafe {
-                            p.set.inner().assume_valid(heap)
-                        })
+                        Compare::same_value(heap, get, p.get.get(heap))
+                            && Compare::same_value(heap, set, p.set.get(heap))
                     });
                 if !matches {
                     continue;
@@ -139,7 +135,7 @@ impl Map {
     pub fn find_remove_transition_locked<'a>(
         &self,
         heap: &'a Heap,
-        name: SlotName,
+        name: Tagged<'a, SlotName>,
         _guard: &TransitionGuard<'_>,
     ) -> Option<HeapRef<'a, Map>> {
         let array = self.transitions.heap_ref(heap)?;
@@ -149,16 +145,18 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            if entry[0].inner() != name.value() {
+            if !entry[0].get(heap).ptr_eq(name.erase_type()) {
                 continue;
             }
-            // Safety: word freshly read from a traced slot under the
-            // anchored borrow `heap`.
-            let target = unsafe { Tagged::<'_, Value>::from_value_unchecked(entry[1].inner()) }
+            let target = entry[1]
+                .get(heap)
                 .get_as::<Map>()
                 .expect("transition target must be a map");
             if target.descriptor_count() + 1 == self.descriptor_count()
-                && !target.descriptors().iter().any(|d| d.name() == name)
+                && !target
+                    .descriptors()
+                    .iter()
+                    .any(|d| d.name(heap).ptr_eq(name))
             {
                 return Some(target);
             }
@@ -170,7 +168,7 @@ impl Map {
 pub struct MapInit<'a> {
     pub kind: MapKind,
     pub value_slot_count: usize,
-    pub descriptors: &'a [(SlotName, SlotFlags, Handle<'a, Value>)],
+    pub descriptors: &'a [(Handle<'a, SlotName>, SlotFlags, Handle<'a, Value>)],
     /// the hole = no prototype (null-proto for JS maps).
     /// Handled because `Map` allocation may move the prototype.
     pub prototype: Handle<'a, Value>,
@@ -195,20 +193,14 @@ impl HeapObject for Map {
             .set(heap, host, Smi::new(config.descriptors.len() as i64));
         self.kind
             .set(heap, host, Smi::new(config.kind.bits() as i64));
-        // Safety: init runs before any further allocation; the config's
-        // handles are rooted by the caller.
-        self.prototype.set(heap, host, unsafe {
-            Tagged::from_value_unchecked(config.prototype.read_unchecked())
-        });
+        self.prototype
+            .set(heap, host, config.prototype.as_tagged(heap));
         self.transitions.clear(heap);
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
-            // Safety: as above.
-            d.name.set(heap, host, unsafe { name.tagged(heap) });
+            d.name.set(heap, host, name.as_tagged(heap));
             d.flags.set(heap, host, Smi::new(flags.bits() as i64));
-            d.value.set(heap, host, unsafe {
-                Tagged::from_value_unchecked(value.read_unchecked())
-            });
+            d.value.set(heap, host, value.as_tagged(heap));
         }
     }
 
@@ -392,8 +384,8 @@ pub struct SlotDescriptor {
 }
 
 impl SlotDescriptor {
-    pub fn name(&self) -> SlotName {
-        SlotName(self.name.inner())
+    pub fn name<'a>(&self, heap: &'a Heap) -> Tagged<'a, SlotName> {
+        self.name.get(heap)
     }
 
     pub fn flags(&self) -> SlotFlags {
@@ -410,58 +402,35 @@ impl SlotDescriptor {
 /// A property name: a string (the interner's canonical instance, by
 /// convention — names compare by pointer), a symbol, or a smi index.
 #[repr(transparent)]
-#[derive(Debug, Copy, Clone)]
 pub struct SlotName(Value);
 
 impl SlotName {
-    pub fn value(self) -> Value {
+    /// The erased name word.
+    pub fn into_value(self) -> Value {
         self.0
     }
+}
 
-    pub fn from_value(value: Value) -> Self {
-        Self(value)
-    }
-
-    /// # Safety
-    /// The name word must have been loaded (or kept alive some other
-    /// way) under a heap borrow that is still alive for `'a`.
-    pub unsafe fn tagged<'a>(self, _heap: &'a Heap) -> Tagged<'a, SlotName> {
-        unsafe { Tagged::from_value_unchecked(self.0) }
+impl<'a> From<Tagged<'a, DenseString>> for Tagged<'a, SlotName> {
+    fn from(string: Tagged<'a, DenseString>) -> Self {
+        // Safety: type-level narrowing
+        unsafe { string.cast() }
     }
 }
 
-impl From<Tagged<'_, Symbol>> for SlotName {
-    fn from(symbol: Tagged<'_, Symbol>) -> Self {
-        Self(symbol.erase())
+impl<'a> From<Tagged<'a, Symbol>> for Tagged<'a, SlotName> {
+    fn from(symbol: Tagged<'a, Symbol>) -> Self {
+        // Safety: type-level narrowing
+        unsafe { symbol.cast() }
     }
 }
 
-impl From<Tagged<'_, DenseString>> for SlotName {
-    fn from(string: Tagged<'_, DenseString>) -> Self {
-        Self(string.erase())
+impl<'a> From<Smi> for Tagged<'a, SlotName> {
+    fn from(smi: Smi) -> Self {
+        // Safety: Smi words are pointer-free
+        unsafe { Tagged::from_value_unchecked(smi.encode()) }
     }
 }
-
-impl From<Tagged<'_, Smi>> for SlotName {
-    fn from(smi: Tagged<'_, Smi>) -> Self {
-        Self(smi.erase())
-    }
-}
-
-impl From<Handle<'_, Symbol>> for SlotName {
-    fn from(symbol: Handle<'_, Symbol>) -> Self {
-        // Safety: rooted-slot word read for a pointer-keyed name.
-        Self(unsafe { symbol.read_unchecked() })
-    }
-}
-
-impl PartialEq for SlotName {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Eq for SlotName {}
 
 #[repr(C)]
 pub struct AccessorPair {
@@ -483,13 +452,9 @@ impl HeapObject for AccessorPair {
         self.header
             .map
             .set(heap, host, heap.known().accessor_pair_map.as_tagged(heap));
-        // Safety: init runs before any further allocation.
-        self.get.set(heap, host, unsafe {
-            Tagged::from_value_unchecked(config.0.read_unchecked())
-        });
-        self.set.set(heap, host, unsafe {
-            Tagged::from_value_unchecked(config.1.read_unchecked())
-        });
+        // the config's handles are roots; no allocation runs inside init
+        self.get.set(heap, host, config.0.as_tagged(heap));
+        self.set.set(heap, host, config.1.as_tagged(heap));
     }
 
     fn header(&self) -> &Header {

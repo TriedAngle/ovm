@@ -87,7 +87,7 @@ pub(crate) fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<V
         }
     }
     for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
-        keys.push(d.name().value());
+        keys.push(d.name(heap).erase());
     }
     keys
 }
@@ -110,19 +110,24 @@ pub(crate) fn object_has_own_property(
         // Safety: fresh argument word, rooted below before any allocation.
         let receiver = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_receiver) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         let receiver = receiver.as_tagged(&*heap).erase();
         let has = heap.no_gc(|heap| {
-            let key = crate::SlotName::from_value(key);
-            if let crate::Key::Element(i) = crate::classify_key(
-                heap,
-                // Safety: pointer-keyed name word re-anchored for the class check.
-                unsafe { key.tagged(heap) }.erase_type(),
-            )
-            .unwrap_or(crate::Key::Name(key))
+            let key = key.as_tagged(heap);
+            if let crate::Key::Element(i) =
+                crate::classify_key(heap, key.erase_type()).unwrap_or(crate::Key::Name(key))
                 && let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -157,19 +162,24 @@ pub(crate) fn object_property_is_enumerable(
         // Safety: fresh argument word, rooted below before any allocation.
         let receiver = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_receiver) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         let receiver = receiver.as_tagged(&*heap).erase();
         let enumerable = heap.no_gc(|heap| {
-            let key = crate::SlotName::from_value(key);
-            if let crate::Key::Element(i) = crate::classify_key(
-                heap,
-                // Safety: pointer-keyed name word re-anchored for the class check.
-                unsafe { key.tagged(heap) }.erase_type(),
-            )
-            .unwrap_or(crate::Key::Name(key))
+            let key = key.as_tagged(heap);
+            if let crate::Key::Element(i) =
+                crate::classify_key(heap, key.erase_type()).unwrap_or(crate::Key::Name(key))
                 && let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -227,38 +237,23 @@ pub(crate) fn object_get_own_property_names(
 /// Build a plain `{ key: value, ... }` object from static field names.
 pub(crate) fn plain_object(
     nctx: &mut crate::natives::NativeContext<'_>,
-    fields: &[(&'static str, Value)],
+    fields: &[(&'static str, Handle<'_, Value>)],
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
-        // root every field value up front: the object allocation and the
-        // per-field interning/defines below allocate, which would leave
-        // raw copies stale
-        // Safety: caller-supplied words, fresh at entry, rooted below.
-        let rooted: Vec<(&'static str, Handle<'_, Value>)> = fields
-            .iter()
-            .map(|(name, value)| {
-                (
-                    *name,
-                    scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(*value) }),
-                )
-            })
-            .collect();
         let map = nctx.heap().known().object_initial_map;
         let obj = nctx
             .heap()
             .new_object(&scope, map, GcSlice::EMPTY)
             .into_handle(&scope);
-        for (name, value) in rooted {
+        for (name, value) in fields {
             let name = nctx.intern(&scope, name);
-            // Safety: fresh rooted-slot words; the define roots its inputs.
-            let name = scope
-                .handle(unsafe { Tagged::<SlotName>::from_value_unchecked(name.read_unchecked()) });
+            let name = scope.handle(name.as_tagged(&*nctx.heap()));
             Object::define_own_property(
                 nctx.heap(),
                 &scope,
                 obj,
                 name,
-                PropertyDescriptor::data(unsafe { value.read_unchecked() }),
+                PropertyDescriptor::data(*value),
             )?;
         }
         // Safety: fresh rooted-slot word, returned without an
@@ -286,22 +281,36 @@ pub(crate) fn object_get_own_property_descriptor(
         // Safety: fresh argument word, rooted below before any allocation.
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         let desc = heap.no_gc(|heap| {
             crate::lookup::ordinary_own_descriptor(
                 heap,
+                &scope,
                 target.as_tagged(heap),
-                // Safety: fresh coercion result, consumed here.
-                unsafe { key.assume_valid(heap) },
+                // fresh rooted name word re-read under the anchor
+                key.as_tagged(heap).erase_type(),
             )
         });
-        // Safety: fresh root-slot words for the oddball singletons.
+        // root the oddball singletons once for the descriptor fields
         let undefined = unsafe { nctx.heap().known().undefined.read_unchecked() };
-        let true_v = unsafe { nctx.heap().known().true_object.read_unchecked() };
-        let false_v = unsafe { nctx.heap().known().false_object.read_unchecked() };
+        let true_v = scope.handle(unsafe {
+            Tagged::<Value>::from_value_unchecked(nctx.heap().known().true_object.read_unchecked())
+        });
+        let false_v = scope.handle(unsafe {
+            Tagged::<Value>::from_value_unchecked(nctx.heap().known().false_object.read_unchecked())
+        });
         let bool_ = |b| if b { true_v } else { false_v };
         match desc {
             Some(crate::PropertyDescriptor::Data {
@@ -359,28 +368,37 @@ pub(crate) fn object_define_property(
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let attrs = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_attrs) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = crate::runtime::Runtime::to_property_key(
+            vm,
+            heap,
+            state,
+            // Safety: fresh argument word, fresh at entry.
+            unsafe { Tagged::<Value>::from_value_unchecked(raw_key) },
+        )?
+        else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
-        // Safety: fresh coercion result, rooted below.
-        let key = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(key) });
+        // root the name: the tagged result anchors the `&mut` borrow
+        let key = scope.handle(key);
         // shared ToPropertyDescriptor; proxies and ordinary targets both
         // complete/validate inside define_internal
-        let attrs_value = attrs.as_tagged(&*heap).erase();
-        let partial =
-            match crate::runtime::Runtime::to_property_descriptor(vm, heap, state, attrs_value)? {
-                Some(partial) => partial,
-                // Safety: fresh root-slot word read for the immediate return.
-                None => return Ok(unsafe { heap.known().exception.read_unchecked() }),
-            };
+        let partial = match crate::runtime::Runtime::to_property_descriptor(
+            vm, heap, state, &scope, attrs,
+        )? {
+            Some(partial) => partial,
+            // Safety: fresh root-slot word read for the immediate return.
+            None => return Ok(unsafe { heap.known().exception.read_unchecked() }),
+        };
         let (vm, heap, state) = nctx.split();
         // Safety: fresh rooted-slot words, consumed by the call.
         match crate::proxy::define_internal(
             vm,
             heap,
             state,
+            &scope,
             unsafe { Tagged::<Value>::from_value_unchecked(target.read_unchecked()) },
+            // Safety: fresh rooted name word, consumed by the trap call.
             unsafe { Tagged::<Value>::from_value_unchecked(key.read_unchecked()) },
             partial,
         )? {
@@ -424,7 +442,12 @@ pub(crate) fn object_set_prototype_of(
         return Err(VmError::Type);
     }
     nctx.handle_scope(|nctx, scope| {
-        crate::Object::set_prototype(nctx.heap(), &scope, target, proto)?;
+        let target_h = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(target) });
+        let proto_h = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(proto) });
+        let target_obj = scope
+            .cast::<Object>(target_h.as_tagged(&*nctx.heap()))
+            .expect("target checked to be an object");
+        crate::Object::set_prototype(nctx.heap(), &scope, target_obj, proto_h)?;
         Ok(target)
     })
 }
@@ -521,42 +544,50 @@ pub(crate) fn set_integrity_flags(
     freeze: bool,
 ) {
     use crate::{Map, MapInit, MapKind, SlotFlags};
-    let (kind, prototype, descriptors) = heap.no_gc(|heap| {
+    let (kind, descriptor_count, already) = heap.no_gc(|heap| {
         let map = obj.heap_ref(heap).map_ref(heap);
         (
             map.kind(),
-            map.prototype.inner(),
-            map.descriptors()
-                .iter()
-                .map(|d| (d.name(), d.flags(), scope.handle(d.value.get(heap))))
-                .collect::<Vec<_>>(),
+            map.descriptors().len(),
+            !map.kind().is_extendable()
+                && map.descriptors().iter().all(|d| {
+                    let flags = d.flags();
+                    !flags.is_configurable()
+                        && (!freeze || flags.is_accessor() || !flags.is_writable())
+                }),
         )
     });
-    let already = !kind.is_extendable()
-        && descriptors.iter().all(|(_, flags, _)| {
-            !flags.is_configurable() && (!freeze || flags.is_accessor() || !flags.is_writable())
-        });
     if already {
         return;
     }
-    // Safety: fresh map-slot word, rooted below before any allocation.
-    let prototype = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(prototype) });
-    let descriptors: Vec<_> = descriptors
-        .into_iter()
-        .map(|(name, flags, value)| {
-            let mut flags = flags;
-            flags = SlotFlags::new(flags.bits() & !SlotFlags::CONFIGURABLE.bits());
-            if freeze && !flags.is_accessor() {
-                flags = SlotFlags::new(flags.bits() & !SlotFlags::WRITABLE.bits());
-            }
-            (name, flags, value)
-        })
-        .collect();
-    heap.allocate_token_enter_heap(Map::layout_for(descriptors.len()), |token, heap| {
+    // clone the map with `configurable` (and for freeze `writable`)
+    // cleared on every descriptor and EXTENDABLE dropped: names are
+    // read under the enter-heap anchor so the descriptor rows stay
+    // anchored across the (allocating) map build
+    heap.allocate_token_enter_heap(Map::layout_for(descriptor_count), |token, heap| {
         let obj_ref = obj.heap_ref(heap);
+        let map = obj_ref.map_ref(heap);
+        // Safety: fresh map-slot word, rooted below before the allocation.
+        let prototype = scope.handle(map.prototype.get(heap));
+        let descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> = map
+            .descriptors()
+            .iter()
+            .map(|d| {
+                let mut flags = d.flags();
+                flags = SlotFlags::new(flags.bits() & !SlotFlags::CONFIGURABLE.bits());
+                if freeze && !flags.is_accessor() {
+                    flags = SlotFlags::new(flags.bits() & !SlotFlags::WRITABLE.bits());
+                }
+                (
+                    scope.handle(d.name(heap)),
+                    flags,
+                    scope.handle(d.value.get(heap)),
+                )
+            })
+            .collect();
         let new_map = token.allocate::<Map>(MapInit {
             kind: MapKind::new(kind.bits() & !MapKind::EXTENDABLE.bits()),
-            value_slot_count: obj_ref.map_ref(heap).value_slot_count(),
+            value_slot_count: map.value_slot_count(),
             descriptors: &descriptors,
             prototype,
         });

@@ -173,7 +173,12 @@ fn classify_callee(heap: &Heap, f: Value) -> Callee {
     }
 }
 
-fn callable_name(heap: &Heap, stack: &Stack, meta: &FrameMeta, idx: usize) -> SlotName {
+fn callable_name<'a>(
+    heap: &'a Heap,
+    stack: &Stack,
+    meta: &FrameMeta,
+    idx: usize,
+) -> Tagged<'a, SlotName> {
     let callable = stack.callable_slot(meta).read(heap);
     let Some(callable) = callable.as_heap_object() else {
         panic!("frame callable must be an object");
@@ -442,24 +447,20 @@ fn apply_store_outcome(
     meta: FrameMeta,
     pc: usize,
     receiver: Value,
-    outcome: StoreOutcome,
+    outcome: StoreOutcome<'_>,
 ) -> Result<(), VmError> {
     match outcome {
-        StoreOutcome::Transition { receiver, name } => {
-            // fresh word for the descriptor, read at the call
-            let value = cache.acc(&*heap).erase();
-
+        StoreOutcome::Transition {
+            receiver: recv,
+            name,
+        } => {
             state.handle_scope(|scope| {
-                Object::add_own_property_values(
-                    heap,
-                    &scope,
-                    receiver,
-                    name,
-                    PropertyDescriptor::data(value),
-                )
-                // TODO(strict-mode): a false result must throw in strict code;
-                // the current store path preserves its existing sloppy result.
-                .map(|_| ())
+                // fresh word for the descriptor, read at the call
+                let value = scope.handle(cache.acc(&*heap));
+                Object::add_own_property(heap, &scope, recv, name, PropertyDescriptor::data(value))
+                    // TODO(strict-mode): a false result must throw in strict code;
+                    // the current store path preserves its existing sloppy result.
+                    .map(|_| ())
             })
         }
         StoreOutcome::CallSetter { setter } => {
@@ -473,7 +474,8 @@ fn apply_store_outcome(
                 cache,
                 meta,
                 pc,
-                setter,
+                // Safety: rooted-slot word, consumed by the call.
+                unsafe { setter.read_unchecked() },
                 &[receiver, value],
             )?;
             Ok(())
@@ -1406,13 +1408,14 @@ fn step(
             }
         }
         Opcode::LoadNamedProperty => {
-            let name = heap.no_gc(|heap| callable_name(heap, stack, &meta, ops.idx(1)));
             // Safety: fresh register word, no GC since.
             let receiver_word = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             // proxies run their `get` trap outside any no-GC scope
             if heap.no_gc(|heap| {
                 crate::proxy::is_proxy(heap, unsafe { receiver_word.assume_valid(heap) })
             }) {
+                // Safety: name held rooted by the owning constants pool.
+                let name_word = callable_name(&*heap, stack, &meta, ops.idx(1)).erase();
                 return match step_try!(crate::proxy::get(
                     vm,
                     heap,
@@ -1420,8 +1423,8 @@ fn step(
                     // Safety: fresh register word, no GC since.
                     unsafe { Tagged::from_value_unchecked(receiver_word) },
                     unsafe { Tagged::from_value_unchecked(receiver_word) },
-                    // Safety: name held rooted by the owning constants pool.
-                    unsafe { Tagged::from_value_unchecked(name.value()) },
+                    // Safety: constants-pool word, rooted by the callable.
+                    unsafe { Tagged::from_value_unchecked(name_word) },
                 )) {
                     Coercion::Threw => Step::PendingThrow,
                     Coercion::Value(v) => {
@@ -1431,6 +1434,7 @@ fn step(
                 };
             }
             let outcome = step_try!(heap.no_gc(|heap| {
+                let name = callable_name(heap, stack, &meta, ops.idx(1));
                 load_outcome(heap, unsafe { receiver_word.assume_valid(heap) }, name)
                     .map(LoadResult::of)
             }));
@@ -1467,7 +1471,6 @@ fn step(
                 Opcode::StoreNamedPropertyNoShadow => StoreSemantics::WriteThrough,
                 _ => StoreSemantics::Shadow,
             };
-            let name = heap.no_gc(|heap| callable_name(heap, stack, &meta, ops.idx(1)));
             // Safety: fresh register word, no GC since.
             let receiver_word = stack.reg(&*heap, &meta, ops.reg(0)).erase();
             // proxies run their `set` trap outside any no-GC scope
@@ -1476,14 +1479,16 @@ fn step(
             }) {
                 // fresh acc word read for the trap call
                 let value_word = cache.acc(&*heap).erase();
+                // Safety: name held rooted by the owning constants pool.
+                let name_word = callable_name(&*heap, stack, &meta, ops.idx(1)).erase();
                 return match step_try!(crate::proxy::set(
                     vm,
                     heap,
                     state,
                     // Safety: fresh register word, no GC since.
                     unsafe { Tagged::from_value_unchecked(receiver_word) },
-                    // Safety: name held rooted by the owning constants pool.
-                    unsafe { Tagged::from_value_unchecked(name.value()) },
+                    // Safety: constants-pool word, rooted by the callable.
+                    unsafe { Tagged::from_value_unchecked(name_word) },
                     // Safety: fresh acc word, no GC since.
                     unsafe { Tagged::from_value_unchecked(value_word) },
                     unsafe { Tagged::from_value_unchecked(receiver_word) },
@@ -1492,26 +1497,30 @@ fn step(
                     Coercion::Value(_) => Step::Next,
                 };
             }
-            let outcome = step_try!(heap.no_gc(|heap| {
-                unsafe { receiver_word.assume_valid(heap) }.store_lookup(
+            state.handle_scope(|scope| -> Step {
+                let outcome = step_try!(heap.no_gc(|heap| {
+                    let name = callable_name(heap, stack, &meta, ops.idx(1));
+                    unsafe { receiver_word.assume_valid(heap) }.store_lookup(
+                        heap,
+                        &scope,
+                        name,
+                        cache.acc(heap),
+                        semantics,
+                    )
+                }));
+                step_try!(apply_store_outcome(
+                    vm,
                     heap,
-                    name,
-                    cache.acc(heap),
-                    semantics,
-                )
-            }));
-            step_try!(apply_store_outcome(
-                vm,
-                heap,
-                state,
-                stack,
-                cache,
-                meta,
-                pc,
-                receiver_word,
-                outcome,
-            ));
-            Step::Next
+                    state,
+                    stack,
+                    cache,
+                    meta,
+                    pc,
+                    receiver_word,
+                    outcome,
+                ));
+                Step::Next
+            })
         }
         Opcode::LoadKeyedProperty => {
             // the key coercion allocates (to_property_key interns): the
@@ -1519,10 +1528,18 @@ fn step(
             state.handle_scope(|scope| {
                 let receiver = scope.handle(stack.reg(&*heap, &meta, ops.reg(0)));
                 let raw_key = cache.acc(&*heap).erase();
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key))
-                else {
+                let Some(key) = step_try!(Runtime::to_property_key(
+                    vm,
+                    heap,
+                    state,
+                    // Safety: fresh acc word, no GC since.
+                    unsafe { Tagged::from_value_unchecked(raw_key) },
+                )) else {
                     return Step::PendingThrow;
                 };
+                // root the word in the acc register: the tagged result
+                // anchors the `&mut` borrow
+                let key = key.erase();
                 cache.set_acc(key);
                 // re-read through the handle: the coercion above allocated
                 // Safety: fresh rooted-slot word.
@@ -1587,12 +1604,10 @@ fn step(
                                 Some(v) => Ok(LoadResult::Value(v.erase())),
                                 // past the end, a hole, or a non-array receiver:
                                 // fall back to an ordinary property lookup
-                                None => load_outcome(
-                                    heap,
-                                    receiver,
-                                    SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                                )
-                                .map(LoadResult::of),
+                                None => {
+                                    load_outcome(heap, receiver, Tagged::from(Smi::new(i as i64)))
+                                        .map(LoadResult::of)
+                                }
                             }
                         }
                         Key::Name(name) => load_outcome(heap, receiver, name).map(LoadResult::of),
@@ -1637,9 +1652,18 @@ fn step(
                 };
                 let receiver = scope.handle(stack.reg(&*heap, &meta, ops.reg(0)));
                 let raw = stack.reg(&*heap, &meta, ops.reg(1)).erase();
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
+                let Some(key) = step_try!(Runtime::to_property_key(
+                    vm,
+                    heap,
+                    state,
+                    // Safety: fresh register word, no GC since.
+                    unsafe { Tagged::from_value_unchecked(raw) },
+                )) else {
                     return Step::PendingThrow;
                 };
+                // root the word in the key register: the tagged result
+                // anchors the `&mut` borrow
+                let key = key.erase();
                 stack.set_reg(&meta, ops.reg(1), key);
                 // the receiver is re-read through its handle at every
                 // use: the key coercion above allocated and may have moved
@@ -1670,9 +1694,24 @@ fn step(
                         Coercion::Value(_) => Step::Next,
                     };
                 }
-                let key = step_try!(classify_key(&*heap, unsafe { key.assume_valid(&*heap) }));
-                match key {
-                    Key::Element(i) => {
+                // classify the coerced key inside a no-GC scope: the
+                // Key borrows the heap, so the name arm is rooted
+                // before it escapes
+                let mut name_slot: Option<Handle<'_, SlotName>> = None;
+                let element = step_try!(heap.no_gc(|heap| -> Result<Option<usize>, VmError> {
+                    // Safety: register word, fresh at entry.
+                    Ok(
+                        match classify_key(heap, unsafe { key.assume_valid(heap) })? {
+                            Key::Element(i) => Some(i),
+                            Key::Name(name) => {
+                                name_slot = Some(scope.handle(name));
+                                None
+                            }
+                        },
+                    )
+                }));
+                match element {
+                    Some(i) => {
                         let is_array = heap.no_gc(|heap| {
                             let Some(obj) =
                                 unsafe { receiver_word.assume_valid(heap) }.as_heap_object()
@@ -1700,7 +1739,8 @@ fn step(
                             let outcome = step_try!(heap.no_gc(|heap| {
                                 unsafe { receiver_word.assume_valid(heap) }.store_lookup(
                                     heap,
-                                    SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                                    &scope,
+                                    Tagged::from(Smi::new(i as i64)),
                                     cache.acc(heap),
                                     semantics,
                                 )
@@ -1718,11 +1758,13 @@ fn step(
                             ));
                         }
                     }
-                    Key::Name(name) => {
+                    None => {
+                        let name = name_slot.expect("name classified above");
                         let outcome = step_try!(heap.no_gc(|heap| {
                             unsafe { receiver_word.assume_valid(heap) }.store_lookup(
                                 heap,
-                                name,
+                                &scope,
+                                name.as_tagged(heap),
                                 cache.acc(heap),
                                 semantics,
                             )
@@ -1854,19 +1896,22 @@ fn step(
         Opcode::StoreGlobal => {
             // Safety: old-gen root-slot word.
             let global = unsafe { heap.known().global_object.read_unchecked() };
-            let outcome = step_try!(heap.no_gc(|heap| {
-                let name = callable_name(heap, stack, &meta, ops.idx(0));
-                unsafe { global.assume_valid(heap) }.store_lookup(
-                    heap,
-                    name,
-                    cache.acc(heap),
-                    StoreSemantics::WriteThrough,
-                )
-            }));
-            step_try!(apply_store_outcome(
-                vm, heap, state, stack, cache, meta, pc, global, outcome,
-            ));
-            Step::Next
+            state.handle_scope(|scope| -> Step {
+                let outcome = step_try!(heap.no_gc(|heap| {
+                    let name = callable_name(heap, stack, &meta, ops.idx(0));
+                    unsafe { global.assume_valid(heap) }.store_lookup(
+                        heap,
+                        &scope,
+                        name,
+                        cache.acc(heap),
+                        StoreSemantics::WriteThrough,
+                    )
+                }));
+                step_try!(apply_store_outcome(
+                    vm, heap, state, stack, cache, meta, pc, global, outcome,
+                ));
+                Step::Next
+            })
         }
         Opcode::CreateFunctionContext => {
             // constants[idx] is the scope's shared ScopeInfo (its `names`

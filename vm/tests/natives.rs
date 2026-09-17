@@ -112,10 +112,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
-            {
+            match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => {
                     let name_ok = slot.get(heap).erase() == type_error.as_tagged(heap).erase();
                     (name_ok, type_error.as_tagged(heap).erase())

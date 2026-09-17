@@ -2,13 +2,18 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Lookup, PropertyDescriptor, SlotName, StoreOutcome, StoreSemantics, Tagged, Value};
 use vm::{Thread, VM, VmError};
 
+/// A name tag re-anchored under a live heap borrow.
+fn name<'a>(heap: &'a vm::Heap, w: Value) -> Tagged<'a, SlotName> {
+    unsafe { w.assume_valid(heap) }.as_name()
+}
+
 /// Read a data property by interned name value.
-fn get_prop(thread: &mut Thread, obj: Value, name: Value) -> Value {
+fn get_prop(thread: &mut Thread, obj: Value, name_word: Value) -> Value {
     thread.heap().no_gc(|heap| {
         let Some(o) = unsafe { obj.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
-        match o.as_ref().lookup(heap, SlotName::from_value(name)) {
+        match o.as_ref().lookup(heap, name(heap, name_word)) {
             Lookup::Data { slot, .. } => slot.get(heap).erase(),
             _ => panic!("expected a data property"),
         }
@@ -136,15 +141,18 @@ fn error_properties_are_writable() {
         )
     });
 
-    let outcome = thread.heap().no_gc(|heap| {
-        as_tagged_unchecked(obj).store_lookup(
-            heap,
-            SlotName::from_value(name_key),
-            as_tagged_unchecked(custom),
-            StoreSemantics::WriteThrough,
-        )
+    thread.handle_scope(|thread, scope| {
+        let outcome = thread.heap().no_gc(|heap| {
+            as_tagged_unchecked(obj).store_lookup(
+                heap,
+                &scope,
+                name(heap, name_key),
+                as_tagged_unchecked(custom),
+                StoreSemantics::WriteThrough,
+            )
+        });
+        assert!(matches!(outcome, Ok(StoreOutcome::Done)));
     });
-    assert!(matches!(outcome, Ok(StoreOutcome::Done)));
     assert_eq!(get_prop(&mut thread, obj, name_key), custom);
 }
 
@@ -166,35 +174,31 @@ fn error_objects_are_extendable() {
 
     // store_lookup on a missing property must propose a transition
     // (proof of extendability), and completing it adds the own property
-    let outcome = thread.heap().no_gc(|heap| {
-        as_tagged_unchecked(obj).store_lookup(
-            heap,
-            SlotName::from_value(extra_key),
-            as_tagged_unchecked(extra_val),
-            StoreSemantics::WriteThrough,
-        )
-    });
-    match outcome {
-        Ok(StoreOutcome::Transition { receiver, name }) => {
-            thread.handle_scope(|thread, scope| {
-                let receiver = scope
-                    .cast::<vm::Object>(as_tagged_unchecked(receiver))
-                    .unwrap();
-                let name = scope.handle(unsafe { name.tagged(&*thread.heap()) });
+    thread.handle_scope(|thread, scope| {
+        let outcome = thread.heap().no_gc(|heap| {
+            as_tagged_unchecked(obj).store_lookup(
+                heap,
+                &scope,
+                name(heap, extra_key),
+                as_tagged_unchecked(extra_val),
+                StoreSemantics::WriteThrough,
+            )
+        });
+        match outcome {
+            Ok(StoreOutcome::Transition { receiver, name }) => {
                 let value = scope.handle(as_tagged_unchecked(extra_val));
-                let value_word = value.as_tagged(&*thread.heap()).erase();
                 vm::Object::define_own_property(
                     thread.heap(),
                     &scope,
                     receiver,
                     name,
-                    PropertyDescriptor::data(value_word),
+                    PropertyDescriptor::data(value),
                 )
                 .unwrap();
-            });
+            }
+            other => panic!("expected transition, got {other:?}"),
         }
-        other => panic!("expected transition, got {other:?}"),
-    }
+    });
     assert_eq!(get_prop(&mut thread, obj, extra_key), extra_val);
 }
 

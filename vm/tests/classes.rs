@@ -5,7 +5,7 @@
 //! calls) plus the observable edge cases.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{DenseString, SlotName, Smi, Value};
+use vm::{DenseString, Smi, Value};
 use vm::{ScriptError, Thread, VM};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
@@ -64,7 +64,7 @@ fn run_error_name(src: &str) -> String {
     thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name");
         thread.heap().no_gc(|heap| {
-            let name_key = SlotName::from(name.as_tagged(heap));
+            let name_key = name.as_tagged(heap).into();
             let o = unsafe { ex.assume_valid(heap) }
                 .as_heap_object()
                 .expect("pending exception must be an object");

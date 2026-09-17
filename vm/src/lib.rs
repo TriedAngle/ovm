@@ -88,6 +88,8 @@ const _: () = {
     assert!(size_of::<GcSlot<Smi>>() == size_of::<Word>());
     assert!(size_of::<GcSlot<DenseString>>() == size_of::<Word>());
     assert!(size_of::<Register>() == size_of::<Word>());
+    // SlotName is a newtype over the erased name word; names travel as
+    // `Tagged<'_, SlotName>`
     assert!(size_of::<SlotName>() == size_of::<Word>());
 };
 

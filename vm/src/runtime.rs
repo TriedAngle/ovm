@@ -55,24 +55,22 @@ impl Runtime {
         // class constructors carry a third hidden slot: the instance-field
         // array ([key0, init0, ...]); undefined until SetClassFields
         let function = if kind.is_class_constructor() {
-            let values = heap.no_gc(|heap| {
-                [
-                    info.as_tagged(heap).erase(),
-                    context.as_tagged(heap).erase(),
-                    heap.known().undefined.as_tagged(heap).erase(),
-                ]
+            let args = heap.no_gc(|heap| {
+                scope.stage(&[
+                    info.as_tagged(heap).erase_type(),
+                    context.as_tagged(heap).erase_type(),
+                    heap.known().undefined.as_tagged(heap).erase_type(),
+                ])
             });
-            heap.new_object(scope, map, scope.stage_words(&values))
-                .into_handle(scope)
+            heap.new_object(scope, map, args).into_handle(scope)
         } else {
-            let values = heap.no_gc(|heap| {
-                [
-                    info.as_tagged(heap).erase(),
-                    context.as_tagged(heap).erase(),
-                ]
+            let args = heap.no_gc(|heap| {
+                scope.stage(&[
+                    info.as_tagged(heap).erase_type(),
+                    context.as_tagged(heap).erase_type(),
+                ])
             });
-            heap.new_object(scope, map, scope.stage_words(&values))
-                .into_handle(scope)
+            heap.new_object(scope, map, args).into_handle(scope)
         };
 
         let length_key = heap.known().strings.length;
@@ -83,7 +81,7 @@ impl Runtime {
             function,
             length_key,
             PropertyDescriptor::Data {
-                value: Smi::new(formal_length as i64).encode(),
+                value: scope.handle(Smi::new(formal_length as i64)),
                 writable: false,
                 enumerable: false,
                 configurable: true,
@@ -92,16 +90,13 @@ impl Runtime {
         if !defined {
             return Err(VmError::Type);
         }
-        // fresh word out of the rooted slot, stored below before any
-        // allocation completes (the define path roots its inputs first)
-        let function_name_word = function_name.as_tagged(&*heap).erase();
         let defined = Object::define_own_property(
             heap,
             scope,
             function,
             name_key,
             PropertyDescriptor::Data {
-                value: function_name_word,
+                value: function_name.erase(),
                 writable: false,
                 enumerable: false,
                 configurable: true,
@@ -117,14 +112,13 @@ impl Runtime {
                 .into_handle(scope);
             let constructor = heap.known().strings.constructor;
             let prototype = heap.known().strings.prototype;
-            let function_word = function.as_tagged(&*heap).erase();
             let defined = Object::define_own_property(
                 heap,
                 scope,
                 proto,
                 constructor,
                 PropertyDescriptor::Data {
-                    value: function_word,
+                    value: function.erase(),
                     writable: true,
                     enumerable: false,
                     configurable: true,
@@ -133,14 +127,13 @@ impl Runtime {
             if !defined {
                 return Err(VmError::Type);
             }
-            let proto_word = proto.as_tagged(&*heap).erase();
             let defined = Object::define_own_property(
                 heap,
                 scope,
                 function,
                 prototype,
                 PropertyDescriptor::Data {
-                    value: proto_word,
+                    value: proto.erase(),
                     writable: true,
                     enumerable: false,
                     configurable: false,
@@ -361,7 +354,8 @@ impl Runtime {
             let outcome = load_outcome_on(
                 heap,
                 unsafe { holder.assume_valid(heap) },
-                SlotName::from_value(name),
+                // Safety: caller-supplied name word, fresh at entry.
+                unsafe { name.assume_valid(heap) }.as_name(),
             )?;
             (outcome, exception)
         };
@@ -387,92 +381,78 @@ impl Runtime {
         }
     }
 
-    pub fn to_property_descriptor(
+    pub fn to_property_descriptor<'s>(
         vm: &VM,
         heap: &mut Heap,
         state: &ContextState,
-        attrs: Value,
-    ) -> Result<Option<PartialDescriptor>, VmError> {
-        if heap.no_gc(|heap| Convert::is_primitive(heap, unsafe { attrs.assume_valid(heap) })) {
+        scope: &'s HandleScope<'_>,
+        attrs: Handle<'_, Value>,
+    ) -> Result<Option<PartialDescriptor<'s>>, VmError> {
+        if heap.no_gc(|heap| Convert::is_primitive(heap, attrs.as_tagged(heap))) {
             return Err(VmError::Type);
         }
-        state.handle_scope(|scope| {
-            // Safety: caller-supplied word, fresh at entry.
-            let attrs = scope.handle(unsafe { attrs.assume_valid(&*heap) });
-            let names = heap.no_gc(|heap| {
-                let s = heap.known().strings;
-                [
-                    s.value,
-                    s.get,
-                    s.set,
-                    s.writable,
-                    s.enumerable,
-                    s.configurable,
-                ]
-                .map(|n| n.as_tagged(heap).erase())
-            });
-            let mut reads: Vec<Handle<'_, Value>> = Vec::new();
-            for name in names {
-                // re-read per iteration: the getters below may run user
-                // code (and move the receiver)
-                let attrs_word = attrs.as_tagged(&*heap).erase();
-                match Self::get_property(vm, heap, state, attrs_word, name)? {
-                    Coercion::Threw => return Ok(None),
-                    // Safety: fresh word from the call, no allocation since.
-                    Coercion::Value(v) => {
-                        reads.push(scope.handle(unsafe { v.assume_valid(&*heap) }))
-                    }
+        let attrs = scope.handle(attrs.as_tagged(&*heap));
+        let names = heap.no_gc(|heap| {
+            let s = heap.known().strings;
+            [
+                s.value,
+                s.get,
+                s.set,
+                s.writable,
+                s.enumerable,
+                s.configurable,
+            ]
+            .map(|n| n.as_tagged(heap).erase())
+        });
+        let mut reads: Vec<Handle<'_, Value>> = Vec::new();
+        for name in names {
+            // re-read per iteration: the getters below may run user
+            // code (and move the receiver)
+            let attrs_word = attrs.as_tagged(&*heap).erase();
+            match Self::get_property(vm, heap, state, attrs_word, name)? {
+                Coercion::Threw => return Ok(None),
+                // Safety: fresh word from the call, no allocation since.
+                Coercion::Value(v) => reads.push(scope.handle(unsafe { v.assume_valid(&*heap) })),
+            }
+        }
+        let (present, truthy) = heap.no_gc(|heap| {
+            let undef = heap.known().undefined.as_tagged(heap).erase_type();
+            let present = [
+                !reads[0].as_tagged(heap).ptr_eq(undef),
+                !reads[1].as_tagged(heap).ptr_eq(undef),
+                !reads[2].as_tagged(heap).ptr_eq(undef),
+                !reads[3].as_tagged(heap).ptr_eq(undef),
+                !reads[4].as_tagged(heap).ptr_eq(undef),
+                !reads[5].as_tagged(heap).ptr_eq(undef),
+            ];
+            let truthy = [
+                Convert::is_truthy(heap, reads[3].as_tagged(heap)),
+                Convert::is_truthy(heap, reads[4].as_tagged(heap)),
+                Convert::is_truthy(heap, reads[5].as_tagged(heap)),
+            ];
+            (present, truthy)
+        });
+        let value = present[0].then_some(reads[0]);
+        let get = present[1].then_some(reads[1]);
+        let set = present[2].then_some(reads[2]);
+        // accessor halves must be callable or undefined
+        if get.is_some() || set.is_some() {
+            for half in [get, set] {
+                if let Some(h) = half
+                    && !heap.no_gc(|heap| Self::is_callable(heap, h.as_tagged(heap).erase()))
+                {
+                    return Err(VmError::Type);
                 }
             }
-            // fresh words out of rooted slots, consumed within these
-            // statements (no allocation in between)
-            let (value_w, get_w, set_w, writable_w, enumerable_w, configurable_w) =
-                heap.no_gc(|heap| {
-                    (
-                        reads[0].as_tagged(heap).erase(),
-                        reads[1].as_tagged(heap).erase(),
-                        reads[2].as_tagged(heap).erase(),
-                        reads[3].as_tagged(heap).erase(),
-                        reads[4].as_tagged(heap).erase(),
-                        reads[5].as_tagged(heap).erase(),
-                    )
-                });
-            let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
-            let value = (value_w != undefined).then_some(value_w);
-            let get = (get_w != undefined).then_some(get_w);
-            let set = (set_w != undefined).then_some(set_w);
-            // accessor halves must be callable or undefined
-            if get.is_some() || set.is_some() {
-                for half in [get, set] {
-                    if let Some(h) = half
-                        && h != undefined
-                        && !Self::is_callable(heap, h)
-                    {
-                        return Err(VmError::Type);
-                    }
-                }
-            }
-            Ok(Some(PartialDescriptor {
-                value,
-                get,
-                set,
-                writable: (writable_w != undefined).then(|| {
-                    heap.no_gc(|heap| {
-                        Convert::is_truthy(heap, unsafe { writable_w.assume_valid(heap) })
-                    })
-                }),
-                enumerable: (enumerable_w != undefined).then(|| {
-                    heap.no_gc(|heap| {
-                        Convert::is_truthy(heap, unsafe { enumerable_w.assume_valid(heap) })
-                    })
-                }),
-                configurable: (configurable_w != undefined).then(|| {
-                    heap.no_gc(|heap| {
-                        Convert::is_truthy(heap, unsafe { configurable_w.assume_valid(heap) })
-                    })
-                }),
-            }))
-        })
+        }
+        Ok(Some(PartialDescriptor {
+            value,
+            get,
+            set,
+            writable: present[3].then_some(truthy[0]),
+            enumerable: present[4].then_some(truthy[1]),
+            configurable: present[5].then_some(truthy[2]),
+        }))
     }
 
     pub fn is_callable(heap: &Heap, v: Value) -> bool {
@@ -483,53 +463,67 @@ impl Runtime {
         obj.as_ref().header.map.heap_ref(heap).kind().is_callable()
     }
 
-    pub fn to_property_key(
+    /// ES 7.1.18 ToPropertyKey: smis and symbols pass through, everything
+    /// else is coerced to its interned canonical string. The returned
+    /// name is anchored at the `&mut Heap` borrow; callers store the word
+    /// (or root it) before the next allocation. `None` means user code
+    /// threw (the pending exception holds it).
+    pub fn to_property_key<'a>(
         vm: &VM,
-        heap: &mut Heap,
+        heap: &'a mut Heap,
         state: &ContextState,
-        v: Value,
-    ) -> Result<Option<Value>, VmError> {
-        if v.is_smi()
-            || heap.no_gc(|heap| unsafe { v.assume_valid(heap) }.get_as::<Symbol>().is_some())
-        {
-            return Ok(Some(v));
+        v: Tagged<'_, Value>,
+    ) -> Result<Option<Tagged<'a, SlotName>>, VmError> {
+        // Smis are pointer-free: valid at any lifetime, no rooting needed.
+        if let Some(smi) = Smi::decode(v.erase()) {
+            return Ok(Some(Tagged::from(smi)));
         }
-        let is_string = heap.no_gc(|heap| {
-            unsafe { v.assume_valid(heap) }
-                .get_as::<DenseString>()
-                .is_some()
-        });
-        let primitive = if is_string {
-            v
-        } else {
-            match Self::to_primitive(vm, heap, state, v, Hint::String)? {
-                Coercion::Threw => return Ok(None),
-                Coercion::Value(p) => p,
+        // The coercion below may run user code (valueOf/toString): root
+        // the incoming word first so every return path can re-read it
+        // (or a successor) fresh under the `&mut` borrow's anchor.
+        state.handle_scope(|scope| {
+            let word = scope.handle(v);
+            if heap.no_gc(|heap| word.as_tagged(heap).get_as::<Symbol>().is_some()) {
+                // fresh anchored re-read of the rooted word
+                return Ok(Some(word.as_tagged(&*heap).as_name()));
             }
-        };
-        // named lookup compares interned strings by pointer: canonicalize
-        // exactly once here, then every downstream bits-compare is sound.
-        // to_string allocates (Float → string, ToString of objects), so
-        // its result must be rooted and re-cast inside one scope — a raw
-        // copy crossing the scope boundary goes stale
-        let interned = state.handle_scope(|scope| {
-            let stringified = Convert::to_string(
-                heap,
-                &scope,
-                // Safety: caller-supplied / freshly coerced word.
-                unsafe { Tagged::from_value_unchecked(primitive) },
-            )?;
-            match scope.cast::<DenseString>(stringified) {
-                Some(s) => Ok(vm
-                    .interner()
-                    .intern_value(heap, &scope, &s)
-                    .as_tagged(&*heap)
-                    .erase()),
+            let is_string =
+                heap.no_gc(|heap| word.as_tagged(heap).get_as::<DenseString>().is_some());
+            let primitive: Handle<'_, Value> = if is_string {
+                word
+            } else {
+                match Self::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    word.as_tagged(&*heap).erase(),
+                    Hint::String,
+                )? {
+                    Coercion::Threw => return Ok(None),
+                    // Safety: fresh word from the coercion, no allocation
+                    // since.
+                    Coercion::Value(p) => scope.handle(unsafe { p.assume_valid(&*heap) }),
+                }
+            };
+            // Named lookup compares interned strings by pointer:
+            // canonicalize exactly once here, then every downstream
+            // bits-compare is sound. to_string allocates (Float →
+            // string, ToString of objects), so its result is rooted and
+            // re-read inside one scope — a raw copy crossing the scope
+            // boundary goes stale.
+            // Safety: fresh rooted-slot word, consumed by the call
+            // before any allocation.
+            let stringified = Convert::to_string(heap, &scope, unsafe {
+                Tagged::from_value_unchecked(primitive.read_unchecked())
+            })?;
+            let interned = match scope.cast::<DenseString>(stringified) {
+                Some(s) => vm.interner().intern_value(heap, &scope, &s),
                 // ToString of a symbol primitive throws (ES 6.1.7.1)
-                None => Err(VmError::Type),
-            }
-        })?;
-        Ok(Some(interned))
+                None => return Err(VmError::Type),
+            };
+            // fresh anchored re-read of the rooted interned word
+            Ok(Some(interned.as_tagged(&*heap).into()))
+        })
     }
 
     /// ES 13.5.3 typeof: the well-known type string for a value. `null`
@@ -668,11 +662,7 @@ impl Runtime {
                 .new_object(&scope, known.object_initial_map, GcSlice::EMPTY)
                 .into_handle(&scope);
             if let Some(proto) = proto {
-                // fresh words under a shared reborrow, stored by the call
-                // before any allocation completes
-                let proto_word = proto.as_tagged(&*heap).erase();
-                let obj_word = obj.as_tagged(&*heap).erase();
-                Object::set_prototype(heap, &scope, obj_word, proto_word)?;
+                Object::set_prototype(heap, &scope, obj, proto.erase())?;
             }
             // fresh word at return: callers store it to a register (rooted
             // memory) immediately

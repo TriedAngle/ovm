@@ -1,4 +1,4 @@
-use crate::{GcSlice, Heap, Object, PropertyDescriptor, Value, VmError};
+use crate::{DenseString, GcSlice, Handle, Heap, Object, PropertyDescriptor, Value, VmError};
 
 use crate::{ContextState, VM};
 
@@ -33,17 +33,21 @@ pub fn error_from_vm_error(
         let name = heap.known().strings.name;
         let message = heap.known().strings.message;
         // root fresh copies before the (allocating) defines below
-        let name_value = scope.handle(name_value.as_tagged(&*heap));
-        let message_value = scope.handle(message_value.as_tagged(&*heap));
-        let name_word = name_value.as_tagged(&*heap).erase();
-        Object::define_own_property(heap, &scope, obj, name, PropertyDescriptor::data(name_word))?;
-        let message_word = message_value.as_tagged(&*heap).erase();
+        let name_value: Handle<'_, DenseString> = scope.handle(name_value.as_tagged(&*heap));
+        let message_value: Handle<'_, DenseString> = scope.handle(message_value.as_tagged(&*heap));
+        Object::define_own_property(
+            heap,
+            &scope,
+            obj,
+            name,
+            PropertyDescriptor::data(name_value.erase()),
+        )?;
         Object::define_own_property(
             heap,
             &scope,
             obj,
             message,
-            PropertyDescriptor::data(message_word),
+            PropertyDescriptor::data(message_value.erase()),
         )?;
         Ok(obj.as_tagged(&*heap).erase())
     })

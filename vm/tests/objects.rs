@@ -1,4 +1,4 @@
-use vm::{SlotFlags, SlotName, Tagged};
+use vm::{SlotFlags, SlotName, Smi, Tagged};
 
 #[test]
 fn slot_flags_accessor_bit() {
@@ -23,9 +23,9 @@ fn slot_flags_attributes() {
 
 #[test]
 fn slot_name_equality_by_bits() {
-    let a = SlotName::from(Tagged::smi(1).unwrap());
-    let b = SlotName::from(Tagged::smi(1).unwrap());
-    let c = SlotName::from(Tagged::smi(2).unwrap());
-    assert_eq!(a, b);
-    assert_ne!(a, c);
+    let a: Tagged<'_, SlotName> = Tagged::from(Smi::new(1));
+    let b: Tagged<'_, SlotName> = Tagged::from(Smi::new(1));
+    let c: Tagged<'_, SlotName> = Tagged::from(Smi::new(2));
+    assert!(a.ptr_eq(b));
+    assert!(!a.ptr_eq(c));
 }

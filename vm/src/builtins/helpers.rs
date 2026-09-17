@@ -4,8 +4,8 @@
 use crate::materialize::materialize_closure_vm;
 use crate::natives::{NativeContext, NativeIndex};
 use crate::{
-    GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotName, Smi,
-    Tagged, Value, VmError,
+    GcSlice, Handle, HandleScope, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
+    SlotName, Smi, Tagged, Value, VmError,
 };
 
 pub(crate) fn alloc_map(
@@ -155,34 +155,25 @@ pub(crate) fn install_constructor(
     // proto.constructor = fn; fn.prototype = proto
     // (built-in methods/constructor properties are non-enumerable, ES 20+)
     let constructor_str = thread.intern(scope, "constructor");
-    let prototype_str = thread.intern(scope, "prototype");
+    // Safety: fresh interned word, rooted below before any allocation.
+    let constructor_name = scope.handle(constructor_str.as_tagged(&*thread.heap()));
     define_method_prop(
         thread.heap(),
         scope,
         proto,
-        SlotName::from_value(unsafe { constructor_str.read_unchecked() }),
-        // Safety: fresh root-slot word; the define roots its inputs.
-        unsafe { fn_obj.read_unchecked() },
+        constructor_name,
+        fn_obj.erase(),
     )?;
-    define_method_prop(
-        thread.heap(),
-        scope,
-        fn_obj,
-        SlotName::from_value(unsafe { prototype_str.read_unchecked() }),
-        // Safety: fresh root-slot word; the define roots its inputs.
-        unsafe { proto.read_unchecked() },
-    )?;
+    let prototype_str = thread.intern(scope, "prototype");
+    // Safety: fresh interned word, rooted below before any allocation.
+    let prototype_name = scope.handle(prototype_str.as_tagged(&*thread.heap()));
+    define_method_prop(thread.heap(), scope, fn_obj, prototype_name, proto.erase())?;
 
     // global.Name = fn
     let global = thread.heap().known().global_object;
-    define_data(
-        thread.heap(),
-        scope,
-        global,
-        SlotName::from_value(unsafe { name_str.read_unchecked() }),
-        // Safety: fresh root-slot word; the define roots its inputs.
-        unsafe { fn_obj.read_unchecked() },
-    )?;
+    // Safety: fresh interned word, rooted below before any allocation.
+    let name = scope.handle(name_str.as_tagged(&*thread.heap()));
+    define_data(thread.heap(), scope, global, name, fn_obj.erase())?;
     Ok((fn_obj, proto))
 }
 
@@ -196,14 +187,9 @@ pub(crate) fn install_method(
 ) -> Result<(), VmError> {
     let method = make_native_function(thread, scope, roots, index)?;
     let name_str = thread.intern(scope, name);
-    define_method_prop(
-        thread.heap(),
-        scope,
-        receiver,
-        SlotName::from_value(unsafe { name_str.read_unchecked() }),
-        // Safety: fresh root-slot word; the define roots its inputs.
-        unsafe { method.read_unchecked() },
-    )?;
+    // Safety: fresh interned word, rooted below before any allocation.
+    let method_name = scope.handle(name_str.as_tagged(&*thread.heap()));
+    define_method_prop(thread.heap(), scope, receiver, method_name, method.erase())?;
     Ok(())
 }
 
@@ -215,18 +201,13 @@ pub(crate) fn define_method_prop(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     object: crate::Global<Object>,
-    name: SlotName,
-    value: Value,
+    name: Handle<'_, SlotName>,
+    value: Handle<'_, Value>,
 ) -> Result<(), VmError> {
-    // Safety: fresh root-slot word, rooted below before any allocation.
-    let obj =
-        scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(object.read_unchecked()) });
-    // Safety: pointer-keyed name word, rooted below before any allocation.
-    let name = scope.handle(unsafe { name.tagged(heap) });
     Object::define_own_property(
         heap,
         scope,
-        obj,
+        object,
         name,
         PropertyDescriptor::Data {
             value,
@@ -242,15 +223,10 @@ pub(crate) fn define_data(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     object: crate::Global<Object>,
-    name: impl Into<SlotName>,
-    value: Value,
+    name: Handle<'_, SlotName>,
+    value: Handle<'_, Value>,
 ) -> Result<(), VmError> {
-    // Safety: fresh root-slot word, rooted below before any allocation.
-    let obj =
-        scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(object.read_unchecked()) });
-    // Safety: pointer-keyed name word, rooted below before any allocation.
-    let name = scope.handle(unsafe { name.into().tagged(heap) });
-    Object::define_own_property(heap, scope, obj, name, PropertyDescriptor::data(value))?;
+    Object::define_own_property(heap, scope, object, name, PropertyDescriptor::data(value))?;
     Ok(())
 }
 
@@ -260,22 +236,13 @@ pub(crate) fn define_non_enumerable(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     object: crate::Global<Object>,
-    name: crate::Global<SlotName>,
-    value: Value,
+    name: Handle<'_, SlotName>,
+    value: Handle<'_, Value>,
 ) -> Result<(), VmError> {
-    // Safety: fresh root-slot word, rooted below before any allocation.
-    let obj =
-        scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(object.read_unchecked()) });
-    // Safety: fresh root-slot word, rooted below before any allocation.
-    let name = scope.handle(unsafe {
-        name.read_unchecked()
-            .assume_valid(&*heap)
-            .cast::<SlotName>()
-    });
     Object::define_own_property(
         heap,
         scope,
-        obj,
+        object,
         name,
         PropertyDescriptor::Data {
             value,

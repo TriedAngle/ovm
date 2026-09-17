@@ -283,10 +283,7 @@ fn stack_overflow_during_call_is_throwable() {
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o
-                .as_ref()
-                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
-            {
+            match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => {
                     assert_eq!(
                         slot.get(heap).erase(),

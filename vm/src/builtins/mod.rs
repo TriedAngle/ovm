@@ -48,8 +48,8 @@ use string::{string_constructor, string_to_string, string_value_of};
 use symbol::symbol_constructor;
 
 use crate::{
-    GcSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotFlags, SlotName, Smi, Tagged,
-    Value, VmError,
+    GcSlice, Handle, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotFlags, SlotName, Smi,
+    Tagged, Value, VmError,
 };
 
 use crate::VM;
@@ -196,14 +196,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             ("NaN", number_nan),
         ] {
             let n = thread.intern(&scope, name);
-            define_data(
-                thread.heap(),
-                &scope,
-                number_fn,
-                SlotName::from_value(unsafe { n.read_unchecked() }),
-                // Safety: fresh root-slot word; the define roots its inputs.
-                unsafe { value.read_unchecked() },
-            )?;
+            // Safety: fresh interned word, rooted below before the define.
+            let n = scope.handle(n.as_tagged(&*thread.heap()));
+            define_data(thread.heap(), &scope, number_fn, n, value.erase())?;
         }
         let mut known = *thread.heap().known();
         known.number_wrapper_map = alloc_map_with_slots(
@@ -304,17 +299,15 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             error_proto,
-            SlotName::from_value(unsafe { known.strings.name.read_unchecked() }),
-            // Safety: fresh rooted-slot word; the define roots its inputs.
-            unsafe { error_name.read_unchecked() },
+            known.strings.name,
+            error_name.erase(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             error_proto,
-            SlotName::from_value(unsafe { known.strings.message.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { known.strings.empty.read_unchecked() },
+            known.strings.message,
+            known.strings.empty.erase(),
         )?;
         install_method(
             thread,
@@ -350,17 +343,15 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             type_error_proto,
-            SlotName::from_value(unsafe { wks.name.read_unchecked() }),
-            // Safety: fresh rooted-slot word; the define roots its inputs.
-            unsafe { type_error_name.read_unchecked() },
+            wks.name,
+            type_error_name.erase(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             type_error_proto,
-            SlotName::from_value(unsafe { wks.message.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { wks.empty.read_unchecked() },
+            wks.message,
+            wks.empty.erase(),
         )?;
         let mut known = *thread.heap().known();
         known.type_error_map = alloc_map(
@@ -385,17 +376,15 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             reference_error_proto,
-            SlotName::from_value(unsafe { wks.name.read_unchecked() }),
-            // Safety: fresh rooted-slot word; the define roots its inputs.
-            unsafe { reference_error_name.read_unchecked() },
+            wks.name,
+            reference_error_name.erase(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             reference_error_proto,
-            SlotName::from_value(unsafe { wks.message.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { wks.empty.read_unchecked() },
+            wks.message,
+            wks.empty.erase(),
         )?;
         let mut known = *thread.heap().known();
         known.reference_error_map = alloc_map(
@@ -414,27 +403,26 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             function_prototype,
-            SlotName::from_value(unsafe { wks.constructor.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { function_fn.read_unchecked() },
+            wks.constructor,
+            function_fn.erase(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             function_fn,
-            SlotName::from_value(unsafe { wks.prototype.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { function_prototype.read_unchecked() },
+            wks.prototype,
+            function_prototype.erase(),
         )?;
         let function_name = thread.intern(&scope, "Function");
+        // Safety: fresh interned word, rooted below before the define.
+        let function_name = scope.handle(function_name.as_tagged(&*thread.heap()));
         let global_object = thread.heap().known().global_object;
         define_data(
             thread.heap(),
             &scope,
             global_object,
-            SlotName::from_value(unsafe { function_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { function_fn.read_unchecked() },
+            function_name,
+            function_fn.erase(),
         )?;
 
         // ---- Function.prototype toString/call/apply/bind ------------------------
@@ -480,14 +468,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let eval_fn = make_native_function(thread, &scope, roots, idx.eval)?;
         let global = thread.heap().known().global_object;
         let eval_name = thread.intern(&scope, "eval");
-        define_data(
-            thread.heap(),
-            &scope,
-            global,
-            SlotName::from_value(unsafe { eval_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { eval_fn.read_unchecked() },
-        )?;
+        // Safety: fresh interned word, rooted below before the define.
+        let eval_name = scope.handle(eval_name.as_tagged(&*thread.heap()));
+        define_data(thread.heap(), &scope, global, eval_name, eval_fn.erase())?;
 
         // ---- Object.prototype.toString/hasOwnProperty/propertyIsEnumerable ------
         let object_prototype = thread.heap().known().object_prototype;
@@ -525,26 +508,25 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             object_prototype,
-            SlotName::from_value(unsafe { wks.constructor.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { object_fn.read_unchecked() },
+            wks.constructor,
+            object_fn.erase(),
         )?;
         define_method_prop(
             thread.heap(),
             &scope,
             object_fn,
-            SlotName::from_value(unsafe { wks.prototype.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { object_prototype.read_unchecked() },
+            wks.prototype,
+            object_prototype.erase(),
         )?;
         let object_name = thread.intern(&scope, "Object");
+        // Safety: fresh interned word, rooted below before the define.
+        let object_name = scope.handle(object_name.as_tagged(&*thread.heap()));
         define_data(
             thread.heap(),
             &scope,
             global,
-            SlotName::from_value(unsafe { object_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { object_fn.read_unchecked() },
+            object_name,
+            object_fn.erase(),
         )?;
         install_method(
             thread,
@@ -596,38 +578,32 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             array_prototype,
-            SlotName::from_value(unsafe { wks.constructor.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { array_fn.read_unchecked() },
+            wks.constructor,
+            array_fn.erase(),
         )?;
         define_data(
             thread.heap(),
             &scope,
             array_fn,
-            SlotName::from_value(unsafe { wks.prototype.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { array_prototype.read_unchecked() },
+            wks.prototype,
+            array_prototype.erase(),
         )?;
         let array_name = thread.intern(&scope, "Array");
-        define_data(
-            thread.heap(),
-            &scope,
-            global,
-            SlotName::from_value(unsafe { array_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { array_fn.read_unchecked() },
-        )?;
+        // Safety: fresh interned word, rooted below before the define.
+        let array_name = scope.handle(array_name.as_tagged(&*thread.heap()));
+        define_data(thread.heap(), &scope, global, array_name, array_fn.erase())?;
 
         // Array.isArray
         let is_array_fn = make_native_function(thread, &scope, roots, idx.array_is_array)?;
         let is_array_name = thread.intern(&scope, "isArray");
+        // Safety: fresh interned word, rooted below before the define.
+        let is_array_name = scope.handle(is_array_name.as_tagged(&*thread.heap()));
         define_data(
             thread.heap(),
             &scope,
             array_fn,
-            SlotName::from_value(unsafe { is_array_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { is_array_fn.read_unchecked() },
+            is_array_name,
+            is_array_fn.erase(),
         )?;
 
         // ---- Array iteration (the iterator protocol minimum) ---------------------
@@ -653,34 +629,35 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let sym_iterator_iter =
             make_native_function(thread, &scope, roots, idx.array_iterator_symbol_iterator)?;
         let iterator_symbol = thread.heap().known().iterator_symbol;
+        // Safety: fresh root-slot word, rooted below before the defines.
+        let iterator_name = scope.handle(iterator_symbol.as_tagged(&*thread.heap()));
         define_method_prop(
             thread.heap(),
             &scope,
             array_iterator_prototype,
-            SlotName::from_value(unsafe { iterator_symbol.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { sym_iterator_iter.read_unchecked() },
+            iterator_name,
+            sym_iterator_iter.erase(),
         )?;
 
         // Array.prototype.values === Array.prototype[Symbol.iterator]: a
         // native returning a fresh array-iterator object
         let values_fn = make_native_function(thread, &scope, roots, idx.array_values)?;
         let values_name = thread.intern(&scope, "values");
+        // Safety: fresh interned word, rooted below before the defines.
+        let values_name = scope.handle(values_name.as_tagged(&*thread.heap()));
         define_method_prop(
             thread.heap(),
             &scope,
             array_prototype,
-            SlotName::from_value(unsafe { values_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { values_fn.read_unchecked() },
+            values_name,
+            values_fn.erase(),
         )?;
         define_method_prop(
             thread.heap(),
             &scope,
             array_prototype,
-            SlotName::from_value(unsafe { iterator_symbol.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { values_fn.read_unchecked() },
+            iterator_name,
+            values_fn.erase(),
         )?;
 
         // array-iterator map: slots [iterated array, next index], prototype
@@ -701,28 +678,33 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             let flags = SlotFlags::WRITABLE
                 .union(SlotFlags::CONFIGURABLE)
                 .union(SlotFlags::ENUMERABLE);
-            let descriptors = vec![
-                (
-                    SlotName::from_value(unsafe { value_name.read_unchecked() }),
-                    flags,
-                    scope.handle(Smi::new(0).into_tagged()),
-                ),
-                (
-                    SlotName::from_value(unsafe { done_name.read_unchecked() }),
-                    flags,
-                    scope.handle(Smi::new(1).into_tagged()),
-                ),
-            ];
             // Safety: fresh root-slot word, rooted below before any allocation.
             let proto = scope.handle(unsafe {
                 Tagged::<Value>::from_value_unchecked(object_prototype.read_unchecked())
             });
-            roots.create_handle(thread.heap().allocate::<Map>(MapInit {
-                kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
-                value_slot_count: 2,
-                descriptors: &descriptors,
-                prototype: proto,
-            }))
+            thread
+                .heap()
+                .allocate_token_enter_heap(Map::layout_for(2), |token, heap| {
+                    // Safety: fresh interned words re-read under the anchor.
+                    let descriptors: [(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>); 2] = [
+                        (
+                            scope.handle(value_name.as_tagged(heap).erase_type().as_name()),
+                            flags,
+                            scope.handle(Smi::new(0).into_tagged()),
+                        ),
+                        (
+                            scope.handle(done_name.as_tagged(heap).erase_type().as_name()),
+                            flags,
+                            scope.handle(Smi::new(1).into_tagged()),
+                        ),
+                    ];
+                    roots.create_handle(token.allocate::<Map>(MapInit {
+                        kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                        value_slot_count: 2,
+                        descriptors: &descriptors,
+                        prototype: proto,
+                    }))
+                })
         };
 
         let mut known = *thread.heap().known();
@@ -745,13 +727,14 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
 
         let is_nan_fn = make_native_function(thread, &scope, roots, idx.is_nan)?;
         let is_nan_name = thread.intern(&scope, "isNaN");
+        // Safety: fresh interned word, rooted below before the define.
+        let is_nan_name = scope.handle(is_nan_name.as_tagged(&*thread.heap()));
         define_data(
             thread.heap(),
             &scope,
             global,
-            SlotName::from_value(unsafe { is_nan_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { is_nan_fn.read_unchecked() },
+            is_nan_name,
+            is_nan_fn.erase(),
         )?;
 
         // ---- Symbol (minimal: constructor + Symbol.iterator) ---------------
@@ -759,23 +742,25 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // gated by the test262 feature skip
         let symbol_fn = make_native_function(thread, &scope, roots, idx.symbol)?;
         let symbol_name = thread.intern(&scope, "Symbol");
+        // Safety: fresh interned word, rooted below before the define.
+        let symbol_name = scope.handle(symbol_name.as_tagged(&*thread.heap()));
         define_data(
             thread.heap(),
             &scope,
             global,
-            SlotName::from_value(unsafe { symbol_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { symbol_fn.read_unchecked() },
+            symbol_name,
+            symbol_fn.erase(),
         )?;
         let iterator_symbol = thread.heap().known().iterator_symbol;
         let iter_name = thread.intern(&scope, "iterator");
+        // Safety: fresh interned word, rooted below before the define.
+        let iter_name = scope.handle(iter_name.as_tagged(&*thread.heap()));
         define_data(
             thread.heap(),
             &scope,
             symbol_fn,
-            SlotName::from_value(unsafe { iter_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { iterator_symbol.read_unchecked() },
+            iter_name,
+            iterator_symbol.erase(),
         )?;
 
         // ---- Proxy ------------------------------------------------------------
@@ -783,7 +768,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // `.prototype` property (ES 20.2.1: "Proxy.prototype is
         // undefined"); `install_constructor` cannot be used.
         let proxy_fn = make_native_function(thread, &scope, roots, idx.proxy)?;
-        let two = Smi::new(2).encode();
+        let two = scope.handle(Smi::new(2));
         define_non_enumerable(thread.heap(), &scope, proxy_fn, wks.length, two)?;
         let proxy_name = thread.intern(&scope, "Proxy");
         define_non_enumerable(
@@ -791,17 +776,11 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             &scope,
             proxy_fn,
             wks.name,
-            // Safety: fresh rooted-slot word; the define roots its inputs.
-            unsafe { proxy_name.read_unchecked() },
+            proxy_name.erase(),
         )?;
-        define_data(
-            thread.heap(),
-            &scope,
-            global,
-            SlotName::from_value(unsafe { proxy_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { proxy_fn.read_unchecked() },
-        )?;
+        // Safety: fresh interned word, rooted below before the define.
+        let proxy_name = scope.handle(proxy_name.as_tagged(&*thread.heap()));
+        define_data(thread.heap(), &scope, global, proxy_name, proxy_fn.erase())?;
         // Proxy.revocable: a non-constructor function returning
         // { proxy, revoke }; the revoke closure is the JS template
         // installed by REVOKE_PRELUDE (natives cannot carry state).
@@ -813,27 +792,28 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             &scope,
             revocable_fn,
             wks.name,
-            // Safety: fresh rooted-slot word; the define roots its inputs.
-            unsafe { revocable_name.read_unchecked() },
+            revocable_name.erase(),
         )?;
+        // Safety: fresh interned word, rooted below before the define.
+        let revocable_name = scope.handle(revocable_name.as_tagged(&*thread.heap()));
         define_data(
             thread.heap(),
             &scope,
             proxy_fn,
-            SlotName::from_value(unsafe { revocable_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { revocable_fn.read_unchecked() },
+            revocable_name,
+            revocable_fn.erase(),
         )?;
         // hidden revoke native used by the REVOKE_PRELUDE closure
         let revoke_fn = make_native_plain_function(thread, &scope, roots, idx.proxy_revoke)?;
         let revoke_name = thread.intern(&scope, "__revokeProxy");
+        // Safety: fresh interned word, rooted below before the define.
+        let revoke_name = scope.handle(revoke_name.as_tagged(&*thread.heap()));
         define_data(
             thread.heap(),
             &scope,
             global,
-            SlotName::from_value(unsafe { revoke_name.read_unchecked() }),
-            // Safety: fresh root-slot word; the define roots its inputs.
-            unsafe { revoke_fn.read_unchecked() },
+            revoke_name,
+            revoke_fn.erase(),
         )?;
 
         // ---- Object extensibility statics --------------------------------------
@@ -874,19 +854,16 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             // what `delete NaN` observes, writable/enumerable stay per
             //missive until non-writable stores stop throwing in sloppy
             // code
-            // Safety: fresh root-slot words, consumed by the define below
-            // (which roots its inputs before allocating).
             let value = match name {
-                "Infinity" => unsafe { infinity.read_unchecked() },
-                "NaN" => unsafe { nan.read_unchecked() },
-                _ => unsafe { undefined.read_unchecked() },
+                "Infinity" => infinity.erase(),
+                "NaN" => nan.erase(),
+                _ => undefined.erase(),
             };
             // Safety: fresh root-slot words, rooted below before any
             // allocation.
             let receiver = scope
                 .handle(unsafe { Tagged::<Object>::from_value_unchecked(global.read_unchecked()) });
-            let key = scope
-                .handle(unsafe { Tagged::<SlotName>::from_value_unchecked(n.read_unchecked()) });
+            let key = scope.handle(n.as_tagged(&*thread.heap()));
             Object::define_own_property(
                 thread.heap(),
                 &scope,

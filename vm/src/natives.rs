@@ -102,6 +102,21 @@ impl<'a> NativeContext<'a> {
         crate::interpreter::execute(self.vm, self.heap, self.state, callable, args, None)
     }
 
+    /// Invoke a callable that is already rooted in a handle. This is the
+    /// `&mut Heap`-context entry point: it needs no caller-side anchor.
+    pub fn call_rooted<'s>(
+        &mut self,
+        callable: Handle<'_, Value>,
+        args: GcSlice<'s>,
+    ) -> Result<Value, VmError> {
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
+        let callable = scope.cast::<Object>(callable.as_tagged(&*self.heap));
+        let Some(callable) = callable else {
+            return Err(VmError::Type);
+        };
+        crate::interpreter::execute(self.vm, self.heap, self.state, callable, args, None)
+    }
+
     /// Invoke `callable` as a constructor with `new.target` = `new_target`:
     /// native callees see `is_construct()` and the receiver's prototype
     /// comes from `new_target.prototype` (ES 9.2.2). See [`Self::call`]

@@ -76,14 +76,14 @@ pub(crate) fn proxy_revocable(
         // Function.prototype.__makeRevoke (installed by REVOKE_PRELUDE)
         let make_revoke = {
             let (vm, heap, state) = nctx.split();
-            // Safety: fresh rooted-slot words, consumed by the lookup.
-            let name = crate::SlotName::from_value(unsafe {
+            // Safety: fresh interned word, consumed by the lookup.
+            let name = unsafe {
                 vm.interner()
                     .intern_str(heap, &scope, "__makeRevoke")
                     .read_unchecked()
-            });
+            };
             let proto = unsafe { heap.known().function_prototype.read_unchecked() };
-            match crate::runtime::Runtime::get_property(vm, heap, state, proto, name.value())? {
+            match crate::runtime::Runtime::get_property(vm, heap, state, proto, name)? {
                 crate::runtime::Coercion::Threw => {
                     // Safety: fresh root-slot word read for the return.
                     return Ok(unsafe { heap.known().exception.read_unchecked() });
@@ -108,14 +108,7 @@ pub(crate) fn proxy_revocable(
         }
         // Safety: fresh call result, rooted below.
         let revoke = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(revoke) });
-        plain_object(
-            nctx,
-            // Safety: fresh rooted-slot words; plain_object roots them.
-            &[
-                ("proxy", unsafe { proxy.read_unchecked() }),
-                ("revoke", unsafe { revoke.read_unchecked() }),
-            ],
-        )
+        plain_object(nctx, &[("proxy", proxy.erase()), ("revoke", revoke)])
     })
 }
 

@@ -20,6 +20,12 @@ unsafe fn anchored<'a>(heap: &'a Heap, v: Value) -> Tagged<'a, Value> {
     unsafe { v.assume_valid(heap) }
 }
 
+/// A name tag from a raw word. Tests only: no collection may run between
+/// the word's load and its consumption.
+fn raw_name(w: Value) -> Tagged<'static, SlotName> {
+    unsafe { Tagged::from_value_unchecked(w) }.as_name()
+}
+
 fn thread() -> (VM, Thread) {
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let thread = vm.attach();
@@ -41,35 +47,31 @@ fn object_with(thread: &mut Thread, proto: Value, props: &[(&str, i64)]) -> Valu
             .heap()
             .new_object(&scope, map, GcSlice::EMPTY)
             .into_handle(&scope);
-        let obj_word = {
-            let heap = &*thread.heap();
-            obj.as_tagged(heap).erase()
-        };
-        Object::set_prototype(thread.heap(), &scope, obj_word, proto).unwrap();
+        // Safety: caller-supplied proto word, rooted before any allocation.
+        let proto = scope.handle(unsafe { proto.assume_valid(&*thread.heap()) });
+        Object::set_prototype(thread.heap(), &scope, obj, proto).unwrap();
         for (name, v) in props {
             let name = thread.intern(&scope, name);
-            let name = {
-                let heap = &*thread.heap();
-                SlotName::from(name.as_tagged(heap))
-            };
-            Object::add_own_property_values(
+            let name = scope.handle(name.as_tagged(&*thread.heap()));
+            let value = scope.handle(Smi::new(*v));
+            Object::add_own_property(
                 thread.heap(),
                 &scope,
-                obj_word,
+                obj,
                 name,
-                PropertyDescriptor::data(smi(*v)),
+                PropertyDescriptor::data(value),
             )
             .unwrap();
         }
-        obj_word
+        obj.as_tagged(&*thread.heap()).erase()
     })
 }
 
-fn slot_name(thread: &mut Thread, name: &str) -> SlotName {
+fn slot_name(thread: &mut Thread, name: &str) -> Tagged<'static, SlotName> {
     thread.handle_scope(|thread, scope| {
         let interned = thread.intern(&scope, name);
         let heap = &*thread.heap();
-        SlotName::from(interned.as_tagged(heap))
+        raw_name(interned.as_tagged(heap).erase())
     })
 }
 
@@ -189,23 +191,30 @@ fn super_store_shadow_creates_own_property_on_this() {
     let this_ = object_with(&mut thread, null, &[]);
     let x = slot_name(&mut thread, "x");
 
-    thread.heap().no_gc(|heap| {
-        match super_store_lookup(
-            heap,
-            home_proto(heap, unsafe { anchored(heap, home) }),
-            unsafe { anchored(heap, this_) },
-            x,
-            unsafe { anchored(heap, smi(42)) },
-            StoreSemantics::Shadow,
-        )
-        .unwrap()
-        {
-            StoreOutcome::Transition { receiver, name } => {
-                assert_eq!(receiver, this_);
-                assert_eq!(name, x);
+    thread.handle_scope(|thread, scope| {
+        thread.heap().no_gc(|heap| {
+            match super_store_lookup(
+                heap,
+                &scope,
+                home_proto(heap, unsafe { anchored(heap, home) }),
+                unsafe { anchored(heap, this_) },
+                x,
+                unsafe { anchored(heap, smi(42)) },
+                StoreSemantics::Shadow,
+            )
+            .unwrap()
+            {
+                StoreOutcome::Transition { receiver, name } => {
+                    assert!(
+                        receiver
+                            .as_tagged(heap)
+                            .ptr_eq(unsafe { anchored(heap, this_) })
+                    );
+                    assert!(name.as_tagged(heap).ptr_eq(x.erase_type()));
+                }
+                other => panic!("shadow store must define on the receiver, got {other:?}"),
             }
-            other => panic!("shadow store must define on the receiver, got {other:?}"),
-        }
+        });
     });
     // the parent keeps its value; the transition handler would add `x` to
     // `this`
@@ -221,17 +230,20 @@ fn super_store_write_through_updates_the_holder() {
     let this_ = object_with(&mut thread, null, &[]);
     let x = slot_name(&mut thread, "x");
 
-    thread.heap().no_gc(|heap| {
-        let outcome = super_store_lookup(
-            heap,
-            home_proto(heap, unsafe { anchored(heap, home) }),
-            unsafe { anchored(heap, this_) },
-            x,
-            unsafe { anchored(heap, smi(42)) },
-            StoreSemantics::WriteThrough,
-        )
-        .unwrap();
-        assert!(matches!(outcome, StoreOutcome::Done));
+    thread.handle_scope(|thread, scope| {
+        thread.heap().no_gc(|heap| {
+            let outcome = super_store_lookup(
+                heap,
+                &scope,
+                home_proto(heap, unsafe { anchored(heap, home) }),
+                unsafe { anchored(heap, this_) },
+                x,
+                unsafe { anchored(heap, smi(42)) },
+                StoreSemantics::WriteThrough,
+            )
+            .unwrap();
+            assert!(matches!(outcome, StoreOutcome::Done));
+        });
     });
     assert_eq!(get_smi(&mut thread, parent, "x"), 42);
     // nothing was created on the receiver
@@ -254,17 +266,20 @@ fn super_store_write_through_hits_second_parent_holder() {
     let this_ = object_with(&mut thread, null, &[]);
     let b = slot_name(&mut thread, "b");
 
-    thread.heap().no_gc(|heap| {
-        let outcome = super_store_lookup(
-            heap,
-            home_proto(heap, unsafe { anchored(heap, home) }),
-            unsafe { anchored(heap, this_) },
-            b,
-            unsafe { anchored(heap, smi(9)) },
-            StoreSemantics::WriteThrough,
-        )
-        .unwrap();
-        assert!(matches!(outcome, StoreOutcome::Done));
+    thread.handle_scope(|thread, scope| {
+        thread.heap().no_gc(|heap| {
+            let outcome = super_store_lookup(
+                heap,
+                &scope,
+                home_proto(heap, unsafe { anchored(heap, home) }),
+                unsafe { anchored(heap, this_) },
+                b,
+                unsafe { anchored(heap, smi(9)) },
+                StoreSemantics::WriteThrough,
+            )
+            .unwrap();
+            assert!(matches!(outcome, StoreOutcome::Done));
+        });
     });
     // the holder (second parent) got the write
     assert_eq!(get_smi(&mut thread, p2, "b"), 9);
@@ -279,17 +294,19 @@ fn super_store_readonly_and_nullish_receiver_throw() {
     // a non-writable parent property
     thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "x");
-        let name = {
-            let heap = &*thread.heap();
-            SlotName::from(name.as_tagged(heap))
-        };
-        Object::add_own_property_values(
+        let name = scope.handle(name.as_tagged(&*thread.heap()));
+        // Safety: parent word freshly returned, consumed here.
+        let parent_obj = scope
+            .cast::<Object>(unsafe { parent.assume_valid(&*thread.heap()) })
+            .expect("object_with returns an object");
+        let value = scope.handle(Smi::new(1));
+        Object::add_own_property(
             thread.heap(),
             &scope,
-            parent,
+            parent_obj,
             name,
             PropertyDescriptor::Data {
-                value: smi(1),
+                value,
                 writable: false,
                 enumerable: true,
                 configurable: true,
@@ -305,34 +322,38 @@ fn super_store_readonly_and_nullish_receiver_throw() {
         heap.known().undefined.as_tagged(heap).erase()
     };
 
-    thread.heap().no_gc(|heap| {
-        for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
-            assert_eq!(
-                super_store_lookup(
-                    heap,
-                    home_proto(heap, unsafe { anchored(heap, home) }),
-                    unsafe { anchored(heap, this_) },
-                    x,
-                    unsafe { anchored(heap, smi(2)) },
-                    semantics
-                ),
-                Err(VmError::Type)
-            );
-        }
-        // nullish receivers are invalid property store receivers
-        for bad in [null, undefined] {
-            assert_eq!(
-                super_store_lookup(
-                    heap,
-                    home_proto(heap, unsafe { anchored(heap, home) }),
-                    unsafe { anchored(heap, bad) },
-                    x,
-                    unsafe { anchored(heap, smi(2)) },
-                    StoreSemantics::Shadow
-                ),
-                Err(VmError::Type)
-            );
-        }
+    thread.handle_scope(|thread, scope| {
+        thread.heap().no_gc(|heap| {
+            for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
+                assert!(matches!(
+                    super_store_lookup(
+                        heap,
+                        &scope,
+                        home_proto(heap, unsafe { anchored(heap, home) }),
+                        unsafe { anchored(heap, this_) },
+                        x,
+                        unsafe { anchored(heap, smi(2)) },
+                        semantics
+                    ),
+                    Err(VmError::Type)
+                ));
+            }
+            // nullish receivers are invalid property store receivers
+            for bad in [null, undefined] {
+                assert!(matches!(
+                    super_store_lookup(
+                        heap,
+                        &scope,
+                        home_proto(heap, unsafe { anchored(heap, home) }),
+                        unsafe { anchored(heap, bad) },
+                        x,
+                        unsafe { anchored(heap, smi(2)) },
+                        StoreSemantics::Shadow
+                    ),
+                    Err(VmError::Type)
+                ));
+            }
+        });
     });
 }
 
@@ -344,21 +365,25 @@ fn super_store_on_null_proto_chain_defines_on_this() {
     let this_ = object_with(&mut thread, null, &[]);
     let x = slot_name(&mut thread, "x");
 
-    thread.heap().no_gc(|heap| {
-        // no parent chain at all: both semantics define on the receiver
-        for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
-            assert!(matches!(
-                super_store_lookup(
-                    heap,
-                    home_proto(heap, unsafe { anchored(heap, home) }),
-                    unsafe { anchored(heap, this_) },
-                    x,
-                    unsafe { anchored(heap, smi(2)) },
-                    semantics
-                )
-                .unwrap(),
-                StoreOutcome::Transition { receiver, .. } if receiver == this_
-            ));
-        }
+    thread.handle_scope(|thread, scope| {
+        thread.heap().no_gc(|heap| {
+            // no parent chain at all: both semantics define on the receiver
+            for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
+                assert!(matches!(
+                    super_store_lookup(
+                        heap,
+                        &scope,
+                        home_proto(heap, unsafe { anchored(heap, home) }),
+                        unsafe { anchored(heap, this_) },
+                        x,
+                        unsafe { anchored(heap, smi(2)) },
+                        semantics
+                    )
+                    .unwrap(),
+                    StoreOutcome::Transition { receiver, .. }
+                        if receiver.as_tagged(heap).ptr_eq(unsafe { anchored(heap, this_) })
+                ));
+            }
+        });
     });
 }

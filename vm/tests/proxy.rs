@@ -64,7 +64,7 @@ fn assert_type_error(src: &str) {
             };
             match obj
                 .as_ref()
-                .lookup(heap, vm::SlotName::from(name_handle.as_tagged(heap)))
+                .lookup(heap, name_handle.as_tagged(heap).into())
             {
                 vm::Lookup::Data { slot, .. } => slot
                     .get(heap)
