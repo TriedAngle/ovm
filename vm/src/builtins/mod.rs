@@ -39,8 +39,16 @@ use string::{string_constructor, string_to_string, string_value_of};
 use symbol::symbol_constructor;
 
 use crate::{
-    Map, MapInit, MapKind,
-    Object, PropertyDescriptor, SlotFlags, SlotName, Smi, VmError,
+    GcSlice,
+    Map,
+    MapInit,
+    MapKind,
+    Object,
+    PropertyDescriptor,
+    SlotFlags,
+    SlotName,
+    Smi,
+    VmError,
 };
 
 use crate::natives::NativeIndex;
@@ -628,7 +636,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             )?;
             thread
                 .heap()
-                .new_object(&scope, map, &[])
+                .new_object(&scope, map, GcSlice::EMPTY)
                 .into_global(roots)
         };
         install_method(
@@ -691,12 +699,12 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
                 (
                     SlotName::from(value_name.as_tagged()),
                     flags,
-                    Smi::new(0).encode(),
+                    scope.handle(Smi::new(0).encode()),
                 ),
                 (
                     SlotName::from(done_name.as_tagged()),
                     flags,
-                    Smi::new(1).encode(),
+                    scope.handle(Smi::new(1).encode()),
                 ),
             ];
             let proto = scope.handle(object_prototype.value());

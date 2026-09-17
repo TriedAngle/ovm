@@ -1,7 +1,7 @@
 use core::alloc::Layout;
 
 use crate::{
-    Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap,
+    Compare, ContextState, Convert, EdgeVisitable, GcSlot, GcSlice, Handle, HandleScope, Header, Heap,
     HeapObject, Key, Lookup, Map, NativeContext, NoGc, Object, ObjectKind, PartialDescriptor,
     PropertyDescriptor, SlotName, VM, Value, Visitor, VmError, is_compatible_property_descriptor,
     lookup::has_property,
@@ -18,8 +18,8 @@ pub struct ProxyObject {
 
 pub struct ProxyInit<'a> {
     pub map: Handle<'a, Map>,
-    pub target: Value,
-    pub handler: Value,
+    pub target: Handle<'a, Value>,
+    pub handler: Handle<'a, Value>,
 }
 
 impl ProxyObject {
@@ -49,8 +49,8 @@ impl HeapObject for ProxyObject {
     fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header.map.set(nogc, host, config.map.as_tagged());
-        self.target.set(nogc, host, config.target);
-        self.handler.set(nogc, host, config.handler);
+        self.target.set(nogc, host, config.target.value());
+        self.handler.set(nogc, host, config.handler.value());
     }
 
     fn header(&self) -> &Header {
@@ -145,10 +145,13 @@ fn parts<'a>(nogc: &'a NoGc<'a>, proxy: Value) -> Option<(Value, Value)> {
     Some(p.as_ref().parts())
 }
 
-pub fn allocate(heap: &mut Heap, target: Value, handler: Value) -> Value {
+pub fn allocate(heap: &mut Heap, scope: &HandleScope<'_>, target: Value, handler: Value) -> Value {
+    let target = scope.handle(target);
+    let handler = scope.handle(handler);
     let known = heap.known();
     let map: Handle<'_, Map> = heap.no_gc(|nogc| {
         let kind = target
+            .value()
             .as_heap_object(nogc)
             .expect("proxy target must be a JSReceiver")
             .as_ref()
@@ -440,7 +443,7 @@ fn descriptor_object(
 ) -> Result<Value, VmError> {
     state.handle_scope(|scope| {
         let obj = heap
-            .new_object(&scope, heap.known().object_initial_map, &[])
+            .new_object(&scope, heap.known().object_initial_map, GcSlice::EMPTY)
             .into_handle(&scope);
         let s = heap.known().strings;
         // spec field order: value, writable, get, set, enumerable, configurable
@@ -1097,7 +1100,8 @@ pub fn apply(
             }
             TrapLookup::Trap(t) => {
                 // args: (target, thisArg, argumentsList)
-                let arr = heap.new_array(&scope, &args[1..]).into_tagged().erase();
+                let staged = scope.stage(&args[1..]);
+                let arr = heap.new_array(&scope, staged).into_tagged().erase();
                 let arr = scope.handle(arr);
                 let result = call_trap(
                     vm,
@@ -1193,7 +1197,8 @@ pub fn construct(
             }
             TrapLookup::Trap(t) => {
                 // args: (target, argumentsList, newTarget)
-                let arr = heap.new_array(&scope, args).into_tagged().erase();
+                let staged = scope.stage(args);
+                let arr = heap.new_array(&scope, staged).into_tagged().erase();
                 let arr = scope.handle(arr);
                 let result = call_trap(
                     vm,
@@ -1227,7 +1232,11 @@ pub fn construct(
 /// Ordinary `[[PreventExtensions]]`: clone the map without the
 /// EXTENDABLE bit (maps are shared, so the clone isolates the object).
 fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Handle<'_, Object>) {
-    use crate::{MapInit, MapKind};
+    use crate::{
+    GcSlice,
+    MapInit,
+    MapKind,
+};
     let (kind, prototype, descriptors) = heap.no_gc(|nogc| {
         let map = obj.heap_ref(nogc).map_ref(nogc);
         (
@@ -1235,7 +1244,7 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
             map.prototype.inner(),
             map.descriptors()
                 .iter()
-                .map(|d| (d.name(), d.flags(), d.value.inner()))
+                .map(|d| (d.name(), d.flags(), scope.handle(d.value.inner())))
                 .collect::<Vec<_>>(),
         )
     });

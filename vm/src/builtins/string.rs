@@ -16,7 +16,10 @@ pub(crate) fn string_constructor(
         }
         let (_, heap, _) = nctx.split();
         let map = heap.known().string_wrapper_map;
-        Ok(heap.new_object(&scope, map, &[s]).into_tagged().erase())
+        Ok(heap
+            .new_object(&scope, map, scope.stage(&[s]))
+            .into_tagged()
+            .erase())
     })
 }
 

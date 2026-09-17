@@ -165,7 +165,7 @@ impl Map {
 pub struct MapInit<'a> {
     pub kind: MapKind,
     pub value_slot_count: usize,
-    pub descriptors: &'a [(SlotName, SlotFlags, Value)],
+    pub descriptors: &'a [(SlotName, SlotFlags, Handle<'a, Value>)],
     /// the hole = no prototype (null-proto for JS maps).
     /// Handled because `Map` allocation may move the prototype.
     pub prototype: Handle<'a, Value>,
@@ -196,7 +196,7 @@ impl HeapObject for Map {
             let d = self.descriptor(i);
             d.name.set(nogc, host, name.tagged());
             d.flags.set(nogc, host, Smi::new(flags.bits() as i64));
-            d.value.set(nogc, host, *value);
+            d.value.set(nogc, host, value.value());
         }
     }
 
@@ -456,7 +456,7 @@ pub struct AccessorPair {
 
 impl HeapObject for AccessorPair {
     const KIND: ObjectKind = ObjectKind::AccessorPair;
-    type Init<'a> = (Value, Value);
+    type Init<'a> = (Handle<'a, Value>, Handle<'a, Value>);
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
         Layout::new::<Self>()
@@ -467,8 +467,8 @@ impl HeapObject for AccessorPair {
         self.header
             .map
             .set(nogc, host, nogc.known().accessor_pair_map.as_tagged());
-        self.get.set(nogc, host, config.0);
-        self.set.set(nogc, host, config.1);
+        self.get.set(nogc, host, config.0.value());
+        self.set.set(nogc, host, config.1.value());
     }
 
     fn header(&self) -> &Header {

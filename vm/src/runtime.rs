@@ -1,7 +1,25 @@
 use crate::{
-    CallableInfoObject, Context, Convert, DenseString, FixedArray, Float, Handle, HandleScope,
-    Heap, LoadOutcome, NoGc, Object, PartialDescriptor, PropertyDescriptor, SlotName, Smi, Symbol,
-    Value, VmError, load_outcome_on,
+    CallableInfoObject,
+    Context,
+    Convert,
+    DenseString,
+    FixedArray,
+    Float,
+    GcSlice,
+    Handle,
+    HandleScope,
+    Heap,
+    load_outcome_on,
+    LoadOutcome,
+    NoGc,
+    Object,
+    PartialDescriptor,
+    PropertyDescriptor,
+    SlotName,
+    Smi,
+    Symbol,
+    Value,
+    VmError,
 };
 
 use crate::{ContextState, NativeContext, VM};
@@ -45,18 +63,16 @@ impl Runtime {
         // class constructors carry a third hidden slot: the instance-field
         // array ([key0, init0, ...]); undefined until SetClassFields
         let function = if kind.is_class_constructor() {
-            heap.new_object(
-                scope,
-                map,
-                &[
-                    info.value(),
-                    context.value(),
-                    heap.known().undefined.value(),
-                ],
-            )
-            .into_handle(scope)
+            let values = [
+                info.value(),
+                context.value(),
+                heap.known().undefined.value(),
+            ];
+            heap.new_object(scope, map, scope.stage(&values))
+                .into_handle(scope)
         } else {
-            heap.new_object(scope, map, &[info.value(), context.value()])
+            let values = [info.value(), context.value()];
+            heap.new_object(scope, map, scope.stage(&values))
                 .into_handle(scope)
         };
 
@@ -95,7 +111,7 @@ impl Runtime {
 
         if kind.needs_prototype() {
             let proto = heap
-                .new_object(scope, heap.known().object_initial_map, &[])
+                .new_object(scope, heap.known().object_initial_map, GcSlice::EMPTY)
                 .into_handle(scope);
             let constructor = heap.known().strings.constructor;
             let prototype = heap.known().strings.prototype;
@@ -502,7 +518,7 @@ impl Runtime {
             let proto = scope.cast::<Object>(proto);
             let known = heap.known();
             let obj = heap
-                .new_object(&scope, known.object_initial_map, &[])
+                .new_object(&scope, known.object_initial_map, GcSlice::EMPTY)
                 .into_handle(&scope)
                 .as_tagged()
                 .erase();

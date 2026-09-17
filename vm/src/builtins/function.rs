@@ -58,7 +58,8 @@ pub(crate) fn function_bind(
     };
     let array = nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        heap.new_array(&scope, &prepend).into_tagged().erase()
+        let staged = scope.stage(&prepend);
+        heap.new_array(&scope, staged).into_tagged().erase()
     });
     nctx.handle_scope(|nctx, scope| {
         // args[0] is the receiver (undefined for the plain call)
@@ -141,44 +142,45 @@ pub(crate) fn function_constructor(
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     let argv: Vec<Value> = (1..args.len()).filter_map(|i| args.get(i)).collect();
-    // ToString all arguments (user toString may run)
-    let mut parts: Vec<String> = Vec::with_capacity(argv.len());
-    for a in argv {
-        let s = nctx.handle_scope(|nctx, scope| {
-            let (_, heap, _) = nctx.split();
-            let _ = heap;
-            Convert::to_string(nctx.heap(), &scope, a)
-        })?;
-        parts.push(nctx.heap().no_gc(|nogc| {
-            s.get_as::<DenseString>(nogc)
-                .map(|x| x.to_rust_string(nogc))
-                .unwrap_or_default()
-        }));
-    }
-    let (params, body) = match parts.split_last() {
-        Some((body, params)) => (params.join(", "), body.clone()),
-        None => (String::new(), String::new()),
-    };
-    let source = format!("(function ({params}) {{\n{body}\n}})");
-    let context = nctx
-        .current_context()
-        .unwrap_or_else(|| nctx.heap().known().empty_context.value());
-    let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&source));
-    if p.parse_script().is_err() {
-        nctx.set_pending_exception(VmError::Type);
-        return Ok(nctx.heap().known().exception.value());
-    }
-    let ast = p.into_ast();
-    let compiled = match base_compiler::compile_eval(&ast) {
-        Ok(c) => c,
-        Err(_) => {
+    nctx.handle_scope(|nctx, scope| {
+        // root the caller context before the allocating ToString loop below
+        let context = scope.handle(
+            nctx.current_context()
+                .unwrap_or_else(|| nctx.heap().known().empty_context.value()),
+        );
+        // ToString all arguments (user toString may run)
+        let mut parts: Vec<String> = Vec::with_capacity(argv.len());
+        for a in argv {
+            let s = {
+                let (_, heap, _) = nctx.split();
+                Convert::to_string(heap, &scope, a)?
+            };
+            parts.push(nctx.heap().no_gc(|nogc| {
+                s.get_as::<DenseString>(nogc)
+                    .map(|x| x.to_rust_string(nogc))
+                    .unwrap_or_default()
+            }));
+        }
+        let (params, body) = match parts.split_last() {
+            Some((body, params)) => (params.join(", "), body.clone()),
+            None => (String::new(), String::new()),
+        };
+        let source = format!("(function ({params}) {{\n{body}\n}})");
+        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&source));
+        if p.parse_script().is_err() {
             nctx.set_pending_exception(VmError::Type);
             return Ok(nctx.heap().known().exception.value());
         }
-    };
-    nctx.handle_scope(|nctx, scope| {
+        let ast = p.into_ast();
+        let compiled = match base_compiler::compile_eval(&ast) {
+            Ok(c) => c,
+            Err(_) => {
+                nctx.set_pending_exception(VmError::Type);
+                return Ok(nctx.heap().known().exception.value());
+            }
+        };
         let (vm, heap, state) = nctx.split();
-        let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
+        let context = scope.cast::<Context>(context.value()).ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
         nctx.call(closure.value(), GcSlice::EMPTY)
     })

@@ -1,6 +1,6 @@
 use core::alloc::Layout;
 
-use crate::{EdgeVisitable, GcSlot, Header, HeapObject, NoGc, ObjectKind, Smi, Value, Visitor};
+use crate::{EdgeVisitable, GcSlot, GcSlice, Header, HeapObject, NoGc, ObjectKind, Smi, Value, Visitor};
 
 #[repr(C)]
 pub struct FixedArray {
@@ -46,7 +46,7 @@ impl FixedArray {
 
 impl HeapObject for FixedArray {
     const KIND: ObjectKind = ObjectKind::FixedArray;
-    type Init<'a> = &'a [Value];
+    type Init<'a> = GcSlice<'a>;
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
         Self::layout_for(config.len())

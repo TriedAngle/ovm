@@ -231,6 +231,12 @@ impl Stack {
         let saved_top = self.top();
         let base = self.reserve(0, args.len())?;
         let dst = base + HEADER_SLOTS;
+        // the staged region reserves frame-header slots it never writes:
+        // they sit below `top`, so the GC would scan whatever stale words
+        // previous frames left there — fill them like fresh registers
+        for i in 0..HEADER_SLOTS {
+            self.slot_unchecked(base + i).store(self.fill.inner());
+        }
         unsafe {
             core::ptr::copy_nonoverlapping(
                 args.as_slice().as_ptr(),

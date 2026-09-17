@@ -150,12 +150,20 @@ fn eval_completion_values() {
         "loop completion is the last body value"
     );
     // declarations (and blocks of declarations) produce no value
-    let (result, mut thread) = run_value(&vm, "eval('{ let x = 1; }');");
-    assert_eq!(result, thread.heap().known().undefined.value());
-    let (result, mut thread) = run_value(&vm, "eval('function fn() {}{}');");
-    assert_eq!(result, thread.heap().known().undefined.value());
-    let (result, mut thread) = run_value(&vm, "eval('var x = 1;');");
-    assert_eq!(result, thread.heap().known().undefined.value());
+    // (each probe is scoped: an attached-but-idle thread would block
+    // every stop-the-world collection of the threads still running)
+    {
+        let (result, mut thread) = run_value(&vm, "eval('{ let x = 1; }');");
+        assert_eq!(result, thread.heap().known().undefined.value());
+    }
+    {
+        let (result, mut thread) = run_value(&vm, "eval('function fn() {}{}');");
+        assert_eq!(result, thread.heap().known().undefined.value());
+    }
+    {
+        let (result, mut thread) = run_value(&vm, "eval('var x = 1;');");
+        assert_eq!(result, thread.heap().known().undefined.value());
+    }
 }
 
 #[test]

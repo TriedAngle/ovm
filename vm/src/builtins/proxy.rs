@@ -30,6 +30,7 @@ pub(crate) fn proxy_constructor(
         let handler = scope.handle(handler);
         Ok(crate::proxy::allocate(
             nctx.heap(),
+            &scope,
             target.value(),
             handler.value(),
         ))
@@ -59,6 +60,7 @@ pub(crate) fn proxy_revocable(
         let handler = scope.handle(handler);
         let proxy = scope.handle(crate::proxy::allocate(
             nctx.heap(),
+            &scope,
             target.value(),
             handler.value(),
         ));

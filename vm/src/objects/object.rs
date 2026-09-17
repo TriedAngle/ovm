@@ -1,7 +1,7 @@
 use core::alloc::Layout;
 
 use crate::{
-    CallableInfoObject, Context, DenseString, EdgeVisitable, FixedArray, FunctionKind, GcSlot,
+    CallableInfoObject, Context, DenseString, EdgeVisitable, FixedArray, FunctionKind, GcSlice, GcSlot,
     Handle, HandleScope, Header, Heap, HeapObject, HeapRef, Map, NoGc, ObjectKind, SlotName, Smi,
     Tagged, Value, Visitor, VmError,
 };
@@ -178,7 +178,7 @@ pub fn store_array_element(
             Ok::<_, VmError>(values)
         })?;
         values[i] = value;
-        let elements = heap.allocate_handle::<FixedArray>(&values, scope);
+        let elements = heap.allocate_handle::<FixedArray>(scope.stage(&values), scope);
         heap.no_gc(|nogc| {
             let obj = receiver.heap_ref(nogc);
             obj.elements
@@ -210,7 +210,7 @@ pub struct ObjectInit<'a> {
 
 pub struct ObjectSlotsInit<'m, 'v> {
     pub map: Handle<'m, Map>,
-    pub values: &'v [Value],
+    pub values: GcSlice<'v>,
     pub elements: Handle<'m, Value>,
     pub length: usize,
 }

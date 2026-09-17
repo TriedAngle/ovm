@@ -1,4 +1,11 @@
-use crate::{Heap, Object, PropertyDescriptor, Value, VmError};
+use crate::{
+    GcSlice,
+    Heap,
+    Object,
+    PropertyDescriptor,
+    Value,
+    VmError,
+};
 
 use crate::{ContextState, VM};
 
@@ -22,7 +29,7 @@ pub fn error_from_vm_error(
             "RangeError" => heap.known().range_error_map,
             _ => heap.known().error_map,
         };
-        let obj = heap.new_object(&scope, map, &[]).into_handle(&scope);
+        let obj = heap.new_object(&scope, map, GcSlice::EMPTY).into_handle(&scope);
         let name = heap.known().strings.name;
         let message = heap.known().strings.message;
         let name_value = scope.handle(name_value.value());

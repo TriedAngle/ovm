@@ -116,20 +116,23 @@ impl HandleDataImpl {
     }
 
     fn extend(&mut self) {
-        let block = vec![self.fill.inner(); HANDLE_BLOCK_SIZE].into_boxed_slice();
+        self.extend_sized(HANDLE_BLOCK_SIZE);
+    }
+
+    fn extend_sized(&mut self, size: usize) {
+        let block = vec![self.fill.inner(); size].into_boxed_slice();
         self.next = block.as_ptr() as *mut Value;
         self.limit = unsafe { self.next.add(block.len()) };
         self.blocks.push(block);
     }
 
     /// Reserve `n` contiguous slots in the current block, extending first
-    /// when the remainder is too small.
+    /// when the remainder is too small. Oversized requests get a dedicated
+    /// block (block memory is boxed and never moves, so any size works).
     fn allocate_block(&mut self, n: usize) -> *mut Value {
-        assert!(
-            n <= HANDLE_BLOCK_SIZE,
-            "cannot stage more values than one handle block"
-        );
-        if self.next.addr() + n > self.limit.addr() {
+        if n > HANDLE_BLOCK_SIZE {
+            self.extend_sized(n);
+        } else if self.next.addr() + n * core::mem::size_of::<Value>() > self.limit.addr() {
             self.extend();
         }
         let start = self.next;

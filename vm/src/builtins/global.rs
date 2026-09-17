@@ -9,37 +9,35 @@ pub(crate) fn eval_native(
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     let src = args.get(1).ok_or(VmError::Arity)?;
-    let context = nctx.current_context().ok_or(VmError::Type)?;
-
-    let text = nctx.handle_scope(|nctx, scope| {
+    nctx.handle_scope(|nctx, scope| {
+        // root the caller context before the allocating ToString below
+        let context = scope.handle(nctx.current_context().ok_or(VmError::Type)?);
         let (_vm, heap, _) = nctx.split();
         let s = Convert::to_string(heap, &scope, src)?;
-        heap.no_gc(|nogc| {
+        let text = heap.no_gc(|nogc| {
             s.get_as::<DenseString>(nogc)
                 .map(|s| s.to_rust_string(nogc))
                 .ok_or(VmError::Type)
-        })
-    })?;
+        })?;
 
-    let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&text));
-    if let Err(e) = p.parse_script() {
-        // TODO: a SyntaxError class; approximate with TypeError for now
-        let _ = e;
-        nctx.set_pending_exception(VmError::Type);
-        return Ok(nctx.heap().known().exception.value());
-    }
-    let ast = p.into_ast();
-    let compiled = match compile_eval(&ast) {
-        Ok(c) => c,
-        Err(_) => {
+        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&text));
+        if let Err(e) = p.parse_script() {
+            // TODO: a SyntaxError class; approximate with TypeError for now
+            let _ = e;
             nctx.set_pending_exception(VmError::Type);
             return Ok(nctx.heap().known().exception.value());
         }
-    };
+        let ast = p.into_ast();
+        let compiled = match compile_eval(&ast) {
+            Ok(c) => c,
+            Err(_) => {
+                nctx.set_pending_exception(VmError::Type);
+                return Ok(nctx.heap().known().exception.value());
+            }
+        };
 
-    nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
-        let context = scope.cast::<Context>(context).ok_or(VmError::Type)?;
+        let context = scope.cast::<Context>(context.value()).ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
         nctx.call(closure.value(), GcSlice::EMPTY)
     })

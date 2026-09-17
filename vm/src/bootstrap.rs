@@ -1,10 +1,7 @@
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
-use crate::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
-    Handle, HandleData, HandleScope, Heap, Map, MapInit, MapKind, Object, ObjectInit, RootHandles,
-    ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged, Value,
+use crate::{CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, GcSlice, Global, Handle, HandleData, HandleScope, Heap, Map, MapInit, MapKind, Object, ObjectInit, RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged, Value,
 };
 
 #[derive(Clone, Copy)]
@@ -301,7 +298,7 @@ fn alloc_object(
     roots: &RootHandles,
     map: Global<Map>,
 ) -> Global<Object> {
-    heap.new_object(scope, map, &[]).into_global(roots)
+    heap.new_object(scope, map, GcSlice::EMPTY).into_global(roots)
 }
 
 pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
@@ -470,8 +467,8 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
     let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
-    let empty_slots = heap.allocate::<FixedArray>(&[]).into_global(roots);
-    known.empty_fixed_array = heap.allocate::<FixedArray>(&[]).into_global(roots);
+    let empty_slots = heap.allocate::<FixedArray>(GcSlice::EMPTY).into_global(roots);
+    known.empty_fixed_array = heap.allocate::<FixedArray>(GcSlice::EMPTY).into_global(roots);
     heap.set_known(known);
     let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map);
 
@@ -566,7 +563,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         .new_object(
             &scope,
             function_prototype_map,
-            &[empty_info.value(), empty_context.value()],
+            scope.stage(&[empty_info.value(), empty_context.value()]),
         )
         .into_global(roots);
 

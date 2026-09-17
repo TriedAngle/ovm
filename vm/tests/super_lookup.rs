@@ -4,7 +4,7 @@
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
-    FixedArray, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi, StoreOutcome,
+    FixedArray, GcSlice, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi, StoreOutcome,
     StoreSemantics, Thread, VM, Value, VmError, home_proto, lookup_in_parents, super_lookup,
     super_store_lookup,
 };
@@ -26,7 +26,7 @@ fn object_with(thread: &mut Thread, proto: Value, props: &[(&str, i64)]) -> Valu
         let map = thread.heap().known().object_initial_map;
         let obj = thread
             .heap()
-            .new_object(&scope, map, &[])
+            .new_object(&scope, map, GcSlice::EMPTY)
             .into_handle(&scope);
         Object::set_prototype(thread.heap(), &scope, obj.value(), proto).unwrap();
         for (name, v) in props {
@@ -61,7 +61,7 @@ fn parents_of(thread: &mut Thread, p1: Value, p2: Value) -> Value {
     thread.handle_scope(|thread, scope| {
         thread
             .heap()
-            .allocate_handle::<FixedArray>(&[p1, p2], &scope)
+            .allocate_handle::<FixedArray>(scope.stage(&[p1, p2]), &scope)
             .value()
     })
 }

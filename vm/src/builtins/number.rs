@@ -20,7 +20,10 @@ pub(crate) fn number_constructor(
         let (_, heap, _) = nctx.split();
         let value = heap.new_number(&scope, n);
         let map = heap.known().number_wrapper_map;
-        Ok(heap.new_object(&scope, map, &[value]).into_tagged().erase())
+        Ok(heap
+            .new_object(&scope, map, scope.stage(&[value]))
+            .into_tagged()
+            .erase())
     })
 }
 

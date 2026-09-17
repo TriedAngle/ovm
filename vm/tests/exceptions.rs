@@ -25,7 +25,7 @@ fn callable<'s>(
         .allocate_handle::<FixedByteArray>(program, scope);
     let constants = thread
         .heap()
-        .allocate_handle::<FixedArray>(constants, scope);
+        .allocate_handle::<FixedArray>(scope.stage(constants), scope);
     let handlers = handlers.map(|entries| {
         thread
             .heap()
@@ -47,7 +47,7 @@ fn callable<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.value(), empty_context.value()],
+                values: scope.stage(&[info.value(), empty_context.value()]),
                 elements: the_hole.erase(),
                 length: 0,
             },
