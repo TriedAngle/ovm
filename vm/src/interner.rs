@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::{
-    DenseString, EdgeVisitable, Handle, HandleSet, Heap, NoGc, StringData, Visitor,
-    string_content_hash,
+    DenseString, EdgeVisitable, Handle, HandleSet, Heap, StringData, Visitor, string_content_hash,
 };
 
 use crate::heap::WeakGcCell;
@@ -51,10 +50,10 @@ impl StringInterner {
         scope: &'s impl HandleSet,
         data: StringData<'_>,
     ) -> Handle<'s, DenseString> {
-        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|nogc| {
+        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|heap| {
             let hash = string_content_hash(data);
             let mut table = self.table.lock().unwrap();
-            match probe_unlocked(nogc, scope, &mut table, hash, data) {
+            match probe_unlocked(heap, scope, &mut table, hash, data) {
                 Some(handle) => Ok(handle),
                 None => Err((InternKey::from_data(data), hash)),
             }
@@ -84,12 +83,12 @@ impl StringInterner {
         scope: &'s impl HandleSet,
         s: &Handle<'_, DenseString>,
     ) -> Handle<'s, DenseString> {
-        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|nogc| {
-            let r = s.heap_ref(nogc);
-            let hash = r.hash(nogc);
+        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|heap| {
+            let r = s.heap_ref(heap);
+            let hash = r.hash(heap);
             let mut table = self.table.lock().unwrap();
-            let data = r.data(nogc);
-            match probe_unlocked(nogc, scope, &mut table, hash, data) {
+            let data = r.data(heap);
+            match probe_unlocked(heap, scope, &mut table, hash, data) {
                 Some(handle) => Ok(handle),
                 None => Err((InternKey::from_data(data), hash)),
             }
@@ -111,7 +110,7 @@ impl StringInterner {
             .allocate::<DenseString>((key.data(), hash))
             .into_handle(scope);
         let mut table = self.table.lock().unwrap();
-        let raced = heap.no_gc(|nogc| probe_unlocked(nogc, scope, &mut table, hash, key.data()));
+        let raced = heap.no_gc(|heap| probe_unlocked(heap, scope, &mut table, hash, key.data()));
         match raced {
             Some(existing) => existing,
             None => {
@@ -125,8 +124,8 @@ impl StringInterner {
     }
 }
 
-fn probe_unlocked<'s, 'g>(
-    nogc: &'g NoGc<'g>,
+fn probe_unlocked<'s>(
+    heap: &Heap,
     scope: &'s impl HandleSet,
     table: &mut InternTable,
     hash: i64,
@@ -136,7 +135,7 @@ fn probe_unlocked<'s, 'g>(
     let mut i = 0;
     while i < bucket.len() {
         if bucket[i].0.data().eq(&data) {
-            if let Some(r) = bucket[i].1.upgrade(nogc) {
+            if let Some(r) = bucket[i].1.upgrade(heap) {
                 return Some(r.into_handle(scope));
             }
             // dead entry: prune and keep scanning

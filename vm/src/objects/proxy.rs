@@ -1,12 +1,12 @@
 use core::alloc::Layout;
 
+use crate::lookup::has_property;
+use crate::runtime::{Coercion, Runtime};
 use crate::{
-    Compare, ContextState, Convert, EdgeVisitable, GcSlot, GcSlice, Handle, HandleScope, Header, Heap,
-    HeapObject, Key, Lookup, Map, NativeContext, NoGc, Object, ObjectKind, PartialDescriptor,
-    PropertyDescriptor, SlotName, VM, Value, Visitor, VmError, is_compatible_property_descriptor,
-    lookup::has_property,
-    runtime::{Coercion, Runtime},
-    store_array_element,
+    Compare, ContextState, Convert, EdgeVisitable, FixedArray, GcSlice, GcSlot, Handle,
+    HandleScope, Header, Heap, HeapObject, Key, Lookup, Map, NativeContext, Object, ObjectKind,
+    PartialDescriptor, PropertyDescriptor, SlotName, Smi, Tagged, VM, Value, Visitor, VmError,
+    is_compatible_property_descriptor,
 };
 
 #[repr(C)]
@@ -28,8 +28,8 @@ impl ProxyObject {
     }
 
     /// Whether the proxy has been revoked (handler nulled).
-    pub fn is_revoked<'a>(&self, nogc: &'a NoGc<'a>) -> bool {
-        self.handler.inner() == nogc.known().null.value()
+    pub fn is_revoked(&self, heap: &Heap) -> bool {
+        self.handler.inner() == heap.known().null.as_tagged(heap).erase()
     }
 
     /// (target, handler) as raw values; caller checks revocation.
@@ -46,11 +46,13 @@ impl HeapObject for ProxyObject {
         Self::layout_for()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
-        self.header.map.set(nogc, host, config.map.as_tagged());
-        self.target.set(nogc, host, config.target.value());
-        self.handler.set(nogc, host, config.handler.value());
+        self.header.map.set(heap, host, config.map.as_tagged(heap));
+        self.target
+            .set(heap, host, config.target.as_tagged(heap).erase_type());
+        self.handler
+            .set(heap, host, config.handler.as_tagged(heap).erase_type());
     }
 
     fn header(&self) -> &Header {
@@ -96,29 +98,41 @@ pub enum Trap {
 }
 
 impl Trap {
-    fn name(self, heap: &Heap) -> Value {
+    fn name(self, heap: &Heap) -> SlotName {
         let s = heap.known().strings;
         match self {
-            Self::Get => s.get.value(),
-            Self::Set => s.set.value(),
-            Self::Has => s.has.value(),
-            Self::DeleteProperty => s.delete_property.value(),
-            Self::GetOwnPropertyDescriptor => s.get_own_property_descriptor.value(),
-            Self::DefineProperty => s.define_property.value(),
-            Self::GetPrototypeOf => s.get_prototype_of.value(),
-            Self::SetPrototypeOf => s.set_prototype_of.value(),
-            Self::IsExtensible => s.is_extensible.value(),
-            Self::PreventExtensions => s.prevent_extensions.value(),
-            Self::OwnKeys => s.own_keys.value(),
-            Self::Apply => s.apply.value(),
-            Self::Construct => s.construct.value(),
+            Self::Get => SlotName::from_value(unsafe { s.get.read_unchecked() }),
+            Self::Set => SlotName::from_value(unsafe { s.set.read_unchecked() }),
+            Self::Has => SlotName::from_value(unsafe { s.has.read_unchecked() }),
+            Self::DeleteProperty => {
+                SlotName::from_value(unsafe { s.delete_property.read_unchecked() })
+            }
+            Self::GetOwnPropertyDescriptor => {
+                SlotName::from_value(unsafe { s.get_own_property_descriptor.read_unchecked() })
+            }
+            Self::DefineProperty => {
+                SlotName::from_value(unsafe { s.define_property.read_unchecked() })
+            }
+            Self::GetPrototypeOf => {
+                SlotName::from_value(unsafe { s.get_prototype_of.read_unchecked() })
+            }
+            Self::SetPrototypeOf => {
+                SlotName::from_value(unsafe { s.set_prototype_of.read_unchecked() })
+            }
+            Self::IsExtensible => SlotName::from_value(unsafe { s.is_extensible.read_unchecked() }),
+            Self::PreventExtensions => {
+                SlotName::from_value(unsafe { s.prevent_extensions.read_unchecked() })
+            }
+            Self::OwnKeys => SlotName::from_value(unsafe { s.own_keys.read_unchecked() }),
+            Self::Apply => SlotName::from_value(unsafe { s.apply.read_unchecked() }),
+            Self::Construct => SlotName::from_value(unsafe { s.construct.read_unchecked() }),
         }
     }
 }
 
 /// Fast proxy check: one map-kind read.
-pub fn is_proxy<'a>(nogc: &'a NoGc<'a>, v: Value) -> bool {
-    v.get_as::<ProxyObject>(nogc).is_some()
+pub fn is_proxy<'a>(_heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
+    v.get_as::<ProxyObject>().is_some()
 }
 
 /// Whether `v` is a valid ECMAScript receiver ([[ProxyTarget]] /
@@ -126,38 +140,44 @@ pub fn is_proxy<'a>(nogc: &'a NoGc<'a>, v: Value) -> bool {
 /// checks): a pure map-kind check, like V8's instance-type range test —
 /// the oddball singletons (`null`, `undefined`, `true`, `false`, …)
 /// carry `ODDBALL`-kind maps and fall out naturally.
-pub fn is_js_receiver<'a>(nogc: &'a NoGc<'a>, v: Value) -> bool {
-    let Some(obj) = v.as_heap_object(nogc) else {
+pub fn is_js_receiver<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
+    let Some(obj) = v.as_heap_object() else {
         return false;
     };
     obj.as_ref()
         .header
         .map
-        .heap_ref(nogc)
+        .heap_ref(heap)
         .kind()
         .kind()
         .is_js_receiver()
 }
 
-/// (target, handler) of a proxy, read under a leaf scope.
-fn parts<'a>(nogc: &'a NoGc<'a>, proxy: Value) -> Option<(Value, Value)> {
-    let p = proxy.get_as::<ProxyObject>(nogc)?;
+/// (target, handler) of a proxy, read under a leaf scope. The raw words
+/// must be rooted by the caller before any allocation.
+fn parts<'a>(_heap: &'a Heap, proxy: Tagged<'a, Value>) -> Option<(Value, Value)> {
+    let p = proxy.get_as::<ProxyObject>()?;
     Some(p.as_ref().parts())
 }
 
-pub fn allocate(heap: &mut Heap, scope: &HandleScope<'_>, target: Value, handler: Value) -> Value {
+pub fn allocate<'a>(
+    heap: &'a mut Heap,
+    scope: &HandleScope<'_>,
+    target: Tagged<'_, Value>,
+    handler: Tagged<'_, Value>,
+) -> Tagged<'a, Value> {
     let target = scope.handle(target);
     let handler = scope.handle(handler);
     let known = heap.known();
-    let map: Handle<'_, Map> = heap.no_gc(|nogc| {
+    let map: Handle<'_, Map> = heap.no_gc(|heap| {
         let kind = target
-            .value()
-            .as_heap_object(nogc)
+            .as_tagged(heap)
+            .as_heap_object()
             .expect("proxy target must be a JSReceiver")
             .as_ref()
             .header
             .map
-            .heap_ref(nogc)
+            .heap_ref(heap)
             .kind();
         if kind.is_constructor() {
             known.proxy_constructor_map
@@ -167,54 +187,65 @@ pub fn allocate(heap: &mut Heap, scope: &HandleScope<'_>, target: Value, handler
             known.proxy_map
         }
     });
-    heap.allocate::<ProxyObject>(crate::ProxyInit {
+    heap.allocate::<ProxyObject>(ProxyInit {
         map,
         target,
         handler,
     })
-    .erase()
+    .erase_type()
 }
 
-pub fn revoke(heap: &mut Heap, proxy: Value) {
-    heap.no_gc(|nogc| {
-        let Some(p) = proxy.get_as::<ProxyObject>(nogc) else {
+pub fn revoke(heap: &mut Heap, proxy: Tagged<'_, Value>) {
+    heap.no_gc(|heap| {
+        let Some(p) = proxy.get_as::<ProxyObject>() else {
             return;
         };
-        if p.as_ref().is_revoked(nogc) {
+        if p.as_ref().is_revoked(heap) {
             return;
         }
-        let null = nogc.known().null.value();
-        p.as_ref().target.set(nogc, proxy, null);
-        p.as_ref().handler.set(nogc, proxy, null);
+        let host = proxy.erase();
+        let null = heap.known().null.as_tagged(heap).erase_type();
+        p.as_ref().target.set(heap, host, null);
+        p.as_ref().handler.set(heap, host, null);
     });
 }
 
-enum TrapLookup {
+enum TrapLookup<'s> {
     /// undefined/null: forward to the target.
     None,
     /// A callable... verified by `call_trap`.
-    Trap(Value),
+    Trap(Handle<'s, Value>),
     Threw,
 }
 
-fn get_trap(
+fn get_trap<'s>(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    handler: Value,
+    scope: &'s HandleScope<'_>,
+    handler: &Handle<'_, Value>,
     trap: Trap,
-) -> Result<TrapLookup, VmError> {
-    let name = trap.name(heap);
-    match Runtime::get_property(vm, heap, state, handler, name)? {
+) -> Result<TrapLookup<'s>, VmError> {
+    let name = heap.no_gc(|heap| trap.name(heap));
+    match Runtime::get_property(
+        vm,
+        heap,
+        state,
+        unsafe { handler.read_unchecked() },
+        name.value(),
+    )? {
         Coercion::Threw => Ok(TrapLookup::Threw),
         Coercion::Value(v) => {
-            let nullish = heap.no_gc(|nogc| {
-                v == nogc.known().undefined.value() || v == nogc.known().null.value()
+            let nullish = heap.no_gc(|heap| {
+                v == heap.known().undefined.as_tagged(heap).erase()
+                    || v == heap.known().null.as_tagged(heap).erase()
             });
             if nullish {
                 Ok(TrapLookup::None)
             } else {
-                Ok(TrapLookup::Trap(v))
+                Ok(TrapLookup::Trap(
+                    scope.handle(unsafe { v.assume_valid(&*heap) }),
+                ))
             }
         }
     }
@@ -225,15 +256,21 @@ fn call_trap(
     heap: &mut Heap,
     state: &ContextState,
     scope: &HandleScope<'_>,
-    trap: Value,
-    args: &[Value],
+    trap: &Handle<'_, Value>,
+    args: &[Handle<'_, Value>],
 ) -> Result<Coercion, VmError> {
-    if !Runtime::is_callable(heap, trap) {
+    if !Runtime::is_callable(heap, unsafe { trap.read_unchecked() }) {
         return Err(VmError::Message("proxy trap is not a function"));
     }
-    let trap = scope.handle(trap);
-    let result = NativeContext::new(vm, heap, state).call(trap.value(), scope.stage(args))?;
-    if result == heap.known().exception.value() {
+    let words: Vec<Value> = args.iter().map(|h| unsafe { h.read_unchecked() }).collect();
+    let result = NativeContext::new(vm, heap, state)
+        // Safety: fresh handle-slot word under the live scope borrow.
+        .call(
+            unsafe { Tagged::from_value_unchecked(trap.read_unchecked()) },
+            scope.stage_words(&words),
+        )?;
+    let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+    if result == exception {
         Ok(Coercion::Threw)
     } else {
         Ok(Coercion::Value(result))
@@ -241,16 +278,24 @@ fn call_trap(
 }
 
 /// Revocation check + (target, handler) extraction — the shared entry
-/// of every internal method. The caller roots both values before any
-/// trap can run.
-fn enter_trap(heap: &mut Heap, proxy: Value, trap: Trap) -> Result<(Value, Value), VmError> {
+/// of every internal method. Both values come back rooted in `scope`.
+fn enter_trap<'s>(
+    scope: &'s HandleScope<'_>,
+    heap: &mut Heap,
+    proxy: &Handle<'_, Value>,
+    trap: Trap,
+) -> Result<(Handle<'s, Value>, Handle<'s, Value>), VmError> {
     let (target, handler) = heap
-        .no_gc(|nogc| parts(nogc, proxy))
+        .no_gc(|heap| parts(heap, proxy.as_tagged(heap)))
         .expect("caller verified a proxy");
-    if handler == heap.known().null.value() {
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    if revoked {
         return Err(revoked_error(trap));
     }
-    Ok((target, handler))
+    Ok((
+        scope.handle(unsafe { target.assume_valid(&*heap) }),
+        scope.handle(unsafe { handler.assume_valid(&*heap) }),
+    ))
 }
 
 fn revoked_error(trap: Trap) -> VmError {
@@ -279,56 +324,64 @@ pub fn internal_own_descriptor(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    obj: Value,
-    key: Value,
+    obj: Tagged<'_, Value>,
+    key: Tagged<'_, Value>,
 ) -> Result<Flow<Option<PartialDescriptor>>, VmError> {
-    if !heap.no_gc(|nogc| is_proxy(nogc, obj)) {
-        let desc = heap.no_gc(|nogc| crate::lookup::ordinary_own_descriptor(nogc, obj, key));
+    state.handle_scope(|scope| {
+        let obj = scope.handle(obj);
+        let key = scope.handle(key);
+        own_descriptor_h(vm, heap, state, &scope, &obj, &key)
+    })
+}
+
+fn own_descriptor_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    obj: &Handle<'_, Value>,
+    key: &Handle<'_, Value>,
+) -> Result<Flow<Option<PartialDescriptor>>, VmError> {
+    if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
+        let desc = heap.no_gc(|heap| {
+            crate::lookup::ordinary_own_descriptor(heap, obj.as_tagged(heap), key.as_tagged(heap))
+        });
         return Ok(Flow::Value(desc.as_ref().map(PartialDescriptor::from)));
     }
     let (target, handler) = heap
-        .no_gc(|nogc| parts(nogc, obj))
+        .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    if handler == heap.known().null.value() {
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    if revoked {
         return Err(revoked_error(Trap::GetOwnPropertyDescriptor));
     }
-    state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
-        let key = scope.handle(key);
-        match get_trap(
-            vm,
-            heap,
-            state,
-            handler.value(),
-            Trap::GetOwnPropertyDescriptor,
-        )? {
-            TrapLookup::Threw => Ok(Flow::Threw),
-            TrapLookup::None => {
-                internal_own_descriptor(vm, heap, state, target.value(), key.value())
+    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    match get_trap(
+        vm,
+        heap,
+        state,
+        scope,
+        &handler,
+        Trap::GetOwnPropertyDescriptor,
+    )? {
+        TrapLookup::Threw => Ok(Flow::Threw),
+        TrapLookup::None => own_descriptor_h(vm, heap, state, scope, &target, key),
+        TrapLookup::Trap(t) => {
+            let result = call_trap(vm, heap, state, scope, &t, &[handler, target, *key])?;
+            let Coercion::Value(result) = result else {
+                return Ok(Flow::Threw);
+            };
+            let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
+            if result == undefined {
+                return Ok(Flow::Value(None));
             }
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value(), key.value()],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Flow::Threw);
-                };
-                if result == heap.known().undefined.value() {
-                    return Ok(Flow::Value(None));
-                }
-                match Runtime::to_property_descriptor(vm, heap, state, result)? {
-                    Some(partial) => Ok(Flow::Value(Some(partial))),
-                    None => Ok(Flow::Threw),
-                }
+            match Runtime::to_property_descriptor(vm, heap, state, result)? {
+                Some(partial) => Ok(Flow::Value(Some(partial))),
+                None => Ok(Flow::Threw),
             }
         }
-    })
+    }
 }
 
 /// [[IsExtensible]] through proxies, *without* the trap-must-match
@@ -338,44 +391,50 @@ pub fn internal_is_extensible(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    obj: Value,
+    obj: Tagged<'_, Value>,
 ) -> Result<Flow<bool>, VmError> {
-    if !heap.no_gc(|nogc| is_proxy(nogc, obj)) {
-        return Ok(Flow::Value(heap.no_gc(|nogc| {
-            obj.as_heap_object(nogc)
-                .is_some_and(|o| o.as_ref().map_ref(nogc).kind().is_extendable())
+    state.handle_scope(|scope| {
+        let obj = scope.handle(obj);
+        is_extensible_h(vm, heap, state, &scope, &obj)
+    })
+}
+
+fn is_extensible_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    obj: &Handle<'_, Value>,
+) -> Result<Flow<bool>, VmError> {
+    if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
+        return Ok(Flow::Value(heap.no_gc(|heap| {
+            obj.as_tagged(heap)
+                .as_heap_object()
+                .is_some_and(|o| o.as_ref().map_ref(heap).kind().is_extendable())
         })));
     }
     let (target, handler) = heap
-        .no_gc(|nogc| parts(nogc, obj))
+        .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    if handler == heap.known().null.value() {
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
-    state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
-        match get_trap(vm, heap, state, handler.value(), Trap::IsExtensible)? {
-            TrapLookup::Threw => Ok(Flow::Threw),
-            TrapLookup::None => internal_is_extensible(vm, heap, state, target.value()),
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value()],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Flow::Threw);
-                };
-                Ok(Flow::Value(
-                    heap.no_gc(|nogc| Convert::is_truthy(nogc, result)),
-                ))
-            }
+    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    match get_trap(vm, heap, state, scope, &handler, Trap::IsExtensible)? {
+        TrapLookup::Threw => Ok(Flow::Threw),
+        TrapLookup::None => is_extensible_h(vm, heap, state, scope, &target),
+        TrapLookup::Trap(t) => {
+            let result = call_trap(vm, heap, state, scope, &t, &[handler, target])?;
+            let Coercion::Value(result) = result else {
+                return Ok(Flow::Threw);
+            };
+            Ok(Flow::Value(heap.no_gc(|heap| {
+                Convert::is_truthy(heap, unsafe { result.assume_valid(heap) })
+            })))
         }
-    })
+    }
 }
 
 // ---- forwards (trap absent → run the operation on the target) ---------------
@@ -392,11 +451,17 @@ struct RootedPartial<'s> {
 }
 
 impl<'s> RootedPartial<'s> {
-    fn new(scope: &'s HandleScope<'_>, partial: &PartialDescriptor) -> Self {
+    fn new(scope: &'s HandleScope<'_>, heap: &Heap, partial: &PartialDescriptor) -> Self {
         Self {
-            value: partial.value.map(|v| scope.handle(v)),
-            get: partial.get.map(|v| scope.handle(v)),
-            set: partial.set.map(|v| scope.handle(v)),
+            value: partial
+                .value
+                .map(|v| scope.handle(unsafe { v.assume_valid(heap) })),
+            get: partial
+                .get
+                .map(|v| scope.handle(unsafe { v.assume_valid(heap) })),
+            set: partial
+                .set
+                .map(|v| scope.handle(unsafe { v.assume_valid(heap) })),
             writable: partial.writable,
             enumerable: partial.enumerable,
             configurable: partial.configurable,
@@ -407,11 +472,13 @@ impl<'s> RootedPartial<'s> {
         self.partial().is_data_descriptor()
     }
 
+    /// The words are fresh reads out of rooted slots; the result must be
+    /// consumed within the same expression (no allocation in between).
     fn partial(&self) -> PartialDescriptor {
         PartialDescriptor {
-            value: self.value.map(|h| h.value()),
-            get: self.get.map(|h| h.value()),
-            set: self.set.map(|h| h.value()),
+            value: self.value.map(|h| unsafe { h.read_unchecked() }),
+            get: self.get.map(|h| unsafe { h.read_unchecked() }),
+            set: self.set.map(|h| unsafe { h.read_unchecked() }),
             writable: self.writable,
             enumerable: self.enumerable,
             configurable: self.configurable,
@@ -421,9 +488,12 @@ impl<'s> RootedPartial<'s> {
 
 /// CreateDataProperty-style full descriptor ({w,e,c} true) — the payload
 /// of OrdinarySet's receiver-define step.
-fn create_data_partial<'s>(scope: &'s HandleScope<'_>, value: Value) -> RootedPartial<'s> {
+fn create_data_partial<'s>(
+    _scope: &'s HandleScope<'_>,
+    value: &Handle<'s, Value>,
+) -> RootedPartial<'s> {
     RootedPartial {
-        value: Some(scope.handle(value)),
+        value: Some(*value),
         get: None,
         set: None,
         writable: Some(true),
@@ -447,37 +517,124 @@ fn descriptor_object(
             .into_handle(&scope);
         let s = heap.known().strings;
         // spec field order: value, writable, get, set, enumerable, configurable
-        let mut fields: Vec<(Value, Value)> = Vec::new();
+        let mut fields: Vec<(SlotName, Handle<'_, Value>)> = Vec::new();
         if let Some(v) = &partial.value {
-            fields.push((s.value.value(), v.value()));
+            fields.push((
+                SlotName::from_value(unsafe { s.value.read_unchecked() }),
+                *v,
+            ));
         }
         if let Some(b) = partial.writable {
-            fields.push((s.writable.value(), Convert::boolean(heap, b)));
+            fields.push((
+                SlotName::from_value(unsafe { s.writable.read_unchecked() }),
+                scope.handle(Convert::boolean(&*heap, b)),
+            ));
         }
         if let Some(v) = &partial.get {
-            fields.push((s.get.value(), v.value()));
+            fields.push((SlotName::from_value(unsafe { s.get.read_unchecked() }), *v));
         }
         if let Some(v) = &partial.set {
-            fields.push((s.set.value(), v.value()));
+            fields.push((SlotName::from_value(unsafe { s.set.read_unchecked() }), *v));
         }
         if let Some(b) = partial.enumerable {
-            fields.push((s.enumerable.value(), Convert::boolean(heap, b)));
+            fields.push((
+                SlotName::from_value(unsafe { s.enumerable.read_unchecked() }),
+                scope.handle(Convert::boolean(&*heap, b)),
+            ));
         }
         if let Some(b) = partial.configurable {
-            fields.push((s.configurable.value(), Convert::boolean(heap, b)));
+            fields.push((
+                SlotName::from_value(unsafe { s.configurable.read_unchecked() }),
+                scope.handle(Convert::boolean(&*heap, b)),
+            ));
         }
         for (name, value) in fields {
-            let name = scope.handle(SlotName::from_value(name).tagged());
+            let name = scope.handle(unsafe { name.tagged(&*heap) });
             crate::Object::define_own_property(
                 heap,
                 &scope,
                 obj,
                 name,
-                PropertyDescriptor::data(value),
+                PropertyDescriptor::data(unsafe { value.read_unchecked() }),
             )?;
         }
-        Ok(obj.value())
+        Ok(unsafe { obj.read_unchecked() })
     })
+}
+
+/// Store `value` at element index `i` of an array object, growing the
+/// elements backing store and updating `length` when `i` is past the
+/// end. Handle-rooted variant of `objects::object::store_array_element`
+/// (the exported one takes `Tagged` args, which cannot be re-read from
+/// handles under a `&mut Heap`).
+fn define_array_element(
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
+    receiver: &Handle<'_, Object>,
+    i: usize,
+    value: &Handle<'_, Value>,
+) -> Result<(), VmError> {
+    let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
+    let grows = heap.no_gc(|heap| {
+        let obj = receiver.heap_ref(heap);
+        if !obj.as_ref().is_array(heap) {
+            return Err(VmError::Type);
+        }
+        // grow only when the store index is past the physical backing
+        // store (its capacity), not the logical length: sequential
+        // appends with headroom must not reallocate every time
+        let capacity = obj
+            .as_ref()
+            .elements_array(heap)
+            .map(|e| e.len())
+            .unwrap_or(0);
+        Ok(i >= capacity)
+    })?;
+
+    if grows {
+        let mut values = Vec::new();
+        heap.no_gc(|heap| -> Result<(), VmError> {
+            let obj = receiver.heap_ref(heap);
+            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+            let keep = obj.as_ref().length().min(elements.len());
+            let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
+            values = Vec::with_capacity(capacity);
+            for k in 0..keep {
+                values.push(elements.at(heap, k).erase());
+            }
+            // Safety: fresh root-slot read under the anchor.
+            values.resize(capacity, unsafe { heap.known().the_hole.read_unchecked() });
+            Ok(())
+        })?;
+        values[i] = unsafe { value.read_unchecked() };
+        let elements = heap.allocate_handle::<FixedArray>(scope.stage_words(&values), scope);
+        heap.no_gc(|heap| {
+            let obj = receiver.heap_ref(heap);
+            obj.as_ref().elements.set(
+                heap,
+                obj.as_ref().erase(),
+                elements.as_tagged(heap).erase_type(),
+            );
+            obj.as_ref()
+                .length
+                .set(heap, obj.as_ref().erase(), Smi::new(new_len as i64));
+        });
+    } else {
+        heap.no_gc(|heap| -> Result<(), VmError> {
+            let obj = receiver.heap_ref(heap);
+            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+            elements.set(heap, i, value.as_tagged(heap));
+            // a store inside the physical capacity but past the logical
+            // length still extends the array
+            if i >= obj.as_ref().length() {
+                obj.as_ref()
+                    .length
+                    .set(heap, obj.as_ref().erase(), Smi::new(new_len as i64));
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 /// `[[DefineOwnProperty]]` dispatch: proxies run their `defineProperty`
@@ -488,57 +645,71 @@ pub fn define_internal(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    obj: Value,
-    name: Value,
+    obj: Tagged<'_, Value>,
+    name: Tagged<'_, Value>,
     partial: PartialDescriptor,
 ) -> Result<Flow<bool>, VmError> {
-    if heap.no_gc(|nogc| is_proxy(nogc, obj)) {
-        return proxy_define(vm, heap, state, obj, name, partial);
-    }
     state.handle_scope(|scope| {
         let obj = scope.handle(obj);
         let name = scope.handle(name);
-        let undefined = heap.known().undefined.value();
-        // dense array elements: element defines land in the backing
-        // store, not as descriptors
-        let is_element_on_array = heap.no_gc(|nogc| {
-            crate::classify_key(nogc, name.value()).is_ok_and(|k| {
-                matches!(k, Key::Element(_))
-                    && obj
-                        .value()
-                        .as_heap_object(nogc)
-                        .is_some_and(|o| o.as_ref().is_array(nogc))
-            })
-        });
-        if is_element_on_array {
-            let key = heap
-                .no_gc(|nogc| crate::classify_key(nogc, name.value()))
-                .expect("element classification cannot fail here");
-            let Key::Element(i) = key else {
-                unreachable!("checked above")
-            };
-            let completed = partial.complete_against(undefined, None);
-            let PropertyDescriptor::Data { value, .. } = completed else {
-                return Err(VmError::Type);
-            };
-            let value = scope.handle(value);
-            store_array_element(heap, &scope, obj.value(), i, value.value())?;
-            return Ok(Flow::Value(true));
-        }
-        let current = heap
-            .no_gc(|nogc| crate::lookup::ordinary_own_descriptor(nogc, obj.value(), name.value()));
-        // no allocation between reading `current` and the define call
-        // (the define path roots its inputs before allocating)
-        let full = partial.complete_against(undefined, current.as_ref());
-        let defined = crate::Object::define_own_property_values(
-            heap,
-            &scope,
-            obj.value(),
-            SlotName::from_value(name.value()),
-            full,
-        )?;
-        Ok(Flow::Value(defined))
+        define_internal_h(vm, heap, state, &scope, &obj, &name, partial)
     })
+}
+
+fn define_internal_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    obj: &Handle<'_, Value>,
+    name: &Handle<'_, Value>,
+    partial: PartialDescriptor,
+) -> Result<Flow<bool>, VmError> {
+    if heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
+        return proxy_define_h(vm, heap, state, scope, obj, name, partial);
+    }
+    let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
+    // dense array elements: element defines land in the backing
+    // store, not as descriptors
+    let element = heap.no_gc(|heap| {
+        let on_array = obj
+            .as_tagged(heap)
+            .as_heap_object()
+            .is_some_and(|o| o.as_ref().is_array(heap));
+        if !on_array {
+            return None;
+        }
+        match crate::classify_key(heap, name.as_tagged(heap)) {
+            Ok(Key::Element(i)) => Some(i),
+            _ => None,
+        }
+    });
+    if let Some(i) = element {
+        let completed = partial.complete_against(undefined, None);
+        let PropertyDescriptor::Data { value, .. } = completed else {
+            return Err(VmError::Type);
+        };
+        let value = scope.handle(unsafe { value.assume_valid(&*heap) });
+        let array = scope
+            .cast::<Object>(obj.as_tagged(&*heap))
+            .expect("array checked above");
+        define_array_element(heap, scope, &array, i, &value)?;
+        return Ok(Flow::Value(true));
+    }
+    let current = heap.no_gc(|heap| {
+        crate::lookup::ordinary_own_descriptor(heap, obj.as_tagged(heap), name.as_tagged(heap))
+    });
+    // no allocation between reading `current` and the define call
+    // (the define path roots its inputs before allocating)
+    let full = partial.complete_against(undefined, current.as_ref());
+    let defined = crate::Object::define_own_property_values(
+        heap,
+        scope,
+        unsafe { obj.read_unchecked() },
+        SlotName::from_value(unsafe { name.read_unchecked() }),
+        full,
+    )?;
+    Ok(Flow::Value(defined))
 }
 
 /// OrdinarySet (receiver-aware) for an ordinary target with a proxy
@@ -547,102 +718,92 @@ fn ordinary_set_forward(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    target: Value,
-    receiver: Value,
-    name: Value,
-    value: Value,
+    scope: &HandleScope<'_>,
+    target: &Handle<'_, Value>,
+    receiver: &Handle<'_, Value>,
+    name: &Handle<'_, Value>,
+    value: &Handle<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let receiver = scope.handle(receiver);
-        let name = scope.handle(name);
-        let value = scope.handle(value);
+    // array element keys on arrays route through the define path
+    // (which stores into the backing store)
+    let classified = heap.no_gc(|heap| {
+        (
+            matches!(
+                crate::classify_key(heap, name.as_tagged(heap)),
+                Ok(Key::Element(_))
+            ),
+            target
+                .as_tagged(heap)
+                .as_heap_object()
+                .is_some_and(|o| o.as_ref().is_array(heap)),
+        )
+    });
+    if let (true, true) = classified {
+        let partial = create_data_partial(scope, value);
+        let flow = define_internal_h(vm, heap, state, scope, receiver, name, partial.partial())?;
+        return define_flow_to_coercion(heap, flow);
+    }
 
-        // array element keys on arrays route through the define path
-        // (which stores into the backing store)
-        let classified = heap.no_gc(|nogc| {
-            (
-                crate::classify_key(nogc, name.value()),
-                target
-                    .value()
-                    .as_heap_object(nogc)
-                    .is_some_and(|o| o.as_ref().is_array(nogc)),
-            )
-        });
-        if let (Ok(Key::Element(_)), true) = classified {
-            let partial = create_data_partial(&scope, value.value());
-            let flow = define_internal(
-                vm,
-                heap,
-                state,
-                receiver.value(),
-                name.value(),
-                partial.partial(),
-            )?;
-            return define_flow_to_coercion(heap, flow);
-        }
-
-        // owned summary of the chain lookup starting at the target
-        // (Lookup borrows its no-GC scope, so it is consumed inside)
-        enum SetLookup {
-            DataWritable,
-            DataReadonly,
-            Setter(Value),
-            NotFound,
-        }
-        let lookup = heap.no_gc(|nogc| {
-            match target
-                .value()
-                .lookup(nogc, SlotName::from_value(name.value()))
-            {
-                Lookup::Data { flags, .. } => {
-                    if flags.is_writable() {
-                        SetLookup::DataWritable
-                    } else {
-                        SetLookup::DataReadonly
-                    }
-                }
-                Lookup::Accessor { pair, .. } => SetLookup::Setter(pair.set.inner()),
-                Lookup::NotFound => SetLookup::NotFound,
-            }
-        });
-        match lookup {
-            SetLookup::DataReadonly => Ok(Coercion::Value(Convert::boolean(heap, false))),
-            SetLookup::DataWritable | SetLookup::NotFound => {
-                let partial = create_data_partial(&scope, value.value());
-                let flow = define_internal(
-                    vm,
-                    heap,
-                    state,
-                    receiver.value(),
-                    name.value(),
-                    partial.partial(),
-                )?;
-                define_flow_to_coercion(heap, flow)
-            }
-            SetLookup::Setter(setter) => {
-                if setter == heap.known().undefined.value() {
-                    return Ok(Coercion::Value(Convert::boolean(heap, false)));
-                }
-                let setter = scope.handle(setter);
-                let result = NativeContext::new(vm, heap, state).call(
-                    setter.value(),
-                    scope.stage(&[receiver.value(), value.value()]),
-                )?;
-                if result == heap.known().exception.value() {
-                    Ok(Coercion::Threw)
+    // owned summary of the chain lookup starting at the target
+    // (Lookup borrows its no-GC scope, so it is consumed inside)
+    enum SetLookup {
+        DataWritable,
+        DataReadonly,
+        Setter(Value),
+        NotFound,
+    }
+    let lookup = heap.no_gc(|heap| {
+        match target
+            .as_tagged(heap)
+            .lookup(heap, SlotName::from_value(unsafe { name.read_unchecked() }))
+        {
+            Lookup::Data { flags, .. } => {
+                if flags.is_writable() {
+                    SetLookup::DataWritable
                 } else {
-                    Ok(Coercion::Value(Convert::boolean(heap, true)))
+                    SetLookup::DataReadonly
                 }
             }
+            Lookup::Accessor { pair, .. } => SetLookup::Setter(pair.as_ref().set.inner()),
+            Lookup::NotFound => SetLookup::NotFound,
         }
-    })
+    });
+    match lookup {
+        SetLookup::DataReadonly => Ok(Coercion::Value(Convert::boolean(heap, false).erase())),
+        SetLookup::DataWritable | SetLookup::NotFound => {
+            let partial = create_data_partial(scope, value);
+            let flow =
+                define_internal_h(vm, heap, state, scope, receiver, name, partial.partial())?;
+            define_flow_to_coercion(heap, flow)
+        }
+        SetLookup::Setter(setter) => {
+            let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
+            if setter == undefined {
+                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
+            }
+            let setter = scope.handle(unsafe { setter.assume_valid(&*heap) });
+            let words = [unsafe { receiver.read_unchecked() }, unsafe {
+                value.read_unchecked()
+            }];
+            let result = NativeContext::new(vm, heap, state).call(
+                // Safety: fresh handle-slot word.
+                unsafe { Tagged::from_value_unchecked(setter.read_unchecked()) },
+                scope.stage_words(&words),
+            )?;
+            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+            if result == exception {
+                Ok(Coercion::Threw)
+            } else {
+                Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
+            }
+        }
+    }
 }
 
 fn define_flow_to_coercion(heap: &Heap, flow: Flow<bool>) -> Result<Coercion, VmError> {
     Ok(match flow {
         Flow::Threw => Coercion::Threw,
-        Flow::Value(b) => Coercion::Value(Convert::boolean(heap, b)),
+        Flow::Value(b) => Coercion::Value(Convert::boolean(heap, b).erase()),
     })
 }
 
@@ -655,80 +816,90 @@ pub fn get(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    proxy: Value,
-    receiver: Value,
-    name: Value,
+    proxy: Tagged<'_, Value>,
+    receiver: Tagged<'_, Value>,
+    name: Tagged<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    let (target, handler) = enter_trap(heap, proxy, Trap::Get)?;
     state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
-        let name = scope.handle(name);
+        let proxy = scope.handle(proxy);
         let receiver = scope.handle(receiver);
-        match get_trap(vm, heap, state, handler.value(), Trap::Get)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => {
-                // forward: lookup on the target, getter `this` = the
-                // original receiver (a proxy target re-enters its own
-                // `get` trap with the same receiver)
-                Runtime::get_property_on(
-                    vm,
-                    heap,
-                    state,
-                    target.value(),
-                    receiver.value(),
-                    name.value(),
-                )
-            }
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value(), name.value(), receiver.value()],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Coercion::Threw);
-                };
-                let result = scope.handle(result);
-                // invariant (steps 9-11): a trap cannot lie about
-                // non-configurable data / accessor properties
-                let desc = internal_own_descriptor(vm, heap, state, target.value(), name.value())?;
-                let Flow::Value(desc) = desc else {
-                    return Ok(Coercion::Threw);
-                };
-                if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
-                    heap.no_gc(|nogc| {
-                        let undefined = nogc.known().undefined.value();
-                        if d.is_data_descriptor()
-                            && d.writable == Some(false)
-                            && !Compare::same_value(
-                                nogc,
-                                result.value(),
-                                d.value.unwrap_or(undefined),
-                            )
-                        {
-                            return Err(VmError::Message(
-                                "proxy get trap must match a non-writable, non-configurable property",
-                            ));
-                        }
-                        if d.is_accessor_descriptor()
-                            && d.get.as_ref().is_some_and(|g| *g == undefined)
-                            && result.value() != undefined
-                        {
-                            return Err(VmError::Message(
-                                "proxy get trap must return undefined for an accessor without a getter",
-                            ));
-                        }
-                        Ok(())
-                    })?;
-                }
-                Ok(Coercion::Value(result.value()))
-            }
-        }
+        let name = scope.handle(name);
+        get_h(vm, heap, state, &scope, &proxy, &receiver, &name)
     })
+}
+
+fn get_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    proxy: &Handle<'_, Value>,
+    receiver: &Handle<'_, Value>,
+    name: &Handle<'_, Value>,
+) -> Result<Coercion, VmError> {
+    let (target, handler) = enter_trap(scope, heap, proxy, Trap::Get)?;
+    match get_trap(vm, heap, state, scope, &handler, Trap::Get)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => {
+            // forward: lookup on the target, getter `this` = the
+            // original receiver (a proxy target re-enters its own
+            // `get` trap with the same receiver)
+            Runtime::get_property_on(
+                vm,
+                heap,
+                state,
+                // Safety: fresh handle-slot words, rooted until consumed.
+                unsafe { target.read_unchecked() },
+                unsafe { receiver.read_unchecked() },
+                unsafe { name.read_unchecked() },
+            )
+        }
+        TrapLookup::Trap(t) => {
+            let result = call_trap(
+                vm,
+                heap,
+                state,
+                scope,
+                &t,
+                &[handler, target, *name, *receiver],
+            )?;
+            let Coercion::Value(result) = result else {
+                return Ok(Coercion::Threw);
+            };
+            let result = scope.handle(unsafe { result.assume_valid(&*heap) });
+            // invariant (steps 9-11): a trap cannot lie about
+            // non-configurable data / accessor properties
+            let desc = own_descriptor_h(vm, heap, state, scope, &target, name)?;
+            let Flow::Value(desc) = desc else {
+                return Ok(Coercion::Threw);
+            };
+            if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
+                heap.no_gc(|heap| -> Result<(), VmError> {
+                    let undefined = heap.known().undefined.as_tagged(heap).erase();
+                    if d.is_data_descriptor()
+                        && d.writable == Some(false)
+                        && !Compare::same_value(heap, result.as_tagged(heap), unsafe {
+                            d.value.unwrap_or(undefined).assume_valid(heap)
+                        })
+                    {
+                        return Err(VmError::Message(
+                            "proxy get trap must match a non-writable, non-configurable property",
+                        ));
+                    }
+                    if d.is_accessor_descriptor()
+                        && d.get.as_ref().is_some_and(|g| *g == undefined)
+                        && result.as_tagged(heap).erase() != undefined
+                    {
+                        return Err(VmError::Message(
+                            "proxy get trap must return undefined for an accessor without a getter",
+                        ));
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(Coercion::Value(unsafe { result.read_unchecked() }))
+        }
+    }
 }
 
 /// Proxy `[[Set]]` (ES 20.2.5.10).
@@ -736,92 +907,91 @@ pub fn set(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    proxy: Value,
-    name: Value,
-    value: Value,
-    receiver: Value,
+    proxy: Tagged<'_, Value>,
+    name: Tagged<'_, Value>,
+    value: Tagged<'_, Value>,
+    receiver: Tagged<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    let (target, handler) = enter_trap(heap, proxy, Trap::Set)?;
     state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
+        let proxy = scope.handle(proxy);
         let name = scope.handle(name);
         let value = scope.handle(value);
         let receiver = scope.handle(receiver);
-        match get_trap(vm, heap, state, handler.value(), Trap::Set)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => {
-                if heap.no_gc(|nogc| is_proxy(nogc, target.value())) {
-                    set(vm, heap, state, target.value(), name.value(), value.value(), receiver.value())
-                } else {
-                    ordinary_set_forward(
-                        vm,
-                        heap,
-                        state,
-                        target.value(),
-                        receiver.value(),
-                        name.value(),
-                        value.value(),
-                    )
-                }
-            }
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[
-                        handler.value(),
-                        target.value(),
-                        name.value(),
-                        value.value(),
-                        receiver.value(),
-                    ],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Coercion::Threw);
-                };
-                let truthy = heap.no_gc(|nogc| Convert::is_truthy(nogc, result));
-                if !truthy {
-                    // [[Set]] returned false; sloppy stores ignore it
-                    return Ok(Coercion::Value(Convert::boolean(heap, false)));
-                }
-                // invariant (steps 11-13)
-                let desc = internal_own_descriptor(vm, heap, state, target.value(), name.value())?;
-                let Flow::Value(desc) = desc else {
-                    return Ok(Coercion::Threw);
-                };
-                if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
-                    heap.no_gc(|nogc| {
-                        let undefined = nogc.known().undefined.value();
-                        if d.is_data_descriptor()
-                            && d.writable == Some(false)
-                            && !Compare::same_value(
-                                nogc,
-                                value.value(),
-                                d.value.unwrap_or(undefined),
-                            )
-                        {
-                            return Err(VmError::Message(
-                                "proxy set trap must match a non-writable, non-configurable property",
-                            ));
-                        }
-                        if d.is_accessor_descriptor()
-                            && d.set.as_ref().is_some_and(|s| *s == undefined)
-                        {
-                            return Err(VmError::Message(
-                                "proxy set trap may not report success for an accessor without a setter",
-                            ));
-                        }
-                        Ok(())
-                    })?;
-                }
-                Ok(Coercion::Value(Convert::boolean(heap, true)))
+        set_h(vm, heap, state, &scope, &proxy, &name, &value, &receiver)
+    })
+}
+
+fn set_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    proxy: &Handle<'_, Value>,
+    name: &Handle<'_, Value>,
+    value: &Handle<'_, Value>,
+    receiver: &Handle<'_, Value>,
+) -> Result<Coercion, VmError> {
+    let (target, handler) = enter_trap(scope, heap, proxy, Trap::Set)?;
+    match get_trap(vm, heap, state, scope, &handler, Trap::Set)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => {
+            if heap.no_gc(|heap| is_proxy(heap, target.as_tagged(heap))) {
+                set_h(vm, heap, state, scope, &target, name, value, receiver)
+            } else {
+                ordinary_set_forward(vm, heap, state, scope, &target, receiver, name, value)
             }
         }
-    })
+        TrapLookup::Trap(t) => {
+            let result = call_trap(
+                vm,
+                heap,
+                state,
+                scope,
+                &t,
+                &[handler, target, *name, *value, *receiver],
+            )?;
+            let Coercion::Value(result) = result else {
+                return Ok(Coercion::Threw);
+            };
+            let truthy =
+                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            if !truthy {
+                // [[Set]] returned false; sloppy stores ignore it
+                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
+            }
+            // invariant (steps 11-13)
+            let desc = own_descriptor_h(vm, heap, state, scope, &target, name)?;
+            let Flow::Value(desc) = desc else {
+                return Ok(Coercion::Threw);
+            };
+            if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
+                heap.no_gc(|heap| -> Result<(), VmError> {
+                    let undefined = heap.known().undefined.as_tagged(heap).erase();
+                    if d.is_data_descriptor()
+                        && d.writable == Some(false)
+                        && !Compare::same_value(
+                            heap,
+                            value.as_tagged(heap),
+                            unsafe { d.value.unwrap_or(undefined).assume_valid(heap) },
+                        )
+                    {
+                        return Err(VmError::Message(
+                            "proxy set trap must match a non-writable, non-configurable property",
+                        ));
+                    }
+                    if d.is_accessor_descriptor()
+                        && d.set.as_ref().is_some_and(|s| *s == undefined)
+                    {
+                        return Err(VmError::Message(
+                            "proxy set trap may not report success for an accessor without a setter",
+                        ));
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
+        }
+    }
 }
 
 /// Proxy `[[HasProperty]]` (ES 20.2.5.9).
@@ -829,68 +999,76 @@ pub fn has(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    proxy: Value,
-    name: Value,
+    proxy: Tagged<'_, Value>,
+    name: Tagged<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    let (target, handler) = enter_trap(heap, proxy, Trap::Has)?;
     state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
+        let proxy = scope.handle(proxy);
         let name = scope.handle(name);
-        match get_trap(vm, heap, state, handler.value(), Trap::Has)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => {
-                if heap.no_gc(|nogc| is_proxy(nogc, target.value())) {
-                    has(vm, heap, state, target.value(), name.value())
-                } else {
-                    let found = heap.no_gc(|nogc| {
-                        has_property(nogc, target.value(), SlotName::from_value(name.value()))
-                    });
-                    Ok(Coercion::Value(Convert::boolean(heap, found)))
-                }
-            }
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value(), name.value()],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Coercion::Threw);
-                };
-                let truthy = heap.no_gc(|nogc| Convert::is_truthy(nogc, result));
-                if truthy {
-                    return Ok(Coercion::Value(Convert::boolean(heap, true)));
-                }
-                // invariant (steps 10-12): cannot hide non-configurable
-                // or existing-on-non-extensible-target properties
-                let desc = internal_own_descriptor(vm, heap, state, target.value(), name.value())?;
-                let Flow::Value(desc) = desc else {
-                    return Ok(Coercion::Threw);
-                };
-                if let Some(d) = desc {
-                    if d.configurable == Some(false) {
-                        return Err(VmError::Message(
-                            "proxy has trap may not hide a non-configurable property",
-                        ));
-                    }
-                    let ext = internal_is_extensible(vm, heap, state, target.value())?;
-                    let Flow::Value(extensible) = ext else {
-                        return Ok(Coercion::Threw);
-                    };
-                    if !extensible {
-                        return Err(VmError::Message(
-                            "proxy has trap may not hide a property of a non-extensible target",
-                        ));
-                    }
-                }
-                Ok(Coercion::Value(Convert::boolean(heap, false)))
+        has_h(vm, heap, state, &scope, &proxy, &name)
+    })
+}
+
+fn has_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    proxy: &Handle<'_, Value>,
+    name: &Handle<'_, Value>,
+) -> Result<Coercion, VmError> {
+    let (target, handler) = enter_trap(scope, heap, proxy, Trap::Has)?;
+    match get_trap(vm, heap, state, scope, &handler, Trap::Has)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => {
+            if heap.no_gc(|heap| is_proxy(heap, target.as_tagged(heap))) {
+                has_h(vm, heap, state, scope, &target, name)
+            } else {
+                let found = heap.no_gc(|heap| {
+                    has_property(
+                        heap,
+                        target.as_tagged(heap),
+                        SlotName::from_value(unsafe { name.read_unchecked() }),
+                    )
+                });
+                Ok(Coercion::Value(Convert::boolean(heap, found).erase()))
             }
         }
-    })
+        TrapLookup::Trap(t) => {
+            let result = call_trap(vm, heap, state, scope, &t, &[handler, target, *name])?;
+            let Coercion::Value(result) = result else {
+                return Ok(Coercion::Threw);
+            };
+            let truthy =
+                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            if truthy {
+                return Ok(Coercion::Value(Convert::boolean(heap, true).erase()));
+            }
+            // invariant (steps 10-12): cannot hide non-configurable
+            // or existing-on-non-extensible-target properties
+            let desc = own_descriptor_h(vm, heap, state, scope, &target, name)?;
+            let Flow::Value(desc) = desc else {
+                return Ok(Coercion::Threw);
+            };
+            if let Some(d) = desc {
+                if d.configurable == Some(false) {
+                    return Err(VmError::Message(
+                        "proxy has trap may not hide a non-configurable property",
+                    ));
+                }
+                let ext = is_extensible_h(vm, heap, state, scope, &target)?;
+                let Flow::Value(extensible) = ext else {
+                    return Ok(Coercion::Threw);
+                };
+                if !extensible {
+                    return Err(VmError::Message(
+                        "proxy has trap may not hide a property of a non-extensible target",
+                    ));
+                }
+            }
+            Ok(Coercion::Value(Convert::boolean(heap, false).erase()))
+        }
+    }
 }
 
 /// Proxy `[[Delete]]` (ES 20.2.5.4). The strict-mode false→TypeError
@@ -899,72 +1077,76 @@ pub fn delete(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    proxy: Value,
-    key: Value,
+    proxy: Tagged<'_, Value>,
+    key: Tagged<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    let (target, handler) = enter_trap(heap, proxy, Trap::DeleteProperty)?;
     state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
+        let proxy = scope.handle(proxy);
         let key = scope.handle(key);
-        match get_trap(vm, heap, state, handler.value(), Trap::DeleteProperty)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => {
-                if heap.no_gc(|nogc| is_proxy(nogc, target.value())) {
-                    delete(vm, heap, state, target.value(), key.value())
-                } else {
-                    let target_obj = scope.cast::<Object>(target.value()).expect("ordinary target");
-                    let deleted = crate::Object::delete_own_property(
-                        heap,
-                        &scope,
-                        target_obj,
-                        key.value(),
-                    )?;
-                    Ok(Coercion::Value(Convert::boolean(heap, deleted)))
-                }
-            }
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value(), key.value()],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Coercion::Threw);
-                };
-                let truthy = heap.no_gc(|nogc| Convert::is_truthy(nogc, result));
-                if !truthy {
-                    return Ok(Coercion::Value(Convert::boolean(heap, false)));
-                }
-                // invariant: cannot claim deletion of non-configurable
-                // (or existing-on-non-extensible-target) properties
-                let desc = internal_own_descriptor(vm, heap, state, target.value(), key.value())?;
-                let Flow::Value(desc) = desc else {
-                    return Ok(Coercion::Threw);
-                };
-                if let Some(d) = desc {
-                    if d.configurable == Some(false) {
-                        return Err(VmError::Message(
-                            "proxy deleteProperty trap may not delete a non-configurable property",
-                        ));
-                    }
-                    let ext = internal_is_extensible(vm, heap, state, target.value())?;
-                    let Flow::Value(extensible) = ext else {
-                        return Ok(Coercion::Threw);
-                    };
-                    if !extensible {
-                        return Err(VmError::Message(
-                            "proxy deleteProperty trap may not delete a property of a non-extensible target",
-                        ));
-                    }
-                }
-                Ok(Coercion::Value(Convert::boolean(heap, true)))
+        delete_h(vm, heap, state, &scope, &proxy, &key)
+    })
+}
+
+fn delete_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    proxy: &Handle<'_, Value>,
+    key: &Handle<'_, Value>,
+) -> Result<Coercion, VmError> {
+    let (target, handler) = enter_trap(scope, heap, proxy, Trap::DeleteProperty)?;
+    match get_trap(vm, heap, state, scope, &handler, Trap::DeleteProperty)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => {
+            if heap.no_gc(|heap| is_proxy(heap, target.as_tagged(heap))) {
+                delete_h(vm, heap, state, scope, &target, key)
+            } else {
+                let target_obj = scope
+                    .cast::<Object>(target.as_tagged(&*heap))
+                    .expect("ordinary target");
+                let deleted =
+                    crate::Object::delete_own_property(heap, scope, target_obj, unsafe {
+                        key.read_unchecked()
+                    })?;
+                Ok(Coercion::Value(Convert::boolean(heap, deleted).erase()))
             }
         }
-    })
+        TrapLookup::Trap(t) => {
+            let result = call_trap(vm, heap, state, scope, &t, &[handler, target, *key])?;
+            let Coercion::Value(result) = result else {
+                return Ok(Coercion::Threw);
+            };
+            let truthy =
+                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            if !truthy {
+                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
+            }
+            // invariant: cannot claim deletion of non-configurable
+            // (or existing-on-non-extensible-target) properties
+            let desc = own_descriptor_h(vm, heap, state, scope, &target, key)?;
+            let Flow::Value(desc) = desc else {
+                return Ok(Coercion::Threw);
+            };
+            if let Some(d) = desc {
+                if d.configurable == Some(false) {
+                    return Err(VmError::Message(
+                        "proxy deleteProperty trap may not delete a non-configurable property",
+                    ));
+                }
+                let ext = is_extensible_h(vm, heap, state, scope, &target)?;
+                let Flow::Value(extensible) = ext else {
+                    return Ok(Coercion::Threw);
+                };
+                if !extensible {
+                    return Err(VmError::Message(
+                        "proxy deleteProperty trap may not delete a property of a non-extensible target",
+                    ));
+                }
+            }
+            Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
+        }
+    }
 }
 
 /// Proxy `[[DefineOwnProperty]]` (ES 20.2.5.6).
@@ -972,102 +1154,105 @@ pub fn proxy_define(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    proxy: Value,
-    name: Value,
+    proxy: Tagged<'_, Value>,
+    name: Tagged<'_, Value>,
     partial: PartialDescriptor,
 ) -> Result<Flow<bool>, VmError> {
-    let (target, handler) = enter_trap(heap, proxy, Trap::DefineProperty)?;
     state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
+        let proxy = scope.handle(proxy);
         let name = scope.handle(name);
-        let partial = RootedPartial::new(&scope, &partial);
+        proxy_define_h(vm, heap, state, &scope, &proxy, &name, partial)
+    })
+}
 
-        match get_trap(vm, heap, state, handler.value(), Trap::DefineProperty)? {
-            TrapLookup::Threw => Ok(Flow::Threw),
-            TrapLookup::None => define_internal(
+fn proxy_define_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    proxy: &Handle<'_, Value>,
+    name: &Handle<'_, Value>,
+    partial: PartialDescriptor,
+) -> Result<Flow<bool>, VmError> {
+    let (target, handler) = enter_trap(scope, heap, proxy, Trap::DefineProperty)?;
+    let partial = RootedPartial::new(scope, &*heap, &partial);
+
+    match get_trap(vm, heap, state, scope, &handler, Trap::DefineProperty)? {
+        TrapLookup::Threw => Ok(Flow::Threw),
+        TrapLookup::None => {
+            define_internal_h(vm, heap, state, scope, &target, name, partial.partial())
+        }
+        TrapLookup::Trap(t) => {
+            let desc_obj = descriptor_object(heap, state, &partial)?;
+            let desc_obj = scope.handle(unsafe { desc_obj.assume_valid(&*heap) });
+            let result = call_trap(
                 vm,
                 heap,
                 state,
-                target.value(),
-                name.value(),
-                partial.partial(),
-            ),
-            TrapLookup::Trap(t) => {
-                let desc_obj = descriptor_object(heap, state, &partial)?;
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value(), name.value(), desc_obj],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Flow::Threw);
-                };
-                if !heap.no_gc(|nogc| Convert::is_truthy(nogc, result)) {
-                    return Ok(Flow::Value(false));
-                }
-                // extensible first (a proxy target's trap allocates)
-                let ext = internal_is_extensible(vm, heap, state, target.value())?;
-                let Flow::Value(extensible) = ext else {
-                    return Ok(Flow::Threw);
-                };
-                let desc = internal_own_descriptor(vm, heap, state, target.value(), name.value())?;
-                let Flow::Value(desc) = desc else {
-                    return Ok(Flow::Threw);
-                };
-                let setting_config_false = partial.configurable == Some(false);
-                match desc.as_ref() {
-                    None => {
-                        if !extensible {
-                            return Err(VmError::Message(
-                                "proxy defineProperty trap may not add a property to a non-extensible target",
-                            ));
-                        }
-                        if setting_config_false {
-                            return Err(VmError::Message(
-                                "proxy defineProperty trap may not claim a non-configurable new property",
-                            ));
-                        }
-                    }
-                    Some(d) => {
-                        let compatible = heap.no_gc(|nogc| {
-                            is_compatible_property_descriptor(
-                                nogc,
-                                extensible,
-                                &partial.partial(),
-                                Some(d),
-                            )
-                        });
-                        if !compatible {
-                            return Err(VmError::Message(
-                                "proxy defineProperty trap returned an incompatible descriptor",
-                            ));
-                        }
-                        if setting_config_false && d.configurable != Some(false) {
-                            return Err(VmError::Message(
-                                "proxy defineProperty trap may not make a configurable property non-configurable",
-                            ));
-                        }
-                        if d.configurable == Some(false)
-                            && d.is_data_descriptor()
-                            && d.writable == Some(true)
-                            && partial.is_data_descriptor()
-                            && partial.writable == Some(false)
-                        {
-                            return Err(VmError::Message(
-                                "proxy defineProperty trap may not make a non-configurable property non-writable",
-                            ));
-                        }
-                    }
-                }
-                // the trap owns the define; its true result stands
-                Ok(Flow::Value(true))
+                scope,
+                &t,
+                &[handler, target, *name, desc_obj],
+            )?;
+            let Coercion::Value(result) = result else {
+                return Ok(Flow::Threw);
+            };
+            if !heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) })) {
+                return Ok(Flow::Value(false));
             }
+            // extensible first (a proxy target's trap allocates)
+            let ext = is_extensible_h(vm, heap, state, scope, &target)?;
+            let Flow::Value(extensible) = ext else {
+                return Ok(Flow::Threw);
+            };
+            let desc = own_descriptor_h(vm, heap, state, scope, &target, name)?;
+            let Flow::Value(desc) = desc else {
+                return Ok(Flow::Threw);
+            };
+            let setting_config_false = partial.configurable == Some(false);
+            match desc.as_ref() {
+                None => {
+                    if !extensible {
+                        return Err(VmError::Message(
+                            "proxy defineProperty trap may not add a property to a non-extensible target",
+                        ));
+                    }
+                    if setting_config_false {
+                        return Err(VmError::Message(
+                            "proxy defineProperty trap may not claim a non-configurable new property",
+                        ));
+                    }
+                }
+                Some(d) => {
+                    let compatible = heap.no_gc(|heap| {
+                        let p = partial.partial();
+                        is_compatible_property_descriptor(heap, extensible, &p, Some(d))
+                    });
+                    if !compatible {
+                        return Err(VmError::Message(
+                            "proxy defineProperty trap returned an incompatible descriptor",
+                        ));
+                    }
+                    if setting_config_false && d.configurable != Some(false) {
+                        return Err(VmError::Message(
+                            "proxy defineProperty trap may not make a configurable property non-configurable",
+                        ));
+                    }
+                    if d.configurable == Some(false)
+                        && d.is_data_descriptor()
+                        && d.writable == Some(true)
+                        && partial.is_data_descriptor()
+                        && partial.writable == Some(false)
+                    {
+                        return Err(VmError::Message(
+                            "proxy defineProperty trap may not make a non-configurable property non-writable",
+                        ));
+                    }
+                }
+            }
+            // the trap owns the define; its true result stands
+            Ok(Flow::Value(true))
         }
-    })
+    }
 }
 
 /// Proxy `[[Call]]` (ES 20.2.5.15): the `apply` trap, or a plain call
@@ -1076,50 +1261,72 @@ pub fn apply(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    proxy: Value,
-    args: &[Value],
+    proxy: Tagged<'_, Value>,
+    args: &[Tagged<'_, Value>],
 ) -> Result<Coercion, VmError> {
-    let (target, handler) = enter_trap(heap, proxy, Trap::Apply)?;
     state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
-        let this_arg = scope.handle(*args.first().unwrap_or(&heap.known().undefined.value()));
-        match get_trap(vm, heap, state, handler.value(), Trap::Apply)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => {
-                let all: Vec<Value> = std::iter::once(this_arg.value())
-                    .chain(args.iter().skip(1).copied())
-                    .collect();
-                let result =
-                    NativeContext::new(vm, heap, state).call(target.value(), scope.stage(&all))?;
-                if result == heap.known().exception.value() {
-                    Ok(Coercion::Threw)
-                } else {
-                    Ok(Coercion::Value(result))
-                }
+        let proxy = scope.handle(proxy);
+        let args: Vec<Handle<'_, Value>> = args.iter().map(|a| scope.handle(*a)).collect();
+        apply_h(vm, heap, state, &scope, &proxy, &args)
+    })
+}
+
+fn apply_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    proxy: &Handle<'_, Value>,
+    args: &[Handle<'_, Value>],
+) -> Result<Coercion, VmError> {
+    let (target, handler) = enter_trap(scope, heap, proxy, Trap::Apply)?;
+    let this_arg = match args.first() {
+        Some(h) => *h,
+        None => {
+            scope.handle(unsafe { heap.known().undefined.read_unchecked().assume_valid(&*heap) })
+        }
+    };
+    match get_trap(vm, heap, state, scope, &handler, Trap::Apply)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => {
+            let mut all: Vec<Value> = Vec::with_capacity(args.len());
+            all.push(unsafe { this_arg.read_unchecked() });
+            for h in &args[1..] {
+                all.push(unsafe { h.read_unchecked() });
             }
-            TrapLookup::Trap(t) => {
-                // args: (target, thisArg, argumentsList)
-                let staged = scope.stage(&args[1..]);
-                let arr = heap.new_array(&scope, staged).into_tagged().erase();
-                let arr = scope.handle(arr);
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[
-                        handler.value(),
-                        target.value(),
-                        this_arg.value(),
-                        arr.value(),
-                    ],
-                )?;
-                Ok(result)
+            let result = NativeContext::new(vm, heap, state).call(
+                // Safety: fresh handle-slot word.
+                unsafe { Tagged::from_value_unchecked(target.read_unchecked()) },
+                scope.stage_words(&all),
+            )?;
+            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+            if result == exception {
+                Ok(Coercion::Threw)
+            } else {
+                Ok(Coercion::Value(result))
             }
         }
-    })
+        TrapLookup::Trap(t) => {
+            // args: (target, thisArg, argumentsList)
+            let words: Vec<Value> = args[1..]
+                .iter()
+                .map(|h| unsafe { h.read_unchecked() })
+                .collect();
+            let arr = heap
+                .new_array(scope, scope.stage_words(&words))
+                .into_handle(scope)
+                .erase();
+            let result = call_trap(
+                vm,
+                heap,
+                state,
+                scope,
+                &t,
+                &[handler, target, this_arg, arr],
+            )?;
+            Ok(result)
+        }
+    }
 }
 
 /// Proxy `[[Construct]]` (ES 20.2.5.5): the `construct` trap, or a
@@ -1129,140 +1336,152 @@ pub fn construct(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    proxy: Value,
-    args: &[Value],
-    new_target: Value,
+    proxy: Tagged<'_, Value>,
+    args: &[Tagged<'_, Value>],
+    new_target: Tagged<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    let (target, handler) = enter_trap(heap, proxy, Trap::Construct)?;
     state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
+        let proxy = scope.handle(proxy);
+        let args: Vec<Handle<'_, Value>> = args.iter().map(|a| scope.handle(*a)).collect();
         let new_target = scope.handle(new_target);
-        match get_trap(vm, heap, state, handler.value(), Trap::Construct)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => {
-                // forward: the full target [[Construct]] — synthesize the
-                // receiver from new.target (the hole for derived class
-                // constructors), run, and prefer an object result
-                let derived = heap.no_gc(|nogc| {
-                    target
-                        .value()
-                        .as_heap_object(nogc)
-                        .and_then(|obj| {
-                            obj.as_ref()
-                                .header
-                                .map
-                                .heap_ref(nogc)
-                                .kind()
-                                .is_class_constructor()
-                                .then(|| obj.as_ref().callable_info(nogc))
-                        })
-                        .flatten()
-                        .is_some_and(|info| info.function_kind().is_derived_class_constructor())
-                });
-                let receiver = if derived {
-                    heap.known().the_hole.value()
-                } else {
-                    let Some(r) = Runtime::create_construct_receiver_value(
-                        vm,
-                        heap,
-                        state,
-                        new_target.value(),
-                    )?
-                    else {
-                        return Ok(Coercion::Threw);
-                    };
-                    r
-                };
-                let receiver = scope.handle(receiver);
-                let mut all: Vec<Value> = Vec::with_capacity(args.len() + 1);
-                all.push(receiver.value());
-                all.extend_from_slice(args);
-                let result = NativeContext::new(vm, heap, state).call_construct(
-                    target.value(),
-                    new_target.value(),
-                    scope.stage(&all),
-                )?;
-                if result == heap.known().exception.value() {
-                    return Ok(Coercion::Threw);
-                }
-                if heap.no_gc(|nogc| Convert::is_primitive(nogc, result)) {
-                    if derived {
-                        // a derived constructor may only return objects
-                        return Err(VmError::Type);
-                    }
-                    return Ok(Coercion::Value(receiver.value()));
-                }
-                Ok(Coercion::Value(result))
-            }
-            TrapLookup::Trap(t) => {
-                // args: (target, argumentsList, newTarget)
-                let staged = scope.stage(args);
-                let arr = heap.new_array(&scope, staged).into_tagged().erase();
-                let arr = scope.handle(arr);
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[
-                        handler.value(),
-                        target.value(),
-                        arr.value(),
-                        new_target.value(),
-                    ],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Coercion::Threw);
-                };
-                let result = scope.handle(result);
-                // invariant: the trap must return an object
-                if heap.no_gc(|nogc| Convert::is_primitive(nogc, result.value())) {
-                    return Err(VmError::Message(
-                        "proxy construct trap must return an object",
-                    ));
-                }
-                Ok(Coercion::Value(result.value()))
-            }
-        }
+        construct_h(vm, heap, state, &scope, &proxy, &args, &new_target)
     })
+}
+
+fn construct_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    proxy: &Handle<'_, Value>,
+    args: &[Handle<'_, Value>],
+    new_target: &Handle<'_, Value>,
+) -> Result<Coercion, VmError> {
+    let (target, handler) = enter_trap(scope, heap, proxy, Trap::Construct)?;
+    match get_trap(vm, heap, state, scope, &handler, Trap::Construct)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => {
+            // forward: the full target [[Construct]] — synthesize the
+            // receiver from new.target (the hole for derived class
+            // constructors), run, and prefer an object result
+            let derived = heap.no_gc(|heap| {
+                target
+                    .as_tagged(heap)
+                    .as_heap_object()
+                    .and_then(|obj| {
+                        obj.as_ref()
+                            .header
+                            .map
+                            .heap_ref(heap)
+                            .kind()
+                            .is_class_constructor()
+                            .then(|| obj.as_ref().callable_info(heap))
+                    })
+                    .flatten()
+                    .is_some_and(|info| info.function_kind().is_derived_class_constructor())
+            });
+            let receiver = if derived {
+                let hole = heap.no_gc(|heap| heap.known().the_hole.as_tagged(heap).erase());
+                scope.handle(unsafe { hole.assume_valid(&*heap) })
+            } else {
+                let Some(r) = Runtime::create_construct_receiver_value(vm, heap, state, unsafe {
+                    new_target.read_unchecked()
+                })?
+                else {
+                    return Ok(Coercion::Threw);
+                };
+                scope.handle(unsafe { r.assume_valid(&*heap) })
+            };
+            let mut all: Vec<Value> = Vec::with_capacity(args.len() + 1);
+            all.push(unsafe { receiver.read_unchecked() });
+            for h in args {
+                all.push(unsafe { h.read_unchecked() });
+            }
+            let result = NativeContext::new(vm, heap, state).call_construct(
+                // Safety: fresh handle-slot word.
+                unsafe { Tagged::from_value_unchecked(target.read_unchecked()) },
+                // Safety: fresh handle-slot word.
+                unsafe { Tagged::from_value_unchecked(new_target.read_unchecked()) },
+                scope.stage_words(&all),
+            )?;
+            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+            if result == exception {
+                return Ok(Coercion::Threw);
+            }
+            let result = scope.handle(unsafe { result.assume_valid(&*heap) });
+            if heap.no_gc(|heap| Convert::is_primitive(heap, result.as_tagged(heap))) {
+                if derived {
+                    // a derived constructor may only return objects
+                    return Err(VmError::Type);
+                }
+                return Ok(Coercion::Value(unsafe { receiver.read_unchecked() }));
+            }
+            Ok(Coercion::Value(unsafe { result.read_unchecked() }))
+        }
+        TrapLookup::Trap(t) => {
+            // args: (target, argumentsList, newTarget)
+            let words: Vec<Value> = args.iter().map(|h| unsafe { h.read_unchecked() }).collect();
+            let arr = heap
+                .new_array(scope, scope.stage_words(&words))
+                .into_handle(scope)
+                .erase();
+            let result = call_trap(
+                vm,
+                heap,
+                state,
+                scope,
+                &t,
+                &[handler, target, arr, *new_target],
+            )?;
+            let Coercion::Value(result) = result else {
+                return Ok(Coercion::Threw);
+            };
+            let result = scope.handle(unsafe { result.assume_valid(&*heap) });
+            // invariant: the trap must return an object
+            if heap.no_gc(|heap| Convert::is_primitive(heap, result.as_tagged(heap))) {
+                return Err(VmError::Message(
+                    "proxy construct trap must return an object",
+                ));
+            }
+            Ok(Coercion::Value(unsafe { result.read_unchecked() }))
+        }
+    }
 }
 
 /// Ordinary `[[PreventExtensions]]`: clone the map without the
 /// EXTENDABLE bit (maps are shared, so the clone isolates the object).
 fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Handle<'_, Object>) {
-    use crate::{
-    MapInit,
-    MapKind,
-};
-    let (kind, prototype, descriptors) = heap.no_gc(|nogc| {
-        let map = obj.heap_ref(nogc).map_ref(nogc);
+    use crate::{MapInit, MapKind};
+    let (kind, prototype, descriptors) = heap.no_gc(|heap| {
+        let map = obj.heap_ref(heap).map_ref(heap);
         (
             map.kind(),
             map.prototype.inner(),
             map.descriptors()
                 .iter()
-                .map(|d| (d.name(), d.flags(), scope.handle(d.value.inner())))
+                .map(|d| {
+                    (
+                        d.name(),
+                        d.flags(),
+                        scope.handle(unsafe { d.value.inner().assume_valid(heap) }),
+                    )
+                })
                 .collect::<Vec<_>>(),
         )
     });
     if !kind.is_extendable() {
         return; // already non-extensible (idempotent)
     }
-    let prototype = scope.handle(prototype);
-    heap.allocate_token_enter_nogc(crate::Map::layout_for(descriptors.len()), |token, nogc| {
-        let obj_ref = obj.heap_ref(nogc);
+    let prototype = scope.handle(unsafe { prototype.assume_valid(&*heap) });
+    heap.allocate_token_enter_heap(Map::layout_for(descriptors.len()), |token, heap| {
+        let obj_ref = obj.heap_ref(heap);
         let new_map = token.allocate::<Map>(MapInit {
             kind: MapKind::new(kind.bits() & !MapKind::EXTENDABLE.bits()),
-            value_slot_count: obj_ref.map_ref(nogc).value_slot_count(),
+            value_slot_count: obj_ref.map_ref(heap).value_slot_count(),
             descriptors: &descriptors,
             prototype,
         });
-        obj_ref
-            .header
-            .map
-            .set(nogc, obj.value(), new_map.into_tagged());
+        obj_ref.header.map.set(heap, obj_ref.erase(), new_map);
     });
 }
 
@@ -1272,58 +1491,61 @@ pub fn prevent_extensions(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    obj: Value,
+    obj: Tagged<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    if !heap.no_gc(|nogc| is_proxy(nogc, obj)) {
-        return state.handle_scope(|scope| {
-            let Some(obj) = scope.cast::<Object>(obj) else {
-                return Err(VmError::Type);
-            };
-            ordinary_prevent_extensions(heap, &scope, obj);
-            Ok(Coercion::Value(Convert::boolean(heap, true)))
-        });
+    state.handle_scope(|scope| {
+        let obj = scope.handle(obj);
+        prevent_extensions_h(vm, heap, state, &scope, &obj)
+    })
+}
+
+fn prevent_extensions_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    obj: &Handle<'_, Value>,
+) -> Result<Coercion, VmError> {
+    if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
+        let Some(obj) = scope.cast::<Object>(obj.as_tagged(&*heap)) else {
+            return Err(VmError::Type);
+        };
+        ordinary_prevent_extensions(heap, scope, obj);
+        return Ok(Coercion::Value(Convert::boolean(heap, true).erase()));
     }
     let (target, handler) = heap
-        .no_gc(|nogc| parts(nogc, obj))
+        .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    if handler == heap.known().null.value() {
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    if revoked {
         return Err(revoked_error(Trap::PreventExtensions));
     }
-    state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
-        match get_trap(vm, heap, state, handler.value(), Trap::PreventExtensions)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => prevent_extensions(vm, heap, state, target.value()),
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value()],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Coercion::Threw);
-                };
-                if !heap.no_gc(|nogc| Convert::is_truthy(nogc, result)) {
-                    return Ok(Coercion::Value(Convert::boolean(heap, false)));
-                }
-                // invariant: returning true requires a non-extensible target
-                let ext = internal_is_extensible(vm, heap, state, target.value())?;
-                let Flow::Value(extensible) = ext else {
-                    return Ok(Coercion::Threw);
-                };
-                if extensible {
-                    return Err(VmError::Message(
-                        "proxy preventExtensions trap returned true for an extensible target",
-                    ));
-                }
-                Ok(Coercion::Value(Convert::boolean(heap, true)))
+    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    match get_trap(vm, heap, state, scope, &handler, Trap::PreventExtensions)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => prevent_extensions_h(vm, heap, state, scope, &target),
+        TrapLookup::Trap(t) => {
+            let result = call_trap(vm, heap, state, scope, &t, &[handler, target])?;
+            let Coercion::Value(result) = result else {
+                return Ok(Coercion::Threw);
+            };
+            if !heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) })) {
+                return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
             }
+            // invariant: returning true requires a non-extensible target
+            let ext = is_extensible_h(vm, heap, state, scope, &target)?;
+            let Flow::Value(extensible) = ext else {
+                return Ok(Coercion::Threw);
+            };
+            if extensible {
+                return Err(VmError::Message(
+                    "proxy preventExtensions trap returned true for an extensible target",
+                ));
+            }
+            Ok(Coercion::Value(Convert::boolean(heap, true).erase()))
         }
-    })
+    }
 }
 
 /// `Object.isExtensible` (ES 20.1.2.14) including the proxy trap and
@@ -1332,51 +1554,58 @@ pub fn is_extensible(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,
-    obj: Value,
+    obj: Tagged<'_, Value>,
 ) -> Result<Coercion, VmError> {
-    if !heap.no_gc(|nogc| is_proxy(nogc, obj)) {
-        let extensible = heap.no_gc(|nogc| {
-            obj.as_heap_object(nogc)
-                .is_some_and(|o| o.as_ref().map_ref(nogc).kind().is_extendable())
+    state.handle_scope(|scope| {
+        let obj = scope.handle(obj);
+        is_extensible_entry_h(vm, heap, state, &scope, &obj)
+    })
+}
+
+fn is_extensible_entry_h(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    scope: &HandleScope<'_>,
+    obj: &Handle<'_, Value>,
+) -> Result<Coercion, VmError> {
+    if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
+        let extensible = heap.no_gc(|heap| {
+            obj.as_tagged(heap)
+                .as_heap_object()
+                .is_some_and(|o| o.as_ref().map_ref(heap).kind().is_extendable())
         });
-        return Ok(Coercion::Value(Convert::boolean(heap, extensible)));
+        return Ok(Coercion::Value(Convert::boolean(heap, extensible).erase()));
     }
     let (target, handler) = heap
-        .no_gc(|nogc| parts(nogc, obj))
+        .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    if handler == heap.known().null.value() {
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
-    state.handle_scope(|scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
-        match get_trap(vm, heap, state, handler.value(), Trap::IsExtensible)? {
-            TrapLookup::Threw => Ok(Coercion::Threw),
-            TrapLookup::None => is_extensible(vm, heap, state, target.value()),
-            TrapLookup::Trap(t) => {
-                let result = call_trap(
-                    vm,
-                    heap,
-                    state,
-                    &scope,
-                    t,
-                    &[handler.value(), target.value()],
-                )?;
-                let Coercion::Value(result) = result else {
-                    return Ok(Coercion::Threw);
-                };
-                let trap_bool = heap.no_gc(|nogc| Convert::is_truthy(nogc, result));
-                let target_bool = internal_is_extensible(vm, heap, state, target.value())?;
-                let Flow::Value(target_bool) = target_bool else {
-                    return Ok(Coercion::Threw);
-                };
-                if trap_bool != target_bool {
-                    return Err(VmError::Message(
-                        "proxy isExtensible trap must match the target's extensibility",
-                    ));
-                }
-                Ok(Coercion::Value(Convert::boolean(heap, trap_bool)))
+    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    match get_trap(vm, heap, state, scope, &handler, Trap::IsExtensible)? {
+        TrapLookup::Threw => Ok(Coercion::Threw),
+        TrapLookup::None => is_extensible_entry_h(vm, heap, state, scope, &target),
+        TrapLookup::Trap(t) => {
+            let result = call_trap(vm, heap, state, scope, &t, &[handler, target])?;
+            let Coercion::Value(result) = result else {
+                return Ok(Coercion::Threw);
+            };
+            let trap_bool =
+                heap.no_gc(|heap| Convert::is_truthy(heap, unsafe { result.assume_valid(heap) }));
+            let target_bool = is_extensible_h(vm, heap, state, scope, &target)?;
+            let Flow::Value(target_bool) = target_bool else {
+                return Ok(Coercion::Threw);
+            };
+            if trap_bool != target_bool {
+                return Err(VmError::Message(
+                    "proxy isExtensible trap must match the target's extensibility",
+                ));
             }
+            Ok(Coercion::Value(Convert::boolean(heap, trap_bool).erase()))
         }
-    })
+    }
 }

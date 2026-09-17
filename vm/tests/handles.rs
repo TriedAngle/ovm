@@ -1,6 +1,7 @@
 use core::ptr::NonNull;
 
-use vm::{EdgeVisitable, HandleData, HandleScope, RawCell, Smi, Tagged, Visitor};
+use mark_sweep::{MarkSweep, MarkSweepConfig};
+use vm::{EdgeVisitable, HandleData, HandleScope, Heap, RawCell, Smi, Tagged, VM, Visitor};
 
 struct Counter(usize);
 
@@ -20,21 +21,35 @@ fn handle_scope(data: &HandleData) -> HandleScope<'_> {
     unsafe { HandleScope::from_raw(NonNull::from(data)) }
 }
 
-fn smi_handle(scope: &HandleScope<'_>, v: i64) -> i64 {
+/// A heap anchor: reading a handle back as a word requires a live
+/// `&Heap` borrow (`Handle::as_tagged`).
+fn anchor() -> (vm::VM, vm::Thread) {
+    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let thread = vm.attach();
+    (vm, thread)
+}
+
+fn smi_bits(heap: &Heap, handle: vm::Handle<'_, Smi>) -> i64 {
+    Smi::decode(handle.as_tagged(heap).erase()).unwrap().value()
+}
+
+fn smi_handle(scope: &HandleScope<'_>, heap: &Heap, v: i64) -> i64 {
     let handle = scope.handle(Tagged::smi(v).unwrap());
-    Smi::decode(handle.value()).unwrap().value()
+    smi_bits(heap, handle)
 }
 
 #[test]
 fn handles_read_back_their_values() {
     let data = HandleData::new(Smi::new(0).encode());
+    let (_vm, mut thread) = anchor();
+    let heap = thread.heap();
     let scope = handle_scope(&data);
 
     let a = scope.handle(Tagged::smi(42).unwrap());
     let b = scope.handle(Tagged::smi(-7).unwrap());
 
-    assert_eq!(Smi::decode(a.value()).unwrap().value(), 42);
-    assert_eq!(Smi::decode(b.value()).unwrap().value(), -7);
+    assert_eq!(smi_bits(heap, a), 42);
+    assert_eq!(smi_bits(heap, b), -7);
     // +1: the block fill template is a visited root cell
     assert_eq!(root_count(&data), 3);
 }
@@ -57,28 +72,30 @@ fn scope_tracks_nesting_level() {
 #[test]
 fn closed_scope_unroots_its_handles() {
     let data = HandleData::new(Smi::new(0).encode());
+    let (_vm, mut thread) = anchor();
     let outer = handle_scope(&data);
     let keep = outer.handle(Tagged::smi(1).unwrap());
 
     {
         let inner = handle_scope(&data);
-        smi_handle(&inner, 2);
-        smi_handle(&inner, 3);
+        smi_handle(&inner, thread.heap(), 2);
+        smi_handle(&inner, thread.heap(), 3);
         assert_eq!(root_count(&data), 4);
     }
 
     // inner scope closed: its slots are reclaimed, outer handle survives
     assert_eq!(root_count(&data), 2);
-    assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
+    assert_eq!(smi_bits(thread.heap(), keep), 1);
 }
 
 #[test]
 fn reclaimed_slots_are_reused() {
     let data = HandleData::new(Smi::new(0).encode());
+    let (_vm, mut thread) = anchor();
     {
         let scope = handle_scope(&data);
         for i in 0..10 {
-            smi_handle(&scope, i);
+            smi_handle(&scope, thread.heap(), i);
         }
         assert_eq!(root_count(&data), 11);
     }
@@ -86,16 +103,18 @@ fn reclaimed_slots_are_reused() {
 
     let scope = handle_scope(&data);
     for i in 0..5 {
-        smi_handle(&scope, i * 100);
+        smi_handle(&scope, thread.heap(), i * 100);
     }
     assert_eq!(root_count(&data), 6);
     let fourth = scope.handle(Tagged::smi(400).unwrap());
-    assert_eq!(Smi::decode(fourth.value()).unwrap().value(), 400);
+    assert_eq!(smi_bits(thread.heap(), fourth), 400);
 }
 
 #[test]
 fn blocks_extend_when_full() {
     let data = HandleData::new(Smi::new(0).encode());
+    let (_vm, mut thread) = anchor();
+    let heap = thread.heap();
     let scope = handle_scope(&data);
 
     let mut handles = Vec::new();
@@ -105,16 +124,17 @@ fn blocks_extend_when_full() {
 
     assert_eq!(root_count(&data), 1031);
     for (i, handle) in handles.iter().enumerate() {
-        assert_eq!(Smi::decode(handle.value()).unwrap().value(), i as i64);
+        assert_eq!(smi_bits(heap, *handle), i as i64);
     }
 }
 
 #[test]
 fn escaped_handle_survives_inner_scope() {
     let data = HandleData::new(Smi::new(0).encode());
+    let (_vm, mut thread) = anchor();
     let mut outer = handle_scope(&data);
     let keep = outer.handle(Tagged::smi(1).unwrap());
-    assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
+    assert_eq!(smi_bits(thread.heap(), keep), 1);
 
     let escaped = {
         let escapable = outer.escapable_scope();
@@ -124,15 +144,16 @@ fn escaped_handle_survives_inner_scope() {
     };
 
     assert_eq!(root_count(&data), 3);
-    assert_eq!(Smi::decode(escaped.value()).unwrap().value(), 2);
+    assert_eq!(smi_bits(thread.heap(), escaped), 2);
 }
 
 #[test]
 fn escapable_scope_closed_without_escape_reclaims() {
     let data = HandleData::new(Smi::new(0).encode());
+    let (_vm, mut thread) = anchor();
     let mut outer = handle_scope(&data);
     let keep = outer.handle(Tagged::smi(1).unwrap());
-    assert_eq!(Smi::decode(keep.value()).unwrap().value(), 1);
+    assert_eq!(smi_bits(thread.heap(), keep), 1);
 
     {
         let escapable = outer.escapable_scope();
@@ -147,11 +168,12 @@ fn strong_handles_are_infallible() {
     use vm::{Object, Tagged};
 
     let data = HandleData::new(Smi::new(0).encode());
+    let (_vm, mut thread) = anchor();
     let scope = handle_scope(&data);
 
     // smis root without ceremony
     let smi = scope.handle(Tagged::smi(7).unwrap());
-    assert_eq!(Smi::decode(smi.value()).unwrap().value(), 7);
+    assert_eq!(smi_bits(thread.heap(), smi), 7);
 
     // strong-tagged values root without ceremony
     let _ = scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(Smi::new(0).encode()) });

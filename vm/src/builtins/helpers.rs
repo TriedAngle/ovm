@@ -4,13 +4,13 @@
 use crate::materialize::materialize_closure_vm;
 use crate::natives::{NativeContext, NativeIndex};
 use crate::{
-    GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
-    SlotName, Smi, Value, VmError,
+    GcSlice, HandleScope, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotName, Smi,
+    Tagged, Value, VmError,
 };
 
-pub(crate) fn alloc_map<'s>(
+pub(crate) fn alloc_map(
     heap: &mut Heap,
-    scope: &'s HandleScope<'_>,
+    scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
     kind: MapKind,
     prototype: crate::Global<Object>,
@@ -18,30 +18,30 @@ pub(crate) fn alloc_map<'s>(
     alloc_map_with_slots(heap, scope, roots, kind, prototype, 0)
 }
 
-pub(crate) fn alloc_map_with_slots<'s>(
+pub(crate) fn alloc_map_with_slots(
     heap: &mut Heap,
-    scope: &'s HandleScope<'_>,
+    scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
     kind: MapKind,
     prototype: crate::Global<Object>,
     value_slot_count: usize,
 ) -> Result<crate::Global<Map>, VmError> {
-    let proto = scope.handle(prototype.value());
-    Ok(heap
-        .allocate::<Map>(MapInit {
-            kind,
-            value_slot_count,
-            descriptors: &[],
-            prototype: proto,
-        })
-        .into_global(roots))
+    // Safety: fresh root-slot word, rooted below before any allocation.
+    let proto =
+        scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(prototype.read_unchecked()) });
+    Ok(roots.create_handle(heap.allocate::<Map>(MapInit {
+        kind,
+        value_slot_count,
+        descriptors: &[],
+        prototype: proto,
+    })))
 }
 
 /// A native function object: `CALLABLE | CONSTRUCTOR | NATIVE`, slots[0] =
 /// native index, slots[1] = empty context, [[Prototype]] = Function.prototype.
-pub(crate) fn make_native_function<'s>(
+pub(crate) fn make_native_function(
     thread: &mut crate::Thread,
-    scope: &'s HandleScope<'_>,
+    scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
     index: NativeIndex,
 ) -> Result<crate::Global<Object>, VmError> {
@@ -53,20 +53,22 @@ pub(crate) fn make_native_function<'s>(
         .union(MapKind::EXTENDABLE);
     let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
     let empty_context = heap.known().empty_context;
-    let obj = heap
-        .new_object(
-            scope,
-            map,
-            scope.stage(&[Smi::new(index.0 as i64).encode(), empty_context.value()]),
-        )
-        .into_global(roots);
-    Ok(obj)
+    let obj = heap.new_object(
+        scope,
+        map,
+        scope.stage(&[
+            Smi::new(index.0 as i64).into_tagged(),
+            // Safety: fresh root-slot word staged into rooted slots.
+            unsafe { Tagged::<Value>::from_value_unchecked(empty_context.read_unchecked()) },
+        ]),
+    );
+    Ok(roots.create_handle(obj))
 }
 
 /// A non-constructor native function (`Proxy.revocable`-style statics).
-pub(crate) fn make_native_plain_function<'s>(
+pub(crate) fn make_native_plain_function(
     thread: &mut crate::Thread,
-    scope: &'s HandleScope<'_>,
+    scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
     index: NativeIndex,
 ) -> Result<crate::Global<Object>, VmError> {
@@ -77,14 +79,16 @@ pub(crate) fn make_native_plain_function<'s>(
         .union(MapKind::EXTENDABLE);
     let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
     let empty_context = heap.known().empty_context;
-    let obj = heap
-        .new_object(
-            scope,
-            map,
-            scope.stage(&[Smi::new(index.0 as i64).encode(), empty_context.value()]),
-        )
-        .into_global(roots);
-    Ok(obj)
+    let obj = heap.new_object(
+        scope,
+        map,
+        scope.stage(&[
+            Smi::new(index.0 as i64).into_tagged(),
+            // Safety: fresh root-slot word staged into rooted slots.
+            unsafe { Tagged::<Value>::from_value_unchecked(empty_context.read_unchecked()) },
+        ]),
+    );
+    Ok(roots.create_handle(obj))
 }
 
 /// Compile and run a JS prelude once at install time (BIND_PRELUDE,
@@ -111,11 +115,15 @@ pub(crate) fn run_prelude(
         materialize_closure_vm(vm, heap, state, scope, &compiled, empty)?
     };
     let (vm, heap, state) = thread.split();
-    let result = NativeContext::new(vm, heap, state).call(closure.value(), GcSlice::EMPTY)?;
-    if result == heap.known().exception.value() {
-        state
-            .take_pending_exception()
-            .map(|ex| eprintln!("{name} prelude threw: {ex:?}"));
+    let result = NativeContext::new(vm, heap, state).call(
+        // Safety: fresh rooted-slot word, consumed by the call.
+        unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
+        GcSlice::EMPTY,
+    )?;
+    if result == unsafe { heap.known().exception.read_unchecked() } {
+        if let Some(ex) = state.take_pending_exception() {
+            eprintln!("{name} prelude threw: {ex:?}")
+        }
         return Err(VmError::Type);
     }
     Ok(())
@@ -123,9 +131,9 @@ pub(crate) fn run_prelude(
 
 /// A constructor function + its prototype object (with `.constructor`),
 /// the function installed on the global object under `name`.
-pub(crate) fn install_constructor<'s>(
+pub(crate) fn install_constructor(
     thread: &mut crate::Thread,
-    scope: &'s HandleScope<'_>,
+    scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
     index: NativeIndex,
     name: &str,
@@ -142,7 +150,7 @@ pub(crate) fn install_constructor<'s>(
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         proto_parent,
     )?;
-    let proto = thread.heap().new_object(scope, map, GcSlice::EMPTY).into_global(roots);
+    let proto = roots.create_handle(thread.heap().new_object(scope, map, GcSlice::EMPTY));
 
     // proto.constructor = fn; fn.prototype = proto
     // (built-in methods/constructor properties are non-enumerable, ES 20+)
@@ -152,15 +160,17 @@ pub(crate) fn install_constructor<'s>(
         thread.heap(),
         scope,
         proto,
-        SlotName::from(constructor_str.as_tagged()),
-        fn_obj.value(),
+        SlotName::from_value(unsafe { constructor_str.read_unchecked() }),
+        // Safety: fresh root-slot word; the define roots its inputs.
+        unsafe { fn_obj.read_unchecked() },
     )?;
     define_method_prop(
         thread.heap(),
         scope,
         fn_obj,
-        SlotName::from(prototype_str.as_tagged()),
-        proto.value(),
+        SlotName::from_value(unsafe { prototype_str.read_unchecked() }),
+        // Safety: fresh root-slot word; the define roots its inputs.
+        unsafe { proto.read_unchecked() },
     )?;
 
     // global.Name = fn
@@ -169,15 +179,16 @@ pub(crate) fn install_constructor<'s>(
         thread.heap(),
         scope,
         global,
-        SlotName::from(name_str.as_tagged()),
-        fn_obj.value(),
+        SlotName::from_value(unsafe { name_str.read_unchecked() }),
+        // Safety: fresh root-slot word; the define roots its inputs.
+        unsafe { fn_obj.read_unchecked() },
     )?;
     Ok((fn_obj, proto))
 }
 
-pub(crate) fn install_method<'s>(
+pub(crate) fn install_method(
     thread: &mut crate::Thread,
-    scope: &'s HandleScope<'_>,
+    scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
     receiver: crate::Global<Object>,
     name: &str,
@@ -189,8 +200,9 @@ pub(crate) fn install_method<'s>(
         thread.heap(),
         scope,
         receiver,
-        SlotName::from(name_str.as_tagged()),
-        method.value(),
+        SlotName::from_value(unsafe { name_str.read_unchecked() }),
+        // Safety: fresh root-slot word; the define roots its inputs.
+        unsafe { method.read_unchecked() },
     )?;
     Ok(())
 }
@@ -206,8 +218,11 @@ pub(crate) fn define_method_prop(
     name: SlotName,
     value: Value,
 ) -> Result<(), VmError> {
-    let obj = scope.handle(object.as_tagged());
-    let name = scope.handle(name.tagged());
+    // Safety: fresh root-slot word, rooted below before any allocation.
+    let obj =
+        scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(object.read_unchecked()) });
+    // Safety: pointer-keyed name word, rooted below before any allocation.
+    let name = scope.handle(unsafe { name.tagged(heap) });
     Object::define_own_property(
         heap,
         scope,
@@ -230,8 +245,11 @@ pub(crate) fn define_data(
     name: impl Into<SlotName>,
     value: Value,
 ) -> Result<(), VmError> {
-    let obj = scope.handle(object.as_tagged());
-    let name = scope.handle(name.into().tagged());
+    // Safety: fresh root-slot word, rooted below before any allocation.
+    let obj =
+        scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(object.read_unchecked()) });
+    // Safety: pointer-keyed name word, rooted below before any allocation.
+    let name = scope.handle(unsafe { name.into().tagged(heap) });
     Object::define_own_property(heap, scope, obj, name, PropertyDescriptor::data(value))?;
     Ok(())
 }
@@ -245,7 +263,15 @@ pub(crate) fn define_non_enumerable(
     name: crate::Global<SlotName>,
     value: Value,
 ) -> Result<(), VmError> {
-    let obj = scope.handle(object.as_tagged());
+    // Safety: fresh root-slot word, rooted below before any allocation.
+    let obj =
+        scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(object.read_unchecked()) });
+    // Safety: fresh root-slot word, rooted below before any allocation.
+    let name = scope.handle(unsafe {
+        name.read_unchecked()
+            .assume_valid(&*heap)
+            .cast::<SlotName>()
+    });
     Object::define_own_property(
         heap,
         scope,
@@ -262,15 +288,13 @@ pub(crate) fn define_non_enumerable(
 }
 
 /// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver.
-pub(crate) fn wrapper_value(heap: &mut Heap, receiver: Value) -> Result<Value, VmError> {
-    heap.no_gc(|nogc| {
-        let Some(obj) = receiver.as_heap_object(nogc) else {
-            return Err(VmError::Type);
-        };
-        let map = obj.as_ref().header.map.heap_ref(nogc);
-        if !map.kind().contains(MapKind::PRIMITIVE_WRAPPER) {
-            return Err(VmError::Type);
-        }
-        Ok(obj.as_ref().slots.heap_ref(nogc).at(0))
-    })
+pub(crate) fn wrapper_value(heap: &Heap, receiver: Tagged<'_, Value>) -> Result<Value, VmError> {
+    let Some(obj) = receiver.as_heap_object() else {
+        return Err(VmError::Type);
+    };
+    let map = obj.as_ref().header.map.heap_ref(heap);
+    if !map.kind().contains(MapKind::PRIMITIVE_WRAPPER) {
+        return Err(VmError::Type);
+    }
+    Ok(obj.as_ref().slots.heap_ref(heap).at(heap, 0).erase())
 }

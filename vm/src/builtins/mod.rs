@@ -18,14 +18,23 @@ pub mod proxy;
 pub mod string;
 pub mod symbol;
 
-use array::{array_constructor, array_is_array, array_iterator_next, array_iterator_symbol_iterator, array_values};
+use array::{
+    array_constructor, array_is_array, array_iterator_next, array_iterator_symbol_iterator,
+    array_values,
+};
 use boolean::{boolean_constructor, boolean_to_string, boolean_value_of};
-use error::{error_constructor, error_to_string, reference_error_constructor, type_error_constructor};
-use function::{BIND_PRELUDE, function_apply, function_bind, function_call, function_constructor, function_to_string};
+use error::{
+    error_constructor, error_to_string, reference_error_constructor, type_error_constructor,
+};
+use function::{
+    BIND_PRELUDE, function_apply, function_bind, function_call, function_constructor,
+    function_to_string,
+};
 use global::{eval_native, is_nan};
 use helpers::{
     alloc_map, alloc_map_with_slots, define_data, define_method_prop, define_non_enumerable,
-    install_constructor, install_method, make_native_function, make_native_plain_function, run_prelude,
+    install_constructor, install_method, make_native_function, make_native_plain_function,
+    run_prelude,
 };
 use number::{number_constructor, number_to_string, number_value_of};
 use object::{
@@ -39,20 +48,12 @@ use string::{string_constructor, string_to_string, string_value_of};
 use symbol::symbol_constructor;
 
 use crate::{
-    GcSlice,
-    Map,
-    MapInit,
-    MapKind,
-    Object,
-    PropertyDescriptor,
-    SlotFlags,
-    SlotName,
-    Smi,
-    VmError,
+    GcSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotFlags, SlotName, Smi, Tagged,
+    Value, VmError,
 };
 
-use crate::natives::NativeIndex;
 use crate::VM;
+use crate::natives::NativeIndex;
 
 /// Register the builtin natives.
 pub fn register_builtin_natives(vm: &mut VM) -> BuiltinIndices {
@@ -180,40 +181,28 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             idx.number_to_string,
         )?;
         // static data properties on the Number constructor
-        let pos_inf = thread
-            .heap()
-            .allocate::<crate::Float>(f64::INFINITY)
-            .into_global(roots);
-        let neg_inf = thread
-            .heap()
-            .allocate::<crate::Float>(f64::NEG_INFINITY)
-            .into_global(roots);
-        let max_value = thread
-            .heap()
-            .allocate::<crate::Float>(f64::MAX)
-            .into_global(roots);
-        let min_value = thread
-            .heap()
-            .allocate::<crate::Float>(f64::MIN_POSITIVE)
-            .into_global(roots);
-        let number_nan = thread
-            .heap()
-            .allocate::<crate::Float>(f64::NAN)
-            .into_global(roots);
+        let pos_inf = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::INFINITY));
+        let neg_inf =
+            roots.create_handle(thread.heap().allocate::<crate::Float>(f64::NEG_INFINITY));
+        let max_value = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::MAX));
+        let min_value =
+            roots.create_handle(thread.heap().allocate::<crate::Float>(f64::MIN_POSITIVE));
+        let number_nan = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::NAN));
         for (name, value) in [
-            ("POSITIVE_INFINITY", pos_inf.value()),
-            ("NEGATIVE_INFINITY", neg_inf.value()),
-            ("MAX_VALUE", max_value.value()),
-            ("MIN_VALUE", min_value.value()),
-            ("NaN", number_nan.value()),
+            ("POSITIVE_INFINITY", pos_inf),
+            ("NEGATIVE_INFINITY", neg_inf),
+            ("MAX_VALUE", max_value),
+            ("MIN_VALUE", min_value),
+            ("NaN", number_nan),
         ] {
             let n = thread.intern(&scope, name);
             define_data(
                 thread.heap(),
                 &scope,
                 number_fn,
-                SlotName::from(n.as_tagged()),
-                value,
+                SlotName::from_value(unsafe { n.read_unchecked() }),
+                // Safety: fresh root-slot word; the define roots its inputs.
+                unsafe { value.read_unchecked() },
             )?;
         }
         let mut known = *thread.heap().known();
@@ -315,15 +304,17 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             error_proto,
-            known.strings.name,
-            error_name.value(),
+            SlotName::from_value(unsafe { known.strings.name.read_unchecked() }),
+            // Safety: fresh rooted-slot word; the define roots its inputs.
+            unsafe { error_name.read_unchecked() },
         )?;
         define_data(
             thread.heap(),
             &scope,
             error_proto,
-            known.strings.message,
-            known.strings.empty.value(),
+            SlotName::from_value(unsafe { known.strings.message.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { known.strings.empty.read_unchecked() },
         )?;
         install_method(
             thread,
@@ -359,15 +350,17 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             type_error_proto,
-            wks.name,
-            type_error_name.value(),
+            SlotName::from_value(unsafe { wks.name.read_unchecked() }),
+            // Safety: fresh rooted-slot word; the define roots its inputs.
+            unsafe { type_error_name.read_unchecked() },
         )?;
         define_data(
             thread.heap(),
             &scope,
             type_error_proto,
-            wks.message,
-            wks.empty.value(),
+            SlotName::from_value(unsafe { wks.message.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { wks.empty.read_unchecked() },
         )?;
         let mut known = *thread.heap().known();
         known.type_error_map = alloc_map(
@@ -392,15 +385,17 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             reference_error_proto,
-            wks.name,
-            reference_error_name.value(),
+            SlotName::from_value(unsafe { wks.name.read_unchecked() }),
+            // Safety: fresh rooted-slot word; the define roots its inputs.
+            unsafe { reference_error_name.read_unchecked() },
         )?;
         define_data(
             thread.heap(),
             &scope,
             reference_error_proto,
-            wks.message,
-            wks.empty.value(),
+            SlotName::from_value(unsafe { wks.message.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { wks.empty.read_unchecked() },
         )?;
         let mut known = *thread.heap().known();
         known.reference_error_map = alloc_map(
@@ -419,15 +414,17 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             function_prototype,
-            SlotName::from_value(wks.constructor.value()),
-            function_fn.value(),
+            SlotName::from_value(unsafe { wks.constructor.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { function_fn.read_unchecked() },
         )?;
         define_data(
             thread.heap(),
             &scope,
             function_fn,
-            SlotName::from_value(wks.prototype.value()),
-            function_prototype.value(),
+            SlotName::from_value(unsafe { wks.prototype.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { function_prototype.read_unchecked() },
         )?;
         let function_name = thread.intern(&scope, "Function");
         let global_object = thread.heap().known().global_object;
@@ -435,8 +432,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             global_object,
-            SlotName::from(function_name.as_tagged()),
-            function_fn.value(),
+            SlotName::from_value(unsafe { function_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { function_fn.read_unchecked() },
         )?;
 
         // ---- Function.prototype toString/call/apply/bind ------------------------
@@ -486,8 +484,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             global,
-            SlotName::from(eval_name.as_tagged()),
-            eval_fn.value(),
+            SlotName::from_value(unsafe { eval_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { eval_fn.read_unchecked() },
         )?;
 
         // ---- Object.prototype.toString/hasOwnProperty/propertyIsEnumerable ------
@@ -526,23 +525,26 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             object_prototype,
-            SlotName::from_value(wks.constructor.value()),
-            object_fn.value(),
+            SlotName::from_value(unsafe { wks.constructor.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { object_fn.read_unchecked() },
         )?;
         define_method_prop(
             thread.heap(),
             &scope,
             object_fn,
-            SlotName::from_value(wks.prototype.value()),
-            object_prototype.value(),
+            SlotName::from_value(unsafe { wks.prototype.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { object_prototype.read_unchecked() },
         )?;
         let object_name = thread.intern(&scope, "Object");
         define_data(
             thread.heap(),
             &scope,
             global,
-            SlotName::from(object_name.as_tagged()),
-            object_fn.value(),
+            SlotName::from_value(unsafe { object_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { object_fn.read_unchecked() },
         )?;
         install_method(
             thread,
@@ -594,23 +596,26 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             array_prototype,
-            SlotName::from_value(wks.constructor.value()),
-            array_fn.value(),
+            SlotName::from_value(unsafe { wks.constructor.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { array_fn.read_unchecked() },
         )?;
         define_data(
             thread.heap(),
             &scope,
             array_fn,
-            SlotName::from_value(wks.prototype.value()),
-            array_prototype.value(),
+            SlotName::from_value(unsafe { wks.prototype.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { array_prototype.read_unchecked() },
         )?;
         let array_name = thread.intern(&scope, "Array");
         define_data(
             thread.heap(),
             &scope,
             global,
-            SlotName::from(array_name.as_tagged()),
-            array_fn.value(),
+            SlotName::from_value(unsafe { array_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { array_fn.read_unchecked() },
         )?;
 
         // Array.isArray
@@ -620,8 +625,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             array_fn,
-            SlotName::from(is_array_name.as_tagged()),
-            is_array_fn.value(),
+            SlotName::from_value(unsafe { is_array_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { is_array_fn.read_unchecked() },
         )?;
 
         // ---- Array iteration (the iterator protocol minimum) ---------------------
@@ -634,10 +640,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
                 MapKind::OBJECT.union(MapKind::EXTENDABLE),
                 object_prototype,
             )?;
-            thread
-                .heap()
-                .new_object(&scope, map, GcSlice::EMPTY)
-                .into_global(roots)
+            roots.create_handle(thread.heap().new_object(&scope, map, GcSlice::EMPTY))
         };
         install_method(
             thread,
@@ -654,8 +657,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             array_iterator_prototype,
-            SlotName::from(iterator_symbol.as_tagged()),
-            sym_iterator_iter.value(),
+            SlotName::from_value(unsafe { iterator_symbol.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { sym_iterator_iter.read_unchecked() },
         )?;
 
         // Array.prototype.values === Array.prototype[Symbol.iterator]: a
@@ -666,15 +670,17 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             array_prototype,
-            SlotName::from(values_name.as_tagged()),
-            values_fn.value(),
+            SlotName::from_value(unsafe { values_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { values_fn.read_unchecked() },
         )?;
         define_method_prop(
             thread.heap(),
             &scope,
             array_prototype,
-            SlotName::from(iterator_symbol.as_tagged()),
-            values_fn.value(),
+            SlotName::from_value(unsafe { iterator_symbol.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { values_fn.read_unchecked() },
         )?;
 
         // array-iterator map: slots [iterated array, next index], prototype
@@ -697,26 +703,26 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
                 .union(SlotFlags::ENUMERABLE);
             let descriptors = vec![
                 (
-                    SlotName::from(value_name.as_tagged()),
+                    SlotName::from_value(unsafe { value_name.read_unchecked() }),
                     flags,
-                    scope.handle(Smi::new(0).encode()),
+                    scope.handle(Smi::new(0).into_tagged()),
                 ),
                 (
-                    SlotName::from(done_name.as_tagged()),
+                    SlotName::from_value(unsafe { done_name.read_unchecked() }),
                     flags,
-                    scope.handle(Smi::new(1).encode()),
+                    scope.handle(Smi::new(1).into_tagged()),
                 ),
             ];
-            let proto = scope.handle(object_prototype.value());
-            thread
-                .heap()
-                .allocate::<Map>(MapInit {
-                    kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
-                    value_slot_count: 2,
-                    descriptors: &descriptors,
-                    prototype: proto,
-                })
-                .into_global(roots)
+            // Safety: fresh root-slot word, rooted below before any allocation.
+            let proto = scope.handle(unsafe {
+                Tagged::<Value>::from_value_unchecked(object_prototype.read_unchecked())
+            });
+            roots.create_handle(thread.heap().allocate::<Map>(MapInit {
+                kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                value_slot_count: 2,
+                descriptors: &descriptors,
+                prototype: proto,
+            }))
         };
 
         let mut known = *thread.heap().known();
@@ -743,8 +749,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             global,
-            SlotName::from(is_nan_name.as_tagged()),
-            is_nan_fn.value(),
+            SlotName::from_value(unsafe { is_nan_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { is_nan_fn.read_unchecked() },
         )?;
 
         // ---- Symbol (minimal: constructor + Symbol.iterator) ---------------
@@ -756,8 +763,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             global,
-            SlotName::from(symbol_name.as_tagged()),
-            symbol_fn.value(),
+            SlotName::from_value(unsafe { symbol_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { symbol_fn.read_unchecked() },
         )?;
         let iterator_symbol = thread.heap().known().iterator_symbol;
         let iter_name = thread.intern(&scope, "iterator");
@@ -765,8 +773,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             symbol_fn,
-            SlotName::from(iter_name.as_tagged()),
-            iterator_symbol.value(),
+            SlotName::from_value(unsafe { iter_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { iterator_symbol.read_unchecked() },
         )?;
 
         // ---- Proxy ------------------------------------------------------------
@@ -782,14 +791,16 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             &scope,
             proxy_fn,
             wks.name,
-            proxy_name.value(),
+            // Safety: fresh rooted-slot word; the define roots its inputs.
+            unsafe { proxy_name.read_unchecked() },
         )?;
         define_data(
             thread.heap(),
             &scope,
             global,
-            SlotName::from(proxy_name.as_tagged()),
-            proxy_fn.value(),
+            SlotName::from_value(unsafe { proxy_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { proxy_fn.read_unchecked() },
         )?;
         // Proxy.revocable: a non-constructor function returning
         // { proxy, revoke }; the revoke closure is the JS template
@@ -802,14 +813,16 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             &scope,
             revocable_fn,
             wks.name,
-            revocable_name.value(),
+            // Safety: fresh rooted-slot word; the define roots its inputs.
+            unsafe { revocable_name.read_unchecked() },
         )?;
         define_data(
             thread.heap(),
             &scope,
             proxy_fn,
-            SlotName::from(revocable_name.as_tagged()),
-            revocable_fn.value(),
+            SlotName::from_value(unsafe { revocable_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { revocable_fn.read_unchecked() },
         )?;
         // hidden revoke native used by the REVOKE_PRELUDE closure
         let revoke_fn = make_native_plain_function(thread, &scope, roots, idx.proxy_revoke)?;
@@ -818,8 +831,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap(),
             &scope,
             global,
-            SlotName::from(revoke_name.as_tagged()),
-            revoke_fn.value(),
+            SlotName::from_value(unsafe { revoke_name.read_unchecked() }),
+            // Safety: fresh root-slot word; the define roots its inputs.
+            unsafe { revoke_fn.read_unchecked() },
         )?;
 
         // ---- Object extensibility statics --------------------------------------
@@ -850,31 +864,34 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         )?;
 
         // ---- value properties of the global object -----------------------------
-        let infinity = thread
-            .heap()
-            .allocate::<crate::Float>(f64::INFINITY)
-            .into_global(roots);
-        let nan = thread
-            .heap()
-            .allocate::<crate::Float>(f64::NAN)
-            .into_global(roots);
+        let infinity = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::INFINITY));
+        let nan = roots.create_handle(thread.heap().allocate::<crate::Float>(f64::NAN));
         let undefined = thread.heap().known().undefined;
-        for (name, value) in [
-            ("Infinity", infinity.value()),
-            ("NaN", nan.value()),
-            ("undefined", undefined.value()),
-        ] {
+        for name in ["Infinity", "NaN", "undefined"] {
             let n = thread.intern(&scope, name);
             // spec attributes are {writable: false, enumerable: false,
             // configurable: false} (ES 19.1.1); non-configurability is
             // what `delete NaN` observes, writable/enumerable stay per
             //missive until non-writable stores stop throwing in sloppy
             // code
+            // Safety: fresh root-slot words, consumed by the define below
+            // (which roots its inputs before allocating).
+            let value = match name {
+                "Infinity" => unsafe { infinity.read_unchecked() },
+                "NaN" => unsafe { nan.read_unchecked() },
+                _ => unsafe { undefined.read_unchecked() },
+            };
+            // Safety: fresh root-slot words, rooted below before any
+            // allocation.
+            let receiver = scope
+                .handle(unsafe { Tagged::<Object>::from_value_unchecked(global.read_unchecked()) });
+            let key = scope
+                .handle(unsafe { Tagged::<SlotName>::from_value_unchecked(n.read_unchecked()) });
             Object::define_own_property(
                 thread.heap(),
                 &scope,
-                scope.handle(global.as_tagged()),
-                scope.handle(SlotName::from(n.as_tagged()).tagged()),
+                receiver,
+                key,
                 PropertyDescriptor::Data {
                     value,
                     writable: true,

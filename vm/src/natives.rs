@@ -7,8 +7,8 @@ use core::ptr::NonNull;
 
 use crate::builtins::intrinsics::runtime_fn;
 use crate::{
-    ContextState, DenseString, GcSlice, Handle, HandleScope, Heap, Object, Thread, Value, VM,
-    VmError,
+    ContextState, DenseString, GcSlice, Handle, HandleScope, Heap, Object, Tagged, Thread, VM,
+    Value, VmError,
 };
 
 pub struct NativeContext<'a> {
@@ -50,8 +50,11 @@ impl<'a> NativeContext<'a> {
         self.new_target.is_some()
     }
 
+    /// The raw `new.target` word: callers must consume it in the same
+    /// statement (store to a register / rooted slot) or anchor it
+    /// themselves.
     pub fn new_target(&self) -> Option<Value> {
-        self.new_target.map(|h| h.value())
+        self.new_target.map(|h| unsafe { h.read_unchecked() })
     }
 
     pub fn vm(&self) -> &VM {
@@ -60,7 +63,7 @@ impl<'a> NativeContext<'a> {
 
     /// Split the context into its parts (for multi-borrow calls).
     pub(crate) fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
-        (&self.vm, &mut self.heap, &self.state)
+        (self.vm, &mut self.heap, self.state)
     }
 
     pub fn heap(&mut self) -> &mut Heap {
@@ -82,7 +85,16 @@ impl<'a> NativeContext<'a> {
         f(self, scope)
     }
 
-    pub fn call<'s>(&mut self, callable: Value, args: GcSlice<'s>) -> Result<Value, VmError> {
+    /// Invoke `callable` ([[Call]]). The anchored callable must be valid
+    /// under a borrow of the heap that is still live for this call; in
+    /// `&mut Heap` contexts the only constructible anchors are loan-free
+    /// (`Smi::into_tagged()` or `Tagged::from_value_unchecked` on a word
+    /// freshly read from rooted memory).
+    pub fn call<'s>(
+        &mut self,
+        callable: Tagged<'_, Value>,
+        args: GcSlice<'s>,
+    ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
         let Some(callable) = scope.cast::<Object>(callable) else {
             return Err(VmError::Type);
@@ -92,11 +104,12 @@ impl<'a> NativeContext<'a> {
 
     /// Invoke `callable` as a constructor with `new.target` = `new_target`:
     /// native callees see `is_construct()` and the receiver's prototype
-    /// comes from `new_target.prototype` (ES 9.2.2).
+    /// comes from `new_target.prototype` (ES 9.2.2). See [`Self::call`]
+    /// for the callable anchoring rules.
     pub fn call_construct<'s>(
         &mut self,
-        callable: Value,
-        new_target: Value,
+        callable: Tagged<'_, Value>,
+        new_target: Tagged<'_, Value>,
         args: GcSlice<'s>,
     ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
@@ -159,7 +172,9 @@ pub unsafe extern "C" fn native_trampoline(
                 crate::errors::error_from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
                     .expect("error materialization must not fail");
             thread.state.set_pending_exception(ex);
-            thread.heap.known().exception.value()
+            // Safety: singleton word read for immediate return; the
+            // singletons are promoted old-gen and never move.
+            unsafe { thread.heap.known().exception.read_unchecked() }
         }
     }
 }
@@ -217,4 +232,3 @@ impl Default for NativeRegistry {
         Self::new()
     }
 }
-

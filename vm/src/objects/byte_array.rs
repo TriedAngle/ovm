@@ -1,6 +1,6 @@
 use core::{alloc::Layout, cell::UnsafeCell};
 
-use crate::{EdgeVisitable, GcSlot, Header, HeapObject, NoGc, ObjectKind, Smi, Visitor};
+use crate::{EdgeVisitable, GcSlot, Header, Heap, HeapObject, ObjectKind, Smi, Visitor};
 
 #[repr(C)]
 pub struct FixedByteArray {
@@ -52,12 +52,12 @@ impl HeapObject for FixedByteArray {
         Self::layout_for(config.len())
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().byte_array_map.as_tagged());
-        self.size.set(nogc, host, Smi::new(config.len() as i64));
+            .set(heap, host, heap.known().byte_array_map.as_tagged(heap));
+        self.size.set(heap, host, Smi::new(config.len() as i64));
         for (i, b) in config.iter().enumerate() {
             self.set(i, *b);
         }

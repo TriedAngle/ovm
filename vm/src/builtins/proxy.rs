@@ -1,9 +1,9 @@
 //! ES 28.2: the Proxy constructor, Proxy.revocable, and the
 //! revoke-closure prelude.
 
-use crate::natives::NativeContext;
-use crate::{GcSlice, Value, VmError};
 use super::object::plain_object;
+use crate::natives::NativeContext;
+use crate::{GcSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
@@ -15,10 +15,15 @@ pub(crate) fn proxy_constructor(
     if !nctx.is_construct() {
         return Err(VmError::Message("constructor Proxy requires 'new'"));
     }
-    let target = args.get(1).ok_or(VmError::Type)?;
-    let handler = args.get(2).ok_or(VmError::Type)?;
-    let ok = nctx.heap().no_gc(|nogc| {
-        crate::proxy::is_js_receiver(nogc, target) && crate::proxy::is_js_receiver(nogc, handler)
+    let (target, handler) = nctx.heap().no_gc(|heap| {
+        Ok((
+            args.get(heap, 1).ok_or(VmError::Type)?.erase(),
+            args.get(heap, 2).ok_or(VmError::Type)?.erase(),
+        ))
+    })?;
+    let ok = nctx.heap().no_gc(|heap| {
+        crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            && crate::proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     });
     if !ok {
         return Err(VmError::Message(
@@ -26,14 +31,14 @@ pub(crate) fn proxy_constructor(
         ));
     }
     nctx.handle_scope(|nctx, scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
         Ok(crate::proxy::allocate(
             nctx.heap(),
             &scope,
-            target.value(),
-            handler.value(),
-        ))
+            // Safety: fresh argument words, consumed by the allocation.
+            unsafe { Tagged::<Value>::from_value_unchecked(target) },
+            unsafe { Tagged::<Value>::from_value_unchecked(handler) },
+        )
+        .erase())
     })
 }
 
@@ -45,10 +50,15 @@ pub(crate) fn proxy_revocable(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let target = args.get(1).ok_or(VmError::Type)?;
-    let handler = args.get(2).ok_or(VmError::Type)?;
-    let ok = nctx.heap().no_gc(|nogc| {
-        crate::proxy::is_js_receiver(nogc, target) && crate::proxy::is_js_receiver(nogc, handler)
+    let (target, handler) = nctx.heap().no_gc(|heap| {
+        Ok((
+            args.get(heap, 1).ok_or(VmError::Type)?.erase(),
+            args.get(heap, 2).ok_or(VmError::Type)?.erase(),
+        ))
+    })?;
+    let ok = nctx.heap().no_gc(|heap| {
+        crate::proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            && crate::proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     });
     if !ok {
         return Err(VmError::Message(
@@ -56,43 +66,55 @@ pub(crate) fn proxy_revocable(
         ));
     }
     nctx.handle_scope(|nctx, scope| {
-        let target = scope.handle(target);
-        let handler = scope.handle(handler);
         let proxy = scope.handle(crate::proxy::allocate(
             nctx.heap(),
             &scope,
-            target.value(),
-            handler.value(),
+            // Safety: fresh argument words, consumed by the allocation.
+            unsafe { Tagged::<Value>::from_value_unchecked(target) },
+            unsafe { Tagged::<Value>::from_value_unchecked(handler) },
         ));
         // Function.prototype.__makeRevoke (installed by REVOKE_PRELUDE)
         let make_revoke = {
             let (vm, heap, state) = nctx.split();
-            let name = vm
-                .interner()
-                .intern_str(heap, &scope, "__makeRevoke")
-                .value();
-            let proto = heap.known().function_prototype.value();
-            match crate::runtime::Runtime::get_property(vm, heap, state, proto, name)? {
+            // Safety: fresh rooted-slot words, consumed by the lookup.
+            let name = crate::SlotName::from_value(unsafe {
+                vm.interner()
+                    .intern_str(heap, &scope, "__makeRevoke")
+                    .read_unchecked()
+            });
+            let proto = unsafe { heap.known().function_prototype.read_unchecked() };
+            match crate::runtime::Runtime::get_property(vm, heap, state, proto, name.value())? {
                 crate::runtime::Coercion::Threw => {
-                    return Ok(heap.known().exception.value());
+                    // Safety: fresh root-slot word read for the return.
+                    return Ok(unsafe { heap.known().exception.read_unchecked() });
                 }
                 crate::runtime::Coercion::Value(v) => v,
             }
         };
-        let make_revoke = scope.handle(make_revoke);
-        let undefined = nctx.heap().known().undefined.value();
+        // Safety: fresh word from the lookup above, rooted below.
+        let make_revoke =
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(make_revoke) });
+        // Safety: fresh rooted-slot words staged for the call.
+        let undefined = unsafe { nctx.heap().known().undefined.read_unchecked() };
+        let proxy_word = unsafe { proxy.read_unchecked() };
         let (vm, heap, state) = nctx.split();
         let revoke = NativeContext::new(vm, heap, state).call(
-            make_revoke.value(),
-            scope.stage(&[undefined, proxy.value()]),
+            // Safety: fresh rooted-slot word, consumed by the call.
+            unsafe { Tagged::<Value>::from_value_unchecked(make_revoke.read_unchecked()) },
+            scope.stage_words(&[undefined, proxy_word]),
         )?;
-        if revoke == heap.known().exception.value() {
-            return Ok(heap.known().exception.value());
+        if revoke == unsafe { heap.known().exception.read_unchecked() } {
+            return Ok(revoke);
         }
-        let revoke = scope.handle(revoke);
+        // Safety: fresh call result, rooted below.
+        let revoke = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(revoke) });
         plain_object(
             nctx,
-            &[("proxy", proxy.value()), ("revoke", revoke.value())],
+            // Safety: fresh rooted-slot words; plain_object roots them.
+            &[
+                ("proxy", unsafe { proxy.read_unchecked() }),
+                ("revoke", unsafe { revoke.read_unchecked() }),
+            ],
         )
     })
 }
@@ -104,9 +126,16 @@ pub(crate) fn proxy_revoke(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let proxy = args.get(1).ok_or(VmError::Arity)?;
-    crate::proxy::revoke(nctx.heap(), proxy);
-    Ok(nctx.heap().known().undefined.value())
+    let proxy = nctx
+        .heap()
+        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.erase()))?;
+    crate::proxy::revoke(
+        nctx.heap(),
+        // Safety: fresh argument word, consumed with no allocation delay.
+        unsafe { Tagged::<Value>::from_value_unchecked(proxy) },
+    );
+    // Safety: fresh root-slot word read for the immediate return.
+    Ok(unsafe { nctx.heap().known().undefined.read_unchecked() })
 }
 
 /// The revoke-closure template: `done` plays [[RevocableProxy]]'s

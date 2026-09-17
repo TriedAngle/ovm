@@ -1,6 +1,6 @@
 use core::{alloc::Layout, cell::Cell};
 
-use crate::{EdgeVisitable, Header, HeapObject, NoGc, ObjectKind, Visitor};
+use crate::{EdgeVisitable, Header, Heap, HeapObject, ObjectKind, Visitor};
 
 #[repr(C)]
 pub struct Float {
@@ -16,11 +16,11 @@ impl HeapObject for Float {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().float_map.as_tagged());
+            .set(heap, host, heap.known().float_map.as_tagged(heap));
         self.value.set(*config);
     }
 

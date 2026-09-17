@@ -9,10 +9,10 @@ pub(crate) fn symbol_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let desc = args.get(1);
-    let desc_text = nctx.heap().no_gc(|nogc| {
-        desc.and_then(|d| d.get_as::<DenseString>(nogc))
-            .map(|s| s.to_rust_string(nogc))
+    let desc_text = nctx.heap().no_gc(|heap| {
+        args.get(heap, 1)
+            .and_then(|d| d.get_as::<DenseString>())
+            .map(|s| s.to_rust_string(heap))
     });
     nctx.handle_scope(|nctx, scope| {
         let mut text = String::from("Symbol(");
@@ -20,8 +20,9 @@ pub(crate) fn symbol_constructor(
             text.push_str(d);
         }
         text.push(')');
-        Ok(Symbol::new(nctx.heap(), &scope, text.as_bytes())
-            .as_tagged()
-            .erase())
+        let sym = Symbol::new(nctx.heap(), &scope, text.as_bytes());
+        // Safety: fresh rooted-slot word, returned without an
+        // intervening allocation.
+        Ok(unsafe { sym.read_unchecked() })
     })
 }

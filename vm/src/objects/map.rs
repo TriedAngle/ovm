@@ -1,8 +1,8 @@
 use core::alloc::Layout;
 
 use crate::{
-    Compare, DenseString, EdgeVisitable, FixedArray, GcSlot, Handle, Header, HeapObject, HeapRef,
-    NoGc, ObjectKind, OptionGcSlot, Smi, Symbol, Tagged, TransitionGuard, Value, Visitor,
+    Compare, DenseString, EdgeVisitable, FixedArray, GcSlot, Handle, Header, Heap, HeapObject,
+    HeapRef, ObjectKind, OptionGcSlot, Smi, Symbol, Tagged, TransitionGuard, Value, Visitor,
 };
 
 #[repr(C)]
@@ -60,38 +60,39 @@ impl Map {
 
     pub fn find_transition<'a>(
         &self,
-        nogc: &'a NoGc<'a>,
+        heap: &'a Heap,
         name: SlotName,
         flags: SlotFlags,
         pair: Option<(Value, Value)>,
     ) -> Option<HeapRef<'a, Map>> {
-        let lock = nogc.transition_lock();
+        let lock = heap.transition_lock();
         let guard = lock.acquire();
-        self.find_transition_locked(nogc, name, flags, pair, &guard)
+        self.find_transition_locked(heap, name, flags, pair, &guard)
     }
 
     pub fn find_transition_locked<'a>(
         &self,
-        nogc: &'a NoGc<'a>,
+        heap: &'a Heap,
         name: SlotName,
         flags: SlotFlags,
         pair: Option<(Value, Value)>,
         _guard: &TransitionGuard<'_>,
     ) -> Option<HeapRef<'a, Map>> {
-        let array = self.transitions.heap_ref(nogc)?;
+        let array = self.transitions.heap_ref(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
             pairs.len() % 2 == 0,
             "transition pairs are flat [name, map]"
         );
-        for entry in pairs.chunks_exact(2) {
+        for entry in pairs.as_chunks::<2>().0 {
             if entry[0].inner() != name.value() {
                 continue;
             }
 
-            let target = entry[1]
-                .inner()
-                .get_as::<Map>(nogc)
+            // Safety: word freshly read from a traced slot under the
+            // anchored borrow `heap`.
+            let target = unsafe { Tagged::<'_, Value>::from_value_unchecked(entry[1].inner()) }
+                .get_as::<Map>()
                 .expect("transition target must be a map");
 
             // adds append the property (last descriptor), redefines keep
@@ -110,13 +111,16 @@ impl Map {
             // reusable when the pair is identical (same-name accessors with
             // different pairs get separate tree entries)
             if let Some((get, set)) = pair {
-                let matches = row
-                    .value
-                    .inner()
-                    .get_as::<AccessorPair>(nogc)
+                // Safety: caller-supplied pair words read fresh under the
+                // anchor; slot reads likewise.
+                let matches = unsafe { row.value.inner().assume_valid(heap) }
+                    .get_as::<AccessorPair>()
                     .is_some_and(|p| {
-                        Compare::same_value(nogc, get, p.get.inner())
-                            && Compare::same_value(nogc, set, p.set.inner())
+                        Compare::same_value(heap, unsafe { get.assume_valid(heap) }, unsafe {
+                            p.get.inner().assume_valid(heap)
+                        }) && Compare::same_value(heap, unsafe { set.assume_valid(heap) }, unsafe {
+                            p.set.inner().assume_valid(heap)
+                        })
                     });
                 if !matches {
                     continue;
@@ -134,23 +138,24 @@ impl Map {
     /// populations sharing one name never collide.
     pub fn find_remove_transition_locked<'a>(
         &self,
-        nogc: &'a NoGc<'a>,
+        heap: &'a Heap,
         name: SlotName,
         _guard: &TransitionGuard<'_>,
     ) -> Option<HeapRef<'a, Map>> {
-        let array = self.transitions.heap_ref(nogc)?;
+        let array = self.transitions.heap_ref(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
             pairs.len() % 2 == 0,
             "transition pairs are flat [name, map]"
         );
-        for entry in pairs.chunks_exact(2) {
+        for entry in pairs.as_chunks::<2>().0 {
             if entry[0].inner() != name.value() {
                 continue;
             }
-            let target = entry[1]
-                .inner()
-                .get_as::<Map>(nogc)
+            // Safety: word freshly read from a traced slot under the
+            // anchored borrow `heap`.
+            let target = unsafe { Tagged::<'_, Value>::from_value_unchecked(entry[1].inner()) }
+                .get_as::<Map>()
                 .expect("transition target must be a map");
             if target.descriptor_count() + 1 == self.descriptor_count()
                 && !target.descriptors().iter().any(|d| d.name() == name)
@@ -179,24 +184,31 @@ impl HeapObject for Map {
         Self::layout_for(config.descriptors.len())
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().map_map.as_tagged());
+            .set(heap, host, heap.known().map_map.as_tagged(heap));
         self.value_slot_count
-            .set(nogc, host, Smi::new(config.value_slot_count as i64));
+            .set(heap, host, Smi::new(config.value_slot_count as i64));
         self.descriptor_count
-            .set(nogc, host, Smi::new(config.descriptors.len() as i64));
+            .set(heap, host, Smi::new(config.descriptors.len() as i64));
         self.kind
-            .set(nogc, host, Smi::new(config.kind.bits() as i64));
-        self.prototype.set(nogc, host, config.prototype.value());
-        self.transitions.clear(nogc.heap());
+            .set(heap, host, Smi::new(config.kind.bits() as i64));
+        // Safety: init runs before any further allocation; the config's
+        // handles are rooted by the caller.
+        self.prototype.set(heap, host, unsafe {
+            Tagged::from_value_unchecked(config.prototype.read_unchecked())
+        });
+        self.transitions.clear(heap);
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
-            d.name.set(nogc, host, name.tagged());
-            d.flags.set(nogc, host, Smi::new(flags.bits() as i64));
-            d.value.set(nogc, host, value.value());
+            // Safety: as above.
+            d.name.set(heap, host, unsafe { name.tagged(heap) });
+            d.flags.set(heap, host, Smi::new(flags.bits() as i64));
+            d.value.set(heap, host, unsafe {
+                Tagged::from_value_unchecked(value.read_unchecked())
+            });
         }
     }
 
@@ -410,32 +422,36 @@ impl SlotName {
         Self(value)
     }
 
-    pub fn tagged(self) -> Tagged<SlotName> {
+    /// # Safety
+    /// The name word must have been loaded (or kept alive some other
+    /// way) under a heap borrow that is still alive for `'a`.
+    pub unsafe fn tagged<'a>(self, _heap: &'a Heap) -> Tagged<'a, SlotName> {
         unsafe { Tagged::from_value_unchecked(self.0) }
     }
 }
 
-impl From<Tagged<Symbol>> for SlotName {
-    fn from(symbol: Tagged<Symbol>) -> Self {
+impl From<Tagged<'_, Symbol>> for SlotName {
+    fn from(symbol: Tagged<'_, Symbol>) -> Self {
         Self(symbol.erase())
     }
 }
 
-impl From<Tagged<DenseString>> for SlotName {
-    fn from(string: Tagged<DenseString>) -> Self {
+impl From<Tagged<'_, DenseString>> for SlotName {
+    fn from(string: Tagged<'_, DenseString>) -> Self {
         Self(string.erase())
     }
 }
 
-impl From<Tagged<Smi>> for SlotName {
-    fn from(smi: Tagged<Smi>) -> Self {
+impl From<Tagged<'_, Smi>> for SlotName {
+    fn from(smi: Tagged<'_, Smi>) -> Self {
         Self(smi.erase())
     }
 }
 
-impl From<Handle<'_, SlotName>> for SlotName {
-    fn from(name: Handle<'_, SlotName>) -> Self {
-        Self::from_value(name.value())
+impl From<Handle<'_, Symbol>> for SlotName {
+    fn from(symbol: Handle<'_, Symbol>) -> Self {
+        // Safety: rooted-slot word read for a pointer-keyed name.
+        Self(unsafe { symbol.read_unchecked() })
     }
 }
 
@@ -462,13 +478,18 @@ impl HeapObject for AccessorPair {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.erase();
         self.header
             .map
-            .set(nogc, host, nogc.known().accessor_pair_map.as_tagged());
-        self.get.set(nogc, host, config.0.value());
-        self.set.set(nogc, host, config.1.value());
+            .set(heap, host, heap.known().accessor_pair_map.as_tagged(heap));
+        // Safety: init runs before any further allocation.
+        self.get.set(heap, host, unsafe {
+            Tagged::from_value_unchecked(config.0.read_unchecked())
+        });
+        self.set.set(heap, host, unsafe {
+            Tagged::from_value_unchecked(config.1.read_unchecked())
+        });
     }
 
     fn header(&self) -> &Header {

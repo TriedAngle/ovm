@@ -14,18 +14,19 @@ fn empty_context_is_the_well_known_root() {
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    let (kind, outer, len) = thread.heap().no_gc(|nogc| {
-        let ctx = nogc.known().empty_context.heap_ref(nogc).as_ref();
+    let (kind, outer, len) = thread.heap().no_gc(|heap| {
+        let ctx = heap.known().empty_context.heap_ref(heap).as_ref();
         (
-            ctx.header.map.heap_ref(nogc).kind().kind(),
-            ctx.outer.inner(),
-            ctx.slots.heap_ref(nogc).as_ref().len(),
+            ctx.header.map.heap_ref(heap).kind().kind(),
+            vm::Value::from_bits(ctx.outer.as_raw().load()),
+            ctx.slots.heap_ref(heap).as_ref().len(),
         )
     });
     assert_eq!(kind, ObjectKind::Context);
+    let heap = thread.heap();
     assert_eq!(
         outer,
-        thread.heap().known().the_hole.value(),
+        heap.known().the_hole.as_tagged(heap).erase(),
         "no outer context"
     );
     assert_eq!(len, 0, "no context slots");
@@ -40,7 +41,7 @@ fn contexts_chain_through_outer() {
         let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(42).encode()]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(42).into_tagged()]), &scope);
         let inner = thread.heap().allocate_handle::<Context>(
             ContextInit {
                 outer: None,
@@ -51,7 +52,7 @@ fn contexts_chain_through_outer() {
         );
         let slots = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(7).encode()]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(7).into_tagged()]), &scope);
         let outer = thread.heap().allocate_handle::<Context>(
             ContextInit {
                 outer: Some(inner),
@@ -61,17 +62,18 @@ fn contexts_chain_through_outer() {
             &scope,
         );
 
-        let (own, via_outer) = thread.heap().no_gc(|nogc| {
-            let o = outer.heap_ref(nogc).as_ref();
+        let (own, via_outer) = thread.heap().no_gc(|heap| {
+            let o = outer.heap_ref(heap).as_ref();
             (
-                o.slots.heap_ref(nogc).at(0),
+                o.slots.heap_ref(heap).at(heap, 0).erase(),
                 o.outer
-                    .heap_ref(nogc)
+                    .heap_ref(heap)
                     .expect("outer context")
                     .as_ref()
                     .slots
-                    .heap_ref(nogc)
-                    .at(0),
+                    .heap_ref(heap)
+                    .at(heap, 0)
+                    .erase(),
             )
         });
         assert_eq!(own.to_i64().unwrap(), 7);
@@ -89,7 +91,7 @@ fn closure_object_carries_typed_context() {
         let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(9).encode()]), &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(9).into_tagged()]), &scope);
         let context = thread.heap().allocate_handle::<Context>(
             ContextInit {
                 outer: None,
@@ -100,7 +102,9 @@ fn closure_object_carries_typed_context() {
         );
 
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+        let constants = thread
+            .heap()
+            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -112,28 +116,33 @@ fn closure_object_carries_typed_context() {
         );
 
         let map = thread.heap().known().function_map;
+        let values = {
+            let heap = &*thread.heap();
+            scope.stage(&[
+                info.as_tagged(heap).erase_type(),
+                context.as_tagged(heap).erase_type(),
+            ])
+        };
         let obj = thread
             .heap()
             .allocate_object(
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: scope.stage(&[info.value(), context.value()]),
+                    values,
                     elements: the_hole.erase(),
                     length: 0,
                 },
             )
             .into_handle(&scope);
 
-        let slot0 = thread.heap().no_gc(|nogc| {
-            let Some(o) = obj.value().as_heap_object(nogc) else {
-                panic!("callable must be an object");
-            };
+        let slot0 = thread.heap().no_gc(|heap| {
+            let o = obj.heap_ref(heap);
             let context = o
                 .as_ref()
-                .closure_context(nogc)
+                .closure_context(heap)
                 .expect("context must be typed as Context");
-            context.slots.heap_ref(nogc).at(0)
+            context.slots.heap_ref(heap).at(heap, 0).erase()
         });
         assert_eq!(slot0.to_i64().unwrap(), 9);
     });

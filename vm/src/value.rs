@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{Header, HeapObject, HeapRef, Map, NoGc, Object, VmError};
+use crate::{Header, Heap, HeapObject, HeapRef, Map, Object, VmError};
 
 // The word/tag representation is shared with the heap ABI crate; the VM
 // layers the typed Value/Tagged/HeapPtr wrappers on top of it.
@@ -8,6 +8,12 @@ pub use heap_api::{PTR_BIT, STRONG_PTR, TAG_MASK, TAG_SMI, WEAK_BIT, WEAK_PTR, W
 
 /// Generic Value
 /// Either SMI or Pointer
+///
+/// The type-erased word: it may be stored in GC-visited slots, compared
+/// and inspected, but there is no safe way to promote it back into a
+/// [`Tagged`] — a pointer word is only guaranteed valid directly after a
+/// load under a `&Heap` borrow, which is exactly the lifetime a
+/// `Tagged<'a, _>` carries.
 #[repr(transparent)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Value(Word);
@@ -52,21 +58,13 @@ impl Value {
         Smi::decode(self).map(|s| s.value())
     }
 
-    pub fn get_as<'a, T: HeapObject>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, T>> {
-        let ptr = HeapPtr::decode_strong(*self)?;
-        // Safety: strong pointer; reads only the header's map slot.
-        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.get();
-        let kind = unsafe { HeapPtr::<Map>::from(map).as_ref() }.kind().kind();
-        if !T::matches_kind(kind) {
-            return None;
-        }
-        // Safety: the map-kind check above is the type witness.
-        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
-    }
-
-    pub fn as_heap_object<'a>(&self, _nogc: &'a NoGc<'a>) -> Option<HeapRef<'a, Object>> {
-        let ptr = HeapPtr::decode_strong(*self)?;
-        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
+    /// # Safety
+    /// The word must have been loaded under a borrow of the heap that is
+    /// still alive for `'a` (rooted memory may be re-read at any time —
+    /// the GC updates it in place — but a snapshot taken earlier may be
+    /// stale), and no collection may have run since the load.
+    pub unsafe fn assume_valid<'a>(self, _heap: &'a Heap) -> Tagged<'a, Value> {
+        unsafe { Tagged::from_value_unchecked(self) }
     }
 }
 
@@ -197,20 +195,29 @@ impl<T: HeapObject> HeapPtr<T> {
 
 pub struct MaybeWeak<T>(PhantomData<fn() -> T>);
 
-/// Tagged is a typed Value
+/// Tagged is a typed Value that is valid for the lifetime `'a` of the
+/// heap borrow it was loaded (or allocated) under: a *flow type*. While
+/// any `Tagged<'a, _>` exists, the borrow checker keeps the `'a` borrow
+/// of the heap alive, so no allocation (and therefore no GC) can happen
+/// through it. To carry a value across a GC safepoint it must be rooted
+/// first: `Tagged<'a, T>` -> `Handle<'scope, T>` (via a handle scope).
+///
+/// Safe construction is only possible from Smis, fresh allocation, or
+/// anchored reads (handle slots, GC slots, registers) — never from a
+/// raw `Value`.
 #[repr(transparent)]
-pub struct Tagged<T> {
+pub struct Tagged<'a, T: 'a = Value> {
     raw: Value,
-    _phantom: PhantomData<T>,
+    _phantom: PhantomData<(&'a (), T)>,
 }
-impl<T> Clone for Tagged<T> {
+impl<'a, T> Clone for Tagged<'a, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T> Copy for Tagged<T> {}
+impl<'a, T> Copy for Tagged<'a, T> {}
 
-impl<T> core::fmt::Debug for Tagged<T> {
+impl<'a, T> core::fmt::Debug for Tagged<'a, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("Tagged")
             .field(&core::any::type_name::<T>())
@@ -219,28 +226,33 @@ impl<T> core::fmt::Debug for Tagged<T> {
     }
 }
 
-impl From<Value> for Tagged<Value> {
-    fn from(value: Value) -> Self {
-        Self {
-            raw: value,
+impl Smi {
+    /// Smis are pointer-free and valid at any lifetime.
+    pub fn into_tagged(self) -> Tagged<'static, Value> {
+        Tagged::from(self)
+    }
+}
+
+impl<'a> From<Smi> for Tagged<'a, Value> {
+    fn from(smi: Smi) -> Self {
+        Tagged {
+            raw: smi.encode(),
             _phantom: PhantomData,
         }
     }
 }
 
-impl From<Smi> for Value {
+impl<'a> From<Smi> for Tagged<'a, Smi> {
     fn from(smi: Smi) -> Self {
-        smi.encode()
+        Self::from_smi(smi)
     }
 }
 
-impl From<Smi> for Tagged<Value> {
-    fn from(smi: Smi) -> Self {
-        Self::from(smi.encode())
-    }
-}
-
-impl<T> Tagged<T> {
+impl<'a, T> Tagged<'a, T> {
+    /// # Safety
+    /// The value must be a strong (non-weak) word that was loaded (or
+    /// allocated) under a borrow of the heap that is still alive for
+    /// `'a`, and no GC may have run since.
     pub unsafe fn from_value_unchecked(value: Value) -> Self {
         debug_assert!(
             !value.is_weak_ptr(),
@@ -252,11 +264,33 @@ impl<T> Tagged<T> {
         }
     }
 
+    /// Try to reinterpret an erased word as a Smi: the only safe
+    /// promotion from `Value`, since Smis cannot dangle.
+    pub fn try_smi(value: Value) -> Option<Tagged<'static, Value>> {
+        if value.is_smi() {
+            Some(Tagged {
+                raw: value,
+                _phantom: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+
     pub fn erase(self) -> Value {
         self.raw
     }
 
-    pub unsafe fn cast<U>(self) -> Tagged<U> {
+    /// Erase the phantom type only: the anchor is unchanged. This is
+    /// purely type-level (any heap object is a `Value`).
+    pub fn erase_type(self) -> Tagged<'a, Value> {
+        Tagged {
+            raw: self.raw,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub unsafe fn cast<U>(self) -> Tagged<'a, U> {
         unsafe { Tagged::from_value_unchecked(self.raw) }
     }
 
@@ -276,12 +310,35 @@ impl<T> Tagged<T> {
         self.raw.is_weak_ptr()
     }
 
-    pub fn ptr_eq<U>(self, other: Tagged<U>) -> bool {
+    pub fn ptr_eq<U>(self, other: Tagged<'a, U>) -> bool {
         self.raw.to_bits() == other.raw.to_bits()
     }
 }
 
-impl Tagged<Smi> {
+impl<'a> Tagged<'a, Value> {
+    pub fn get_as<T: HeapObject>(self) -> Option<HeapRef<'a, T>> {
+        let ptr = HeapPtr::decode_strong(self.raw)?;
+        // Safety: strong pointer; reads only the header's map slot.
+        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.inner();
+        // Safety: raw header read under the anchor.
+        let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
+        let kind = map_ref.kind().kind();
+        if !T::matches_kind(kind) {
+            return None;
+        }
+        // Safety: the map-kind check above is the type witness; the
+        // anchor `'a` proves no GC ran since the load.
+        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
+    }
+
+    pub fn as_heap_object(self) -> Option<HeapRef<'a, Object>> {
+        let ptr = HeapPtr::decode_strong(self.raw)?;
+        // Safety: anchor `'a` proves no GC ran since the load.
+        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
+    }
+}
+
+impl<'a> Tagged<'a, Smi> {
     pub fn from_smi(smi: Smi) -> Self {
         unsafe { Self::from_value_unchecked(smi.encode()) }
     }
@@ -299,8 +356,10 @@ impl Tagged<Smi> {
     }
 }
 
-impl<T: HeapObject> Tagged<T> {
-    pub fn from_ptr(ptr: HeapPtr<T>) -> Self {
+impl<'a, T: HeapObject> Tagged<'a, T> {
+    pub fn from_ptr(_heap: &'a Heap, ptr: HeapPtr<T>) -> Self {
+        // Safety: `ptr` is a strong heap pointer re-anchored at a live
+        // borrow of the heap — no GC can have run since it was obtained.
         unsafe { Self::from_value_unchecked(ptr.encode_strong()) }
     }
 
@@ -311,28 +370,30 @@ impl<T: HeapObject> Tagged<T> {
             None
         }
     }
+
+    /// A rooted copy: the value may now cross GC safepoints.
+    pub fn into_handle<'s>(self, scope: &'s impl crate::HandleSet) -> crate::Handle<'s, T>
+    where
+        T: 's,
+    {
+        scope.create_handle(self)
+    }
 }
 
-impl<T: HeapObject> From<Tagged<T>> for HeapPtr<T> {
-    fn from(v: Tagged<T>) -> Self {
+impl<'a, T: HeapObject> From<Tagged<'a, T>> for HeapPtr<T> {
+    fn from(v: Tagged<'a, T>) -> Self {
         unsafe { HeapPtr::new(v.erase().raw_addr() as *mut T) }
     }
 }
 
-impl<T> From<Tagged<T>> for Value {
-    fn from(tagged: Tagged<T>) -> Self {
+impl<'a, T> From<Tagged<'a, T>> for Value {
+    fn from(tagged: Tagged<'a, T>) -> Self {
         tagged.erase()
     }
 }
 
-impl From<Smi> for Tagged<Smi> {
-    fn from(smi: Smi) -> Self {
-        Self::from_smi(smi)
-    }
-}
-
-impl<T: HeapObject> Tagged<T> {
-    pub fn make_weak(self) -> Tagged<MaybeWeak<T>> {
+impl<'a, T: HeapObject> Tagged<'a, T> {
+    pub fn make_weak(self) -> Tagged<'a, MaybeWeak<T>> {
         Tagged {
             raw: Value(self.raw.to_bits() | WEAK_PTR),
             _phantom: PhantomData,
@@ -340,15 +401,15 @@ impl<T: HeapObject> Tagged<T> {
     }
 }
 
-impl<T: HeapObject> Tagged<MaybeWeak<T>> {
-    pub fn from_strong(strong: Tagged<T>) -> Self {
+impl<'a, T: HeapObject> Tagged<'a, MaybeWeak<T>> {
+    pub fn from_strong(strong: Tagged<'a, T>) -> Self {
         Tagged {
             raw: strong.raw,
             _phantom: PhantomData,
         }
     }
 
-    pub fn strengthen(self) -> Option<Tagged<T>> {
+    pub fn strengthen(self) -> Option<Tagged<'a, T>> {
         if self.raw.is_weak_ptr() {
             None
         } else {

@@ -19,9 +19,11 @@ fn run_str(src: &str) -> String {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
-    thread.heap().no_gc(|nogc| {
-        let s = v.get_as::<DenseString>(nogc).expect("string result");
-        s.to_rust_string(nogc)
+    thread.heap().no_gc(|heap| {
+        let s = unsafe { v.assume_valid(heap) }
+            .get_as::<DenseString>()
+            .expect("string result");
+        s.to_rust_string(heap)
     })
 }
 
@@ -29,14 +31,18 @@ fn run_bool(src: &str) -> bool {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
-    v == thread.heap().known().true_object.value()
+    let heap = thread.heap();
+    v == heap.known().true_object.as_tagged(heap).erase()
 }
 
 fn throws(src: &str) -> bool {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     match thread.run_script(src) {
-        Ok(v) => v == thread.heap().known().exception.value(),
+        Ok(v) => {
+            let heap = thread.heap();
+            v == heap.known().exception.as_tagged(heap).erase()
+        }
         Err(_) => true,
     }
 }
@@ -48,23 +54,29 @@ fn throws_named(src: &str, want: &str) -> bool {
     let Ok(v) = thread.run_script(src) else {
         return false;
     };
-    if v != thread.heap().known().exception.value() {
-        return false;
+    {
+        let heap = thread.heap();
+        if v != heap.known().exception.as_tagged(heap).erase() {
+            return false;
+        }
     }
     thread.handle_scope(|thread, scope| {
         let Some(ex) = thread.take_pending_exception() else {
             return false;
         };
-        let name_key = thread.intern(&scope, "name").value();
-        thread.heap().no_gc(|nogc| {
-            let Some(o) = ex.as_heap_object(nogc) else {
+        let name = thread.intern(&scope, "name");
+        thread.heap().no_gc(|heap| {
+            let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 return false;
             };
-            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
+            match o
+                .as_ref()
+                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
+            {
                 vm::Lookup::Data { slot, .. } => slot
-                    .inner()
-                    .get_as::<DenseString>(nogc)
-                    .map(|s| s.data(nogc).matches_ascii(want.as_bytes()))
+                    .get(heap)
+                    .get_as::<DenseString>()
+                    .map(|s| s.data(heap).matches_ascii(want.as_bytes()))
                     .unwrap_or(false),
                 _ => false,
             }

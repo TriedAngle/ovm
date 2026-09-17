@@ -29,11 +29,8 @@ fn roundtrip_entries() {
                 HandlerEntryInit::new(12, 20, 55),
             ],
         );
-        let out = thread.heap().no_gc(|nogc| {
-            let table = t
-                .value()
-                .get_as::<HandlerTable>(nogc)
-                .expect("handler table value");
+        let out = thread.heap().no_gc(|heap| {
+            let table = t.heap_ref(heap);
             (table.len(), table.entry(0), table.entry(1))
         });
         assert_eq!(out.0, 2);
@@ -49,8 +46,8 @@ fn lookup_finds_handler_inside_range() {
 
     thread.handle_scope(|thread, scope| {
         let t = table(thread, &scope, &[HandlerEntryInit::new(5, 15, 100)]);
-        thread.heap().no_gc(|nogc| {
-            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
+        thread.heap().no_gc(|heap| {
+            let table = t.heap_ref(heap);
             // try_start is inside (inclusive) ...
             assert_eq!(table.lookup(5), Some(100));
             // ... as is any offset before try_end
@@ -66,8 +63,8 @@ fn lookup_returns_none_outside_range() {
 
     thread.handle_scope(|thread, scope| {
         let t = table(thread, &scope, &[HandlerEntryInit::new(5, 15, 100)]);
-        thread.heap().no_gc(|nogc| {
-            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
+        thread.heap().no_gc(|heap| {
+            let table = t.heap_ref(heap);
             // before the region ...
             assert_eq!(table.lookup(4), None);
             // ... try_end is exclusive ...
@@ -94,8 +91,8 @@ fn lookup_returns_innermost_of_nested_ranges() {
                 HandlerEntryInit::new(0, 20, 100),
             ],
         );
-        thread.heap().no_gc(|nogc| {
-            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
+        thread.heap().no_gc(|heap| {
+            let table = t.heap_ref(heap);
             // inside both ranges: the innermost (largest try_start) wins
             assert_eq!(table.lookup(5), Some(300));
             // inside the outer range only
@@ -112,8 +109,8 @@ fn lookup_on_empty_table_returns_none() {
 
     thread.handle_scope(|thread, scope| {
         let t = table(thread, &scope, &[]);
-        thread.heap().no_gc(|nogc| {
-            let table = t.value().get_as::<HandlerTable>(nogc).unwrap();
+        thread.heap().no_gc(|heap| {
+            let table = t.heap_ref(heap);
             assert_eq!(table.len(), 0);
             assert_eq!(table.lookup(0), None);
         });
@@ -131,7 +128,9 @@ fn callable_info_carries_handler_table() {
         let t = table(thread, &scope, &[HandlerEntryInit::new(2, 8, 33)]);
 
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+        let constants = thread
+            .heap()
+            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -144,27 +143,32 @@ fn callable_info_carries_handler_table() {
 
         // wrap in a callable object so `callable_info` can be exercised
         let map = thread.heap().known().function_map;
+        let values = {
+            let heap = &*thread.heap();
+            scope.stage(&[
+                info.as_tagged(heap).erase_type(),
+                empty_context.as_tagged(heap).erase_type(),
+            ])
+        };
         let obj = thread
             .heap()
             .allocate_object(
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: scope.stage(&[info.value(), empty_context.value()]),
+                    values,
                     elements: the_hole.erase(),
                     length: 0,
                 },
             )
             .into_handle(&scope);
 
-        let result = thread.heap().no_gc(|nogc| {
-            let Some(o) = obj.value().as_heap_object(nogc) else {
-                panic!("callable must be an object");
-            };
-            let info = o.as_ref().callable_info(nogc).unwrap();
+        let result = thread.heap().no_gc(|heap| {
+            let o = obj.heap_ref(heap);
+            let info = o.as_ref().callable_info(heap).unwrap();
             let table = info
                 .handlers
-                .heap_ref(nogc)
+                .heap_ref(heap)
                 .expect("handler table attached");
             table.lookup(5)
         });
@@ -179,7 +183,9 @@ fn callable_info_without_handler_table() {
 
     thread.handle_scope(|thread: &mut Thread, scope| {
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
+        let constants = thread
+            .heap()
+            .allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -189,8 +195,8 @@ fn callable_info_without_handler_table() {
             },
             &scope,
         );
-        thread.heap().no_gc(|nogc| {
-            let h = info.heap_ref(nogc).handlers.heap_ref(nogc);
+        thread.heap().no_gc(|heap| {
+            let h = info.heap_ref(heap).handlers.heap_ref(heap);
             assert!(h.is_none(), "a hole handlers slot must mean no table");
         });
     });

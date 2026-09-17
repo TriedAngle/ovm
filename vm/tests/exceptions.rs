@@ -2,7 +2,7 @@ use bytecode::{Opcode, emit};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
     CallableInfoInit, CallableInfoObject, FixedArray, FixedByteArray, HandlerEntryInit,
-    HandlerTable, HandlerTableInit, ObjectSlotsInit, Smi, Value,
+    HandlerTable, HandlerTableInit, ObjectSlotsInit, Smi, Tagged, Value,
 };
 use vm::{Thread, VM};
 
@@ -10,11 +10,11 @@ fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
-fn callable<'s>(
+fn callable(
     thread: &mut Thread,
-    scope: &'s vm::HandleScope<'_>,
+    scope: &vm::HandleScope<'_>,
     program: &[u8],
-    constants: &[Value],
+    constants: &[Tagged<'_, Value>],
     register_count: usize,
     handlers: Option<&[HandlerEntryInit]>,
 ) -> Value {
@@ -41,13 +41,20 @@ fn callable<'s>(
         scope,
     );
     let map = thread.heap().known().function_map;
+    let values = {
+        let heap = &*thread.heap();
+        scope.stage(&[
+            info.as_tagged(heap).erase_type(),
+            empty_context.as_tagged(heap).erase_type(),
+        ])
+    };
     thread
         .heap()
         .allocate_object(
             scope,
             ObjectSlotsInit {
                 map,
-                values: scope.stage(&[info.value(), empty_context.value()]),
+                values,
                 elements: the_hole.erase(),
                 length: 0,
             },
@@ -78,7 +85,12 @@ fn throw_is_caught_in_same_function() {
             1,
             Some(&[HandlerEntryInit::new(0, 3, 4)]),
         );
-        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
+        thread.execute(
+            scope
+                .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
+                .unwrap(),
+            &[],
+        )
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 99);
     // catching consumes the pending exception
@@ -98,9 +110,18 @@ fn throw_any_value_escapes_as_sentinel() {
 
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &program, &[], 0, None);
-        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
+        thread.execute(
+            scope
+                .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
+                .unwrap(),
+            &[],
+        )
     });
-    assert_eq!(result, Ok(thread.heap().known().exception.value()));
+    let exception_word = {
+        let heap = thread.heap();
+        heap.known().exception.as_tagged(heap).erase()
+    };
+    assert_eq!(result, Ok(exception_word));
     assert_eq!(
         thread.take_pending_exception(),
         Some(smi(42)),
@@ -132,7 +153,12 @@ fn innermost_handler_wins() {
     ];
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &program, &[], 0, Some(&entries));
-        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
+        thread.execute(
+            scope
+                .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
+                .unwrap(),
+            &[],
+        )
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 100);
 }
@@ -167,11 +193,16 @@ fn exception_unwinds_to_caller() {
             thread,
             &scope,
             &program,
-            &[callee],
+            &[unsafe { Tagged::from_value_unchecked(callee) }],
             1,
             Some(&[HandlerEntryInit::new(0, 9, 9)]),
         );
-        let result = thread.execute(scope.cast::<vm::Object>(caller).unwrap(), &[]);
+        let result = thread.execute(
+            scope
+                .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(caller) })
+                .unwrap(),
+            &[],
+        );
         assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
     });
 }
@@ -200,9 +231,18 @@ fn rethrow_from_finally_escapes_past_its_own_handler() {
             0,
             Some(&[HandlerEntryInit::new(0, 4, 4)]),
         );
-        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
+        thread.execute(
+            scope
+                .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
+                .unwrap(),
+            &[],
+        )
     });
-    assert_eq!(result, Ok(thread.heap().known().exception.value()));
+    let exception_word = {
+        let heap = thread.heap();
+        heap.known().exception.as_tagged(heap).erase()
+    };
+    assert_eq!(result, Ok(exception_word));
     assert_eq!(thread.take_pending_exception(), Some(smi(3)));
 }
 
@@ -221,21 +261,38 @@ fn stack_overflow_during_call_is_throwable() {
 
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &program, &[], 1, None);
-        let handle = scope.cast::<vm::Object>(f).unwrap();
+        let handle = scope
+            .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
+            .unwrap();
         thread.execute(handle, &[f])
     });
-    assert_eq!(result, Ok(thread.heap().known().exception.value()));
+    let exception_word = {
+        let heap = thread.heap();
+        heap.known().exception.as_tagged(heap).erase()
+    };
+    assert_eq!(result, Ok(exception_word));
     let ex = thread.take_pending_exception().expect("pending exception");
-    let expected = thread.handle_scope(|thread, scope| thread.intern(&scope, "RangeError").value());
+    let expected = thread.handle_scope(|thread, scope| {
+        let name = thread.intern(&scope, "RangeError");
+        let heap = &*thread.heap();
+        name.as_tagged(heap).erase()
+    });
     thread.handle_scope(|thread, scope| {
-        let name_key = thread.intern(&scope, "name").value();
-        thread.heap().no_gc(|nogc| {
-            let Some(o) = ex.as_heap_object(nogc) else {
+        let name = thread.intern(&scope, "name");
+        thread.heap().no_gc(|heap| {
+            let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o.as_ref().lookup(nogc, vm::SlotName::from_value(name_key)) {
+            match o
+                .as_ref()
+                .lookup(heap, vm::SlotName::from(name.as_tagged(heap)))
+            {
                 vm::Lookup::Data { slot, .. } => {
-                    assert_eq!(slot.inner(), expected, "stack overflow -> RangeError");
+                    assert_eq!(
+                        slot.get(heap).erase(),
+                        expected,
+                        "stack overflow -> RangeError"
+                    );
                 }
                 _ => panic!("error object must have a name property"),
             }
@@ -248,7 +305,12 @@ fn stack_overflow_during_call_is_throwable() {
     emit(&mut good, Opcode::Return, &[]);
     let result = thread.handle_scope(|thread, scope| {
         let f = callable(thread, &scope, &good, &[], 0, None);
-        thread.execute(scope.cast::<vm::Object>(f).unwrap(), &[])
+        thread.execute(
+            scope
+                .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
+                .unwrap(),
+            &[],
+        )
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 5);
 }

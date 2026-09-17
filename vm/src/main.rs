@@ -94,25 +94,25 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
     if let Some(smi) = Smi::decode(v) {
         return smi.value().to_string();
     }
-    let known = thread.heap().known();
-    if v == known.undefined.value() {
-        return "undefined".into();
-    }
-    if v == known.null.value() {
-        return "null".into();
-    }
-    if v == known.true_object.value() {
-        return "true".into();
-    }
-    if v == known.false_object.value() {
-        return "false".into();
-    }
-    thread.heap().no_gc(|nogc| {
-        if let Some(f) = v.get_as::<Float>(nogc) {
+    thread.heap().no_gc(|heap| {
+        let known = heap.known();
+        if v == known.undefined.as_tagged(heap).erase() {
+            return "undefined".into();
+        }
+        if v == known.null.as_tagged(heap).erase() {
+            return "null".into();
+        }
+        if v == known.true_object.as_tagged(heap).erase() {
+            return "true".into();
+        }
+        if v == known.false_object.as_tagged(heap).erase() {
+            return "false".into();
+        }
+        if let Some(f) = unsafe { v.assume_valid(heap) }.get_as::<Float>() {
             return f.value.get().to_string();
         }
-        if let Some(s) = v.get_as::<DenseString>(nogc) {
-            return s.to_rust_string(nogc);
+        if let Some(s) = unsafe { v.assume_valid(heap) }.get_as::<DenseString>() {
+            return s.to_rust_string(heap);
         }
         format!("{v:?}")
     })

@@ -2,7 +2,7 @@ use core::{alloc::Layout, cell::UnsafeCell, cmp::Ordering};
 
 use crate::{
     EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, HeapPtr, Map, MapKind,
-    NoGc, ObjectKind, Smi, Value, Visitor,
+    ObjectKind, Smi, Value, Visitor,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,8 +151,9 @@ impl DenseString {
     }
 
     fn encoding_of(header: &Header) -> Encoding {
-        let map = header.map.get();
-        let map_ref = unsafe { HeapPtr::<Map>::from(map).as_ref() };
+        // Safety: raw header read (encoding is map-kind metadata).
+        let map = header.map.inner();
+        let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
         if map_ref.kind().contains(MapKind::LATIN1) {
             Encoding::Latin1
         } else {
@@ -164,7 +165,7 @@ impl DenseString {
         Self::encoding_of(&self.header)
     }
 
-    pub fn data<'s>(&'s self, _nogc: &NoGc<'_>) -> StringData<'s> {
+    pub fn data<'s>(&'s self, _heap: &Heap) -> StringData<'s> {
         let ptr = self.data_ptr();
         let len = self.len();
         match self.encoding() {
@@ -185,12 +186,12 @@ impl DenseString {
         self.len() == 0
     }
 
-    pub fn hash(&self, nogc: &NoGc<'_>) -> i64 {
+    pub fn hash(&self, heap: &Heap) -> i64 {
         match self.cached_hash() {
             Some(h) => h,
             None => {
-                let h = string_content_hash(self.data(nogc));
-                self.hash.set(nogc, self.erase(), Smi::new(h));
+                let h = string_content_hash(self.data(heap));
+                self.hash.set(heap, self.erase(), Smi::new(h));
                 h
             }
         }
@@ -201,16 +202,16 @@ impl DenseString {
         (h != 0).then_some(h)
     }
 
-    pub fn content_eq(&self, nogc: &NoGc<'_>, other: &DenseString) -> bool {
+    pub fn content_eq(&self, heap: &Heap, other: &DenseString) -> bool {
         if let (Some(a), Some(b)) = (self.cached_hash(), other.cached_hash())
             && a != b
         {
             return false;
         }
-        self.data(nogc) == other.data(nogc)
+        self.data(heap) == other.data(heap)
     }
 
-    pub fn code_unit(&self, _nogc: &NoGc<'_>, i: usize) -> u16 {
+    pub fn code_unit(&self, _heap: &Heap, i: usize) -> u16 {
         debug_assert!(i < self.len());
         match self.encoding() {
             Encoding::Latin1 => unsafe { *self.data_ptr().add(i) as u16 },
@@ -218,8 +219,8 @@ impl DenseString {
         }
     }
 
-    pub fn to_rust_string(&self, nogc: &NoGc<'_>) -> String {
-        self.data(nogc).to_rust_string()
+    pub fn to_rust_string(&self, heap: &Heap) -> String {
+        self.data(heap).to_rust_string()
     }
 
     pub fn from_units<'s>(
@@ -269,21 +270,23 @@ impl DenseString {
     pub fn concat<'s>(
         heap: &mut Heap,
         scope: &'s HandleScope<'_>,
-        a: Value,
-        b: Value,
+        a: Handle<'_, Value>,
+        b: Handle<'_, Value>,
     ) -> Handle<'s, DenseString> {
-        let units = heap.no_gc(|nogc| {
+        let units = heap.no_gc(|heap| {
             let sa = a
-                .get_as::<DenseString>(nogc)
+                .as_tagged(heap)
+                .get_as::<DenseString>()
                 .expect("concat operand must be a string")
                 .as_ref();
             let sb = b
-                .get_as::<DenseString>(nogc)
+                .as_tagged(heap)
+                .get_as::<DenseString>()
                 .expect("concat operand must be a string")
                 .as_ref();
             let mut out = Vec::with_capacity(sa.len() + sb.len());
-            sa.data(nogc).write_units(&mut out);
-            sb.data(nogc).write_units(&mut out);
+            sa.data(heap).write_units(&mut out);
+            sb.data(heap).write_units(&mut out);
             out
         });
         Self::from_units(heap, scope, &units)
@@ -305,19 +308,19 @@ impl HeapObject for DenseString {
             .0
     }
 
-    fn init(&mut self, nogc: &NoGc<'_>, config: &Self::Init<'_>) {
+    fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         debug_assert!(
             config.0.is_compressed(),
             "heap strings are always in the compressed encoding"
         );
         let host = self.erase();
         let map = match config.0.encoding() {
-            Encoding::Latin1 => nogc.known().dense_latin1_string_map,
-            Encoding::Utf16 => nogc.known().dense_utf16_string_map,
+            Encoding::Latin1 => heap.known().dense_latin1_string_map,
+            Encoding::Utf16 => heap.known().dense_utf16_string_map,
         };
-        self.header.map.set(nogc, host, map.as_tagged());
-        self.hash.set(nogc, host, Smi::new(config.1));
-        self.length.set(nogc, host, Smi::new(config.0.len() as i64));
+        self.header.map.set(heap, host, map.as_tagged(heap));
+        self.hash.set(heap, host, Smi::new(config.1));
+        self.length.set(heap, host, Smi::new(config.0.len() as i64));
         let ptr = self.data_ptr();
         match config.0 {
             StringData::Latin1(b) => unsafe {

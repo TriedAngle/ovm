@@ -1,6 +1,6 @@
 use core::alloc::Layout;
 
-use vm::{Header, HeapObject, HeapPtr, MaybeWeak, NoGc, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
+use vm::{Header, Heap, HeapObject, HeapPtr, MaybeWeak, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
 
 /// Stand-in heap object, aligned like a real heap allocation.
 #[repr(align(8))]
@@ -15,7 +15,7 @@ impl HeapObject for TestObj {
         Layout::new::<Self>()
     }
 
-    fn init(&mut self, _nogc: &NoGc<'_>, _config: &Self::Init<'_>) {
+    fn init(&mut self, _heap: &Heap, _config: &Self::Init<'_>) {
         unimplemented!("TestObj is boxed, never heap-allocated by these tests")
     }
 
@@ -133,7 +133,9 @@ mod heap_ptr {
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::new(raw) };
 
-        let v = Tagged::from_ptr(ptr).make_weak().erase();
+        let v = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }
+            .make_weak()
+            .erase();
         assert!(v.is_weak_ptr());
         assert!(v.is_ptr());
         assert!(!v.is_smi());
@@ -247,7 +249,7 @@ mod tagged {
     fn from_ptr_roundtrip() {
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let tagged = Tagged::from_ptr(ptr);
+        let tagged = unsafe { Tagged::from_value_unchecked(ptr.encode_strong()) };
 
         assert!(tagged.is_ptr());
         assert!(tagged.is_strong_ptr());
@@ -267,7 +269,8 @@ mod tagged {
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
         // weak references live in MaybeWeak: strengthening fails, so a weak
         // word can never reach `as_ptr` on a strong Tagged
-        let weak = Tagged::from_ptr(ptr).make_weak();
+        let weak =
+            unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }.make_weak();
         assert!(weak.strengthen().is_none());
 
         unsafe { free_test_obj(raw) };
@@ -277,7 +280,7 @@ mod tagged {
     fn maybe_weak_roundtrip() {
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let strong = Tagged::from_ptr(ptr);
+        let strong = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
 
         let weak = strong.make_weak();
         assert!(weak.erase().is_weak_ptr());
@@ -306,7 +309,7 @@ mod tagged {
     fn erase_recovers_the_raw_value() {
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let tagged = Tagged::from_ptr(ptr);
+        let tagged = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
 
         assert_eq!(tagged.erase(), ptr.encode_strong());
 
@@ -318,7 +321,7 @@ mod tagged {
         let tagged = Tagged::<Smi>::smi(7).unwrap();
 
         let erased: Value = tagged.erase();
-        let re_tagged = Tagged::<Value>::from(erased);
+        let re_tagged = Tagged::<Value>::try_smi(erased).unwrap();
         assert_eq!(re_tagged.erase().to_bits(), tagged.erase().to_bits());
         assert!(re_tagged.is_smi());
     }

@@ -53,10 +53,10 @@ pub fn materialize_closure_vm<'s>(
     let info = materialize_function(vm, heap, state, scope, script, &mut infos, FunctionId(0))?;
 
     let map = heap.known().function_map;
-    let slots = scope.stage(&[info.value(), context.value()]);
-    let object = heap
-        .new_object(scope, map, slots)
-        .into_handle(scope);
+    let slots = scope.stage_words(&[unsafe { info.read_unchecked() }, unsafe {
+        context.read_unchecked()
+    }]);
+    let object = heap.new_object(scope, map, slots).into_handle(scope);
     Ok(object)
 }
 
@@ -77,37 +77,40 @@ fn materialize_function<'s>(
     let mut constants: Vec<Handle<'s, Value>> = Vec::with_capacity(function.constants.len());
     for constant in &function.constants {
         let value = match constant {
-            Constant::String(bytes) => scope.handle(intern(heap, state, scope, vm, bytes)),
-            Constant::Smi(v) => scope.handle(crate::Smi::new(*v).encode()),
+            Constant::String(bytes) => intern(heap, state, scope, vm, bytes).erase(),
+            Constant::Smi(v) => scope.handle(crate::Smi::new(*v)),
             Constant::Float(f) => scope.handle(heap.new_number(scope, *f)),
             Constant::Callable(child) => {
                 let info = materialize_function(vm, heap, state, scope, script, infos, *child)?;
-                scope.handle(info.value())
+                info.erase()
             }
             Constant::ContextNames(names) => {
                 let interned: Vec<Handle<'s, Value>> = names
                     .iter()
-                    .map(|n| scope.handle(intern(heap, state, scope, vm, n)))
+                    .map(|n| intern(heap, state, scope, vm, n).erase())
                     .collect();
-                let values: Vec<Value> = interned.iter().map(|h| h.value()).collect();
-                let names =
-                    heap.allocate_handle::<FixedArray>(scope.stage(&values), scope);
+                let words: Vec<Value> = interned
+                    .iter()
+                    .map(|h| unsafe { h.read_unchecked() })
+                    .collect();
+                let names = heap.allocate_handle::<FixedArray>(scope.stage_words(&words), scope);
                 // one shared ScopeInfo per compiled scope; every activation
                 // of the scope references it from its context
-                scope.handle(
-                    heap.allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, scope)
-                        .value(),
-                )
+                heap.allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, scope)
+                    .erase()
             }
-            Constant::ObjectPrototype => scope.handle(heap.known().object_prototype.value()),
-            Constant::FunctionPrototype => scope.handle(heap.known().function_prototype.value()),
+            Constant::ObjectPrototype => heap.known().object_prototype.erase(),
+            Constant::FunctionPrototype => heap.known().function_prototype.erase(),
         };
         constants.push(value);
     }
 
     let bytecode = heap.allocate_handle::<FixedByteArray>(&function.bytecode, scope);
-    let values: Vec<Value> = constants.iter().map(|h| h.value()).collect();
-    let constants = heap.allocate_handle::<FixedArray>(scope.stage(&values), scope);
+    let words: Vec<Value> = constants
+        .iter()
+        .map(|h| unsafe { h.read_unchecked() })
+        .collect();
+    let constants = heap.allocate_handle::<FixedArray>(scope.stage_words(&words), scope);
     let handlers = if function.handlers.is_empty() {
         None
     } else {
@@ -128,7 +131,7 @@ fn materialize_function<'s>(
         },
         scope,
     );
-    let name = function
+    let name: Option<Handle<'s, crate::DenseString>> = function
         .name
         .as_deref()
         .map(|name| intern(heap, state, scope, vm, name));
@@ -143,10 +146,10 @@ fn materialize_function<'s>(
         parser::FunctionKind::DerivedClassConstructor => FunctionKind::DerivedClassConstructor,
         parser::FunctionKind::DefaultDerivedConstructor => FunctionKind::DefaultDerivedConstructor,
     };
-    heap.no_gc(|nogc| {
-        info.heap_ref(nogc).set_metadata_full(
-            nogc,
-            name,
+    heap.no_gc(|heap| {
+        info.heap_ref(heap).set_metadata_full(
+            heap,
+            name.map(|h| h.as_tagged(heap).erase_type()),
             function.formal_parameter_count as usize,
             function.formal_length as usize,
             kind,
@@ -157,15 +160,14 @@ fn materialize_function<'s>(
     Ok(info)
 }
 
-fn intern(
+fn intern<'s>(
     heap: &mut Heap,
     _state: &ContextState,
-    scope: &HandleScope<'_>,
+    scope: &'s HandleScope<'_>,
     vm: &VM,
     s: &[u8],
-) -> crate::Value {
+) -> Handle<'s, crate::DenseString> {
     let units = crate::decode_wtf8(s).expect("parser produces valid WTF-8 string constants");
     vm.interner()
         .intern(heap, scope, crate::StringData::Utf16(&units))
-        .value()
 }

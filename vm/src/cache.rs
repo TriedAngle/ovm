@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 
 use crate::{
-    EdgeVisitable, FixedArray, FixedByteArray, Heap, HeapRef, NoGc, Register, Value, Visitor,
+    EdgeVisitable, FixedArray, FixedByteArray, Heap, HeapRef, Register, Tagged, Value, Visitor,
 };
 
 use crate::{FrameMeta, Stack};
@@ -47,21 +47,26 @@ impl StackCache {
         let cache = self.get();
         cache.active = true;
         // the accumulator is undefined on frame entry
-        cache.acc.store(heap.known().undefined.value());
+        // Safety: fresh root-slot read stored immediately.
+        cache
+            .acc
+            .store(unsafe { heap.known().undefined.read_unchecked() });
     }
 
     pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
-        heap.no_gc(|nogc| {
-            let Some(obj) = stack.callable_slot(&frame).inner().as_heap_object(nogc) else {
-                panic!("frame callable must be an object");
+        heap.no_gc(|heap| {
+            let tagged = stack.callable(heap, &frame);
+            // Safety: frame callable slots hold strong object pointers.
+            let obj = unsafe {
+                HeapRef::from_ptr(tagged.as_ptr().expect("frame callable must be an object"))
             };
             let info = obj
                 .as_ref()
-                .callable_info(nogc)
+                .callable_info(heap)
                 .expect("frame callable must have callable info");
             let cache = self.get();
-            cache.code.store(info.bytecode.get().erase());
-            cache.constants.store(info.constants.get().erase());
+            cache.code.store(info.bytecode.get(heap).erase());
+            cache.constants.store(info.constants.get(heap).erase());
             cache.pc = frame.pc;
             cache.base = frame.base;
             cache.register_count = frame.register_count;
@@ -96,21 +101,42 @@ impl StackCache {
         self.get().pc = pc;
     }
 
-    pub fn code_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedByteArray> {
+    pub fn code_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, FixedByteArray> {
         debug_assert!(self.is_active(), "bytecode read from inactive cache");
-        self.get().code.heap_ref(nogc)
+        // Safety: the cached register holds a strong FixedByteArray.
+        unsafe {
+            HeapRef::from_ptr(
+                self.get()
+                    .code
+                    .read(heap)
+                    .get_as::<FixedByteArray>()
+                    .expect("strong cache slot")
+                    .into_ptr(),
+            )
+        }
     }
 
-    pub fn constants_ref<'a>(&self, nogc: &'a NoGc<'a>) -> HeapRef<'a, FixedArray> {
+    pub fn constants_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, FixedArray> {
         debug_assert!(self.is_active(), "constants read from inactive cache");
-        self.get().constants.heap_ref(nogc)
+        // Safety: the cached register holds a strong FixedArray.
+        unsafe {
+            HeapRef::from_ptr(
+                self.get()
+                    .constants
+                    .read(heap)
+                    .get_as::<FixedArray>()
+                    .expect("strong cache slot")
+                    .into_ptr(),
+            )
+        }
     }
 
-    pub fn acc(&self) -> Value {
-        self.get().acc.inner()
+    /// The accumulator, re-read under a heap borrow.
+    pub fn acc<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
+        self.get().acc.read(heap)
     }
 
-    pub fn set_acc(&self, v: Value) {
+    pub fn set_acc(&self, v: impl Into<Value>) {
         self.get().acc.store(v);
     }
 }

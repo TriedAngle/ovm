@@ -6,13 +6,17 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, HeapObject, HeapPtr, HeapRef, Map,
-    NoGc, RawCell, Register, Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, Heap, HeapObject, HeapPtr, HeapRef,
+    Map, RawCell, Register, Tagged, Value, Visitor,
 };
 
 /// A rooted reference to a `T` that survives relocation by the GC.
 /// Weak references cannot be rooted: they live in `WeakGcCell`s as
 /// `Tagged<MaybeWeak<T>>` words.
+///
+/// The handle itself is only a location; reading it back as a
+/// [`Tagged`] requires a live borrow of the heap
+/// ([`Handle::as_tagged`]) so the snapshot cannot outlive the next GC.
 pub struct Handle<'scope, T> {
     location: NonNull<Value>,
     _phantom: PhantomData<(&'scope (), T)>,
@@ -27,9 +31,9 @@ impl<'s, T> Copy for Handle<'s, T> {}
 
 impl<'s, T> core::fmt::Debug for Handle<'s, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Handle")
-            .field("value", &self.value())
-            .finish()
+        // Safety: raw word read for diagnostics only.
+        let value = unsafe { *self.location.as_ptr() };
+        f.debug_struct("Handle").field("value", &value).finish()
     }
 }
 
@@ -41,7 +45,16 @@ impl<'s, T> Handle<'s, T> {
         }
     }
 
-    pub fn value(self) -> Value {
+    /// Re-read the rooted slot under a heap borrow: the returned
+    /// snapshot is valid for `'a` because no GC can run while the
+    /// borrow lives. This is the only safe `Handle -> Tagged` path.
+    pub fn as_tagged<'a>(self, _heap: &'a Heap) -> Tagged<'a, T> {
+        // Safety: handle slots only ever hold strong values, and the
+        // anchor borrow proves no GC ran since the load.
+        unsafe { Tagged::from_value_unchecked(*self.location.as_ptr()) }
+    }
+
+    pub(crate) unsafe fn read_unchecked(self) -> Value {
         unsafe { *self.location.as_ptr() }
     }
 
@@ -55,39 +68,20 @@ impl<'s, T> Handle<'s, T> {
 
 impl<'s, T: HeapObject> Handle<'s, T> {
     pub fn get(self) -> HeapPtr<T> {
-        self.as_tagged()
+        // Safety: handle slots only ever hold strong values.
+        unsafe { Tagged::<T>::from_value_unchecked(self.read_unchecked()) }
             .as_ptr()
             .expect("strong local slot must contain strong pointer")
     }
 
-    pub fn as_tagged(self) -> Tagged<T> {
-        self.into()
-    }
-
-    pub fn heap_ref<'a>(self, _guard: &'a NoGc<'a>) -> HeapRef<'a, T> {
-        unsafe { HeapRef::from_ptr(self.get()) }
-    }
-}
-
-impl<'s, T> From<Handle<'s, T>> for Tagged<T> {
-    fn from(h: Handle<'s, T>) -> Self {
-        // SAFETY: handle slots only ever hold strong values.
-        unsafe { Self::from_value_unchecked(h.value()) }
-    }
-}
-
-/// Typed handles erase into value slots (`GcSlot<Value>`). Disjoint from
-/// the typed impl above: `Value` is not a `HeapObject`.
-impl<'s, T: HeapObject> From<Handle<'s, T>> for Tagged<Value> {
-    fn from(h: Handle<'s, T>) -> Self {
-        Self::from(h.value())
-    }
-}
-
-/// Reading a handle at a value boundary (e.g. `GcSlot::set`'s host argument).
-impl<'s, T> From<Handle<'s, T>> for Value {
-    fn from(h: Handle<'s, T>) -> Self {
-        h.value()
+    pub fn heap_ref<'a>(self, heap: &'a Heap) -> HeapRef<'a, T> {
+        self.as_tagged(heap)
+            .as_ptr()
+            .map(|ptr| {
+                // Safety: anchored at `heap`; strong by handle invariant.
+                unsafe { HeapRef::from_ptr(ptr) }
+            })
+            .expect("strong local slot must contain strong pointer")
     }
 }
 
@@ -211,7 +205,7 @@ impl<'d> HandleScope<'d> {
         }
     }
 
-    pub fn handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T> {
+    pub fn handle<'x, T: 'x>(&self, value: impl Into<Tagged<'x, T>>) -> Handle<'_, T> {
         let value = value.into();
         debug_assert!(
             !value.erase().is_weak_ptr(),
@@ -222,24 +216,37 @@ impl<'d> HandleScope<'d> {
         Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
     }
 
-    pub fn stage(&self, args: &[Value]) -> GcSlice<'_> {
+    /// Root a copy of `args` in contiguous scope slots. The argument
+    /// values may be anchored anywhere: rooting only writes words.
+    pub fn stage(&self, args: &[Tagged<'_, Value>]) -> GcSlice<'_> {
+        let words: Vec<Value> = args.iter().map(|v| v.erase()).collect();
+        self.stage_words(&words)
+    }
+
+    /// Stage raw words. Crate-internal: every word must be a currently
+    /// valid value (read under a still-live heap borrow, no GC since) —
+    /// the words are copied into rooted slots immediately.
+    pub(crate) fn stage_words(&self, words: &[Value]) -> GcSlice<'_> {
         let inner = unsafe { &*self.data.as_ptr() }.inner();
-        let start = inner.allocate_block(args.len());
-        for (i, v) in args.iter().enumerate() {
+        let start = inner.allocate_block(words.len());
+        for (i, v) in words.iter().enumerate() {
             debug_assert!(!v.is_weak_ptr(), "weak value staged for a call");
             unsafe { *start.add(i) = *v };
         }
-        unsafe { GcSlice::from_slice(core::slice::from_raw_parts(start, args.len())) }
+        unsafe { GcSlice::from_slice(core::slice::from_raw_parts(start, words.len())) }
     }
 
-    pub fn cast<T: HeapObject>(&self, value: Value) -> Option<Handle<'_, T>> {
-        let ptr = HeapPtr::decode_strong(value)?;
-        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.get();
-        let kind = unsafe { HeapPtr::<Map>::from(map).as_ref() }.kind().kind();
+    pub fn cast<T: HeapObject>(&self, value: Tagged<'_, Value>) -> Option<Handle<'_, T>> {
+        let ptr = HeapPtr::decode_strong(value.erase())?;
+        // Safety: raw header read for a kind check.
+        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.inner();
+        let kind = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() }
+            .kind()
+            .kind();
         if !T::matches_kind(kind) {
             return None;
         }
-        Some(self.handle(unsafe { Tagged::from_value_unchecked(value) }))
+        Some(self.handle(unsafe { value.cast() }))
     }
 
     pub fn escapable_scope<'a>(&'a mut self) -> EscapableHandleScope<'a, 'd> {
@@ -293,7 +300,8 @@ impl<'i, 'o> EscapableHandleScope<'i, 'o> {
     pub fn escape<T>(&self, handle: Handle<'i, T>) -> Handle<'o, T> {
         debug_assert!(!self.escaped.get(), "only one handle can escape a scope");
         self.escaped.set(true);
-        unsafe { *self.escape_slot = handle.value() };
+        // Safety: moving one rooted word into another rooted slot.
+        unsafe { *self.escape_slot = handle.read_unchecked() };
         Handle::from_location(unsafe { NonNull::new_unchecked(self.escape_slot) })
     }
 }
@@ -326,7 +334,7 @@ impl RootHandles {
         }
     }
 
-    pub fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Global<T> {
+    pub fn create_handle<'x, T: 'x>(&self, value: impl Into<Tagged<'x, T>>) -> Global<T> {
         let value = value.into();
         let i = self.next.fetch_add(1, Ordering::Relaxed);
         assert!(i < self.slots.len(), "root handle table exhausted");
@@ -345,17 +353,17 @@ impl EdgeVisitable for RootHandles {
 }
 
 pub trait HandleSet {
-    fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T>;
+    fn create_handle<'x, T: 'x>(&self, value: impl Into<Tagged<'x, T>>) -> Handle<'_, T>;
 }
 
 impl HandleSet for HandleScope<'_> {
-    fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T> {
+    fn create_handle<'x, T: 'x>(&self, value: impl Into<Tagged<'x, T>>) -> Handle<'_, T> {
         self.handle(value)
     }
 }
 
 impl HandleSet for RootHandles {
-    fn create_handle<T>(&self, value: impl Into<Tagged<T>>) -> Handle<'_, T> {
+    fn create_handle<'x, T: 'x>(&self, value: impl Into<Tagged<'x, T>>) -> Handle<'_, T> {
         // Slots in the root table are stable and never reclaimed, so the
         // returned handle is valid for the borrow of `self` (in practice:
         // pseudo-static, see `Global<T>`).
@@ -363,6 +371,11 @@ impl HandleSet for RootHandles {
     }
 }
 
+/// A borrowed view of rooted argument memory. The words live in
+/// GC-visited slots (handle scope blocks or the register file), so they
+/// are *updated in place* by the GC; individual reads must therefore
+/// happen under a heap borrow (see [`GcSlice::get`]) — a word read
+/// earlier may be stale after a collection.
 #[derive(Copy, Clone)]
 pub struct GcSlice<'a> {
     slice: &'a [Value],
@@ -376,13 +389,14 @@ impl<'a> GcSlice<'a> {
     /// The slice must point at memory the GC visits for as long as it is
     /// alive: rooted scope slots ([`HandleScope::stage`]), the register
     /// file, or caller-owned memory that the callee stages into the frame
-    /// before allocating. Raw unrooted copies must be consumed before any
-    /// GC can run.
+    /// before allocating.
     pub unsafe fn from_slice(slice: &'a [Value]) -> Self {
         Self { slice }
     }
 
-    pub fn as_slice(&self) -> &'a [Value] {
+    /// Raw words, for storage copies into fresh objects (no GC can run
+    /// mid-`init`).
+    pub(crate) fn words(&self) -> &'a [Value] {
         self.slice
     }
 
@@ -394,19 +408,21 @@ impl<'a> GcSlice<'a> {
         self.slice.is_empty()
     }
 
-    pub fn get(&self, index: usize) -> Option<Value> {
-        self.slice.get(index).copied()
+    /// Re-read an argument under a heap borrow.
+    pub fn get<'h>(&self, _heap: &'h Heap, index: usize) -> Option<Tagged<'h, Value>> {
+        let v = self.slice.get(index).copied()?;
+        // Safety: rooted memory is updated in place by the GC, so the
+        // word is current; the anchor proves no GC runs before its use.
+        Some(unsafe { Tagged::from_value_unchecked(v) })
     }
 
-    pub fn iter(&self) -> core::slice::Iter<'a, Value> {
-        self.slice.iter()
-    }
-}
-
-impl core::ops::Index<usize> for GcSlice<'_> {
-    type Output = Value;
-
-    fn index(&self, index: usize) -> &Value {
-        &self.slice[index]
+    pub fn iter<'h>(&self, _heap: &'h Heap) -> impl Iterator<Item = Tagged<'h, Value>> + 'h
+    where
+        'a: 'h,
+    {
+        self.slice.iter().map(|v| {
+            // Safety: anchored re-read of rooted memory.
+            unsafe { Tagged::from_value_unchecked(*v) }
+        })
     }
 }

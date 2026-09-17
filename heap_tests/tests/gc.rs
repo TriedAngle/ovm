@@ -12,23 +12,24 @@ where
         thread.heap().collect();
     }
 
+    let heap = &*thread.heap();
     let known = vm.known();
     let values = [
-        known.map_map.value(),
-        known.the_hole.value(),
-        known.undefined.value(),
-        known.null.value(),
-        known.smi_map.value(),
-        known.float_map.value(),
-        known.array_map.value(),
-        known.dense_latin1_string_map.value(),
-        known.dense_utf16_string_map.value(),
-        known.object_prototype.value(),
-        known.object_initial_map.value(),
-        known.empty_fixed_array.value(),
-        known.empty_context.value(),
-        known.strings.length.value(),
-        known.strings.prototype.value(),
+        known.map_map.as_tagged(heap).erase(),
+        known.the_hole.as_tagged(heap).erase(),
+        known.undefined.as_tagged(heap).erase(),
+        known.null.as_tagged(heap).erase(),
+        known.smi_map.as_tagged(heap).erase(),
+        known.float_map.as_tagged(heap).erase(),
+        known.array_map.as_tagged(heap).erase(),
+        known.dense_latin1_string_map.as_tagged(heap).erase(),
+        known.dense_utf16_string_map.as_tagged(heap).erase(),
+        known.object_prototype.as_tagged(heap).erase(),
+        known.object_initial_map.as_tagged(heap).erase(),
+        known.empty_fixed_array.as_tagged(heap).erase(),
+        known.empty_context.as_tagged(heap).erase(),
+        known.strings.length.as_tagged(heap).erase(),
+        known.strings.prototype.as_tagged(heap).erase(),
     ];
     for value in values {
         assert!(value.is_strong_ptr());
@@ -38,9 +39,13 @@ where
     // the interner's strong entries keep well-known strings unique
     thread.handle_scope(|t, scope| {
         let again = t.intern(&scope, "length");
+        let heap = &*t.heap();
         assert_eq!(
-            SlotName::from(again.as_tagged()).tagged().erase().to_bits(),
-            known.strings.length.value().to_bits()
+            // Safety: fresh rooted-slot words under the live borrow.
+            unsafe { SlotName::from(again.as_tagged(heap)).tagged(heap) }
+                .erase()
+                .to_bits(),
+            known.strings.length.as_tagged(heap).erase().to_bits()
         );
         let _ = scope;
     });
@@ -55,23 +60,33 @@ where
 
     thread.handle_scope(|t, scope| {
         let string = DenseString::from_latin1(t.heap(), &scope, b"survivor");
-        let array = t
-            .heap()
-            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(42).encode(), string.value()]), &scope);
-        let before = (string.value().to_bits(), array.value().to_bits());
+        {
+            let staged = {
+                let heap = &*t.heap();
+                scope.stage(&[
+                    Smi::new(42).into_tagged(),
+                    string.as_tagged(heap).erase_type(),
+                ])
+            };
+            let array = t.heap().allocate_handle::<FixedArray>(staged, &scope);
+            let before = (
+                string.as_tagged(&*t.heap()).erase().to_bits(),
+                array.as_tagged(&*t.heap()).erase().to_bits(),
+            );
 
-        t.heap().collect();
-        t.heap().collect();
+            t.heap().collect();
+            t.heap().collect();
 
-        assert_eq!(string.value().to_bits(), before.0);
-        assert_eq!(array.value().to_bits(), before.1);
-        t.heap().no_gc(|nogc| {
-            let array = array.heap_ref(nogc);
-            assert_eq!(Smi::decode(array.at(0)).unwrap().value(), 42);
-            assert_eq!(array.at(1), string.value());
-            let string = string.heap_ref(nogc);
-            assert!(string.data(nogc).matches_ascii(b"survivor"));
-        });
+            assert_eq!(string.as_tagged(&*t.heap()).erase().to_bits(), before.0);
+            assert_eq!(array.as_tagged(&*t.heap()).erase().to_bits(), before.1);
+            t.heap().no_gc(|heap| {
+                let array = array.heap_ref(heap);
+                assert_eq!(Smi::decode(array.at(heap, 0).erase()).unwrap().value(), 42);
+                assert_eq!(array.at(heap, 1).erase(), string.as_tagged(heap).erase());
+                let string = string.heap_ref(heap);
+                assert!(string.data(heap).matches_ascii(b"survivor"));
+            });
+        }
     });
 }
 
@@ -84,7 +99,9 @@ where
         let mut thread = vm.attach();
         thread.handle_scope(|t, _scope| {
             for _ in 0..8 {
-                let _ = t.heap().allocate::<FixedArray>(_scope.stage(&[Smi::new(0).encode()]));
+                let _ = t
+                    .heap()
+                    .allocate::<FixedArray>(_scope.stage(&[Smi::new(0).into_tagged()]));
             }
         });
     }

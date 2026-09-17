@@ -2,8 +2,8 @@
 //! object materialization.
 
 use crate::{
-    ContextState, Convert, DenseString, GcSlice, Heap, Object, PropertyDescriptor, VM, Value,
-    VmError, runtime::Runtime,
+    ContextState, Convert, DenseString, GcSlice, Heap, Object, PropertyDescriptor, Tagged, VM,
+    Value, VmError, runtime::Runtime,
 };
 
 pub(crate) fn error_constructor(
@@ -36,9 +36,18 @@ pub(crate) fn make_error(
         let (vm, heap, _) = nctx.split();
         // root the message right away: the allocations below (new_object,
         // interning) would leave a raw copy stale
-        let message = match args.get(1) {
-            Some(v) => scope.handle(Convert::to_string(heap, &scope, v)?),
-            None => scope.handle(vm.interner().intern_str(heap, &scope, "").value()),
+        let message = match heap.no_gc(|heap| args.get(heap, 1).map(|v| v.erase())) {
+            // Safety: fresh argument word, consumed before any allocation.
+            Some(v) => {
+                let v = unsafe { Tagged::<Value>::from_value_unchecked(v) };
+                scope.handle(Convert::to_string(heap, &scope, v)?)
+            }
+            None => scope.handle(
+                vm.interner()
+                    .intern_str(heap, &scope, "")
+                    .as_tagged(&*heap)
+                    .erase_type(),
+            ),
         };
         let map = match class {
             "TypeError" => heap.known().type_error_map,
@@ -56,16 +65,20 @@ pub(crate) fn make_error(
             &scope,
             obj,
             name,
-            PropertyDescriptor::data(class_value.value()),
+            // Safety: fresh rooted-slot word; the define roots its inputs.
+            PropertyDescriptor::data(unsafe { class_value.read_unchecked() }),
         )?;
         Object::define_own_property(
             heap,
             &scope,
             obj,
             message_key,
-            PropertyDescriptor::data(message.value()),
+            // Safety: fresh rooted-slot word; the define roots its inputs.
+            PropertyDescriptor::data(unsafe { message.read_unchecked() }),
         )?;
-        Ok(obj.value())
+        // Safety: fresh rooted-slot word, returned without an
+        // intervening allocation.
+        Ok(unsafe { obj.read_unchecked() })
     })
 }
 
@@ -73,20 +86,38 @@ pub(crate) fn error_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let receiver = args.get(0).ok_or(VmError::Arity)?;
-    let (vm, heap, state) = nctx.split();
-    let name = get_property(vm, heap, state, receiver, "name")?;
-    let message = get_property(vm, heap, state, receiver, "message")?;
     nctx.handle_scope(|nctx, scope| {
+        // both [[Get]]s below run user code (getters): the receiver must
+        // stay rooted across them
+        // Safety: fresh argument word, rooted below before any allocation.
+        let receiver_word = nctx
+            .heap()
+            .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
+        let receiver =
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(receiver_word) });
+        let (vm, heap, state) = nctx.split();
+        let recv = receiver.as_tagged(&*heap).erase();
+        let name = get_property(vm, heap, state, recv, "name")?;
+        let recv = receiver.as_tagged(&*heap).erase();
+        let message = get_property(vm, heap, state, recv, "message")?;
         let (vm, heap, _) = nctx.split();
         // each to_string/intern allocates: root both halves before the
         // concats read them
-        let a = scope.handle(Convert::to_string(heap, &scope, name)?);
-        let b = scope.handle(Convert::to_string(heap, &scope, message)?);
+        // Safety: fresh words from the lookups above, consumed before any
+        // allocation.
+        let a = scope.handle(Convert::to_string(heap, &scope, unsafe {
+            Tagged::<Value>::from_value_unchecked(name)
+        })?);
+        let b = scope.handle(Convert::to_string(heap, &scope, unsafe {
+            Tagged::<Value>::from_value_unchecked(message)
+        })?);
         let colon = vm.interner().intern_str(heap, &scope, ": ");
-        let ab = DenseString::concat(heap, &scope, a.value(), colon.value());
-        let ab = scope.handle(ab.value());
-        Ok(DenseString::concat(heap, &scope, ab.value(), b.value()).value())
+        let ab = DenseString::concat(heap, &scope, a, colon.erase());
+        let ab = scope.handle(ab.as_tagged(&*heap).erase_type());
+        let out = DenseString::concat(heap, &scope, ab, b);
+        // Safety: fresh rooted-slot word, returned without an
+        // intervening allocation.
+        Ok(unsafe { out.read_unchecked() })
     })
 }
 
@@ -97,9 +128,17 @@ pub(crate) fn get_property(
     receiver: Value,
     name: &str,
 ) -> Result<Value, VmError> {
-    let name = state.handle_scope(|scope| vm.interner().intern_str(heap, &scope, name).value());
+    let name = state.handle_scope(|scope| {
+        // Safety: fresh rooted-slot word, consumed below.
+        unsafe {
+            vm.interner()
+                .intern_str(heap, &scope, name)
+                .read_unchecked()
+        }
+    });
     match Runtime::get_property(vm, heap, state, receiver, name)? {
         crate::runtime::Coercion::Value(v) => Ok(v),
-        crate::runtime::Coercion::Threw => Ok(heap.known().exception.value()),
+        // Safety: fresh root-slot word read for the immediate return.
+        crate::runtime::Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
     }
 }
