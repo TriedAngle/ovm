@@ -87,30 +87,36 @@ pub(crate) fn object_has_own_property(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let receiver = args.get(0).ok_or(VmError::Arity)?;
+    let raw_receiver = args.get(0).ok_or(VmError::Arity)?;
     let raw_key = args.get(1).ok_or(VmError::Arity)?;
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    let has = heap.no_gc(|nogc| {
-        let key = crate::SlotName::from_value(key);
-        if let crate::Key::Element(i) =
-            crate::classify_key(nogc, key.value()).unwrap_or(crate::Key::Name(key))
-        {
-            if let Some(obj) = receiver.as_heap_object(nogc)
-                && obj.as_ref().element_value(nogc, i).is_some()
+    nctx.handle_scope(|nctx, scope| {
+        // the key coercion allocates (float/wrapper keys intern or run
+        // user code): the receiver must stay rooted across it
+        let receiver = scope.handle(raw_receiver);
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(heap.known().exception.value());
+        };
+        let receiver = receiver.value();
+        let has = heap.no_gc(|nogc| {
+            let key = crate::SlotName::from_value(key);
+            if let crate::Key::Element(i) =
+                crate::classify_key(nogc, key.value()).unwrap_or(crate::Key::Name(key))
             {
-                return true;
+                if let Some(obj) = receiver.as_heap_object(nogc)
+                    && obj.as_ref().element_value(nogc, i).is_some()
+                {
+                    return true;
+                }
             }
-        }
-        match receiver.lookup(nogc, key) {
-            crate::Lookup::NotFound => false,
-            // the array `length` internal slot counts as an own property
-            _ => true,
-        }
-    });
-    Ok(Convert::boolean(nctx.heap(), has))
+            match receiver.lookup(nogc, key) {
+                crate::Lookup::NotFound => false,
+                // the array `length` internal slot counts as an own property
+                _ => true,
+            }
+        });
+        Ok(Convert::boolean(nctx.heap(), has))
+    })
 }
 
 /// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
@@ -118,12 +124,17 @@ pub(crate) fn object_property_is_enumerable(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let receiver = args.get(0).ok_or(VmError::Arity)?;
+    let raw_receiver = args.get(0).ok_or(VmError::Arity)?;
     let raw_key = args.get(1).ok_or(VmError::Arity)?;
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
+    nctx.handle_scope(|nctx, scope| {
+        // the key coercion allocates (float/wrapper keys intern or run
+        // user code): the receiver must stay rooted across it
+        let receiver = scope.handle(raw_receiver);
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(heap.known().exception.value());
+        };
+        let receiver = receiver.value();
     let enumerable = heap.no_gc(|nogc| {
         let key = crate::SlotName::from_value(key);
         if let crate::Key::Element(i) =
@@ -149,8 +160,9 @@ pub(crate) fn object_property_is_enumerable(
                 .is_enumerable(),
             crate::Lookup::NotFound => false,
         }
-    });
-    Ok(Convert::boolean(nctx.heap(), enumerable))
+        });
+        Ok(Convert::boolean(nctx.heap(), enumerable))
+    })
 }
 
 /// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
