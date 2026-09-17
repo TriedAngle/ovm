@@ -75,7 +75,12 @@ pub struct AllocToken<'heap> {
 }
 
 impl<'heap> AllocToken<'heap> {
-    pub fn new(heap: &'heap mut Heap, raw: NonNull<u8>, total: Layout) -> Self {
+    /// # Safety
+    /// `raw` must point to at least `total.size()` bytes reserved from
+    /// `heap` for the token's whole lifetime, aligned to `total.align()`.
+    /// `total` must match the summed layouts of every
+    /// [`AllocToken::allocate`] call made on the returned token.
+    pub unsafe fn new(heap: &'heap mut Heap, raw: NonNull<u8>, total: Layout) -> Self {
         Self {
             heap,
             next: Cell::new(raw.as_ptr()),
@@ -557,7 +562,8 @@ impl Heap {
         let raw = self
             .allocate_raw(layout)
             .expect("heap allocation failed (out of memory)");
-        AllocToken::new(self, raw, total)
+        // Safety: `raw` is the freshly reserved region of exactly `layout`.
+        unsafe { AllocToken::new(self, raw, total) }
     }
 
     pub fn allocate_token_enter_heap<R>(

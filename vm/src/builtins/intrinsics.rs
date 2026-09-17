@@ -332,16 +332,16 @@ fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         // below before any allocation.
         let level = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(level) });
         let (vm, heap, _) = nctx.split();
-        let level_word = level.as_tagged(&*heap).erase();
+        let level_word = level.as_tagged(heap).erase();
         let keys = for_in_level_keys(vm, heap, &scope, level_word)?;
 
         let keys = heap.allocate_handle::<FixedArray>(scope.stage_words(&keys), &scope);
         let empty = heap.known().empty_fixed_array;
         let map = heap.known().for_in_enumerator_map;
         // Safety: fresh rooted-slot words staged into the fresh object.
-        let level_word = level.as_tagged(&*heap).erase();
-        let keys_word = keys.as_tagged(&*heap).erase();
-        let empty_word = empty.as_tagged(&*heap).erase();
+        let level_word = level.as_tagged(heap).erase();
+        let keys_word = keys.as_tagged(heap).erase();
+        let empty_word = empty.as_tagged(heap).erase();
         let enumerator = heap.new_object(
             &scope,
             map,
@@ -495,7 +495,7 @@ fn for_in_level_keys(
     let mut keys: Vec<Handle<'_, Value>> = Vec::with_capacity(indices.len() + names.len());
     for i in indices {
         let s = vm.interner().intern_str(heap, scope, &i.to_string());
-        keys.push(scope.handle(s.as_tagged(&*heap).erase_type()));
+        keys.push(scope.handle(s.as_tagged(heap).erase_type()));
     }
     keys.extend(names);
     // fresh words out of the rooted slots, consumed by the caller's
@@ -579,7 +579,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
                 // level rooted across it
                 // Safety: fresh word from the walk, rooted below.
                 let proto = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(proto) });
-                let proto_word = proto.as_tagged(&*heap).erase();
+                let proto_word = proto.as_tagged(heap).erase();
                 let keys = for_in_level_keys(vm, heap, &scope, proto_word)?;
                 let keys = heap.allocate_handle::<FixedArray>(scope.stage_words(&keys), &scope);
                 heap.no_gc(|heap| -> Result<(), VmError> {
@@ -811,7 +811,7 @@ fn get_iterator(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
         let (vm, heap, state) = nctx.split();
         // Safety: fresh root-slot word read for the lookup.
         let symbol = unsafe { heap.known().iterator_symbol.read_unchecked() };
-        let obj_word = obj.as_tagged(&*heap).erase();
+        let obj_word = obj.as_tagged(heap).erase();
         let method = crate::runtime::Runtime::get_property(vm, heap, state, obj_word, symbol)?;
         let method = match method {
             // Safety: fresh root-slot word read for the immediate return.
@@ -850,7 +850,7 @@ fn iterator_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Valu
         let (vm, heap, state) = nctx.split();
         // Safety: fresh root-slot word read for the lookup.
         let next_name = unsafe { heap.known().strings.next.read_unchecked() };
-        let iter_word = iter.as_tagged(&*heap).erase();
+        let iter_word = iter.as_tagged(heap).erase();
         let next = crate::runtime::Runtime::get_property(vm, heap, state, iter_word, next_name)?;
         let next = match next {
             // Safety: fresh root-slot word read for the immediate return.
@@ -953,7 +953,7 @@ fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
-        let obj = obj.as_tagged(&*heap).erase();
+        let obj = obj.as_tagged(heap).erase();
         if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { obj.assume_valid(heap) })) {
             // Safety: fresh rooted-slot word plus a fresh coercion
             // result, both consumed by the trap call.
@@ -1043,7 +1043,7 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                         unsafe { Tagged::<Value>::from_value_unchecked(k) },
                     )? {
                         Some(k) => out.push(k.erase()),
-                        None => return Ok((true, target_handle.as_tagged(&*heap).erase())),
+                        None => return Ok((true, target_handle.as_tagged(heap).erase())),
                     }
                 }
                 out
@@ -1086,12 +1086,12 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 .collect();
             let (vm, heap, state) = nctx.split();
             for key in keys {
-                let key_word = key.as_tagged(&*heap).erase();
+                let key_word = key.as_tagged(heap).erase();
                 if excluded.contains(&key_word) {
                     continue;
                 }
                 // full [[Get]] (getters may run)
-                let source_word = source_handle.as_tagged(&*heap).erase();
+                let source_word = source_handle.as_tagged(heap).erase();
                 let value = match crate::runtime::Runtime::get_property(
                     vm,
                     heap,
@@ -1099,7 +1099,7 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                     source_word,
                     key_word,
                 )? {
-                    Coercion::Threw => return Ok((true, target_handle.as_tagged(&*heap).erase())),
+                    Coercion::Threw => return Ok((true, target_handle.as_tagged(heap).erase())),
                     Coercion::Value(v) => v,
                 };
                 // CreateDataProperty: skipped when already present
@@ -1116,9 +1116,9 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 // Safety: fresh call result, rooted below before any allocation.
                 let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(value) });
                 let target_obj = scope
-                    .cast::<Object>(target_handle.as_tagged(&*heap))
+                    .cast::<Object>(target_handle.as_tagged(heap))
                     .expect("copy target is an object");
-                let key_name: Handle<'_, SlotName> = scope.handle(key.as_tagged(&*heap).as_name());
+                let key_name: Handle<'_, SlotName> = scope.handle(key.as_tagged(heap).as_name());
                 Object::add_own_property(
                     heap,
                     &scope,
@@ -1127,7 +1127,7 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                     PropertyDescriptor::data(value),
                 )?;
             }
-            Ok((false, target_handle.as_tagged(&*heap).erase()))
+            Ok((false, target_handle.as_tagged(heap).erase()))
         })?;
     if threw {
         // Safety: fresh root-slot word read for the immediate return.
@@ -1585,7 +1585,7 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
             }
         });
         let defined = {
-            let Some(fn_obj) = scope.cast::<Object>(fn_value.as_tagged(&*heap)) else {
+            let Some(fn_obj) = scope.cast::<Object>(fn_value.as_tagged(heap)) else {
                 return Err(VmError::Type);
             };
             let name_key = heap.known().strings.name;
@@ -1625,7 +1625,7 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
         if !defined {
             return Err(VmError::Type);
         }
-        Ok(fn_value.as_tagged(&*heap).erase())
+        Ok(fn_value.as_tagged(heap).erase())
     })
 }
 
@@ -1713,13 +1713,13 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
             ))
         })?;
         let target_obj = scope
-            .cast::<Object>(target.as_tagged(&*heap))
+            .cast::<Object>(target.as_tagged(heap))
             .expect("checked object above");
         let defined = Object::define_own_property(heap, &scope, target_obj, name, desc)?;
         if !defined {
             return Err(VmError::Type);
         }
-        Ok(closure.as_tagged(&*heap).erase())
+        Ok(closure.as_tagged(heap).erase())
     })
 }
 
@@ -1806,7 +1806,7 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
                 // Safety: fresh root-slot word read for the immediate return.
                 crate::proxy::Flow::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
                 crate::proxy::Flow::Value(false) => Err(VmError::Type),
-                crate::proxy::Flow::Value(true) => Ok(receiver.as_tagged(&*heap).erase()),
+                crate::proxy::Flow::Value(true) => Ok(receiver.as_tagged(heap).erase()),
             };
         }
         let (name, desc) = heap.no_gc(|heap| -> Result<_, VmError> {
@@ -1843,13 +1843,13 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
             Ok((scope.handle(name), desc))
         })?;
         let receiver_obj = scope
-            .cast::<Object>(receiver.as_tagged(&*heap))
+            .cast::<Object>(receiver.as_tagged(heap))
             .expect("checked object above");
         let defined = Object::define_own_property(heap, &scope, receiver_obj, name, desc)?;
         if !defined {
             return Err(VmError::Type);
         }
-        Ok(receiver.as_tagged(&*heap).erase())
+        Ok(receiver.as_tagged(heap).erase())
     })
 }
 
@@ -2338,7 +2338,7 @@ fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
         // re-read through the handles: the coercion above allocated
-        let recv = recv.as_tagged(&*heap).erase();
+        let recv = recv.as_tagged(heap).erase();
         // (plain value, getter) — both raw fresh words
         // Safety: fresh anchored handle words plus a fresh coercion result.
         let outcome =

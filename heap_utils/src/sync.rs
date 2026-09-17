@@ -128,6 +128,9 @@ impl Safepoint {
             }
             list.count += 1;
             if barrier.armed {
+                // Relaxed: this thread owns the node and re-reads the bit
+                // itself in `park_for_collection`; the barrier lock orders it
+                // against the armer's `target` bookkeeping.
                 node.state.fetch_or(REQUESTED, Ordering::Relaxed);
                 barrier.target += 1;
                 true
@@ -172,25 +175,38 @@ impl Safepoint {
 
     pub fn park_for_collection(&self, node: &LocalNode) {
         loop {
-            let state = node.state.load(Ordering::Relaxed);
-            if state & REQUESTED == 0 {
-                if state & PARKED == 0 {
+            // Fast path: nothing pending. PARKED is only ever written by this
+            // thread, so an exact `0` cannot hide our own parked state; a
+            // stale REQUESTED only means the armer already counted us as a
+            // target, and we will observe it at our next safepoint.
+            if node.state.load(Ordering::Relaxed) == 0 {
+                return;
+            }
+            // Mark ourselves parked. `prev` comes from an RMW, so it is the
+            // current value: the decision below can never be made on a stale
+            // REQUESTED read (the old load-then-act fast path could, and then
+            // wait for a disarm that a counted target never performs).
+            let prev = node.state.fetch_or(PARKED, Ordering::AcqRel);
+            if prev & REQUESTED == 0 {
+                // No cycle pending: leave the barrier. If one armed while we
+                // were deciding, the CAS sees REQUESTED and fails, and we
+                // re-evaluate from the fresh value.
+                if node
+                    .state
+                    .compare_exchange(PARKED, 0, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
                     return;
                 }
-                let current = node.state.fetch_and(!PARKED, Ordering::Relaxed);
-                if current & REQUESTED != 0 {
-                    self.wait_disarmed();
-                }
                 continue;
             }
-            if state & PARKED != 0 {
+            if prev & PARKED != 0 {
                 self.wait_disarmed();
-                continue;
-            }
-            let old = node.state.fetch_or(PARKED, Ordering::Relaxed);
-            if old & REQUESTED != 0 {
+            } else {
                 self.count_in_and_wait();
             }
+            // PARKED stays set across the wait, then this loop clears it (or
+            // handles a newly armed cycle).
         }
     }
 
@@ -212,7 +228,7 @@ impl Safepoint {
                 while !node.is_null() {
                     let n = unsafe { &*node };
                     if Some(ptr::from_ref(n)) != req {
-                        let old = n.state.fetch_or(REQUESTED, Ordering::Relaxed);
+                        let old = n.state.fetch_or(REQUESTED, Ordering::AcqRel);
                         if old & PARKED == 0 {
                             barrier.target += 1;
                         }
@@ -236,7 +252,7 @@ impl Safepoint {
                     let mut node = list.head;
                     while !node.is_null() {
                         let n = unsafe { &*node };
-                        n.state.fetch_and(!REQUESTED, Ordering::Relaxed);
+                        n.state.fetch_and(!REQUESTED, Ordering::Release);
                         node = n.next;
                     }
                     drop(barrier);
