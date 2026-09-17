@@ -8,7 +8,6 @@ use crate::{
     classify_key,
     Compare,
     FixedArray,
-    GcSlice,
     Handle,
     HandleScope,
     Heap,

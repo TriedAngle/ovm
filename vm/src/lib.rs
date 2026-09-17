@@ -161,60 +161,19 @@ unsafe impl Send for ContextState {}
 // in theory full isolation (and passing?) should be possible
 unsafe impl Sync for ContextState {}
 
-// TEMPORARY DEBUG PROBE: report root slots pointing at young memory whose
-// header is null-tagged (dead), naming the owning root region.
-struct RegionProbe<'a> {
-    inner: &'a mut dyn Visitor,
-    region: &'static str,
-}
-
-impl Visitor for RegionProbe<'_> {
-    fn visit(&mut self, cell: &heap_api::RawCell) {
-        let word = cell.load();
-        if word & TAG_MASK == STRONG_PTR {
-            let addr = (word & !TAG_MASK) as usize;
-            if addr != 0 {
-                let header = unsafe { *(addr as *const Word) };
-                if header & !TAG_MASK == 0 {
-                    eprintln!("ROOT-GARBAGE region={} cell={:p} word={word:#x}", self.region, cell);
-                }
-            }
-        }
-        self.inner.visit(cell);
-    }
-}
-
 impl SharedVM {
     fn visit_roots(&self, visitor: &mut dyn Visitor) {
-        {
-            let mut p = RegionProbe { inner: visitor, region: "interner" };
-            self.interner.visit_edges(&mut p);
-        }
-        {
-            let mut p = RegionProbe { inner: visitor, region: "roots" };
-            self.roots.visit_edges(&mut p);
-        }
-        {
-            let mut p = RegionProbe { inner: visitor, region: "heap-roots" };
-            self.heap.iterate_roots(&mut p);
-        }
+        self.interner.visit_edges(visitor);
+        self.roots.visit_edges(visitor);
+        self.heap.iterate_roots(visitor);
         for slot in self.weak_slots.lock().unwrap().iter() {
             visitor.visit(slot);
         }
         let threads = self.threads.lock().unwrap();
         for state in threads.iter().filter_map(Weak::upgrade) {
-            {
-                let mut p = RegionProbe { inner: visitor, region: "handles" };
-                state.handles.visit_edges(&mut p);
-            }
-            {
-                let mut p = RegionProbe { inner: visitor, region: "stack" };
-                state.stack.visit_edges(&mut p);
-            }
-            {
-                let mut p = RegionProbe { inner: visitor, region: "cache" };
-                state.cache.visit_edges(&mut p);
-            }
+            state.handles.visit_edges(visitor);
+            state.stack.visit_edges(visitor);
+            state.cache.visit_edges(visitor);
             visitor.visit(state.pending_exception.as_raw());
         }
     }
@@ -499,6 +458,18 @@ impl VM {
         let mut vm = Self::new::<B>(config).map_err(|_| VmError::OutOfBounds)?;
         let idx = builtins::register_builtin_natives(&mut vm);
         builtins::install_builtins(&mut vm, &idx)?;
+        // Promote the bootstrap singletons (the hole, undefined, the
+        // initial maps and prototype objects, ...) out of the young
+        // generation before any code runs: the VM caches their addresses
+        // (`known().*.value()` snapshots in Rust locals across
+        // allocations, handle/stack fill cells), which is only sound
+        // while they never move again. One minor collection evacuates
+        // every reachable young object — all of them included — into
+        // the old generation.
+        {
+            let mut thread = vm.attach();
+            thread.heap().collect_minor();
+        }
         #[cfg(feature = "stress-minor-gc")]
         vm.shared.heap.arm_gc_stress();
         Ok(vm)

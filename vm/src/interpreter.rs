@@ -478,9 +478,13 @@ fn step(
             Step::Next
         }
         Opcode::Add => {
-            let other = stack.reg(&meta, ops.reg(0));
+            // the register index, not a raw copy: the first to_primitive
+            // below may run user code, and a held raw value would go
+            // stale — registers are GC-visited and always read fresh
+            let other_reg = ops.reg(0);
             let mut result = None;
-            if let (Some(a), Some(b)) = (cache.acc().to_i64(), other.to_i64()) {
+            if let (Some(a), Some(b)) = (cache.acc().to_i64(), stack.reg(&meta, other_reg).to_i64())
+            {
                 if let Some(r) = a.checked_add(b) {
                     if Smi::in_range(r) {
                         result = Some(Smi::new(r).encode());
@@ -512,7 +516,7 @@ fn step(
                             vm,
                             heap,
                             state,
-                            other,
+                            stack.reg(&meta, other_reg),
                             Hint::Default
                         ));
                         let rhs = match rhs {
@@ -541,9 +545,7 @@ fn step(
                                 let b = Convert::to_number(nogc, rhs.value())?;
                                 // IEEE `-0 + -0` yields +0; the spec demands -0
                                 let r = a + b;
-                                let r = if r == 0.0
-                                    && a.is_sign_negative()
-                                    && b.is_sign_negative()
+                                let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative()
                                 {
                                     -0.0
                                 } else {
@@ -851,7 +853,7 @@ fn step(
                     Ok(Coercion::Value(v)) => {
                         cache.set_acc(v);
                         Step::Next
-                    },
+                    }
                     Err(err) => Step::Error(err),
                 };
             }
@@ -929,93 +931,140 @@ fn step(
             Step::Next
         }
         Opcode::LessThan => {
-            // Abstract Relational Comparison: objects ToPrimitive'd with hint Number
-            let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(
-                vm,
-                heap,
-                state,
-                cache.acc(),
-                Hint::Number
-            ));
-            let x = match x {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
-            let y = match y {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let r = step_try!(Compare::less_than(&heap.guard(), x, y));
-            cache.set_acc(Convert::boolean(heap, r));
-            Step::Next
+            // Abstract Relational Comparison: objects ToPrimitive'd with
+            // hint Number; the coercions run user code (valueOf), so the
+            // left result stays rooted and the right operand is re-read
+            // from its register instead of a raw copy
+            state.handle_scope(|scope| {
+                let other_reg = ops.reg(0);
+                let x = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    cache.acc(),
+                    Hint::Number
+                ));
+                let x = match x {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let y = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    stack.reg(&meta, other_reg),
+                    Hint::Number
+                ));
+                let y = match y {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let r = step_try!(Compare::less_than(&heap.guard(), x.value(), y.value()));
+                cache.set_acc(Convert::boolean(heap, r));
+                Step::Next
+            })
         }
         Opcode::LessThanOrEqual => {
-            let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(
-                vm,
-                heap,
-                state,
-                cache.acc(),
-                Hint::Number
-            ));
-            let x = match x {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
-            let y = match y {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let r = step_try!(Compare::less_than_or_equal(&heap.guard(), x, y));
-            cache.set_acc(Convert::boolean(heap, r));
-            Step::Next
+            // Abstract Relational Comparison: objects ToPrimitive'd with
+            // hint Number; the coercions run user code (valueOf), so the
+            // left result stays rooted and the right operand is re-read
+            // from its register instead of a raw copy
+            state.handle_scope(|scope| {
+                let other_reg = ops.reg(0);
+                let x = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    cache.acc(),
+                    Hint::Number
+                ));
+                let x = match x {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let y = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    stack.reg(&meta, other_reg),
+                    Hint::Number
+                ));
+                let y = match y {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let r = step_try!(Compare::less_than_or_equal(&heap.guard(), x.value(), y.value()));
+                cache.set_acc(Convert::boolean(heap, r));
+                Step::Next
+            })
         }
         Opcode::GreaterThan => {
-            let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(
-                vm,
-                heap,
-                state,
-                cache.acc(),
-                Hint::Number
-            ));
-            let x = match x {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
-            let y = match y {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let r = step_try!(Compare::greater_than(&heap.guard(), x, y));
-            cache.set_acc(Convert::boolean(heap, r));
-            Step::Next
+            // Abstract Relational Comparison: objects ToPrimitive'd with
+            // hint Number; the coercions run user code (valueOf), so the
+            // left result stays rooted and the right operand is re-read
+            // from its register instead of a raw copy
+            state.handle_scope(|scope| {
+                let other_reg = ops.reg(0);
+                let x = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    cache.acc(),
+                    Hint::Number
+                ));
+                let x = match x {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let y = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    stack.reg(&meta, other_reg),
+                    Hint::Number
+                ));
+                let y = match y {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let r = step_try!(Compare::greater_than(&heap.guard(), x.value(), y.value()));
+                cache.set_acc(Convert::boolean(heap, r));
+                Step::Next
+            })
         }
         Opcode::GreaterThanOrEqual => {
-            let other = stack.reg(&meta, ops.reg(0));
-            let x = step_try!(Runtime::to_primitive(
-                vm,
-                heap,
-                state,
-                cache.acc(),
-                Hint::Number
-            ));
-            let x = match x {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let y = step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Number));
-            let y = match y {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => v,
-            };
-            let r = step_try!(Compare::greater_than_or_equal(&heap.guard(), x, y));
-            cache.set_acc(Convert::boolean(heap, r));
-            Step::Next
+            // Abstract Relational Comparison: objects ToPrimitive'd with
+            // hint Number; the coercions run user code (valueOf), so the
+            // left result stays rooted and the right operand is re-read
+            // from its register instead of a raw copy
+            state.handle_scope(|scope| {
+                let other_reg = ops.reg(0);
+                let x = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    cache.acc(),
+                    Hint::Number
+                ));
+                let x = match x {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let y = step_try!(Runtime::to_primitive(
+                    vm,
+                    heap,
+                    state,
+                    stack.reg(&meta, other_reg),
+                    Hint::Number
+                ));
+                let y = match y {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                let r = step_try!(Compare::greater_than_or_equal(&heap.guard(), x.value(), y.value()));
+                cache.set_acc(Convert::boolean(heap, r));
+                Step::Next
+            })
         }
         Opcode::Throw | Opcode::ReThrow => Step::Throw(cache.acc()),
         Opcode::CallRuntime => {
@@ -1194,13 +1243,14 @@ fn step(
             // receiver must stay rooted across it
             state.handle_scope(|scope| {
                 let receiver = scope.handle(stack.reg(&meta, ops.reg(0)));
-                let receiver = receiver.value();
                 let raw_key = cache.acc();
                 let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key))
                 else {
                     return Step::PendingThrow;
                 };
                 cache.set_acc(key);
+                // re-read through the handle: the coercion above allocated
+                let receiver = receiver.value();
                 // string primitives expose their code units as index
                 // properties (ES 5.4.3.1): `"ab"[1]` is "b". The one-unit
                 // string is allocated fresh — string comparison is by
@@ -1291,12 +1341,15 @@ fn step(
                     _ => StoreSemantics::Shadow,
                 };
                 let receiver = scope.handle(stack.reg(&meta, ops.reg(0)));
-                let receiver = receiver.value();
                 let raw = stack.reg(&meta, ops.reg(1));
                 let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
                     return Step::PendingThrow;
                 };
                 stack.set_reg(&meta, ops.reg(1), key);
+                // the receiver is re-read through its handle at every
+                // use: the key coercion above allocated and may have moved
+                // it (a raw snapshot would go stale)
+                let receiver = receiver.value();
                 // proxies run their `set` trap outside any no-GC scope
                 // (including array-element stores)
                 if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
