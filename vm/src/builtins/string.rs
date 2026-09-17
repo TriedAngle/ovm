@@ -3,7 +3,7 @@
 use super::helpers::wrapper_value;
 use crate::{Convert, GcSlice, Tagged, Value, VmError};
 
-pub(crate) fn string_constructor(
+pub fn string_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -29,7 +29,7 @@ pub(crate) fn string_constructor(
     })
 }
 
-pub(crate) fn string_value_of(
+pub fn string_value_of(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -39,7 +39,7 @@ pub(crate) fn string_value_of(
     })
 }
 
-pub(crate) fn string_to_string(
+pub fn string_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

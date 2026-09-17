@@ -8,7 +8,7 @@ use crate::{GcSlice, Tagged, Value, VmError};
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
 /// observable (`typeof`, future `Call`/`Construct` dispatch).
-pub(crate) fn proxy_constructor(
+pub fn proxy_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -46,7 +46,7 @@ pub(crate) fn proxy_constructor(
 /// `{ proxy, revoke }`; the revoke closure is the JS template installed
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
 /// hidden `__revokeProxy` native).
-pub(crate) fn proxy_revocable(
+pub fn proxy_revocable(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -115,7 +115,7 @@ pub(crate) fn proxy_revocable(
 /// Hidden `__revokeProxy(p)`: nulls the proxy's target/handler slots
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
-pub(crate) fn proxy_revoke(
+pub fn proxy_revoke(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -134,7 +134,7 @@ pub(crate) fn proxy_revoke(
 /// The revoke-closure template: `done` plays [[RevocableProxy]]'s
 /// cleared-slot role (idempotent revoke), the captured `p` keeps the
 /// proxy reachable.
-pub(crate) const REVOKE_PRELUDE: &str = r#"
+pub const REVOKE_PRELUDE: &str = r#"
 Function.prototype.__makeRevoke = function (p) {
   var done = false;
   return function revoke() {

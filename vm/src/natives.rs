@@ -32,7 +32,7 @@ impl<'a> NativeContext<'a> {
         }
     }
 
-    pub(crate) fn with_new_target(
+    pub fn with_new_target(
         vm: &'a VM,
         heap: &'a mut Heap,
         state: &'a ContextState,
@@ -62,7 +62,7 @@ impl<'a> NativeContext<'a> {
     }
 
     /// Split the context into its parts (for multi-borrow calls).
-    pub(crate) fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
+    pub fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
         (self.vm, &mut self.heap, self.state)
     }
 

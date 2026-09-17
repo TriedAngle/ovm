@@ -7,7 +7,7 @@ use crate::{Convert, GcSlice, Smi, Tagged, Value, VmError};
 /// arguments → `[]`; one non-negative Smi → that many holes (negative or
 /// non-integer numbers are a RangeError); otherwise the arguments are the
 /// elements.
-pub(crate) fn array_constructor(
+pub fn array_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -44,7 +44,7 @@ pub(crate) fn array_constructor(
 
 /// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):
 /// returns a fresh array-iterator over the receiver (CreateArrayIterator).
-pub(crate) fn array_values(
+pub fn array_values(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -75,7 +75,7 @@ pub(crate) fn array_values(
 
 /// `%ArrayIteratorPrototype%.next` (ES 23.1.5.2.1): one step over the
 /// iterated array, producing `{ value, done }`.
-pub(crate) fn array_iterator_next(
+pub fn array_iterator_next(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -147,7 +147,7 @@ pub(crate) fn array_iterator_next(
 }
 
 /// `%ArrayIteratorPrototype%[@@iterator]`: returns the receiver.
-pub(crate) fn array_iterator_symbol_iterator(
+pub fn array_iterator_symbol_iterator(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -156,7 +156,7 @@ pub(crate) fn array_iterator_symbol_iterator(
 }
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).
-pub(crate) fn array_is_array(
+pub fn array_is_array(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

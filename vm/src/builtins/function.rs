@@ -6,7 +6,7 @@ use crate::{Context, Convert, DenseString, GcSlice, Smi, Tagged, Value, VmError}
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
-pub(crate) fn function_to_string(
+pub fn function_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     _args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -19,7 +19,7 @@ pub(crate) fn function_to_string(
 }
 
 /// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.4).
-pub(crate) fn function_call(
+pub fn function_call(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -42,7 +42,7 @@ pub(crate) fn function_call(
 /// `Function.prototype.bind(thisArg, ...prepend)` (ES 20.2.3.5): the
 /// bound function is the JS closure template installed by BIND_PRELUDE,
 /// called with (target, thisArg, prepend-array).
-pub(crate) fn function_bind(
+pub fn function_bind(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -106,7 +106,7 @@ pub(crate) fn function_bind(
 }
 
 /// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.3).
-pub(crate) fn function_apply(
+pub fn function_apply(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -177,7 +177,7 @@ pub(crate) fn function_apply(
 /// this, prepend array). The native `function_bind` builds the prepend
 /// array and delegates here — the native registry holds stateless fn
 /// pointers, so the closure state must live in a JS closure.
-pub(crate) const BIND_PRELUDE: &str = r#"
+pub const BIND_PRELUDE: &str = r#"
 Function.prototype.__makeBound = function (f, t, p) {
   return function (...rest) {
     var all = [];
@@ -192,7 +192,7 @@ Function.prototype.__makeBound = function (f, t, p) {
 /// Builds `function (p0, p1, ...) { body }` and evaluates it in the global
 /// scope (approximated with the caller's context; the direct-eval pipeline
 /// provides the parsing).
-pub(crate) fn function_constructor(
+pub fn function_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

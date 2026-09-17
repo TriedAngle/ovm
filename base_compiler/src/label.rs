@@ -5,41 +5,41 @@
 //! the target is known.
 
 #[derive(Default)]
-pub(crate) struct Label {
+pub struct Label {
     pos: Option<usize>,
     patches: Vec<usize>,
 }
 
 impl Label {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
     /// Fix the label at the current pc.
-    pub(crate) fn bind(&mut self, code: &[u8]) {
+    pub fn bind(&mut self, code: &[u8]) {
         debug_assert!(self.pos.is_none(), "label bound twice");
         self.pos = Some(code.len());
     }
 
     /// Fix the label at an explicit pc (backward branches).
-    pub(crate) fn bind_at(&mut self, pc: usize) {
+    pub fn bind_at(&mut self, pc: usize) {
         debug_assert!(self.pos.is_none(), "label bound twice");
         self.pos = Some(pc);
     }
 
     /// Target pc: only valid after `bind`.
-    pub(crate) fn pos(&self) -> usize {
+    pub fn pos(&self) -> usize {
         self.pos.expect("label used before bind")
     }
 
     /// Record a jump at `jump_pc` (the pc of the jump instruction itself)
     /// that must land here; patched by [`patch_all`](Self::patch_all).
-    pub(crate) fn patch_here(&mut self, jump_pc: usize) {
+    pub fn patch_here(&mut self, jump_pc: usize) {
         self.patches.push(jump_pc);
     }
 
     /// Rewrite every recorded relative jump to target this label.
-    pub(crate) fn patch_all(&self, code: &mut [u8]) {
+    pub fn patch_all(&self, code: &mut [u8]) {
         let target = self.pos();
         for &jump_pc in &self.patches {
             patch_jump(code, jump_pc, target);
@@ -49,7 +49,7 @@ impl Label {
 
 /// Rewrite a relative jump operand at `jump_pc` to target `target_pc`.
 /// Jumps are always emitted forced-wide: `[Wide][op][offset:2]`.
-pub(crate) fn patch_jump(code: &mut [u8], jump_pc: usize, target_pc: usize) {
+pub fn patch_jump(code: &mut [u8], jump_pc: usize, target_pc: usize) {
     debug_assert_eq!(
         code[jump_pc],
         bytecode::Opcode::Wide as u8,

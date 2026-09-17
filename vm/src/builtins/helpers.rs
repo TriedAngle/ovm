@@ -8,7 +8,7 @@ use crate::{
     SlotName, Smi, Tagged, Value, VmError,
 };
 
-pub(crate) fn alloc_map(
+pub fn alloc_map(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
@@ -18,7 +18,7 @@ pub(crate) fn alloc_map(
     alloc_map_with_slots(heap, scope, roots, kind, prototype, 0)
 }
 
-pub(crate) fn alloc_map_with_slots(
+pub fn alloc_map_with_slots(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
@@ -39,7 +39,7 @@ pub(crate) fn alloc_map_with_slots(
 
 /// A native function object: `CALLABLE | CONSTRUCTOR | NATIVE`, slots[0] =
 /// native index, slots[1] = empty context, [[Prototype]] = Function.prototype.
-pub(crate) fn make_native_function(
+pub fn make_native_function(
     thread: &mut crate::Thread,
     scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
@@ -66,7 +66,7 @@ pub(crate) fn make_native_function(
 }
 
 /// A non-constructor native function (`Proxy.revocable`-style statics).
-pub(crate) fn make_native_plain_function(
+pub fn make_native_plain_function(
     thread: &mut crate::Thread,
     scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
@@ -93,7 +93,7 @@ pub(crate) fn make_native_plain_function(
 
 /// Compile and run a JS prelude once at install time (BIND_PRELUDE,
 /// REVOKE_PRELUDE): its top-level assignments install hidden helpers.
-pub(crate) fn run_prelude(
+pub fn run_prelude(
     thread: &mut crate::Thread,
     scope: &HandleScope<'_>,
     src: &str,
@@ -131,7 +131,7 @@ pub(crate) fn run_prelude(
 
 /// A constructor function + its prototype object (with `.constructor`),
 /// the function installed on the global object under `name`.
-pub(crate) fn install_constructor(
+pub fn install_constructor(
     thread: &mut crate::Thread,
     scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
@@ -177,7 +177,7 @@ pub(crate) fn install_constructor(
     Ok((fn_obj, proto))
 }
 
-pub(crate) fn install_method(
+pub fn install_method(
     thread: &mut crate::Thread,
     scope: &HandleScope<'_>,
     roots: &crate::RootHandles,
@@ -197,7 +197,7 @@ pub(crate) fn install_method(
 /// configurable: true} (ES 20.1.3-style attributes for prototype
 /// methods). Non-enumerability keeps for-in/`Object.keys` clean.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn define_method_prop(
+pub fn define_method_prop(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     object: crate::Global<Object>,
@@ -219,7 +219,7 @@ pub(crate) fn define_method_prop(
     Ok(())
 }
 
-pub(crate) fn define_data(
+pub fn define_data(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     object: crate::Global<Object>,
@@ -232,7 +232,7 @@ pub(crate) fn define_data(
 
 /// {writable: false, enumerable: false, configurable: true} — the spec
 /// attributes of builtin `length`/`name` properties.
-pub(crate) fn define_non_enumerable(
+pub fn define_non_enumerable(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     object: crate::Global<Object>,
@@ -255,7 +255,7 @@ pub(crate) fn define_non_enumerable(
 }
 
 /// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver.
-pub(crate) fn wrapper_value(heap: &Heap, receiver: Tagged<'_, Value>) -> Result<Value, VmError> {
+pub fn wrapper_value(heap: &Heap, receiver: Tagged<'_, Value>) -> Result<Value, VmError> {
     let Some(obj) = receiver.as_heap_object() else {
         return Err(VmError::Type);
     };

@@ -227,7 +227,7 @@ impl Thread {
     }
 
     /// Split the thread into its parts (multi-borrow calls).
-    pub(crate) fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
+    pub fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
         (&self.vm, &mut self.heap, &self.state)
     }
 

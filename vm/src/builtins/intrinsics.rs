@@ -20,7 +20,7 @@ use crate::{ContextState, VM};
 /// without an entry here is a compile error, and `NativeRegistry::new`
 /// registers them in `RuntimeFn::ALL` order so registry indices equal
 /// discriminants.
-pub(crate) fn runtime_fn(id: bytecode::RuntimeFn) -> NativeFn {
+pub fn runtime_fn(id: bytecode::RuntimeFn) -> NativeFn {
     match id {
         bytecode::RuntimeFn::GetIterator => get_iterator,
         bytecode::RuntimeFn::IteratorNext => iterator_next,
@@ -238,7 +238,7 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
 /// allocated (string comparisons are by content, so identity never
 /// shows). `None` when the receiver is not a string or `i` is out of
 /// range (ES 6.1.4: string indices are code units).
-pub(crate) fn string_char_at(
+pub fn string_char_at(
     heap: &mut Heap,
     scope: &crate::HandleScope<'_>,
     receiver: Value,

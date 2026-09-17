@@ -6,7 +6,7 @@ use crate::{
 };
 
 /// Stub: `Object.prototype.toString` returns "[object Object]".
-pub(crate) fn object_to_string(
+pub fn object_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     _args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -21,7 +21,7 @@ pub(crate) fn object_to_string(
 /// `Object(x)`: returns objects unchanged (boxing of primitives is not
 /// implemented yet); `new Object()`: the interpreter prepends the fresh
 /// receiver, so [[Construct]] just returns it.
-pub(crate) fn object_constructor(
+pub fn object_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -48,7 +48,7 @@ pub(crate) fn object_constructor(
 /// `Object.getPrototypeOf(o)`: the receiver's map prototype. Primitive
 /// arguments are a TypeError until ToObject boxing exists (ES5 behavior;
 /// ES2015+ boxes them).
-pub(crate) fn object_get_prototype_of(
+pub fn object_get_prototype_of(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -68,7 +68,7 @@ pub(crate) fn object_get_prototype_of(
 /// Own enumerable-property keys in specification order: integer indices
 /// ascending, then string keys in insertion order (ES 8.6.2, the
 /// descriptors array is insertion-ordered).
-pub(crate) fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
+pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
     let mut keys = Vec::new();
     let Some(obj) = target.as_heap_object() else {
         return keys;
@@ -94,7 +94,7 @@ pub(crate) fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<V
 
 /// `Object.prototype.hasOwnProperty(key)` (ES 20.4.3.2, own properties
 /// only).
-pub(crate) fn object_has_own_property(
+pub fn object_has_own_property(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -146,7 +146,7 @@ pub(crate) fn object_has_own_property(
 }
 
 /// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
-pub(crate) fn object_property_is_enumerable(
+pub fn object_property_is_enumerable(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -207,7 +207,7 @@ pub(crate) fn object_property_is_enumerable(
 }
 
 /// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
-pub(crate) fn object_get_own_property_names(
+pub fn object_get_own_property_names(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -235,7 +235,7 @@ pub(crate) fn object_get_own_property_names(
 }
 
 /// Build a plain `{ key: value, ... }` object from static field names.
-pub(crate) fn plain_object(
+pub fn plain_object(
     nctx: &mut crate::natives::NativeContext<'_>,
     fields: &[(&'static str, Handle<'_, Value>)],
 ) -> Result<Value, VmError> {
@@ -265,7 +265,7 @@ pub(crate) fn plain_object(
 /// `Object.getOwnPropertyDescriptor(O, P)` (ES 20.1.2.5): the shared
 /// raw descriptor reader (`lookup::ordinary_own_descriptor`) converted
 /// to a descriptor object via FromPropertyDescriptor semantics.
-pub(crate) fn object_get_own_property_descriptor(
+pub fn object_get_own_property_descriptor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -349,7 +349,7 @@ pub(crate) fn object_get_own_property_descriptor(
 /// `Object.defineProperty(O, P, Attributes)` (ES 20.1.2.4):
 /// ToPropertyDescriptor + [[DefineOwnProperty]] (through the
 /// `defineProperty` trap for proxy receivers, ES 20.2.5.6).
-pub(crate) fn object_define_property(
+pub fn object_define_property(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -410,7 +410,7 @@ pub(crate) fn object_define_property(
     })
 }
 
-pub(crate) fn object_set_prototype_of(
+pub fn object_set_prototype_of(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -454,7 +454,7 @@ pub(crate) fn object_set_prototype_of(
 
 /// `Object.preventExtensions(O)` (ES 20.1.2.16): through the
 /// `preventExtensions` trap for proxies (ES 20.2.5.3).
-pub(crate) fn object_prevent_extensions(
+pub fn object_prevent_extensions(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -507,7 +507,7 @@ pub(crate) fn object_prevent_extensions(
 
 /// `Object.isExtensible(O)` (ES 20.1.2.14): primitives are `false`;
 /// proxies run the `isExtensible` trap with its must-match invariant.
-pub(crate) fn object_is_extensible(
+pub fn object_is_extensible(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -537,7 +537,7 @@ pub(crate) fn object_is_extensible(
 /// descriptor and EXTENDABLE dropped. Dense array elements keep their
 /// intrinsic attributes (TODO: element sealing with the elements
 /// machinery).
-pub(crate) fn set_integrity_flags(
+pub fn set_integrity_flags(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
     obj: Handle<'_, Object>,
@@ -600,7 +600,7 @@ pub(crate) fn set_integrity_flags(
 }
 
 /// `Object.seal(O)` (ES 20.1.2.17).
-pub(crate) fn object_seal(
+pub fn object_seal(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -662,7 +662,7 @@ pub(crate) fn object_seal(
 }
 
 /// `Object.freeze(O)` (ES 20.1.2.9).
-pub(crate) fn object_freeze(
+pub fn object_freeze(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

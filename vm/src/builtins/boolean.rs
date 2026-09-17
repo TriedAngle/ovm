@@ -3,7 +3,7 @@
 use super::helpers::wrapper_value;
 use crate::{Convert, GcSlice, Tagged, Value, VmError};
 
-pub(crate) fn boolean_constructor(
+pub fn boolean_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -26,7 +26,7 @@ pub(crate) fn boolean_constructor(
     })
 }
 
-pub(crate) fn boolean_value_of(
+pub fn boolean_value_of(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -36,7 +36,7 @@ pub(crate) fn boolean_value_of(
     })
 }
 
-pub(crate) fn boolean_to_string(
+pub fn boolean_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

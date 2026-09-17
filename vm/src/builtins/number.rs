@@ -3,7 +3,7 @@
 use super::helpers::wrapper_value;
 use crate::{Convert, GcSlice, Smi, Tagged, Value, VmError, runtime::Runtime};
 
-pub(crate) fn number_constructor(
+pub fn number_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -31,7 +31,7 @@ pub(crate) fn number_constructor(
     })
 }
 
-pub(crate) fn number_value_of(
+pub fn number_value_of(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -41,7 +41,7 @@ pub(crate) fn number_value_of(
     })
 }
 
-pub(crate) fn number_to_string(
+pub fn number_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

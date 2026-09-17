@@ -75,7 +75,7 @@ pub struct AllocToken<'heap> {
 }
 
 impl<'heap> AllocToken<'heap> {
-    pub(crate) fn new(heap: &'heap mut Heap, raw: NonNull<u8>, total: Layout) -> Self {
+    pub fn new(heap: &'heap mut Heap, raw: NonNull<u8>, total: Layout) -> Self {
         Self {
             heap,
             next: Cell::new(raw.as_ptr()),
@@ -242,7 +242,7 @@ impl<T> GcSlot<T> {
         unsafe { Tagged::from_value_unchecked(Value::from_bits(self.cell.load())) }
     }
 
-    pub(crate) fn inner(&self) -> Value {
+    pub fn inner(&self) -> Value {
         Value::from_bits(self.cell.load())
     }
 
@@ -302,7 +302,7 @@ impl<T> OptionGcSlot<T> {
         }
     }
 
-    pub(crate) fn inner(&self) -> Value {
+    pub fn inner(&self) -> Value {
         self.slot.inner()
     }
 
@@ -357,7 +357,7 @@ impl Register {
         Smi::decode(Value::from_bits(self.0.load())).expect("register holds a Smi")
     }
 
-    pub(crate) fn inner(&self) -> Value {
+    pub fn inner(&self) -> Value {
         Value::from_bits(self.0.load())
     }
 
