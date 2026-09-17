@@ -54,20 +54,32 @@ fn start(
     base_depth: usize,
 ) -> Result<Value, VmError> {
     if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, callable.value())) {
-        let argv: Vec<Value> = args.as_slice().to_vec();
-        let callee = callable.value();
-        let result = match new_target {
-            None => crate::proxy::apply(vm, heap, state, callee, &argv),
-            Some(nt) => {
-                let real: Vec<Value> = argv.iter().skip(1).copied().collect();
-                let nt = nt.value();
-                crate::proxy::construct(vm, heap, state, callee, &real, nt)
+        // no raw copies: stage the args into GC-visited stack memory —
+        // trap lookups may run user getters, so raw Vecs would go stale
+        return state.handle_scope(|scope| {
+            let argv = args.as_slice();
+            let callee = callable.value();
+            let result = match new_target {
+                None => crate::proxy::apply(vm, heap, state, callee, argv),
+                Some(nt) => {
+                    let real: Vec<Value> = argv.iter().skip(1).copied().collect();
+                    let nt = nt.value();
+                    crate::proxy::construct(
+                        vm,
+                        heap,
+                        state,
+                        callee,
+                        scope.stage(&real).as_slice(),
+                        nt,
+                    )
+                }
+            };
+            match result {
+                Ok(Coercion::Threw) => Ok(heap.known().exception.value()),
+                Ok(Coercion::Value(v)) => Ok(v),
+                Err(e) => Err(e),
             }
-        };
-        return match result? {
-            Coercion::Threw => Ok(heap.known().exception.value()),
-            Coercion::Value(v) => Ok(v),
-        };
+        });
     }
     match call_target(&heap.guard(), callable.value()) {
         Some(CallTarget::Native(idx)) => {
@@ -182,11 +194,14 @@ fn call_value(
     // via a nested run — their callable state lives on a ProxyObject,
     // not in function slots
     if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, f)) {
-        let argv: Vec<Value> = args.to_vec();
-        return match crate::proxy::apply(vm, heap, state, f, &argv)? {
-            Coercion::Threw => Ok(Called::Threw),
-            Coercion::Value(v) => Ok(Called::Immediate(v)),
-        };
+        return state.handle_scope(|scope| {
+            // staged: trap lookups may run user getters
+            let argv = args.to_vec();
+            match crate::proxy::apply(vm, heap, state, f, scope.stage(&argv).as_slice())? {
+                Coercion::Threw => Ok(Called::Threw),
+                Coercion::Value(v) => Ok(Called::Immediate(v)),
+            }
+        });
     }
     let target = call_target(&heap.guard(), f);
     // TODO: native getters/setters invoke in place instead of pushing a frame
@@ -473,57 +488,76 @@ fn step(
                 }
             }
             match result {
-                Some(v) => cache.set_acc(v),
+                Some(v) => {
+                    cache.set_acc(v);
+                    Step::Next
+                }
                 None => {
-                    let lhs = step_try!(Runtime::to_primitive(
-                        vm,
-                        heap,
-                        state,
-                        cache.acc(),
-                        Hint::Default
-                    ));
-                    let lhs = match lhs {
-                        Coercion::Threw => return Step::PendingThrow,
-                        Coercion::Value(v) => v,
-                    };
-                    let rhs =
-                        step_try!(Runtime::to_primitive(vm, heap, state, other, Hint::Default));
-                    let rhs = match rhs {
-                        Coercion::Threw => return Step::PendingThrow,
-                        Coercion::Value(v) => v,
-                    };
-                    let is_string = heap.no_gc(|nogc| {
-                        (
-                            lhs.get_as::<DenseString>(nogc).is_some(),
-                            rhs.get_as::<DenseString>(nogc).is_some(),
-                        )
-                    });
-                    if is_string.0 || is_string.1 {
-                        let s = step_try!(state.handle_scope(|scope| {
-                            let a = Convert::to_string(heap, &scope, lhs)?;
-                            let b = Convert::to_string(heap, &scope, rhs)?;
-                            Ok::<_, VmError>(DenseString::concat(heap, &scope, a, b).value())
-                        }));
-                        cache.set_acc(s);
-                    } else {
-                        let r = step_try!(heap.no_gc(|nogc| {
-                            let a = Convert::to_number(nogc, lhs)?;
-                            let b = Convert::to_number(nogc, rhs)?;
-                            // IEEE `-0 + -0` yields +0; the spec demands -0
-                            let r = a + b;
-                            let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative() {
-                                -0.0
-                            } else {
-                                r
-                            };
-                            Ok::<_, VmError>(r)
-                        }));
-                        let v = state.handle_scope(|scope| heap.new_number(&scope, r));
-                        cache.set_acc(v);
-                    }
+                    state.handle_scope(|scope| {
+                        // to_primitive may run user code and to_string
+                        // allocates: the coerced operands must stay rooted
+                        // across the sibling coercion
+                        let lhs = step_try!(Runtime::to_primitive(
+                            vm,
+                            heap,
+                            state,
+                            cache.acc(),
+                            Hint::Default
+                        ));
+                        let lhs = match lhs {
+                            Coercion::Threw => return Step::PendingThrow,
+                            Coercion::Value(v) => scope.handle(v),
+                        };
+                        let rhs = step_try!(Runtime::to_primitive(
+                            vm,
+                            heap,
+                            state,
+                            other,
+                            Hint::Default
+                        ));
+                        let rhs = match rhs {
+                            Coercion::Threw => return Step::PendingThrow,
+                            Coercion::Value(v) => scope.handle(v),
+                        };
+                        let is_string = heap.no_gc(|nogc| {
+                            (
+                                lhs.value().get_as::<DenseString>(nogc).is_some(),
+                                rhs.value().get_as::<DenseString>(nogc).is_some(),
+                            )
+                        });
+                        if is_string.0 || is_string.1 {
+                            let s = step_try!((|| -> Result<Value, VmError> {
+                                let a = Convert::to_string(heap, &scope, lhs.value())?;
+                                // to_string of the sibling allocates: keep
+                                // this side rooted until the concat reads it
+                                let a = scope.handle(a);
+                                let b = Convert::to_string(heap, &scope, rhs.value())?;
+                                Ok(DenseString::concat(heap, &scope, a.value(), b).value())
+                            })());
+                            cache.set_acc(s);
+                        } else {
+                            let r = step_try!(heap.no_gc(|nogc| {
+                                let a = Convert::to_number(nogc, lhs.value())?;
+                                let b = Convert::to_number(nogc, rhs.value())?;
+                                // IEEE `-0 + -0` yields +0; the spec demands -0
+                                let r = a + b;
+                                let r = if r == 0.0
+                                    && a.is_sign_negative()
+                                    && b.is_sign_negative()
+                                {
+                                    -0.0
+                                } else {
+                                    r
+                                };
+                                Ok::<_, VmError>(r)
+                            }));
+                            let v = heap.new_number(&scope, r);
+                            cache.set_acc(v);
+                        }
+                        Step::Next
+                    })
                 }
             }
-            Step::Next
         }
         Opcode::Sub => {
             let other = stack.reg(&meta, ops.reg(0));
@@ -798,18 +832,26 @@ fn step(
             if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, stack.reg(&meta, ops.reg(0)))) {
                 let callee = stack.reg(&meta, ops.reg(0));
                 let count = ops.reg_count(2);
-                let argv: Vec<Value> = stack
-                    .args(&meta, ops.reg_list(1), count)
-                    .as_slice()
-                    .to_vec();
-                return match state.handle_scope(|_scope| {
-                    crate::proxy::construct(vm, heap, state, callee, &argv, callee)
+                return match state.handle_scope(|scope| {
+                    // staged: trap lookups may run user getters
+                    let argv = stack
+                        .args(&meta, ops.reg_list(1), count)
+                        .as_slice()
+                        .to_vec();
+                    crate::proxy::construct(
+                        vm,
+                        heap,
+                        state,
+                        callee,
+                        scope.stage(&argv).as_slice(),
+                        callee,
+                    )
                 }) {
                     Ok(Coercion::Threw) => Step::PendingThrow,
                     Ok(Coercion::Value(v)) => {
                         cache.set_acc(v);
                         Step::Next
-                    }
+                    },
                     Err(err) => Step::Error(err),
                 };
             }
@@ -1002,13 +1044,14 @@ fn step(
             // a callable proxy dispatches through its `apply` trap (or
             // a nested call of the target)
             if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, callee)) {
-                let argv: Vec<Value> = stack
-                    .args(&meta, ops.reg_list(1), count)
-                    .as_slice()
-                    .to_vec();
-                return match state
-                    .handle_scope(|_scope| crate::proxy::apply(vm, heap, state, callee, &argv))
-                {
+                return match state.handle_scope(|scope| {
+                    // staged: trap lookups may run user getters
+                    let argv = stack
+                        .args(&meta, ops.reg_list(1), count)
+                        .as_slice()
+                        .to_vec();
+                    crate::proxy::apply(vm, heap, state, callee, scope.stage(&argv).as_slice())
+                }) {
                     Ok(Coercion::Threw) => Step::PendingThrow,
                     Ok(Coercion::Value(v)) => {
                         cache.set_acc(v);
@@ -1147,155 +1190,168 @@ fn step(
             Step::Next
         }
         Opcode::LoadKeyedProperty => {
-            let receiver = stack.reg(&meta, ops.reg(0));
-            let raw_key = cache.acc();
-            let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key)) else {
-                return Step::PendingThrow;
-            };
-            cache.set_acc(key);
-            // string primitives expose their code units as index
-            // properties (ES 5.4.3.1): `"ab"[1]` is "b". The one-unit
-            // string is allocated fresh — string comparison is by
-            // content, so identity is unobservable. Out-of-range and
-            // non-string receivers fall through to the ordinary path.
-            let string_index = heap.no_gc(|nogc| match classify_key(nogc, key) {
-                Ok(Key::Element(i)) if receiver.get_as::<DenseString>(nogc).is_some() => Some(i),
-                _ => None,
-            });
-            if let Some(i) = string_index {
-                let unit = state.handle_scope(|scope| {
-                    crate::builtins::intrinsics::string_char_at(heap, &scope, receiver, i)
-                });
-                if let Some(unit) = unit {
-                    cache.set_acc(unit);
-                    return Step::Next;
-                }
-            }
-            // proxies run their `get` trap outside any no-GC scope
-            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
-                return match step_try!(crate::proxy::get(
-                    vm,
-                    heap,
-                    state,
-                    receiver,
-                    receiver,
-                    cache.acc()
-                )) {
-                    Coercion::Threw => Step::PendingThrow,
-                    Coercion::Value(v) => {
-                        cache.set_acc(v);
-                        Step::Next
-                    }
+            // the key coercion allocates (to_property_key interns): the
+            // receiver must stay rooted across it
+            state.handle_scope(|scope| {
+                let receiver = scope.handle(stack.reg(&meta, ops.reg(0)));
+                let receiver = receiver.value();
+                let raw_key = cache.acc();
+                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key))
+                else {
+                    return Step::PendingThrow;
                 };
-            }
-            let outcome = step_try!(heap.no_gc(|nogc| {
-                match classify_key(nogc, cache.acc())? {
-                    Key::Element(i) => match receiver
-                        .as_heap_object(nogc)
-                        .and_then(|obj| obj.as_ref().element_value(nogc, i))
-                    {
-                        Some(v) => Ok(LoadOutcome::Value(v)),
-                        // past the end, a hole, or a non-array receiver:
-                        // fall back to an ordinary property lookup
-                        None => load_outcome(
-                            nogc,
-                            receiver,
-                            SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                        ),
-                    },
-                    Key::Name(name) => load_outcome(nogc, receiver, name),
-                }
-            }));
-            match outcome {
-                LoadOutcome::Value(v) => cache.set_acc(v),
-                LoadOutcome::Getter(getter) => {
-                    match step_try!(call_value(
-                        vm,
-                        state,
-                        heap,
-                        stack,
-                        cache,
-                        meta,
-                        pc,
-                        getter,
-                        &[receiver]
-                    )) {
-                        Called::Frame => {}
-                        Called::NotCallable => {
-                            cache.set_acc(heap.known().undefined.value());
-                        }
-                        Called::Immediate(v) => cache.set_acc(v),
-                        Called::Threw => return Step::PendingThrow,
+                cache.set_acc(key);
+                // string primitives expose their code units as index
+                // properties (ES 5.4.3.1): `"ab"[1]` is "b". The one-unit
+                // string is allocated fresh — string comparison is by
+                // content, so identity is unobservable. Out-of-range and
+                // non-string receivers fall through to the ordinary path.
+                let string_index = heap.no_gc(|nogc| match classify_key(nogc, key) {
+                    Ok(Key::Element(i)) if receiver.get_as::<DenseString>(nogc).is_some() => {
+                        Some(i)
+                    }
+                    _ => None,
+                });
+                if let Some(i) = string_index {
+                    let unit = state.handle_scope(|scope| {
+                        crate::builtins::intrinsics::string_char_at(heap, &scope, receiver, i)
+                    });
+                    if let Some(unit) = unit {
+                        cache.set_acc(unit);
+                        return Step::Next;
                     }
                 }
-            }
-            Step::Next
+                // proxies run their `get` trap outside any no-GC scope
+                if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                    return match step_try!(crate::proxy::get(
+                        vm,
+                        heap,
+                        state,
+                        receiver,
+                        receiver,
+                        cache.acc()
+                    )) {
+                        Coercion::Threw => Step::PendingThrow,
+                        Coercion::Value(v) => {
+                            cache.set_acc(v);
+                            Step::Next
+                        }
+                    };
+                }
+                let outcome = step_try!(heap.no_gc(|nogc| {
+                    match classify_key(nogc, cache.acc())? {
+                        Key::Element(i) => match receiver
+                            .as_heap_object(nogc)
+                            .and_then(|obj| obj.as_ref().element_value(nogc, i))
+                        {
+                            Some(v) => Ok(LoadOutcome::Value(v)),
+                            // past the end, a hole, or a non-array receiver:
+                            // fall back to an ordinary property lookup
+                            None => load_outcome(
+                                nogc,
+                                receiver,
+                                SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                            ),
+                        },
+                        Key::Name(name) => load_outcome(nogc, receiver, name),
+                    }
+                }));
+                match outcome {
+                    LoadOutcome::Value(v) => cache.set_acc(v),
+                    LoadOutcome::Getter(getter) => {
+                        match step_try!(call_value(
+                            vm,
+                            state,
+                            heap,
+                            stack,
+                            cache,
+                            meta,
+                            pc,
+                            getter,
+                            &[receiver],
+                        )) {
+                            Called::Frame => {}
+                            Called::NotCallable => {
+                                cache.set_acc(heap.known().undefined.value());
+                            }
+                            Called::Immediate(v) => cache.set_acc(v),
+                            Called::Threw => return Step::PendingThrow,
+                        }
+                    }
+                }
+                Step::Next
+            })
         }
         Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyNoShadow => {
-            let semantics = match op {
-                Opcode::StoreKeyedPropertyNoShadow => StoreSemantics::WriteThrough,
-                _ => StoreSemantics::Shadow,
-            };
-            let receiver = stack.reg(&meta, ops.reg(0));
-            let raw = stack.reg(&meta, ops.reg(1));
-            let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
-                return Step::PendingThrow;
-            };
-            stack.set_reg(&meta, ops.reg(1), key);
-            // proxies run their `set` trap outside any no-GC scope
-            // (including array-element stores)
-            if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
-                return match step_try!(crate::proxy::set(
-                    vm,
-                    heap,
-                    state,
-                    receiver,
-                    key,
-                    cache.acc(),
-                    receiver
-                )) {
-                    Coercion::Threw => Step::PendingThrow,
-                    Coercion::Value(_) => Step::Next,
+            // the key coercion allocates (to_property_key interns): the
+            // receiver must stay rooted across it
+            state.handle_scope(|scope| {
+                let semantics = match op {
+                    Opcode::StoreKeyedPropertyNoShadow => StoreSemantics::WriteThrough,
+                    _ => StoreSemantics::Shadow,
                 };
-            }
-            let key = step_try!(classify_key(&heap.guard(), key));
-            match key {
-                Key::Element(i) => {
-                    let is_array = heap.no_gc(|nogc| {
-                        let Some(obj) = receiver.as_heap_object(nogc) else {
-                            return false;
-                        };
-                        obj.as_ref().is_array(nogc)
-                    });
-                    if is_array {
-                        step_try!(state.handle_scope(|scope| {
-                            store_array_element(heap, &scope, receiver, i, cache.acc())
-                        }));
-                    } else {
-                        // numeric property on a non-array receiver
+                let receiver = scope.handle(stack.reg(&meta, ops.reg(0)));
+                let receiver = receiver.value();
+                let raw = stack.reg(&meta, ops.reg(1));
+                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
+                    return Step::PendingThrow;
+                };
+                stack.set_reg(&meta, ops.reg(1), key);
+                // proxies run their `set` trap outside any no-GC scope
+                // (including array-element stores)
+                if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+                    return match step_try!(crate::proxy::set(
+                        vm,
+                        heap,
+                        state,
+                        receiver,
+                        key,
+                        cache.acc(),
+                        receiver
+                    )) {
+                        Coercion::Threw => Step::PendingThrow,
+                        Coercion::Value(_) => Step::Next,
+                    };
+                }
+                let key = step_try!(classify_key(&heap.guard(), key));
+                match key {
+                    Key::Element(i) => {
+                        let is_array = heap.no_gc(|nogc| {
+                            let Some(obj) = receiver.as_heap_object(nogc) else {
+                                return false;
+                            };
+                            obj.as_ref().is_array(nogc)
+                        });
+                        if is_array {
+                            step_try!(state.handle_scope(|scope| {
+                                store_array_element(heap, &scope, receiver, i, cache.acc())
+                            }));
+                        } else {
+                            // numeric property on a non-array receiver
+                            let outcome = step_try!(heap.no_gc(|nogc| {
+                                receiver.store_lookup(
+                                    nogc,
+                                    SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                                    cache.acc(),
+                                    semantics,
+                                )
+                            }));
+                            step_try!(apply_store_outcome(
+                                vm, heap, state, stack, cache, meta, pc, receiver, outcome,
+                            ));
+                        }
+                    }
+                    Key::Name(name) => {
                         let outcome = step_try!(heap.no_gc(|nogc| {
-                            receiver.store_lookup(
-                                nogc,
-                                SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-                                cache.acc(),
-                                semantics,
-                            )
+                            receiver.store_lookup(nogc, name, cache.acc(), semantics)
                         }));
                         step_try!(apply_store_outcome(
                             vm, heap, state, stack, cache, meta, pc, receiver, outcome,
                         ));
                     }
                 }
-                Key::Name(name) => {
-                    let outcome = step_try!(heap.no_gc(|nogc| {
-                        receiver.store_lookup(nogc, name, cache.acc(), semantics)
-                    }));
-                    step_try!(apply_store_outcome(
-                        vm, heap, state, stack, cache, meta, pc, receiver, outcome,
-                    ));
-                }
-            }
-            Step::Next
+                Step::Next
+            })
         }
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {

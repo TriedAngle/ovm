@@ -319,30 +319,38 @@ pub(crate) fn object_prevent_extensions(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let target = args.get(1).ok_or(VmError::Arity)?;
+    let raw_target = args.get(1).ok_or(VmError::Arity)?;
     let nullish = nctx.heap().no_gc(|nogc| {
-        target == nogc.known().null.value() || target == nogc.known().undefined.value()
+        raw_target == nogc.known().null.value() || raw_target == nogc.known().undefined.value()
     });
     if nullish {
         return Err(VmError::Type);
     }
-    if !nctx
-        .heap()
-        .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
-    {
-        return Ok(target); // primitives returned unchanged
-    }
-    let (vm, heap, state) = nctx.split();
-    match crate::proxy::prevent_extensions(vm, heap, state, target)? {
-        crate::runtime::Coercion::Threw => Ok(heap.known().exception.value()),
-        crate::runtime::Coercion::Value(v) => {
-            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
-                Err(VmError::Message("object is not extensible"))
-            } else {
-                Ok(target)
+    // the (possibly proxy) receiver is returned after traps ran user
+    // code: keep it rooted across the call
+    nctx.handle_scope(|nctx, scope| {
+        let target_handle = scope.handle(raw_target);
+        let target = target_handle.value();
+        if !nctx
+            .heap()
+            .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
+        {
+            return Ok(target); // primitives returned unchanged
+        }
+        let (vm, heap, state) = nctx.split();
+        match crate::proxy::prevent_extensions(vm, heap, state, target)? {
+            crate::runtime::Coercion::Threw => Ok(heap.known().exception.value()),
+            crate::runtime::Coercion::Value(v) => {
+                if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
+                    Err(VmError::Message("object is not extensible"))
+                } else {
+                    // re-read through the handle: the trap above ran user
+                    // code and may have moved the receiver
+                    Ok(target_handle.value())
+                }
             }
         }
-    }
+    })
 }
 
 /// `Object.isExtensible(O)` (ES 20.1.2.14): primitives are `false`;
@@ -427,39 +435,45 @@ pub(crate) fn object_seal(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let target = args.get(1).ok_or(VmError::Arity)?;
+    let raw_target = args.get(1).ok_or(VmError::Arity)?;
     let nullish = nctx.heap().no_gc(|nogc| {
-        target == nogc.known().null.value() || target == nogc.known().undefined.value()
+        raw_target == nogc.known().null.value() || raw_target == nogc.known().undefined.value()
     });
     if nullish {
         return Err(VmError::Type);
     }
-    if !nctx
-        .heap()
-        .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
-    {
-        return Ok(target);
-    }
-    let (vm, heap, state) = nctx.split();
-    // [[PreventExtensions]] first (traps included)
-    match crate::proxy::prevent_extensions(vm, heap, state, target)? {
-        crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
-        crate::runtime::Coercion::Value(v) => {
-            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
-                return Err(VmError::Message("object is not extensible"));
+    // traps run user code before the receiver is returned: keep it rooted
+    nctx.handle_scope(|nctx, scope| {
+        let target_handle = scope.handle(raw_target);
+        let target = target_handle.value();
+        if !nctx
+            .heap()
+            .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
+        {
+            return Ok(target);
+        }
+        let (vm, heap, state) = nctx.split();
+        // [[PreventExtensions]] first (traps included)
+        match crate::proxy::prevent_extensions(vm, heap, state, target)? {
+            crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
+            crate::runtime::Coercion::Value(v) => {
+                if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
+                    return Err(VmError::Message("object is not extensible"));
+                }
             }
         }
-    }
-    // TODO: per-key [[DefineOwnProperty]] through the defineProperty
-    // trap once ownKeys lands (proxy targets); ordinary targets:
-    let (_, heap, _) = nctx.split();
-    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, target)) {
-        return Ok(target);
-    }
-    nctx.handle_scope(|nctx, scope| {
+        // TODO: per-key [[DefineOwnProperty]] through the defineProperty
+        // trap once ownKeys lands (proxy targets); ordinary targets:
+        let (_, heap, _) = nctx.split();
+        // re-read through the handle: the trap may have moved the receiver
+        let target = target_handle.value();
+        if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, target)) {
+            return Ok(target);
+        }
         let obj = scope.cast::<Object>(target).expect("checked above");
         set_integrity_flags(nctx.heap(), &scope, obj, false);
-        Ok(target)
+        // re-read through the handle: traps may have moved the receiver
+        Ok(target_handle.value())
     })
 }
 
@@ -468,35 +482,41 @@ pub(crate) fn object_freeze(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let target = args.get(1).ok_or(VmError::Arity)?;
+    let raw_target = args.get(1).ok_or(VmError::Arity)?;
     let nullish = nctx.heap().no_gc(|nogc| {
-        target == nogc.known().null.value() || target == nogc.known().undefined.value()
+        raw_target == nogc.known().null.value() || raw_target == nogc.known().undefined.value()
     });
     if nullish {
         return Err(VmError::Type);
     }
-    if !nctx
-        .heap()
-        .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
-    {
-        return Ok(target);
-    }
-    let (vm, heap, state) = nctx.split();
-    match crate::proxy::prevent_extensions(vm, heap, state, target)? {
-        crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
-        crate::runtime::Coercion::Value(v) => {
-            if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
-                return Err(VmError::Message("object is not extensible"));
+    // traps run user code before the receiver is returned: keep it rooted
+    nctx.handle_scope(|nctx, scope| {
+        let target_handle = scope.handle(raw_target);
+        let target = target_handle.value();
+        if !nctx
+            .heap()
+            .no_gc(|nogc| crate::proxy::is_js_receiver(nogc, target))
+        {
+            return Ok(target);
+        }
+        let (vm, heap, state) = nctx.split();
+        match crate::proxy::prevent_extensions(vm, heap, state, target)? {
+            crate::runtime::Coercion::Threw => return Ok(heap.known().exception.value()),
+            crate::runtime::Coercion::Value(v) => {
+                if !heap.no_gc(|nogc| Convert::is_truthy(nogc, v)) {
+                    return Err(VmError::Message("object is not extensible"));
+                }
             }
         }
-    }
-    let (_, heap, _) = nctx.split();
-    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, target)) {
-        return Ok(target);
-    }
-    nctx.handle_scope(|nctx, scope| {
+        let (_, heap, _) = nctx.split();
+        // re-read through the handle: the trap may have moved the receiver
+        let target = target_handle.value();
+        if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, target)) {
+            return Ok(target);
+        }
         let obj = scope.cast::<Object>(target).expect("checked above");
         set_integrity_flags(nctx.heap(), &scope, obj, true);
-        Ok(target)
+        // re-read through the handle: traps may have moved the receiver
+        Ok(target_handle.value())
     })
 }
