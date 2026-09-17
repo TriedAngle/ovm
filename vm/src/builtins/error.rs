@@ -6,28 +6,28 @@ use crate::{
     Value, VmError, runtime::Runtime,
 };
 
-pub(crate) fn error_constructor(
+pub fn error_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "Error")
 }
 
-pub(crate) fn type_error_constructor(
+pub fn type_error_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "TypeError")
 }
 
-pub(crate) fn reference_error_constructor(
+pub fn reference_error_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "ReferenceError")
 }
 
-pub(crate) fn make_error(
+pub fn make_error(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
     class: &str,
@@ -80,7 +80,7 @@ pub(crate) fn make_error(
     })
 }
 
-pub(crate) fn error_to_string(
+pub fn error_to_string(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -119,7 +119,7 @@ pub(crate) fn error_to_string(
     })
 }
 
-pub(crate) fn get_property(
+pub fn get_property(
     vm: &VM,
     heap: &mut Heap,
     state: &ContextState,

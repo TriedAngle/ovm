@@ -5,7 +5,7 @@ use crate::{DenseString, GcSlice, Symbol, Value, VmError};
 /// `Symbol(desc)`: a fresh Symbol primitive (ES 20.4.1.1). This minimal
 /// surface exists so user code can author iterables
 /// (`obj[Symbol.iterator] = ...`); `Symbol.iterator` is the well-known one.
-pub(crate) fn symbol_constructor(
+pub fn symbol_constructor(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

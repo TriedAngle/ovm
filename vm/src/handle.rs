@@ -54,7 +54,7 @@ impl<'s, T> Handle<'s, T> {
         unsafe { Tagged::from_value_unchecked(*self.location.as_ptr()) }
     }
 
-    pub(crate) unsafe fn read_unchecked(self) -> Value {
+    pub unsafe fn read_unchecked(self) -> Value {
         unsafe { *self.location.as_ptr() }
     }
 
@@ -226,7 +226,7 @@ impl<'d> HandleScope<'d> {
     /// Stage raw words. Crate-internal: every word must be a currently
     /// valid value (read under a still-live heap borrow, no GC since) —
     /// the words are copied into rooted slots immediately.
-    pub(crate) fn stage_words(&self, words: &[Value]) -> GcSlice<'_> {
+    pub fn stage_words(&self, words: &[Value]) -> GcSlice<'_> {
         let inner = unsafe { &*self.data.as_ptr() }.inner();
         let start = inner.allocate_block(words.len());
         for (i, v) in words.iter().enumerate() {
@@ -396,7 +396,7 @@ impl<'a> GcSlice<'a> {
 
     /// Raw words, for storage copies into fresh objects (no GC can run
     /// mid-`init`).
-    pub(crate) fn words(&self) -> &'a [Value] {
+    pub fn words(&self) -> &'a [Value] {
         self.slice
     }
 

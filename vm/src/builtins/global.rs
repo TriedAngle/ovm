@@ -4,7 +4,7 @@ use crate::materialize::materialize_closure_vm;
 use crate::{Context, Convert, DenseString, GcSlice, Tagged, Value, VmError, runtime::Runtime};
 use base_compiler::compile_eval;
 
-pub(crate) fn eval_native(
+pub fn eval_native(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
@@ -60,7 +60,7 @@ pub(crate) fn eval_native(
 }
 
 /// `isNaN(x)`: ToNumber(x) is NaN.
-pub(crate) fn is_nan(
+pub fn is_nan(
     nctx: &mut crate::natives::NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {

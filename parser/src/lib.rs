@@ -664,7 +664,7 @@ impl Ast {
         self.node_scope[node.0 as usize]
     }
 
-    pub(crate) fn set_symbol_table(&mut self, strings: SymbolTable) {
+    pub fn set_symbol_table(&mut self, strings: SymbolTable) {
         self.strings = strings;
     }
 }
