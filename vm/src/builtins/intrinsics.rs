@@ -5,7 +5,7 @@
 
 use crate::{
     AccessorPair, Context, Convert, DenseString, FixedArray, GcSlice,
-    Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object, ObjectSlotsInit, PropertyDescriptor,
+    Handle, Heap, HeapRef, Key, LoadOutcome, Lookup, NoGc, Object, ObjectSlotsInit, PropertyDescriptor,
     SlotName, Smi, StoreOutcome, StoreSemantics, StringData, Symbol, Tagged, Value, VmError,
     classify_key, function_kind_of, home_proto, load_outcome, private_find,
     runtime::Coercion, super_constructor, super_lookup_from_proto, super_store_lookup,
@@ -106,33 +106,38 @@ fn delete_property(
     args: GcSlice<'_>,
     strict: bool,
 ) -> Result<Value, VmError> {
-    let target = args.get(0).ok_or(VmError::Arity)?;
+    let raw_target = args.get(0).ok_or(VmError::Arity)?;
     let raw_key = args.get(1).ok_or(VmError::Arity)?;
     // the reference's key is coerced before the base is touched (ES
     // 13.15.5 EvaluatePropertyAccess: user toString/valueOf of a
-    // computed key runs even when the delete afterwards throws)
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(nctx.heap().known().exception.value());
-    };
-    // proxies run their `deleteProperty` trap (ES 20.2.5.4); the
-    // returned boolean flows through the strict handling below
-    let ok = if nctx
-        .heap()
-        .no_gc(|nogc| crate::proxy::is_proxy(nogc, target))
-    {
+    // computed key runs even when the delete afterwards throws);
+    // the coercion allocates, so the base must stay rooted across it
+    nctx.handle_scope(|nctx, scope| {
+        let target = scope.handle(raw_target);
+        let target = target.value();
         let (vm, heap, state) = nctx.split();
-        match crate::proxy::delete(vm, heap, state, target, key)? {
-            Coercion::Threw => return Ok(heap.known().exception.value()),
-            Coercion::Value(v) => heap.no_gc(|nogc| Convert::is_truthy(nogc, v)),
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(nctx.heap().known().exception.value());
+        };
+        // proxies run their `deleteProperty` trap (ES 20.2.5.4); the
+        // returned boolean flows through the strict handling below
+        let ok = if nctx
+            .heap()
+            .no_gc(|nogc| crate::proxy::is_proxy(nogc, target))
+        {
+            let (vm, heap, state) = nctx.split();
+            match crate::proxy::delete(vm, heap, state, target, key)? {
+                Coercion::Threw => return Ok(heap.known().exception.value()),
+                Coercion::Value(v) => heap.no_gc(|nogc| Convert::is_truthy(nogc, v)),
+            }
+        } else {
+            delete_property_core(nctx, target, key)?
+        };
+        if strict && !ok {
+            return Err(VmError::Type);
         }
-    } else {
-        delete_property_core(nctx, target, key)?
-    };
-    if strict && !ok {
-        return Err(VmError::Type);
-    }
-    Ok(Convert::boolean(nctx.heap(), ok))
+        Ok(Convert::boolean(nctx.heap(), ok))
+    })
 }
 
 fn delete_property_core(
@@ -263,8 +268,11 @@ fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         return Ok(nctx.heap().known().undefined.value());
     };
     nctx.handle_scope(|nctx, scope| {
+        // the level must survive the key collection and FixedArray
+        // allocation below (both allocate)
+        let level = scope.handle(level);
         let (vm, heap, _) = nctx.split();
-        let keys = for_in_level_keys(vm, heap, &scope, level)?;
+        let keys = for_in_level_keys(vm, heap, &scope, level.value())?;
 
         let keys = heap.allocate_handle::<FixedArray>(scope.stage(&keys), &scope);
         let empty = heap.known().empty_fixed_array;
@@ -272,7 +280,7 @@ fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         let enumerator = heap.new_object(
             &scope,
             map,
-            scope.stage(&[level, keys.value(), Smi::new(0).encode(), empty.value()]),
+            scope.stage(&[level.value(), keys.value(), Smi::new(0).encode(), empty.value()]),
         );
         Ok(enumerator.into_tagged().erase())
     })
@@ -396,16 +404,17 @@ fn for_in_level_keys(
 
     indices.sort_unstable();
     indices.dedup();
-    // intern the index keys to canonical strings
-    let mut keys: Vec<Value> = Vec::with_capacity(indices.len() + names.len());
+    // root every key before the next allocates: interning index keys
+    // promotes earlier results, and raw copies would dangle
+    // root the name keys too: the interning loop below allocates
+    let names: Vec<Handle<'_, Value>> = names.iter().map(|v| scope.handle(*v)).collect();
+    let mut keys: Vec<Handle<'_, Value>> = Vec::with_capacity(indices.len() + names.len());
     for i in indices {
-        keys.push(
-            vm.interner()
-                .intern_str(heap, scope, &i.to_string())
-                .value(),
-        );
+        let s = vm.interner().intern_str(heap, scope, &i.to_string());
+        keys.push(scope.handle(s.value()));
     }
-    keys.extend(names.iter().copied());
+    keys.extend(names);
+    let keys: Vec<Value> = keys.iter().map(|h| h.value()).collect();
     Ok(keys)
 }
 
@@ -423,12 +432,16 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
         return Ok(nctx.heap().known().undefined.value());
     }
     nctx.handle_scope(|nctx, scope| {
+        // the enumerator must survive the allocations below (key
+        // interning, visited-array growth): read it through the handle
+        // at every use, never a raw snapshot
+        let enumerator = scope.handle(enumerator);
         let (vm, heap, _) = nctx.split();
         loop {
             // one candidate per turn: the cursor advances before the
             // key is examined, so skipped keys are never revisited
             let candidate = heap.no_gc(|nogc| -> Result<Option<Value>, VmError> {
-                let Some(obj) = enumerator.as_heap_object(nogc) else {
+                let Some(obj) = enumerator.value().as_heap_object(nogc) else {
                     return Err(VmError::Type);
                 };
                 let slots = obj.as_ref().slots.heap_ref(nogc);
@@ -448,7 +461,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
             let Some(key) = candidate else {
                 // snapshot exhausted: advance to the live prototype
                 let level = heap.no_gc(|nogc| -> Result<Value, VmError> {
-                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                    let Some(obj) = enumerator.value().as_heap_object(nogc) else {
                         return Err(VmError::Type);
                     };
                     Ok(obj.as_ref().slots.heap_ref(nogc).at(FOR_IN_LEVEL))
@@ -456,36 +469,41 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
                 let Some(proto) = for_in_next_level(vm, heap, level)? else {
                     return Ok(heap.known().undefined.value());
                 };
-                let keys = for_in_level_keys(vm, heap, &scope, proto)?;
+                // for_in_level_keys allocates (interning): keep the new
+                // level rooted across it
+                let proto = scope.handle(proto);
+                let keys = for_in_level_keys(vm, heap, &scope, proto.value())?;
                 let keys = heap.allocate_handle::<FixedArray>(scope.stage(&keys), &scope);
                 heap.no_gc(|nogc| -> Result<(), VmError> {
-                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                    let Some(obj) = enumerator.value().as_heap_object(nogc) else {
                         return Err(VmError::Type);
                     };
                     let slots = obj.as_ref().slots.heap_ref(nogc);
-                    slots.set(nogc, FOR_IN_LEVEL, proto);
+                    slots.set(nogc, FOR_IN_LEVEL, proto.value());
                     slots.set(nogc, FOR_IN_KEYS, keys.value());
                     slots.set(nogc, FOR_IN_INDEX, Smi::new(0).encode());
                     Ok(())
                 })?;
                 continue;
             };
+            // the candidate must survive the visited-array growth below
+            let key = scope.handle(key);
             // lazy [[GetOwnProperty]] on the key's own level: a key
             // deleted since the snapshot is skipped without registering
             let level = heap.no_gc(|nogc| -> Result<Value, VmError> {
-                let Some(obj) = enumerator.as_heap_object(nogc) else {
+                let Some(obj) = enumerator.value().as_heap_object(nogc) else {
                     return Err(VmError::Type);
                 };
                 Ok(obj.as_ref().slots.heap_ref(nogc).at(FOR_IN_LEVEL))
             })?;
-            let own = heap.no_gc(|nogc| for_in_own_state(nogc, level, key));
+            let own = heap.no_gc(|nogc| for_in_own_state(nogc, level, key.value()));
             let Some(enumerable) = own else {
                 continue;
             };
             // already registered (yielded earlier, or shadowing
             // non-enumerable on a closer level): skip
             let seen = heap.no_gc(|nogc| -> Result<bool, VmError> {
-                let Some(obj) = enumerator.as_heap_object(nogc) else {
+                let Some(obj) = enumerator.value().as_heap_object(nogc) else {
                     return Err(VmError::Type);
                 };
                 let visited = obj
@@ -495,7 +513,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
                     .at(FOR_IN_VISITED)
                     .get_as::<FixedArray>(nogc)
                     .ok_or(VmError::Type)?;
-                Ok(visited.as_slice().iter().any(|s| s.inner() == key))
+                Ok(visited.as_slice().iter().any(|s| s.inner() == key.value()))
             })?;
             if seen {
                 continue;
@@ -503,7 +521,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
             // register the key — yielded or shadowing, both at most once
             {
                 let visited = heap.no_gc(|nogc| -> Result<Vec<Value>, VmError> {
-                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                    let Some(obj) = enumerator.value().as_heap_object(nogc) else {
                         return Err(VmError::Type);
                     };
                     Ok(obj
@@ -519,10 +537,10 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
                         .collect())
                 })?;
                 let mut visited = visited;
-                visited.push(key);
+                visited.push(key.value());
                 let visited = heap.allocate_handle::<FixedArray>(scope.stage(&visited), &scope);
                 heap.no_gc(|nogc| -> Result<(), VmError> {
-                    let Some(obj) = enumerator.as_heap_object(nogc) else {
+                    let Some(obj) = enumerator.value().as_heap_object(nogc) else {
                         return Err(VmError::Type);
                     };
                     obj.as_ref()
@@ -535,7 +553,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
             if !enumerable {
                 continue;
             }
-            return Ok(key);
+            return Ok(key.value());
         }
     })
 }
@@ -695,20 +713,25 @@ fn iterator_value(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Val
 /// run their `has` trap (ES 20.2.5.9).
 fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let raw_key = args.get(0).ok_or(VmError::Arity)?;
-    let obj = args.get(1).ok_or(VmError::Arity)?;
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(nctx.heap().known().exception.value());
-    };
-    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, obj)) {
-        return match crate::proxy::has(vm, heap, state, obj, key)? {
-            Coercion::Threw => Ok(heap.known().exception.value()),
-            Coercion::Value(v) => Ok(v),
+    let raw_obj = args.get(1).ok_or(VmError::Arity)?;
+    // the key coercion allocates: root the receiver across it
+    nctx.handle_scope(|nctx, scope| {
+        let obj = scope.handle(raw_obj);
+        let obj = obj.value();
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(nctx.heap().known().exception.value());
         };
-    }
-    // lookup::has_property covers array `length` slots along the chain
-    let has = heap.no_gc(|nogc| crate::lookup::has_property(nogc, obj, SlotName::from_value(key)));
-    Ok(Convert::boolean(nctx.heap(), has))
+        if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, obj)) {
+            return match crate::proxy::has(vm, heap, state, obj, key)? {
+                Coercion::Threw => Ok(heap.known().exception.value()),
+                Coercion::Value(v) => Ok(v),
+            };
+        }
+        // lookup::has_property covers array `length` slots along the chain
+        let has = heap.no_gc(|nogc| crate::lookup::has_property(nogc, obj, SlotName::from_value(key)));
+        Ok(Convert::boolean(nctx.heap(), has))
+    })
 }
 
 /// CopyDataProperties (ES 8.5.1) with an exclusion list (object rest):
@@ -734,46 +757,51 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
     {
         return Ok(target);
     }
-    // enumerate own enumerable keys: element indices ascending, then named
-    // descriptors in insertion order
-    let mut keys: Vec<Value> = Vec::new();
-    nctx.heap().no_gc(|nogc| {
-        let Some(obj) = source.as_heap_object(nogc) else {
-            return;
-        };
-        if obj.as_ref().is_array(nogc) {
-            let len = obj.as_ref().length().min(
-                obj.as_ref()
-                    .elements_array(nogc)
-                    .map(|e| e.len())
-                    .unwrap_or(0),
-            );
-            for i in 0..len {
-                if obj.as_ref().element_value(nogc, i).is_some() {
-                    keys.push(Smi::new(i as i64).encode());
+    let (threw, target_out) = nctx.handle_scope(|nctx, scope| -> Result<(bool, Value), VmError> {
+        // target and source survive getter calls and property adds below:
+        // root them once, not per iteration from raw copies
+        let target_handle = scope.handle(target);
+        let source_handle = scope.handle(source);
+        // canonicalize the excluded keys (interning strings) so a plain
+        // bits comparison suffices against the source's descriptor names
+        let excluded: Vec<Value> = {
+            let (vm, heap, state) = nctx.split();
+            let mut out = Vec::with_capacity(excluded.len());
+            for &k in excluded {
+                match crate::runtime::Runtime::to_property_key(vm, heap, state, k)? {
+                    Some(k) => out.push(k),
+                    None => return Ok((true, target_handle.value())),
                 }
             }
-        }
-        for d in obj.as_ref().header.map.heap_ref(nogc).descriptors() {
-            if d.flags().is_enumerable() {
-                keys.push(d.name().value());
+            out
+        };
+        // enumerate own enumerable keys: element indices ascending, then
+        // named descriptors in insertion order; collected AFTER the
+        // exclusion canonicalization so no allocation can stale them
+        let mut keys: Vec<Value> = Vec::new();
+        nctx.heap().no_gc(|nogc| {
+            let Some(obj) = source_handle.value().as_heap_object(nogc) else {
+                return;
+            };
+            if obj.as_ref().is_array(nogc) {
+                let len = obj.as_ref().length().min(
+                    obj.as_ref()
+                        .elements_array(nogc)
+                        .map(|e| e.len())
+                        .unwrap_or(0),
+                );
+                for i in 0..len {
+                    if obj.as_ref().element_value(nogc, i).is_some() {
+                        keys.push(Smi::new(i as i64).encode());
+                    }
+                }
             }
-        }
-    });
-    // canonicalize the excluded keys (interning strings) so a plain bits
-    // comparison suffices against the source's descriptor names
-    let excluded: Vec<Value> = {
-        let (vm, heap, state) = nctx.split();
-        let mut out = Vec::with_capacity(excluded.len());
-        for &k in excluded {
-            match crate::runtime::Runtime::to_property_key(vm, heap, state, k)? {
-                Some(k) => out.push(k),
-                None => return Ok(nctx.heap().known().exception.value()),
+            for d in obj.as_ref().header.map.heap_ref(nogc).descriptors() {
+                if d.flags().is_enumerable() {
+                    keys.push(d.name().value());
+                }
             }
-        }
-        out
-    };
-    let threw = nctx.handle_scope(|nctx, scope| -> Result<bool, VmError> {
+        });
         let (vm, heap, state) = nctx.split();
         for key in keys {
             if excluded.contains(&key) {
@@ -785,16 +813,16 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 vm,
                 heap,
                 state,
-                source,
+                source_handle.value(),
                 key.value(),
             )? {
-                Coercion::Threw => return Ok(true),
+                Coercion::Threw => return Ok((true, target_handle.value())),
                 Coercion::Value(v) => v,
             };
             // CreateDataProperty: skipped when already present
             let exists = heap.no_gc(|nogc| {
                 !matches!(
-                    target.lookup(nogc, SlotName::from_value(key.value())),
+                    target_handle.value().lookup(nogc, SlotName::from_value(key.value())),
                     Lookup::NotFound
                 )
             });
@@ -802,21 +830,22 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 continue;
             }
             let value = scope.handle(value);
-            let target = scope.handle(target);
             Object::add_own_property_values(
                 heap,
                 &scope,
-                target.value(),
+                target_handle.value(),
                 SlotName::from_value(key.value()),
                 PropertyDescriptor::data(value.value()),
             )?;
         }
-        Ok(false)
+        Ok((false, target_handle.value()))
     })?;
     if threw {
         return Ok(nctx.heap().known().exception.value());
     }
-    Ok(target)
+    // re-read through the handle: the copy loop allocated (getters,
+    // property adds) and may have moved the target
+    Ok(target_out)
 }
 
 /// A fresh private name: (description) -> Symbol.
@@ -962,11 +991,13 @@ fn init_instance_fields(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                     None => return Ok(true),
                 }
             };
+            // the initializer call allocates (user code): the key must
+            // stay rooted across it
+            let key = scope.handle(key);
             let value = nctx.call(init, scope.stage(&[instance.value()]))?;
             if value == exception {
                 return Ok(true);
             }
-            let key = scope.handle(key);
             let value = scope.handle(value);
             let defined = {
                 let heap = nctx.heap();
@@ -1140,66 +1171,73 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
     let prefix = Smi::decode(args.get(2).ok_or(VmError::Arity)?)
         .map(|s| s.value())
         .unwrap_or(0);
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    let units = state.handle_scope(|scope| -> Result<Vec<u16>, VmError> {
-        let text = Convert::to_string(heap, &scope, key)?;
-        Ok(heap.no_gc(|nogc| {
-            let s = text
-                .get_as::<DenseString>(nogc)
-                .expect("ToString yields a string")
-                .as_ref();
-            let mut full: Vec<u16> = match prefix {
-                1 => b"get ".iter().map(|&b| b as u16).collect(),
-                2 => b"set ".iter().map(|&b| b as u16).collect(),
-                _ => Vec::new(),
-            };
-            s.data(nogc).write_units(&mut full);
-            full
-        }))
-    })?;
-    let name = state.handle_scope(|scope| {
-        vm.interner()
-            .intern(heap, &scope, StringData::Utf16(&units))
-            .value()
-    });
-    let defined = state.handle_scope(|scope| {
-        let Some(fn_obj) = scope.cast::<Object>(fn_value) else {
-            return Err(VmError::Type);
+    // name construction allocates (interning): the closure must stay
+    // rooted across it
+    nctx.handle_scope(|nctx, scope| {
+        let fn_value = scope.handle(fn_value);
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(nctx.heap().known().exception.value());
         };
-        let name_key = heap.known().strings.name;
-        // the closure's own placeholder is never writable nor an accessor,
-        // so only explicit member defines match here
-        let explicit = heap.no_gc(|nogc| {
-            let plain = SlotName::from_value(name_key.value());
-            match fn_obj.heap_ref(nogc).as_ref().lookup(nogc, plain) {
-                Lookup::Data { flags, .. } => flags.is_writable(),
-                Lookup::Accessor { .. } => true,
-                Lookup::NotFound => false,
-            }
+        let units = state.handle_scope(|scope| -> Result<Vec<u16>, VmError> {
+            let text = Convert::to_string(heap, &scope, key)?;
+            Ok(heap.no_gc(|nogc| {
+                let s = text
+                    .get_as::<DenseString>(nogc)
+                    .expect("ToString yields a string")
+                    .as_ref();
+                let mut full: Vec<u16> = match prefix {
+                    1 => b"get ".iter().map(|&b| b as u16).collect(),
+                    2 => b"set ".iter().map(|&b| b as u16).collect(),
+                    _ => Vec::new(),
+                };
+                s.data(nogc).write_units(&mut full);
+                full
+            }))
+        })?;
+        let name = state.handle_scope(|scope| {
+            vm.interner()
+                .intern(heap, &scope, StringData::Utf16(&units))
+                .value()
         });
-        if explicit {
-            return Ok(true);
+        let defined = {
+            let Some(fn_obj) = scope.cast::<Object>(fn_value.value()) else {
+                return Err(VmError::Type);
+            };
+            let name_key = heap.known().strings.name;
+            // the closure's own placeholder is never writable nor an accessor,
+            // so only explicit member defines match here
+            let explicit = heap.no_gc(|nogc| {
+                let plain = SlotName::from_value(name_key.value());
+                match fn_obj.heap_ref(nogc).as_ref().lookup(nogc, plain) {
+                    Lookup::Data { flags, .. } => flags.is_writable(),
+                    Lookup::Accessor { .. } => true,
+                    Lookup::NotFound => false,
+                }
+            });
+            let defined = if explicit {
+                true
+            } else {
+                Object::define_own_property(
+                    heap,
+                    &scope,
+                    fn_obj,
+                    name_key,
+                    PropertyDescriptor::Data {
+                        value: name,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                )?
+            };
+            defined
+        };
+        if !defined {
+            return Err(VmError::Type);
         }
-        Object::define_own_property(
-            heap,
-            &scope,
-            fn_obj,
-            name_key,
-            PropertyDescriptor::Data {
-                value: name,
-                writable: false,
-                enumerable: false,
-                configurable: true,
-            },
-        )
-    })?;
-    if !defined {
-        return Err(VmError::Type);
-    }
-    Ok(fn_value)
+        Ok(fn_value.value())
+    })
 }
 
 /// Accessor member installation (ES 14.3.10): (target, key, closure,
@@ -1207,67 +1245,72 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
 /// the same key; flags bit 0 marks the getter half, PropertyFlags bits
 /// carry enumerability.
 fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    let target = args.get(0).ok_or(VmError::Arity)?;
+    let raw_target = args.get(0).ok_or(VmError::Arity)?;
     let raw_key = args.get(1).ok_or(VmError::Arity)?;
-    let closure = args.get(2).ok_or(VmError::Arity)?;
+    let raw_closure = args.get(2).ok_or(VmError::Arity)?;
     let flags = Smi::decode(args.get(3).ok_or(VmError::Arity)?)
         .map(|s| s.value() as u32)
         .unwrap_or(0);
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    let is_getter = flags & 1 != 0;
-    let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
-    let (name, desc) = heap.no_gc(|nogc| -> Result<_, VmError> {
-        if target.as_heap_object(nogc).is_none() {
-            return Err(VmError::Type);
-        }
-        let name = match classify_key(nogc, key)? {
-            Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-            Key::Name(name) => name,
+    // the key coercion allocates: root the target and closure across it
+    nctx.handle_scope(|nctx, scope| {
+        let target = scope.handle(raw_target);
+        let closure = scope.handle(raw_closure);
+        let target = target.value();
+        let closure = closure.value();
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(nctx.heap().known().exception.value());
         };
-        // existing own accessor half, if any (own descriptors only)
-        let undefined = nogc.known().undefined.value();
-        let mut get = undefined;
-        let mut set = undefined;
-        if let Some(obj) = target.as_heap_object(nogc) {
-            for d in obj.as_ref().header.map.heap_ref(nogc).descriptors() {
-                if d.name() == name && d.flags().is_accessor() {
-                    let pair = d
-                        .value
-                        .inner()
-                        .get_as::<AccessorPair>(nogc)
-                        .expect("accessor descriptor holds a pair");
-                    let pair = pair.as_ref();
-                    get = pair.get.inner();
-                    set = pair.set.inner();
-                    break;
+        let is_getter = flags & 1 != 0;
+        let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
+        let (name, desc) = heap.no_gc(|nogc| -> Result<_, VmError> {
+            if target.as_heap_object(nogc).is_none() {
+                return Err(VmError::Type);
+            }
+            let name = match classify_key(nogc, key)? {
+                Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                Key::Name(name) => name,
+            };
+            // existing own accessor half, if any (own descriptors only)
+            let undefined = nogc.known().undefined.value();
+            let mut get = undefined;
+            let mut set = undefined;
+            if let Some(obj) = target.as_heap_object(nogc) {
+                for d in obj.as_ref().header.map.heap_ref(nogc).descriptors() {
+                    if d.name() == name && d.flags().is_accessor() {
+                        let pair = d
+                            .value
+                            .inner()
+                            .get_as::<AccessorPair>(nogc)
+                            .expect("accessor descriptor holds a pair");
+                        let pair = pair.as_ref();
+                        get = pair.get.inner();
+                        set = pair.set.inner();
+                        break;
+                    }
                 }
             }
+            if is_getter {
+                get = closure;
+            } else {
+                set = closure;
+            }
+            Ok((
+                name,
+                PropertyDescriptor::Accessor {
+                    get,
+                    set,
+                    enumerable,
+                    configurable: true,
+                },
+            ))
+        })?;
+        let defined = Object::define_own_property_values(heap, &scope, target, name, desc)?;
+        if !defined {
+            return Err(VmError::Type);
         }
-        if is_getter {
-            get = closure;
-        } else {
-            set = closure;
-        }
-        Ok((
-            name,
-            PropertyDescriptor::Accessor {
-                get,
-                set,
-                enumerable,
-                configurable: true,
-            },
-        ))
-    })?;
-    let defined = state.handle_scope(|scope| {
-        Object::define_own_property_values(heap, &scope, target, name, desc)
-    })?;
-    if !defined {
-        return Err(VmError::Type);
-    }
-    Ok(closure)
+        Ok(closure)
+    })
 }
 
 /// [[DefineOwnProperty]] with exact attributes (class member
@@ -1275,86 +1318,91 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
 /// strict-mode code: a rejected define throws a TypeError. flags are
 /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair).
 fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    let receiver = args.get(0).ok_or(VmError::Arity)?;
+    let raw_receiver = args.get(0).ok_or(VmError::Arity)?;
     let raw_key = args.get(1).ok_or(VmError::Arity)?;
-    let value = args.get(2).ok_or(VmError::Arity)?;
+    let raw_value = args.get(2).ok_or(VmError::Arity)?;
     let flags = Smi::decode(args.get(3).ok_or(VmError::Arity)?)
         .map(|s| s.value() as u32)
         .unwrap_or(0);
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    // proxies run their `defineProperty` trap (ES 20.2.5.6); define
-    // sites are strict-mode: a rejected define throws
-    if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
-        let partial = heap.no_gc(|nogc| -> Result<crate::PartialDescriptor, VmError> {
+    // the key coercion allocates: root the receiver and value across it
+    nctx.handle_scope(|nctx, scope| {
+        let receiver = scope.handle(raw_receiver);
+        let value = scope.handle(raw_value);
+        let receiver = receiver.value();
+        let value = value.value();
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(nctx.heap().known().exception.value());
+        };
+        // proxies run their `defineProperty` trap (ES 20.2.5.6); define
+        // sites are strict-mode: a rejected define throws
+        if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
+            let partial = heap.no_gc(|nogc| -> Result<crate::PartialDescriptor, VmError> {
+                let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
+                let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
+                if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
+                    let pair = value.get_as::<AccessorPair>(nogc).ok_or(VmError::Type)?;
+                    let pair = pair.as_ref();
+                    Ok(crate::PartialDescriptor {
+                        value: None,
+                        get: Some(pair.get.inner()),
+                        set: Some(pair.set.inner()),
+                        writable: None,
+                        enumerable: Some(enumerable),
+                        configurable: Some(configurable),
+                    })
+                } else {
+                    Ok(crate::PartialDescriptor {
+                        value: Some(value),
+                        get: None,
+                        set: None,
+                        writable: Some(flags & bytecode::PropertyFlags::ReadOnly.bits() == 0),
+                        enumerable: Some(enumerable),
+                        configurable: Some(configurable),
+                    })
+                }
+            })?;
+            return match crate::proxy::define_internal(vm, heap, state, receiver, key, partial)? {
+                crate::proxy::Flow::Threw => Ok(heap.known().exception.value()),
+                crate::proxy::Flow::Value(false) => Err(VmError::Type),
+                crate::proxy::Flow::Value(true) => Ok(receiver),
+            };
+        }
+        let (name, desc) = heap.no_gc(|nogc| -> Result<_, VmError> {
+            if receiver.as_heap_object(nogc).is_none() {
+                return Err(VmError::Type);
+            }
+            let name = match classify_key(nogc, key)? {
+                Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                Key::Name(name) => name,
+            };
             let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
             let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
-            if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
+            let desc = if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
                 let pair = value.get_as::<AccessorPair>(nogc).ok_or(VmError::Type)?;
                 let pair = pair.as_ref();
-                Ok(crate::PartialDescriptor {
-                    value: None,
-                    get: Some(pair.get.inner()),
-                    set: Some(pair.set.inner()),
-                    writable: None,
-                    enumerable: Some(enumerable),
-                    configurable: Some(configurable),
-                })
+                PropertyDescriptor::Accessor {
+                    get: pair.get.inner(),
+                    set: pair.set.inner(),
+                    enumerable,
+                    configurable,
+                }
             } else {
-                Ok(crate::PartialDescriptor {
-                    value: Some(value),
-                    get: None,
-                    set: None,
-                    writable: Some(flags & bytecode::PropertyFlags::ReadOnly.bits() == 0),
-                    enumerable: Some(enumerable),
-                    configurable: Some(configurable),
-                })
-            }
+                PropertyDescriptor::Data {
+                    value,
+                    writable: flags & bytecode::PropertyFlags::ReadOnly.bits() == 0,
+                    enumerable,
+                    configurable,
+                }
+            };
+            Ok((name, desc))
         })?;
-        return match crate::proxy::define_internal(vm, heap, state, receiver, key, partial)? {
-            crate::proxy::Flow::Threw => Ok(heap.known().exception.value()),
-            crate::proxy::Flow::Value(false) => Err(VmError::Type),
-            crate::proxy::Flow::Value(true) => Ok(receiver),
-        };
-    }
-    let (name, desc) = heap.no_gc(|nogc| -> Result<_, VmError> {
-        if receiver.as_heap_object(nogc).is_none() {
+        let defined = Object::define_own_property_values(heap, &scope, receiver, name, desc)?;
+        if !defined {
             return Err(VmError::Type);
         }
-        let name = match classify_key(nogc, key)? {
-            Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-            Key::Name(name) => name,
-        };
-        let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
-        let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
-        let desc = if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
-            let pair = value.get_as::<AccessorPair>(nogc).ok_or(VmError::Type)?;
-            let pair = pair.as_ref();
-            PropertyDescriptor::Accessor {
-                get: pair.get.inner(),
-                set: pair.set.inner(),
-                enumerable,
-                configurable,
-            }
-        } else {
-            PropertyDescriptor::Data {
-                value,
-                writable: flags & bytecode::PropertyFlags::ReadOnly.bits() == 0,
-                enumerable,
-                configurable,
-            }
-        };
-        Ok((name, desc))
-    })?;
-    let defined = state.handle_scope(|scope| {
-        Object::define_own_property_values(heap, &scope, receiver, name, desc)
-    })?;
-    if !defined {
-        return Err(VmError::Type);
-    }
-    Ok(receiver)
+        Ok(receiver)
+    })
 }
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
@@ -1464,19 +1512,29 @@ fn construct_super_construct(
         let Some(new_target) = scope.cast::<Object>(new_target_v) else {
             return Err(VmError::Type);
         };
+        // root the forwarded arguments before anything allocates: they
+        // are raw copies of caller stack slots and go stale when a GC
+        // moves their targets (create_construct_receiver allocates)
+        let args: Vec<Handle<'_, Value>> = args.iter().map(|v| scope.handle(*v)).collect();
         let (receiver, allocated) = if derived {
-            (nctx.heap().known().the_hole.value(), false)
+            (
+                scope.handle(nctx.heap().known().the_hole.value()),
+                false,
+            )
         } else {
             let (vm, heap, state) = nctx.split();
             match crate::runtime::Runtime::create_construct_receiver(vm, heap, state, new_target) {
-                Ok(Some(r)) => (r, true),
+                // the receiver must stay rooted across the callee call:
+                // a primitive return falls back to it after the call
+                // allocated (and possibly moved it)
+                Ok(Some(r)) => (scope.handle(r), true),
                 Ok(None) => return Ok(nctx.heap().known().exception.value()),
                 Err(err) => return Err(err),
             }
         };
         let mut args_v = Vec::with_capacity(args.len() + 1);
-        args_v.push(receiver);
-        args_v.extend_from_slice(args);
+        args_v.push(receiver.value());
+        args_v.extend(args.iter().map(|h| h.value()));
         let result = {
             let (vm, heap, state) = nctx.split();
             NativeContext::new(vm, heap, state).call_construct(
@@ -1490,7 +1548,7 @@ fn construct_super_construct(
         }
         Ok(if Convert::is_primitive(&nctx.heap().guard(), result) {
             if allocated {
-                receiver
+                receiver.value()
             } else {
                 // a derived constructor returned a primitive: only
                 // reachable via `return <primitive>` (ES 9.2.2.1)
@@ -1678,34 +1736,41 @@ fn create_rest_parameter(
 /// chain searched).
 fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let home = args.get(0).ok_or(VmError::Arity)?;
-    let recv = args.get(1).ok_or(VmError::Arity)?;
+    let raw_recv = args.get(1).ok_or(VmError::Arity)?;
     let raw_key = args.get(2).ok_or(VmError::Arity)?;
-    if recv == nctx.heap().known().the_hole.value() {
+    if raw_recv == nctx.heap().known().the_hole.value() {
         // super.x before super() in a derived constructor
         return Err(VmError::Reference);
     }
-    let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home));
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    let outcome = nctx.heap().no_gc(|nogc| {
-        let name = match classify_key(nogc, key)? {
-            Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-            Key::Name(name) => name,
+    // the key coercion allocates: root home/recv across it
+    nctx.handle_scope(|nctx, scope| {
+        let home = scope.handle(home);
+        let recv = scope.handle(raw_recv);
+        let home = home.value();
+        let recv = recv.value();
+        let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home));
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(heap.known().exception.value());
         };
-        super_lookup_from_proto(nogc, proto, name)
-    })?;
-    match outcome {
-        LoadOutcome::Value(v) => Ok(v),
-        LoadOutcome::Getter(getter) => {
-            let undefined = nctx.heap().known().undefined.value();
-            if getter == undefined || !crate::runtime::Runtime::is_callable(nctx.heap(), getter) {
-                return Ok(undefined);
+        let outcome = nctx.heap().no_gc(|nogc| {
+            let name = match classify_key(nogc, key)? {
+                Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                Key::Name(name) => name,
+            };
+            super_lookup_from_proto(nogc, proto, name)
+        })?;
+        match outcome {
+            LoadOutcome::Value(v) => Ok(v),
+            LoadOutcome::Getter(getter) => {
+                let undefined = nctx.heap().known().undefined.value();
+                if getter == undefined || !crate::runtime::Runtime::is_callable(nctx.heap(), getter) {
+                    return Ok(undefined);
+                }
+                nctx.call(getter, scope.stage(&[recv]))
             }
-            nctx.handle_scope(|nctx, scope| nctx.call(getter, scope.stage(&[recv])))
         }
-    }
+    })
 }
 
 /// super.x store: (home, recv, key, value, semantics) -> value. ES stores
@@ -1714,34 +1779,43 @@ fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
 /// coercion runs.
 fn super_set_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let home = args.get(0).ok_or(VmError::Arity)?;
-    let recv = args.get(1).ok_or(VmError::Arity)?;
+    let raw_recv = args.get(1).ok_or(VmError::Arity)?;
     let raw_key = args.get(2).ok_or(VmError::Arity)?;
-    let value = args.get(3).ok_or(VmError::Arity)?;
+    let raw_value = args.get(3).ok_or(VmError::Arity)?;
     let semantics_flag = Smi::decode(args.get(4).ok_or(VmError::Arity)?)
         .map(|s| s.value() as u32)
         .unwrap_or(0);
-    if recv == nctx.heap().known().the_hole.value() {
+    if raw_recv == nctx.heap().known().the_hole.value() {
         return Err(VmError::Reference);
     }
-    let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home));
-    let (vm, heap, state) = nctx.split();
-    let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
-        return Ok(heap.known().exception.value());
-    };
-    let semantics = if semantics_flag & bytecode::SUPER_STORE_WRITE_THROUGH != 0 {
-        StoreSemantics::WriteThrough
-    } else {
-        StoreSemantics::Shadow
-    };
-    let outcome = nctx.heap().no_gc(|nogc| {
-        let name = match classify_key(nogc, key)? {
-            Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
-            Key::Name(name) => name,
+    // the key coercion allocates: root home/recv/value across it
+    nctx.handle_scope(|nctx, scope| {
+        let home = scope.handle(home);
+        let recv = scope.handle(raw_recv);
+        let value = scope.handle(raw_value);
+        let home = home.value();
+        let recv = recv.value();
+        let value = value.value();
+        let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home));
+        let (vm, heap, state) = nctx.split();
+        let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
+            return Ok(heap.known().exception.value());
         };
-        super_store_lookup(nogc, proto, recv, name, value, semantics)
-    })?;
-    if apply_store_outcome(nctx, recv, outcome, value)? {
-        return Ok(nctx.heap().known().exception.value());
-    }
-    Ok(value)
+        let semantics = if semantics_flag & bytecode::SUPER_STORE_WRITE_THROUGH != 0 {
+            StoreSemantics::WriteThrough
+        } else {
+            StoreSemantics::Shadow
+        };
+        let outcome = nctx.heap().no_gc(|nogc| {
+            let name = match classify_key(nogc, key)? {
+                Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
+                Key::Name(name) => name,
+            };
+            super_store_lookup(nogc, proto, recv, name, value, semantics)
+        })?;
+        if apply_store_outcome(nctx, recv, outcome, value)? {
+            return Ok(nctx.heap().known().exception.value());
+        }
+        Ok(value)
+    })
 }
