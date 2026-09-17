@@ -48,7 +48,7 @@ pub fn eval_native(
 
         let (vm, heap, state) = nctx.split();
         let context = scope
-            .cast::<Context>(context.as_tagged(&*heap))
+            .cast::<Context>(context.as_tagged(heap))
             .ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
         nctx.call(

@@ -45,7 +45,7 @@ pub fn make_error(
             None => scope.handle(
                 vm.interner()
                     .intern_str(heap, &scope, "")
-                    .as_tagged(&*heap)
+                    .as_tagged(heap)
                     .erase_type(),
             ),
         };
@@ -94,9 +94,9 @@ pub fn error_to_string(
         let receiver =
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(receiver_word) });
         let (vm, heap, state) = nctx.split();
-        let recv = receiver.as_tagged(&*heap).erase();
+        let recv = receiver.as_tagged(heap).erase();
         let name = get_property(vm, heap, state, recv, "name")?;
-        let recv = receiver.as_tagged(&*heap).erase();
+        let recv = receiver.as_tagged(heap).erase();
         let message = get_property(vm, heap, state, recv, "message")?;
         let (vm, heap, _) = nctx.split();
         // each to_string/intern allocates: root both halves before the
@@ -111,7 +111,7 @@ pub fn error_to_string(
         })?);
         let colon = vm.interner().intern_str(heap, &scope, ": ");
         let ab = DenseString::concat(heap, &scope, a, colon.erase());
-        let ab = scope.handle(ab.as_tagged(&*heap).erase_type());
+        let ab = scope.handle(ab.as_tagged(heap).erase_type());
         let out = DenseString::concat(heap, &scope, ab, b);
         // Safety: fresh rooted-slot word, returned without an
         // intervening allocation.

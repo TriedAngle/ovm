@@ -41,7 +41,7 @@ impl Runtime {
         let function_name = match source_name {
             // Safety: the word was read under an anchor one statement ago;
             // no allocation has run since.
-            Some(name) => scope.handle(unsafe { name.assume_valid(&*heap) }),
+            Some(name) => scope.handle(unsafe { name.assume_valid(heap) }),
             None => heap.no_gc(|heap| {
                 scope.handle(heap.known().strings.empty.as_tagged(heap).erase_type())
             }),
@@ -146,7 +146,7 @@ impl Runtime {
 
         // fresh word under a final shared reborrow; anchored at the `&mut`
         // borrow, so callers must store or root it before allocating
-        Ok(function.as_tagged(&*heap).erase_type())
+        Ok(function.as_tagged(heap).erase_type())
     }
 
     /// ES 7.1.1 ToPrimitive. Primitives pass through untouched
@@ -165,7 +165,7 @@ impl Runtime {
         // and would leave a raw copy dangling
         state.handle_scope(|scope| {
             // Safety: caller-supplied word, fresh at entry.
-            let value = scope.handle(unsafe { value.assume_valid(&*heap) });
+            let value = scope.handle(unsafe { value.assume_valid(heap) });
             let (exception, to_primitive_symbol, undefined, null) = heap.no_gc(|heap| {
                 let known = heap.known();
                 (
@@ -177,14 +177,14 @@ impl Runtime {
             });
 
             // 1. exotic @@toPrimitive (GetMethod)
-            let receiver_word = value.as_tagged(&*heap).erase();
+            let receiver_word = value.as_tagged(heap).erase();
             let exotic = Self::get_property(vm, heap, state, receiver_word, to_primitive_symbol)?;
             let exotic = match exotic {
                 Coercion::Threw => return Ok(Coercion::Threw),
                 // Safety: fresh word from the call, no allocation since.
-                Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
+                Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(heap) }),
             };
-            let exotic_word = exotic.as_tagged(&*heap).erase();
+            let exotic_word = exotic.as_tagged(heap).erase();
             if exotic_word != undefined && exotic_word != null {
                 if !Self::is_callable(heap, exotic_word) {
                     // GetMethod: a non-callable, non-nullish method is a TypeError
@@ -234,18 +234,18 @@ impl Runtime {
                 }
             });
             for name in method_names {
-                let receiver_word = value.as_tagged(&*heap).erase();
+                let receiver_word = value.as_tagged(heap).erase();
                 let method = Self::get_property(vm, heap, state, receiver_word, name)?;
                 let method = match method {
                     Coercion::Threw => return Ok(Coercion::Threw),
                     // Safety: fresh word from the call, no allocation since.
-                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(&*heap) }),
+                    Coercion::Value(v) => scope.handle(unsafe { v.assume_valid(heap) }),
                 };
-                let method_word = method.as_tagged(&*heap).erase();
+                let method_word = method.as_tagged(heap).erase();
                 if !Self::is_callable(heap, method_word) {
                     continue;
                 }
-                let receiver = value.as_tagged(&*heap).erase();
+                let receiver = value.as_tagged(heap).erase();
                 let result = state.handle_scope(|scope| {
                     NativeContext::new(vm, heap, state).call(
                         // Safety: word freshly read from a rooted slot, no
@@ -299,10 +299,10 @@ impl Runtime {
         // stay rooted across the first one's coercion
         state.handle_scope(|scope| {
             // Safety: caller-supplied word, fresh at entry.
-            let b = scope.handle(unsafe { b.assume_valid(&*heap) });
+            let b = scope.handle(unsafe { b.assume_valid(heap) });
             let a = Self::to_numeric(vm, heap, state, a)?;
             let Some(a) = a else { return Ok(None) };
-            let b_word = b.as_tagged(&*heap).erase();
+            let b_word = b.as_tagged(heap).erase();
             let b = Self::to_numeric(vm, heap, state, b_word)?;
             let Some(b) = b else { return Ok(None) };
             let r = op(a, b);
@@ -349,7 +349,7 @@ impl Runtime {
         // direct anchor: the outcome is consumed (erased / rooted) before
         // any allocation below runs
         let (outcome, exception) = {
-            let heap = &*heap;
+            let heap: &Heap = &*heap;
             let exception = heap.known().exception.as_tagged(heap).erase();
             let outcome = load_outcome_on(
                 heap,
@@ -391,7 +391,7 @@ impl Runtime {
         if heap.no_gc(|heap| Convert::is_primitive(heap, attrs.as_tagged(heap))) {
             return Err(VmError::Type);
         }
-        let attrs = scope.handle(attrs.as_tagged(&*heap));
+        let attrs = scope.handle(attrs.as_tagged(heap));
         let names = heap.no_gc(|heap| {
             let s = heap.known().strings;
             [
@@ -408,11 +408,11 @@ impl Runtime {
         for name in names {
             // re-read per iteration: the getters below may run user
             // code (and move the receiver)
-            let attrs_word = attrs.as_tagged(&*heap).erase();
+            let attrs_word = attrs.as_tagged(heap).erase();
             match Self::get_property(vm, heap, state, attrs_word, name)? {
                 Coercion::Threw => return Ok(None),
                 // Safety: fresh word from the call, no allocation since.
-                Coercion::Value(v) => reads.push(scope.handle(unsafe { v.assume_valid(&*heap) })),
+                Coercion::Value(v) => reads.push(scope.handle(unsafe { v.assume_valid(heap) })),
             }
         }
         let (present, truthy) = heap.no_gc(|heap| {
@@ -485,7 +485,7 @@ impl Runtime {
             let word = scope.handle(v);
             if heap.no_gc(|heap| word.as_tagged(heap).get_as::<Symbol>().is_some()) {
                 // fresh anchored re-read of the rooted word
-                return Ok(Some(word.as_tagged(&*heap).as_name()));
+                return Ok(Some(word.as_tagged(heap).as_name()));
             }
             let is_string =
                 heap.no_gc(|heap| word.as_tagged(heap).get_as::<DenseString>().is_some());
@@ -496,13 +496,13 @@ impl Runtime {
                     vm,
                     heap,
                     state,
-                    word.as_tagged(&*heap).erase(),
+                    word.as_tagged(heap).erase(),
                     Hint::String,
                 )? {
                     Coercion::Threw => return Ok(None),
                     // Safety: fresh word from the coercion, no allocation
                     // since.
-                    Coercion::Value(p) => scope.handle(unsafe { p.assume_valid(&*heap) }),
+                    Coercion::Value(p) => scope.handle(unsafe { p.assume_valid(heap) }),
                 }
             };
             // Named lookup compares interned strings by pointer:
@@ -522,7 +522,7 @@ impl Runtime {
                 None => return Err(VmError::Type),
             };
             // fresh anchored re-read of the rooted interned word
-            Ok(Some(interned.as_tagged(&*heap).into()))
+            Ok(Some(interned.as_tagged(heap).into()))
         })
     }
 
@@ -574,7 +574,7 @@ impl Runtime {
         // code: the object must stay rooted across it
         state.handle_scope(|scope| {
             // Safety: caller-supplied word, fresh at entry.
-            let object = scope.handle(unsafe { object.assume_valid(&*heap) });
+            let object = scope.handle(unsafe { object.assume_valid(heap) });
             let proto_name =
                 heap.no_gc(|heap| heap.known().strings.prototype.as_tagged(heap).erase());
             let proto = Self::get_property(vm, heap, state, callable, proto_name)?;
@@ -634,7 +634,7 @@ impl Runtime {
         state: &ContextState,
         new_target: Handle<'_, Object>,
     ) -> Result<Option<Value>, VmError> {
-        let new_target = new_target.as_tagged(&*heap).erase();
+        let new_target = new_target.as_tagged(heap).erase();
         Self::create_construct_receiver_value(vm, heap, state, new_target)
     }
 
@@ -656,7 +656,7 @@ impl Runtime {
             // root the prototype before allocating below (GC may move it)
             // non-object prototypes fall back to the ordinary prototype
             // Safety: fresh word from the call, no allocation since.
-            let proto = scope.cast::<Object>(unsafe { proto.assume_valid(&*heap) });
+            let proto = scope.cast::<Object>(unsafe { proto.assume_valid(heap) });
             let known = heap.known();
             let obj = heap
                 .new_object(&scope, known.object_initial_map, GcSlice::EMPTY)
@@ -666,7 +666,7 @@ impl Runtime {
             }
             // fresh word at return: callers store it to a register (rooted
             // memory) immediately
-            Ok(Some(obj.as_tagged(&*heap).erase()))
+            Ok(Some(obj.as_tagged(heap).erase()))
         })
     }
 }

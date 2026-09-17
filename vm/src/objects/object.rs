@@ -184,7 +184,7 @@ pub fn store_array_element(
             values.resize(capacity, unsafe { heap.known().the_hole.read_unchecked() });
             Ok::<_, VmError>(())
         })?;
-        values[i] = value.as_tagged(&*heap).erase();
+        values[i] = value.as_tagged(heap).erase();
         let elements = heap.allocate_handle::<FixedArray>(scope.stage_words(&values), scope);
         heap.no_gc(|heap| {
             let obj = receiver.heap_ref(heap);

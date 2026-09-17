@@ -214,13 +214,13 @@ fn get_trap<'s>(
     handler: &Handle<'_, Value>,
     trap: Trap,
 ) -> Result<TrapLookup<'s>, VmError> {
-    let name = scope.handle(trap.name(&*heap));
+    let name = scope.handle(trap.name(heap));
     match Runtime::get_property(
         vm,
         heap,
         state,
         unsafe { handler.read_unchecked() },
-        name.as_tagged(&*heap).erase(),
+        name.as_tagged(heap).erase(),
     )? {
         Coercion::Threw => Ok(TrapLookup::Threw),
         Coercion::Value(v) => {
@@ -232,7 +232,7 @@ fn get_trap<'s>(
                 Ok(TrapLookup::None)
             } else {
                 Ok(TrapLookup::Trap(
-                    scope.handle(unsafe { v.assume_valid(&*heap) }),
+                    scope.handle(unsafe { v.assume_valid(heap) }),
                 ))
             }
         }
@@ -281,8 +281,8 @@ fn enter_trap<'s>(
         return Err(revoked_error(trap));
     }
     Ok((
-        scope.handle(unsafe { target.assume_valid(&*heap) }),
-        scope.handle(unsafe { handler.assume_valid(&*heap) }),
+        scope.handle(unsafe { target.assume_valid(heap) }),
+        scope.handle(unsafe { handler.assume_valid(heap) }),
     ))
 }
 
@@ -349,8 +349,8 @@ fn own_descriptor_h<'s>(
     if revoked {
         return Err(revoked_error(Trap::GetOwnPropertyDescriptor));
     }
-    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    let target = scope.handle(unsafe { target.assume_valid(heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
     match get_trap(
         vm,
         heap,
@@ -420,8 +420,8 @@ fn is_extensible_h(
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
-    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    let target = scope.handle(unsafe { target.assume_valid(heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
     match get_trap(vm, heap, state, scope, &handler, Trap::IsExtensible)? {
         TrapLookup::Threw => Ok(Flow::Threw),
         TrapLookup::None => is_extensible_h(vm, heap, state, scope, &target),
@@ -477,7 +477,7 @@ fn descriptor_object(
             fields.push((s.value, v));
         }
         if let Some(b) = partial.writable {
-            fields.push((s.writable, scope.handle(Convert::boolean(&*heap, b))));
+            fields.push((s.writable, scope.handle(Convert::boolean(heap, b))));
         }
         if let Some(v) = partial.get {
             fields.push((s.get, v));
@@ -486,10 +486,10 @@ fn descriptor_object(
             fields.push((s.set, v));
         }
         if let Some(b) = partial.enumerable {
-            fields.push((s.enumerable, scope.handle(Convert::boolean(&*heap, b))));
+            fields.push((s.enumerable, scope.handle(Convert::boolean(heap, b))));
         }
         if let Some(b) = partial.configurable {
-            fields.push((s.configurable, scope.handle(Convert::boolean(&*heap, b))));
+            fields.push((s.configurable, scope.handle(Convert::boolean(heap, b))));
         }
         for (name, value) in fields {
             crate::Object::define_own_property(
@@ -632,7 +632,7 @@ fn define_internal_h<'s>(
             return Err(VmError::Type);
         };
         let array = scope
-            .cast::<Object>(obj.as_tagged(&*heap))
+            .cast::<Object>(obj.as_tagged(heap))
             .expect("array checked above");
         define_array_element(heap, scope, &array, i, &value)?;
         return Ok(Flow::Value(true));
@@ -647,9 +647,9 @@ fn define_internal_h<'s>(
     });
     let full = partial.complete_against(undefined, current.as_ref());
     let obj_ref = scope
-        .cast::<Object>(obj.as_tagged(&*heap))
+        .cast::<Object>(obj.as_tagged(heap))
         .expect("non-proxy target is an object");
-    let name_ref: Handle<'_, SlotName> = scope.handle(name.as_tagged(&*heap).as_name());
+    let name_ref: Handle<'_, SlotName> = scope.handle(name.as_tagged(heap).as_name());
     let defined = crate::Object::define_own_property(heap, scope, obj_ref, name_ref, full)?;
     Ok(Flow::Value(defined))
 }
@@ -722,7 +722,7 @@ fn ordinary_set_forward(
             if setter == undefined {
                 return Ok(Coercion::Value(Convert::boolean(heap, false).erase()));
             }
-            let setter = scope.handle(unsafe { setter.assume_valid(&*heap) });
+            let setter = scope.handle(unsafe { setter.assume_valid(heap) });
             let words = [unsafe { receiver.read_unchecked() }, unsafe {
                 value.read_unchecked()
             }];
@@ -807,7 +807,7 @@ fn get_h(
             let Coercion::Value(result) = result else {
                 return Ok(Coercion::Threw);
             };
-            let result = scope.handle(unsafe { result.assume_valid(&*heap) });
+            let result = scope.handle(unsafe { result.assume_valid(heap) });
             // invariant (steps 9-11): a trap cannot lie about
             // non-configurable data / accessor properties
             let desc = own_descriptor_h(vm, heap, state, scope, &target, name)?;
@@ -1042,7 +1042,7 @@ fn delete_h(
                 delete_h(vm, heap, state, scope, &target, key)
             } else {
                 let target_obj = scope
-                    .cast::<Object>(target.as_tagged(&*heap))
+                    .cast::<Object>(target.as_tagged(heap))
                     .expect("ordinary target");
                 let deleted = crate::Object::delete_own_property(heap, scope, target_obj, *key)?;
                 Ok(Coercion::Value(Convert::boolean(heap, deleted).erase()))
@@ -1117,7 +1117,7 @@ fn proxy_define_h(
         TrapLookup::None => define_internal_h(vm, heap, state, scope, &target, name, partial),
         TrapLookup::Trap(t) => {
             let desc_obj = descriptor_object(heap, state, &partial)?;
-            let desc_obj = scope.handle(unsafe { desc_obj.assume_valid(&*heap) });
+            let desc_obj = scope.handle(unsafe { desc_obj.assume_valid(heap) });
             let result = call_trap(
                 vm,
                 heap,
@@ -1215,9 +1215,7 @@ fn apply_h(
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::Apply)?;
     let this_arg = match args.first() {
         Some(h) => *h,
-        None => {
-            scope.handle(unsafe { heap.known().undefined.read_unchecked().assume_valid(&*heap) })
-        }
+        None => scope.handle(unsafe { heap.known().undefined.read_unchecked().assume_valid(heap) }),
     };
     match get_trap(vm, heap, state, scope, &handler, Trap::Apply)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
@@ -1315,7 +1313,7 @@ fn construct_h(
             });
             let receiver = if derived {
                 let hole = heap.no_gc(|heap| heap.known().the_hole.as_tagged(heap).erase());
-                scope.handle(unsafe { hole.assume_valid(&*heap) })
+                scope.handle(unsafe { hole.assume_valid(heap) })
             } else {
                 let Some(r) = Runtime::create_construct_receiver_value(vm, heap, state, unsafe {
                     new_target.read_unchecked()
@@ -1323,7 +1321,7 @@ fn construct_h(
                 else {
                     return Ok(Coercion::Threw);
                 };
-                scope.handle(unsafe { r.assume_valid(&*heap) })
+                scope.handle(unsafe { r.assume_valid(heap) })
             };
             let mut all: Vec<Value> = Vec::with_capacity(args.len() + 1);
             all.push(unsafe { receiver.read_unchecked() });
@@ -1341,7 +1339,7 @@ fn construct_h(
             if result == exception {
                 return Ok(Coercion::Threw);
             }
-            let result = scope.handle(unsafe { result.assume_valid(&*heap) });
+            let result = scope.handle(unsafe { result.assume_valid(heap) });
             if heap.no_gc(|heap| Convert::is_primitive(heap, result.as_tagged(heap))) {
                 if derived {
                     // a derived constructor may only return objects
@@ -1369,7 +1367,7 @@ fn construct_h(
             let Coercion::Value(result) = result else {
                 return Ok(Coercion::Threw);
             };
-            let result = scope.handle(unsafe { result.assume_valid(&*heap) });
+            let result = scope.handle(unsafe { result.assume_valid(heap) });
             // invariant: the trap must return an object
             if heap.no_gc(|heap| Convert::is_primitive(heap, result.as_tagged(heap))) {
                 return Err(VmError::Message(
@@ -1441,7 +1439,7 @@ fn prevent_extensions_h(
     obj: &Handle<'_, Value>,
 ) -> Result<Coercion, VmError> {
     if !heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
-        let Some(obj) = scope.cast::<Object>(obj.as_tagged(&*heap)) else {
+        let Some(obj) = scope.cast::<Object>(obj.as_tagged(heap)) else {
             return Err(VmError::Type);
         };
         ordinary_prevent_extensions(heap, scope, obj);
@@ -1454,8 +1452,8 @@ fn prevent_extensions_h(
     if revoked {
         return Err(revoked_error(Trap::PreventExtensions));
     }
-    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    let target = scope.handle(unsafe { target.assume_valid(heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
     match get_trap(vm, heap, state, scope, &handler, Trap::PreventExtensions)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => prevent_extensions_h(vm, heap, state, scope, &target),
@@ -1518,8 +1516,8 @@ fn is_extensible_entry_h(
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
-    let target = scope.handle(unsafe { target.assume_valid(&*heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(&*heap) });
+    let target = scope.handle(unsafe { target.assume_valid(heap) });
+    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
     match get_trap(vm, heap, state, scope, &handler, Trap::IsExtensible)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => is_extensible_entry_h(vm, heap, state, scope, &target),

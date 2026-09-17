@@ -33,8 +33,8 @@ pub fn error_from_vm_error(
         let name = heap.known().strings.name;
         let message = heap.known().strings.message;
         // root fresh copies before the (allocating) defines below
-        let name_value: Handle<'_, DenseString> = scope.handle(name_value.as_tagged(&*heap));
-        let message_value: Handle<'_, DenseString> = scope.handle(message_value.as_tagged(&*heap));
+        let name_value: Handle<'_, DenseString> = scope.handle(name_value.as_tagged(heap));
+        let message_value: Handle<'_, DenseString> = scope.handle(message_value.as_tagged(heap));
         Object::define_own_property(
             heap,
             &scope,
@@ -49,6 +49,6 @@ pub fn error_from_vm_error(
             message,
             PropertyDescriptor::data(message_value.erase()),
         )?;
-        Ok(obj.as_tagged(&*heap).erase())
+        Ok(obj.as_tagged(heap).erase())
     })
 }

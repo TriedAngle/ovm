@@ -172,21 +172,16 @@ impl Convert {
         match kind {
             PrimitiveString::Smi(n) => {
                 let s = DenseString::from_utf8(heap, scope, &n.to_string());
-                Ok(s.as_tagged(&*heap).erase_type())
+                Ok(s.as_tagged(heap).erase_type())
             }
             // strings are their own stringification
-            PrimitiveString::IsString => Ok(v.as_tagged(&*heap)),
-            PrimitiveString::Undefined => Ok(heap
-                .known()
-                .strings
-                .undefined
-                .as_tagged(&*heap)
-                .erase_type()),
-            PrimitiveString::Null => Ok(heap.known().strings.null.as_tagged(&*heap).erase_type()),
-            PrimitiveString::True => Ok(heap.known().strings.true_.as_tagged(&*heap).erase_type()),
-            PrimitiveString::False => {
-                Ok(heap.known().strings.false_.as_tagged(&*heap).erase_type())
+            PrimitiveString::IsString => Ok(v.as_tagged(heap)),
+            PrimitiveString::Undefined => {
+                Ok(heap.known().strings.undefined.as_tagged(heap).erase_type())
             }
+            PrimitiveString::Null => Ok(heap.known().strings.null.as_tagged(heap).erase_type()),
+            PrimitiveString::True => Ok(heap.known().strings.true_.as_tagged(heap).erase_type()),
+            PrimitiveString::False => Ok(heap.known().strings.false_.as_tagged(heap).erase_type()),
             PrimitiveString::Float(x) => {
                 let text = if x.is_nan() {
                     "NaN".to_string()
@@ -198,7 +193,7 @@ impl Convert {
                     format!("{x}")
                 };
                 let s = DenseString::from_utf8(heap, scope, &text);
-                Ok(s.as_tagged(&*heap).erase_type())
+                Ok(s.as_tagged(heap).erase_type())
             }
             // symbols (and anything else reaching this point) are a TypeError
             PrimitiveString::Other => Err(VmError::Type),

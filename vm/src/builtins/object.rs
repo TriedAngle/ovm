@@ -123,7 +123,7 @@ pub fn object_has_own_property(
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
-        let receiver = receiver.as_tagged(&*heap).erase();
+        let receiver = receiver.as_tagged(heap).erase();
         let has = heap.no_gc(|heap| {
             let key = key.as_tagged(heap);
             if let crate::Key::Element(i) =
@@ -175,7 +175,7 @@ pub fn object_property_is_enumerable(
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
-        let receiver = receiver.as_tagged(&*heap).erase();
+        let receiver = receiver.as_tagged(heap).erase();
         let enumerable = heap.no_gc(|heap| {
             let key = key.as_tagged(heap);
             if let crate::Key::Element(i) =
@@ -498,7 +498,7 @@ pub fn object_prevent_extensions(
                 } else {
                     // re-read through the handle: the trap above ran user
                     // code and may have moved the receiver
-                    Ok(raw_target.as_tagged(&*heap).erase())
+                    Ok(raw_target.as_tagged(heap).erase())
                 }
             }
         }
@@ -648,16 +648,16 @@ pub fn object_seal(
         // trap once ownKeys lands (proxy targets); ordinary targets:
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
-        let target = target_handle.as_tagged(&*heap).erase();
+        let target = target_handle.as_tagged(heap).erase();
         if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { target.assume_valid(heap) })) {
             return Ok(target);
         }
         let obj = scope
-            .cast::<Object>(unsafe { target.assume_valid(&*heap) })
+            .cast::<Object>(unsafe { target.assume_valid(heap) })
             .expect("checked above");
         set_integrity_flags(heap, &scope, obj, false);
         // re-read through the handle: traps may have moved the receiver
-        Ok(target_handle.as_tagged(&*heap).erase())
+        Ok(target_handle.as_tagged(heap).erase())
     })
 }
 
@@ -706,15 +706,15 @@ pub fn object_freeze(
         }
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
-        let target = target_handle.as_tagged(&*heap).erase();
+        let target = target_handle.as_tagged(heap).erase();
         if heap.no_gc(|heap| crate::proxy::is_proxy(heap, unsafe { target.assume_valid(heap) })) {
             return Ok(target);
         }
         let obj = scope
-            .cast::<Object>(unsafe { target.assume_valid(&*heap) })
+            .cast::<Object>(unsafe { target.assume_valid(heap) })
             .expect("checked above");
         set_integrity_flags(heap, &scope, obj, true);
         // re-read through the handle: traps may have moved the receiver
-        Ok(target_handle.as_tagged(&*heap).erase())
+        Ok(target_handle.as_tagged(heap).erase())
     })
 }

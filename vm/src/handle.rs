@@ -38,7 +38,11 @@ impl<'s, T> core::fmt::Debug for Handle<'s, T> {
 }
 
 impl<'s, T> Handle<'s, T> {
-    pub fn from_location(location: NonNull<Value>) -> Self {
+    /// # Safety
+    /// `location` must point at a live GC-visited slot that holds a strong
+    /// value and that stays valid for `'s` (i.e. is owned by a handle scope
+    /// that outlives `'s`).
+    pub unsafe fn from_location(location: NonNull<Value>) -> Self {
         Handle {
             location,
             _phantom: PhantomData,
@@ -213,7 +217,7 @@ impl<'d> HandleScope<'d> {
         );
         let slot = unsafe { &*self.data.as_ptr() }.inner().allocate_slot();
         unsafe { *slot = value.erase() };
-        Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
+        unsafe { Handle::from_location(NonNull::new_unchecked(slot)) }
     }
 
     /// Root a copy of `args` in contiguous scope slots. The argument
@@ -302,7 +306,7 @@ impl<'i, 'o> EscapableHandleScope<'i, 'o> {
         self.escaped.set(true);
         // Safety: moving one rooted word into another rooted slot.
         unsafe { *self.escape_slot = handle.read_unchecked() };
-        Handle::from_location(unsafe { NonNull::new_unchecked(self.escape_slot) })
+        unsafe { Handle::from_location(NonNull::new_unchecked(self.escape_slot)) }
     }
 }
 
@@ -340,7 +344,7 @@ impl RootHandles {
         assert!(i < self.slots.len(), "root handle table exhausted");
         let slot = GcSlot::raw_get(&self.slots[i]);
         unsafe { *slot = value.erase() };
-        Handle::from_location(unsafe { NonNull::new_unchecked(slot) })
+        unsafe { Handle::from_location(NonNull::new_unchecked(slot)) }
     }
 }
 
