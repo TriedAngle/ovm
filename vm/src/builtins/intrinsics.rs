@@ -714,14 +714,16 @@ fn iterator_value(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Val
 fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let raw_key = args.get(0).ok_or(VmError::Arity)?;
     let raw_obj = args.get(1).ok_or(VmError::Arity)?;
-    // the key coercion allocates: root the receiver across it
+    // the key coercion allocates (wrapper keys run toString/valueOf):
+    // root the receiver and re-read it after the coercion — a raw
+    // snapshot taken before would go stale
     nctx.handle_scope(|nctx, scope| {
         let obj = scope.handle(raw_obj);
-        let obj = obj.value();
         let (vm, heap, state) = nctx.split();
         let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
             return Ok(nctx.heap().known().exception.value());
         };
+        let obj = obj.value();
         if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, obj)) {
             return match crate::proxy::has(vm, heap, state, obj, key)? {
                 Coercion::Threw => Ok(heap.known().exception.value()),
@@ -1368,8 +1370,10 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
                 crate::proxy::Flow::Value(true) => Ok(receiver),
             };
         }
+        eprintln!("[dbg] dop: receiver={receiver:?} key={key:?} value={value:?}");
         let (name, desc) = heap.no_gc(|nogc| -> Result<_, VmError> {
             if receiver.as_heap_object(nogc).is_none() {
+                eprintln!("[dbg] dop: reject - receiver not an object");
                 return Err(VmError::Type);
             }
             let name = match classify_key(nogc, key)? {
@@ -1399,6 +1403,7 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         })?;
         let defined = Object::define_own_property_values(heap, &scope, receiver, name, desc)?;
         if !defined {
+            eprintln!("[dbg] dop: REJECTED name={:?} is_elem={}", key, matches!(crate::classify_key(&heap.guard(), key), Ok(crate::Key::Element(_))));
             return Err(VmError::Type);
         }
         Ok(receiver)
@@ -1746,13 +1751,13 @@ fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
     nctx.handle_scope(|nctx, scope| {
         let home = scope.handle(home);
         let recv = scope.handle(raw_recv);
-        let home = home.value();
-        let recv = recv.value();
-        let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home));
+        let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home.value()));
         let (vm, heap, state) = nctx.split();
         let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
             return Ok(heap.known().exception.value());
         };
+        // re-read through the handles: the coercion above allocated
+        let recv = recv.value();
         let outcome = nctx.heap().no_gc(|nogc| {
             let name = match classify_key(nogc, key)? {
                 Key::Element(i) => SlotName::from(Tagged::from_smi(Smi::new(i as i64))),
@@ -1793,14 +1798,14 @@ fn super_set_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
         let home = scope.handle(home);
         let recv = scope.handle(raw_recv);
         let value = scope.handle(raw_value);
-        let home = home.value();
-        let recv = recv.value();
-        let value = value.value();
-        let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home));
+        let proto = nctx.heap().no_gc(|nogc| home_proto(nogc, home.value()));
         let (vm, heap, state) = nctx.split();
         let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
             return Ok(heap.known().exception.value());
         };
+        // re-read through the handles: the coercion above allocated
+        let recv = recv.value();
+        let value = value.value();
         let semantics = if semantics_flag & bytecode::SUPER_STORE_WRITE_THROUGH != 0 {
             StoreSemantics::WriteThrough
         } else {
