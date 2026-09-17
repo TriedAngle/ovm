@@ -1330,12 +1330,14 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
     nctx.handle_scope(|nctx, scope| {
         let receiver = scope.handle(raw_receiver);
         let value = scope.handle(raw_value);
-        let receiver = receiver.value();
-        let value = value.value();
         let (vm, heap, state) = nctx.split();
         let Some(key) = crate::runtime::Runtime::to_property_key(vm, heap, state, raw_key)? else {
             return Ok(nctx.heap().known().exception.value());
         };
+        // re-read through the handles: the coercion above allocated
+        // (wrapper/float keys intern a string) and may have moved them
+        let receiver = receiver.value();
+        let value = value.value();
         // proxies run their `defineProperty` trap (ES 20.2.5.6); define
         // sites are strict-mode: a rejected define throws
         if heap.no_gc(|nogc| crate::proxy::is_proxy(nogc, receiver)) {
@@ -1370,10 +1372,8 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
                 crate::proxy::Flow::Value(true) => Ok(receiver),
             };
         }
-        eprintln!("[dbg] dop: receiver={receiver:?} key={key:?} value={value:?}");
         let (name, desc) = heap.no_gc(|nogc| -> Result<_, VmError> {
             if receiver.as_heap_object(nogc).is_none() {
-                eprintln!("[dbg] dop: reject - receiver not an object");
                 return Err(VmError::Type);
             }
             let name = match classify_key(nogc, key)? {
@@ -1403,7 +1403,6 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         })?;
         let defined = Object::define_own_property_values(heap, &scope, receiver, name, desc)?;
         if !defined {
-            eprintln!("[dbg] dop: REJECTED name={:?} is_elem={}", key, matches!(crate::classify_key(&heap.guard(), key), Ok(crate::Key::Element(_))));
             return Err(VmError::Type);
         }
         Ok(receiver)
