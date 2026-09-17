@@ -131,7 +131,7 @@ fn callable_info_carries_handler_table() {
         let t = table(thread, &scope, &[HandlerEntryInit::new(2, 8, 33)]);
 
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -150,7 +150,7 @@ fn callable_info_carries_handler_table() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[info.value(), empty_context.value()],
+                    values: scope.stage(&[info.value(), empty_context.value()]),
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -179,7 +179,7 @@ fn callable_info_without_handler_table() {
 
     thread.handle_scope(|thread: &mut Thread, scope| {
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,

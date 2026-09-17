@@ -381,7 +381,7 @@ mod tests {
             ],
         );
         let arr = heap
-            .allocate::<FixedArray>(&[float.value(), Smi::new(7).encode()])
+            .allocate::<FixedArray>(scope.stage(&[float.value(), Smi::new(7).encode()]))
             .into_ptr();
 
         let float_addr = float.get().as_ptr() as *mut ();
@@ -423,8 +423,8 @@ mod tests {
     }
 
     use vm::{
-        AccessorPair, Change, DenseString, Float, Global, Heap, HeapPtr, Lookup, Map, MapInit,
-        MapKind, Object, ObjectSlotsInit, RootHandles, SlotFlags, SlotName, StoreOutcome,
+        AccessorPair, Change, DenseString, Float, GcSlice, Global, Heap, HeapPtr, Lookup, Map,
+        MapInit, MapKind, Object, ObjectSlotsInit, RootHandles, SlotFlags, SlotName, StoreOutcome,
         StoreSemantics, Tagged, Transition, Value, VmError,
     };
     use vm::{FixedArray, FixedByteArray, HandleData, HandleScope, Smi};
@@ -442,9 +442,11 @@ mod tests {
         value_slots: usize,
         descs: &[(i64, SlotFlags, Value)],
     ) -> Global<Map> {
-        let descriptors: Vec<(SlotName, SlotFlags, Value)> = descs
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
+        let descriptors: Vec<(SlotName, SlotFlags, vm::Handle<'_, Value>)> = descs
             .iter()
-            .map(|(name, flags, value)| (smi_name(*name), *flags, *value))
+            .map(|(name, flags, value)| (smi_name(*name), *flags, scope.handle(*value)))
             .collect();
         let map = heap
             .allocate::<Map>(MapInit {
@@ -466,9 +468,11 @@ mod tests {
         descs: &[(i64, SlotFlags, Value)],
         proto: Value,
     ) -> Global<Map> {
-        let descriptors: Vec<(SlotName, SlotFlags, Value)> = descs
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
+        let descriptors: Vec<(SlotName, SlotFlags, vm::Handle<'_, Value>)> = descs
             .iter()
-            .map(|(name, flags, value)| (smi_name(*name), *flags, *value))
+            .map(|(name, flags, value)| (smi_name(*name), *flags, scope.handle(*value)))
             .collect();
         let map = heap
             .allocate::<Map>(MapInit {
@@ -484,6 +488,7 @@ mod tests {
     fn alloc_object(heap: &mut Heap, map: Global<Map>, values: &[Value]) -> HeapPtr<Object> {
         let data = HandleData::new(heap.known().the_hole.value());
         let scope = scope(&data);
+        let values = scope.stage(values);
         let elements = heap.known().empty_fixed_array.erase();
         heap.allocate_object(
             &scope,
@@ -564,8 +569,10 @@ mod tests {
             &[(1, flags, Smi::new(0).encode())],
         );
         // hand-built transition pairs [name, target]
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
         let pairs = heap
-            .allocate::<FixedArray>(&[smi_name(1).value(), child.value()])
+            .allocate::<FixedArray>(scope.stage(&[smi_name(1).value(), child.value()]))
             .into_tagged();
 
         heap.no_gc(|nogc| {
@@ -930,8 +937,10 @@ mod tests {
 
         // child: smi(1) = value slot 0, smi(2) = value slot 1,
         // prototype = FixedArray([parent])
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
         let parents = heap
-            .allocate::<FixedArray>(&[parent.encode_strong()])
+            .allocate::<FixedArray>(scope.stage(&[parent.encode_strong()]))
             .into_ptr();
         let child_map = alloc_map_proto(
             &mut heap,
@@ -1027,8 +1036,10 @@ mod tests {
         let parent_b = alloc_object(&mut heap, map_b, &[Smi::new(20).encode()]);
 
         // child with prototype = [a, b]: the first parent wins
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
         let parents_ab = heap
-            .allocate::<FixedArray>(&[parent_a.encode_strong(), parent_b.encode_strong()])
+            .allocate::<FixedArray>(scope.stage(&[parent_a.encode_strong(), parent_b.encode_strong()]))
             .into_ptr();
         let child_ab_map = alloc_map_proto(
             &mut heap,
@@ -1043,7 +1054,7 @@ mod tests {
 
         // child with prototype = [b] alone reaches the second parent
         let parents_b = heap
-            .allocate::<FixedArray>(&[parent_b.encode_strong()])
+            .allocate::<FixedArray>(scope.stage(&[parent_b.encode_strong()]))
             .into_ptr();
         let child_b_map = alloc_map_proto(
             &mut heap,
@@ -1067,8 +1078,13 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
 
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
         let pair_ptr = heap
-            .allocate::<AccessorPair>((Smi::new(111).encode(), Smi::new(222).encode()))
+            .allocate::<AccessorPair>((
+                scope.handle(Smi::new(111).encode()),
+                scope.handle(Smi::new(222).encode()),
+            ))
             .into_ptr();
 
         let map = alloc_map(
@@ -1095,8 +1111,13 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
 
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
         let pair_ptr = heap
-            .allocate::<AccessorPair>((Smi::new(111).encode(), Smi::new(222).encode()))
+            .allocate::<AccessorPair>((
+                scope.handle(Smi::new(111).encode()),
+                scope.handle(Smi::new(222).encode()),
+            ))
             .into_ptr();
         let map = alloc_map(
             &mut heap,
@@ -1131,9 +1152,11 @@ mod tests {
         let fx = local_with_maps(1 << 16);
         let mut heap = fx.local();
 
+        let data = HandleData::new(heap.known().the_hole.value());
+        let scope = scope(&data);
         let undefined = heap.known().undefined.value();
         let pair_ptr = heap
-            .allocate::<AccessorPair>((undefined, undefined))
+            .allocate::<AccessorPair>((scope.handle(undefined), scope.handle(undefined)))
             .into_ptr();
         let map = alloc_map(
             &mut heap,
@@ -1179,7 +1202,7 @@ mod tests {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[Smi::new(7).encode()],
+                    values: scope.stage(&[Smi::new(7).encode()]),
                     elements: heap.known().the_hole.erase(),
                     length: 0,
                 },
@@ -1234,7 +1257,7 @@ mod tests {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[],
+                    values: GcSlice::EMPTY,
                     elements: heap.known().the_hole.erase(),
                     length: 0,
                 },
@@ -1531,7 +1554,8 @@ mod tests {
         {
             let tok = heap.allocate_token(total);
             assert_eq!(tok.remaining(), la.size() + lb.size());
-            let a = tok.allocate::<FixedArray>(&[Smi::new(0).encode(); 2]);
+            let twos = [Smi::new(0).encode(); 2];
+            let a = tok.allocate::<FixedArray>(unsafe { GcSlice::from_slice(&twos) });
             let b = tok.allocate::<FixedByteArray>(&[0u8; 8]);
             assert_ne!(a.as_ptr() as *mut u8, b.as_ptr() as *mut u8);
             assert_eq!(tok.remaining(), 0);
@@ -1554,7 +1578,7 @@ mod tests {
         let (ha, hb) = {
             let tok = heap.allocate_token(total);
             let ha = tok
-                .allocate::<FixedArray>(&[Smi::new(0).encode(); 2])
+                .allocate::<FixedArray>(scope.stage(&[Smi::new(0).encode(); 2]))
                 .into_handle(&scope);
             let hb = tok
                 .allocate::<FixedByteArray>(&[0u8; 8])
@@ -1579,8 +1603,10 @@ mod tests {
 
         let tok = heap.allocate_token(total);
         // multiple Fresh alive at once (shared borrows of the token)
-        let a = tok.allocate::<FixedArray>(&[Smi::new(0).encode()]);
-        let b = tok.allocate::<FixedArray>(&[Smi::new(0).encode()]);
+        let one = [Smi::new(0).encode()];
+        let a = tok.allocate::<FixedArray>(unsafe { GcSlice::from_slice(&one) });
+        let two = [Smi::new(0).encode()];
+        let b = tok.allocate::<FixedArray>(unsafe { GcSlice::from_slice(&two) });
         let ha = a.into_handle(&scope);
         let hb = b.into_handle(&scope);
         assert_ne!(ha.value().to_bits(), hb.value().to_bits());
@@ -1721,7 +1747,7 @@ mod tests {
         );
 
         let parents = heap
-            .allocate::<FixedArray>(&[parent_a.value(), parent_b.value()])
+            .allocate::<FixedArray>(scope.stage(&[parent_a.value(), parent_b.value()]))
             .into_handle(&scope);
         let child_map = alloc_map_proto(
             &mut heap,

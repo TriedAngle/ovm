@@ -171,7 +171,8 @@ pub(crate) fn object_get_own_property_names(
     });
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        Ok(heap.new_array(&scope, &names).into_tagged().erase())
+        let staged = scope.stage(&names);
+        Ok(heap.new_array(&scope, staged).into_tagged().erase())
     })
 }
 
@@ -182,7 +183,7 @@ pub(crate) fn plain_object(
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let map = nctx.heap().known().object_initial_map;
-        let obj = nctx.heap().new_object(&scope, map, &[]).into_handle(&scope);
+        let obj = nctx.heap().new_object(&scope, map, GcSlice::EMPTY).into_handle(&scope);
         for (name, value) in fields {
             let name = nctx.intern(&scope, name);
             let name = scope.handle(SlotName::from(name.as_tagged()).tagged());
@@ -383,7 +384,7 @@ pub(crate) fn set_integrity_flags(
             map.prototype.inner(),
             map.descriptors()
                 .iter()
-                .map(|d| (d.name(), d.flags(), d.value.inner()))
+                .map(|d| (d.name(), d.flags(), scope.handle(d.value.inner())))
                 .collect::<Vec<_>>(),
         )
     });

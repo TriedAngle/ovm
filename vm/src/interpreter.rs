@@ -311,18 +311,19 @@ fn dispatch(
     let mut trace = 0;
     loop {
         let pc = cache.pc();
+        let (op, ops, next_pc) = decode(cache.code_ref(&heap.guard()).as_slice(), pc);
         if std::env::var("OVM_TRACE").is_ok() {
             trace += 1;
-            if trace > 600 {
+            if trace > 200000 {
                 panic!("trace limit");
             }
             eprintln!(
-                "pc={pc} rc={} acc={:?}",
+                "pc={pc} base={} rc={} op={op:?} acc={:?}",
+                cache.frame_meta().base,
                 cache.frame_meta().register_count,
                 cache.acc(),
             );
         }
-        let (op, ops, next_pc) = decode(cache.code_ref(&heap.guard()).as_slice(), pc);
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
@@ -817,10 +818,10 @@ fn step(
                     return Step::Error(VmError::Type);
                 };
                 let (receiver, allocated) = if derived {
-                    (heap.known().the_hole.value(), false)
+                    (scope.handle(heap.known().the_hole.value()), false)
                 } else {
                     match Runtime::create_construct_receiver(vm, heap, state, callee) {
-                        Ok(Some(r)) => (r, true),
+                        Ok(Some(r)) => (scope.handle(r), true),
                         Ok(None) => return Step::PendingThrow,
                         Err(err) => return Step::Error(err),
                     }
@@ -829,7 +830,7 @@ fn step(
                 // synthesized and prepended
                 let count = ops.reg_count(2);
                 let mut args = Vec::with_capacity(count + 1);
-                args.push(receiver);
+                args.push(receiver.value());
                 args.extend_from_slice(stack.args(&meta, ops.reg_list(1), count).as_slice());
                 let result = match NativeContext::new(vm, heap, state).call_construct(
                     callee.value(),
@@ -844,7 +845,7 @@ fn step(
                 }
                 cache.set_acc(if Convert::is_primitive(&heap.guard(), result) {
                     if allocated {
-                        receiver
+                        receiver.value()
                     } else {
                         // a derived constructor returned a primitive: only
                         // reachable via `return <primitive>` (ES 9.2.2.1)
@@ -1298,14 +1299,14 @@ fn step(
         }
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
-                heap.new_object(&scope, heap.known().object_initial_map, &[])
+                heap.new_object(&scope, heap.known().object_initial_map, GcSlice::EMPTY)
             });
             cache.set_acc(obj.erase());
             Step::Next
         }
         Opcode::CreateEmptyArrayLiteral => {
             let obj = state.handle_scope(|scope| {
-                heap.new_object(&scope, heap.known().js_array_map, &[])
+                heap.new_object(&scope, heap.known().js_array_map, GcSlice::EMPTY)
                     .into_tagged()
                     .erase()
             });
@@ -1424,7 +1425,7 @@ fn step(
                 let scope_info = scope
                     .cast::<ScopeInfo>(scope_info)
                     .expect("constants slot holds a ScopeInfo");
-                let slots = heap.allocate_handle::<FixedArray>(&values, &scope);
+                let slots = heap.allocate_handle::<FixedArray>(scope.stage(&values), &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
                     slots,
@@ -1443,7 +1444,7 @@ fn step(
                 let outer = scope
                     .cast::<Context>(outer)
                     .expect("frame context slot holds a Context");
-                let slots = heap.allocate_handle::<FixedArray>(&values, &scope);
+                let slots = heap.allocate_handle::<FixedArray>(scope.stage(&values), &scope);
                 heap.allocate::<Context>(ContextInit {
                     outer: Some(outer),
                     slots,

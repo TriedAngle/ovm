@@ -16,7 +16,10 @@ pub(crate) fn boolean_constructor(
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
         let map = heap.known().boolean_wrapper_map;
-        Ok(heap.new_object(&scope, map, &[value]).into_tagged().erase())
+        Ok(heap
+            .new_object(&scope, map, scope.stage(&[value]))
+            .into_tagged()
+            .erase())
     })
 }
 

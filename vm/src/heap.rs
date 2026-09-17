@@ -1,10 +1,6 @@
 use std::sync::Arc;
 
-use crate::{
-    AllocError, FixedArray, Float, GcHost, Global, Handle, HandleScope, HandleSet, HeapBackend,
-    HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit, ObjectSlotsInit, RawCell,
-    RootHandles, STRONG_PTR, SharedHeap, Smi, TAG_MASK, Tagged, TransitionLock, Value, Visitor,
-    Word,
+use crate::{AllocError, FixedArray, Float, GcHost, GcSlice, Global, Handle, HandleScope, HandleSet, HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit, ObjectSlotsInit, RawCell, RootHandles, SharedHeap, Smi, STRONG_PTR, TAG_MASK, Tagged, TransitionLock, Value, Visitor, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -436,6 +432,8 @@ pub struct Heap {
     local: Box<dyn LocalHeap>,
     transition_lock: TransitionLock,
     known: *const KnownCell,
+    #[cfg(feature = "stress-minor-gc")]
+    stress_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 unsafe impl Send for Heap {}
@@ -490,7 +488,9 @@ impl Heap {
 
     pub fn allocate<T: HeapObject>(&mut self, config: T::Init<'_>) -> Fresh<'_, T> {
         #[cfg(feature = "stress-minor-gc")]
-        self.collect_minor();
+        if self.stress_armed.load(std::sync::atomic::Ordering::Acquire) {
+            self.collect_minor();
+        }
         let raw = self
             .allocate_raw(T::layout_for(&config))
             .expect("heap allocation failed (out of memory)");
@@ -531,7 +531,7 @@ impl Heap {
         &mut self,
         handles: &'a impl HandleSet,
         map: Handle<'a, Map>,
-        values: &'a [Value],
+        values: GcSlice<'a>,
     ) -> Fresh<'_, Object> {
         self.allocate_object(
             handles,
@@ -561,16 +561,14 @@ impl Heap {
     }
 
     /// CreateArrayFromList (ES 7.3.17): a fresh dense array holding
-    /// `values`. The values must be rooted by the caller (stack,
-    /// GcSlice, or handle block) — they are copied into the backing
-    /// store before any further allocation.
-    pub fn new_array(&mut self, scope: &HandleScope<'_>, values: &[Value]) -> Fresh<'_, Object> {
+    /// `values` (a GC-visited slice: stage raw values first).
+    pub fn new_array(&mut self, scope: &HandleScope<'_>, values: GcSlice<'_>) -> Fresh<'_, Object> {
         let elements = self.allocate_handle::<FixedArray>(values, scope);
         self.allocate_object(
             scope,
             ObjectSlotsInit {
                 map: self.known().js_array_map,
-                values: &[],
+                values: GcSlice::EMPTY,
                 elements: elements.erase(),
                 length: values.len(),
             },
@@ -626,6 +624,8 @@ impl core::fmt::Debug for Heap {
 pub struct GlobalHeap {
     shared: Arc<dyn SharedHeap>,
     transition_lock: TransitionLock,
+    #[cfg(feature = "stress-minor-gc")]
+    stress_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl GlobalHeap {
@@ -633,6 +633,8 @@ impl GlobalHeap {
         Self {
             shared,
             transition_lock: TransitionLock::new(),
+            #[cfg(feature = "stress-minor-gc")]
+            stress_armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -641,11 +643,20 @@ impl GlobalHeap {
         Ok(Self::new(B::new(config)?.into_shared()))
     }
 
+    /// Arm the `stress-minor-gc` knob: bootstrap runs un-stressed; from
+    /// here on every allocation triggers a minor collection first.
+    #[cfg(feature = "stress-minor-gc")]
+    pub fn arm_gc_stress(&self) {
+        self.stress_armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub fn new_local(&self, known: &KnownCell) -> Heap {
         Heap {
             local: self.shared.new_local(),
             transition_lock: self.transition_lock.clone(),
             known: known as *const KnownCell,
+            #[cfg(feature = "stress-minor-gc")]
+            stress_armed: std::sync::Arc::clone(&self.stress_armed),
         }
     }
 

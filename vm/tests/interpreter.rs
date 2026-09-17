@@ -56,7 +56,7 @@ fn callable_object<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.value(), empty_context.value()],
+                values: scope.stage(&[info.value(), empty_context.value()]),
                 elements: the_hole.erase(),
                 length: 0,
             },
@@ -74,7 +74,7 @@ fn run_program(
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&program, &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -101,7 +101,7 @@ fn create_closure_of_kind(
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(body, &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -144,7 +144,7 @@ fn run_program_ctx(
             .map(|i| thread.intern(&scope, &format!("slot{i}")))
             .map(|h| h.value())
             .collect();
-        let names = thread.heap().allocate_handle::<FixedArray>(&dummy, &scope);
+        let names = thread.heap().allocate_handle::<FixedArray>(scope.stage(&dummy), &scope);
         let scope_info = thread
             .heap()
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
@@ -153,7 +153,7 @@ fn run_program_ctx(
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[scope_info.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[scope_info.value()]), &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -229,7 +229,7 @@ fn failed_run_does_not_leak_frames_into_next_run() {
         let known = thread.heap().known();
         thread
             .heap()
-            .new_object(&scope, known.object_initial_map, &[])
+            .new_object(&scope, known.object_initial_map, GcSlice::EMPTY)
             .into_handle(&scope)
             .as_tagged()
             .erase()
@@ -294,7 +294,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
         let callee_bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&callee_program, &scope);
-        let callee_constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee_constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let callee = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,
@@ -309,7 +309,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
         // caller: r0 = callee object; CallNoFeedback r0, r0, 1 -> acc
         let receiver_consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[callee_obj.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[callee_obj.value()]), &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -434,7 +434,7 @@ fn object_literal_built_with_manual_stores() {
             let y = thread.intern(&scope, "y");
             let consts = thread
                 .heap()
-                .allocate_handle::<FixedArray>(&[x.value(), y.value()], &scope);
+                .allocate_handle::<FixedArray>(scope.stage(&[x.value(), y.value()]), &scope);
 
             // r0 = {}; r0.x = 7; r0.y = 9; return r0
             let mut program = Vec::new();
@@ -508,7 +508,7 @@ fn define_named_own_property_attributes_and_value() {
             let m = thread.intern(&scope, "m");
             let consts = thread
                 .heap()
-                .allocate_handle::<FixedArray>(&[m.value()], &scope);
+                .allocate_handle::<FixedArray>(scope.stage(&[m.value()]), &scope);
             let define = |program: &mut Vec<u8>, value: i32| {
                 emit(program, Opcode::Load, &[0]);
                 emit(program, Opcode::Store, &[1]);
@@ -708,7 +708,7 @@ fn define_own_property_accessor_invokes_getter() {
         let bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&body, &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -930,7 +930,7 @@ fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Resu
         let y = thread.intern(&scope, "y");
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[x.value(), y.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[x.value(), y.value()]), &scope);
 
         // r2 = {}; r2.x = 7; r2.y = 9
         let mut program = Vec::new();
@@ -1006,7 +1006,7 @@ fn transition_object_program(
             MapInit {
                 kind,
                 value_slot_count: 1,
-                descriptors: &[(SlotName::from(x.as_tagged()), x_flags, Smi::new(0).encode())],
+                descriptors: &[(SlotName::from(x.as_tagged()), x_flags, scope.handle(Smi::new(0).encode()))],
                 prototype: the_hole.erase(),
             },
             &scope,
@@ -1017,7 +1017,7 @@ fn transition_object_program(
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[smi(7)],
+                    values: scope.stage(&[smi(7)]),
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -1025,7 +1025,7 @@ fn transition_object_program(
             .into_handle(&scope);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[obj.value(), x.value(), z.value(), w.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[obj.value(), x.value(), z.value(), w.value()]), &scope);
 
         // r2 = object
         let mut program = Vec::new();
@@ -1157,7 +1157,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 descriptors: &[(
                     SlotName::from(p.as_tagged()),
                     WRITABLE_VALUE,
-                    Smi::new(0).encode(),
+                    scope.handle(Smi::new(0).encode()),
                 )],
                 prototype: the_hole.erase(),
             },
@@ -1169,7 +1169,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 &scope,
                 ObjectSlotsInit {
                     map: parent_map,
-                    values: &[Smi::new(1).encode()],
+                    values: scope.stage(&[Smi::new(1).encode()]),
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -1179,7 +1179,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
         // parents in priority order; here a single one)
         let parents = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[parent.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[parent.value()]), &scope);
         let child_map = thread.heap().allocate_handle::<Map>(
             MapInit {
                 kind: EXTENDABLE,
@@ -1195,7 +1195,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 &scope,
                 ObjectSlotsInit {
                     map: child_map,
-                    values: &[],
+                    values: GcSlice::EMPTY,
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -1203,7 +1203,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
             .into_handle(&scope);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[child.value(), p.value(), parent.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[child.value(), p.value(), parent.value()]), &scope);
 
         // r2 = child; r2.p = 2 (via `store_op`); acc = r2.p + parent.p
         let mut program = Vec::new();
@@ -1365,7 +1365,7 @@ fn jump_if_truthy_follows_toboolean() {
                     &scope,
                     ObjectSlotsInit {
                         map,
-                        values: &[],
+                        values: GcSlice::EMPTY,
                         elements: the_hole.erase(),
                         length: 0,
                     },
@@ -1476,7 +1476,7 @@ fn accessor_object_program(
                 .allocate_handle::<FixedByteArray>(program, &scope);
             let constants = thread
                 .heap()
-                .allocate_handle::<FixedArray>(&[y.value()], &scope);
+                .allocate_handle::<FixedArray>(scope.stage(&[y.value()]), &scope);
             let info = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
                     bytecode,
@@ -1488,8 +1488,8 @@ fn accessor_object_program(
             );
             callable_object(thread, &scope, info).value()
         };
-        let get = getter.map_or(undefined.value(), |p| make(&mut *thread, p));
-        let set = setter.map_or(undefined.value(), |p| make(&mut *thread, p));
+        let get = scope.handle(getter.map_or(undefined.value(), |p| make(&mut *thread, p)));
+        let set = scope.handle(setter.map_or(undefined.value(), |p| make(&mut *thread, p)));
         let pair = thread
             .heap()
             .allocate_handle::<AccessorPair>((get, set), &scope);
@@ -1502,12 +1502,12 @@ fn accessor_object_program(
                     (
                         SlotName::from(y.as_tagged()),
                         WRITABLE_VALUE,
-                        Smi::new(0).encode(),
+                        scope.handle(Smi::new(0).encode()),
                     ),
                     (
                         SlotName::from(x.as_tagged()),
                         SlotFlags::ACCESSOR,
-                        pair.value(),
+                        scope.handle(pair.value()),
                     ),
                 ],
                 prototype: the_hole.erase(),
@@ -1520,7 +1520,7 @@ fn accessor_object_program(
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[smi(7)],
+                    values: scope.stage(&[smi(7)]),
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -1528,7 +1528,7 @@ fn accessor_object_program(
             .into_handle(&scope);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[obj.value(), x.value(), y.value(), z.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[obj.value(), x.value(), y.value(), z.value()]), &scope);
 
         // r2 = object
         let mut program = Vec::new();
@@ -1666,7 +1666,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 descriptors: &[(
                     SlotName::from(y.as_tagged()),
                     WRITABLE_VALUE,
-                    Smi::new(0).encode(),
+                    scope.handle(Smi::new(0).encode()),
                 )],
                 prototype: the_hole.erase(),
             },
@@ -1678,7 +1678,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[smi(7)],
+                    values: scope.stage(&[smi(7)]),
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -1692,7 +1692,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 .allocate_handle::<FixedByteArray>(&getter_program(), &scope);
             let constants = thread
                 .heap()
-                .allocate_handle::<FixedArray>(&[y.value()], &scope);
+                .allocate_handle::<FixedArray>(scope.stage(&[y.value()]), &scope);
             let info = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
                     bytecode,
@@ -1724,7 +1724,7 @@ fn store_new_accessor_property_defines_own_accessor() {
         // program: acc = param0.x
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[x.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[x.value()]), &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -1775,7 +1775,7 @@ fn native_function<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[Smi::new(idx.0 as i64).encode()],
+                values: scope.stage(&[Smi::new(idx.0 as i64).encode()]),
                 elements: the_hole.erase(),
                 length: 0,
             },
@@ -1796,7 +1796,7 @@ fn bytecode_fn(
     let bytecode = nctx
         .heap()
         .allocate_handle::<FixedByteArray>(program, scope);
-    let constants = nctx.heap().allocate_handle::<FixedArray>(constants, scope);
+    let constants = nctx.heap().allocate_handle::<FixedArray>(scope.stage(constants), scope);
     let info = nctx.heap().allocate_handle::<CallableInfoObject>(
         CallableInfoInit {
             bytecode,
@@ -1812,7 +1812,7 @@ fn bytecode_fn(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[info.value(), empty_context.value()],
+                values: scope.stage(&[info.value(), empty_context.value()]),
                 elements: the_hole.erase(),
                 length: 0,
             },
@@ -1847,7 +1847,7 @@ fn call_dispatches_to_native_function_object() {
         let f = native_function(thread, &scope, idx);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[f.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[f.value()]), &scope);
 
         // r0 = native fn; Call r0 with r0 as the (single, receiver) arg
         let mut program = Vec::new();
@@ -2069,13 +2069,13 @@ fn equal_strict_compares_numbers_strings_and_objects() {
         let object_init = thread.heap().known();
         let obj = thread
             .heap()
-            .new_object(&scope, object_init.object_initial_map, &[])
+            .new_object(&scope, object_init.object_initial_map, GcSlice::EMPTY)
             .into_handle(&scope)
             .as_tagged()
             .erase();
         let obj2 = thread
             .heap()
-            .new_object(&scope, object_init.object_initial_map, &[])
+            .new_object(&scope, object_init.object_initial_map, GcSlice::EMPTY)
             .into_handle(&scope)
             .as_tagged()
             .erase();
@@ -2466,7 +2466,7 @@ fn run_program_consts(
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let constants = thread
             .heap()
-            .allocate_handle::<FixedArray>(constants, &scope);
+            .allocate_handle::<FixedArray>(scope.stage(constants), &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -2615,7 +2615,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
         let callee_bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&callee_program, &scope);
-        let callee_consts = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee_consts = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,
@@ -2638,13 +2638,13 @@ fn create_closure_inherits_current_context_and_is_callable() {
         let slot_name = thread.intern(&scope, "slot0");
         let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[slot_name.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[slot_name.value()]), &scope);
         let scope_info = thread
             .heap()
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[scope_info.value(), callee_info.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[scope_info.value(), callee_info.value()]), &scope);
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -2658,7 +2658,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
         // the caller runs in a context whose slot 0 = 42
         let slots = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[smi(42)], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[smi(42)]), &scope);
         let scope_info = thread.heap().known().empty_scope_info;
         let context = thread.heap().allocate_handle::<Context>(
             ContextInit {
@@ -2676,7 +2676,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[caller_info.value(), context.value()],
+                    values: scope.stage(&[caller_info.value(), context.value()]),
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -2694,7 +2694,7 @@ fn create_closure_shares_callable_info_template() {
 
     let (result, template) = thread.handle_scope(|thread, scope| {
         let callee_bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
-        let callee_consts = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee_consts = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,
@@ -2868,7 +2868,7 @@ fn push_context_saves_previous_context_to_register() {
         let slot_name = thread.intern(&scope, "slot0");
         let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[slot_name.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[slot_name.value()]), &scope);
         let scope_info = thread
             .heap()
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
@@ -2959,7 +2959,7 @@ fn closure_captures_function_context_end_to_end() {
         let callee_bytecode = thread
             .heap()
             .allocate_handle::<FixedByteArray>(&callee_program, &scope);
-        let callee_consts = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let callee_consts = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode: callee_bytecode,
@@ -2992,13 +2992,13 @@ fn closure_captures_function_context_end_to_end() {
         let slot_name = thread.intern(&scope, "slot0");
         let names = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[slot_name.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[slot_name.value()]), &scope);
         let scope_info = thread
             .heap()
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[scope_info.value(), callee_info.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[scope_info.value(), callee_info.value()]), &scope);
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -3028,7 +3028,7 @@ fn proto_object<'s>(
             descriptors: &[(
                 SlotName::from(p.as_tagged()),
                 WRITABLE_VALUE,
-                Smi::new(0).encode(),
+                scope.handle(Smi::new(0).encode()),
             )],
             prototype: the_hole.erase(),
         },
@@ -3040,7 +3040,7 @@ fn proto_object<'s>(
             scope,
             ObjectSlotsInit {
                 map,
-                values: &[smi(7)],
+                values: scope.stage(&[smi(7)]),
                 elements: the_hole.erase(),
                 length: 0,
             },
@@ -3059,7 +3059,7 @@ fn set_prototype_changes_property_lookup_chain() {
         let obj_b = proto_object(&mut *thread, &scope, p);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[p.value(), obj_b.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[p.value(), obj_b.value()]), &scope);
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
@@ -3108,7 +3108,7 @@ fn set_prototype_survives_property_transitions() {
         let obj_b = proto_object(&mut *thread, &scope, p);
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[p.value(), obj_b.value(), x.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[p.value(), obj_b.value(), x.value()]), &scope);
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
@@ -3197,7 +3197,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[],
+                    values: GcSlice::EMPTY,
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -3206,7 +3206,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
 
         let consts = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[frozen.value(), obj_b.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[frozen.value(), obj_b.value()]), &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -3253,7 +3253,7 @@ fn make_callable<'s>(
         .allocate_handle::<FixedByteArray>(program, scope);
     let constants = thread
         .heap()
-        .allocate_handle::<FixedArray>(constants, scope);
+        .allocate_handle::<FixedArray>(scope.stage(constants), scope);
     let info = thread.heap().allocate_handle::<CallableInfoObject>(
         CallableInfoInit {
             bytecode,
@@ -3271,7 +3271,7 @@ fn empty_object<'s>(thread: &mut Thread, scope: &'s HandleScope<'_>) -> Handle<'
     let known = thread.heap().known();
     thread
         .heap()
-        .new_object(scope, known.object_initial_map, &[])
+        .new_object(scope, known.object_initial_map, GcSlice::EMPTY)
         .into_handle(scope)
 }
 
@@ -3954,7 +3954,7 @@ fn shadow_setup<'s>(
             descriptors: &[(
                 SlotName::from(p.as_tagged()),
                 WRITABLE_VALUE,
-                Smi::new(0).encode(),
+                scope.handle(Smi::new(0).encode()),
             )],
             prototype: the_hole.erase(),
         },
@@ -3966,7 +3966,7 @@ fn shadow_setup<'s>(
             scope,
             ObjectSlotsInit {
                 map: parent_map,
-                values: &[Smi::new(1).encode()],
+                values: scope.stage(&[Smi::new(1).encode()]),
                 elements: the_hole.erase(),
                 length: 0,
             },
@@ -3974,7 +3974,7 @@ fn shadow_setup<'s>(
         .into_handle(scope);
     let parents = thread
         .heap()
-        .allocate_handle::<FixedArray>(&[parent.value()], &scope);
+        .allocate_handle::<FixedArray>(scope.stage(&[parent.value()]), &scope);
     let child_map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: if child_extendable {
@@ -3994,7 +3994,7 @@ fn shadow_setup<'s>(
             scope,
             ObjectSlotsInit {
                 map: child_map,
-                values: &[],
+                values: GcSlice::EMPTY,
                 elements: the_hole.erase(),
                 length: 0,
             },

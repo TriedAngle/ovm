@@ -3,9 +3,30 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use core::alloc::Layout;
 
 use crate::{
-    AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef,
-    Key, Lookup, Map, MapInit, NoGc, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
-    classify_key, lookup_in_parents,
+    AccessorPair,
+    AllocToken,
+    classify_key,
+    Compare,
+    FixedArray,
+    GcSlice,
+    Handle,
+    HandleScope,
+    Heap,
+    HeapObject,
+    HeapRef,
+    Key,
+    Lookup,
+    lookup_in_parents,
+    Map,
+    MapInit,
+    NoGc,
+    Object,
+    SlotFlags,
+    SlotName,
+    Smi,
+    Tagged,
+    Value,
+    VmError,
 };
 
 /// Serializes map-transition tree mutations across threads. VM-internal:
@@ -294,16 +315,16 @@ impl Transition {
         heap.allocate_token_enter_nogc(total, |token, nogc| {
             let parent_ref = parent(nogc);
             let row_value = match pair {
-                Some((get, set)) => token
-                    .allocate::<AccessorPair>((get.value(), set.value()))
-                    .erase(),
-                None => Smi::new(row_offset as i64).encode(),
+                Some((get, set)) => {
+                    scope.handle(token.allocate::<AccessorPair>((get, set)).erase())
+                }
+                None => scope.handle(Smi::new(row_offset as i64).encode()),
             };
 
-            let mut descriptors: Vec<(SlotName, SlotFlags, Value)> = parent_ref
+            let mut descriptors: Vec<(SlotName, SlotFlags, Handle<'_, Value>)> = parent_ref
                 .descriptors()
                 .iter()
-                .map(|d| (d.name(), d.flags(), d.value.inner()))
+                .map(|d| (d.name(), d.flags(), scope.handle(d.value.inner())))
                 .collect();
             match change {
                 Change::Append => descriptors.push((name.into(), flags, row_value)),
@@ -322,7 +343,7 @@ impl Transition {
             }
             pairs.push(name.value());
             pairs.push(child.erase());
-            let pairs = token.allocate::<FixedArray>(&pairs);
+            let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
             parent_ref
                 .transitions
                 .set(nogc, parent_ref.erase(), pairs.into_tagged());
@@ -333,6 +354,7 @@ impl Transition {
 
     fn grow_slots_and_swap(
         heap: &mut Heap,
+        scope: &HandleScope<'_>,
         receiver: Handle<Object>,
         name: Handle<SlotName>,
         flags: SlotFlags,
@@ -359,7 +381,7 @@ impl Transition {
             );
             values.push(value.value());
             debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
-            let slots = token.allocate::<FixedArray>(&values);
+            let slots = token.allocate::<FixedArray>(scope.stage(&values));
             let host = receiver.value();
             receiver_ref.slots.set(nogc, host, slots.into_tagged());
             receiver_ref
@@ -439,7 +461,7 @@ impl Transition {
             let existing = parent
                 .find_remove_transition_locked(&nogc, name.into(), &guard)
                 .map(|m| m.into_tagged());
-            let mut surviving: Vec<(SlotName, SlotFlags, Value)> =
+            let mut surviving: Vec<(SlotName, SlotFlags, Handle<'_, Value>)> =
                 Vec::with_capacity(descriptors.len() - 1);
             let mut values: Vec<Value> = obj.slots.heap_ref(&nogc).as_slice()[..base]
                 .iter()
@@ -451,7 +473,7 @@ impl Transition {
                 }
                 if d.flags().is_accessor() {
                     // accessors embed their pair in the descriptor row
-                    surviving.push((d.name(), d.flags(), d.value.inner()));
+                    surviving.push((d.name(), d.flags(), scope.handle(d.value.inner())));
                 } else {
                     // data rows re-dense their offsets; the value rides
                     // along in slot order
@@ -459,7 +481,7 @@ impl Transition {
                     surviving.push((
                         d.name(),
                         d.flags(),
-                        Smi::new(values.len() as i64 - 1).encode(),
+                        scope.handle(Smi::new(values.len() as i64 - 1).encode()),
                     ));
                 }
             }
@@ -479,7 +501,7 @@ impl Transition {
             // shared child map: only this receiver's slots need compacting
             heap.allocate_token_enter_nogc(FixedArray::layout_for(values.len()), |token, nogc| {
                 let obj = receiver.heap_ref(nogc);
-                let slots = token.allocate::<FixedArray>(&values);
+                let slots = token.allocate::<FixedArray>(scope.stage(&values));
                 let host = receiver.value();
                 obj.slots.set(nogc, host, slots.into_tagged());
                 obj.header.map.set(nogc, host, existing);
@@ -506,11 +528,11 @@ impl Transition {
             }
             pairs.push(name.value());
             pairs.push(child.erase());
-            let pairs = token.allocate::<FixedArray>(&pairs);
+            let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
             parent
                 .transitions
                 .set(nogc, parent.erase(), pairs.into_tagged());
-            let slots = token.allocate::<FixedArray>(&values);
+            let slots = token.allocate::<FixedArray>(scope.stage(&values));
             let host = receiver.value();
             obj.slots.set(nogc, host, slots.into_tagged());
             obj.header.map.set(nogc, host, child.into_tagged());
@@ -549,7 +571,7 @@ impl Transition {
                     change,
                 );
                 if grow {
-                    Self::grow_slots_and_swap(heap, receiver, name, flags, value);
+                    Self::grow_slots_and_swap(heap, scope, receiver, name, flags, value);
                 } else {
                     let Change::Replace { index } = change else {
                         unreachable!("appends always grow")
@@ -904,10 +926,10 @@ impl Object {
             let map = obj.map_ref(nogc);
             let kind = map.kind();
             let value_slot_count = map.value_slot_count();
-            let descriptors: Vec<(SlotName, SlotFlags, Value)> = map
+            let descriptors: Vec<(SlotName, SlotFlags, Handle<'_, Value>)> = map
                 .descriptors()
                 .iter()
-                .map(|d| (d.name(), d.flags(), d.value.inner()))
+                .map(|d| (d.name(), d.flags(), scope.handle(d.value.inner())))
                 .collect();
             let new_map = token.allocate::<Map>(MapInit {
                 kind,

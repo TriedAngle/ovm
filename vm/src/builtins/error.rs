@@ -40,7 +40,7 @@ pub(crate) fn make_error(
             "ReferenceError" => heap.known().reference_error_map,
             _ => heap.known().error_map,
         };
-        let obj = heap.new_object(&scope, map, &[]).into_handle(&scope);
+        let obj = heap.new_object(&scope, map, GcSlice::EMPTY).into_handle(&scope);
         let name = heap.known().strings.name;
         let message_key = heap.known().strings.message;
         let class_value = vm.interner().intern_str(heap, &scope, class);

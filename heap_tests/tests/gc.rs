@@ -57,7 +57,7 @@ where
         let string = DenseString::from_latin1(t.heap(), &scope, b"survivor");
         let array = t
             .heap()
-            .allocate_handle::<FixedArray>(&[Smi::new(42).encode(), string.value()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(42).encode(), string.value()]), &scope);
         let before = (string.value().to_bits(), array.value().to_bits());
 
         t.heap().collect();
@@ -84,7 +84,7 @@ where
         let mut thread = vm.attach();
         thread.handle_scope(|t, _scope| {
             for _ in 0..8 {
-                let _ = t.heap().allocate::<FixedArray>(&[Smi::new(0).encode()]);
+                let _ = t.heap().allocate::<FixedArray>(_scope.stage(&[Smi::new(0).encode()]));
             }
         });
     }

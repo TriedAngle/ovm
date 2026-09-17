@@ -266,13 +266,13 @@ fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         let (vm, heap, _) = nctx.split();
         let keys = for_in_level_keys(vm, heap, &scope, level)?;
 
-        let keys = heap.allocate_handle::<FixedArray>(&keys, &scope);
+        let keys = heap.allocate_handle::<FixedArray>(scope.stage(&keys), &scope);
         let empty = heap.known().empty_fixed_array;
         let map = heap.known().for_in_enumerator_map;
         let enumerator = heap.new_object(
             &scope,
             map,
-            &[level, keys.value(), Smi::new(0).encode(), empty.value()],
+            scope.stage(&[level, keys.value(), Smi::new(0).encode(), empty.value()]),
         );
         Ok(enumerator.into_tagged().erase())
     })
@@ -457,7 +457,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
                     return Ok(heap.known().undefined.value());
                 };
                 let keys = for_in_level_keys(vm, heap, &scope, proto)?;
-                let keys = heap.allocate_handle::<FixedArray>(&keys, &scope);
+                let keys = heap.allocate_handle::<FixedArray>(scope.stage(&keys), &scope);
                 heap.no_gc(|nogc| -> Result<(), VmError> {
                     let Some(obj) = enumerator.as_heap_object(nogc) else {
                         return Err(VmError::Type);
@@ -520,7 +520,7 @@ fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
                 })?;
                 let mut visited = visited;
                 visited.push(key);
-                let visited = heap.allocate_handle::<FixedArray>(&visited, &scope);
+                let visited = heap.allocate_handle::<FixedArray>(scope.stage(&visited), &scope);
                 heap.no_gc(|nogc| -> Result<(), VmError> {
                     let Some(obj) = enumerator.as_heap_object(nogc) else {
                         return Err(VmError::Type);
@@ -1654,12 +1654,12 @@ fn create_rest_parameter(
     };
     let arr = nctx.handle_scope(|nctx, scope| {
         let heap = nctx.heap();
-        let elements = heap.allocate_handle::<FixedArray>(&values, &scope);
+        let elements = heap.allocate_handle::<FixedArray>(scope.stage(&values), &scope);
         heap.allocate_object(
             &scope,
             ObjectSlotsInit {
                 map: heap.known().js_array_map,
-                values: &[],
+                values: GcSlice::EMPTY,
                 elements: elements.erase(),
                 length: values.len(),
             },

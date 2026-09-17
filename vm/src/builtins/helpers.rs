@@ -57,7 +57,7 @@ pub(crate) fn make_native_function<'s>(
         .new_object(
             scope,
             map,
-            &[Smi::new(index.0 as i64).encode(), empty_context.value()],
+            scope.stage(&[Smi::new(index.0 as i64).encode(), empty_context.value()]),
         )
         .into_global(roots);
     Ok(obj)
@@ -81,7 +81,7 @@ pub(crate) fn make_native_plain_function<'s>(
         .new_object(
             scope,
             map,
-            &[Smi::new(index.0 as i64).encode(), empty_context.value()],
+            scope.stage(&[Smi::new(index.0 as i64).encode(), empty_context.value()]),
         )
         .into_global(roots);
     Ok(obj)
@@ -142,7 +142,7 @@ pub(crate) fn install_constructor<'s>(
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         proto_parent,
     )?;
-    let proto = thread.heap().new_object(scope, map, &[]).into_global(roots);
+    let proto = thread.heap().new_object(scope, map, GcSlice::EMPTY).into_global(roots);
 
     // proto.constructor = fn; fn.prototype = proto
     // (built-in methods/constructor properties are non-enumerable, ES 20+)

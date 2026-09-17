@@ -40,7 +40,7 @@ fn contexts_chain_through_outer() {
         let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[Smi::new(42).encode()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(42).encode()]), &scope);
         let inner = thread.heap().allocate_handle::<Context>(
             ContextInit {
                 outer: None,
@@ -51,7 +51,7 @@ fn contexts_chain_through_outer() {
         );
         let slots = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[Smi::new(7).encode()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(7).encode()]), &scope);
         let outer = thread.heap().allocate_handle::<Context>(
             ContextInit {
                 outer: Some(inner),
@@ -89,7 +89,7 @@ fn closure_object_carries_typed_context() {
         let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()
-            .allocate_handle::<FixedArray>(&[Smi::new(9).encode()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[Smi::new(9).encode()]), &scope);
         let context = thread.heap().allocate_handle::<Context>(
             ContextInit {
                 outer: None,
@@ -100,7 +100,7 @@ fn closure_object_carries_typed_context() {
         );
 
         let bytecode = thread.heap().allocate_handle::<FixedByteArray>(&[], &scope);
-        let constants = thread.heap().allocate_handle::<FixedArray>(&[], &scope);
+        let constants = thread.heap().allocate_handle::<FixedArray>(scope.stage(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
                 bytecode,
@@ -118,7 +118,7 @@ fn closure_object_carries_typed_context() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: &[info.value(), context.value()],
+                    values: scope.stage(&[info.value(), context.value()]),
                     elements: the_hole.erase(),
                     length: 0,
                 },

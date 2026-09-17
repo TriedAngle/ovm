@@ -32,7 +32,8 @@ pub(crate) fn array_constructor(
                 (argv, n)
             }
         };
-        Ok(heap.new_array(&scope, &values).into_tagged().erase())
+        let staged = scope.stage(&values);
+        Ok(heap.new_array(&scope, staged).into_tagged().erase())
     })
 }
 
@@ -59,7 +60,7 @@ pub(crate) fn array_values(
         let map = heap.known().array_iterator_map;
         let zero = Smi::new(0).encode();
         Ok(heap
-            .new_object(&scope, map, &[receiver, zero])
+            .new_object(&scope, map, scope.stage(&[receiver, zero]))
             .into_tagged()
             .erase())
     })
@@ -122,7 +123,7 @@ pub(crate) fn array_iterator_next(
         })?;
         let map = heap.known().iterator_result_map;
         Ok(heap
-            .new_object(&scope, map, &[value, done_value])
+            .new_object(&scope, map, scope.stage(&[value, done_value]))
             .into_tagged()
             .erase())
     })

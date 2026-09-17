@@ -1,5 +1,5 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{FixedArray, VM};
+use vm::{FixedArray, GcSlice, VM};
 
 fn vm() -> VM {
     heap_tests::vm::<MarkSweep>(MarkSweepConfig::default())
@@ -13,9 +13,10 @@ fn unrooted_allocations_are_freed() {
         let used0 = vm.heap().stats().used;
         thread_handle_scope(t, |t, scope| {
             for _ in 0..4 {
+                let smis = vec![vm::Smi::new(0).encode(); 8192];
                 let _ = t
                     .heap()
-                    .allocate_handle::<FixedArray>(&vec![vm::Smi::new(0).encode(); 8192], &scope);
+                    .allocate_handle::<FixedArray>(scope.stage(&smis), &scope);
             }
         });
         let used1 = vm.heap().stats().used;
@@ -43,9 +44,10 @@ fn weak_to_dead_is_cleared_and_does_not_retain() {
     let vm = vm();
     let mut thread = vm.attach();
     let index = thread.handle_scope(|t, scope| {
+        let smis = vec![vm::Smi::new(0).encode(); 4096];
         let target = t
             .heap()
-            .allocate_handle::<FixedArray>(&vec![vm::Smi::new(0).encode(); 4096], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&smis), &scope);
         let index = vm.track_weak(target.value());
         assert!(!vm.weak_value(index).is_cleared());
         index
@@ -70,7 +72,7 @@ fn weak_to_live_stays_uncleared() {
     thread.handle_scope(|t, scope| {
         let target = t
             .heap()
-            .allocate_handle::<FixedArray>(&[vm::Smi::new(1).encode()], &scope);
+            .allocate_handle::<FixedArray>(scope.stage(&[vm::Smi::new(1).encode()]), &scope);
         let index = vm.track_weak(target.value());
 
         t.heap().collect();

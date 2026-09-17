@@ -8,7 +8,7 @@
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
     Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ScopeInfo,
-    ScopeInfoInit, VmError,
+    ScopeInfoInit, Value, VmError,
 };
 
 use base_compiler::{CompiledScript, Constant};
@@ -53,8 +53,9 @@ pub fn materialize_closure_vm<'s>(
     let info = materialize_function(vm, heap, state, scope, script, &mut infos, FunctionId(0))?;
 
     let map = heap.known().function_map;
+    let slots = scope.stage(&[info.value(), context.value()]);
     let object = heap
-        .new_object(scope, map, &[info.value(), context.value()])
+        .new_object(scope, map, slots)
         .into_handle(scope);
     Ok(object)
 }
@@ -73,35 +74,40 @@ fn materialize_function<'s>(
     }
     let function = &script.functions[fid.0 as usize];
 
-    let mut constants = Vec::with_capacity(function.constants.len());
+    let mut constants: Vec<Handle<'s, Value>> = Vec::with_capacity(function.constants.len());
     for constant in &function.constants {
         let value = match constant {
-            Constant::String(bytes) => intern(heap, state, scope, vm, bytes),
-            Constant::Smi(v) => crate::Smi::new(*v).encode(),
-            Constant::Float(f) => heap.new_number(scope, *f),
+            Constant::String(bytes) => scope.handle(intern(heap, state, scope, vm, bytes)),
+            Constant::Smi(v) => scope.handle(crate::Smi::new(*v).encode()),
+            Constant::Float(f) => scope.handle(heap.new_number(scope, *f)),
             Constant::Callable(child) => {
                 let info = materialize_function(vm, heap, state, scope, script, infos, *child)?;
-                info.value()
+                scope.handle(info.value())
             }
             Constant::ContextNames(names) => {
-                let interned: Vec<crate::Value> = names
+                let interned: Vec<Handle<'s, Value>> = names
                     .iter()
-                    .map(|n| intern(heap, state, scope, vm, n))
+                    .map(|n| scope.handle(intern(heap, state, scope, vm, n)))
                     .collect();
-                let names = heap.allocate_handle::<FixedArray>(&interned, scope);
+                let values: Vec<Value> = interned.iter().map(|h| h.value()).collect();
+                let names =
+                    heap.allocate_handle::<FixedArray>(scope.stage(&values), scope);
                 // one shared ScopeInfo per compiled scope; every activation
                 // of the scope references it from its context
-                heap.allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, scope)
-                    .value()
+                scope.handle(
+                    heap.allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, scope)
+                        .value(),
+                )
             }
-            Constant::ObjectPrototype => heap.known().object_prototype.value(),
-            Constant::FunctionPrototype => heap.known().function_prototype.value(),
+            Constant::ObjectPrototype => scope.handle(heap.known().object_prototype.value()),
+            Constant::FunctionPrototype => scope.handle(heap.known().function_prototype.value()),
         };
         constants.push(value);
     }
 
     let bytecode = heap.allocate_handle::<FixedByteArray>(&function.bytecode, scope);
-    let constants = heap.allocate_handle::<FixedArray>(&constants, scope);
+    let values: Vec<Value> = constants.iter().map(|h| h.value()).collect();
+    let constants = heap.allocate_handle::<FixedArray>(scope.stage(&values), scope);
     let handlers = if function.handlers.is_empty() {
         None
     } else {
