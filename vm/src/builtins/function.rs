@@ -25,13 +25,13 @@ pub fn function_to_string(
 pub fn function_call(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let f = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()))?;
     if !Runtime::is_callable(nctx.heap(), f) {
         return Err(VmError::Type);
     }
     let call_args: Vec<Value> = nctx
         .heap()
-        .no_gc(|heap| args.iter(heap).skip(1).map(|v| v.erase()).collect());
+        .no_gc(|heap| args.iter(heap).skip(1).map(|v| v.raw()).collect());
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, still fresh (no allocation since).
         let f = unsafe { Tagged::<Value>::from_value_unchecked(f) };
@@ -53,21 +53,21 @@ pub fn function_call(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
 pub fn function_bind(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let raw_f = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()))?;
     if !Runtime::is_callable(nctx.heap(), raw_f) {
         return Err(VmError::Type);
     }
     // Safety: fresh root-slot word read for the immediate use.
     let undefined = nctx
         .heap()
-        .no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
+        .no_gc(|heap| heap.known().undefined.as_tagged(heap).raw());
     let raw_this_arg = nctx
         .heap()
-        .no_gc(|heap| args.get(heap, 1).map(|v| v.erase()))
+        .no_gc(|heap| args.get(heap, 1).map(|v| v.raw()))
         .unwrap_or(undefined);
     let prepend: Vec<Value> = nctx
         .heap()
-        .no_gc(|heap| args.iter(heap).skip(2).map(|v| v.erase()).collect());
+        .no_gc(|heap| args.iter(heap).skip(2).map(|v| v.raw()).collect());
     nctx.handle_scope(|nctx, scope| {
         // everything below allocates (interning, the [[Get]] for
         // __makeBound, the prepend array, the call): keep the raw inputs
@@ -96,19 +96,15 @@ pub fn function_bind(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
                 .collect::<Vec<_>>(),
         );
         let (_, heap, _) = nctx.split();
-        let array = scope.handle(heap.new_array(&scope, staged).erase_type());
+        let array = scope.handle(heap.new_array(&scope, staged).erase());
         // args[0] is the receiver (undefined for the plain call)
         // Safety: fresh rooted-slot words staged for the call.
         let nctx_heap = nctx.heap();
         let staged = scope.stage(&[
-            nctx_heap
-                .known()
-                .undefined
-                .as_tagged(nctx_heap)
-                .erase_type(),
-            f.as_tagged(nctx_heap).erase_type(),
-            this_arg.as_tagged(nctx_heap).erase_type(),
-            array.as_tagged(nctx_heap).erase_type(),
+            nctx_heap.known().undefined.as_tagged(nctx_heap).erase(),
+            f.as_tagged(nctx_heap).erase(),
+            this_arg.as_tagged(nctx_heap).erase(),
+            array.as_tagged(nctx_heap).erase(),
         ]);
         nctx.call_rooted(make_bound, staged)
     })
@@ -118,26 +114,26 @@ pub fn function_bind(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
 pub fn function_apply(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let f = nctx
         .heap()
-        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
+        .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()))?;
     if !Runtime::is_callable(nctx.heap(), f) {
         return Err(VmError::Type);
     }
     // Safety: fresh root-slot word read for the immediate use.
     let undefined = nctx
         .heap()
-        .no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
+        .no_gc(|heap| heap.known().undefined.as_tagged(heap).raw());
     let this_arg = nctx
         .heap()
-        .no_gc(|heap| args.get(heap, 1).map(|v| v.erase()))
+        .no_gc(|heap| args.get(heap, 1).map(|v| v.raw()))
         .unwrap_or(undefined);
     let array = nctx
         .heap()
-        .no_gc(|heap| args.get(heap, 2).map(|v| v.erase()))
+        .no_gc(|heap| args.get(heap, 2).map(|v| v.raw()))
         .unwrap_or(undefined);
     let call_args: Vec<Value> = {
         let nullish = nctx.heap().no_gc(|heap| {
-            array == heap.known().undefined.as_tagged(heap).erase()
-                || array == heap.known().null.as_tagged(heap).erase()
+            array == heap.known().undefined.as_tagged(heap).raw()
+                || array == heap.known().null.as_tagged(heap).raw()
         });
         if nullish {
             vec![this_arg]
@@ -153,7 +149,7 @@ pub fn function_apply(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
                                 // Safety: fresh root-slot word for a name read.
                                 heap.known().strings.length.as_tagged(heap),
                             )
-                            .and_then(|v| Smi::decode(v.erase()).map(|s| s.value() as usize))
+                            .and_then(|v| Smi::decode(v.raw()).map(|s| s.value() as usize))
                             .unwrap_or(0)
                     })
                     .unwrap_or(0)
@@ -165,8 +161,8 @@ pub fn function_apply(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
                     unsafe { array.assume_valid(heap) }
                         .as_heap_object()
                         .and_then(|o| o.as_ref().element_value(heap, i))
-                        .map(|v| v.erase())
-                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase())
+                        .map(|v| v.raw())
+                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).raw())
                 }));
             }
             out
@@ -212,19 +208,17 @@ pub fn function_constructor(
 ) -> Result<Value, VmError> {
     let argv: Vec<Value> = nctx.heap().no_gc(|heap| {
         (1..args.len())
-            .filter_map(|i| args.get(heap, i).map(|v| v.erase()))
+            .filter_map(|i| args.get(heap, i).map(|v| v.raw()))
             .collect()
     });
     nctx.handle_scope(|nctx, scope| {
         // root the caller context before the allocating ToString loop below
-        // Safety: register/root-slot words, fresh at entry, rooted below.
-        let context = scope.handle(unsafe {
-            Tagged::<Value>::from_value_unchecked(nctx.current_context().unwrap_or_else(|| {
-                // Safety (outer block): fresh root-slot word read for
-                // the rooting.
-                nctx.heap().known().empty_context.read_unchecked()
-            }))
-        });
+        let (_, heap, state) = nctx.split();
+        let context = scope.handle(
+            state
+                .current_context(heap)
+                .unwrap_or_else(|| heap.known().empty_context.as_tagged(heap).erase()),
+        );
         // ToString all arguments (user toString may run)
         let mut parts: Vec<String> = Vec::with_capacity(argv.len());
         for a in argv {
@@ -232,7 +226,7 @@ pub fn function_constructor(
                 let (_, heap, _) = nctx.split();
                 // Safety: fresh argument word, consumed before any allocation.
                 let a = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(a) });
-                Convert::to_string(heap, &scope, a)?.erase()
+                Convert::to_string(heap, &scope, a)?.raw()
             };
             parts.push(nctx.heap().no_gc(|heap| {
                 // Safety: fresh word, no allocation since the read.

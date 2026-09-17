@@ -65,8 +65,8 @@ impl StackCache {
                 .callable_info(heap)
                 .expect("frame callable must have callable info");
             let cache = self.get();
-            cache.code.store(info.bytecode.get(heap).erase());
-            cache.constants.store(info.constants.get(heap).erase());
+            cache.code.store(info.bytecode.get(heap).raw());
+            cache.constants.store(info.constants.get(heap).raw());
             cache.pc = frame.pc;
             cache.base = frame.base;
             cache.register_count = frame.register_count;
@@ -139,7 +139,7 @@ impl StackCache {
     /// Store a value into the accumulator. Anchored/rooted values only:
     /// pass a `Tagged`, or a `Handle::as_tagged(heap)`.
     pub fn set_acc<'a, T: 'a>(&self, v: impl Into<Tagged<'a, T>>) {
-        self.get().acc.store(v.into().erase());
+        self.get().acc.store(v.into().raw());
     }
 }
 

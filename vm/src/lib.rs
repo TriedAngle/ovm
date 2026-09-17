@@ -143,11 +143,11 @@ impl ContextState {
 
     /// The current frame's context (the chain `LoadContextSlot` walks),
     /// for direct eval. `None` when no frame is executing.
-    pub fn current_context(&self) -> Option<Value> {
+    pub fn current_context<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
         if !self.cache.is_active() {
             return None;
         }
-        Some(self.stack.context_slot(&self.cache.frame_meta()).inner())
+        Some(self.stack.context(heap, &self.cache.frame_meta()))
     }
 
     pub fn handle_scope<R>(&self, f: impl for<'s> FnOnce(HandleScope<'s>) -> R) -> R {

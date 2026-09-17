@@ -135,7 +135,7 @@ mod heap_ptr {
 
         let v = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }
             .make_weak()
-            .erase();
+            .raw();
         assert!(v.is_weak_ptr());
         assert!(v.is_ptr());
         assert!(!v.is_smi());
@@ -283,15 +283,15 @@ mod tagged {
         let strong = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
 
         let weak = strong.make_weak();
-        assert!(weak.erase().is_weak_ptr());
-        assert!(!weak.erase().is_strong_ptr());
-        assert_eq!(weak.erase().raw_addr(), raw as u64);
+        assert!(weak.raw().is_weak_ptr());
+        assert!(!weak.raw().is_strong_ptr());
+        assert_eq!(weak.raw().raw_addr(), raw as u64);
         assert!(weak.strengthen().is_none());
 
         let maybe = Tagged::<MaybeWeak<TestObj>>::from_strong(strong);
         assert!(!maybe.is_cleared());
-        assert_eq!(maybe.strengthen().unwrap().erase(), strong.erase());
-        assert_eq!(maybe.erase(), strong.erase());
+        assert_eq!(maybe.strengthen().unwrap().raw(), strong.raw());
+        assert_eq!(maybe.raw(), strong.raw());
 
         unsafe { free_test_obj(raw) };
     }
@@ -311,7 +311,7 @@ mod tagged {
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
         let tagged = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
 
-        assert_eq!(tagged.erase(), ptr.encode_strong());
+        assert_eq!(tagged.raw(), ptr.encode_strong());
 
         unsafe { free_test_obj(raw) };
     }
@@ -320,9 +320,9 @@ mod tagged {
     fn erase_and_into_preserve_bits() {
         let tagged = Tagged::<Smi>::smi(7).unwrap();
 
-        let erased: Value = tagged.erase();
+        let erased: Value = tagged.raw();
         let re_tagged = Tagged::<Value>::try_smi(erased).unwrap();
-        assert_eq!(re_tagged.erase().to_bits(), tagged.erase().to_bits());
+        assert_eq!(re_tagged.raw().to_bits(), tagged.raw().to_bits());
         assert!(re_tagged.is_smi());
     }
 

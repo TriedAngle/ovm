@@ -313,7 +313,7 @@ impl Stack {
         argc: usize,
     ) -> FrameMeta {
         self.slot_unchecked(base + register_count + CALLABLE_OFFSET)
-            .store(callable.erase());
+            .store(callable.raw());
         self.slot_unchecked(base + register_count + ARGC_OFFSET)
             .store(Smi::new(argc as i64).encode());
         self.slot_unchecked(base + register_count + CONTEXT_OFFSET)

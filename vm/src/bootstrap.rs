@@ -316,7 +316,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     heap.no_gc(|heap| {
         map_map.heap_ref(heap).header.map.set(
             heap,
-            map_map.as_tagged(heap).erase(),
+            map_map.as_tagged(heap).raw(),
             map_map.as_tagged(heap),
         );
     });
@@ -365,13 +365,13 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         null_map.heap_ref(heap).transitions.clear(heap);
         the_hole_map.heap_ref(heap).prototype.set(
             heap,
-            the_hole_map.as_tagged(heap).erase(),
-            null.as_tagged(heap).erase_type(),
+            the_hole_map.as_tagged(heap).raw(),
+            null.as_tagged(heap).erase(),
         );
         null_map.heap_ref(heap).prototype.set(
             heap,
-            null_map.as_tagged(heap).erase(),
-            null.as_tagged(heap).erase_type(),
+            null_map.as_tagged(heap).raw(),
+            null.as_tagged(heap).erase(),
         );
     });
 
@@ -557,8 +557,8 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         &scope,
         function_prototype_map,
         scope.stage(&[
-            empty_info.as_tagged(&*heap).erase_type(),
-            empty_context.as_tagged(&*heap).erase_type(),
+            empty_info.as_tagged(&*heap).erase(),
+            empty_context.as_tagged(&*heap).erase(),
         ]),
     ));
 
@@ -608,21 +608,21 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         let o = null.heap_ref(heap);
         o.slots.set(
             heap,
-            null.as_tagged(heap).erase(),
+            null.as_tagged(heap).raw(),
             known.empty_fixed_array.as_tagged(heap),
         );
         o.elements.set(
             heap,
-            null.as_tagged(heap).erase(),
-            known.empty_fixed_array.as_tagged(heap).erase_type(),
+            null.as_tagged(heap).raw(),
+            known.empty_fixed_array.as_tagged(heap).erase(),
         );
         // ordinary function objects' [[Prototype]] is %Function.prototype%
         // (ES 19.2.3.1): function_map was created with a null placeholder
         // in bootstrap_basics
         known.function_map.heap_ref(heap).prototype.set(
             heap,
-            known.function_map.as_tagged(heap).erase(),
-            function_prototype.as_tagged(heap).erase_type(),
+            known.function_map.as_tagged(heap).raw(),
+            function_prototype.as_tagged(heap).erase(),
         );
         known
             .non_constructor_function_map
@@ -630,13 +630,13 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
             .prototype
             .set(
                 heap,
-                known.non_constructor_function_map.as_tagged(heap).erase(),
-                function_prototype.as_tagged(heap).erase_type(),
+                known.non_constructor_function_map.as_tagged(heap).raw(),
+                function_prototype.as_tagged(heap).erase(),
             );
         known.class_constructor_map.heap_ref(heap).prototype.set(
             heap,
-            known.class_constructor_map.as_tagged(heap).erase(),
-            function_prototype.as_tagged(heap).erase_type(),
+            known.class_constructor_map.as_tagged(heap).raw(),
+            function_prototype.as_tagged(heap).erase(),
         );
     });
 }

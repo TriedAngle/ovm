@@ -35,7 +35,7 @@ fn thread() -> (VM, Thread) {
 /// The well-known `null` word for `thread`'s heap.
 fn null_word(thread: &mut Thread) -> Value {
     let heap = thread.heap();
-    heap.known().null.as_tagged(heap).erase()
+    heap.known().null.as_tagged(heap).raw()
 }
 
 /// A fresh ordinary object with `proto` (any of the three shapes) and
@@ -63,7 +63,7 @@ fn object_with(thread: &mut Thread, proto: Value, props: &[(&str, i64)]) -> Valu
             )
             .unwrap();
         }
-        obj.as_tagged(&*thread.heap()).erase()
+        obj.as_tagged(&*thread.heap()).raw()
     })
 }
 
@@ -71,7 +71,7 @@ fn slot_name(thread: &mut Thread, name: &str) -> Tagged<'static, SlotName> {
     thread.handle_scope(|thread, scope| {
         let interned = thread.intern(&scope, name);
         let heap = &*thread.heap();
-        raw_name(interned.as_tagged(heap).erase())
+        raw_name(interned.as_tagged(heap).raw())
     })
 }
 
@@ -80,7 +80,7 @@ fn get_smi(thread: &mut Thread, obj: Value, name: &str) -> i64 {
     let name = slot_name(thread, name);
     thread.heap().no_gc(
         |heap| match unsafe { anchored(heap, obj) }.lookup(heap, name) {
-            vm::Lookup::Data { slot, .. } => Smi::decode(slot.get(heap).erase()).unwrap().value(),
+            vm::Lookup::Data { slot, .. } => Smi::decode(slot.get(heap).raw()).unwrap().value(),
             _ => panic!("property {name:?} must be an own-or-inherited data property"),
         },
     )
@@ -99,7 +99,7 @@ fn parents_of(thread: &mut Thread, p1: Value, p2: Value) -> Value {
             )
         };
         let heap = &*thread.heap();
-        arr.as_tagged(heap).erase()
+        arr.as_tagged(heap).raw()
     })
 }
 
@@ -115,7 +115,7 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     thread.heap().no_gc(|heap| {
         assert!(matches!(
             super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
-            LoadOutcome::Value(v) if v.erase() == smi(7)
+            LoadOutcome::Value(v) if v.raw() == smi(7)
         ));
     });
 
@@ -124,7 +124,7 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     thread.heap().no_gc(|heap| {
         assert!(matches!(
             super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
-            LoadOutcome::Value(v) if v.erase() == heap.known().undefined.as_tagged(heap).erase()
+            LoadOutcome::Value(v) if v.raw() == heap.known().undefined.as_tagged(heap).raw()
         ));
     });
 
@@ -138,11 +138,11 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     thread.heap().no_gc(|heap| {
         assert!(matches!(
             super_lookup(heap, unsafe { anchored(heap, home) }, a).unwrap(),
-            LoadOutcome::Value(v) if v.erase() == smi(1)
+            LoadOutcome::Value(v) if v.raw() == smi(1)
         ));
         assert!(matches!(
             super_lookup(heap, unsafe { anchored(heap, home) }, b).unwrap(),
-            LoadOutcome::Value(v) if v.erase() == smi(3)
+            LoadOutcome::Value(v) if v.raw() == smi(3)
         ));
     });
 }
@@ -162,13 +162,13 @@ fn lookup_in_parents_respects_priority_order() {
         // "a" exists on both parents: the first in priority order wins
         match lookup_in_parents(heap, unsafe { anchored(heap, protos) }, a) {
             vm::Lookup::Data { slot, .. } => {
-                assert_eq!(slot.get(heap).erase(), smi(1));
+                assert_eq!(slot.get(heap).raw(), smi(1));
             }
             _ => panic!("a must resolve through the first parent"),
         }
         // "b" only exists on the second parent
         match lookup_in_parents(heap, unsafe { anchored(heap, protos) }, b) {
-            vm::Lookup::Data { slot, .. } => assert_eq!(slot.get(heap).erase(), smi(3)),
+            vm::Lookup::Data { slot, .. } => assert_eq!(slot.get(heap).raw(), smi(3)),
             _ => panic!("b must resolve through the second parent"),
         }
         assert!(matches!(
@@ -211,7 +211,7 @@ fn super_store_shadow_creates_own_property_on_this() {
                             .as_tagged(heap)
                             .ptr_eq(unsafe { anchored(heap, this_) })
                     );
-                    assert!(name.as_tagged(heap).ptr_eq(x.erase_type()));
+                    assert!(name.as_tagged(heap).ptr_eq(x.erase()));
                 }
                 other => panic!("shadow store must define on the receiver, got {other:?}"),
             }
@@ -320,7 +320,7 @@ fn super_store_readonly_and_nullish_receiver_throw() {
     let x = slot_name(&mut thread, "x");
     let undefined = {
         let heap = thread.heap();
-        heap.known().undefined.as_tagged(heap).erase()
+        heap.known().undefined.as_tagged(heap).raw()
     };
 
     thread.handle_scope(|thread, scope| {

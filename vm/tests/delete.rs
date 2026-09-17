@@ -19,9 +19,9 @@ fn run_smi(src: &str) -> i64 {
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
     thread.heap().no_gc(|heap| {
-        if result == heap.known().true_object.as_tagged(heap).erase() {
+        if result == heap.known().true_object.as_tagged(heap).raw() {
             true
-        } else if result == heap.known().false_object.as_tagged(heap).erase() {
+        } else if result == heap.known().false_object.as_tagged(heap).raw() {
             false
         } else {
             panic!("expected boolean result, got {result:?}");

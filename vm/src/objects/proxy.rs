@@ -30,7 +30,7 @@ impl ProxyObject {
 
     /// Whether the proxy has been revoked (handler nulled).
     pub fn is_revoked(&self, heap: &Heap) -> bool {
-        self.handler.inner() == heap.known().null.as_tagged(heap).erase()
+        self.handler.inner() == heap.known().null.as_tagged(heap).raw()
     }
 
     /// (target, handler) as raw values; caller checks revocation.
@@ -51,9 +51,9 @@ impl HeapObject for ProxyObject {
         let host = self.erase();
         self.header.map.set(heap, host, config.map.as_tagged(heap));
         self.target
-            .set(heap, host, config.target.as_tagged(heap).erase_type());
+            .set(heap, host, config.target.as_tagged(heap).erase());
         self.handler
-            .set(heap, host, config.handler.as_tagged(heap).erase_type());
+            .set(heap, host, config.handler.as_tagged(heap).erase());
     }
 
     fn header(&self) -> &Header {
@@ -181,7 +181,7 @@ pub fn allocate<'a>(
         target,
         handler,
     })
-    .erase_type()
+    .erase()
 }
 
 pub fn revoke(heap: &mut Heap, proxy: Tagged<'_, Value>) {
@@ -192,8 +192,8 @@ pub fn revoke(heap: &mut Heap, proxy: Tagged<'_, Value>) {
         if p.as_ref().is_revoked(heap) {
             return;
         }
-        let host = proxy.erase();
-        let null = heap.known().null.as_tagged(heap).erase_type();
+        let host = proxy.raw();
+        let null = heap.known().null.as_tagged(heap).erase();
         p.as_ref().target.set(heap, host, null);
         p.as_ref().handler.set(heap, host, null);
     });
@@ -215,14 +215,14 @@ fn get_trap<'s>(
     handler: &Handle<'_, Value>,
     trap: Trap,
 ) -> Result<TrapLookup<'s>, VmError> {
-    let name = scope.handle(trap.name(heap).erase_type());
+    let name = scope.handle(trap.name(heap).erase());
     match Runtime::get_property(vm, heap, state, *handler, name)? {
         Coercion::Threw => Ok(TrapLookup::Threw),
         Coercion::Value(v) => {
             let v = scope.handle(v);
             let nullish = heap.no_gc(|heap| {
-                v.as_tagged(heap).erase() == heap.known().undefined.as_tagged(heap).erase()
-                    || v.as_tagged(heap).erase() == heap.known().null.as_tagged(heap).erase()
+                v.as_tagged(heap).raw() == heap.known().undefined.as_tagged(heap).raw()
+                    || v.as_tagged(heap).raw() == heap.known().null.as_tagged(heap).raw()
             });
             if nullish {
                 Ok(TrapLookup::None)
@@ -247,7 +247,7 @@ fn call_trap<'a>(
     let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
     let staged = scope.stage(&words);
     let result = NativeContext::new(vm, heap, state).call_rooted(*trap, staged)?;
-    let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+    let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).raw());
     if result == exception {
         Ok(Coercion::Threw)
     } else {
@@ -269,7 +269,7 @@ fn enter_trap<'s>(
     let (target, handler) = heap
         .no_gc(|heap| parts(heap, proxy.as_tagged(heap)))
         .expect("caller verified a proxy");
-    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).raw());
     if revoked {
         return Err(revoked_error(trap));
     }
@@ -332,7 +332,7 @@ fn own_descriptor_h<'s>(
         .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
     let revoked = heap.no_gc(|heap| {
-        unsafe { handler.assume_valid(heap) }.ptr_eq(heap.known().null.as_tagged(heap).erase_type())
+        unsafe { handler.assume_valid(heap) }.ptr_eq(heap.known().null.as_tagged(heap).erase())
     });
     if revoked {
         return Err(revoked_error(Trap::GetOwnPropertyDescriptor));
@@ -358,7 +358,7 @@ fn own_descriptor_h<'s>(
             let is_undefined = heap.no_gc(|heap| {
                 result
                     .as_tagged(heap)
-                    .ptr_eq(heap.known().undefined.as_tagged(heap).erase_type())
+                    .ptr_eq(heap.known().undefined.as_tagged(heap).erase())
             });
             if is_undefined {
                 return Ok(Flow::Value(None));
@@ -403,7 +403,7 @@ fn is_extensible_h(
     let (target, handler) = heap
         .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).raw());
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
@@ -528,7 +528,7 @@ fn define_array_element(
             }
             values.resize(
                 capacity,
-                heap_ref.known().the_hole.as_tagged(heap_ref).erase_type(),
+                heap_ref.known().the_hole.as_tagged(heap_ref).erase(),
             );
             values[i] = value.as_tagged(heap_ref);
             scope.stage(&values)
@@ -536,11 +536,9 @@ fn define_array_element(
         let elements = heap.allocate_handle::<FixedArray>(staged, scope);
         heap.no_gc(|heap| {
             let obj = receiver.heap_ref(heap);
-            obj.as_ref().elements.set(
-                heap,
-                obj.as_ref().erase(),
-                elements.as_tagged(heap).erase_type(),
-            );
+            obj.as_ref()
+                .elements
+                .set(heap, obj.as_ref().erase(), elements.as_tagged(heap).erase());
             obj.as_ref()
                 .length
                 .set(heap, obj.as_ref().erase(), Smi::new(new_len as i64));
@@ -593,8 +591,7 @@ fn define_internal_h<'s>(
     if heap.no_gc(|heap| is_proxy(heap, obj.as_tagged(heap))) {
         return proxy_define_h(vm, heap, state, scope, obj, name, partial);
     }
-    let undefined =
-        heap.no_gc(|heap| scope.handle(heap.known().undefined.as_tagged(heap).erase_type()));
+    let undefined = heap.no_gc(|heap| scope.handle(heap.known().undefined.as_tagged(heap).erase()));
     // dense array elements: element defines land in the backing
     // store, not as descriptors
     let element = heap.no_gc(|heap| {
@@ -697,18 +694,18 @@ fn ordinary_set_forward<'a>(
             define_flow_to_coercion(heap, flow)
         }
         SetLookup::Setter(setter) => {
-            let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).erase());
+            let undefined = heap.no_gc(|heap| heap.known().undefined.as_tagged(heap).raw());
             if setter == undefined {
                 return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
             let setter = scope.handle(unsafe { setter.assume_valid(heap) });
             let words = [
-                receiver.as_tagged(heap).erase_type(),
-                value.as_tagged(heap).erase_type(),
+                receiver.as_tagged(heap).erase(),
+                value.as_tagged(heap).erase(),
             ];
             let staged = scope.stage(&words);
             let result = NativeContext::new(vm, heap, state).call_rooted(setter, staged)?;
-            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).raw());
             if result == exception {
                 Ok(Coercion::Threw)
             } else {
@@ -780,7 +777,7 @@ fn get_h<'a>(
             };
             if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
                 heap.no_gc(|heap| -> Result<(), VmError> {
-                    let undefined = heap.known().undefined.as_tagged(heap).erase_type();
+                    let undefined = heap.known().undefined.as_tagged(heap).erase();
                     if d.is_data_descriptor()
                         && d.writable == Some(false)
                         && !Compare::same_value(
@@ -814,18 +811,12 @@ pub fn set<'a>(
     vm: &VM,
     heap: &'a mut Heap,
     state: &ContextState,
-    proxy: Tagged<'_, Value>,
-    name: Tagged<'_, Value>,
-    value: Tagged<'_, Value>,
-    receiver: Tagged<'_, Value>,
+    proxy: Handle<'_, Value>,
+    name: Handle<'_, Value>,
+    value: Handle<'_, Value>,
+    receiver: Handle<'_, Value>,
 ) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| {
-        let proxy = scope.handle(proxy);
-        let name = scope.handle(name);
-        let value = scope.handle(value);
-        let receiver = scope.handle(receiver);
-        set_h(vm, heap, state, &scope, &proxy, &name, &value, &receiver)
-    })
+    state.handle_scope(|scope| set_h(vm, heap, state, &scope, &proxy, &name, &value, &receiver))
 }
 
 fn set_h<'a>(
@@ -873,7 +864,7 @@ fn set_h<'a>(
             };
             if let Some(d) = desc.as_ref().filter(|d| d.configurable == Some(false)) {
                 heap.no_gc(|heap| -> Result<(), VmError> {
-                    let undefined = heap.known().undefined.as_tagged(heap).erase_type();
+                    let undefined = heap.known().undefined.as_tagged(heap).erase();
                     if d.is_data_descriptor()
                         && d.writable == Some(false)
                         && !Compare::same_value(
@@ -1185,13 +1176,13 @@ fn apply_h<'a>(
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => {
             let mut all: Vec<Tagged<'_, Value>> = Vec::with_capacity(args.len());
-            all.push(this_arg.as_tagged(heap).erase_type());
+            all.push(this_arg.as_tagged(heap).erase());
             for h in &args[1..] {
-                all.push(h.as_tagged(heap).erase_type());
+                all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
             let result = NativeContext::new(vm, heap, state).call_rooted(target, staged)?;
-            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).raw());
             if result == exception {
                 Ok(Coercion::Threw)
             } else {
@@ -1272,7 +1263,7 @@ fn construct_h<'a>(
                     .is_some_and(|info| info.function_kind().is_derived_class_constructor())
             });
             let receiver = if derived {
-                let hole = heap.no_gc(|heap| heap.known().the_hole.as_tagged(heap).erase());
+                let hole = heap.no_gc(|heap| heap.known().the_hole.as_tagged(heap).raw());
                 scope.handle(unsafe { hole.assume_valid(heap) })
             } else {
                 let Some(r) = Runtime::create_construct_receiver_value(vm, heap, state, unsafe {
@@ -1284,9 +1275,9 @@ fn construct_h<'a>(
                 scope.handle(unsafe { r.assume_valid(heap) })
             };
             let mut all: Vec<Tagged<'_, Value>> = Vec::with_capacity(args.len() + 1);
-            all.push(receiver.as_tagged(heap).erase_type());
+            all.push(receiver.as_tagged(heap).erase());
             for h in args {
-                all.push(h.as_tagged(heap).erase_type());
+                all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
             let result = NativeContext::new(vm, heap, state).call_construct_rooted(
@@ -1294,7 +1285,7 @@ fn construct_h<'a>(
                 *new_target,
                 staged,
             )?;
-            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).erase());
+            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).raw());
             if result == exception {
                 return Ok(Coercion::Threw);
             }
@@ -1408,7 +1399,7 @@ fn prevent_extensions_h<'a>(
     let (target, handler) = heap
         .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).raw());
     if revoked {
         return Err(revoked_error(Trap::PreventExtensions));
     }
@@ -1473,7 +1464,7 @@ fn is_extensible_entry_h<'a>(
     let (target, handler) = heap
         .no_gc(|heap| parts(heap, obj.as_tagged(heap)))
         .expect("checked proxy above");
-    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).erase());
+    let revoked = heap.no_gc(|heap| handler == heap.known().null.as_tagged(heap).raw());
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }

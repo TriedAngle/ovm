@@ -27,7 +27,7 @@ pub enum Key<'a> {
 }
 
 pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key<'a>, VmError> {
-    if let Some(smi) = Smi::decode(key.erase()) {
+    if let Some(smi) = Smi::decode(key.raw()) {
         // ES 6.1.7: an array index is 0 ≤ i < 2^32−1; anything else (incl.
         // 4294967295 itself) is an ordinary named property
         if smi.value() >= 0 && smi.value() < u32::MAX as i64 {
@@ -95,8 +95,8 @@ pub fn load_outcome_on<'a>(
     name: Tagged<'a, SlotName>,
 ) -> Result<LoadOutcome<'a>, VmError> {
     let known = heap.known();
-    if holder.erase() == known.null.as_tagged(heap).erase()
-        || holder.erase() == known.undefined.as_tagged(heap).erase()
+    if holder.raw() == known.null.as_tagged(heap).raw()
+        || holder.raw() == known.undefined.as_tagged(heap).raw()
     {
         return Err(VmError::Type);
     }
@@ -110,7 +110,7 @@ pub fn load_outcome_on<'a>(
     // one-character string and stay unsupported here
     if let Some(s) = holder.get_as::<DenseString>()
         && name
-            .erase_type()
+            .erase()
             .get_as::<DenseString>()
             .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
     {
@@ -121,17 +121,13 @@ pub fn load_outcome_on<'a>(
         Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.get(heap))),
         Lookup::Accessor { pair, .. } => {
             let getter = pair.get.get(heap);
-            if getter.erase() == known.undefined.as_tagged(heap).erase() {
-                Ok(LoadOutcome::Value(
-                    known.undefined.as_tagged(heap).erase_type(),
-                ))
+            if getter.raw() == known.undefined.as_tagged(heap).raw() {
+                Ok(LoadOutcome::Value(known.undefined.as_tagged(heap).erase()))
             } else {
                 Ok(LoadOutcome::Getter(getter))
             }
         }
-        Lookup::NotFound => Ok(LoadOutcome::Value(
-            known.undefined.as_tagged(heap).erase_type(),
-        )),
+        Lookup::NotFound => Ok(LoadOutcome::Value(known.undefined.as_tagged(heap).erase())),
     }
 }
 
@@ -227,7 +223,7 @@ pub fn has_property<'a>(
     receiver: Tagged<'a, Value>,
     name: Tagged<'a, SlotName>,
 ) -> bool {
-    let name = match classify_key(heap, name.erase_type()) {
+    let name = match classify_key(heap, name.erase()) {
         Ok(Key::Element(i)) => {
             // non-array receivers keep index keys as Smi-named
             // descriptors; canonicalize so the named walk finds them
@@ -246,7 +242,7 @@ pub fn has_property<'a>(
     }
     // "length" may live in an array's internal slot at any chain level
     if name
-        .erase_type()
+        .erase()
         .get_as::<DenseString>()
         .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
     {
@@ -268,7 +264,7 @@ fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> boo
             return true;
         }
         let proto = obj.as_ref().header.map.heap_ref(heap).prototype.get(heap);
-        if proto.erase() == heap.known().null.as_tagged(heap).erase() || !proto.is_strong_ptr() {
+        if proto.raw() == heap.known().null.as_tagged(heap).raw() || !proto.is_strong_ptr() {
             return false;
         }
         if let Some(parents) = proto.get_as::<FixedArray>() {
@@ -322,7 +318,7 @@ pub fn lookup_in_parents<'a>(
     proto: Tagged<'a, Value>,
     name: Tagged<'a, SlotName>,
 ) -> Lookup<'a> {
-    if proto.erase() == heap.known().null.as_tagged(heap).erase() {
+    if proto.raw() == heap.known().null.as_tagged(heap).raw() {
         return Lookup::NotFound;
     }
     if let Some(parents) = proto.get_as::<FixedArray>() {
@@ -356,7 +352,7 @@ fn super_start_from_proto<'a>(heap: &'a Heap, proto: Option<Tagged<'a, Value>>) 
     let Some(proto) = proto else {
         return SuperStart::End;
     };
-    if proto.erase() == heap.known().null.as_tagged(heap).erase() || !proto.is_strong_ptr() {
+    if proto.raw() == heap.known().null.as_tagged(heap).raw() || !proto.is_strong_ptr() {
         return SuperStart::End;
     }
     if let Some(parents) = proto.get_as::<FixedArray>() {
@@ -404,11 +400,11 @@ pub fn super_lookup_from_proto<'a>(
                 }
             }
             Ok(LoadOutcome::Value(
-                heap.known().undefined.as_tagged(heap).erase_type(),
+                heap.known().undefined.as_tagged(heap).erase(),
             ))
         }
         SuperStart::End => Ok(LoadOutcome::Value(
-            heap.known().undefined.as_tagged(heap).erase_type(),
+            heap.known().undefined.as_tagged(heap).erase(),
         )),
     }
 }

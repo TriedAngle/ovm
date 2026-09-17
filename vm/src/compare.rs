@@ -14,7 +14,7 @@ impl Compare {
             }
             let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>() {
                 Some(f) => f.value.get(),
-                None => v.erase().to_i64().unwrap() as f64,
+                None => v.raw().to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);
@@ -24,7 +24,7 @@ impl Compare {
             return a == b;
         }
         // identical bits: same interned string, same heap object
-        if x.erase() == y.erase() {
+        if x.raw() == y.raw() {
             return true;
         }
         if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(), y.get_as::<DenseString>()) {
@@ -44,15 +44,15 @@ impl Compare {
             return Ok(true);
         }
         let nullish = |v: Tagged<'_, Value>| {
-            v.erase() == known.null.as_tagged(heap).erase()
-                || v.erase() == known.undefined.as_tagged(heap).erase()
+            v.raw() == known.null.as_tagged(heap).raw()
+                || v.raw() == known.undefined.as_tagged(heap).raw()
         };
         if nullish(x) && nullish(y) {
             return Ok(true);
         }
         let is_bool = |v: Tagged<'_, Value>| {
-            v.erase() == known.true_object.as_tagged(heap).erase()
-                || v.erase() == known.false_object.as_tagged(heap).erase()
+            v.raw() == known.true_object.as_tagged(heap).raw()
+                || v.raw() == known.false_object.as_tagged(heap).raw()
         };
         let is_string = |v: Tagged<'_, Value>| v.get_as::<DenseString>().is_some();
         let is_number = |v: Tagged<'_, Value>| v.is_smi() || v.get_as::<Float>().is_some();
@@ -65,7 +65,7 @@ impl Compare {
         }
         // booleans become numbers (exactly representable as smis, no allocation)
         if is_bool(x) {
-            let n = Smi::new(if x.erase() == known.true_object.as_tagged(heap).erase() {
+            let n = Smi::new(if x.raw() == known.true_object.as_tagged(heap).raw() {
                 1
             } else {
                 0
@@ -74,7 +74,7 @@ impl Compare {
             return Self::equal(heap, n, y);
         }
         if is_bool(y) {
-            let n = Smi::new(if y.erase() == known.true_object.as_tagged(heap).erase() {
+            let n = Smi::new(if y.raw() == known.true_object.as_tagged(heap).raw() {
                 1
             } else {
                 0
@@ -95,7 +95,7 @@ impl Compare {
     /// strings compare by content (identity for everything else).
     /// Unlike `strict_equal` (===); used by [[DefineOwnProperty]] validation.
     pub fn same_value<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {
-        if x.erase() == y.erase() {
+        if x.raw() == y.raw() {
             return true;
         }
         let x_num = x.is_smi() || x.get_as::<Float>().is_some();
@@ -103,7 +103,7 @@ impl Compare {
         if x_num && y_num {
             let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>() {
                 Some(f) => f.value.get(),
-                None => v.erase().to_i64().unwrap() as f64,
+                None => v.raw().to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);

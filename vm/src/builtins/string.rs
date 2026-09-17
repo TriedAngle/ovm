@@ -13,19 +13,19 @@ pub fn string_constructor(
         let (_vm, heap, _) = nctx.split();
         // Safety: fresh argument word, consumed before any allocation.
         let arg = heap
-            .no_gc(|heap| args.get(heap, 1).map(|v| v.erase()))
+            .no_gc(|heap| args.get(heap, 1).map(|v| v.raw()))
             // Safety: fresh root-slot word read for the immediate use.
             .unwrap_or_else(|| unsafe { heap.known().undefined.read_unchecked() });
         let arg = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(arg) });
         let s = scope.handle(Convert::to_string(heap, &scope, arg)?);
         if !construct {
-            return Ok(s.as_tagged(heap).erase());
+            return Ok(s.as_tagged(heap).raw());
         }
         let map = heap.known().string_wrapper_map;
         Ok(heap
-            .new_object(&scope, map, scope.stage(&[s.as_tagged(heap).erase_type()]))
-            .erase_type()
-            .erase())
+            .new_object(&scope, map, scope.stage(&[s.as_tagged(heap).erase()]))
+            .erase()
+            .raw())
     })
 }
 

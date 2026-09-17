@@ -28,9 +28,9 @@ fn run_value(src: &str) -> (Value, Thread) {
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
     let heap = thread.heap();
-    if result == heap.known().true_object.as_tagged(heap).erase() {
+    if result == heap.known().true_object.as_tagged(heap).raw() {
         true
-    } else if result == heap.known().false_object.as_tagged(heap).erase() {
+    } else if result == heap.known().false_object.as_tagged(heap).raw() {
         false
     } else {
         panic!("expected boolean result, got {result:?}");
@@ -55,7 +55,7 @@ fn run_error_name(src: &str) -> String {
         let heap = thread.heap();
         assert_eq!(
             result,
-            heap.known().exception.as_tagged(heap).erase(),
+            heap.known().exception.as_tagged(heap).raw(),
             "script must terminate with an uncaught error"
         );
     }

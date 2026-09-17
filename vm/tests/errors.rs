@@ -14,7 +14,7 @@ fn get_prop(thread: &mut Thread, obj: Value, name_word: Value) -> Value {
             panic!("expected object");
         };
         match o.as_ref().lookup(heap, name(heap, name_word)) {
-            Lookup::Data { slot, .. } => slot.get(heap).erase(),
+            Lookup::Data { slot, .. } => slot.get(heap).raw(),
             _ => panic!("expected a data property"),
         }
     })
@@ -35,9 +35,9 @@ fn error_and_props(thread: &mut Thread, err: VmError) -> (Value, Value, Value) {
         let name_val = thread.intern(&scope, err.name());
         let heap = &*thread.heap();
         (
-            name_key.as_tagged(heap).erase(),
-            name_val.as_tagged(heap).erase(),
-            message_key.as_tagged(heap).erase(),
+            name_key.as_tagged(heap).raw(),
+            name_val.as_tagged(heap).raw(),
+            message_key.as_tagged(heap).raw(),
         )
     });
     let name = get_prop(thread, obj, name_key);
@@ -63,7 +63,7 @@ fn error_names_map_to_spec_classes() {
         let expected = thread.handle_scope(|thread, scope| {
             let e = thread.intern(&scope, expected);
             let heap = &*thread.heap();
-            e.as_tagged(heap).erase()
+            e.as_tagged(heap).raw()
         });
         assert_eq!(name, expected, "{err:?}");
     }
@@ -79,10 +79,7 @@ fn error_object_carries_name_and_message() {
         let type_error = thread.intern(&scope, "TypeError");
         let msg = thread.intern(&scope, "invalid operand type");
         let heap = &*thread.heap();
-        (
-            type_error.as_tagged(heap).erase(),
-            msg.as_tagged(heap).erase(),
-        )
+        (type_error.as_tagged(heap).raw(), msg.as_tagged(heap).raw())
     });
     assert_eq!(name, type_error);
     assert_eq!(message, msg);
@@ -118,8 +115,8 @@ fn error_objects_are_distinct_but_share_shapes() {
             panic!("expected object");
         };
         (
-            a.as_ref().header.map.get(heap).erase(),
-            b.as_ref().header.map.get(heap).erase(),
+            a.as_ref().header.map.get(heap).raw(),
+            b.as_ref().header.map.get(heap).raw(),
         )
     });
     assert_eq!(maps.0, maps.1);
@@ -135,10 +132,7 @@ fn error_properties_are_writable() {
         let name_key = thread.intern(&scope, "name");
         let custom = thread.intern(&scope, "MyError");
         let heap = &*thread.heap();
-        (
-            name_key.as_tagged(heap).erase(),
-            custom.as_tagged(heap).erase(),
-        )
+        (name_key.as_tagged(heap).raw(), custom.as_tagged(heap).raw())
     });
 
     thread.handle_scope(|thread, scope| {
@@ -167,8 +161,8 @@ fn error_objects_are_extendable() {
         let extra_val = thread.intern(&scope, "payload");
         let heap = &*thread.heap();
         (
-            extra_key.as_tagged(heap).erase(),
-            extra_val.as_tagged(heap).erase(),
+            extra_key.as_tagged(heap).raw(),
+            extra_val.as_tagged(heap).raw(),
         )
     });
 
@@ -209,8 +203,8 @@ fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
             panic!("expected object");
         };
         let map = o.as_ref().header.map.heap_ref(heap).as_ref();
-        let proto = map.prototype.get(heap).erase();
-        if proto == heap.known().null.as_tagged(heap).erase() {
+        let proto = map.prototype.get(heap).raw();
+        if proto == heap.known().null.as_tagged(heap).raw() {
             None
         } else {
             Some(proto)
@@ -228,13 +222,13 @@ fn startup_prototype_hierarchy() {
         let heap = thread.heap();
         let k = heap.known();
         (
-            k.error_prototype.as_tagged(heap).erase(),
-            k.object_prototype.as_tagged(heap).erase(),
-            k.undefined.as_tagged(heap).erase(),
-            k.null.as_tagged(heap).erase(),
-            k.true_object.as_tagged(heap).erase(),
-            k.false_object.as_tagged(heap).erase(),
-            k.the_hole.as_tagged(heap).erase(),
+            k.error_prototype.as_tagged(heap).raw(),
+            k.object_prototype.as_tagged(heap).raw(),
+            k.undefined.as_tagged(heap).raw(),
+            k.null.as_tagged(heap).raw(),
+            k.true_object.as_tagged(heap).raw(),
+            k.false_object.as_tagged(heap).raw(),
+            k.the_hole.as_tagged(heap).raw(),
         )
     };
 

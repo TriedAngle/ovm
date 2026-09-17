@@ -30,7 +30,7 @@ fn anchor() -> (vm::VM, vm::Thread) {
 }
 
 fn smi_bits(heap: &Heap, handle: vm::Handle<'_, Smi>) -> i64 {
-    Smi::decode(handle.as_tagged(heap).erase()).unwrap().value()
+    Smi::decode(handle.as_tagged(heap).raw()).unwrap().value()
 }
 
 fn smi_handle(scope: &HandleScope<'_>, heap: &Heap, v: i64) -> i64 {

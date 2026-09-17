@@ -85,7 +85,7 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            if !entry[0].get(heap).ptr_eq(name.erase_type()) {
+            if !entry[0].get(heap).ptr_eq(name.erase()) {
                 continue;
             }
 
@@ -145,7 +145,7 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            if !entry[0].get(heap).ptr_eq(name.erase_type()) {
+            if !entry[0].get(heap).ptr_eq(name.erase()) {
                 continue;
             }
             let target = entry[1]

@@ -71,8 +71,8 @@ impl<'a> Tagged<'a, Value> {
         // TODO(strict-mode): take the active function's language mode and
         // distinguish throwing strict failures from ignored sloppy failures.
         // null/undefined have no [[Prototype]]: property access throws
-        if self.ptr_eq(heap.known().null.as_tagged(heap).erase_type())
-            || self.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type())
+        if self.ptr_eq(heap.known().null.as_tagged(heap).erase())
+            || self.ptr_eq(heap.known().undefined.as_tagged(heap).erase())
         {
             return Err(VmError::Type);
         }
@@ -94,7 +94,7 @@ impl<'a> Tagged<'a, Value> {
                     return Err(VmError::Type);
                 }
                 let host = holder.as_ref().erase();
-                if semantics == StoreSemantics::Shadow && host != self.erase() {
+                if semantics == StoreSemantics::Shadow && host != self.raw() {
                     // inherited writable data property: JS creates an own
                     // property on the receiver
                     return Ok(StoreOutcome::Transition {
@@ -113,7 +113,7 @@ impl<'a> Tagged<'a, Value> {
                 let setter = pair.set.get(heap);
                 // no setter (undefined sentinel): sloppy-mode writes to a
                 // setter-less accessor are silently ignored
-                if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type()) {
+                if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase()) {
                     return Ok(StoreOutcome::Done);
                 }
                 Ok(StoreOutcome::CallSetter {
@@ -142,8 +142,8 @@ pub fn super_store_lookup<'a, 's>(
     value: Tagged<'a, Value>,
     semantics: StoreSemantics,
 ) -> Result<StoreOutcome<'s>, VmError> {
-    if recv.ptr_eq(heap.known().null.as_tagged(heap).erase_type())
-        || recv.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type())
+    if recv.ptr_eq(heap.known().null.as_tagged(heap).erase())
+        || recv.ptr_eq(heap.known().undefined.as_tagged(heap).erase())
     {
         return Err(VmError::Type);
     }
@@ -176,7 +176,7 @@ pub fn super_store_lookup<'a, 's>(
         Lookup::NotFound => super_store_on_receiver(heap, scope, recv, name, value),
         Lookup::Accessor { pair, .. } => {
             let setter = pair.set.get(heap);
-            if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase_type()) {
+            if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase()) {
                 return Ok(StoreOutcome::Done);
             }
             Ok(StoreOutcome::CallSetter {
@@ -211,16 +211,16 @@ fn super_store_on_receiver<'a, 's>(
             slot,
             flags,
             ..
-        } if holder.as_ref().erase() == recv.erase() => {
+        } if holder.as_ref().erase() == recv.raw() => {
             if !flags.is_writable() {
                 return Err(VmError::Type);
             }
-            slot.set(heap, recv.erase(), value);
+            slot.set(heap, recv.raw(), value);
             Ok(StoreOutcome::Done)
         }
         // own accessor: Receiver.[[DefineOwnProperty]]({value}) on an
         // accessor is an incompatible change (ES 9.1.9.2 step 3.d.i)
-        Lookup::Accessor { holder, .. } if holder.as_ref().erase() == recv.erase() => {
+        Lookup::Accessor { holder, .. } if holder.as_ref().erase() == recv.raw() => {
             Err(VmError::Type)
         }
         // not owned by the receiver: define a fresh own property
@@ -273,7 +273,7 @@ impl Transition {
                         let d = &parent_ref.descriptors()[index];
                         // accessor rows embed the pair, not a slot offset
                         let offset = (!d.flags().is_accessor()).then(|| {
-                            Smi::decode(d.value.get(heap).erase()).expect("data row offset")
+                            Smi::decode(d.value.get(heap).raw()).expect("data row offset")
                         });
                         Some((d.flags(), offset))
                     }
@@ -318,7 +318,7 @@ impl Transition {
             let name_word = name.as_tagged(heap);
             let row_value = match pair {
                 Some((get, set)) => {
-                    scope.handle(token.allocate::<AccessorPair>((get, set)).erase_type())
+                    scope.handle(token.allocate::<AccessorPair>((get, set)).erase())
                 }
                 None => scope.handle(Smi::new(row_offset as i64)),
             };
@@ -351,8 +351,8 @@ impl Transition {
             if let Some(old) = parent_ref.transitions.heap_ref(heap) {
                 pairs.extend(old.as_slice().iter().map(|slot| slot.get(heap)));
             }
-            pairs.push(name_word.erase_type());
-            pairs.push(child.erase_type());
+            pairs.push(name_word.erase());
+            pairs.push(child.erase());
             let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
             parent_ref.transitions.set(heap, parent_ref.erase(), pairs);
 
@@ -388,7 +388,7 @@ impl Transition {
             values.push(value.as_tagged(heap));
             debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
             let slots = token.allocate::<FixedArray>(scope.stage(&values));
-            let host = receiver.as_tagged(heap).erase();
+            let host = receiver.as_tagged(heap).raw();
             receiver_ref.slots.set(heap, host, slots);
             receiver_ref
                 .header
@@ -411,11 +411,10 @@ impl Transition {
                 .map_ref(heap)
                 .find_transition(heap, name.as_tagged(heap), flags, pair_values)
                 .expect("transition recorded above");
-            receiver_ref.header.map.set(
-                heap,
-                receiver.as_tagged(heap).erase(),
-                target.into_tagged(),
-            );
+            receiver_ref
+                .header
+                .map
+                .set(heap, receiver.as_tagged(heap).raw(), target.into_tagged());
         });
     }
 
@@ -429,7 +428,7 @@ impl Transition {
             let offset = receiver.heap_ref(heap).map_ref(heap).descriptors()[index].offset();
             receiver.heap_ref(heap).slot(heap, offset).set(
                 heap,
-                receiver.as_tagged(heap).erase(),
+                receiver.as_tagged(heap).raw(),
                 value.as_tagged(heap),
             );
         });
@@ -528,7 +527,7 @@ impl Transition {
             heap.allocate_token_enter_heap(FixedArray::layout_for(values.len()), |token, heap| {
                 let obj = receiver.heap_ref(heap);
                 let slots = token.allocate::<FixedArray>(values);
-                let host = receiver.as_tagged(heap).erase();
+                let host = receiver.as_tagged(heap).raw();
                 obj.slots.set(heap, host, slots);
                 obj.header.map.set(heap, host, existing.as_tagged(heap));
             });
@@ -558,12 +557,12 @@ impl Transition {
             if let Some(old) = parent.transitions.heap_ref(heap) {
                 pairs.extend(old.as_slice().iter().map(|slot| slot.get(heap)));
             }
-            pairs.push(name_word.erase_type());
-            pairs.push(child.erase_type());
+            pairs.push(name_word.erase());
+            pairs.push(child.erase());
             let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
             parent.transitions.set(heap, parent.erase(), pairs);
             let slots = token.allocate::<FixedArray>(values);
-            let host = receiver.as_tagged(heap).erase();
+            let host = receiver.as_tagged(heap).raw();
             obj.slots.set(heap, host, slots);
             obj.header.map.set(heap, host, child);
         });
@@ -782,11 +781,7 @@ impl Object {
                             && let Some(elements) = obj.as_ref().elements_array(heap)
                             && i < elements.len()
                         {
-                            elements.set(
-                                heap,
-                                i,
-                                heap.known().the_hole.as_tagged(heap).erase_type(),
-                            );
+                            elements.set(heap, i, heap.known().the_hole.as_tagged(heap).erase());
                         }
                         return Ok(None);
                     }
@@ -873,7 +868,7 @@ impl Object {
         let is_null = heap.no_gc(|heap| {
             proto
                 .as_tagged(heap)
-                .ptr_eq(heap.known().null.as_tagged(heap).erase_type())
+                .ptr_eq(heap.known().null.as_tagged(heap).erase())
         });
         if !is_null && !heap.no_gc(|heap| proto.as_tagged(heap).is_strong_ptr()) {
             // silently ignore non-object prototypes (sloppy-mode semantics)
@@ -897,8 +892,8 @@ impl Object {
         // cycle check: the receiver must not appear in any proposed chain
         // (FixedArray prototypes contribute one chain per element)
         heap.no_gc(|heap| -> Result<(), VmError> {
-            let null = heap.known().null.as_tagged(heap).erase_type();
-            let this = receiver.as_tagged(heap).erase_type();
+            let null = heap.known().null.as_tagged(heap).erase();
+            let this = receiver.as_tagged(heap).erase();
             let start = proto.as_tagged(heap);
             fn walk<'b>(
                 heap: &'b Heap,
@@ -952,7 +947,7 @@ impl Object {
                 descriptors: &descriptors,
                 prototype: proto,
             });
-            let host = receiver.as_tagged(heap).erase();
+            let host = receiver.as_tagged(heap).raw();
             obj.header.map.set(heap, host, new_map);
             Ok(())
         })
@@ -1021,7 +1016,7 @@ fn validate_define<'a, 's>(
                 return None;
             }
 
-            let offset = Smi::decode(cur_desc_value.as_tagged(heap).erase())
+            let offset = Smi::decode(cur_desc_value.as_tagged(heap).raw())
                 .expect("data row offset")
                 .value() as usize;
             if !Compare::same_value(
@@ -1204,7 +1199,7 @@ pub fn is_compatible_property_descriptor(
     if !desc.is_generic_descriptor() && desc.is_data_descriptor() != cur_is_data {
         return false;
     }
-    let undefined = heap.known().undefined.as_tagged(heap).erase_type();
+    let undefined = heap.known().undefined.as_tagged(heap).erase();
     if cur_is_data && desc.is_data_descriptor() {
         if current.writable != Some(true) {
             if desc.writable == Some(true) {

@@ -29,9 +29,9 @@ fn run_bool(vm: &VM, src: &str) -> bool {
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
     let heap = thread.heap();
-    if result == heap.known().true_object.as_tagged(heap).erase() {
+    if result == heap.known().true_object.as_tagged(heap).raw() {
         true
-    } else if result == heap.known().false_object.as_tagged(heap).erase() {
+    } else if result == heap.known().false_object.as_tagged(heap).raw() {
         false
     } else {
         panic!("expected boolean, got {result:?}");
@@ -156,17 +156,17 @@ fn eval_completion_values() {
     {
         let (result, mut thread) = run_value(&vm, "eval('{ let x = 1; }');");
         let heap = thread.heap();
-        assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
+        assert_eq!(result, heap.known().undefined.as_tagged(heap).raw());
     }
     {
         let (result, mut thread) = run_value(&vm, "eval('function fn() {}{}');");
         let heap = thread.heap();
-        assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
+        assert_eq!(result, heap.known().undefined.as_tagged(heap).raw());
     }
     {
         let (result, mut thread) = run_value(&vm, "eval('var x = 1;');");
         let heap = thread.heap();
-        assert_eq!(result, heap.known().undefined.as_tagged(heap).erase());
+        assert_eq!(result, heap.known().undefined.as_tagged(heap).raw());
     }
 }
 

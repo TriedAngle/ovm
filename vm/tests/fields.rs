@@ -31,7 +31,7 @@ fn run_bool(src: &str) -> bool {
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
     let heap = thread.heap();
-    v == heap.known().true_object.as_tagged(heap).erase()
+    v == heap.known().true_object.as_tagged(heap).raw()
 }
 
 fn throws(src: &str) -> bool {
@@ -40,7 +40,7 @@ fn throws(src: &str) -> bool {
     match thread.run_script(src) {
         Ok(v) => {
             let heap = thread.heap();
-            v == heap.known().exception.as_tagged(heap).erase()
+            v == heap.known().exception.as_tagged(heap).raw()
         }
         Err(_) => true,
     }

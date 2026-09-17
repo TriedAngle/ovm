@@ -282,13 +282,13 @@ impl<'a, T> Tagged<'a, T> {
         }
     }
 
-    pub fn erase(self) -> Value {
+    pub fn raw(self) -> Value {
         self.raw
     }
 
     /// Erase the phantom type only: the anchor is unchanged. This is
     /// purely type-level (any heap object is a `Value`).
-    pub fn erase_type(self) -> Tagged<'a, Value> {
+    pub fn erase(self) -> Tagged<'a, Value> {
         Tagged {
             raw: self.raw,
             _phantom: PhantomData,
@@ -397,13 +397,13 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
 
 impl<'a, T: HeapObject> From<Tagged<'a, T>> for HeapPtr<T> {
     fn from(v: Tagged<'a, T>) -> Self {
-        unsafe { HeapPtr::new(v.erase().raw_addr() as *mut T) }
+        unsafe { HeapPtr::new(v.raw().raw_addr() as *mut T) }
     }
 }
 
 impl<'a, T> From<Tagged<'a, T>> for Value {
     fn from(tagged: Tagged<'a, T>) -> Self {
-        tagged.erase()
+        tagged.raw()
     }
 }
 

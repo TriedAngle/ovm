@@ -146,8 +146,8 @@ fn callable_info_carries_handler_table() {
         let values = {
             let heap = &*thread.heap();
             scope.stage(&[
-                info.as_tagged(heap).erase_type(),
-                empty_context.as_tagged(heap).erase_type(),
+                info.as_tagged(heap).erase(),
+                empty_context.as_tagged(heap).erase(),
             ])
         };
         let obj = thread

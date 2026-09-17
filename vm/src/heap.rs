@@ -173,7 +173,7 @@ impl<T: HeapObject> WeakGcCell<T> {
         // Safety: constructing the storage word of a weak cell.
         let tagged = unsafe { Tagged::<T>::from_value_unchecked(ptr.encode_strong()) };
         Self {
-            cell: unsafe { RawCell::from_word(tagged.make_weak().erase().to_bits()) },
+            cell: unsafe { RawCell::from_word(tagged.make_weak().raw().to_bits()) },
             _phantom: PhantomData,
         }
     }
@@ -186,7 +186,7 @@ impl<T: HeapObject> WeakGcCell<T> {
                 // Safety: constructing the storage word of a cell.
                 RawCell::from_word(
                     Tagged::<T>::from_value_unchecked(ptr.encode_strong())
-                        .erase()
+                        .raw()
                         .to_bits(),
                 )
             },
@@ -257,7 +257,7 @@ impl<T> GcSlot<T> {
         T: 'x,
     {
         let host = host.into();
-        let v = value.into().erase();
+        let v = value.into().raw();
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         if v.is_ptr() {
             heap.write_barrier(host, self.as_raw(), v);
@@ -519,7 +519,7 @@ impl Heap {
         }
         self.allocate_handle::<Float>(f, scope)
             .as_tagged(&*self)
-            .erase_type()
+            .erase()
     }
 
     /// CreateArrayFromList (ES 7.3.17): a fresh dense array holding

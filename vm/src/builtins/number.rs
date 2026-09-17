@@ -22,11 +22,11 @@ pub fn number_constructor(
     };
 
     if !nctx.is_construct() {
-        return nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, n).erase()));
+        return nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, n).raw()));
     }
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let value = heap.new_number(&scope, n).erase();
+        let value = heap.new_number(&scope, n).raw();
         let map = heap.known().number_wrapper_map;
         Ok(heap
             .new_object(
@@ -34,8 +34,8 @@ pub fn number_constructor(
                 map,
                 scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(value) }]),
             )
-            .erase_type()
-            .erase())
+            .erase()
+            .raw())
     })
 }
 
@@ -55,6 +55,6 @@ pub fn number_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
         let (_vm, heap, _) = nctx.split();
         // Safety: fresh word read above, consumed before any allocation.
         let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
-        Convert::to_string(heap, &scope, v).map(|s| s.erase())
+        Convert::to_string(heap, &scope, v).map(|s| s.raw())
     })
 }

@@ -687,12 +687,12 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
                     // Safety: fresh interned words re-read under the anchor.
                     let descriptors: [(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>); 2] = [
                         (
-                            scope.handle(value_name.as_tagged(heap).erase_type().as_name()),
+                            scope.handle(value_name.as_tagged(heap).erase().as_name()),
                             flags,
                             scope.handle(Smi::new(0).into_tagged()),
                         ),
                         (
-                            scope.handle(done_name.as_tagged(heap).erase_type().as_name()),
+                            scope.handle(done_name.as_tagged(heap).erase().as_name()),
                             flags,
                             scope.handle(Smi::new(1).into_tagged()),
                         ),

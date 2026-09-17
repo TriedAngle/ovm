@@ -38,7 +38,7 @@ pub fn make_error(
         let (vm, heap, _) = nctx.split();
         // root the message right away: the allocations below (new_object,
         // interning) would leave a raw copy stale
-        let message = match heap.no_gc(|heap| args.get(heap, 1).map(|v| v.erase())) {
+        let message = match heap.no_gc(|heap| args.get(heap, 1).map(|v| v.raw())) {
             // Safety: fresh argument word, consumed before any allocation.
             Some(v) => {
                 let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
@@ -48,7 +48,7 @@ pub fn make_error(
                 vm.interner()
                     .intern_str(heap, &scope, "")
                     .as_tagged(heap)
-                    .erase_type(),
+                    .erase(),
             ),
         };
         let map = match class {
@@ -90,13 +90,13 @@ pub fn error_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         // Safety: fresh argument word, rooted below before any allocation.
         let receiver_word = nctx
             .heap()
-            .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.erase()))?;
+            .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()))?;
         let receiver =
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(receiver_word) });
         let (vm, heap, state) = nctx.split();
-        let recv = receiver.as_tagged(heap).erase();
+        let recv = receiver.as_tagged(heap).raw();
         let name = get_property(vm, heap, state, recv, "name")?;
-        let recv = receiver.as_tagged(heap).erase();
+        let recv = receiver.as_tagged(heap).raw();
         let message = get_property(vm, heap, state, recv, "message")?;
         let (vm, heap, _) = nctx.split();
         // each to_string/intern allocates: root both halves before the
@@ -109,7 +109,7 @@ pub fn error_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         let b = scope.handle(Convert::to_string(heap, &scope, message)?);
         let colon = vm.interner().intern_str(heap, &scope, ": ");
         let ab = DenseString::concat(heap, &scope, a, colon.erase());
-        let ab = scope.handle(ab.as_tagged(heap).erase_type());
+        let ab = scope.handle(ab.as_tagged(heap).erase());
         let out = DenseString::concat(heap, &scope, ab, b);
         // Safety: fresh rooted-slot word, returned without an
         // intervening allocation.
@@ -129,13 +129,13 @@ pub fn get_property(
             vm.interner()
                 .intern_str(heap, &scope, name)
                 .as_tagged(heap)
-                .erase_type(),
+                .erase(),
         );
         // Safety: caller-supplied word, fresh at entry.
         let receiver = scope.handle(unsafe { receiver.assume_valid(heap) });
         match Runtime::get_property(vm, heap, state, receiver, name)? {
-            Coercion::Value(v) => Ok(v.erase()),
-            Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).erase()),
+            Coercion::Value(v) => Ok(v.raw()),
+            Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
         }
     })
 }

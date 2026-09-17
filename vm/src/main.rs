@@ -96,16 +96,16 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
     }
     thread.heap().no_gc(|heap| {
         let known = heap.known();
-        if v == known.undefined.as_tagged(heap).erase() {
+        if v == known.undefined.as_tagged(heap).raw() {
             return "undefined".into();
         }
-        if v == known.null.as_tagged(heap).erase() {
+        if v == known.null.as_tagged(heap).raw() {
             return "null".into();
         }
-        if v == known.true_object.as_tagged(heap).erase() {
+        if v == known.true_object.as_tagged(heap).raw() {
             return "true".into();
         }
-        if v == known.false_object.as_tagged(heap).erase() {
+        if v == known.false_object.as_tagged(heap).raw() {
             return "false".into();
         }
         if let Some(f) = unsafe { v.assume_valid(heap) }.get_as::<Float>() {

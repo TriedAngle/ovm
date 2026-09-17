@@ -49,6 +49,6 @@ pub fn error_from_vm_error(
             message,
             PropertyDescriptor::data(message_value.erase()),
         )?;
-        Ok(obj.as_tagged(heap).erase())
+        Ok(obj.as_tagged(heap).raw())
     })
 }
