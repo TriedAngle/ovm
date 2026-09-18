@@ -4,11 +4,7 @@ use crate::Lookup;
 use crate::lookup::ordinary_own_descriptor;
 use crate::natives::NativeContext;
 use crate::proxy::Flow;
-use crate::proxy::define_internal;
-use crate::proxy::is_extensible;
-use crate::proxy::is_js_receiver;
-use crate::proxy::is_proxy;
-use crate::proxy::prevent_extensions;
+use crate::proxy::Proxy;
 use crate::runtime::Coercion;
 use crate::runtime::Runtime;
 
@@ -392,7 +388,7 @@ pub fn object_define_property(
         };
         let (vm, heap, state) = nctx.split();
         // Safety: fresh rooted-slot words, consumed by the call.
-        match define_internal(
+        match Proxy::define_internal(
             vm,
             heap,
             state,
@@ -481,7 +477,7 @@ pub fn object_prevent_extensions(
         {
             let cond_38 = {
                 let heap = &*nctx.heap();
-                is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+                Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
             };
             if !cond_38 {
                 return Ok(target); // primitives returned unchanged
@@ -490,7 +486,7 @@ pub fn object_prevent_extensions(
         let (vm, heap, state) = nctx.split();
         // Safety: fresh rooted-slot word, consumed by the call.
         let target = unsafe { Tagged::<Value>::from_value_unchecked(target) };
-        match prevent_extensions(vm, heap, state, target)? {
+        match Proxy::prevent_extensions(vm, heap, state, target)? {
             // Safety: fresh root-slot word read for the immediate return.
             Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
             Coercion::Value(v) => {
@@ -520,7 +516,7 @@ pub fn object_is_extensible(
     };
     let cond_40 = {
         let heap = &*nctx.heap();
-        is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+        Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
     };
     if !cond_40 {
         return Ok({
@@ -531,7 +527,7 @@ pub fn object_is_extensible(
     let (vm, heap, state) = nctx.split();
     // Safety: fresh argument word, consumed by the call.
     let target = unsafe { Tagged::<Value>::from_value_unchecked(target) };
-    match is_extensible(vm, heap, state, target)? {
+    match Proxy::is_extensible(vm, heap, state, target)? {
         // Safety: fresh root-slot word read for the immediate return.
         Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
         Coercion::Value(v) => Ok(v.raw()),
@@ -629,7 +625,7 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
         let target = target_handle.as_tagged(&*nctx.heap()).raw();
         let cond_41 = {
             let heap = &*nctx.heap();
-            is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
         };
         if !cond_41 {
             return Ok(target);
@@ -638,7 +634,7 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
         // Safety: fresh rooted-slot word, consumed by the call.
         let t = unsafe { Tagged::<Value>::from_value_unchecked(target) };
         // [[PreventExtensions]] first (traps included)
-        match prevent_extensions(vm, heap, state, t)? {
+        match Proxy::prevent_extensions(vm, heap, state, t)? {
             // Safety: fresh root-slot word read for the immediate return.
             Coercion::Threw => {
                 // Safety: fresh root-slot word read for the immediate return.
@@ -657,7 +653,7 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
         let target = target_handle.as_tagged(heap).raw();
-        let cond_43 = is_proxy(heap, unsafe { target.assume_valid(heap) });
+        let cond_43 = Proxy::is_proxy(heap, unsafe { target.assume_valid(heap) });
         if cond_43 {
             return Ok(target);
         }
@@ -694,7 +690,7 @@ pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
         let target = target_handle.as_tagged(&*nctx.heap()).raw();
         let cond_44 = {
             let heap = &*nctx.heap();
-            is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
         };
         if !cond_44 {
             return Ok(target);
@@ -702,7 +698,7 @@ pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
         let (vm, heap, state) = nctx.split();
         // Safety: fresh rooted-slot word, consumed by the call.
         let t = unsafe { Tagged::<Value>::from_value_unchecked(target) };
-        match prevent_extensions(vm, heap, state, t)? {
+        match Proxy::prevent_extensions(vm, heap, state, t)? {
             Coercion::Threw => {
                 // Safety: fresh root-slot word read for the immediate return.
                 return Ok(unsafe { heap.known().exception.read_unchecked() });
@@ -718,7 +714,7 @@ pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
         let (_, heap, _) = nctx.split();
         // re-read through the handle: the trap may have moved the receiver
         let target = target_handle.as_tagged(heap).raw();
-        let cond_46 = is_proxy(heap, unsafe { target.assume_valid(heap) });
+        let cond_46 = Proxy::is_proxy(heap, unsafe { target.assume_valid(heap) });
         if cond_46 {
             return Ok(target);
         }

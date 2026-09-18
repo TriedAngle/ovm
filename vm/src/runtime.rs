@@ -4,8 +4,7 @@ use crate::{
     Symbol, Tagged, Value, VmError, load_outcome_on,
 };
 
-use crate::proxy::get;
-use crate::proxy::is_proxy;
+use crate::proxy::Proxy;
 use crate::{ContextState, NativeContext, VM};
 
 /// ToPrimitive hint (ES 7.1.1).
@@ -324,9 +323,9 @@ impl Runtime {
         receiver: Handle<'_, Value>,
         name: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
-        let cond_3 = is_proxy(heap, holder.as_tagged(heap));
+        let cond_3 = Proxy::is_proxy(heap, holder.as_tagged(heap));
         if cond_3 {
-            return get(vm, heap, state, holder, receiver, name);
+            return Proxy::get(vm, heap, state, holder, receiver, name);
         }
         state.handle_scope(|scope| -> Result<Coercion<'a>, VmError> {
             let exception = heap.known().exception.as_tagged(heap).raw();

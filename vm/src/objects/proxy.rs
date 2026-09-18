@@ -10,6 +10,8 @@ use crate::{
     is_compatible_property_descriptor,
 };
 
+pub struct Proxy;
+
 #[repr(C)]
 pub struct ProxyObject {
     pub header: Header,
@@ -33,9 +35,9 @@ impl ProxyObject {
         self.handler.inner() == heap.known().null.as_tagged(heap)
     }
 
-    /// (target, handler) as raw values; caller checks revocation.
-    pub fn parts(&self) -> (Value, Value) {
-        (self.target.inner(), self.handler.inner())
+    /// (target, handler) anchored to `heap`; caller checks revocation.
+    pub fn parts<'a>(&self, heap: &'a Heap) -> (Tagged<'a, Value>, Tagged<'a, Value>) {
+        (self.target.get(heap), self.handler.get(heap))
     }
 }
 
@@ -119,82 +121,14 @@ impl Trap {
     }
 }
 
-/// Fast proxy check: one map-kind read.
-pub fn is_proxy<'a>(_heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
-    v.get_as::<ProxyObject>().is_some()
-}
-
-/// Whether `v` is a valid ECMAScript receiver ([[ProxyTarget]] /
-/// [[ProxyHandler]] validation, `Reflect.*` / `Object.*` argument
-/// checks): a pure map-kind check, like V8's instance-type range test —
-/// the oddball singletons (`null`, `undefined`, `true`, `false`, …)
-/// carry `ODDBALL`-kind maps and fall out naturally.
-pub fn is_js_receiver<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
-    let Some(obj) = v.as_heap_object() else {
-        return false;
-    };
-    obj.as_ref()
-        .header
-        .map
-        .heap_ref(heap)
-        .kind()
-        .kind()
-        .is_js_receiver()
-}
-
 /// (target, handler) of a proxy, read under a leaf scope. The raw words
 /// must be rooted by the caller before any allocation.
-fn parts<'a>(_heap: &'a Heap, proxy: Tagged<'a, Value>) -> Option<(Value, Value)> {
+fn parts<'a>(
+    heap: &'a Heap,
+    proxy: Tagged<'a, Value>,
+) -> Option<(Tagged<'a, Value>, Tagged<'a, Value>)> {
     let p = proxy.get_as::<ProxyObject>()?;
-    Some(p.as_ref().parts())
-}
-
-pub fn allocate<'a>(
-    heap: &'a mut Heap,
-    scope: &HandleScope<'_>,
-    target: Tagged<'_, Value>,
-    handler: Tagged<'_, Value>,
-) -> Tagged<'a, Value> {
-    let target = scope.handle(target);
-    let handler = scope.handle(handler);
-    let known = heap.known();
-    let map: Handle<'_, Map> = {
-        let kind = target
-            .as_tagged(heap)
-            .as_heap_object()
-            .expect("proxy target must be a JSReceiver")
-            .as_ref()
-            .header
-            .map
-            .heap_ref(heap)
-            .kind();
-        if kind.is_constructor() {
-            known.proxy_constructor_map
-        } else if kind.is_callable() {
-            known.proxy_callable_map
-        } else {
-            known.proxy_map
-        }
-    };
-    heap.allocate::<ProxyObject>(ProxyInit {
-        map,
-        target,
-        handler,
-    })
-    .erase()
-}
-
-pub fn revoke(heap: &mut Heap, proxy: Tagged<'_, Value>) {
-    let Some(p) = proxy.get_as::<ProxyObject>() else {
-        return;
-    };
-    if p.as_ref().is_revoked(heap) {
-        return;
-    }
-    let host = proxy.raw();
-    let null = heap.known().null.as_tagged(heap).erase();
-    p.as_ref().target.set(heap, host, null);
-    p.as_ref().handler.set(heap, host, null);
+    Some(p.as_ref().parts(heap))
 }
 
 enum TrapLookup<'s> {
@@ -243,7 +177,7 @@ fn call_trap<'a>(
     let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
     let staged = scope.stage(&words);
     let result = NativeContext::new(vm, heap, state).call_rooted(*trap, staged)?;
-    let exception = heap.known().exception.as_tagged(heap).raw();
+    let exception = heap.known().exception.as_tagged(heap);
     if result == exception {
         Ok(Coercion::Threw)
     } else {
@@ -267,10 +201,7 @@ fn enter_trap<'s>(
     if revoked {
         return Err(revoked_error(trap));
     }
-    Ok((
-        scope.handle(unsafe { target.assume_valid(heap) }),
-        scope.handle(unsafe { handler.assume_valid(heap) }),
-    ))
+    Ok((scope.handle(target), scope.handle(handler)))
 }
 
 fn revoked_error(trap: Trap) -> VmError {
@@ -295,19 +226,6 @@ fn revoked_error(trap: Trap) -> VmError {
     })
 }
 
-pub fn internal_own_descriptor<'s>(
-    vm: &VM,
-    heap: &mut Heap,
-    state: &ContextState,
-    scope: &'s HandleScope<'_>,
-    obj: Tagged<'_, Value>,
-    key: Tagged<'_, Value>,
-) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
-    let obj = scope.handle(obj);
-    let key = scope.handle(key);
-    own_descriptor_h(vm, heap, state, scope, &obj, &key)
-}
-
 fn own_descriptor_h<'s>(
     vm: &VM,
     heap: &mut Heap,
@@ -316,19 +234,18 @@ fn own_descriptor_h<'s>(
     obj: &Handle<'_, Value>,
     key: &Handle<'_, Value>,
 ) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
-    let cond_11 = is_proxy(heap, obj.as_tagged(heap));
+    let cond_11 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if !cond_11 {
         let desc = ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), key.as_tagged(heap));
         return Ok(Flow::Value(desc.as_ref().map(PartialDescriptor::from)));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
-    let revoked =
-        unsafe { handler.assume_valid(heap) }.ptr_eq(heap.known().null.as_tagged(heap).erase());
+    let revoked = handler.ptr_eq(heap.known().null.as_tagged(heap).erase());
     if revoked {
         return Err(revoked_error(Trap::GetOwnPropertyDescriptor));
     }
-    let target = scope.handle(unsafe { target.assume_valid(heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
+    let target = scope.handle(target);
+    let handler = scope.handle(handler);
     match get_trap(
         vm,
         heap,
@@ -359,21 +276,6 @@ fn own_descriptor_h<'s>(
     }
 }
 
-/// [[IsExtensible]] through proxies, *without* the trap-must-match
-/// invariant (that check belongs to the `Object.isExtensible` entry
-/// point; other internal methods only read the value).
-pub fn internal_is_extensible(
-    vm: &VM,
-    heap: &mut Heap,
-    state: &ContextState,
-    obj: Tagged<'_, Value>,
-) -> Result<Flow<bool>, VmError> {
-    state.handle_scope(|scope| {
-        let obj = scope.handle(obj);
-        is_extensible_h(vm, heap, state, &scope, &obj)
-    })
-}
-
 fn is_extensible_h(
     vm: &VM,
     heap: &mut Heap,
@@ -381,7 +283,7 @@ fn is_extensible_h(
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
 ) -> Result<Flow<bool>, VmError> {
-    let cond_12 = is_proxy(heap, obj.as_tagged(heap));
+    let cond_12 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if !cond_12 {
         return Ok(Flow::Value({
             obj.as_tagged(heap)
@@ -394,8 +296,8 @@ fn is_extensible_h(
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
-    let target = scope.handle(unsafe { target.assume_valid(heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
+    let target = scope.handle(target);
+    let handler = scope.handle(handler);
     match get_trap(vm, heap, state, scope, &handler, Trap::IsExtensible)? {
         TrapLookup::Threw => Ok(Flow::Threw),
         TrapLookup::None => is_extensible_h(vm, heap, state, scope, &target),
@@ -434,15 +336,15 @@ fn create_data_partial<'s>(
 /// exactly the fields present in the partial (what a
 /// `defineProperty`/`getOwnPropertyDescriptor` trap receives/returns).
 /// Allocates, so the payload is handle-rooted (`PartialDescriptor`).
-fn descriptor_object(
+fn descriptor_object<'s>(
     heap: &mut Heap,
-    state: &ContextState,
+    scope: &'s HandleScope<'_>,
     partial: &PartialDescriptor<'_>,
-) -> Result<Value, VmError> {
-    state.handle_scope(|scope| {
+) -> Result<Handle<'s, Value>, VmError> {
+    {
         let obj = heap
-            .new_object(&scope, heap.known().object_initial_map, GcSlice::EMPTY)
-            .into_handle(&scope);
+            .new_object(scope, heap.known().object_initial_map, GcSlice::EMPTY)
+            .into_handle(scope);
         // the well-known field names are persistent roots: they cross the
         // define allocations without further rooting
         let s = heap.known().strings;
@@ -467,10 +369,10 @@ fn descriptor_object(
             fields.push((s.configurable, scope.handle(Convert::boolean(heap, b))));
         }
         for (name, value) in fields {
-            Object::define_own_property(heap, &scope, obj, name, PropertyDescriptor::data(value))?;
+            Object::define_own_property(heap, scope, obj, name, PropertyDescriptor::data(value))?;
         }
-        Ok(unsafe { obj.read_unchecked() })
-    })
+        Ok(obj.erase())
+    }
 }
 
 /// Store `value` at element index `i` of an array object, growing the
@@ -546,24 +448,6 @@ fn define_array_element(
     Ok(())
 }
 
-/// `[[DefineOwnProperty]]` dispatch: proxies run their `defineProperty`
-/// trap (with full spec validation), ordinary objects complete the
-/// partial against their current descriptor and define through the
-/// transition machinery.
-pub fn define_internal<'s>(
-    vm: &VM,
-    heap: &mut Heap,
-    state: &ContextState,
-    scope: &'s HandleScope<'_>,
-    obj: Tagged<'_, Value>,
-    name: Tagged<'_, Value>,
-    partial: PartialDescriptor<'s>,
-) -> Result<Flow<bool>, VmError> {
-    let obj = scope.handle(obj);
-    let name = scope.handle(name);
-    define_internal_h(vm, heap, state, scope, &obj, &name, partial)
-}
-
 fn define_internal_h<'s>(
     vm: &VM,
     heap: &mut Heap,
@@ -573,7 +457,7 @@ fn define_internal_h<'s>(
     name: &Handle<'_, Value>,
     partial: PartialDescriptor<'s>,
 ) -> Result<Flow<bool>, VmError> {
-    let cond_13 = is_proxy(heap, obj.as_tagged(heap));
+    let cond_13 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if cond_13 {
         return proxy_define_h(vm, heap, state, scope, obj, name, partial);
     }
@@ -646,10 +530,10 @@ fn ordinary_set_forward<'a>(
 
     // owned summary of the chain lookup starting at the target
     // (Lookup borrows its non-allocating region, so it is consumed inside)
-    enum SetLookup {
+    enum SetLookup<'s> {
         DataWritable,
         DataReadonly,
-        Setter(Value),
+        Setter(Handle<'s, Value>),
         NotFound,
     }
     let lookup = match target
@@ -663,7 +547,9 @@ fn ordinary_set_forward<'a>(
                 SetLookup::DataReadonly
             }
         }
-        Lookup::Accessor { pair, .. } => SetLookup::Setter(pair.as_ref().set.inner()),
+        Lookup::Accessor { pair, .. } => {
+            SetLookup::Setter(scope.handle(pair.as_ref().set.get(heap)))
+        }
         Lookup::NotFound => SetLookup::NotFound,
     };
     match lookup {
@@ -674,18 +560,16 @@ fn ordinary_set_forward<'a>(
             define_flow_to_coercion(heap, flow)
         }
         SetLookup::Setter(setter) => {
-            let undefined = heap.known().undefined.as_tagged(heap).raw();
-            if setter == undefined {
+            if setter.as_tagged(heap) == heap.known().undefined.as_tagged(heap) {
                 return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
-            let setter = scope.handle(unsafe { setter.assume_valid(heap) });
             let words = [
                 receiver.as_tagged(heap).erase(),
                 value.as_tagged(heap).erase(),
             ];
             let staged = scope.stage(&words);
             let result = NativeContext::new(vm, heap, state).call_rooted(setter, staged)?;
-            let exception = heap.known().exception.as_tagged(heap).raw();
+            let exception = heap.known().exception.as_tagged(heap);
             if result == exception {
                 Ok(Coercion::Threw)
             } else {
@@ -703,20 +587,6 @@ fn define_flow_to_coercion<'a>(heap: &'a Heap, flow: Flow<bool>) -> Result<Coerc
 }
 
 // ---- the internal methods (ES 20.2.5.x) ------------------------------------
-
-/// Proxy `[[Get]]` (ES 20.2.5.8). `receiver` is the [[Get]] receiver —
-/// the proxy itself at entry points, the *original* receiver when
-/// forwarding through a chain of proxies.
-pub fn get<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    proxy: Handle<'_, Value>,
-    receiver: Handle<'_, Value>,
-    name: Handle<'_, Value>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| get_h(vm, heap, state, &scope, &proxy, &receiver, &name))
-}
 
 fn get_h<'a>(
     vm: &VM,
@@ -786,24 +656,11 @@ fn get_h<'a>(
     }
 }
 
-/// Proxy `[[Set]]` (ES 20.2.5.10).
-pub fn set<'a>(
+fn set_h<'a, 's>(
     vm: &VM,
     heap: &'a mut Heap,
     state: &ContextState,
-    proxy: Handle<'_, Value>,
-    name: Handle<'_, Value>,
-    value: Handle<'_, Value>,
-    receiver: Handle<'_, Value>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| set_h(vm, heap, state, &scope, &proxy, &name, &value, &receiver))
-}
-
-fn set_h<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    scope: &HandleScope<'_>,
+    scope: &'s HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
     value: &Handle<'_, Value>,
@@ -813,7 +670,7 @@ fn set_h<'a>(
     match get_trap(vm, heap, state, scope, &handler, Trap::Set)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => {
-            let cond_14 = is_proxy(heap, target.as_tagged(heap));
+            let cond_14 = Proxy::is_proxy(heap, target.as_tagged(heap));
             if cond_14 {
                 set_h(vm, heap, state, scope, &target, name, value, receiver)
             } else {
@@ -873,21 +730,6 @@ fn set_h<'a>(
     }
 }
 
-/// Proxy `[[HasProperty]]` (ES 20.2.5.9).
-pub fn has<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    proxy: Tagged<'_, Value>,
-    name: Tagged<'_, Value>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| {
-        let proxy = scope.handle(proxy);
-        let name = scope.handle(name);
-        has_h(vm, heap, state, &scope, &proxy, &name)
-    })
-}
-
 fn has_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
@@ -900,7 +742,7 @@ fn has_h<'a>(
     match get_trap(vm, heap, state, scope, &handler, Trap::Has)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => {
-            let cond_15 = is_proxy(heap, target.as_tagged(heap));
+            let cond_15 = Proxy::is_proxy(heap, target.as_tagged(heap));
             if cond_15 {
                 has_h(vm, heap, state, scope, &target, name)
             } else {
@@ -946,22 +788,6 @@ fn has_h<'a>(
     }
 }
 
-/// Proxy `[[Delete]]` (ES 20.2.5.4). The strict-mode false→TypeError
-/// translation is the caller's (`delete` sloppy/strict natives).
-pub fn delete<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    proxy: Tagged<'_, Value>,
-    key: Tagged<'_, Value>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| {
-        let proxy = scope.handle(proxy);
-        let key = scope.handle(key);
-        delete_h(vm, heap, state, &scope, &proxy, &key)
-    })
-}
-
 fn delete_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
@@ -974,7 +800,7 @@ fn delete_h<'a>(
     match get_trap(vm, heap, state, scope, &handler, Trap::DeleteProperty)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => {
-            let cond_16 = is_proxy(heap, target.as_tagged(heap));
+            let cond_16 = Proxy::is_proxy(heap, target.as_tagged(heap));
             if cond_16 {
                 delete_h(vm, heap, state, scope, &target, key)
             } else {
@@ -1022,22 +848,6 @@ fn delete_h<'a>(
     }
 }
 
-/// Proxy `[[DefineOwnProperty]]` (ES 20.2.5.6).
-pub fn proxy_define(
-    vm: &VM,
-    heap: &mut Heap,
-    state: &ContextState,
-    proxy: Tagged<'_, Value>,
-    name: Tagged<'_, Value>,
-    partial: PartialDescriptor,
-) -> Result<Flow<bool>, VmError> {
-    state.handle_scope(|scope| {
-        let proxy = scope.handle(proxy);
-        let name = scope.handle(name);
-        proxy_define_h(vm, heap, state, &scope, &proxy, &name, partial)
-    })
-}
-
 fn proxy_define_h(
     vm: &VM,
     heap: &mut Heap,
@@ -1053,8 +863,7 @@ fn proxy_define_h(
         TrapLookup::Threw => Ok(Flow::Threw),
         TrapLookup::None => define_internal_h(vm, heap, state, scope, &target, name, partial),
         TrapLookup::Trap(t) => {
-            let desc_obj = descriptor_object(heap, state, &partial)?;
-            let desc_obj = scope.handle(unsafe { desc_obj.assume_valid(heap) });
+            let desc_obj = descriptor_object(heap, scope, &partial)?;
             let result = call_trap(
                 vm,
                 heap,
@@ -1127,21 +936,6 @@ fn proxy_define_h(
     }
 }
 
-/// Proxy `[[Call]]` (ES 20.2.5.15): the `apply` trap, or a plain call
-/// of the target. `args` includes the receiver (`this`) at index 0.
-pub fn apply<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    proxy: Handle<'_, Value>,
-    args: GcSlice<'_>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| {
-        let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
-        apply_h(vm, heap, state, &scope, &proxy, &args)
-    })
-}
-
 fn apply_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
@@ -1153,7 +947,7 @@ fn apply_h<'a>(
     let (target, handler) = enter_trap(scope, heap, proxy, Trap::Apply)?;
     let this_arg = match args.first() {
         Some(h) => *h,
-        None => scope.handle(unsafe { heap.known().undefined.read_unchecked().assume_valid(heap) }),
+        None => scope.handle(heap.known().undefined.as_tagged(heap).erase()),
     };
     match get_trap(vm, heap, state, scope, &handler, Trap::Apply)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
@@ -1165,7 +959,7 @@ fn apply_h<'a>(
             }
             let staged = scope.stage(&all);
             let result = NativeContext::new(vm, heap, state).call_rooted(target, staged)?;
-            let exception = heap.known().exception.as_tagged(heap).raw();
+            let exception = heap.known().exception.as_tagged(heap);
             if result == exception {
                 Ok(Coercion::Threw)
             } else {
@@ -1194,23 +988,6 @@ fn apply_h<'a>(
             Ok(result)
         }
     }
-}
-
-/// Proxy `[[Construct]]` (ES 20.2.5.5): the `construct` trap, or a
-/// construct of the target with the original `new.target`. `args` are
-/// the constructor arguments (no synthesized receiver).
-pub fn construct<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    proxy: Handle<'_, Value>,
-    args: GcSlice<'_>,
-    new_target: Handle<'_, Value>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| {
-        let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
-        construct_h(vm, heap, state, &scope, &proxy, &args, &new_target)
-    })
 }
 
 fn construct_h<'a>(
@@ -1244,8 +1021,7 @@ fn construct_h<'a>(
                 .flatten()
                 .is_some_and(|info| info.function_kind().is_derived_class_constructor());
             let receiver = if derived {
-                let hole = heap.known().the_hole.as_tagged(heap).raw();
-                scope.handle(unsafe { hole.assume_valid(heap) })
+                scope.handle(heap.known().the_hole.as_tagged(heap).erase())
             } else {
                 let Some(r) = Runtime::create_construct_receiver_value(vm, heap, state, unsafe {
                     new_target.read_unchecked()
@@ -1266,7 +1042,7 @@ fn construct_h<'a>(
                 *new_target,
                 staged,
             )?;
-            let exception = heap.known().exception.as_tagged(heap).raw();
+            let exception = heap.known().exception.as_tagged(heap);
             if result == exception {
                 return Ok(Coercion::Threw);
             }
@@ -1353,20 +1129,6 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
     });
 }
 
-/// Proxy `[[PreventExtensions]]` (ES 20.2.5.3), plus the ordinary path —
-/// the `Object.preventExtensions` implementation.
-pub fn prevent_extensions<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    obj: Tagged<'_, Value>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| {
-        let obj = scope.handle(obj);
-        prevent_extensions_h(vm, heap, state, &scope, &obj)
-    })
-}
-
 fn prevent_extensions_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
@@ -1374,7 +1136,7 @@ fn prevent_extensions_h<'a>(
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
 ) -> Result<Coercion<'a>, VmError> {
-    let cond_20 = is_proxy(heap, obj.as_tagged(heap));
+    let cond_20 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if !cond_20 {
         let Some(obj) = scope.cast::<Object>(obj.as_tagged(heap)) else {
             return Err(VmError::Type);
@@ -1387,8 +1149,8 @@ fn prevent_extensions_h<'a>(
     if revoked {
         return Err(revoked_error(Trap::PreventExtensions));
     }
-    let target = scope.handle(unsafe { target.assume_valid(heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
+    let target = scope.handle(target);
+    let handler = scope.handle(handler);
     match get_trap(vm, heap, state, scope, &handler, Trap::PreventExtensions)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => prevent_extensions_h(vm, heap, state, scope, &target),
@@ -1417,20 +1179,6 @@ fn prevent_extensions_h<'a>(
     }
 }
 
-/// `Object.isExtensible` (ES 20.1.2.14) including the proxy trap and
-/// its must-match-target invariant (ES 20.2.5.2 step 8).
-pub fn is_extensible<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
-    obj: Tagged<'_, Value>,
-) -> Result<Coercion<'a>, VmError> {
-    state.handle_scope(|scope| {
-        let obj = scope.handle(obj);
-        is_extensible_entry_h(vm, heap, state, &scope, &obj)
-    })
-}
-
 fn is_extensible_entry_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
@@ -1438,7 +1186,7 @@ fn is_extensible_entry_h<'a>(
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
 ) -> Result<Coercion<'a>, VmError> {
-    let cond_22 = is_proxy(heap, obj.as_tagged(heap));
+    let cond_22 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if !cond_22 {
         let extensible = obj
             .as_tagged(heap)
@@ -1451,8 +1199,8 @@ fn is_extensible_entry_h<'a>(
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
-    let target = scope.handle(unsafe { target.assume_valid(heap) });
-    let handler = scope.handle(unsafe { handler.assume_valid(heap) });
+    let target = scope.handle(target);
+    let handler = scope.handle(handler);
     match get_trap(vm, heap, state, scope, &handler, Trap::IsExtensible)? {
         TrapLookup::Threw => Ok(Coercion::Threw),
         TrapLookup::None => is_extensible_entry_h(vm, heap, state, scope, &target),
@@ -1474,5 +1222,258 @@ fn is_extensible_entry_h<'a>(
             }
             Ok(Coercion::Value(Convert::boolean(heap, trap_bool)))
         }
+    }
+}
+
+impl Proxy {
+    /// Fast proxy check: one map-kind read.
+    pub fn is_proxy<'a>(_heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
+        v.get_as::<ProxyObject>().is_some()
+    }
+
+    /// Whether `v` is a valid ECMAScript receiver ([[ProxyTarget]] /
+    /// [[ProxyHandler]] validation, `Reflect.*` / `Object.*` argument
+    /// checks): a pure map-kind check, like V8's instance-type range test —
+    /// the oddball singletons (`null`, `undefined`, `true`, `false`, …)
+    /// carry `ODDBALL`-kind maps and fall out naturally.
+    pub fn is_js_receiver<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
+        let Some(obj) = v.as_heap_object() else {
+            return false;
+        };
+        obj.as_ref()
+            .header
+            .map
+            .heap_ref(heap)
+            .kind()
+            .kind()
+            .is_js_receiver()
+    }
+
+    pub fn allocate<'a>(
+        heap: &'a mut Heap,
+        scope: &HandleScope<'_>,
+        target: Tagged<'_, Value>,
+        handler: Tagged<'_, Value>,
+    ) -> Tagged<'a, Value> {
+        let target = scope.handle(target);
+        let handler = scope.handle(handler);
+        let known = heap.known();
+        let map: Handle<'_, Map> = {
+            let kind = target
+                .as_tagged(heap)
+                .as_heap_object()
+                .expect("proxy target must be a JSReceiver")
+                .as_ref()
+                .header
+                .map
+                .heap_ref(heap)
+                .kind();
+            if kind.is_constructor() {
+                known.proxy_constructor_map
+            } else if kind.is_callable() {
+                known.proxy_callable_map
+            } else {
+                known.proxy_map
+            }
+        };
+        heap.allocate::<ProxyObject>(ProxyInit {
+            map,
+            target,
+            handler,
+        })
+        .erase()
+    }
+
+    pub fn revoke(heap: &mut Heap, proxy: Tagged<'_, Value>) {
+        let Some(p) = proxy.get_as::<ProxyObject>() else {
+            return;
+        };
+        if p.as_ref().is_revoked(heap) {
+            return;
+        }
+        let host = proxy.raw();
+        let null = heap.known().null.as_tagged(heap).erase();
+        p.as_ref().target.set(heap, host, null);
+        p.as_ref().handler.set(heap, host, null);
+    }
+
+    pub fn internal_own_descriptor<'s>(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        scope: &'s HandleScope<'_>,
+        obj: Tagged<'_, Value>,
+        key: Tagged<'_, Value>,
+    ) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
+        let obj = scope.handle(obj);
+        let key = scope.handle(key);
+        own_descriptor_h(vm, heap, state, scope, &obj, &key)
+    }
+
+    /// [[IsExtensible]] through proxies, *without* the trap-must-match
+    /// invariant (that check belongs to the `Object.isExtensible` entry
+    /// point; other internal methods only read the value).
+    pub fn internal_is_extensible(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        obj: Tagged<'_, Value>,
+    ) -> Result<Flow<bool>, VmError> {
+        state.handle_scope(|scope| {
+            let obj = scope.handle(obj);
+            is_extensible_h(vm, heap, state, &scope, &obj)
+        })
+    }
+
+    /// `[[DefineOwnProperty]]` dispatch: proxies run their `defineProperty`
+    /// trap (with full spec validation), ordinary objects complete the
+    /// partial against their current descriptor and define through the
+    /// transition machinery.
+    pub fn define_internal<'s>(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        scope: &'s HandleScope<'_>,
+        obj: Tagged<'_, Value>,
+        name: Tagged<'_, Value>,
+        partial: PartialDescriptor<'s>,
+    ) -> Result<Flow<bool>, VmError> {
+        let obj = scope.handle(obj);
+        let name = scope.handle(name);
+        define_internal_h(vm, heap, state, scope, &obj, &name, partial)
+    }
+
+    /// Proxy `[[Get]]` (ES 20.2.5.8). `receiver` is the [[Get]] receiver —
+    /// the proxy itself at entry points, the *original* receiver when
+    /// forwarding through a chain of proxies.
+    pub fn get<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        proxy: Handle<'_, Value>,
+        receiver: Handle<'_, Value>,
+        name: Handle<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| get_h(vm, heap, state, &scope, &proxy, &receiver, &name))
+    }
+
+    /// Proxy `[[Set]]` (ES 20.2.5.10).
+    pub fn set<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        proxy: Handle<'_, Value>,
+        name: Handle<'_, Value>,
+        value: Handle<'_, Value>,
+        receiver: Handle<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| set_h(vm, heap, state, &scope, &proxy, &name, &value, &receiver))
+    }
+
+    /// Proxy `[[HasProperty]]` (ES 20.2.5.9).
+    pub fn has<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        proxy: Tagged<'_, Value>,
+        name: Tagged<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| {
+            let proxy = scope.handle(proxy);
+            let name = scope.handle(name);
+            has_h(vm, heap, state, &scope, &proxy, &name)
+        })
+    }
+
+    /// Proxy `[[Delete]]` (ES 20.2.5.4). The strict-mode false→TypeError
+    /// translation is the caller's (`delete` sloppy/strict natives).
+    pub fn delete<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        proxy: Tagged<'_, Value>,
+        key: Tagged<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| {
+            let proxy = scope.handle(proxy);
+            let key = scope.handle(key);
+            delete_h(vm, heap, state, &scope, &proxy, &key)
+        })
+    }
+
+    /// Proxy `[[DefineOwnProperty]]` (ES 20.2.5.6).
+    pub fn proxy_define(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        proxy: Tagged<'_, Value>,
+        name: Tagged<'_, Value>,
+        partial: PartialDescriptor,
+    ) -> Result<Flow<bool>, VmError> {
+        state.handle_scope(|scope| {
+            let proxy = scope.handle(proxy);
+            let name = scope.handle(name);
+            proxy_define_h(vm, heap, state, &scope, &proxy, &name, partial)
+        })
+    }
+
+    /// Proxy `[[Call]]` (ES 20.2.5.15): the `apply` trap, or a plain call
+    /// of the target. `args` includes the receiver (`this`) at index 0.
+    pub fn apply<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        proxy: Handle<'_, Value>,
+        args: GcSlice<'_>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| {
+            let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
+            apply_h(vm, heap, state, &scope, &proxy, &args)
+        })
+    }
+
+    /// Proxy `[[Construct]]` (ES 20.2.5.5): the `construct` trap, or a
+    /// construct of the target with the original `new.target`. `args` are
+    /// the constructor arguments (no synthesized receiver).
+    pub fn construct<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        proxy: Handle<'_, Value>,
+        args: GcSlice<'_>,
+        new_target: Handle<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| {
+            let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
+            construct_h(vm, heap, state, &scope, &proxy, &args, &new_target)
+        })
+    }
+
+    /// Proxy `[[PreventExtensions]]` (ES 20.2.5.3), plus the ordinary path —
+    /// the `Object.preventExtensions` implementation.
+    pub fn prevent_extensions<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        obj: Tagged<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| {
+            let obj = scope.handle(obj);
+            prevent_extensions_h(vm, heap, state, &scope, &obj)
+        })
+    }
+
+    /// `Object.isExtensible` (ES 20.1.2.14) including the proxy trap and
+    /// its must-match-target invariant (ES 20.2.5.2 step 8).
+    pub fn is_extensible<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        obj: Tagged<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        state.handle_scope(|scope| {
+            let obj = scope.handle(obj);
+            is_extensible_entry_h(vm, heap, state, &scope, &obj)
+        })
     }
 }

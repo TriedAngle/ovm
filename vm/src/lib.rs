@@ -123,7 +123,7 @@ impl ContextState {
         &self.stack
     }
 
-    pub fn set_pending_exception(&self, value: Value) {
+    pub fn set_pending_exception(&self, value: impl Into<Value>) {
         self.pending_exception.store(value);
         self.has_pending_exception.set(true);
     }

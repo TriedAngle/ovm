@@ -3,9 +3,7 @@
 
 use super::object::plain_object;
 use crate::natives::NativeContext;
-use crate::proxy::allocate;
-use crate::proxy::is_js_receiver;
-use crate::proxy::revoke;
+use crate::proxy::Proxy;
 use crate::runtime::Coercion;
 use crate::runtime::Runtime;
 use crate::{GcSlice, Tagged, Value, VmError};
@@ -29,8 +27,8 @@ pub fn proxy_constructor(
     };
     let ok = {
         let heap = &*nctx.heap();
-        is_js_receiver(heap, unsafe { target.assume_valid(heap) })
-            && is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
+        Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            && Proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     };
     if !ok {
         return Err(VmError::Message(
@@ -38,7 +36,7 @@ pub fn proxy_constructor(
         ));
     }
     nctx.handle_scope(|nctx, scope| {
-        Ok(allocate(
+        Ok(Proxy::allocate(
             nctx.heap(),
             &scope,
             // Safety: fresh argument words, consumed by the allocation.
@@ -63,8 +61,8 @@ pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
     };
     let ok = {
         let heap = &*nctx.heap();
-        is_js_receiver(heap, unsafe { target.assume_valid(heap) })
-            && is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
+        Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
+            && Proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     };
     if !ok {
         return Err(VmError::Message(
@@ -72,7 +70,7 @@ pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         ));
     }
     nctx.handle_scope(|nctx, scope| {
-        let proxy = scope.handle(allocate(
+        let proxy = scope.handle(Proxy::allocate(
             nctx.heap(),
             &scope,
             // Safety: fresh argument words, consumed by the allocation.
@@ -125,7 +123,7 @@ pub fn proxy_revoke(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
         let heap = &*nctx.heap();
         args.get(heap, 1).ok_or(VmError::Arity)?.raw()
     };
-    revoke(
+    Proxy::revoke(
         nctx.heap(),
         // Safety: fresh argument word, consumed with no allocation delay.
         unsafe { Tagged::<Value>::from_value_unchecked(proxy) },
