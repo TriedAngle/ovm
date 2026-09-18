@@ -6,7 +6,7 @@ use vm::{
     HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo,
     ScopeInfoInit, SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value,
 };
-use vm::{NativeContext, NativeIndex, Thread, VM, VmError};
+use vm::{RuntimeContext, RuntimeIndex, Thread, VM, VmError};
 
 fn smi(v: i64) -> Value {
     Smi::new(v).encode()
@@ -253,7 +253,7 @@ fn load_smi_signed_immediates() {
 
 #[test]
 fn call_runtime_passes_receiver_and_args() {
-    fn add(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+    fn add(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
         let (a, b) = {
             let heap = &*nctx.heap();
             match (
@@ -272,7 +272,7 @@ fn call_runtime_passes_receiver_and_args() {
     }
 
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let add = vm.register_native(add);
+    let add = vm.register_runtime(add);
     let mut thread = vm.attach();
 
     // r0 = receiver, r1 = 6, r2 = 7; CallRuntime add, r0, 3
@@ -1867,19 +1867,19 @@ fn store_new_accessor_property_defines_own_accessor() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
 
-/// A native function object: callable map with NATIVE flag, slots[0] = the
-/// native registry index as a Smi.
-fn native_function<'s>(
+/// A runtime function object: callable map with RUNTIME flag, slots[0] = the
+/// runtime registry index as a Smi.
+fn runtime_function<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
-    idx: NativeIndex,
+    idx: RuntimeIndex,
 ) -> Handle<'s, Object> {
     let the_hole = thread.heap().known().the_hole;
     let map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: MapKind::OBJECT
                 .union(MapKind::CALLABLE)
-                .union(MapKind::NATIVE)
+                .union(MapKind::RUNTIME)
                 .union(MapKind::CONSTRUCTOR),
             value_slot_count: 1,
             descriptors: &[],
@@ -1901,9 +1901,9 @@ fn native_function<'s>(
         .into_handle(scope)
 }
 
-/// Build a bytecode function object from inside a native.
+/// Build a bytecode function object from inside a runtime.
 fn bytecode_fn(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     scope: &HandleScope<'_>,
     program: &[u8],
     constants: &[Value],
@@ -1947,37 +1947,37 @@ fn bytecode_fn(
         .raw()
 }
 
-fn forty_two(_: &mut NativeContext<'_>, _: HandleSlice<'_>) -> Result<Value, VmError> {
+fn forty_two(_: &mut RuntimeContext<'_>, _: HandleSlice<'_>) -> Result<Value, VmError> {
     Ok(smi(42))
 }
 
 #[test]
-fn run_dispatches_native_callable_without_frame() {
+fn run_dispatches_runtime_callable_without_frame() {
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let idx = vm.register_native(forty_two);
+    let idx = vm.register_runtime(forty_two);
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let f = native_function(thread, &scope, idx);
+        let f = runtime_function(thread, &scope, idx);
         thread.execute(f, &[smi(7)])
     });
     assert_eq!(result.unwrap(), smi(42));
 }
 
 #[test]
-fn call_dispatches_to_native_function_object() {
+fn call_dispatches_to_runtime_function_object() {
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let idx = vm.register_native(forty_two);
+    let idx = vm.register_runtime(forty_two);
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let f = native_function(thread, &scope, idx);
+        let f = runtime_function(thread, &scope, idx);
         let w13 = word(&*thread.heap(), f);
         let consts = thread
             .heap()
             .allocate_handle::<FixedArray>(stage_values(&scope, &[w13]), &scope);
 
-        // r0 = native fn; Call r0 with r0 as the (single, receiver) arg
+        // r0 = runtime fn; Call r0 with r0 as the (single, receiver) arg
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[0]);
@@ -2003,10 +2003,10 @@ fn call_dispatches_to_native_function_object() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
 
-/// Native that runs bytecode which throws one call deep; the suspended inner
-/// frames are abandoned and must be unwound when the native recovers.
+/// Runtime that runs bytecode which throws one call deep; the suspended inner
+/// frames are abandoned and must be unwound when the runtime recovers.
 fn run_failing_inner(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -2035,7 +2035,7 @@ fn run_failing_inner(
         ) {
             Ok(exc) if exc == exception_word => {
                 // the exception escapes the nested run as the sentinel with
-                // the pending exception set; the native recovers by
+                // the pending exception set; the runtime recovers by
                 // clearing it
                 let ex = nctx.take_pending_exception().expect("pending exception");
                 assert!(ex.is_strong_ptr());
@@ -2047,9 +2047,9 @@ fn run_failing_inner(
 }
 
 #[test]
-fn inner_run_error_unwinds_and_native_recovers() {
+fn inner_run_error_unwinds_and_runtime_recovers() {
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let idx = vm.register_native(run_failing_inner);
+    let idx = vm.register_runtime(run_failing_inner);
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -4117,9 +4117,12 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
     });
 }
 
-/// Native constructor probe: reports `nctx.is_construct()` by storing 1/0
+/// Runtime constructor probe: reports `nctx.is_construct()` by storing 1/0
 /// into the global property "constructProbe".
-fn construct_probe(nctx: &mut NativeContext<'_>, _args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn construct_probe(
+    nctx: &mut RuntimeContext<'_>,
+    _args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let flag = Smi::new(if nctx.is_construct() { 1 } else { 0 }).into_tagged();
     nctx.handle_scope(|nctx, scope| {
         let name = nctx.intern(&scope, "constructProbe");
@@ -4161,13 +4164,13 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: HandleSlice<'_>) -> Resu
 }
 
 #[test]
-fn construct_sets_native_construct_flag() {
+fn construct_sets_runtime_construct_flag() {
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let idx = vm.register_native(construct_probe);
+    let idx = vm.register_runtime(construct_probe);
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let f_h = native_function(thread, &scope, idx);
+        let f_h = runtime_function(thread, &scope, idx);
         let f = word(&*thread.heap(), f_h);
         let name = intern_word(&mut *thread, &scope, "constructProbe");
 

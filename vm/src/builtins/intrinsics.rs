@@ -1,5 +1,5 @@
-//! The CallRuntime natives: one implementation per `bytecode::RuntimeFn`,
-//! plus the `runtime_fn` table the native registry seeds its fixed
+//! The CallRuntime runtimes: one implementation per `bytecode::RuntimeFn`,
+//! plus the `runtime_fn` table the runtime registry seeds its fixed
 //! 0..COUNT range with. These are compiled-language semantics (each cites
 //! its ES section), not JS-visible library functions.
 
@@ -17,19 +17,18 @@ use crate::HandleScope;
 use crate::PartialDescriptor;
 use crate::lookup::canonical_index;
 use crate::lookup::has_property as lookup_has_property;
-use crate::natives::{NativeContext, NativeFn};
 use crate::proxy::Flow;
 use crate::proxy::Proxy;
-use crate::runtime::Runtime;
 use crate::{ContextState, VM};
+use crate::{RuntimeCall, RuntimeContext};
 
 /// The fixed runtime-helper table: one implementation per
 /// `bytecode::RuntimeFn`. The exhaustive match is the compile-time link
 /// between the ABI ids and their implementations — adding a variant
-/// without an entry here is a compile error, and `NativeRegistry::new`
+/// without an entry here is a compile error, and `RuntimeRegistry::new`
 /// registers them in `RuntimeFn::ALL` order so registry indices equal
 /// discriminants.
-pub fn runtime_fn(id: bytecode::RuntimeFn) -> NativeFn {
+pub fn runtime_fn(id: bytecode::RuntimeFn) -> RuntimeCall {
     match id {
         bytecode::RuntimeFn::GetIterator => get_iterator,
         bytecode::RuntimeFn::IteratorNext => iterator_next,
@@ -76,10 +75,10 @@ pub fn runtime_fn(id: bytecode::RuntimeFn) -> NativeFn {
 /// RequireObjectCoercible (ES 7.2.2): (value) -> value, TypeError on
 /// null/undefined (object destructuring sources).
 fn require_object_coercible(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
-    // internal-native convention: the register list IS the argument list
+    // internal-runtime convention: the register list IS the argument list
     // (no receiver slot)
     {
         let heap = &*nctx.heap();
@@ -100,7 +99,7 @@ fn require_object_coercible(
 
 /// `delete obj.key` in sloppy code: (obj, key) -> bool.
 fn delete_property_sloppy(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     delete_property(nctx, args, false)
@@ -109,14 +108,14 @@ fn delete_property_sloppy(
 /// `delete obj.key` in strict code: (obj, key) -> bool, TypeError when
 /// the delete fails (ES 13.5.1.2 step 4.h).
 fn delete_property_strict(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     delete_property(nctx, args, true)
 }
 
 fn delete_property(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
     strict: bool,
 ) -> Result<Value, VmError> {
@@ -144,7 +143,7 @@ fn delete_property(
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let target = target.as_tagged(&*nctx.heap()).raw();
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -201,7 +200,7 @@ fn delete_property(
 }
 
 fn delete_property_core(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     target: Value,
     key: Value,
 ) -> Result<bool, VmError> {
@@ -272,7 +271,7 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
 /// bindings resolve statically and compile to `false`; only global-object
 /// properties reach here, and sloppy references never throw on failure.
 fn delete_identifier_sloppy(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word, consumed below.
@@ -297,7 +296,7 @@ fn delete_identifier_sloppy(
 /// the uninitialized-`this` check and the key expression); the key is
 /// never coerced — delete-super fails before any ToPropertyKey.
 fn delete_super_property(
-    _nctx: &mut NativeContext<'_>,
+    _nctx: &mut RuntimeContext<'_>,
     _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     Err(VmError::Reference)
@@ -323,7 +322,10 @@ const FOR_IN_VISITED: usize = 3;
 /// zero iterations; objects and strings snapshot level 0 of the lazy
 /// chain walk. Other primitives' prototypes are not walked yet (their
 /// own properties are none, so they enumerate empty).
-fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn for_in_enumerate(
+    nctx: &mut RuntimeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before it is
     // rooted.
     let subject = {
@@ -549,7 +551,7 @@ fn for_in_level_keys(
 /// an earlier level (yielded or non-enumerable) are skipped; enumerable
 /// survivors are yielded at most once. When a level's snapshot runs
 /// dry, the walk advances to the live prototype and snapshots it.
-fn for_in_next(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn for_in_next(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before it is
     // rooted.
     let enumerator_word = {
@@ -843,7 +845,7 @@ fn for_in_own_state(heap: &Heap, level: Value, key: Value) -> Option<bool> {
 }
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
-fn get_iterator(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn get_iterator(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let obj = scope.handle({
@@ -854,7 +856,7 @@ fn get_iterator(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<V
         });
         let (vm, heap, state) = nctx.split();
         let symbol = scope.handle(heap.known().iterator_symbol.as_tagged(heap).erase());
-        let method = Runtime::get_property(vm, heap, state, obj, symbol)?;
+        let method = Lookup::get_property_on(vm, heap, state, obj, obj, symbol)?;
         let method = match method {
             // Safety: fresh root-slot word read for the immediate return.
             Coercion::Threw => {
@@ -862,16 +864,16 @@ fn get_iterator(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<V
             }
             Coercion::Value(v) => scope.handle(v),
         };
-        let method_word = {
+        let (undefined_or_null, callable) = {
             let heap = &*nctx.heap();
-            method.as_tagged(heap).raw()
+            let method = method.as_tagged(heap);
+            (
+                method.raw() == heap.known().undefined.as_tagged(heap).raw()
+                    || method.raw() == heap.known().null.as_tagged(heap).raw(),
+                Object::is_callable(heap, method),
+            )
         };
-        let undefined_or_null = {
-            let heap = &*nctx.heap();
-            method_word == heap.known().undefined.as_tagged(heap).raw()
-                || method_word == heap.known().null.as_tagged(heap).raw()
-        };
-        if undefined_or_null || !Runtime::is_callable(nctx.heap(), method_word) {
+        if undefined_or_null || !callable {
             return Err(VmError::Type); // "obj is not iterable"
         }
         let obj_word = obj.as_tagged(&*nctx.heap()).raw();
@@ -883,7 +885,7 @@ fn get_iterator(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<V
 }
 
 /// IteratorNext (ES 8.5.6): (iterator) -> result object.
-fn iterator_next(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn iterator_next(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let iter = scope.handle({
@@ -894,7 +896,7 @@ fn iterator_next(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<
         });
         let (vm, heap, state) = nctx.split();
         let next_name = scope.handle(heap.known().strings.next.as_tagged(heap).erase());
-        let next = Runtime::get_property(vm, heap, state, iter, next_name)?;
+        let next = Lookup::get_property_on(vm, heap, state, iter, iter, next_name)?;
         let next = match next {
             // Safety: fresh root-slot word read for the immediate return.
             Coercion::Threw => {
@@ -928,12 +930,12 @@ fn iterator_next(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<
 }
 
 /// IteratorComplete (ES 8.5.7): (result) -> bool.
-fn iterator_done(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn iterator_done(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
         let result = args.get(0).ok_or(VmError::Arity)?;
         let done_name = scope.handle(heap.known().strings.done.as_tagged(heap).erase());
-        match Runtime::get_property(vm, heap, state, result, done_name)? {
+        match Lookup::get_property_on(vm, heap, state, result, result, done_name)? {
             Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
             Coercion::Value(v) => {
                 let v = scope.handle(v);
@@ -945,12 +947,12 @@ fn iterator_done(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<
 }
 
 /// IteratorValue (ES 8.5.8): (result) -> value.
-fn iterator_value(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn iterator_value(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
         let result = args.get(0).ok_or(VmError::Arity)?;
         let value_name = scope.handle(heap.known().strings.value.as_tagged(heap).erase());
-        match Runtime::get_property(vm, heap, state, result, value_name)? {
+        match Lookup::get_property_on(vm, heap, state, result, result, value_name)? {
             Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
             Coercion::Value(v) => Ok(v.raw()),
         }
@@ -959,7 +961,7 @@ fn iterator_value(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result
 
 /// The `in` operator (ES 14.11.2): (key, obj) -> bool. Proxy receivers
 /// run their `has` trap (ES 20.2.5.9).
-fn has_property(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn has_property(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_key, raw_obj) = {
@@ -982,7 +984,7 @@ fn has_property(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<V
         // Safety: fresh argument word, rooted below before any allocation.
         let obj = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_obj) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -1030,7 +1032,7 @@ fn has_property(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<V
 /// CopyDataProperties (ES 8.5.1) with an exclusion list (object rest):
 /// (excluded..., target, source); `excluded` has count−2 entries.
 fn copy_data_properties(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let n = args.len();
@@ -1085,7 +1087,7 @@ fn copy_data_properties(
                 let (vm, heap, state) = nctx.split();
                 let mut out = Vec::with_capacity(excluded.len());
                 for k in excluded {
-                    match Runtime::to_property_key(
+                    match Object::to_property_key(
                         vm,
                         heap,
                         state,
@@ -1142,7 +1144,14 @@ fn copy_data_properties(
                     continue;
                 }
                 // full [[Get]] (getters may run)
-                let value = match Runtime::get_property(vm, heap, state, source_handle, key)? {
+                let value = match Lookup::get_property_on(
+                    vm,
+                    heap,
+                    state,
+                    source_handle,
+                    source_handle,
+                    key,
+                )? {
                     Coercion::Threw => return Ok((true, target_handle.as_tagged(heap).raw())),
                     Coercion::Value(v) => scope.handle(v),
                 };
@@ -1179,7 +1188,7 @@ fn copy_data_properties(
 
 /// A fresh private name: (description) -> Symbol.
 fn create_private_name(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let text = {
@@ -1199,7 +1208,7 @@ fn create_private_name(
 }
 
 /// PrivateGet (ES 7.3.30): (obj, key) -> value, TypeError when absent.
-fn private_get(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn private_get(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
     let obj = args
         .get(0)
@@ -1216,7 +1225,7 @@ fn private_get(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Va
 }
 
 /// PrivateSet (ES 7.3.31): (obj, key, value), TypeError when absent.
-fn private_set(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn private_set(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let value = {
         let heap = &*nctx.heap();
         let obj = args
@@ -1243,7 +1252,7 @@ fn private_set(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Va
 }
 
 /// `#x in obj`: (key, obj) -> bool (own private presence only).
-fn private_in(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn private_in(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let has = {
         let heap = &*nctx.heap();
         let key = args
@@ -1264,7 +1273,10 @@ fn private_in(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Val
 
 /// Attach the instance-field array to the class constructor:
 /// (ctor, fields).
-fn set_class_fields(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn set_class_fields(
+    nctx: &mut RuntimeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
     let ctor = args
         .get(0)
@@ -1300,7 +1312,7 @@ fn set_class_fields(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Resu
 /// Runs each field initializer with the instance as receiver and defines
 /// the result onto it ({w+, e+, c+}).
 fn init_instance_fields(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing below allocates before they
@@ -1363,7 +1375,7 @@ fn init_instance_fields(
             // computed keys need ToPropertyKey canonicalization
             let key = {
                 let (vm, heap, state) = nctx.split();
-                match Runtime::to_property_key(
+                match Object::to_property_key(
                     vm,
                     heap,
                     state,
@@ -1508,7 +1520,7 @@ fn frame_super_parts(heap: &mut Heap, state: &ContextState) -> Result<(Value, Va
 /// setter threw (the pending exception is set; the caller propagates the
 /// exception sentinel).
 fn apply_store_outcome(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     receiver: Value,
     outcome: StoreOutcome<'_>,
     value: Value,
@@ -1556,7 +1568,7 @@ fn apply_store_outcome(
 /// A full [[Get]] that treats non-callable getters (an absent half of an
 /// accessor pair) as undefined instead of throwing.
 fn get_property_lenient(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     receiver: Value,
     name: Value,
 ) -> Result<Value, VmError> {
@@ -1583,7 +1595,14 @@ fn get_property_lenient(
         let heap = &*nctx.heap();
         heap.known().undefined.as_tagged(heap).raw()
     };
-    if getter == undefined || !Runtime::is_callable(nctx.heap(), getter) {
+    if getter == undefined
+        || !{
+            let heap = &*nctx.heap();
+            Object::is_callable(heap, unsafe {
+                Tagged::<Value>::from_value_unchecked(getter)
+            })
+        }
+    {
         return Ok(undefined);
     }
     nctx.handle_scope(|nctx, scope| {
@@ -1605,7 +1624,7 @@ fn get_property_lenient(
 /// explicitly defined `name` wins (ES 15.7.14: SetFunctionName happens
 /// before element installation).
 fn set_function_name(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
@@ -1638,7 +1657,7 @@ fn set_function_name(
         // Safety: fresh argument word, rooted below before any allocation.
         let fn_value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(fn_value) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -1724,7 +1743,10 @@ fn set_function_name(
 /// flags). Defines one accessor half, merging with an existing pair under
 /// the same key; flags bit 0 marks the getter half, PropertyFlags bits
 /// carry enumerability.
-fn install_accessor(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn install_accessor(
+    nctx: &mut RuntimeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_target, raw_key, raw_closure, flags) = {
@@ -1759,7 +1781,7 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Resu
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let closure = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_closure) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -1834,7 +1856,7 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Resu
 /// strict-mode code: a rejected define throws a TypeError. flags are
 /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair).
 fn define_own_property(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
@@ -1871,7 +1893,7 @@ fn define_own_property(
         let receiver = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_receiver) });
         let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_value) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -1981,7 +2003,7 @@ fn define_own_property(
 }
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
-fn set_prototype(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn set_prototype(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument words, rooted below before any allocation.
         let obj = scope.handle({
@@ -2008,7 +2030,7 @@ fn set_prototype(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<
 /// Class extends validation (ES 15.7.14 step 15.e): (value) -> value,
 /// TypeError unless the superclass is null or a constructor.
 fn throw_if_not_constructor_or_null(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
@@ -2039,7 +2061,7 @@ fn throw_if_not_constructor_or_null(
 /// superCtor.prototype validation: (value) -> value, TypeError unless the
 /// value is an Object or null.
 fn throw_if_not_object_or_null(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {
@@ -2063,7 +2085,7 @@ fn throw_if_not_object_or_null(
 /// [[ThisBindingStatus]] guard of derived constructors (ES 10.2.2):
 /// (value) -> value, ReferenceError when `this` is still the hole.
 fn throw_super_not_called_if_hole(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {
@@ -2087,7 +2109,7 @@ fn throw_super_not_called_if_hole(
 /// InitializeThisBinding guard (ES 10.2.2): (value) -> value,
 /// ReferenceError unless `this` is still the hole (super() runs once).
 fn throw_super_already_called_if_not_hole(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {
@@ -2114,7 +2136,7 @@ fn throw_super_already_called_if_not_hole(
 /// giving derived parents the hole receiver. The instance lands in the
 /// return value; the exception sentinel escapes when user code threw.
 fn construct_super_construct(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     callee_v: Value,
     new_target_v: Value,
     args: &[Value],
@@ -2163,7 +2185,7 @@ fn construct_super_construct(
             )
         } else {
             let (vm, heap, state) = nctx.split();
-            match Runtime::create_construct_receiver(vm, heap, state, new_target) {
+            match Object::create_construct_receiver_value(vm, heap, state, new_target.erase()) {
                 // the receiver must stay rooted across the callee call:
                 // a primitive return falls back to it after the call
                 // allocated (and possibly moved it)
@@ -2179,7 +2201,7 @@ fn construct_super_construct(
         args_v.extend(args.iter().map(|h| unsafe { h.read_unchecked() }));
         let result = {
             let (vm, heap, state) = nctx.split();
-            NativeContext::new(vm, heap, state).call_construct(
+            RuntimeContext::new(vm, heap, state).call_construct(
                 // Safety: fresh rooted-slot words, consumed by the call.
                 unsafe { Tagged::<Value>::from_value_unchecked(callee.read_unchecked()) },
                 unsafe { Tagged::<Value>::from_value_unchecked(new_target.read_unchecked()) },
@@ -2222,7 +2244,7 @@ fn construct_super_construct(
 
 /// super(...): (args...) -> instance. Resolves the super constructor and
 /// new.target from the executing frame.
-fn construct_super(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn construct_super(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let (callee, new_target) = {
         let (_, heap, state) = nctx.split();
         frame_super_parts(heap, state)?
@@ -2241,7 +2263,7 @@ fn construct_super(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Resul
 /// super() forwarding the frame's full argument list (synthesized default
 /// derived constructors, ES 15.7.13): () -> instance.
 fn construct_super_all_args(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let (callee, new_target, args) = {
@@ -2268,7 +2290,7 @@ fn construct_super_all_args(
 /// The constructor closure and its new.target ride the tail of the
 /// argument window (threaded through .this_function).
 fn construct_super_via(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let n = args.len();
@@ -2325,7 +2347,7 @@ fn construct_super_via(
 /// Direct-eval name load: (name) -> value. Walks the frame context chain
 /// by name; unresolved names fall back to the global object.
 fn load_dynamic_name(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word, consumed below.
@@ -2355,7 +2377,7 @@ fn load_dynamic_name(
 /// Direct-eval name store: (value, name) -> value. Writes through to the
 /// context-chain slot; unresolved names store on the global object.
 fn store_dynamic_name(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument words, consumed below.
@@ -2422,7 +2444,7 @@ fn store_dynamic_name(
 }
 
 /// Fresh singleton-word compare against the hole sentinel.
-fn is_the_hole(nctx: &mut NativeContext<'_>, v: Value) -> bool {
+fn is_the_hole(nctx: &mut RuntimeContext<'_>, v: Value) -> bool {
     let heap = &*nctx.heap();
     v == heap.known().the_hole.as_tagged(heap).raw()
 }
@@ -2432,7 +2454,7 @@ fn is_the_hole(nctx: &mut NativeContext<'_>, v: Value) -> bool {
 /// A fresh array of the frame's arguments from formal index `first`:
 /// (first) -> array.
 fn create_rest_parameter(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let first = {
@@ -2498,7 +2520,7 @@ fn create_rest_parameter(
 /// after the parent link is resolved (user toString must not change the
 /// chain searched).
 fn super_get_property(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
@@ -2534,7 +2556,7 @@ fn super_get_property(
         let home = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(home) });
         let recv = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_recv) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -2572,7 +2594,14 @@ fn super_get_property(
             let heap = &*nctx.heap();
             heap.known().undefined.as_tagged(heap).raw()
         };
-        if getter == undefined || !Runtime::is_callable(nctx.heap(), getter) {
+        if getter == undefined
+            || !{
+                let heap = &*nctx.heap();
+                Object::is_callable(heap, unsafe {
+                    Tagged::<Value>::from_value_unchecked(getter)
+                })
+            }
+        {
             return Ok(undefined);
         }
         nctx.call(
@@ -2589,7 +2618,7 @@ fn super_get_property(
 /// semantics flag is set; the parent link is resolved before any user key
 /// coercion runs.
 fn super_set_property(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
@@ -2638,7 +2667,7 @@ fn super_set_property(
         let recv = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_recv) });
         let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_value) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,

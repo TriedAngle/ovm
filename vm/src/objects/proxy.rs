@@ -2,11 +2,11 @@ use core::alloc::Layout;
 
 use crate::lookup::has_property;
 use crate::lookup::ordinary_own_descriptor;
-use crate::runtime::{Coercion, Runtime};
+use crate::runtime::Coercion;
 use crate::{
     Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
-    Header, Heap, HeapObject, Key, Lookup, Map, NativeContext, Object, ObjectKind,
-    PartialDescriptor, PropertyDescriptor, SlotName, Tagged, VM, Value, Visitor, VmError,
+    Header, Heap, HeapObject, Key, Lookup, Map, Object, ObjectKind, PartialDescriptor,
+    PropertyDescriptor, RuntimeContext, SlotName, Tagged, VM, Value, Visitor, VmError,
     is_compatible_property_descriptor,
 };
 
@@ -148,7 +148,7 @@ fn get_trap<'s>(
     trap: Trap,
 ) -> Result<TrapLookup<'s>, VmError> {
     let name = scope.handle(trap.name(heap).erase());
-    match Runtime::get_property(vm, heap, state, *handler, name)? {
+    match Lookup::get_property_on(vm, heap, state, *handler, *handler, name)? {
         Coercion::Threw => Ok(TrapLookup::Threw),
         Coercion::Value(v) => {
             let v = scope.handle(v);
@@ -171,12 +171,12 @@ fn call_trap<'a>(
     trap: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
 ) -> Result<Coercion<'a>, VmError> {
-    if !Runtime::is_callable(heap, unsafe { trap.read_unchecked() }) {
+    if !Object::is_callable(heap, trap.as_tagged(heap)) {
         return Err(VmError::Message("proxy trap is not a function"));
     }
     let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
     let staged = scope.stage(&words);
-    let result = NativeContext::new(vm, heap, state).call_rooted(*trap, staged)?;
+    let result = RuntimeContext::new(vm, heap, state).call_rooted(*trap, staged)?;
     let exception = heap.known().exception.as_tagged(heap);
     if result == exception {
         Ok(Coercion::Threw)
@@ -268,7 +268,7 @@ fn own_descriptor_h<'s>(
             if is_undefined {
                 return Ok(Flow::Value(None));
             }
-            match Runtime::to_property_descriptor(vm, heap, state, scope, result)? {
+            match Lookup::to_property_descriptor(vm, heap, state, scope, result)? {
                 Some(partial) => Ok(Flow::Value(Some(partial))),
                 None => Ok(Flow::Threw),
             }
@@ -492,7 +492,7 @@ fn ordinary_set_forward<'a>(
                 value.as_tagged(heap).erase(),
             ];
             let staged = scope.stage(&words);
-            let result = NativeContext::new(vm, heap, state).call_rooted(setter, staged)?;
+            let result = RuntimeContext::new(vm, heap, state).call_rooted(setter, staged)?;
             let exception = heap.known().exception.as_tagged(heap);
             if result == exception {
                 Ok(Coercion::Threw)
@@ -528,7 +528,7 @@ fn get_h<'a>(
             // forward: lookup on the target, getter `this` = the
             // original receiver (a proxy target re-enters its own
             // `get` trap with the same receiver)
-            Runtime::get_property_on(vm, heap, state, target, *receiver, *name)
+            Lookup::get_property_on(vm, heap, state, target, *receiver, *name)
         }
         TrapLookup::Trap(t) => {
             let result = call_trap(
@@ -882,7 +882,7 @@ fn apply_h<'a>(
                 all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
-            let result = NativeContext::new(vm, heap, state).call_rooted(target, staged)?;
+            let result = RuntimeContext::new(vm, heap, state).call_rooted(target, staged)?;
             let exception = heap.known().exception.as_tagged(heap);
             if result == exception {
                 Ok(Coercion::Threw)
@@ -948,7 +948,7 @@ fn construct_h<'a>(
                 scope.handle(heap.known().the_hole.as_tagged(heap).erase())
             } else {
                 let Some(receiver) =
-                    Runtime::create_construct_receiver_value(vm, heap, state, *new_target)?
+                    Object::create_construct_receiver_value(vm, heap, state, *new_target)?
                 else {
                     return Ok(Coercion::Threw);
                 };
@@ -960,17 +960,18 @@ fn construct_h<'a>(
                 all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
-            let result = NativeContext::new(vm, heap, state).call_construct_rooted(
+            let result = scope.handle(RuntimeContext::call_construct_rooted(
+                vm,
+                heap,
+                state,
                 target,
                 *new_target,
                 staged,
-            )?;
+            )?);
             let exception = heap.known().exception.as_tagged(heap);
-            if result == exception {
+            if result.as_tagged(heap) == exception {
                 return Ok(Coercion::Threw);
             }
-            // Safety: the construct just returned; no GC since.
-            let result = scope.handle(unsafe { result.assume_valid(heap) });
             let cond_18 = Convert::is_primitive(heap, result.as_tagged(heap));
             if cond_18 {
                 if derived {
@@ -1309,7 +1310,7 @@ impl Proxy {
     }
 
     /// Proxy `[[Delete]]` (ES 20.2.5.4). The strict-mode false→TypeError
-    /// translation is the caller's (`delete` sloppy/strict natives).
+    /// translation is the caller's (`delete` sloppy/strict runtimes).
     pub fn delete<'a>(
         vm: &VM,
         heap: &'a mut Heap,

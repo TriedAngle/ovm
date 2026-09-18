@@ -16,7 +16,6 @@ pub mod interner;
 pub mod interpreter;
 pub mod lookup;
 pub mod materialize;
-pub mod natives;
 pub mod objects;
 pub mod runtime;
 pub mod stack;
@@ -47,7 +46,6 @@ pub use lookup::{
     ordinary_own_descriptor, private_find, super_constructor, super_lookup,
     super_lookup_from_proto,
 };
-pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use objects::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
     DenseString, Encoding, FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry,
@@ -56,7 +54,7 @@ pub use objects::{
     ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol, decode_wtf8,
     object_kind, object_layout, string_content_hash, visit_object,
 };
-pub use runtime::{Coercion, Hint, Runtime};
+pub use runtime::{Coercion, Hint, RuntimeCall, RuntimeContext, RuntimeIndex, RuntimeRegistry};
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
@@ -100,7 +98,7 @@ pub struct SharedVM {
     // TODO: investiage if Mutex is fine, maybe a lock-free mechanism exists
     threads: Mutex<Vec<Weak<ContextState>>>,
     interner: StringInterner,
-    natives: NativeRegistry,
+    runtimes: RuntimeRegistry,
     /// Weak slots the GC clears when their targets die; used for tests and
     /// the seed of a weak-registry feature.
     weak_slots: Mutex<Vec<RawCell>>,
@@ -301,9 +299,9 @@ impl Thread {
         Errors::from_vm_error(&self.vm, &mut self.heap, &self.state, err).map(|v| v.raw())
     }
 
-    pub fn run_native(&mut self, f: NativeFn, args: &[Value]) -> Result<Value, VmError> {
-        let mut nctx = NativeContext::new(&self.vm, &mut self.heap, &self.state);
-        // stage a rooted copy: the native may keep reading it across its
+    pub fn run_runtime(&mut self, f: RuntimeCall, args: &[Value]) -> Result<Value, VmError> {
+        let mut nctx = RuntimeContext::new(&self.vm, &mut self.heap, &self.state);
+        // stage a rooted copy: the runtime may keep reading it across its
         // own allocations
         // Safety: caller-owned words staged before any allocation.
         self.state.handle_scope(|scope| {
@@ -385,7 +383,7 @@ impl VM {
             roots,
             threads: Mutex::new(Vec::new()),
             interner,
-            natives: NativeRegistry::new(),
+            runtimes: RuntimeRegistry::new(),
             weak_slots: Mutex::new(Vec::new()),
         });
         shared.heap.set_host(shared.gc_host());
@@ -408,21 +406,21 @@ impl VM {
         &self.shared.interner
     }
 
-    pub fn natives(&self) -> &NativeRegistry {
-        &self.shared.natives
+    pub fn runtimes(&self) -> &RuntimeRegistry {
+        &self.shared.runtimes
     }
 
-    pub fn native(&self, index: NativeIndex) -> NativeFn {
+    pub fn runtime(&self, index: RuntimeIndex) -> RuntimeCall {
         self.shared
-            .natives
+            .runtimes
             .get(index)
-            .expect("unknown native index")
+            .expect("unknown runtime index")
     }
 
-    pub fn register_native(&mut self, f: NativeFn) -> NativeIndex {
+    pub fn register_runtime(&mut self, f: RuntimeCall) -> RuntimeIndex {
         Arc::get_mut(&mut self.shared)
-            .expect("cannot register natives on a shared VM")
-            .natives
+            .expect("cannot register runtimes on a shared VM")
+            .runtimes
             .insert(f)
     }
 
@@ -487,7 +485,7 @@ impl VM {
         Self: Sized,
     {
         let mut vm = Self::new::<B>(config).map_err(|_| VmError::OutOfBounds)?;
-        let idx = builtins::register_builtin_natives(&mut vm);
+        let idx = builtins::register_builtin_runtimes(&mut vm);
         builtins::install_builtins(&mut vm, &idx)?;
         // Promote the bootstrap singletons (the hole, undefined, the
         // initial maps and prototype objects, ...) out of the young

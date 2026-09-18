@@ -1,11 +1,15 @@
 //! ES 19: function properties of the global object (eval, isNaN).
 
+use crate::Object;
+use crate::RuntimeContext;
 use crate::materialize::materialize_closure_vm;
-use crate::natives::NativeContext;
-use crate::{Context, Convert, DenseString, HandleSlice, Tagged, Value, VmError, runtime::Runtime};
+use crate::{Context, Convert, DenseString, HandleSlice, Tagged, Value, VmError};
 use base_compiler::compile_eval;
 
-pub fn eval_native(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+pub fn eval_runtime(
+    nctx: &mut RuntimeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // root the caller context before the allocating ToString below
         let (_vm, heap, state) = nctx.split();
@@ -57,7 +61,7 @@ pub fn eval_native(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Resul
 }
 
 /// `isNaN(x)`: ToNumber(x) is NaN.
-pub fn is_nan(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+pub fn is_nan(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let n = nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
         let arg = {
@@ -67,7 +71,7 @@ pub fn is_nan(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Val
                 .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
             scope.handle(v)
         };
-        Runtime::to_numeric(vm, heap, state, arg)
+        Object::to_numeric(vm, heap, state, arg)
     })?;
     let Some(n) = n else {
         // Safety: fresh root-slot word read for the immediate return.

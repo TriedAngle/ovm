@@ -1,13 +1,13 @@
 //! ES 20.4: the Symbol constructor (minimal surface).
 
-use crate::natives::NativeContext;
+use crate::RuntimeContext;
 use crate::{DenseString, HandleSlice, Symbol, Value, VmError};
 
 /// `Symbol(desc)`: a fresh Symbol primitive (ES 20.4.1.1). This minimal
 /// surface exists so user code can author iterables
 /// (`obj[Symbol.iterator] = ...`); `Symbol.iterator` is the well-known one.
 pub fn symbol_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let desc_text = {

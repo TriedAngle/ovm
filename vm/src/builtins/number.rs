@@ -1,11 +1,12 @@
 //! ES 21.1: the Number constructor and prototype methods.
 
 use super::helpers::wrapper_value;
-use crate::natives::NativeContext;
-use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError, runtime::Runtime};
+use crate::Object;
+use crate::RuntimeContext;
+use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
 
 pub fn number_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let n = nctx.handle_scope(|nctx, scope| {
@@ -14,7 +15,7 @@ pub fn number_constructor(
             Some(v) => scope.handle(v),
             None => scope.handle(Smi::new(0).into_tagged()),
         };
-        Runtime::to_numeric(vm, heap, state, arg)
+        Object::to_numeric(vm, heap, state, arg)
     })?;
     let Some(n) = n else {
         // Safety: fresh root-slot word read for the immediate return.
@@ -40,7 +41,7 @@ pub fn number_constructor(
 }
 
 pub fn number_value_of(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
@@ -52,7 +53,7 @@ pub fn number_value_of(
 }
 
 pub fn number_to_string(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {

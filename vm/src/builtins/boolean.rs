@@ -1,11 +1,11 @@
 //! ES 20.3: the Boolean constructor and prototype methods.
 
 use super::helpers::wrapper_value;
-use crate::natives::NativeContext;
+use crate::RuntimeContext;
 use crate::{Convert, HandleSlice, Tagged, Value, VmError};
 
 pub fn boolean_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let value = {
@@ -34,7 +34,7 @@ pub fn boolean_constructor(
 }
 
 pub fn boolean_value_of(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
@@ -46,7 +46,7 @@ pub fn boolean_value_of(
 }
 
 pub fn boolean_to_string(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {

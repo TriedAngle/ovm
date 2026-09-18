@@ -1,7 +1,9 @@
+use crate::proxy::Proxy;
 use crate::{
-    AccessorPair, DenseString, FixedArray, FrameMeta, GcSlot, Handle, HandleScope, Heap, HeapRef,
-    Map, Object, PropertyDescriptor, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged,
-    Value, VmError,
+    AccessorPair, Coercion, ContextState, Convert, DenseString, FixedArray, FrameMeta, GcSlot,
+    Handle, HandleScope, Heap, HeapRef, Map, Object, PartialDescriptor, PropertyDescriptor,
+    RuntimeContext, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, VM, Value,
+    VmError,
 };
 
 pub enum Lookup<'a> {
@@ -512,5 +514,126 @@ impl Object {
             .heap_ref(heap)
             .as_ref()
             .lookup(heap, HeapRef::from_ref(self), name)
+    }
+}
+
+impl Lookup<'_> {
+    /// Same, with the lookup start (`holder`) split from the getter
+    /// receiver — the proxy forward shape: lookup on the target,
+    /// `this` = the proxy.
+    pub fn get_property_on<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        holder: Handle<'_, Value>,
+        receiver: Handle<'_, Value>,
+        name: Handle<'_, Value>,
+    ) -> Result<Coercion<'a>, VmError> {
+        let cond_3 = Proxy::is_proxy(heap, holder.as_tagged(heap));
+        if cond_3 {
+            return Proxy::get(vm, heap, state, holder, receiver, name);
+        }
+        state.handle_scope(|scope| -> Result<Coercion<'a>, VmError> {
+            let exception = heap.known().exception.as_tagged(heap).raw();
+            let loaded = {
+                let heap_ref: &Heap = heap;
+                load_outcome_on(
+                    heap_ref,
+                    holder.as_tagged(heap_ref),
+                    name.as_tagged(heap_ref).as_name(),
+                )?
+            };
+            match loaded {
+                // Safety: fresh load outcome, no GC since.
+                LoadOutcome::Value(v) => Ok(Coercion::Value(unsafe {
+                    Tagged::from_value_unchecked(v.raw())
+                })),
+                LoadOutcome::Getter(getter) => {
+                    let getter = scope.handle(getter);
+                    let args = scope.stage(&[receiver.as_tagged(&*heap).erase()]);
+                    let result = RuntimeContext::new(vm, heap, state).call_rooted(getter, args)?;
+                    if result == exception {
+                        Ok(Coercion::Threw)
+                    } else {
+                        // Safety: the call just returned; no GC since.
+                        Ok(Coercion::Value(unsafe {
+                            Tagged::from_value_unchecked(result)
+                        }))
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn to_property_descriptor<'s>(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        scope: &'s HandleScope<'_>,
+        attrs: Handle<'_, Value>,
+    ) -> Result<Option<PartialDescriptor<'s>>, VmError> {
+        let cond_4 = Convert::is_primitive(heap, attrs.as_tagged(heap));
+        if cond_4 {
+            return Err(VmError::Type);
+        }
+        let attrs = scope.handle(attrs.as_tagged(heap));
+        let names: [Handle<'_, Value>; 6] = {
+            let s = heap.known().strings;
+            [
+                s.value,
+                s.get,
+                s.set,
+                s.writable,
+                s.enumerable,
+                s.configurable,
+            ]
+            .map(|n| scope.handle(n.as_tagged(heap).erase()))
+        };
+        let mut reads: Vec<Handle<'_, Value>> = Vec::new();
+        for name in names {
+            match Lookup::get_property_on(vm, heap, state, attrs, attrs, name)? {
+                Coercion::Threw => return Ok(None),
+                // Safety: fresh word from the call, no allocation since.
+                Coercion::Value(v) => reads.push(scope.handle(v)),
+            }
+        }
+        let (present, truthy) = {
+            let undef = heap.known().undefined.as_tagged(heap).erase();
+            let present = [
+                !reads[0].as_tagged(heap).ptr_eq(undef),
+                !reads[1].as_tagged(heap).ptr_eq(undef),
+                !reads[2].as_tagged(heap).ptr_eq(undef),
+                !reads[3].as_tagged(heap).ptr_eq(undef),
+                !reads[4].as_tagged(heap).ptr_eq(undef),
+                !reads[5].as_tagged(heap).ptr_eq(undef),
+            ];
+            let truthy = [
+                Convert::is_truthy(heap, reads[3].as_tagged(heap)),
+                Convert::is_truthy(heap, reads[4].as_tagged(heap)),
+                Convert::is_truthy(heap, reads[5].as_tagged(heap)),
+            ];
+            (present, truthy)
+        };
+        let value = present[0].then_some(reads[0]);
+        let get = present[1].then_some(reads[1]);
+        let set = present[2].then_some(reads[2]);
+        // accessor halves must be callable or undefined
+        if get.is_some() || set.is_some() {
+            for half in [get, set] {
+                if let Some(h) = half
+                    && !Object::is_callable(heap, h.as_tagged(heap))
+                {
+                    return Err(VmError::Type);
+                }
+            }
+        }
+        Ok(Some(PartialDescriptor {
+            value,
+            get,
+            set,
+            writable: present[3].then_some(truthy[0]),
+            enumerable: present[4].then_some(truthy[1]),
+            configurable: present[5].then_some(truthy[2]),
+        }))
     }
 }

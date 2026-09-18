@@ -1,11 +1,11 @@
 //! ES 22.1: the String constructor and prototype methods.
 
 use super::helpers::wrapper_value;
-use crate::natives::NativeContext;
+use crate::RuntimeContext;
 use crate::{Convert, HandleSlice, Tagged, Value, VmError};
 
 pub fn string_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -32,7 +32,7 @@ pub fn string_constructor(
 }
 
 pub fn string_value_of(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
@@ -44,7 +44,7 @@ pub fn string_value_of(
 }
 
 pub fn string_to_string(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();

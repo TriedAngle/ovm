@@ -1,7 +1,7 @@
 //! ES 23.1 + 23.1.5: the Array constructor, Array.isArray,
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
-use crate::natives::NativeContext;
+use crate::RuntimeContext;
 use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
 
 /// `Array(...)`: call and construct behave the same (ES 23.1.1.1). No
@@ -9,7 +9,7 @@ use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
 /// non-integer numbers are a RangeError); otherwise the arguments are the
 /// elements.
 pub fn array_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -41,7 +41,10 @@ pub fn array_constructor(
 
 /// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):
 /// returns a fresh array-iterator over the receiver (CreateArrayIterator).
-pub fn array_values(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+pub fn array_values(
+    nctx: &mut RuntimeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let (receiver, is_array) = {
         let heap = &*nctx.heap();
         let receiver = args
@@ -74,7 +77,7 @@ pub fn array_values(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Resu
 /// `%ArrayIteratorPrototype%.next` (ES 23.1.5.2.1): one step over the
 /// iterated array, producing `{ value, done }`.
 pub fn array_iterator_next(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
@@ -154,7 +157,7 @@ pub fn array_iterator_next(
 
 /// `%ArrayIteratorPrototype%[@@iterator]`: returns the receiver.
 pub fn array_iterator_symbol_iterator(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
@@ -167,7 +170,7 @@ pub fn array_iterator_symbol_iterator(
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).
 pub fn array_is_array(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();

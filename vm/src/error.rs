@@ -1,4 +1,4 @@
-/// Errors surfaced by VM operations (interpreter, natives, transitions).
+/// Errors surfaced by VM operations (interpreter, runtimes, transitions).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum VmError {
     Arity,

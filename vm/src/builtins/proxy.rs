@@ -2,17 +2,17 @@
 //! revoke-closure prelude.
 
 use super::object::plain_object;
-use crate::natives::NativeContext;
+use crate::Lookup;
+use crate::RuntimeContext;
 use crate::proxy::Proxy;
 use crate::runtime::Coercion;
-use crate::runtime::Runtime;
 use crate::{HandleSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
 /// observable (`typeof`, future `Call`/`Construct` dispatch).
 pub fn proxy_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     if !nctx.is_construct() {
@@ -56,9 +56,9 @@ pub fn proxy_constructor(
 /// `Proxy.revocable(target, handler)` (ES 20.2.2.1): returns
 /// `{ proxy, revoke }`; the revoke closure is the JS template installed
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
-/// hidden `__revokeProxy` native).
+/// hidden `__revokeProxy` runtime).
 pub fn proxy_revocable(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let (target, handler) = {
@@ -101,7 +101,7 @@ pub fn proxy_revocable(
                 .intern_str(heap, &scope, "__makeRevoke")
                 .erase();
             let proto = heap.known().function_prototype.erase();
-            match Runtime::get_property(vm, heap, state, proto, name)? {
+            match Lookup::get_property_on(vm, heap, state, proto, proto, name)? {
                 Coercion::Threw => {
                     // Safety: fresh root-slot word read for the return.
                     return Ok(unsafe { heap.known().exception.read_unchecked() });
@@ -113,7 +113,7 @@ pub fn proxy_revocable(
         let undefined = unsafe { nctx.heap().known().undefined.read_unchecked() };
         let proxy_word = unsafe { proxy.read_unchecked() };
         let (vm, heap, state) = nctx.split();
-        let revoke = NativeContext::new(vm, heap, state).call(
+        let revoke = RuntimeContext::new(vm, heap, state).call(
             // Safety: fresh rooted-slot word, consumed by the call.
             unsafe { Tagged::<Value>::from_value_unchecked(make_revoke.read_unchecked()) },
             scope.stage(&[
@@ -133,7 +133,10 @@ pub fn proxy_revocable(
 /// Hidden `__revokeProxy(p)`: nulls the proxy's target/handler slots
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
-pub fn proxy_revoke(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+pub fn proxy_revoke(
+    nctx: &mut RuntimeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let proxy = {
         let heap = &*nctx.heap();
         args.get(1)

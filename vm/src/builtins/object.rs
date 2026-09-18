@@ -1,12 +1,11 @@
 //! ES 20.1: the Object constructor, statics, and prototype methods.
 use crate::Key;
 use crate::Lookup;
+use crate::RuntimeContext;
 use crate::lookup::ordinary_own_descriptor;
-use crate::natives::NativeContext;
 use crate::proxy::Flow;
 use crate::proxy::Proxy;
 use crate::runtime::Coercion;
-use crate::runtime::Runtime;
 
 use crate::{
     Convert, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor, SlotName, Smi,
@@ -15,7 +14,7 @@ use crate::{
 
 /// Stub: `Object.prototype.toString` returns "[object Object]".
 pub fn object_to_string(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -30,7 +29,7 @@ pub fn object_to_string(
 /// implemented yet); `new Object()`: the interpreter prepends the fresh
 /// receiver, so [[Construct]] just returns it.
 pub fn object_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     if nctx.is_construct() {
@@ -65,7 +64,7 @@ pub fn object_constructor(
 /// arguments are a TypeError until ToObject boxing exists (ES5 behavior;
 /// ES2015+ boxes them).
 pub fn object_get_prototype_of(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
@@ -114,7 +113,7 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
 /// `Object.prototype.hasOwnProperty(key)` (ES 20.4.3.2, own properties
 /// only).
 pub fn object_has_own_property(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -133,7 +132,7 @@ pub fn object_has_own_property(
         // the key coercion allocates (float/wrapper keys intern or run
         // user code): the receiver must stay rooted across it
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = Object::to_property_key(vm, heap, state, raw_key)? else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
@@ -160,7 +159,7 @@ pub fn object_has_own_property(
 
 /// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
 pub fn object_property_is_enumerable(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -179,7 +178,7 @@ pub fn object_property_is_enumerable(
         // the key coercion allocates (float/wrapper keys intern or run
         // user code): the receiver must stay rooted across it
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(vm, heap, state, raw_key)? else {
+        let Some(key) = Object::to_property_key(vm, heap, state, raw_key)? else {
             // Safety: fresh root-slot word read for the immediate return.
             return Ok(unsafe { heap.known().exception.read_unchecked() });
         };
@@ -215,7 +214,7 @@ pub fn object_property_is_enumerable(
 
 /// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
 pub fn object_get_own_property_names(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before the
@@ -253,7 +252,7 @@ pub fn object_get_own_property_names(
 
 /// Build a plain `{ key: value, ... }` object from static field names.
 pub fn plain_object(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     fields: &[(&'static str, Handle<'_, Value>)],
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -283,7 +282,7 @@ pub fn plain_object(
 /// raw descriptor reader (`lookup::ordinary_own_descriptor`) converted
 /// to a descriptor object via FromPropertyDescriptor semantics.
 pub fn object_get_own_property_descriptor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -305,7 +304,7 @@ pub fn object_get_own_property_descriptor(
         // Safety: fresh argument word, rooted below before any allocation.
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -372,7 +371,7 @@ pub fn object_get_own_property_descriptor(
 /// ToPropertyDescriptor + [[DefineOwnProperty]] (through the
 /// `defineProperty` trap for proxy receivers, ES 20.2.5.6).
 pub fn object_define_property(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -400,7 +399,7 @@ pub fn object_define_property(
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let attrs = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_attrs) });
         let (vm, heap, state) = nctx.split();
-        let Some(key) = Runtime::to_property_key(
+        let Some(key) = Object::to_property_key(
             vm,
             heap,
             state,
@@ -415,7 +414,7 @@ pub fn object_define_property(
         let key = scope.handle(key);
         // shared ToPropertyDescriptor; proxies and ordinary targets both
         // complete/validate inside define_internal
-        let partial = match Runtime::to_property_descriptor(vm, heap, state, &scope, attrs)? {
+        let partial = match Lookup::to_property_descriptor(vm, heap, state, &scope, attrs)? {
             Some(partial) => partial,
             // Safety: fresh root-slot word read for the immediate return.
             None => return Ok(unsafe { heap.known().exception.read_unchecked() }),
@@ -441,7 +440,7 @@ pub fn object_define_property(
 }
 
 pub fn object_set_prototype_of(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let (target, proto) = {
@@ -492,7 +491,7 @@ pub fn object_set_prototype_of(
 /// `Object.preventExtensions(O)` (ES 20.1.2.16): through the
 /// `preventExtensions` trap for proxies (ES 20.2.5.3).
 pub fn object_prevent_extensions(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -549,7 +548,7 @@ pub fn object_prevent_extensions(
 /// `Object.isExtensible(O)` (ES 20.1.2.14): primitives are `false`;
 /// proxies run the `isExtensible` trap with its must-match invariant.
 pub fn object_is_extensible(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let target = {
@@ -647,7 +646,7 @@ pub fn set_integrity_flags(
 }
 
 /// `Object.seal(O)` (ES 20.1.2.17).
-pub fn object_seal(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+pub fn object_seal(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
     // re-reads under heap-borrow anchors.
     let target = {
@@ -716,7 +715,7 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Resul
 
 /// `Object.freeze(O)` (ES 20.1.2.9).
 pub fn object_freeze(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its

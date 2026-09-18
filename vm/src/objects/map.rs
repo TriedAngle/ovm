@@ -226,10 +226,10 @@ impl EdgeVisitable for Map {
 }
 
 /// Low byte: the `ObjectKind`. Higher bytes: capability flags
-/// (extendable, callable, constructor, native) and representation flags
+/// (extendable, callable, constructor, runtime) and representation flags
 /// (Latin1 string payloads). Constructor implies callable.
-/// NATIVE is only valid together with CALLABLE and means slots[0] of the
-/// object is a Smi native registry index instead of a `CallableInfoObject`.
+/// RUNTIME is only valid together with CALLABLE and means slots[0] of the
+/// object is a Smi runtime registry index instead of a `CallableInfoObject`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct MapKind(u64);
 
@@ -239,7 +239,7 @@ impl MapKind {
     pub const EXTENDABLE: MapKind = MapKind(1 << 8);
     pub const CALLABLE: MapKind = MapKind(1 << 9);
     pub const CONSTRUCTOR: MapKind = MapKind(1 << 10);
-    pub const NATIVE: MapKind = MapKind(1 << 11);
+    pub const RUNTIME: MapKind = MapKind(1 << 11);
     pub const PRIMITIVE_WRAPPER: MapKind = MapKind(1 << 12);
     pub const CLASS_CONSTRUCTOR: MapKind = MapKind(1 << 13);
     /// Dense-string payload encoding: set = one Latin-1 byte per code
@@ -319,8 +319,8 @@ impl MapKind {
         self.0 & Self::CALLABLE.0 != 0
     }
 
-    pub const fn is_native(self) -> bool {
-        self.0 & Self::NATIVE.0 != 0
+    pub const fn is_runtime(self) -> bool {
+        self.0 & Self::RUNTIME.0 != 0
     }
 
     pub const fn is_constructor(self) -> bool {
