@@ -6,50 +6,56 @@ use crate::Object;
 use crate::RuntimeContext;
 use crate::materialize::materialize_closure_vm;
 use crate::runtime::Coercion;
-use crate::{Context, Convert, DenseString, HandleSlice, Smi, Tagged, Value, VmError};
+use crate::{Context, Convert, DenseString, Errors, HandleSlice, Smi, Tagged, Value, VmError};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
-pub fn function_to_string(
-    nctx: &mut RuntimeContext<'_>,
+pub fn function_to_string<'a>(
+    nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
-        let s = nctx.intern(&scope, "function () { [native code] }");
-        // Safety: fresh rooted-slot word, returned without an
-        // intervening allocation.
-        Ok(unsafe { s.read_unchecked() })
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
+        // fresh interned word, consumed with no allocation delay
+        Ok(vm
+            .interner()
+            .intern_str(heap, &scope, "function () { [native code] }")
+            .as_tagged(heap)
+            .erase())
     })
 }
 
 /// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.4).
-pub fn function_call(
-    nctx: &mut RuntimeContext<'_>,
+pub fn function_call<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let f = {
-        let heap = &*nctx.heap();
-        let f = args
-            .get(0)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?;
-        if !Object::is_callable(heap, f) {
-            return Err(VmError::Type);
-        }
-        f.raw()
-    };
-    let call_args: Vec<Value> = {
-        let heap = &*nctx.heap();
-        args.iter()
-            .map(|h| h.as_tagged(heap))
-            .skip(1)
-            .map(|v| v.raw())
-            .collect()
-    };
-    nctx.handle_scope(|nctx, scope| {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let f = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
+    if !Object::is_callable(heap, f) {
+        return Err(VmError::Type);
+    }
+    let f = f.raw();
+    let call_args: Vec<Value> = args
+        .iter()
+        .map(|h| h.as_tagged(heap))
+        .skip(1)
+        .map(|v| v.raw())
+        .collect();
+    state.handle_scope(|scope| {
         // Safety: fresh argument word, still fresh (no allocation since).
-        let f = unsafe { Tagged::<Value>::from_value_unchecked(f) };
-        nctx.call(
+        let f = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(f) });
+        RuntimeContext::call(
+            vm,
+            heap,
+            state,
             f,
             scope.stage(
                 &call_args
@@ -57,6 +63,7 @@ pub fn function_call(
                     .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
                     .collect::<Vec<_>>(),
             ),
+            None,
         )
     })
 }
@@ -64,12 +71,14 @@ pub fn function_call(
 /// `Function.prototype.bind(thisArg, ...prepend)` (ES 20.2.3.5): the
 /// bound function is the JS closure template installed by BIND_PRELUDE,
 /// called with (target, thisArg, prepend-array).
-pub fn function_bind(
-    nctx: &mut RuntimeContext<'_>,
+pub fn function_bind<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let raw_f = {
-        let heap = &*nctx.heap();
         let f = args
             .get(0)
             .map(|h| h.as_tagged(heap))
@@ -80,24 +89,19 @@ pub fn function_bind(
         f.raw()
     };
     // Safety: fresh root-slot word read for the immediate use.
-    let undefined = {
-        let heap = &*nctx.heap();
-        heap.known().undefined.as_tagged(heap).raw()
-    };
-    let raw_this_arg = {
-        let heap = &*nctx.heap();
-        args.get(1).map(|h| h.as_tagged(heap)).map(|v| v.raw())
-    }
-    .unwrap_or(undefined);
-    let prepend: Vec<Value> = {
-        let heap = &*nctx.heap();
-        args.iter()
-            .map(|h| h.as_tagged(heap))
-            .skip(2)
-            .map(|v| v.raw())
-            .collect()
-    };
-    nctx.handle_scope(|nctx, scope| {
+    let undefined = heap.known().undefined.as_tagged(heap).raw();
+    let raw_this_arg = args
+        .get(1)
+        .map(|h| h.as_tagged(heap))
+        .map(|v| v.raw())
+        .unwrap_or(undefined);
+    let prepend: Vec<Value> = args
+        .iter()
+        .map(|h| h.as_tagged(heap))
+        .skip(2)
+        .map(|v| v.raw())
+        .collect();
+    state.handle_scope(|scope| {
         // everything below allocates (interning, the [[Get]] for
         // __makeBound, the prepend array, the call): keep the raw inputs
         // rooted and re-read at the point of use
@@ -106,13 +110,14 @@ pub fn function_bind(
         let this_arg = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_this_arg) });
         // Function.prototype.__makeBound (installed by BIND_PRELUDE)
         let make_bound = {
-            let name = nctx.intern(&scope, "__makeBound").erase();
-            let proto = nctx.heap().known().function_prototype.erase();
-            let (vm, heap, state) = nctx.split();
+            let name = vm
+                .interner()
+                .intern_str(heap, &scope, "__makeBound")
+                .erase();
+            let proto = heap.known().function_prototype.erase();
             match Lookup::get_property_on(vm, heap, state, proto, proto, name)? {
                 Coercion::Threw => {
-                    // Safety: fresh root-slot word read for the return.
-                    return Ok(unsafe { heap.known().exception.read_unchecked() });
+                    return Ok(heap.known().exception.as_tagged(heap).erase());
                 }
                 // Safety: fresh word from the lookup, rooted immediately.
                 Coercion::Value(v) => scope.handle(v),
@@ -124,73 +129,60 @@ pub fn function_bind(
                 .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
                 .collect::<Vec<_>>(),
         );
-        let (_, heap, _) = nctx.split();
         let array = scope.handle(heap.new_array(&scope, staged).erase());
         // args[0] is the receiver (undefined for the plain call)
         // Safety: fresh rooted-slot words staged for the call.
-        let nctx_heap = nctx.heap();
         let staged = scope.stage(&[
-            nctx_heap.known().undefined.as_tagged(nctx_heap).erase(),
-            f.as_tagged(nctx_heap).erase(),
-            this_arg.as_tagged(nctx_heap).erase(),
-            array.as_tagged(nctx_heap).erase(),
+            heap.known().undefined.as_tagged(heap).erase(),
+            f.as_tagged(heap).erase(),
+            this_arg.as_tagged(heap).erase(),
+            array.as_tagged(heap).erase(),
         ]);
-        nctx.call_rooted(make_bound, staged)
+        RuntimeContext::call(vm, heap, state, make_bound, staged, None)
     })
 }
 
 /// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.3).
-pub fn function_apply(
-    nctx: &mut RuntimeContext<'_>,
+pub fn function_apply<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let f = {
-        let heap = &*nctx.heap();
-        let f = args
-            .get(0)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?;
-        if !Object::is_callable(heap, f) {
-            return Err(VmError::Type);
-        }
-        f.raw()
-    };
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let f = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
+    if !Object::is_callable(heap, f) {
+        return Err(VmError::Type);
+    }
+    let f = f.raw();
     // Safety: fresh root-slot word read for the immediate use.
-    let undefined = {
-        let heap = &*nctx.heap();
-        heap.known().undefined.as_tagged(heap).raw()
-    };
-    let this_arg = {
-        let heap = &*nctx.heap();
-        args.get(1).map(|h| h.as_tagged(heap)).map(|v| v.raw())
-    }
-    .unwrap_or(undefined);
-    let array = {
-        let heap = &*nctx.heap();
-        args.get(2).map(|h| h.as_tagged(heap)).map(|v| v.raw())
-    }
-    .unwrap_or(undefined);
+    let undefined = heap.known().undefined.as_tagged(heap).raw();
+    let this_arg = args
+        .get(1)
+        .map(|h| h.as_tagged(heap))
+        .map(|v| v.raw())
+        .unwrap_or(undefined);
+    let array = args
+        .get(2)
+        .map(|h| h.as_tagged(heap))
+        .map(|v| v.raw())
+        .unwrap_or(undefined);
     let call_args: Vec<Value> = {
-        let nullish = {
-            let heap = &*nctx.heap();
-            array == heap.known().undefined.as_tagged(heap).raw()
-                || array == heap.known().null.as_tagged(heap).raw()
-        };
+        let nullish = array == heap.known().undefined.as_tagged(heap).raw()
+            || array == heap.known().null.as_tagged(heap).raw();
         if nullish {
             vec![this_arg]
         } else {
             // array-like: read elements 0..length (holes read as undefined)
             let len = {
-                let heap = &*nctx.heap();
                 unsafe { array.assume_valid(heap) }
                     .as_heap_object()
                     .map(|o| {
                         o.as_ref()
-                            .array_length(
-                                heap,
-                                // Safety: fresh root-slot word for a name read.
-                                heap.known().strings.length.as_tagged(heap),
-                            )
+                            .array_length(heap, heap.known().strings.length.as_tagged(heap))
                             .and_then(|v| Smi::decode(v.raw()).map(|s| s.value() as usize))
                             .unwrap_or(0)
                     })
@@ -199,22 +191,24 @@ pub fn function_apply(
             let mut out = Vec::with_capacity(len + 1);
             out.push(this_arg);
             for i in 0..len {
-                out.push({
-                    let heap = &*nctx.heap();
+                out.push(
                     unsafe { array.assume_valid(heap) }
                         .as_heap_object()
                         .and_then(|o| o.as_ref().element_value(heap, i))
                         .map(|v| v.raw())
-                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).raw())
-                });
+                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).raw()),
+                );
             }
             out
         }
     };
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument word (no allocation since the reads).
-        let f = unsafe { Tagged::<Value>::from_value_unchecked(f) };
-        nctx.call(
+        let f = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(f) });
+        RuntimeContext::call(
+            vm,
+            heap,
+            state,
             f,
             scope.stage(
                 &call_args
@@ -222,6 +216,7 @@ pub fn function_apply(
                     .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
                     .collect::<Vec<_>>(),
             ),
+            None,
         )
     })
 }
@@ -245,19 +240,18 @@ Function.prototype.__makeBound = function (f, t, p) {
 /// Builds `function (p0, p1, ...) { body }` and evaluates it in the global
 /// scope (approximated with the caller's context; the direct-eval pipeline
 /// provides the parsing).
-pub fn function_constructor(
-    nctx: &mut RuntimeContext<'_>,
+pub fn function_constructor<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let argv: Vec<Value> = {
-        let heap = &*nctx.heap();
-        (1..args.len())
-            .filter_map(|i| args.get(i).map(|h| h.as_tagged(heap)).map(|v| v.raw()))
-            .collect()
-    };
-    nctx.handle_scope(|nctx, scope| {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let argv: Vec<Value> = (1..args.len())
+        .filter_map(|i| args.get(i).map(|h| h.as_tagged(heap)).map(|v| v.raw()))
+        .collect();
+    state.handle_scope(|scope| {
         // root the caller context before the allocating ToString loop below
-        let (_, heap, state) = nctx.split();
         let context = scope.handle(
             state
                 .current_context(heap)
@@ -267,13 +261,11 @@ pub fn function_constructor(
         let mut parts: Vec<String> = Vec::with_capacity(argv.len());
         for a in argv {
             let s = {
-                let (_, heap, _) = nctx.split();
                 // Safety: fresh argument word, consumed before any allocation.
                 let a = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(a) });
                 Convert::to_string(heap, &scope, a)?.raw()
             };
             parts.push({
-                let heap = &*nctx.heap();
                 // Safety: fresh word, no allocation since the read.
                 unsafe { s.assume_valid(heap) }
                     .get_as::<DenseString>()
@@ -288,28 +280,23 @@ pub fn function_constructor(
         let source = format!("(function ({params}) {{\n{body}\n}})");
         let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&source));
         if p.parse_script().is_err() {
-            nctx.set_pending_exception(VmError::Type);
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+            let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
+            state.set_pending_exception(ex);
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         }
         let ast = p.into_ast();
         let compiled = match base_compiler::compile_eval(&ast) {
             Ok(c) => c,
             Err(_) => {
-                nctx.set_pending_exception(VmError::Type);
-                // Safety: fresh root-slot word read for the immediate return.
-                return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+                let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
+                state.set_pending_exception(ex);
+                return Ok(heap.known().exception.as_tagged(heap).erase());
             }
         };
-        let (vm, heap, state) = nctx.split();
         let context = scope
             .cast::<Context>(context.as_tagged(heap))
             .ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
-        nctx.call(
-            // Safety: fresh rooted-slot word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
-            HandleSlice::EMPTY,
-        )
+        RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
     })
 }

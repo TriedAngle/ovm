@@ -504,7 +504,7 @@ impl Heap {
     /// A number value: a Smi when the double is an in-range integer, a
     /// freshly boxed Float otherwise. `-0.0` always boxes (it must not
     /// collapse into `+0`).
-    pub fn new_number<'a>(&'a mut self, scope: &HandleScope<'_>, f: f64) -> Tagged<'a, Value> {
+    pub fn new_number<'a>(&'a mut self, f: f64) -> Tagged<'a, Value> {
         let r = f as i64; // saturating cast; the round-trip check rejects out-of-range values
         if f.is_finite()
             && f.fract() == 0.0
@@ -514,9 +514,7 @@ impl Heap {
         {
             return Smi::new(r).into_tagged();
         }
-        self.allocate_handle::<Float>(f, scope)
-            .as_tagged(&*self)
-            .erase()
+        self.allocate::<Float>(f).erase()
     }
 
     /// CreateArrayFromList (ES 7.3.17): a fresh dense array holding

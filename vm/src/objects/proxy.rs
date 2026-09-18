@@ -176,15 +176,14 @@ fn call_trap<'a>(
     }
     let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
     let staged = scope.stage(&words);
-    let result = RuntimeContext::new(vm, heap, state).call_rooted(*trap, staged)?;
+    let result = scope.handle(RuntimeContext::call(
+        vm, &mut *heap, state, *trap, staged, None,
+    )?);
     let exception = heap.known().exception.as_tagged(heap);
-    if result == exception {
+    if result.as_tagged(heap) == exception {
         Ok(Coercion::Threw)
     } else {
-        // Safety: the call just returned; no GC since.
-        Ok(Coercion::Value(unsafe {
-            Tagged::from_value_unchecked(result)
-        }))
+        Ok(Coercion::Value(result.as_tagged(heap)))
     }
 }
 
@@ -492,9 +491,11 @@ fn ordinary_set_forward<'a>(
                 value.as_tagged(heap).erase(),
             ];
             let staged = scope.stage(&words);
-            let result = RuntimeContext::new(vm, heap, state).call_rooted(setter, staged)?;
+            let result = scope.handle(RuntimeContext::call(
+                vm, &mut *heap, state, setter, staged, None,
+            )?);
             let exception = heap.known().exception.as_tagged(heap);
-            if result == exception {
+            if result.as_tagged(heap) == exception {
                 Ok(Coercion::Threw)
             } else {
                 Ok(Coercion::Value(Convert::boolean(heap, true)))
@@ -528,7 +529,14 @@ fn get_h<'a>(
             // forward: lookup on the target, getter `this` = the
             // original receiver (a proxy target re-enters its own
             // `get` trap with the same receiver)
-            Lookup::get_property_on(vm, heap, state, target, *receiver, *name)
+            let forwarded = Lookup::get_property_on(vm, heap, state, target, *receiver, *name)?;
+            match forwarded {
+                Coercion::Threw => Ok(Coercion::Threw),
+                Coercion::Value(v) => {
+                    let v = scope.handle(v);
+                    Ok(Coercion::Value(v.as_tagged(heap)))
+                }
+            }
         }
         TrapLookup::Trap(t) => {
             let result = call_trap(
@@ -882,15 +890,14 @@ fn apply_h<'a>(
                 all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
-            let result = RuntimeContext::new(vm, heap, state).call_rooted(target, staged)?;
+            let result = scope.handle(RuntimeContext::call(
+                vm, &mut *heap, state, target, staged, None,
+            )?);
             let exception = heap.known().exception.as_tagged(heap);
-            if result == exception {
+            if result.as_tagged(heap) == exception {
                 Ok(Coercion::Threw)
             } else {
-                // Safety: the call just returned; no GC since.
-                Ok(Coercion::Value(unsafe {
-                    Tagged::from_value_unchecked(result)
-                }))
+                Ok(Coercion::Value(result.as_tagged(heap)))
             }
         }
         TrapLookup::Trap(t) => {
@@ -960,13 +967,13 @@ fn construct_h<'a>(
                 all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
-            let result = scope.handle(RuntimeContext::call_construct_rooted(
+            let result = scope.handle(RuntimeContext::call(
                 vm,
                 heap,
                 state,
                 target,
-                *new_target,
                 staged,
+                Some(*new_target),
             )?);
             let exception = heap.known().exception.as_tagged(heap);
             if result.as_tagged(heap) == exception {

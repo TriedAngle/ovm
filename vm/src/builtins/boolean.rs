@@ -4,63 +4,58 @@ use super::helpers::wrapper_value;
 use crate::RuntimeContext;
 use crate::{Convert, HandleSlice, Tagged, Value, VmError};
 
-pub fn boolean_constructor(
-    nctx: &mut RuntimeContext<'_>,
+pub fn boolean_constructor<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let value = {
-        let heap = &*nctx.heap();
+) -> Result<Tagged<'a, Value>, VmError> {
+    let is_construct = nctx.is_construct();
+    let RuntimeContext { heap, state, .. } = nctx;
+    if !is_construct {
         let arg = args
             .get(1)
             .map(|h| h.as_tagged(heap))
             .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
-        Convert::boolean(heap, Convert::is_truthy(heap, arg)).raw()
-    };
-    if !nctx.is_construct() {
-        return Ok(value);
+        return Ok(Convert::boolean(heap, Convert::is_truthy(heap, arg)));
     }
-    nctx.handle_scope(|nctx, scope| {
-        let (_, heap, _) = nctx.split();
+    state.handle_scope(|scope| {
+        let arg = args
+            .get(1)
+            .map(|h| h.as_tagged(heap))
+            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+        let value = scope.handle(Convert::boolean(heap, Convert::is_truthy(heap, arg)));
         let map = heap.known().boolean_wrapper_map;
         Ok(heap
-            .new_object(
-                &scope,
-                map,
-                scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(value) }]),
-            )
-            .erase()
-            .raw())
+            .new_object(&scope, map, scope.stage(&[value.as_tagged(heap).erase()]))
+            .erase())
     })
 }
 
-pub fn boolean_value_of(
-    nctx: &mut RuntimeContext<'_>,
+pub fn boolean_value_of<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let heap = &*nctx.heap();
-    let receiver = args
-        .get(0)
-        .map(|h| h.as_tagged(heap))
-        .ok_or(VmError::Arity)?;
-    wrapper_value(heap, receiver)
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
+    wrapper_value(
+        heap,
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?,
+    )
 }
 
-pub fn boolean_to_string(
-    nctx: &mut RuntimeContext<'_>,
+pub fn boolean_to_string<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let v = {
-        let heap = &*nctx.heap();
-        let receiver = args
-            .get(0)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?;
-        wrapper_value(heap, receiver)
-    }?;
-    nctx.handle_scope(|nctx, scope| {
-        let (_vm, heap, _) = nctx.split();
-        // Safety: fresh word read above, consumed before any allocation.
-        let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
-        Convert::to_string(heap, &scope, v).map(|s| s.raw())
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
+    state.handle_scope(|scope| {
+        let v = wrapper_value(
+            heap,
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?,
+        )?;
+        let v = scope.handle(v);
+        Convert::to_string(heap, &scope, v)
     })
 }

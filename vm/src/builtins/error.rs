@@ -9,34 +9,36 @@ use crate::{
     Value, VmError,
 };
 
-pub fn error_constructor(
-    nctx: &mut RuntimeContext<'_>,
+pub fn error_constructor<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     make_error(nctx, args, "Error")
 }
 
-pub fn type_error_constructor(
-    nctx: &mut RuntimeContext<'_>,
+pub fn type_error_constructor<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     make_error(nctx, args, "TypeError")
 }
 
-pub fn reference_error_constructor(
-    nctx: &mut RuntimeContext<'_>,
+pub fn reference_error_constructor<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     make_error(nctx, args, "ReferenceError")
 }
 
-pub fn make_error(
-    nctx: &mut RuntimeContext<'_>,
+pub fn make_error<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
     class: &str,
-) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, _) = nctx.split();
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         // root the message right away: the allocations below (new_object,
         // interning) would leave a raw copy stale
         let message_word = args.get(1).map(|h| h.as_tagged(heap)).map(|v| v.raw());
@@ -79,35 +81,32 @@ pub fn make_error(
             message_key,
             PropertyDescriptor::data(message.erase()),
         )?;
-        // Safety: fresh rooted-slot word, returned without an
-        // intervening allocation.
-        Ok(unsafe { obj.read_unchecked() })
+        Ok(obj.as_tagged(heap).erase())
     })
 }
 
-pub fn error_to_string(
-    nctx: &mut RuntimeContext<'_>,
+pub fn error_to_string<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         // both [[Get]]s below run user code (getters): the receiver must
         // stay rooted across them
         // Safety: fresh argument word, rooted below before any allocation.
-        let receiver_word = {
-            let heap = &*nctx.heap();
-            args.get(0)
-                .map(|h| h.as_tagged(heap))
-                .ok_or(VmError::Arity)?
-                .raw()
-        };
+        let receiver_word = args
+            .get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw();
         let receiver =
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(receiver_word) });
-        let (vm, heap, state) = nctx.split();
         let recv = receiver.as_tagged(heap).raw();
         let name = get_property(vm, heap, state, recv, "name")?;
         let recv = receiver.as_tagged(heap).raw();
         let message = get_property(vm, heap, state, recv, "message")?;
-        let (vm, heap, _) = nctx.split();
         // each to_string/intern allocates: root both halves before the
         // concats read them
         // Safety: fresh words from the lookups above, consumed before any
@@ -120,9 +119,7 @@ pub fn error_to_string(
         let ab = DenseString::concat(heap, &scope, a, colon.erase());
         let ab = scope.handle(ab.as_tagged(heap).erase());
         let out = DenseString::concat(heap, &scope, ab, b);
-        // Safety: fresh rooted-slot word, returned without an
-        // intervening allocation.
-        Ok(unsafe { out.read_unchecked() })
+        Ok(out.as_tagged(heap).erase())
     })
 }
 

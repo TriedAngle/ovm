@@ -74,55 +74,56 @@ pub fn runtime_fn(id: bytecode::RuntimeFn) -> RuntimeCall {
 
 /// RequireObjectCoercible (ES 7.2.2): (value) -> value, TypeError on
 /// null/undefined (object destructuring sources).
-fn require_object_coercible(
-    nctx: &mut RuntimeContext<'_>,
+fn require_object_coercible<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     // internal-runtime convention: the register list IS the argument list
     // (no receiver slot)
-    {
-        let heap = &*nctx.heap();
-        let arg = args
-            .get(0)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?;
-        let null = heap.known().null.as_tagged(heap);
-        let undefined = heap.known().undefined.as_tagged(heap);
-        if arg.ptr_eq(null) || arg.ptr_eq(undefined) {
-            return Err(VmError::Type);
-        }
-        Ok(arg.raw())
+    let RuntimeContext { heap, .. } = nctx;
+    let arg = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
+    let null = heap.known().null.as_tagged(heap);
+    let undefined = heap.known().undefined.as_tagged(heap);
+    if arg.ptr_eq(null) || arg.ptr_eq(undefined) {
+        return Err(VmError::Type);
     }
+    Ok(arg)
 }
 
 // ---- delete (ES 13.5.1) ----------------------------------------------------
 
 /// `delete obj.key` in sloppy code: (obj, key) -> bool.
-fn delete_property_sloppy(
-    nctx: &mut RuntimeContext<'_>,
+fn delete_property_sloppy<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     delete_property(nctx, args, false)
 }
 
 /// `delete obj.key` in strict code: (obj, key) -> bool, TypeError when
 /// the delete fails (ES 13.5.1.2 step 4.h).
-fn delete_property_strict(
-    nctx: &mut RuntimeContext<'_>,
+fn delete_property_strict<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     delete_property(nctx, args, true)
 }
 
-fn delete_property(
-    nctx: &mut RuntimeContext<'_>,
+fn delete_property<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
     strict: bool,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_target, raw_key) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         (
             args.get(0)
                 .map(|h| h.as_tagged(heap))
@@ -138,11 +139,10 @@ fn delete_property(
     // 13.15.5 EvaluatePropertyAccess: user toString/valueOf of a
     // computed key runs even when the delete afterwards throws);
     // the coercion allocates, so the base must stay rooted across it
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
-        let target = target.as_tagged(&*nctx.heap()).raw();
-        let (vm, heap, state) = nctx.split();
+        let target = target.as_tagged(&*heap).raw();
         let Some(key) = Object::to_property_key(
             vm,
             heap,
@@ -151,8 +151,7 @@ fn delete_property(
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
@@ -160,11 +159,10 @@ fn delete_property(
         // returned boolean flows through the strict handling below
         let ok = {
             let cond_23 = {
-                let heap = &*nctx.heap();
+                let heap = &*heap;
                 Proxy::is_proxy(heap, unsafe { target.assume_valid(heap) })
             };
             if cond_23 {
-                let (vm, heap, state) = nctx.split();
                 // Safety: fresh rooted-slot word (re-read above) plus a fresh
                 // coercion result, both consumed by the trap call.
                 let key_word = unsafe { key.read_unchecked() };
@@ -175,9 +173,8 @@ fn delete_property(
                     unsafe { Tagged::<Value>::from_value_unchecked(target) },
                     unsafe { Tagged::<Value>::from_value_unchecked(key_word) },
                 )? {
-                    // Safety: fresh root-slot word read for the immediate return.
                     Coercion::Threw => {
-                        return Ok(unsafe { heap.known().exception.read_unchecked() });
+                        return Ok(heap.known().exception.as_tagged(heap).erase());
                     }
                     Coercion::Value(v) => {
                         let v = scope.handle(v);
@@ -186,27 +183,25 @@ fn delete_property(
                 }
             } else {
                 // Safety: fresh rooted name word, consumed by the delete.
-                delete_property_core(nctx, target, unsafe { key.read_unchecked() })?
+                delete_property_core(heap, &scope, target, unsafe { key.read_unchecked() })?
             }
         };
         if strict && !ok {
             return Err(VmError::Type);
         }
-        Ok({
-            let heap = &*nctx.heap();
-            Convert::boolean(heap, ok).raw()
-        })
+        Ok(Convert::boolean(heap, ok))
     })
 }
 
 fn delete_property_core(
-    nctx: &mut RuntimeContext<'_>,
+    heap: &mut Heap,
+    scope: &HandleScope<'_>,
     target: Value,
     key: Value,
 ) -> Result<bool, VmError> {
     // ToObject (ES 7.2.3): a null/undefined base throws
     let nullish = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let null = heap.known().null.as_tagged(heap).raw();
         let undefined = heap.known().undefined.as_tagged(heap).raw();
         target == null || target == undefined
@@ -218,12 +213,12 @@ fn delete_property_core(
     // properties are a string's non-configurable length/indices
     {
         let cond_24 = {
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             Convert::is_primitive(heap, unsafe { target.assume_valid(heap) })
         };
         if cond_24 {
             let owned = {
-                let heap = &*nctx.heap();
+                let heap = &*heap;
                 string_exotic_own(
                     heap,
                     // Safety: caller-supplied words, fresh at entry.
@@ -234,17 +229,15 @@ fn delete_property_core(
             return Ok(!owned);
         }
     }
-    nctx.handle_scope(|nctx, scope| {
-        let receiver = scope
-            .cast::<Object>(
-                // Safety: caller-supplied word, fresh at entry.
-                unsafe { target.assume_valid(&*nctx.heap()) },
-            )
-            .expect("non-primitive receivers are objects");
-        // Safety: caller-supplied word, rooted before the delete.
-        let key = scope.handle(unsafe { key.assume_valid(&*nctx.heap()) });
-        Object::delete_own_property(nctx.heap(), &scope, receiver, key)
-    })
+    let receiver = scope
+        .cast::<Object>(
+            // Safety: caller-supplied word, fresh at entry.
+            unsafe { target.assume_valid(&*heap) },
+        )
+        .expect("non-primitive receivers are objects");
+    // Safety: caller-supplied word, rooted before the delete.
+    let key = scope.handle(unsafe { key.assume_valid(&*heap) });
+    Object::delete_own_property(heap, scope, receiver, key)
 }
 
 /// Whether a ToObject'd primitive owns `key` non-configurably: only
@@ -270,35 +263,33 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
 /// GlobalEnvironmentRecord.DeleteBinding): (name) -> bool. Declared
 /// bindings resolve statically and compile to `false`; only global-object
 /// properties reach here, and sloppy references never throw on failure.
-fn delete_identifier_sloppy(
-    nctx: &mut RuntimeContext<'_>,
+fn delete_identifier_sloppy<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
     // Safety: fresh argument word, consumed below.
     let name = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(0)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?
             .raw()
     };
     // Safety: fresh root-slot word, consumed by the delete.
-    let global = unsafe { nctx.heap().known().global_object.read_unchecked() };
-    let ok = delete_property_core(nctx, global, name)?;
-    Ok({
-        let heap = &*nctx.heap();
-        Convert::boolean(heap, ok).raw()
-    })
+    let global = unsafe { heap.known().global_object.read_unchecked() };
+    let ok = state.handle_scope(|scope| delete_property_core(heap, &scope, global, name))?;
+    Ok(Convert::boolean(heap, ok))
 }
 
 /// `delete super.x` (ES 13.5.1.2 step 4.c): ReferenceError in both
 /// language modes. The reference has already been evaluated (including
 /// the uninitialized-`this` check and the key expression); the key is
 /// never coerced — delete-super fails before any ToPropertyKey.
-fn delete_super_property(
-    _nctx: &mut RuntimeContext<'_>,
+fn delete_super_property<'a>(
+    _nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     Err(VmError::Reference)
 }
 
@@ -322,45 +313,45 @@ const FOR_IN_VISITED: usize = 3;
 /// zero iterations; objects and strings snapshot level 0 of the lazy
 /// chain walk. Other primitives' prototypes are not walked yet (their
 /// own properties are none, so they enumerate empty).
-fn for_in_enumerate(
-    nctx: &mut RuntimeContext<'_>,
+fn for_in_enumerate<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument word; nothing below allocates before it is
     // rooted.
     let subject = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(0)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?
             .raw()
     };
     let nullish = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let null = heap.known().null.as_tagged(heap).raw();
         let undefined = heap.known().undefined.as_tagged(heap).raw();
         subject == null || subject == undefined
     };
     if nullish {
-        // Safety: fresh root-slot word read for the immediate return.
-        return Ok(unsafe { nctx.heap().known().undefined.read_unchecked() });
+        return Ok(heap.known().undefined.as_tagged(heap).erase());
     }
     let level = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         for_in_initial_level(heap, unsafe { subject.assume_valid(heap) })
     };
     let Some(level) = level else {
-        // Safety: fresh root-slot word read for the immediate return.
-        return Ok(unsafe { nctx.heap().known().undefined.read_unchecked() });
+        return Ok(heap.known().undefined.as_tagged(heap).erase());
     };
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // the level must survive the key collection and FixedArray
         // allocation below (both allocate)
         // Safety: fresh word from the non-allocating level walk, rooted
         // below before any allocation.
         let level = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(level) });
-        let (vm, heap, _) = nctx.split();
-        let level_word = level.as_tagged(heap).raw();
+        let level_word = level.as_tagged(&*heap).raw();
         let keys = for_in_level_keys(vm, heap, &scope, level_word)?;
 
         let keys = heap.allocate_handle::<FixedArray>(
@@ -375,9 +366,9 @@ fn for_in_enumerate(
         let empty = heap.known().empty_fixed_array;
         let map = heap.known().for_in_enumerator_map;
         // Safety: fresh rooted-slot words staged into the fresh object.
-        let level_word = level.as_tagged(heap).raw();
-        let keys_word = keys.as_tagged(heap).raw();
-        let empty_word = empty.as_tagged(heap).raw();
+        let level_word = level.as_tagged(&*heap).raw();
+        let keys_word = keys.as_tagged(&*heap).raw();
+        let empty_word = empty.as_tagged(&*heap).raw();
         let enumerator = heap.new_object(
             &scope,
             map,
@@ -388,7 +379,7 @@ fn for_in_enumerate(
                 unsafe { Tagged::<Value>::from_value_unchecked(empty_word) },
             ]),
         );
-        Ok(enumerator.erase().raw())
+        Ok(enumerator.erase())
     })
 }
 
@@ -551,32 +542,36 @@ fn for_in_level_keys(
 /// an earlier level (yielded or non-enumerable) are skipped; enumerable
 /// survivors are yielded at most once. When a level's snapshot runs
 /// dry, the walk advances to the live prototype and snapshots it.
-fn for_in_next(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn for_in_next<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument word; nothing below allocates before it is
     // rooted.
     let enumerator_word = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(0)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?
             .raw()
     };
     if enumerator_word == {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         heap.known().undefined.as_tagged(heap).raw()
     } {
         // nullish subject: the head produced no enumerator
-        // Safety: fresh root-slot word read for the immediate return.
-        return Ok(unsafe { nctx.heap().known().undefined.read_unchecked() });
+        return Ok(heap.known().undefined.as_tagged(heap).erase());
     }
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // the enumerator must survive the allocations below (key
         // interning, visited-array growth): read it through the handle
         // at every use, never a raw snapshot
         // Safety: fresh argument word, rooted below before any allocation.
         let enumerator =
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(enumerator_word) });
-        let (vm, heap, _) = nctx.split();
         loop {
             // one candidate per turn: the cursor advances before the
             // key is examined, so skipped keys are never revisited
@@ -615,8 +610,7 @@ fn for_in_next(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<V
                         .raw()
                 };
                 let Some(proto) = for_in_next_level(vm, heap, level)? else {
-                    // Safety: fresh root-slot word read for the return.
-                    return Ok(unsafe { heap.known().undefined.read_unchecked() });
+                    return Ok(heap.known().undefined.as_tagged(heap).erase());
                 };
                 // for_in_level_keys allocates (interning): keep the new
                 // level rooted across it
@@ -736,9 +730,7 @@ fn for_in_next(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<V
             if !enumerable {
                 continue;
             }
-            // Safety: fresh rooted-slot word, returned without an
-            // intervening allocation.
-            return Ok(unsafe { key.read_unchecked() });
+            return Ok(key.as_tagged(heap));
         }
     })
 }
@@ -845,27 +837,31 @@ fn for_in_own_state(heap: &Heap, level: Value, key: Value) -> Option<bool> {
 }
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
-fn get_iterator(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
+fn get_iterator<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let obj = scope.handle({
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             args.get(0)
                 .map(|h| h.as_tagged(heap))
                 .ok_or(VmError::Arity)?
         });
-        let (vm, heap, state) = nctx.split();
         let symbol = scope.handle(heap.known().iterator_symbol.as_tagged(heap).erase());
         let method = Lookup::get_property_on(vm, heap, state, obj, obj, symbol)?;
         let method = match method {
-            // Safety: fresh root-slot word read for the immediate return.
             Coercion::Threw => {
-                return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+                return Ok(heap.known().exception.as_tagged(heap).erase());
             }
             Coercion::Value(v) => scope.handle(v),
         };
         let (undefined_or_null, callable) = {
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             let method = method.as_tagged(heap);
             (
                 method.raw() == heap.known().undefined.as_tagged(heap).raw()
@@ -876,96 +872,121 @@ fn get_iterator(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<
         if undefined_or_null || !callable {
             return Err(VmError::Type); // "obj is not iterable"
         }
-        let obj_word = obj.as_tagged(&*nctx.heap()).raw();
-        nctx.call_rooted(
+        let obj_word = obj.as_tagged(&*heap).raw();
+        RuntimeContext::call(
+            vm,
+            heap,
+            state,
             method,
             scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(obj_word) }]),
+            None,
         )
     })
 }
 
 /// IteratorNext (ES 8.5.6): (iterator) -> result object.
-fn iterator_next(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
+fn iterator_next<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let iter = scope.handle({
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             args.get(0)
                 .map(|h| h.as_tagged(heap))
                 .ok_or(VmError::Arity)?
         });
-        let (vm, heap, state) = nctx.split();
         let next_name = scope.handle(heap.known().strings.next.as_tagged(heap).erase());
         let next = Lookup::get_property_on(vm, heap, state, iter, iter, next_name)?;
         let next = match next {
-            // Safety: fresh root-slot word read for the immediate return.
             Coercion::Threw => {
-                return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+                return Ok(heap.known().exception.as_tagged(heap).erase());
             }
             Coercion::Value(v) => scope.handle(v),
         };
-        let iter_word = iter.as_tagged(&*nctx.heap()).raw();
-        let result = nctx.call_rooted(
+        let iter_word = iter.as_tagged(&*heap).raw();
+        let result = scope.handle(RuntimeContext::call(
+            vm,
+            &mut *heap,
+            state,
             next,
             scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(iter_word) }]),
-        )?;
+            None,
+        )?);
         let cond_25 = {
-            let heap = &*nctx.heap();
-            result == heap.known().exception.as_tagged(heap).raw()
+            let heap = &*heap;
+            result.as_tagged(heap).raw() == heap.known().exception.as_tagged(heap).raw()
         };
         if cond_25 {
-            return Ok(result);
+            return Ok(result.as_tagged(heap));
         }
         {
-            let cond_26 = {
-                let heap = &*nctx.heap();
-                Convert::is_primitive(heap, unsafe { result.assume_valid(heap) })
-            };
+            let heap = &*heap;
+            let cond_26 = Convert::is_primitive(heap, result.as_tagged(heap));
             if cond_26 {
                 return Err(VmError::Type); // IteratorNext result must be an Object
             }
         }
-        Ok(result)
+        Ok(result.as_tagged(heap))
     })
 }
 
 /// IteratorComplete (ES 8.5.7): (result) -> bool.
-fn iterator_done(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, state) = nctx.split();
+fn iterator_done<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         let result = args.get(0).ok_or(VmError::Arity)?;
         let done_name = scope.handle(heap.known().strings.done.as_tagged(heap).erase());
-        match Lookup::get_property_on(vm, heap, state, result, result, done_name)? {
-            Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
-            Coercion::Value(v) => {
-                let v = scope.handle(v);
-                let truthy = Convert::is_truthy(heap, v.as_tagged(heap));
-                Ok(Convert::boolean(heap, truthy).raw())
-            }
-        }
+        let v = match Lookup::get_property_on(vm, heap, state, result, result, done_name)? {
+            Coercion::Threw => return Ok(heap.known().exception.as_tagged(heap).erase()),
+            Coercion::Value(v) => scope.handle(v),
+        };
+        let truthy = Convert::is_truthy(heap, v.as_tagged(heap));
+        Ok(Convert::boolean(heap, truthy))
     })
 }
 
 /// IteratorValue (ES 8.5.8): (result) -> value.
-fn iterator_value(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, state) = nctx.split();
+fn iterator_value<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         let result = args.get(0).ok_or(VmError::Arity)?;
         let value_name = scope.handle(heap.known().strings.value.as_tagged(heap).erase());
-        match Lookup::get_property_on(vm, heap, state, result, result, value_name)? {
-            Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
-            Coercion::Value(v) => Ok(v.raw()),
-        }
+        let v = match Lookup::get_property_on(vm, heap, state, result, result, value_name)? {
+            Coercion::Threw => return Ok(heap.known().exception.as_tagged(heap).erase()),
+            Coercion::Value(v) => scope.handle(v),
+        };
+        Ok(v.as_tagged(heap))
     })
 }
 
 /// The `in` operator (ES 14.11.2): (key, obj) -> bool. Proxy receivers
 /// run their `has` trap (ES 20.2.5.9).
-fn has_property(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn has_property<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_key, raw_obj) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         (
             args.get(0)
                 .map(|h| h.as_tagged(heap))
@@ -980,10 +1001,9 @@ fn has_property(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<
     // the key coercion allocates (wrapper keys run toString/valueOf):
     // root the receiver and re-read it after the coercion — a raw
     // snapshot taken before would go stale
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let obj = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_obj) });
-        let (vm, heap, state) = nctx.split();
         let Some(key) = Object::to_property_key(
             vm,
             heap,
@@ -992,8 +1012,7 @@ fn has_property(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
@@ -1003,17 +1022,17 @@ fn has_property(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<
             // Safety: fresh rooted-slot word plus a fresh coercion
             // result, both consumed by the trap call.
             let key_word = unsafe { key.read_unchecked() };
-            return match Proxy::has(
+            let has = match Proxy::has(
                 vm,
                 heap,
                 state,
                 unsafe { Tagged::<Value>::from_value_unchecked(obj) },
                 unsafe { Tagged::<Value>::from_value_unchecked(key_word) },
             )? {
-                // Safety: fresh root-slot word read for the immediate return.
-                Coercion::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
-                Coercion::Value(v) => Ok(v.raw()),
+                Coercion::Threw => return Ok(heap.known().exception.as_tagged(heap).erase()),
+                Coercion::Value(v) => scope.handle(v),
             };
+            return Ok(has.as_tagged(heap));
         }
         // lookup::has_property covers array `length` slots along the chain
         let has = lookup_has_property(
@@ -1022,26 +1041,26 @@ fn has_property(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<
             unsafe { obj.assume_valid(heap) },
             key.as_tagged(heap),
         );
-        Ok({
-            let heap = &*nctx.heap();
-            Convert::boolean(heap, has).raw()
-        })
+        Ok(Convert::boolean(heap, has))
     })
 }
 
 /// CopyDataProperties (ES 8.5.1) with an exclusion list (object rest):
 /// (excluded..., target, source); `excluded` has count−2 entries.
-fn copy_data_properties(
-    nctx: &mut RuntimeContext<'_>,
+fn copy_data_properties<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let n = args.len();
     if n < 2 {
         return Err(VmError::Arity);
     }
     // Safety: fresh argument words, consumed below.
     let (target, source, excluded) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         (
             args.get(n - 2).map(|h| h.as_tagged(heap)).map(|v| v.raw()),
             args.get(n - 1).map(|h| h.as_tagged(heap)).map(|v| v.raw()),
@@ -1054,162 +1073,156 @@ fn copy_data_properties(
         return Err(VmError::Arity);
     };
     let nullish = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let null = heap.known().null.as_tagged(heap).raw();
         let undefined = heap.known().undefined.as_tagged(heap).raw();
         source == null || source == undefined
     };
     if nullish {
-        return Ok(target);
+        return Ok(unsafe { Tagged::<Value>::from_value_unchecked(target) });
     }
     // only heap objects contribute (string sources need boxing)
     {
         let cond_28 = {
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             Convert::is_primitive(heap, unsafe { source.assume_valid(heap) })
         };
         if cond_28 {
-            return Ok(target);
+            return Ok(unsafe { Tagged::<Value>::from_value_unchecked(target) });
         }
     }
-    let (threw, target_out) =
-        nctx.handle_scope(|nctx, scope| -> Result<(bool, Value), VmError> {
-            // target and source survive getter calls and property adds below:
-            // root them once, not per iteration from raw copies
-            // Safety: fresh argument words, rooted below before any allocation.
-            let target_handle =
-                scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(target) });
-            let source_handle =
-                scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(source) });
-            // canonicalize the excluded keys (interning strings) so a plain
-            // bits comparison suffices against the source's descriptor names
-            let excluded: Vec<Value> = {
-                let (vm, heap, state) = nctx.split();
-                let mut out = Vec::with_capacity(excluded.len());
-                for k in excluded {
-                    match Object::to_property_key(
-                        vm,
-                        heap,
-                        state,
-                        // Safety: fresh argument word, fresh at entry.
-                        scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(k) }),
-                    )? {
-                        Some(k) => out.push(k.raw()),
-                        None => return Ok((true, target_handle.as_tagged(heap).raw())),
-                    }
-                }
-                out
-            };
-            // enumerate own enumerable keys: element indices ascending, then
-            // named descriptors in insertion order; collected AFTER the
-            // exclusion canonicalization so no allocation can stale them
-            let mut keys: Vec<Value> = Vec::new();
-            'collect: {
-                let heap = &*nctx.heap();
-                let Some(obj) =
-                    unsafe { source_handle.read_unchecked().assume_valid(heap) }.as_heap_object()
-                else {
-                    break 'collect;
-                };
-                if obj.as_ref().is_array(heap) {
-                    let len = obj.as_ref().length().min(
-                        obj.as_ref()
-                            .elements_array(heap)
-                            .map(|e| e.len())
-                            .unwrap_or(0),
-                    );
-                    for i in 0..len {
-                        if obj.as_ref().element_value(heap, i).is_some() {
-                            keys.push(Smi::new(i as i64).encode());
-                        }
-                    }
-                }
-                for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
-                    if d.flags().is_enumerable() {
-                        keys.push(d.name(heap).raw());
-                    }
-                }
-            }
-            // root every key: the getter calls below allocate and raw copies
-            // would dangle
-            // Safety: fresh words from the walk above (no allocation since).
-            let keys: Vec<Handle<'_, Value>> = keys
-                .iter()
-                .map(|k| scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(*k) }))
-                .collect();
-            let (vm, heap, state) = nctx.split();
-            for key in keys {
-                let key_word = key.as_tagged(heap).raw();
-                if excluded.contains(&key_word) {
-                    continue;
-                }
-                // full [[Get]] (getters may run)
-                let value = match Lookup::get_property_on(
+    let target_out = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        // target and source survive getter calls and property adds below:
+        // root them once, not per iteration from raw copies
+        // Safety: fresh argument words, rooted below before any allocation.
+        let target_handle = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(target) });
+        let source_handle = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(source) });
+        // canonicalize the excluded keys (interning strings) so a plain
+        // bits comparison suffices against the source's descriptor names
+        let excluded: Vec<Value> = {
+            let mut out = Vec::with_capacity(excluded.len());
+            for k in excluded {
+                match Object::to_property_key(
                     vm,
                     heap,
                     state,
-                    source_handle,
-                    source_handle,
-                    key,
+                    // Safety: fresh argument word, fresh at entry.
+                    scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(k) }),
                 )? {
-                    Coercion::Threw => return Ok((true, target_handle.as_tagged(heap).raw())),
-                    Coercion::Value(v) => scope.handle(v),
-                };
-                // CreateDataProperty: skipped when already present
-                let exists = !matches!(
-                    target_handle.lookup(heap, key.as_tagged(heap).as_name()),
-                    Lookup::NotFound
-                );
-                if exists {
-                    continue;
+                    Some(k) => out.push(k.raw()),
+                    None => return Ok(heap.known().exception.as_tagged(heap).erase()),
                 }
-                let target_obj = scope
-                    .cast::<Object>(target_handle.as_tagged(heap))
-                    .expect("copy target is an object");
-                let key_name: Handle<'_, SlotName> = scope.handle(key.as_tagged(heap).as_name());
-                Object::add_own_property(
-                    heap,
-                    &scope,
-                    target_obj,
-                    key_name,
-                    PropertyDescriptor::data(value),
-                )?;
             }
-            Ok((false, target_handle.as_tagged(heap).raw()))
-        })?;
-    if threw {
-        // Safety: fresh root-slot word read for the immediate return.
-        return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
-    }
+            out
+        };
+        // enumerate own enumerable keys: element indices ascending, then
+        // named descriptors in insertion order; collected AFTER the
+        // exclusion canonicalization so no allocation can stale them
+        let mut keys: Vec<Value> = Vec::new();
+        'collect: {
+            let heap = &*heap;
+            let Some(obj) =
+                unsafe { source_handle.read_unchecked().assume_valid(heap) }.as_heap_object()
+            else {
+                break 'collect;
+            };
+            if obj.as_ref().is_array(heap) {
+                let len = obj.as_ref().length().min(
+                    obj.as_ref()
+                        .elements_array(heap)
+                        .map(|e| e.len())
+                        .unwrap_or(0),
+                );
+                for i in 0..len {
+                    if obj.as_ref().element_value(heap, i).is_some() {
+                        keys.push(Smi::new(i as i64).encode());
+                    }
+                }
+            }
+            for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
+                if d.flags().is_enumerable() {
+                    keys.push(d.name(heap).raw());
+                }
+            }
+        }
+        // root every key: the getter calls below allocate and raw copies
+        // would dangle
+        // Safety: fresh words from the walk above (no allocation since).
+        let keys: Vec<Handle<'_, Value>> = keys
+            .iter()
+            .map(|k| scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(*k) }))
+            .collect();
+        for key in keys {
+            let key_word = key.as_tagged(heap).raw();
+            if excluded.contains(&key_word) {
+                continue;
+            }
+            // full [[Get]] (getters may run)
+            let value = match Lookup::get_property_on(
+                vm,
+                heap,
+                state,
+                source_handle,
+                source_handle,
+                key,
+            )? {
+                Coercion::Threw => return Ok(heap.known().exception.as_tagged(heap).erase()),
+                Coercion::Value(v) => scope.handle(v),
+            };
+            // CreateDataProperty: skipped when already present
+            let exists = !matches!(
+                target_handle.lookup(heap, key.as_tagged(heap).as_name()),
+                Lookup::NotFound
+            );
+            if exists {
+                continue;
+            }
+            let target_obj = scope
+                .cast::<Object>(target_handle.as_tagged(heap))
+                .expect("copy target is an object");
+            let key_name: Handle<'_, SlotName> = scope.handle(key.as_tagged(heap).as_name());
+            Object::add_own_property(
+                heap,
+                &scope,
+                target_obj,
+                key_name,
+                PropertyDescriptor::data(value),
+            )?;
+        }
+        Ok(target_handle.as_tagged(heap))
+    })?;
     // re-read through the handle: the copy loop allocated (getters,
     // property adds) and may have moved the target
     Ok(target_out)
 }
 
 /// A fresh private name: (description) -> Symbol.
-fn create_private_name(
-    nctx: &mut RuntimeContext<'_>,
+fn create_private_name<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
     let text = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(1)
             .map(|h| h.as_tagged(heap))
             .and_then(|d| d.get_as::<DenseString>())
             .map(|s| s.to_rust_string(heap))
     };
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         let desc = text.unwrap_or_default();
-        let sym = Symbol::new(nctx.heap(), &scope, desc.as_bytes());
-        // Safety: fresh rooted-slot word, returned without an
-        // intervening allocation.
-        Ok(unsafe { sym.read_unchecked() })
+        let sym = Symbol::new(heap, &scope, desc.as_bytes());
+        Ok(sym.as_tagged(heap).erase())
     })
 }
 
 /// PrivateGet (ES 7.3.30): (obj, key) -> value, TypeError when absent.
-fn private_get(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    let heap = &*nctx.heap();
+fn private_get<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
+    let heap = &*heap;
     let obj = args
         .get(0)
         .map(|h| h.as_tagged(heap))
@@ -1218,16 +1231,20 @@ fn private_get(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<V
         .get(1)
         .map(|h| h.as_tagged(heap))
         .ok_or(VmError::Arity)?;
-    match private_find(heap, obj, key).map(|s| s.inner()) {
-        Some(v) => Ok(v),
+    match private_find(heap, obj, key) {
+        Some(s) => Ok(s.get(heap)),
         None => Err(VmError::Type),
     }
 }
 
 /// PrivateSet (ES 7.3.31): (obj, key, value), TypeError when absent.
-fn private_set(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn private_set<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
     let value = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let obj = args
             .get(0)
             .map(|h| h.as_tagged(heap))
@@ -1243,7 +1260,7 @@ fn private_set(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<V
         match private_find(heap, obj, key) {
             Some(slot) => {
                 slot.set(heap, obj.raw(), value);
-                Ok(value.raw())
+                Ok(value)
             }
             None => Err(VmError::Type),
         }
@@ -1252,9 +1269,13 @@ fn private_set(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<V
 }
 
 /// `#x in obj`: (key, obj) -> bool (own private presence only).
-fn private_in(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn private_in<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
     let has = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let key = args
             .get(0)
             .map(|h| h.as_tagged(heap))
@@ -1263,21 +1284,19 @@ fn private_in(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Va
             .get(1)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?;
-        Ok::<_, VmError>(private_find(heap, obj, key).is_some())
-    }?;
-    Ok({
-        let heap = &*nctx.heap();
-        Convert::boolean(heap, has).raw()
-    })
+        private_find(heap, obj, key).is_some()
+    };
+    Ok(Convert::boolean(heap, has))
 }
 
 /// Attach the instance-field array to the class constructor:
 /// (ctor, fields).
-fn set_class_fields(
-    nctx: &mut RuntimeContext<'_>,
+fn set_class_fields<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let heap = &*nctx.heap();
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
+    let heap = &*heap;
     let ctor = args
         .get(0)
         .map(|h| h.as_tagged(heap))
@@ -1305,20 +1324,23 @@ fn set_class_fields(
     if !ok {
         return Err(VmError::Type);
     }
-    Ok(ctor.raw())
+    Ok(ctor)
 }
 
 /// InitializeInstanceElements (ES 7.3.33): (ctor, instance) -> instance.
 /// Runs each field initializer with the instance as receiver and defines
 /// the result onto it ({w+, e+, c+}).
-fn init_instance_fields(
-    nctx: &mut RuntimeContext<'_>,
+fn init_instance_fields<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing below allocates before they
     // are rooted / consumed.
     let (ctor, instance) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         (
             args.get(0)
                 .map(|h| h.as_tagged(heap))
@@ -1331,7 +1353,7 @@ fn init_instance_fields(
         )
     };
     let fields = 'fields: {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let Some(obj) = unsafe { ctor.assume_valid(heap) }.as_heap_object() else {
             break 'fields None;
         };
@@ -1342,30 +1364,30 @@ fn init_instance_fields(
         return Err(VmError::Type);
     };
     let cond_29 = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         fields == heap.known().undefined.as_tagged(heap).raw()
     };
     if cond_29 {
-        return Ok(instance);
+        return Ok(unsafe { Tagged::<Value>::from_value_unchecked(instance) });
     }
     let count = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         unsafe { fields.assume_valid(heap) }
             .as_heap_object()
             .map(|o| o.as_ref().length())
             .unwrap_or(0)
     };
-    let threw_or_failed = nctx.handle_scope(|nctx, scope| -> Result<bool, VmError> {
+    let instance_out = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         // Safety: fresh argument words, rooted below before any allocation.
         let instance = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(instance) });
         // Safety: fresh walk word, rooted below before any allocation.
         let fields = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(fields) });
         // Safety: fresh root-slot word; singletons never move.
-        let exception = unsafe { nctx.heap().known().exception.read_unchecked() };
+        let exception = heap.known().exception.as_tagged(heap).raw();
         let mut i = 0;
         while i + 1 < count {
             let raw_key = {
-                let heap = &*nctx.heap();
+                let heap = &*heap;
                 unsafe { fields.read_unchecked().assume_valid(heap) }
                     .as_heap_object()
                     .and_then(|o| o.as_ref().element_value(heap, i))
@@ -1374,7 +1396,6 @@ fn init_instance_fields(
             };
             // computed keys need ToPropertyKey canonicalization
             let key = {
-                let (vm, heap, state) = nctx.split();
                 match Object::to_property_key(
                     vm,
                     heap,
@@ -1382,40 +1403,41 @@ fn init_instance_fields(
                     // Safety: fresh walk word, no GC since the read.
                     scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
                 )? {
-                    Some(k) => k,
-                    None => return Ok(true),
+                    Some(k) => scope.handle(k),
+                    None => return Ok(heap.known().exception.as_tagged(heap).erase()),
                 }
             };
-            // the initializer call allocates (user code): the key must
-            // stay rooted across it
-            // Safety: fresh coercion result, rooted below.
-            let key = scope.handle(key);
+            // the initializer call allocates (user code): the key stays
+            // rooted in the scope across it
             // re-read the initializer after the coercion (it allocated)
             let init = {
-                let heap = &*nctx.heap();
+                let heap = &*heap;
                 unsafe { fields.read_unchecked().assume_valid(heap) }
                     .as_heap_object()
                     .and_then(|o| o.as_ref().element_value(heap, i + 1))
                     .map(|v| v.raw())
                     .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).raw())
             };
+            // Safety: fresh walk word, consumed by the call.
+            let init = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(init) });
             // Safety: fresh rooted-slot words staged for the call.
-            let instance_word = instance.as_tagged(&*nctx.heap()).raw();
-            let value = nctx.call(
-                // Safety: fresh walk word, consumed by the call.
-                unsafe { Tagged::<Value>::from_value_unchecked(init) },
+            let instance_word = instance.as_tagged(&*heap).raw();
+            let value = scope.handle(RuntimeContext::call(
+                vm,
+                &mut *heap,
+                state,
+                init,
                 scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(instance_word) }]),
-            )?;
-            if value == exception {
-                return Ok(true);
+                None,
+            )?);
+            if value.as_tagged(heap).raw() == exception {
+                return Ok(heap.known().exception.as_tagged(heap).erase());
             }
-            // Safety: fresh call result, rooted below.
-            let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(value) });
             let instance_obj = scope
-                .cast::<Object>(instance.as_tagged(&*nctx.heap()))
+                .cast::<Object>(instance.as_tagged(&*heap))
                 .expect("class instance is an object");
             let defined = Object::define_own_property(
-                nctx.heap(),
+                heap,
                 &scope,
                 instance_obj,
                 key,
@@ -1431,13 +1453,9 @@ fn init_instance_fields(
             }
             i += 2;
         }
-        Ok(false)
+        Ok(instance.as_tagged(heap))
     })?;
-    if threw_or_failed {
-        // Safety: fresh root-slot word read for the immediate return.
-        return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
-    }
-    Ok(instance)
+    Ok(instance_out)
 }
 
 // ---- frame access -----------------------------------------------------------
@@ -1520,7 +1538,9 @@ fn frame_super_parts(heap: &mut Heap, state: &ContextState) -> Result<(Value, Va
 /// setter threw (the pending exception is set; the caller propagates the
 /// exception sentinel).
 fn apply_store_outcome(
-    nctx: &mut RuntimeContext<'_>,
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
     receiver: Value,
     outcome: StoreOutcome<'_>,
     value: Value,
@@ -1530,33 +1550,30 @@ fn apply_store_outcome(
             receiver: recv,
             name,
         } => {
-            nctx.handle_scope(|nctx, scope| {
+            state.handle_scope(|scope| {
                 // Safety: caller-supplied value word, rooted before the define.
-                let value = scope.handle(unsafe { value.assume_valid(&*nctx.heap()) });
-                Object::add_own_property(
-                    nctx.heap(),
-                    &scope,
-                    recv,
-                    name,
-                    PropertyDescriptor::data(value),
-                )
-                // TODO(strict-mode): a false result must throw in strict code;
-                // the current store path preserves its existing sloppy result.
-                .map(|_| false)
+                let value = scope.handle(unsafe { value.assume_valid(&*heap) });
+                Object::add_own_property(heap, &scope, recv, name, PropertyDescriptor::data(value))
+                    // TODO(strict-mode): a false result must throw in strict code;
+                    // the current store path preserves its existing sloppy result.
+                    .map(|_| false)
             })
         }
         StoreOutcome::CallSetter { setter } => {
             // Safety: fresh root-slot word read for the comparison below.
-            let exception = unsafe { nctx.heap().known().exception.read_unchecked() };
-            let result = nctx.handle_scope(|nctx, scope| {
-                nctx.call(
-                    // Safety: rooted-slot word, consumed by the call.
-                    unsafe { Tagged::<Value>::from_value_unchecked(setter.read_unchecked()) },
+            let exception = heap.known().exception.as_tagged(heap).raw();
+            let result = state.handle_scope(|scope| {
+                RuntimeContext::call(
+                    vm,
+                    heap,
+                    state,
+                    setter,
                     // Safety: caller-supplied words, staged for the call.
                     scope.stage(&[
                         unsafe { Tagged::<Value>::from_value_unchecked(receiver) },
                         unsafe { Tagged::<Value>::from_value_unchecked(value) },
                     ]),
+                    None,
                 )
             })?;
             Ok(result == exception)
@@ -1567,15 +1584,18 @@ fn apply_store_outcome(
 
 /// A full [[Get]] that treats non-callable getters (an absent half of an
 /// accessor pair) as undefined instead of throwing.
-fn get_property_lenient(
-    nctx: &mut RuntimeContext<'_>,
+fn get_property_lenient<'a>(
+    nctx: RuntimeContext<'a>,
     receiver: Value,
     name: Value,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // (plain value, getter) — both raw fresh words
     // Safety: caller-supplied words, fresh at entry.
     let outcome = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         match Lookup::load_outcome(
             heap,
             unsafe { receiver.assume_valid(heap) },
@@ -1587,30 +1607,33 @@ fn get_property_lenient(
         }
     }?;
     if let Some(v) = outcome.0 {
-        return Ok(v);
+        return Ok(unsafe { Tagged::<Value>::from_value_unchecked(v) });
     }
     // Safety: fresh walk word from the lookup above.
     let getter = outcome.1.expect("one of the two arms is set");
     let undefined = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         heap.known().undefined.as_tagged(heap).raw()
     };
     if getter == undefined
         || !{
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             Object::is_callable(heap, unsafe {
                 Tagged::<Value>::from_value_unchecked(getter)
             })
         }
     {
-        return Ok(undefined);
+        return Ok(unsafe { Tagged::<Value>::from_value_unchecked(undefined) });
     }
-    nctx.handle_scope(|nctx, scope| {
-        nctx.call(
-            // Safety: fresh walk word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(getter) },
+    state.handle_scope(|scope| {
+        RuntimeContext::call(
+            vm,
+            heap,
+            state,
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(getter) }),
             // Safety: caller-supplied word, staged for the call.
             scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(receiver) }]),
+            None,
         )
     })
 }
@@ -1623,14 +1646,17 @@ fn get_property_lenient(
 /// constructor after ClassDefinitionEvaluation set its name — an already
 /// explicitly defined `name` wins (ES 15.7.14: SetFunctionName happens
 /// before element installation).
-fn set_function_name(
-    nctx: &mut RuntimeContext<'_>,
+fn set_function_name<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (fn_value, raw_key, prefix) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let prefix = Smi::decode(
             args.get(2)
                 .map(|h| h.as_tagged(heap))
@@ -1653,10 +1679,9 @@ fn set_function_name(
     };
     // name construction allocates (interning): the closure must stay
     // rooted across it
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let fn_value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(fn_value) });
-        let (vm, heap, state) = nctx.split();
         let Some(key) = Object::to_property_key(
             vm,
             heap,
@@ -1665,8 +1690,7 @@ fn set_function_name(
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key).erase();
@@ -1735,7 +1759,7 @@ fn set_function_name(
         if !defined {
             return Err(VmError::Type);
         }
-        Ok(fn_value.as_tagged(heap).raw())
+        Ok(fn_value.as_tagged(heap))
     })
 }
 
@@ -1743,14 +1767,17 @@ fn set_function_name(
 /// flags). Defines one accessor half, merging with an existing pair under
 /// the same key; flags bit 0 marks the getter half, PropertyFlags bits
 /// carry enumerability.
-fn install_accessor(
-    nctx: &mut RuntimeContext<'_>,
+fn install_accessor<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_target, raw_key, raw_closure, flags) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let flags = Smi::decode(
             args.get(3)
                 .map(|h| h.as_tagged(heap))
@@ -1776,11 +1803,10 @@ fn install_accessor(
         )
     };
     // the key coercion allocates: root the target and closure across it
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument words, rooted below before any allocation.
         let target = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_target) });
         let closure = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_closure) });
-        let (vm, heap, state) = nctx.split();
         let Some(key) = Object::to_property_key(
             vm,
             heap,
@@ -1789,8 +1815,7 @@ fn install_accessor(
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
@@ -1847,7 +1872,7 @@ fn install_accessor(
         if !defined {
             return Err(VmError::Type);
         }
-        Ok(closure.as_tagged(heap).raw())
+        Ok(closure.as_tagged(heap))
     })
 }
 
@@ -1855,14 +1880,17 @@ fn install_accessor(
 /// installation): (obj, key, value, flags) -> obj. Define sites are
 /// strict-mode code: a rejected define throws a TypeError. flags are
 /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair).
-fn define_own_property(
-    nctx: &mut RuntimeContext<'_>,
+fn define_own_property<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_receiver, raw_key, raw_value, flags) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let flags = Smi::decode(
             args.get(3)
                 .map(|h| h.as_tagged(heap))
@@ -1888,11 +1916,10 @@ fn define_own_property(
         )
     };
     // the key coercion allocates: root the receiver and value across it
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument words, rooted below before any allocation.
         let receiver = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_receiver) });
         let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_value) });
-        let (vm, heap, state) = nctx.split();
         let Some(key) = Object::to_property_key(
             vm,
             heap,
@@ -1901,8 +1928,7 @@ fn define_own_property(
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
@@ -1951,10 +1977,9 @@ fn define_own_property(
                     unsafe { Tagged::<Value>::from_value_unchecked(key_word) },
                     partial,
                 )? {
-                    // Safety: fresh root-slot word read for the immediate return.
-                    Flow::Threw => Ok(unsafe { heap.known().exception.read_unchecked() }),
+                    Flow::Threw => Ok(heap.known().exception.as_tagged(heap).erase()),
                     Flow::Value(false) => Err(VmError::Type),
-                    Flow::Value(true) => Ok(receiver.as_tagged(heap).raw()),
+                    Flow::Value(true) => Ok(receiver.as_tagged(heap)),
                 };
             }
         }
@@ -1998,42 +2023,46 @@ fn define_own_property(
         if !defined {
             return Err(VmError::Type);
         }
-        Ok(receiver.as_tagged(heap).raw())
+        Ok(receiver.as_tagged(heap))
     })
 }
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
-fn set_prototype(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
+fn set_prototype<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
+    state.handle_scope(|scope| {
         // Safety: fresh argument words, rooted below before any allocation.
         let obj = scope.handle({
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             args.get(0)
                 .map(|h| h.as_tagged(heap))
                 .ok_or(VmError::Arity)?
         });
         let proto = scope.handle({
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             args.get(1)
                 .map(|h| h.as_tagged(heap))
                 .ok_or(VmError::Arity)?
         });
         let obj_ref = scope
-            .cast::<Object>(obj.as_tagged(&*nctx.heap()))
+            .cast::<Object>(obj.as_tagged(&*heap))
             .expect("obj is an object");
-        Object::set_prototype(nctx.heap(), &scope, obj_ref, proto)?;
-        // Safety: fresh root-slot word read for the immediate return.
-        Ok(unsafe { obj.read_unchecked() })
+        Object::set_prototype(heap, &scope, obj_ref, proto)?;
+        Ok(obj.as_tagged(heap))
     })
 }
 
 /// Class extends validation (ES 15.7.14 step 15.e): (value) -> value,
 /// TypeError unless the superclass is null or a constructor.
-fn throw_if_not_constructor_or_null(
-    nctx: &mut RuntimeContext<'_>,
+fn throw_if_not_constructor_or_null<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let heap = &*nctx.heap();
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
+    let heap = &*heap;
     let v = args
         .get(0)
         .map(|h| h.as_tagged(heap))
@@ -2053,81 +2082,82 @@ fn throw_if_not_constructor_or_null(
     if !ok {
         return Err(VmError::Type);
     }
-    // Safety: fresh argument word, returned without an intervening
-    // allocation.
-    Ok(v.raw())
+    Ok(v)
 }
 
 /// superCtor.prototype validation: (value) -> value, TypeError unless the
 /// value is an Object or null.
-fn throw_if_not_object_or_null(
-    nctx: &mut RuntimeContext<'_>,
+fn throw_if_not_object_or_null<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
     let v = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(0)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?
             .raw()
     };
     let ok = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         v == heap.known().null.as_tagged(heap).raw()
             || !Convert::is_primitive(heap, unsafe { v.assume_valid(heap) })
     };
     if !ok {
         return Err(VmError::Type);
     }
-    Ok(v)
+    Ok(unsafe { Tagged::<Value>::from_value_unchecked(v) })
 }
 
 /// [[ThisBindingStatus]] guard of derived constructors (ES 10.2.2):
 /// (value) -> value, ReferenceError when `this` is still the hole.
-fn throw_super_not_called_if_hole(
-    nctx: &mut RuntimeContext<'_>,
+fn throw_super_not_called_if_hole<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
     let v = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(0)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?
             .raw()
     };
     let cond_31 = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         v == heap.known().the_hole.as_tagged(heap).raw()
     };
     if cond_31 {
         // "Must call super constructor before accessing 'this'"
         return Err(VmError::Reference);
     }
-    Ok(v)
+    Ok(unsafe { Tagged::<Value>::from_value_unchecked(v) })
 }
 
 /// InitializeThisBinding guard (ES 10.2.2): (value) -> value,
 /// ReferenceError unless `this` is still the hole (super() runs once).
-fn throw_super_already_called_if_not_hole(
-    nctx: &mut RuntimeContext<'_>,
+fn throw_super_already_called_if_not_hole<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
     let v = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(0)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?
             .raw()
     };
     let cond_32 = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         v == heap.known().the_hole.as_tagged(heap).raw()
     };
     if !cond_32 {
         // "Super constructor may only be called once"
         return Err(VmError::Reference);
     }
-    Ok(v)
+    Ok(unsafe { Tagged::<Value>::from_value_unchecked(v) })
 }
 
 // ---- super() construction (ES 15.4.3) ---------------------------------------
@@ -2135,23 +2165,26 @@ fn throw_super_already_called_if_not_hole(
 /// The shared ConstructSuper tail: construct `callee` with `new_target`,
 /// giving derived parents the hole receiver. The instance lands in the
 /// return value; the exception sentinel escapes when user code threw.
-fn construct_super_construct(
-    nctx: &mut RuntimeContext<'_>,
+fn construct_super_construct<'a>(
+    nctx: RuntimeContext<'a>,
     callee_v: Value,
     new_target_v: Value,
     args: &[Value],
-) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         // Safety: fresh root-slot words for the oddball singletons.
-        let undefined = unsafe { nctx.heap().known().undefined.read_unchecked() };
-        let the_hole = unsafe { nctx.heap().known().the_hole.read_unchecked() };
+        let undefined = heap.known().undefined.as_tagged(heap).raw();
+        let the_hole = heap.known().the_hole.as_tagged(heap).raw();
         if new_target_v == undefined || new_target_v == the_hole {
             // not inside a [[Construct]]: reachable via an arrow that escaped
             // the constructor
             return Err(VmError::Type);
         }
         let derived = {
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             // Safety: caller-supplied word, fresh at entry.
             unsafe { callee_v.assume_valid(heap) }
                 .as_heap_object()
@@ -2184,90 +2217,93 @@ fn construct_super_construct(
                 false,
             )
         } else {
-            let (vm, heap, state) = nctx.split();
             match Object::create_construct_receiver_value(vm, heap, state, new_target.erase()) {
                 // the receiver must stay rooted across the callee call:
                 // a primitive return falls back to it after the call
                 // allocated (and possibly moved it)
                 Ok(Some(r)) => (scope.handle(r), true),
-                // Safety: fresh root-slot word read for the immediate return.
-                Ok(None) => return Ok(unsafe { nctx.heap().known().exception.read_unchecked() }),
+                Ok(None) => return Ok(heap.known().exception.as_tagged(heap).erase()),
                 Err(err) => return Err(err),
             }
         };
         // Safety: fresh rooted-slot words staged for the call.
         let mut args_v = Vec::with_capacity(args.len() + 1);
-        args_v.push(receiver.as_tagged(&*nctx.heap()).raw());
+        args_v.push(receiver.as_tagged(&*heap).raw());
         args_v.extend(args.iter().map(|h| unsafe { h.read_unchecked() }));
-        let result = {
-            let (vm, heap, state) = nctx.split();
-            RuntimeContext::new(vm, heap, state).call_construct(
-                // Safety: fresh rooted-slot words, consumed by the call.
-                unsafe { Tagged::<Value>::from_value_unchecked(callee.read_unchecked()) },
-                unsafe { Tagged::<Value>::from_value_unchecked(new_target.read_unchecked()) },
-                scope.stage(
-                    &args_v
-                        .iter()
-                        .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
-                        .collect::<Vec<_>>(),
-                ),
-            )
-        }?;
+        let result = scope.handle(RuntimeContext::call(
+            vm,
+            &mut *heap,
+            state,
+            callee.erase(),
+            scope.stage(
+                &args_v
+                    .iter()
+                    .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
+                    .collect::<Vec<_>>(),
+            ),
+            Some(new_target.erase()),
+        )?);
         let cond_33 = {
-            let heap = &*nctx.heap();
-            result == heap.known().exception.as_tagged(heap).raw()
+            let heap = &*heap;
+            result.as_tagged(heap).raw() == heap.known().exception.as_tagged(heap).raw()
         };
         if cond_33 {
-            return Ok(result);
+            return Ok(result.as_tagged(heap));
         }
-        Ok({
-            let cond_34 = {
-                let heap = &*nctx.heap();
-                Convert::is_primitive(heap, unsafe { result.assume_valid(heap) })
-            };
-            if cond_34 {
-                if allocated {
-                    // Safety: fresh rooted-slot word, returned without an
-                    // intervening allocation.
-                    unsafe { receiver.read_unchecked() }
-                } else {
-                    // a derived constructor returned a primitive: only
-                    // reachable via `return <primitive>` (ES 9.2.2.1)
-                    return Err(VmError::Type);
-                }
+        let cond_34 = {
+            let heap = &*heap;
+            Convert::is_primitive(heap, result.as_tagged(heap))
+        };
+        if cond_34 {
+            if allocated {
+                Ok(receiver.as_tagged(heap))
             } else {
-                result
+                // a derived constructor returned a primitive: only
+                // reachable via `return <primitive>` (ES 9.2.2.1)
+                Err(VmError::Type)
             }
-        })
+        } else {
+            Ok(result.as_tagged(heap))
+        }
     })
 }
 
 /// super(...): (args...) -> instance. Resolves the super constructor and
 /// new.target from the executing frame.
-fn construct_super(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    let (callee, new_target) = {
-        let (_, heap, state) = nctx.split();
-        frame_super_parts(heap, state)?
-    };
+fn construct_super<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let (callee, new_target) = frame_super_parts(heap, state)?;
     // Safety: fresh register words, consumed below.
     let arg_words = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.iter()
             .map(|h| h.as_tagged(heap))
             .map(|v| v.raw())
             .collect::<Vec<_>>()
     };
-    construct_super_construct(nctx, callee, new_target, &arg_words)
+    construct_super_construct(
+        RuntimeContext::new(vm, heap, state),
+        callee,
+        new_target,
+        &arg_words,
+    )
 }
 
 /// super() forwarding the frame's full argument list (synthesized default
 /// derived constructors, ES 15.7.13): () -> instance.
-fn construct_super_all_args(
-    nctx: &mut RuntimeContext<'_>,
+fn construct_super_all_args<'a>(
+    nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let (callee, new_target, args) = {
-        let (_, heap, state) = nctx.split();
         let (callee, new_target) = frame_super_parts(heap, state)?;
         if !state.cache.is_active() {
             return Err(VmError::Type);
@@ -2278,28 +2314,36 @@ fn construct_super_all_args(
         // Safety: fresh register words, consumed below.
         let args = slice
             .iter()
-            .map(|h| h.as_tagged(heap))
+            .map(|h| h.as_tagged(&*heap))
             .map(|v| v.raw())
             .collect::<Vec<_>>();
         (callee, new_target, args)
     };
-    construct_super_construct(nctx, callee, new_target, &args)
+    construct_super_construct(
+        RuntimeContext::new(vm, heap, state),
+        callee,
+        new_target,
+        &args,
+    )
 }
 
 /// Arrow-delegated super(): (args..., closure, new_target) -> instance.
 /// The constructor closure and its new.target ride the tail of the
 /// argument window (threaded through .this_function).
-fn construct_super_via(
-    nctx: &mut RuntimeContext<'_>,
+fn construct_super_via<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let n = args.len();
     if n < 2 {
         return Err(VmError::Arity);
     }
     // Safety: fresh argument words, consumed below.
     let (closure, new_target, arg_words) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         (
             args.get(n - 2)
                 .map(|h| h.as_tagged(heap))
@@ -2316,7 +2360,7 @@ fn construct_super_via(
         )
     };
     let callee = 'callee: {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let Some(obj) = unsafe { closure.assume_valid(heap) }.as_heap_object() else {
             break 'callee None;
         };
@@ -2339,50 +2383,58 @@ fn construct_super_via(
     let Some(callee) = callee else {
         return Err(VmError::Type);
     };
-    construct_super_construct(nctx, callee, new_target, &arg_words)
+    construct_super_construct(
+        RuntimeContext::new(vm, heap, state),
+        callee,
+        new_target,
+        &arg_words,
+    )
 }
 
 // ---- dynamic names (direct eval) ---------------------------------------------
 
 /// Direct-eval name load: (name) -> value. Walks the frame context chain
 /// by name; unresolved names fall back to the global object.
-fn load_dynamic_name(
-    nctx: &mut RuntimeContext<'_>,
+fn load_dynamic_name<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument word, consumed below.
     let name = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         args.get(0)
             .map(|h| h.as_tagged(heap))
             .ok_or(VmError::Arity)?
             .raw()
     };
-    let found = {
-        let (_, heap, state) = nctx.split();
-        dynamic_lookup_frame(heap, state, name)?
-    };
+    let found = dynamic_lookup_frame(heap, state, name)?;
     match found {
-        Some(v) if !is_the_hole(nctx, v) => Ok(v),
+        Some(v) if !is_the_hole(heap, v) => Ok(unsafe { Tagged::<Value>::from_value_unchecked(v) }),
         Some(_) => Err(VmError::Reference),
         None => {
             // unresolved: fall back to a global object property
             // Safety: fresh root-slot word, consumed below.
-            let global = unsafe { nctx.heap().known().global_object.read_unchecked() };
-            get_property_lenient(nctx, global, name)
+            let global = unsafe { heap.known().global_object.read_unchecked() };
+            get_property_lenient(RuntimeContext::new(vm, heap, state), global, name)
         }
     }
 }
 
 /// Direct-eval name store: (value, name) -> value. Writes through to the
 /// context-chain slot; unresolved names store on the global object.
-fn store_dynamic_name(
-    nctx: &mut RuntimeContext<'_>,
+fn store_dynamic_name<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words, consumed below.
     let (value, name) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         (
             args.get(0)
                 .map(|h| h.as_tagged(heap))
@@ -2394,14 +2446,10 @@ fn store_dynamic_name(
                 .raw(),
         )
     };
-    let found = {
-        let (_, heap, state) = nctx.split();
-        dynamic_lookup_frame(heap, state, name)?
-    };
+    let found = dynamic_lookup_frame(heap, state, name)?;
     match found {
-        Some(v) if !is_the_hole(nctx, v) => {
+        Some(v) if !is_the_hole(heap, v) => {
             // write through to the found slot
-            let (_, heap, state) = nctx.split();
             {
                 let context = frame_context_value(state, heap)?;
                 let mut context = context.get_as::<Context>().ok_or(VmError::Type)?;
@@ -2417,10 +2465,10 @@ fn store_dynamic_name(
         Some(_) => return Err(VmError::Reference),
         None => {
             // Safety: fresh root-slot word, consumed below.
-            let global = unsafe { nctx.heap().known().global_object.read_unchecked() };
-            let threw = nctx.handle_scope(|nctx, scope| -> Result<bool, VmError> {
+            let global = unsafe { heap.known().global_object.read_unchecked() };
+            let threw = state.handle_scope(|scope| -> Result<bool, VmError> {
                 let outcome = {
-                    let heap = &*nctx.heap();
+                    let heap = &*heap;
                     // Safety: fresh root-slot word, consumed here.
                     unsafe { global.assume_valid(heap) }.store_lookup(
                         heap,
@@ -2432,20 +2480,21 @@ fn store_dynamic_name(
                         StoreSemantics::WriteThrough,
                     )
                 }?;
-                apply_store_outcome(nctx, global, outcome, value)
+                apply_store_outcome(vm, heap, state, global, outcome, value)
             })?;
             if threw {
-                // Safety: fresh root-slot word read for the immediate return.
-                return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+                return Ok(heap.known().exception.as_tagged(heap).erase());
             }
         }
     }
-    Ok(value)
+    Ok(args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?)
 }
 
 /// Fresh singleton-word compare against the hole sentinel.
-fn is_the_hole(nctx: &mut RuntimeContext<'_>, v: Value) -> bool {
-    let heap = &*nctx.heap();
+fn is_the_hole(heap: &Heap, v: Value) -> bool {
     v == heap.known().the_hole.as_tagged(heap).raw()
 }
 
@@ -2453,12 +2502,13 @@ fn is_the_hole(nctx: &mut RuntimeContext<'_>, v: Value) -> bool {
 
 /// A fresh array of the frame's arguments from formal index `first`:
 /// (first) -> array.
-fn create_rest_parameter(
-    nctx: &mut RuntimeContext<'_>,
+fn create_rest_parameter<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
     let first = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         Smi::decode(
             args.get(0)
                 .map(|h| h.as_tagged(heap))
@@ -2469,7 +2519,6 @@ fn create_rest_parameter(
         .unwrap_or(0)
     };
     let values: Vec<Value> = {
-        let (_, heap, state) = nctx.split();
         if !state.cache.is_active() {
             return Err(VmError::Type);
         }
@@ -2486,8 +2535,7 @@ fn create_rest_parameter(
             })
             .collect()
     };
-    let arr = nctx.handle_scope(|nctx, scope| {
-        let heap = nctx.heap();
+    state.handle_scope(|scope| {
         let elements = heap.allocate_handle::<FixedArray>(
             scope.stage(
                 &values
@@ -2498,19 +2546,18 @@ fn create_rest_parameter(
             &scope,
         );
         let map = heap.known().js_array_map;
-        heap.allocate_object(
-            &scope,
-            ObjectSlotsInit {
-                map,
-                values: HandleSlice::EMPTY,
-                elements: elements.erase(),
-                length: values.len(),
-            },
-        )
-        .erase()
-        .raw()
-    });
-    Ok(arr)
+        Ok(heap
+            .allocate_object(
+                &scope,
+                ObjectSlotsInit {
+                    map,
+                    values: HandleSlice::EMPTY,
+                    elements: elements.erase(),
+                    length: values.len(),
+                },
+            )
+            .erase())
+    })
 }
 
 // ---- super property access (ES 15.4.2 / 15.4.4) -------------------------------
@@ -2519,14 +2566,17 @@ fn create_rest_parameter(
 /// object walked with the split receiver/lookup-start; key coercion runs
 /// after the parent link is resolved (user toString must not change the
 /// chain searched).
-fn super_get_property(
-    nctx: &mut RuntimeContext<'_>,
+fn super_get_property<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (home, raw_recv, raw_key) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         (
             args.get(0)
                 .map(|h| h.as_tagged(heap))
@@ -2543,7 +2593,7 @@ fn super_get_property(
         )
     };
     let cond_35 = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         raw_recv == heap.known().the_hole.as_tagged(heap).raw()
     };
     if cond_35 {
@@ -2551,11 +2601,10 @@ fn super_get_property(
         return Err(VmError::Reference);
     }
     // the key coercion allocates: root home/recv across it
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument words, rooted below before any allocation.
         let home = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(home) });
         let recv = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_recv) });
-        let (vm, heap, state) = nctx.split();
         let Some(key) = Object::to_property_key(
             vm,
             heap,
@@ -2564,8 +2613,7 @@ fn super_get_property(
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { heap.known().exception.read_unchecked() });
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
@@ -2574,7 +2622,7 @@ fn super_get_property(
         // (plain value, getter) — both raw fresh words
         // Safety: fresh anchored handle words plus a fresh coercion result.
         let outcome = {
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             let proto = home_proto(heap, home.as_tagged(heap));
             let name = match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
@@ -2586,29 +2634,32 @@ fn super_get_property(
             }
         };
         if let Some(v) = outcome.0 {
-            return Ok(v);
+            return Ok(unsafe { Tagged::<Value>::from_value_unchecked(v) });
         }
         // Safety: fresh walk word from the lookup above.
         let getter = outcome.1.expect("one of the two arms is set");
         let undefined = {
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             heap.known().undefined.as_tagged(heap).raw()
         };
         if getter == undefined
             || !{
-                let heap = &*nctx.heap();
+                let heap = &*heap;
                 Object::is_callable(heap, unsafe {
                     Tagged::<Value>::from_value_unchecked(getter)
                 })
             }
         {
-            return Ok(undefined);
+            return Ok(unsafe { Tagged::<Value>::from_value_unchecked(undefined) });
         }
-        nctx.call(
-            // Safety: fresh walk word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(getter) },
+        RuntimeContext::call(
+            vm,
+            heap,
+            state,
+            scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(getter) }),
             // Safety: fresh rooted-slot word, staged for the call.
             scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(recv) }]),
+            None,
         )
     })
 }
@@ -2617,14 +2668,17 @@ fn super_get_property(
 /// shadow inherited data properties on `this` unless the write-through
 /// semantics flag is set; the parent link is resolved before any user key
 /// coercion runs.
-fn super_set_property(
-    nctx: &mut RuntimeContext<'_>,
+fn super_set_property<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (home, raw_recv, raw_key, raw_value, semantics_flag) = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         let semantics_flag = Smi::decode(
             args.get(4)
                 .map(|h| h.as_tagged(heap))
@@ -2654,19 +2708,18 @@ fn super_set_property(
         )
     };
     let cond_36 = {
-        let heap = &*nctx.heap();
+        let heap = &*heap;
         raw_recv == heap.known().the_hole.as_tagged(heap).raw()
     };
     if cond_36 {
         return Err(VmError::Reference);
     }
     // the key coercion allocates: root home/recv/value across it
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         // Safety: fresh argument words, rooted below before any allocation.
         let home = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(home) });
         let recv = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_recv) });
         let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_value) });
-        let (vm, heap, state) = nctx.split();
         let Some(key) = Object::to_property_key(
             vm,
             heap,
@@ -2675,8 +2728,7 @@ fn super_set_property(
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw_key) }),
         )?
         else {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { heap.known().exception.read_unchecked() });
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
@@ -2689,7 +2741,7 @@ fn super_set_property(
             StoreSemantics::Shadow
         };
         let outcome = {
-            let heap = &*nctx.heap();
+            let heap = &*heap;
             let proto = home_proto(heap, home.as_tagged(heap));
             let name = match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
@@ -2705,10 +2757,9 @@ fn super_set_property(
                 semantics,
             )
         }?;
-        if apply_store_outcome(nctx, recv_word, outcome, value_word)? {
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+        if apply_store_outcome(vm, heap, state, recv_word, outcome, value_word)? {
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         }
-        Ok(value_word)
+        Ok(value.as_tagged(heap))
     })
 }

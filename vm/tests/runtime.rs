@@ -1,7 +1,7 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 
 use vm::RuntimeContext;
-use vm::{Float, HandleSlice, Smi, Value};
+use vm::{Float, HandleSlice, Smi, Tagged, Value};
 use vm::{Thread, VM, VmError};
 
 fn float(thread: &mut Thread, v: f64) -> Value {
@@ -12,22 +12,21 @@ fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
-fn smi_add(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    let (a, b) = {
-        let heap = &*nctx.heap();
-        match (
-            args.get(1).map(|h| h.as_tagged(heap)),
-            args.get(2).map(|h| h.as_tagged(heap)),
-        ) {
-            (Some(a), Some(b)) => (a.raw(), b.raw()),
-            _ => return Err(VmError::Arity),
-        }
+fn smi_add<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
+    let (a, b) = match (
+        args.get(1).map(|h| h.as_tagged(heap)),
+        args.get(2).map(|h| h.as_tagged(heap)),
+    ) {
+        (Some(a), Some(b)) => (a.raw(), b.raw()),
+        _ => return Err(VmError::Arity),
     };
-    let (a, b) = (
-        Smi::decode(a).ok_or(VmError::Type)?,
-        Smi::decode(b).ok_or(VmError::Type)?,
-    );
-    Ok(Smi::new(a.value() + b.value()).encode())
+    let a = Smi::decode(a).ok_or(VmError::Type)?;
+    let b = Smi::decode(b).ok_or(VmError::Type)?;
+    Ok(Tagged::from(Smi::new(a.value() + b.value())))
 }
 
 #[test]
@@ -54,9 +53,12 @@ fn registered_runtime_invokes_and_checks_types() {
 
 #[test]
 fn runtime_result_is_boxed_when_not_smi() {
-    fn fadd(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+    fn fadd<'a>(
+        nctx: RuntimeContext<'a>,
+        args: HandleSlice<'_>,
+    ) -> Result<Tagged<'a, Value>, VmError> {
+        let RuntimeContext { heap, .. } = nctx;
         let sum = {
-            let heap = &*nctx.heap();
             let (a, b) = match (
                 args.get(1).map(|h| h.as_tagged(heap)),
                 args.get(2).map(|h| h.as_tagged(heap)),
@@ -66,9 +68,9 @@ fn runtime_result_is_boxed_when_not_smi() {
             };
             let fa = a.get_as::<Float>().ok_or(VmError::Type)?.value.get();
             let fb = b.get_as::<Float>().ok_or(VmError::Type)?.value.get();
-            Ok::<f64, VmError>(fa + fb)
-        }?;
-        nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum).raw()))
+            fa + fb
+        };
+        Ok(heap.new_number(sum))
     }
 
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -144,15 +146,17 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
 #[test]
 fn register_runtime_appends_after_well_known() {
-    fn double(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-        let heap = &*nctx.heap();
-        match args.get(1).map(|h| h.as_tagged(heap)) {
-            Some(v) => {
-                let v = Smi::decode(v.raw()).ok_or(VmError::Type)?;
-                Ok(Smi::new(v.value() * 2).encode())
-            }
-            None => Err(VmError::Arity),
-        }
+    fn double<'a>(
+        nctx: RuntimeContext<'a>,
+        args: HandleSlice<'_>,
+    ) -> Result<Tagged<'a, Value>, VmError> {
+        let RuntimeContext { heap, .. } = nctx;
+        let v = args
+            .get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
+        let v = Smi::decode(v.raw()).ok_or(VmError::Type)?;
+        Ok(Tagged::from(Smi::new(v.value() * 2)))
     }
 
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
