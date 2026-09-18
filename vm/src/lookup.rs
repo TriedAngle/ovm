@@ -95,9 +95,7 @@ pub fn load_outcome_on<'a>(
     name: Tagged<'a, SlotName>,
 ) -> Result<LoadOutcome<'a>, VmError> {
     let known = heap.known();
-    if holder.raw() == known.null.as_tagged(heap).raw()
-        || holder.raw() == known.undefined.as_tagged(heap).raw()
-    {
+    if holder == known.null.as_tagged(heap) || holder == known.undefined.as_tagged(heap) {
         return Err(VmError::Type);
     }
     if let Some(obj) = holder.as_heap_object()
@@ -121,7 +119,7 @@ pub fn load_outcome_on<'a>(
         Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.get(heap))),
         Lookup::Accessor { pair, .. } => {
             let getter = pair.get.get(heap);
-            if getter.raw() == known.undefined.as_tagged(heap).raw() {
+            if getter == known.undefined.as_tagged(heap) {
                 Ok(LoadOutcome::Value(known.undefined.as_tagged(heap).erase()))
             } else {
                 Ok(LoadOutcome::Getter(getter))
@@ -261,7 +259,7 @@ fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> boo
             return true;
         }
         let proto = obj.as_ref().header.map.heap_ref(heap).prototype.get(heap);
-        if proto.raw() == heap.known().null.as_tagged(heap).raw() || !proto.is_strong_ptr() {
+        if proto == heap.known().null.as_tagged(heap) || !proto.is_strong_ptr() {
             return false;
         }
         if let Some(parents) = proto.get_as::<FixedArray>() {
@@ -315,7 +313,7 @@ pub fn lookup_in_parents<'a>(
     proto: Tagged<'a, Value>,
     name: Tagged<'a, SlotName>,
 ) -> Lookup<'a> {
-    if proto.raw() == heap.known().null.as_tagged(heap).raw() {
+    if proto == heap.known().null.as_tagged(heap) {
         return Lookup::NotFound;
     }
     if let Some(parents) = proto.get_as::<FixedArray>() {
@@ -349,7 +347,7 @@ fn super_start_from_proto<'a>(heap: &'a Heap, proto: Option<Tagged<'a, Value>>) 
     let Some(proto) = proto else {
         return SuperStart::End;
     };
-    if proto.raw() == heap.known().null.as_tagged(heap).raw() || !proto.is_strong_ptr() {
+    if proto == heap.known().null.as_tagged(heap) || !proto.is_strong_ptr() {
         return SuperStart::End;
     }
     if let Some(parents) = proto.get_as::<FixedArray>() {

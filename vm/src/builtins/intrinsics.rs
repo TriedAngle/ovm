@@ -415,8 +415,8 @@ fn for_in_initial_level(heap: &Heap, subject: Tagged<'_, Value>) -> Option<Value
         "Number"
     } else if subject.get_as::<Float>().is_some() {
         "Number"
-    } else if subject.raw() == heap.known().true_object.as_tagged(heap).raw()
-        || subject.raw() == heap.known().false_object.as_tagged(heap).raw()
+    } else if subject == heap.known().true_object.as_tagged(heap)
+        || subject == heap.known().false_object.as_tagged(heap)
     {
         "Boolean"
     } else if subject.get_as::<Symbol>().is_some() {
@@ -1412,7 +1412,7 @@ fn dynamic_slot<'a>(
         let ctx = context.as_ref();
         let names = ctx.scope_info.heap_ref(heap).as_ref().names.heap_ref(heap);
         for i in 0..names.len() {
-            if names.at(heap, i).raw() == name {
+            if names.at(heap, i) == name {
                 return Ok(ctx.slots.heap_ref(heap).as_ref().element_slot(i));
             }
         }
@@ -1917,7 +1917,7 @@ fn throw_if_not_constructor_or_null(
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
     let v = args.get(heap, 0).ok_or(VmError::Arity)?;
-    let ok = if v.raw() == heap.known().null.as_tagged(heap).raw() {
+    let ok = if v == heap.known().null.as_tagged(heap) {
         true
     } else {
         v.as_heap_object().is_some_and(|obj| {

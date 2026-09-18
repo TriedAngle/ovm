@@ -87,7 +87,7 @@ fn add_smi_temps_above_locals() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadSmi 1",
         "Store 2",
@@ -111,7 +111,7 @@ fn nested_binary_reuses_temps() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadSmi 1",
         "Store 2",
@@ -139,7 +139,7 @@ fn strict_equality_yields_singletons_and_not_flips() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadSmi 1",
         "Store 2",
@@ -148,9 +148,9 @@ fn strict_equality_yields_singletons_and_not_flips() {
         "Load 2",
         "EqualStrict 3",
         "JumpIfTruthy 28",
-        "LdaTrue",
+        "LoadTrue",
         "Jump 29",
-        "LdaFalse",
+        "LoadFalse",
         "Store 1",
         "PopContext 0",
         "Load 1",
@@ -166,7 +166,7 @@ fn number_literals_outside_smi_range_become_constants() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadConstant #f64[1.5]",
         "Store 2",
@@ -186,7 +186,7 @@ fn number_literals_outside_smi_range_become_constants() {
 fn string_literal_is_interned_constant() {
     let script = compile("'a' + 'b';").unwrap();
     let out = body(&script);
-    assert_eq!(out[2], "LdaUndefined");
+    assert_eq!(out[2], "LoadUndefined");
     assert!(out[4].starts_with("LoadConstant #str["));
     assert!(out[6].starts_with("LoadConstant #str["));
 }
@@ -198,7 +198,7 @@ fn var_declaration_stores_into_local() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 2",
         "LoadSmi 5",
         "Store 0",
@@ -219,9 +219,9 @@ fn var_without_init_stores_undefined() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 2",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 0",
         "Load 0",
         "PopContext 1",
@@ -240,7 +240,7 @@ fn let_has_tdz_hole_check() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 2",
         "Load 0",
         "ThrowReferenceErrorIfHole",
@@ -259,7 +259,7 @@ fn if_else_jumps() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadSmi 1",
         "JumpIfFalsy 21",
@@ -282,7 +282,7 @@ fn while_loop_back_edge() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadSmi 0",
         "JumpIfFalsy 21",
@@ -303,7 +303,7 @@ fn for_loop_with_update_and_condition() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 2",
         "LoadSmi 0",
         "Store 0",
@@ -320,7 +320,7 @@ fn for_loop_with_update_and_condition() {
         "Store 3",
         "LoadSmi 1",
         "Store 4",
-        "LdaZero",
+        "LoadZero",
         "Store 5",
         "Load 3",
         "Sub 5",
@@ -342,11 +342,11 @@ fn plain_call_receiver_is_undefined() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "Store 5",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 2",
         "LoadSmi 6",
         "Store 3",
@@ -368,7 +368,7 @@ fn method_call_passes_receiver() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "Store 2",
@@ -392,7 +392,7 @@ fn new_construct_with_args() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "Store 3",
@@ -414,7 +414,7 @@ fn property_load_and_store() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "Store 2",
@@ -439,7 +439,7 @@ fn keyed_load_and_store() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "Store 2",
@@ -467,7 +467,7 @@ fn array_literal_skips_holes() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "CreateEmptyArrayLiteral",
         "Store 2",
@@ -495,7 +495,7 @@ fn object_literal_shadow_stores() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "CreateEmptyObjectLiteral",
         "Store 2",
@@ -519,7 +519,7 @@ fn logical_and_short_circuits() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "Store 2",
@@ -542,7 +542,7 @@ fn conditional_expression() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "JumpIfFalsy 20",
@@ -564,9 +564,9 @@ fn throw_and_catch_binds_param() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 2",
-        "LdaContext",
+        "LoadContext",
         "Store 3",
         "LoadSmi 42",
         "Throw",
@@ -595,13 +595,13 @@ fn function_declaration_creates_closure_and_stores() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 1",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 2",
         "CreateClosure #fn[1]",
         "Store 0",
         "Load 0",
         "Store 4",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 3",
         "CallNoFeedback 4 3 1",
         "Store 2",
@@ -628,7 +628,7 @@ fn function_declaration_creates_closure_and_stores() {
             "PopContext",
             "Return",
             "PopContext",
-            "LdaUndefined",
+            "LoadUndefined",
             "Return",
         ]
     );
@@ -709,7 +709,7 @@ fn switch_compiles_to_strict_equal_chain() {
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
-        "LdaUndefined",
+        "LoadUndefined",
         "Store 1",
         "LoadGlobal 1 0",
         "Store 2",

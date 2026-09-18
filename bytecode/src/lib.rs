@@ -200,46 +200,63 @@ pub enum Opcode {
     Wide,
     Return,
 
-    Load,  // reg -> acc
-    Store, // acc -> reg
-
+    // -- accumulator loads -------------------------------------------------
+    Load,         // reg -> acc
     LoadSmi,      // imm -> acc
     LoadConstant, // idx -> acc
 
     // well-known singletons: the hottest loaded values skip the
     // constant-pool round trip (1-byte instructions, no pool slot)
-    LdaZero,      // -> acc (Smi 0)
-    LdaUndefined, // -> acc
-    LdaNull,      // -> acc
-    LdaTrue,      // -> acc
-    LdaFalse,     // -> acc
+    LoadZero,      // -> acc (Smi 0)
+    LoadUndefined, // -> acc
+    LoadNull,      // -> acc
+    LoadTrue,      // -> acc
+    LoadFalse,     // -> acc
+    /// acc = TheHole (TDZ staging of non-simple parameter lists)
+    LoadHole, // -> acc
+
+    // I don't think we need this right now, LoadConstant should be enough?
+    LoadGlobal, // idx (constant pool name) idx (feedback) -> acc
+    // typeof on an unresolved global yields "undefined" instead of throwing
+    LoadGlobalNoThrow, // idx (constant pool name) idx (feedback) -> acc
+
+    // dynamic name resolution (direct eval) walks the frame context chain
+    // by name through RuntimeFn::Load/StoreDynamicName
+    LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
+    LoadKeyedProperty, // reg (obj) idx (feedback); key in acc -> acc
+
+    // new.target of the current frame (undefined for plain calls)
+    LoadNewTarget, // -> acc
+
+    // -- stores ------------------------------------------------------------
+    Store,       // acc -> reg
+    StoreGlobal, // acc -> idx (constant pool name) idx (feedback)
+
+    StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
+    // write-through variant: inherited data properties are written at the
+    // holder, never shadowed on the receiver
+    StoreNamedPropertyNoShadow, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
+
+    StoreKeyedProperty,         // acc -> reg (obj) reg (key) idx (feedback)
+    StoreKeyedPropertyNoShadow, // acc -> reg (obj) reg (key) idx (feedback)
 
     Move, // reg -> reg
 
-    // I don't think we need this right now, LoadConstant should be enough?
-    LoadGlobal,  // idx (constant pool name) idx (feedback) -> acc
-    StoreGlobal, // acc -> idx (constant pool name) idx (feedback)
-    // typeof on an unresolved global yields "undefined" instead of throwing
-    LoadGlobalNoThrow, // idx (constant pool name) idx (feedback) -> acc
-    LoadContextSlot,   // idx (slot) uimm (depth) -> acc; from the frame context
-    StoreContextSlot,  // acc -> idx (slot) uimm (depth); frame context
+    // -- contexts ----------------------------------------------------------
+    LoadContextSlot,  // idx (slot) uimm (depth) -> acc; from the frame context
+    StoreContextSlot, // acc -> idx (slot) uimm (depth); frame context
 
     CreateFunctionContext, // idx (constants: the scope's ScopeInfo) -> acc; outer = frame context
     CreateBlockContext,    // uimm (slot count) -> acc; outer = frame context
     PushContext,           // acc (context) -> frame context; reg <- old context
     PopContext,            // reg (context) -> frame context
     ThrowReferenceErrorIfHole, // acc -> throw ReferenceError if the hole
-    // dynamic name resolution (direct eval) walks the frame context chain
-    // by name through RuntimeFn::Load/StoreDynamicName
-    LoadNamedProperty, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
-    StoreNamedProperty, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
-    // write-through variant: inherited data properties are written at the
-    // holder, never shadowed on the receiver
-    StoreNamedPropertyNoShadow, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
 
-    LoadKeyedProperty,          // reg (obj) idx (feedback); key in acc -> acc
-    StoreKeyedProperty,         // acc -> reg (obj) reg (key) idx (feedback)
-    StoreKeyedPropertyNoShadow, // acc -> reg (obj) reg (key) idx (feedback)
+    // the frame's current context (PushContext/PopContext operand value);
+    // lets the compiler snapshot it for absolute restores (try handlers)
+    LoadContext, // -> acc
+
+    // -- calls -------------------------------------------------------------
 
     // for methods the `self` is the first element in the reglist
     Call,           // reg (callee) reglist (base) regcount (count) idx (feedback) -> acc
@@ -248,20 +265,16 @@ pub enum Opcode {
 
     Construct, // reg (callee) reglist (base) regcount (count) -> acc
 
+    // -- literals and closures --------------------------------------------
     CreateEmptyObjectLiteral, // -> acc (object_initial_map, no slots)
     CreateEmptyArrayLiteral,  // -> acc (js_array_map, empty elements)
 
     CreateClosure, // idx -> acc
 
-    // -- classes -----------------------------------------------------------
-
-    // new.target of the current frame (undefined for plain calls)
-    LdaNewTarget, // -> acc
     // the currently executing closure (frame callable)
-    LdaCurrentClosure, // -> acc
-    // the frame's current context (PushContext/PopContext operand value);
-    // lets the compiler snapshot it for absolute restores (try handlers)
-    LdaContext, // -> acc
+    LoadCurrentClosure, // -> acc
+
+    // -- binary arithmetic -------------------------------------------------
 
     // binary arithmetic: acc = acc op reg
     Add, // reg
@@ -277,12 +290,17 @@ pub enum Opcode {
     ShiftRight,
     ShiftRightLogical,
 
+    // -- control flow (jumps and branches) --------------------------------
     Jump,     // imm (offset)
     JumpLoop, // imm (negative offset); safepoint-polls before jumping
 
     JumpIfTruthy, // imm; jump if ToBoolean(acc) == true
     JumpIfFalsy,  // imm; jump if ToBoolean(acc) == false
 
+    /// jump unless acc is `undefined` (pattern/param default guards)
+    JumpIfNotUndefined, // imm (offset)
+
+    // -- tests and comparisons --------------------------------------------
     TestReferenceEqual, // reg; acc = true singleton iff bits(reg) == bits(acc), else false
 
     TestTypeof, // -> acc = interned type string
@@ -300,11 +318,6 @@ pub enum Opcode {
     // exception handling
     Throw,   // acc -> pending exception
     ReThrow, // acc -> pending exception
-
-    /// acc = TheHole (TDZ staging of non-simple parameter lists)
-    LdaHole, // -> acc
-    /// jump unless acc is `undefined` (pattern/param default guards)
-    JumpIfNotUndefined, // imm (offset)
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -392,18 +405,26 @@ impl Opcode {
             b if b == Wide as u8 => Wide,
             b if b == Return as u8 => Return,
             b if b == Load as u8 => Load,
-            b if b == Store as u8 => Store,
             b if b == LoadSmi as u8 => LoadSmi,
             b if b == LoadConstant as u8 => LoadConstant,
-            b if b == LdaZero as u8 => LdaZero,
-            b if b == LdaUndefined as u8 => LdaUndefined,
-            b if b == LdaNull as u8 => LdaNull,
-            b if b == LdaTrue as u8 => LdaTrue,
-            b if b == LdaFalse as u8 => LdaFalse,
-            b if b == Move as u8 => Move,
+            b if b == LoadZero as u8 => LoadZero,
+            b if b == LoadUndefined as u8 => LoadUndefined,
+            b if b == LoadNull as u8 => LoadNull,
+            b if b == LoadTrue as u8 => LoadTrue,
+            b if b == LoadFalse as u8 => LoadFalse,
+            b if b == LoadHole as u8 => LoadHole,
             b if b == LoadGlobal as u8 => LoadGlobal,
-            b if b == StoreGlobal as u8 => StoreGlobal,
             b if b == LoadGlobalNoThrow as u8 => LoadGlobalNoThrow,
+            b if b == LoadNamedProperty as u8 => LoadNamedProperty,
+            b if b == LoadKeyedProperty as u8 => LoadKeyedProperty,
+            b if b == LoadNewTarget as u8 => LoadNewTarget,
+            b if b == Store as u8 => Store,
+            b if b == StoreGlobal as u8 => StoreGlobal,
+            b if b == StoreNamedProperty as u8 => StoreNamedProperty,
+            b if b == StoreNamedPropertyNoShadow as u8 => StoreNamedPropertyNoShadow,
+            b if b == StoreKeyedProperty as u8 => StoreKeyedProperty,
+            b if b == StoreKeyedPropertyNoShadow as u8 => StoreKeyedPropertyNoShadow,
+            b if b == Move as u8 => Move,
             b if b == LoadContextSlot as u8 => LoadContextSlot,
             b if b == StoreContextSlot as u8 => StoreContextSlot,
             b if b == CreateFunctionContext as u8 => CreateFunctionContext,
@@ -411,12 +432,7 @@ impl Opcode {
             b if b == PushContext as u8 => PushContext,
             b if b == PopContext as u8 => PopContext,
             b if b == ThrowReferenceErrorIfHole as u8 => ThrowReferenceErrorIfHole,
-            b if b == LoadNamedProperty as u8 => LoadNamedProperty,
-            b if b == StoreNamedProperty as u8 => StoreNamedProperty,
-            b if b == StoreNamedPropertyNoShadow as u8 => StoreNamedPropertyNoShadow,
-            b if b == LoadKeyedProperty as u8 => LoadKeyedProperty,
-            b if b == StoreKeyedProperty as u8 => StoreKeyedProperty,
-            b if b == StoreKeyedPropertyNoShadow as u8 => StoreKeyedPropertyNoShadow,
+            b if b == LoadContext as u8 => LoadContext,
             b if b == Call as u8 => Call,
             b if b == CallNoFeedback as u8 => CallNoFeedback,
             b if b == CallRuntime as u8 => CallRuntime,
@@ -424,9 +440,7 @@ impl Opcode {
             b if b == CreateEmptyObjectLiteral as u8 => CreateEmptyObjectLiteral,
             b if b == CreateEmptyArrayLiteral as u8 => CreateEmptyArrayLiteral,
             b if b == CreateClosure as u8 => CreateClosure,
-            b if b == LdaNewTarget as u8 => LdaNewTarget,
-            b if b == LdaCurrentClosure as u8 => LdaCurrentClosure,
-            b if b == LdaContext as u8 => LdaContext,
+            b if b == LoadCurrentClosure as u8 => LoadCurrentClosure,
             b if b == Add as u8 => Add,
             b if b == Sub as u8 => Sub,
             b if b == Mul as u8 => Mul,
@@ -443,6 +457,7 @@ impl Opcode {
             b if b == JumpLoop as u8 => JumpLoop,
             b if b == JumpIfTruthy as u8 => JumpIfTruthy,
             b if b == JumpIfFalsy as u8 => JumpIfFalsy,
+            b if b == JumpIfNotUndefined as u8 => JumpIfNotUndefined,
             b if b == TestReferenceEqual as u8 => TestReferenceEqual,
             b if b == TestTypeof as u8 => TestTypeof,
             b if b == Negate as u8 => Negate,
@@ -455,8 +470,6 @@ impl Opcode {
             b if b == GreaterThanOrEqual as u8 => GreaterThanOrEqual,
             b if b == Throw as u8 => Throw,
             b if b == ReThrow as u8 => ReThrow,
-            b if b == LdaHole as u8 => LdaHole,
-            b if b == JumpIfNotUndefined as u8 => JumpIfNotUndefined,
             _ => return None,
         })
     }
@@ -467,37 +480,39 @@ impl Opcode {
             Self::Wide | Self::Return | Self::Throw | Self::ReThrow => &[],
 
             Self::Load => &[Register],
-            Self::Store => &[Register],
-
             Self::LoadSmi => &[Immediate],
             Self::LoadConstant => &[Index],
 
-            Self::LdaZero | Self::LdaUndefined | Self::LdaNull | Self::LdaTrue | Self::LdaFalse => {
-                &[]
+            Self::LoadZero
+            | Self::LoadUndefined
+            | Self::LoadNull
+            | Self::LoadTrue
+            | Self::LoadFalse
+            | Self::LoadHole => &[],
+
+            Self::LoadGlobal | Self::LoadGlobalNoThrow => &[Index, Index],
+            Self::LoadNamedProperty => &[Register, Index, Index],
+            Self::LoadKeyedProperty => &[Register, Index],
+            Self::LoadNewTarget => &[],
+
+            Self::Store => &[Register],
+            Self::StoreGlobal => &[Index, Index],
+            Self::StoreNamedProperty | Self::StoreNamedPropertyNoShadow => {
+                &[Register, Index, Index]
+            }
+            Self::StoreKeyedProperty | Self::StoreKeyedPropertyNoShadow => {
+                &[Register, Register, Index]
             }
 
             Self::Move => &[Register, Register],
 
-            Self::LoadGlobal | Self::LoadGlobalNoThrow => &[Index, Index],
-            Self::StoreGlobal => &[Index, Index],
-
             Self::LoadContextSlot => &[Index, UImmediate],
             Self::StoreContextSlot => &[Index, UImmediate],
-
             Self::CreateFunctionContext => &[Index],
             Self::CreateBlockContext => &[UImmediate],
             Self::PushContext | Self::PopContext => &[Register],
             Self::ThrowReferenceErrorIfHole => &[],
-
-            Self::LoadNamedProperty => &[Register, Index, Index],
-            Self::StoreNamedProperty | Self::StoreNamedPropertyNoShadow => {
-                &[Register, Index, Index]
-            }
-
-            Self::LoadKeyedProperty => &[Register, Index],
-            Self::StoreKeyedProperty | Self::StoreKeyedPropertyNoShadow => {
-                &[Register, Register, Index]
-            }
+            Self::LoadContext => &[],
 
             Self::Call => &[Register, RegisterListStart, RegisterCount, Index],
             Self::CallNoFeedback => &[Register, RegisterListStart, RegisterCount],
@@ -506,8 +521,7 @@ impl Opcode {
 
             Self::CreateEmptyObjectLiteral | Self::CreateEmptyArrayLiteral => &[],
             Self::CreateClosure => &[Index],
-
-            Self::LdaNewTarget | Self::LdaCurrentClosure | Self::LdaContext => &[],
+            Self::LoadCurrentClosure => &[],
 
             Self::Add
             | Self::Sub
@@ -522,9 +536,12 @@ impl Opcode {
             | Self::ShiftRight
             | Self::ShiftRightLogical => &[Register],
 
-            Self::Jump | Self::JumpLoop | Self::JumpIfTruthy | Self::JumpIfFalsy => &[Immediate],
-            Self::JumpIfNotUndefined => &[Immediate],
-            Self::TestTypeof | Self::Negate => &[],
+            Self::Jump
+            | Self::JumpLoop
+            | Self::JumpIfTruthy
+            | Self::JumpIfFalsy
+            | Self::JumpIfNotUndefined => &[Immediate],
+
             Self::TestReferenceEqual
             | Self::EqualStrict
             | Self::Equal
@@ -534,7 +551,7 @@ impl Opcode {
             | Self::GreaterThanOrEqual
             | Self::InstanceOf => &[Register],
 
-            Self::LdaHole => &[],
+            Self::TestTypeof | Self::Negate => &[],
         }
     }
 
