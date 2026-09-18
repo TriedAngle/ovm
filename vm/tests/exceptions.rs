@@ -279,7 +279,8 @@ fn stack_overflow_during_call_is_throwable() {
     });
     thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
@@ -293,7 +294,7 @@ fn stack_overflow_during_call_is_throwable() {
                 }
                 _ => panic!("error object must have a name property"),
             }
-        });
+        };
     });
     // unwinding must not have consumed additional stack: the thread is
     // immediately usable again

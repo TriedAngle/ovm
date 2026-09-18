@@ -128,7 +128,7 @@ macro_rules! define_well_known_strings {
                 Self {
                     $($field: {
                         let interned = interner.intern_str(heap, roots, $text);
-                        heap.no_gc(|heap| roots.create_handle(interned.as_tagged(heap)))
+    roots.create_handle(interned.as_tagged(heap))
                     },)*
                 }
             }
@@ -313,13 +313,11 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         descriptors: &[],
         prototype: roots.create_handle(Smi::new(0)),
     }));
-    heap.no_gc(|heap| {
-        map_map.heap_ref(heap).header.map.set(
-            heap,
-            map_map.as_tagged(heap).raw(),
-            map_map.as_tagged(heap),
-        );
-    });
+    map_map.heap_ref(heap).header.map.set(
+        heap,
+        map_map.as_tagged(heap).raw(),
+        map_map.as_tagged(heap),
+    );
     known.map_map = map_map;
     heap.set_known(known);
 
@@ -359,21 +357,19 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.null_map = null_map;
     heap.set_known(known);
 
-    heap.no_gc(|heap| {
-        map_map.heap_ref(heap).transitions.clear(heap);
-        the_hole_map.heap_ref(heap).transitions.clear(heap);
-        null_map.heap_ref(heap).transitions.clear(heap);
-        the_hole_map.heap_ref(heap).prototype.set(
-            heap,
-            the_hole_map.as_tagged(heap).raw(),
-            null.as_tagged(heap).erase(),
-        );
-        null_map.heap_ref(heap).prototype.set(
-            heap,
-            null_map.as_tagged(heap).raw(),
-            null.as_tagged(heap).erase(),
-        );
-    });
+    map_map.heap_ref(heap).transitions.clear(heap);
+    the_hole_map.heap_ref(heap).transitions.clear(heap);
+    null_map.heap_ref(heap).transitions.clear(heap);
+    the_hole_map.heap_ref(heap).prototype.set(
+        heap,
+        the_hole_map.as_tagged(heap).raw(),
+        null.as_tagged(heap).erase(),
+    );
+    null_map.heap_ref(heap).prototype.set(
+        heap,
+        null_map.as_tagged(heap).raw(),
+        null.as_tagged(heap).erase(),
+    );
 
     // builtin maps: every allocation init path looks these up, so they must
     // exist before any other object is created (incl. interned strings)
@@ -604,41 +600,39 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     heap.set_known(known);
 
     let null = known.null;
-    heap.no_gc(|heap| {
-        let o = null.heap_ref(heap);
-        o.slots.set(
+    let o = null.heap_ref(heap);
+    o.slots.set(
+        heap,
+        null.as_tagged(heap).raw(),
+        known.empty_fixed_array.as_tagged(heap),
+    );
+    o.elements.set(
+        heap,
+        null.as_tagged(heap).raw(),
+        known.empty_fixed_array.as_tagged(heap).erase(),
+    );
+    // ordinary function objects' [[Prototype]] is %Function.prototype%
+    // (ES 19.2.3.1): function_map was created with a null placeholder
+    // in bootstrap_basics
+    known.function_map.heap_ref(heap).prototype.set(
+        heap,
+        known.function_map.as_tagged(heap).raw(),
+        function_prototype.as_tagged(heap).erase(),
+    );
+    known
+        .non_constructor_function_map
+        .heap_ref(heap)
+        .prototype
+        .set(
             heap,
-            null.as_tagged(heap).raw(),
-            known.empty_fixed_array.as_tagged(heap),
-        );
-        o.elements.set(
-            heap,
-            null.as_tagged(heap).raw(),
-            known.empty_fixed_array.as_tagged(heap).erase(),
-        );
-        // ordinary function objects' [[Prototype]] is %Function.prototype%
-        // (ES 19.2.3.1): function_map was created with a null placeholder
-        // in bootstrap_basics
-        known.function_map.heap_ref(heap).prototype.set(
-            heap,
-            known.function_map.as_tagged(heap).raw(),
+            known.non_constructor_function_map.as_tagged(heap).raw(),
             function_prototype.as_tagged(heap).erase(),
         );
-        known
-            .non_constructor_function_map
-            .heap_ref(heap)
-            .prototype
-            .set(
-                heap,
-                known.non_constructor_function_map.as_tagged(heap).raw(),
-                function_prototype.as_tagged(heap).erase(),
-            );
-        known.class_constructor_map.heap_ref(heap).prototype.set(
-            heap,
-            known.class_constructor_map.as_tagged(heap).raw(),
-            function_prototype.as_tagged(heap).erase(),
-        );
-    });
+    known.class_constructor_map.heap_ref(heap).prototype.set(
+        heap,
+        known.class_constructor_map.as_tagged(heap).raw(),
+        function_prototype.as_tagged(heap).erase(),
+    );
 }
 
 pub struct KnownCell {

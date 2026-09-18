@@ -35,21 +35,19 @@ impl Runtime {
         info: Handle<'_, CallableInfoObject>,
         context: Handle<'_, Context>,
     ) -> Result<Tagged<'a, Value>, VmError> {
-        let (kind, source_name, formal_length) = heap.no_gc(|heap| {
+        let (kind, source_name, formal_length) = {
             let info = info.heap_ref(heap);
             (
                 info.function_kind(),
                 info.name(heap).map(|name| name.raw()),
                 info.formal_length(),
             )
-        });
+        };
         let function_name = match source_name {
             // Safety: the word was read under an anchor one statement ago;
             // no allocation has run since.
             Some(name) => scope.handle(unsafe { name.assume_valid(heap) }),
-            None => {
-                heap.no_gc(|heap| scope.handle(heap.known().strings.empty.as_tagged(heap).erase()))
-            }
+            None => scope.handle(heap.known().strings.empty.as_tagged(heap).erase()),
         };
         let map = match kind {
             kind if kind.is_class_constructor() => heap.known().class_constructor_map,
@@ -59,21 +57,17 @@ impl Runtime {
         // class constructors carry a third hidden slot: the instance-field
         // array ([key0, init0, ...]); undefined until SetClassFields
         let function = if kind.is_class_constructor() {
-            let args = heap.no_gc(|heap| {
-                scope.stage(&[
-                    info.as_tagged(heap).erase(),
-                    context.as_tagged(heap).erase(),
-                    heap.known().undefined.as_tagged(heap).erase(),
-                ])
-            });
+            let args = scope.stage(&[
+                info.as_tagged(heap).erase(),
+                context.as_tagged(heap).erase(),
+                heap.known().undefined.as_tagged(heap).erase(),
+            ]);
             heap.new_object(scope, map, args).into_handle(scope)
         } else {
-            let args = heap.no_gc(|heap| {
-                scope.stage(&[
-                    info.as_tagged(heap).erase(),
-                    context.as_tagged(heap).erase(),
-                ])
-            });
+            let args = scope.stage(&[
+                info.as_tagged(heap).erase(),
+                context.as_tagged(heap).erase(),
+            ]);
             heap.new_object(scope, map, args).into_handle(scope)
         };
 
@@ -163,21 +157,22 @@ impl Runtime {
         value: Handle<'_, Value>,
         hint: Hint,
     ) -> Result<Coercion<'a>, VmError> {
-        if heap.no_gc(|heap| Convert::is_primitive(heap, value.as_tagged(heap))) {
+        let cond_0 = Convert::is_primitive(heap, value.as_tagged(heap));
+        if cond_0 {
             return Ok(Coercion::Value(value.as_tagged(heap)));
         }
         // the receiver stays rooted throughout: method lookups and calls
         // below run user code (getters, valueOf/toString), which allocates
         // and would leave a raw copy dangling
         state.handle_scope(|scope| {
-            let (exception, undefined, null) = heap.no_gc(|heap| {
+            let (exception, undefined, null) = {
                 let known = heap.known();
                 (
                     known.exception.as_tagged(heap).raw(),
                     known.undefined.as_tagged(heap).raw(),
                     known.null.as_tagged(heap).raw(),
                 )
-            });
+            };
 
             let to_primitive_symbol =
                 scope.handle(heap.known().to_primitive_symbol.as_tagged(heap).erase());
@@ -193,34 +188,35 @@ impl Runtime {
                     // GetMethod: a non-callable, non-nullish method is a TypeError
                     return Err(VmError::Type);
                 }
-                let hint_string = heap.no_gc(|heap| {
+                let hint_string = {
                     let s = heap.known().strings;
                     match hint {
                         Hint::Default => s.default.as_tagged(heap).raw(),
                         Hint::Number => s.number.as_tagged(heap).raw(),
                         Hint::String => s.string.as_tagged(heap).raw(),
                     }
-                });
+                };
                 let args =
                     scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(hint_string) }]);
                 let result = NativeContext::new(vm, heap, state).call_rooted(exotic, args)?;
                 if result == exception {
                     return Ok(Coercion::Threw);
                 }
-                return if heap
-                    .no_gc(|heap| Convert::is_primitive(heap, unsafe { result.assume_valid(heap) }))
-                {
-                    // Safety: the call above just returned; no GC since.
-                    Ok(Coercion::Value(unsafe {
-                        Tagged::from_value_unchecked(result)
-                    }))
-                } else {
-                    Err(VmError::Type)
+                return {
+                    let cond_1 = Convert::is_primitive(heap, unsafe { result.assume_valid(heap) });
+                    if cond_1 {
+                        // Safety: the call above just returned; no GC since.
+                        Ok(Coercion::Value(unsafe {
+                            Tagged::from_value_unchecked(result)
+                        }))
+                    } else {
+                        Err(VmError::Type)
+                    }
                 };
             }
 
             // 2. OrdinaryToPrimitive: hint string → toString first, else valueOf first
-            let method_names: [Handle<'_, Value>; 2] = heap.no_gc(|heap| {
+            let method_names: [Handle<'_, Value>; 2] = {
                 let s = heap.known().strings;
                 if hint == Hint::String {
                     [
@@ -233,7 +229,7 @@ impl Runtime {
                         scope.handle(s.to_string.as_tagged(heap).erase()),
                     ]
                 }
-            });
+            };
             for name in method_names {
                 let method = Self::get_property(vm, heap, state, value, name)?;
                 let method = match method {
@@ -251,13 +247,14 @@ impl Runtime {
                 if result == exception {
                     return Ok(Coercion::Threw);
                 }
-                if heap
-                    .no_gc(|heap| Convert::is_primitive(heap, unsafe { result.assume_valid(heap) }))
                 {
-                    // Safety: the call above just returned; no GC since.
-                    return Ok(Coercion::Value(unsafe {
-                        Tagged::from_value_unchecked(result)
-                    }));
+                    let cond_2 = Convert::is_primitive(heap, unsafe { result.assume_valid(heap) });
+                    if cond_2 {
+                        // Safety: the call above just returned; no GC since.
+                        return Ok(Coercion::Value(unsafe {
+                            Tagged::from_value_unchecked(result)
+                        }));
+                    }
                 }
                 // object result: try the next method name
             }
@@ -279,9 +276,7 @@ impl Runtime {
                 // root the anchored result to release the heap borrow
                 Coercion::Value(v) => {
                     let v = scope.handle(v);
-                    Ok(Some(heap.no_gc(|heap| {
-                        Convert::to_number(heap, v.as_tagged(heap))
-                    })?))
+                    Ok(Some({ Convert::to_number(heap, v.as_tagged(heap)) }?))
                 }
             }
         })
@@ -335,11 +330,12 @@ impl Runtime {
         receiver: Handle<'_, Value>,
         name: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
-        if heap.no_gc(|heap| is_proxy(heap, holder.as_tagged(heap))) {
+        let cond_3 = is_proxy(heap, holder.as_tagged(heap));
+        if cond_3 {
             return get(vm, heap, state, holder, receiver, name);
         }
         state.handle_scope(|scope| -> Result<Coercion<'a>, VmError> {
-            let exception = heap.no_gc(|heap| heap.known().exception.as_tagged(heap).raw());
+            let exception = heap.known().exception.as_tagged(heap).raw();
             let loaded = {
                 let heap_ref: &Heap = heap;
                 load_outcome_on(
@@ -377,11 +373,12 @@ impl Runtime {
         scope: &'s HandleScope<'_>,
         attrs: Handle<'_, Value>,
     ) -> Result<Option<PartialDescriptor<'s>>, VmError> {
-        if heap.no_gc(|heap| Convert::is_primitive(heap, attrs.as_tagged(heap))) {
+        let cond_4 = Convert::is_primitive(heap, attrs.as_tagged(heap));
+        if cond_4 {
             return Err(VmError::Type);
         }
         let attrs = scope.handle(attrs.as_tagged(heap));
-        let names: [Handle<'_, Value>; 6] = heap.no_gc(|heap| {
+        let names: [Handle<'_, Value>; 6] = {
             let s = heap.known().strings;
             [
                 s.value,
@@ -392,7 +389,7 @@ impl Runtime {
                 s.configurable,
             ]
             .map(|n| scope.handle(n.as_tagged(heap).erase()))
-        });
+        };
         let mut reads: Vec<Handle<'_, Value>> = Vec::new();
         for name in names {
             match Self::get_property(vm, heap, state, attrs, name)? {
@@ -401,7 +398,7 @@ impl Runtime {
                 Coercion::Value(v) => reads.push(scope.handle(v)),
             }
         }
-        let (present, truthy) = heap.no_gc(|heap| {
+        let (present, truthy) = {
             let undef = heap.known().undefined.as_tagged(heap).erase();
             let present = [
                 !reads[0].as_tagged(heap).ptr_eq(undef),
@@ -417,7 +414,7 @@ impl Runtime {
                 Convert::is_truthy(heap, reads[5].as_tagged(heap)),
             ];
             (present, truthy)
-        });
+        };
         let value = present[0].then_some(reads[0]);
         let get = present[1].then_some(reads[1]);
         let set = present[2].then_some(reads[2]);
@@ -425,7 +422,7 @@ impl Runtime {
         if get.is_some() || set.is_some() {
             for half in [get, set] {
                 if let Some(h) = half
-                    && !heap.no_gc(|heap| Self::is_callable(heap, h.as_tagged(heap).raw()))
+                    && !{ Self::is_callable(heap, h.as_tagged(heap).raw()) }
                 {
                     return Err(VmError::Type);
                 }
@@ -465,10 +462,11 @@ impl Runtime {
             return Ok(Some(Tagged::from(smi)));
         }
         state.handle_scope(|scope| {
-            if heap.no_gc(|heap| v.as_tagged(heap).get_as::<Symbol>().is_some()) {
+            let cond_5 = v.as_tagged(heap).get_as::<Symbol>().is_some();
+            if cond_5 {
                 return Ok(Some(v.as_tagged(heap).as_name()));
             }
-            let is_string = heap.no_gc(|heap| v.as_tagged(heap).get_as::<DenseString>().is_some());
+            let is_string = v.as_tagged(heap).get_as::<DenseString>().is_some();
             let primitive: Handle<'_, Value> = if is_string {
                 v
             } else {
@@ -548,12 +546,15 @@ impl Runtime {
                 Coercion::Value(v) => scope.handle(v),
             };
             // 5. P must be an object
-            if heap.no_gc(|heap| Convert::is_primitive(heap, proto.as_tagged(heap))) {
-                return Err(VmError::Type);
+            {
+                let cond_6 = Convert::is_primitive(heap, proto.as_tagged(heap));
+                if cond_6 {
+                    return Err(VmError::Type);
+                }
             }
-            Ok(Some(heap.no_gc(|heap| {
+            Ok(Some({
                 Self::has_proto_in_chain(heap, object.as_tagged(heap), proto.as_tagged(heap))
-            })))
+            }))
         })
     }
 

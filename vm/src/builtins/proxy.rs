@@ -20,16 +20,18 @@ pub fn proxy_constructor(
     if !nctx.is_construct() {
         return Err(VmError::Message("constructor Proxy requires 'new'"));
     }
-    let (target, handler) = nctx.heap().no_gc(|heap| {
-        Ok((
+    let (target, handler) = {
+        let heap = &*nctx.heap();
+        (
             args.get(heap, 1).ok_or(VmError::Type)?.raw(),
             args.get(heap, 2).ok_or(VmError::Type)?.raw(),
-        ))
-    })?;
-    let ok = nctx.heap().no_gc(|heap| {
+        )
+    };
+    let ok = {
+        let heap = &*nctx.heap();
         is_js_receiver(heap, unsafe { target.assume_valid(heap) })
             && is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
-    });
+    };
     if !ok {
         return Err(VmError::Message(
             "cannot create proxy with a non-object target or handler",
@@ -52,16 +54,18 @@ pub fn proxy_constructor(
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
 /// hidden `__revokeProxy` native).
 pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    let (target, handler) = nctx.heap().no_gc(|heap| {
-        Ok((
+    let (target, handler) = {
+        let heap = &*nctx.heap();
+        (
             args.get(heap, 1).ok_or(VmError::Type)?.raw(),
             args.get(heap, 2).ok_or(VmError::Type)?.raw(),
-        ))
-    })?;
-    let ok = nctx.heap().no_gc(|heap| {
+        )
+    };
+    let ok = {
+        let heap = &*nctx.heap();
         is_js_receiver(heap, unsafe { target.assume_valid(heap) })
             && is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
-    });
+    };
     if !ok {
         return Err(VmError::Message(
             "cannot create proxy with a non-object target or handler",
@@ -117,9 +121,10 @@ pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
 pub fn proxy_revoke(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    let proxy = nctx
-        .heap()
-        .no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
+    let proxy = {
+        let heap = &*nctx.heap();
+        args.get(heap, 1).ok_or(VmError::Arity)?.raw()
+    };
     revoke(
         nctx.heap(),
         // Safety: fresh argument word, consumed with no allocation delay.

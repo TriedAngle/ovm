@@ -54,23 +54,21 @@ impl StackCache {
     }
 
     pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
-        heap.no_gc(|heap| {
-            let tagged = stack.callable(heap, &frame);
-            // Safety: frame callable slots hold strong object pointers.
-            let obj = unsafe {
-                HeapRef::from_ptr(tagged.as_ptr().expect("frame callable must be an object"))
-            };
-            let info = obj
-                .as_ref()
-                .callable_info(heap)
-                .expect("frame callable must have callable info");
-            let cache = self.get();
-            cache.code.store(info.bytecode.get(heap).raw());
-            cache.constants.store(info.constants.get(heap).raw());
-            cache.pc = frame.pc;
-            cache.base = frame.base;
-            cache.register_count = frame.register_count;
-        });
+        let tagged = stack.callable(heap, &frame);
+        // Safety: frame callable slots hold strong object pointers.
+        let obj = unsafe {
+            HeapRef::from_ptr(tagged.as_ptr().expect("frame callable must be an object"))
+        };
+        let info = obj
+            .as_ref()
+            .callable_info(heap)
+            .expect("frame callable must have callable info");
+        let cache = self.get();
+        cache.code.store(info.bytecode.get(heap).raw());
+        cache.constants.store(info.constants.get(heap).raw());
+        cache.pc = frame.pc;
+        cache.base = frame.base;
+        cache.register_count = frame.register_count;
     }
 
     pub fn deactivate(&self) {
@@ -131,15 +129,44 @@ impl StackCache {
         }
     }
 
-    /// The accumulator, re-read under a heap borrow.
     pub fn acc<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
         self.get().acc.read(heap)
     }
 
-    /// Store a value into the accumulator. Anchored/rooted values only:
-    /// pass a `Tagged`, or a `Handle::as_tagged(heap)`.
+    pub fn acc_mut(&self) -> Acc<'_> {
+        Acc(&self.get().acc)
+    }
+
     pub fn set_acc<'a, T: 'a>(&self, v: impl Into<Tagged<'a, T>>) {
         self.get().acc.store(v.into().raw());
+    }
+}
+
+pub struct Acc<'a>(&'a Register);
+
+impl Acc<'_> {
+    fn word_ptr(&self) -> *mut Value {
+        self.0.as_raw().as_ptr().cast::<Value>()
+    }
+}
+
+impl core::ops::Deref for Acc<'_> {
+    type Target = Value;
+
+    fn deref(&self) -> &Value {
+        unsafe { &*self.word_ptr() }
+    }
+}
+
+impl core::ops::DerefMut for Acc<'_> {
+    fn deref_mut(&mut self) -> &mut Value {
+        unsafe { &mut *self.word_ptr() }
+    }
+}
+
+impl Acc<'_> {
+    pub fn read<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
+        self.0.read(heap)
     }
 }
 

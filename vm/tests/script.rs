@@ -46,7 +46,8 @@ fn exception_word(thread: &mut Thread) -> Value {
 
 fn run_num(src: &str) -> f64 {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         if let Some(smi) = Smi::decode(result) {
             return smi.value() as f64;
         }
@@ -55,17 +56,18 @@ fn run_num(src: &str) -> f64 {
             .expect("number result")
             .value
             .get()
-    })
+    }
 }
 
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
             .get_as::<DenseString>()
             .expect("string result");
         s.to_rust_string(heap)
-    })
+    }
 }
 
 fn run_undefined(src: &str) -> Value {
@@ -276,7 +278,8 @@ fn function_metadata_and_public_properties_survive_materialization() {
         let prototype = thread.intern(&scope, "prototype");
         let constructor = thread.intern(&scope, "constructor");
         let expected_name = thread.intern(&scope, "named");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let function_value = function;
             let Some(function) = unsafe { function.assume_valid(heap) }.as_heap_object() else {
                 panic!("result must be a function object")
@@ -334,7 +337,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                 }
                 _ => panic!("ordinary function must have a prototype property"),
             }
-        });
+        };
     });
 }
 
@@ -367,7 +370,8 @@ fn tdz_throws_on_let_before_init() {
     thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name");
         let expected = thread.intern(&scope, "ReferenceError");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
@@ -377,7 +381,7 @@ fn tdz_throws_on_let_before_init() {
                 }
                 _ => panic!("error object must have a name property"),
             }
-        });
+        };
     });
 
     // the hole survives frame reuse: run twice in a row

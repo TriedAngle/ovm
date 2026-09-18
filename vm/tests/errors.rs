@@ -9,7 +9,8 @@ fn name<'a>(heap: &'a vm::Heap, w: Value) -> Tagged<'a, SlotName> {
 
 /// Read a data property by interned name value.
 fn get_prop(thread: &mut Thread, obj: Value, name_word: Value) -> Value {
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let Some(o) = unsafe { obj.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
@@ -17,7 +18,7 @@ fn get_prop(thread: &mut Thread, obj: Value, name_word: Value) -> Value {
             Lookup::Data { slot, .. } => slot.get(heap).raw(),
             _ => panic!("expected a data property"),
         }
-    })
+    }
 }
 
 /// A rooted copy of `word`, staged immediately (no allocation between
@@ -107,7 +108,8 @@ fn error_objects_are_distinct_but_share_shapes() {
     // both started from the well-known error map and added the same
     // properties in the same order: the transition cache must yield one
     // shared final shape
-    let maps = thread.heap().no_gc(|heap| {
+    let maps = {
+        let heap = &*thread.heap();
         let Some(a) = unsafe { a.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
@@ -118,7 +120,7 @@ fn error_objects_are_distinct_but_share_shapes() {
             a.as_ref().header.map.get(heap).raw(),
             b.as_ref().header.map.get(heap).raw(),
         )
-    });
+    };
     assert_eq!(maps.0, maps.1);
 }
 
@@ -136,7 +138,8 @@ fn error_properties_are_writable() {
     });
 
     thread.handle_scope(|thread, scope| {
-        let outcome = thread.heap().no_gc(|heap| {
+        let outcome = {
+            let heap = &*thread.heap();
             as_tagged_unchecked(obj).store_lookup(
                 heap,
                 &scope,
@@ -144,7 +147,7 @@ fn error_properties_are_writable() {
                 as_tagged_unchecked(custom),
                 StoreSemantics::WriteThrough,
             )
-        });
+        };
         assert!(matches!(outcome, Ok(StoreOutcome::Done)));
     });
     assert_eq!(get_prop(&mut thread, obj, name_key), custom);
@@ -169,7 +172,8 @@ fn error_objects_are_extendable() {
     // store_lookup on a missing property must propose a transition
     // (proof of extendability), and completing it adds the own property
     thread.handle_scope(|thread, scope| {
-        let outcome = thread.heap().no_gc(|heap| {
+        let outcome = {
+            let heap = &*thread.heap();
             as_tagged_unchecked(obj).store_lookup(
                 heap,
                 &scope,
@@ -177,7 +181,7 @@ fn error_objects_are_extendable() {
                 as_tagged_unchecked(extra_val),
                 StoreSemantics::WriteThrough,
             )
-        });
+        };
         match outcome {
             Ok(StoreOutcome::Transition { receiver, name }) => {
                 let value = scope.handle(as_tagged_unchecked(extra_val));
@@ -198,7 +202,8 @@ fn error_objects_are_extendable() {
 
 /// The object this object's map links to via its `prototype` slot.
 fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let Some(o) = unsafe { obj.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
@@ -209,7 +214,7 @@ fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
         } else {
             Some(proto)
         }
-    })
+    }
 }
 
 #[test]

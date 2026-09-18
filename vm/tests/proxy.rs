@@ -58,7 +58,8 @@ fn assert_type_error(src: &str) {
         .expect("pending exception set");
     thread.handle_scope(|thread, scope| {
         let name_handle = thread.intern(&scope, "name");
-        let name = thread.heap().no_gc(|heap| {
+        let name = {
+            let heap = &*thread.heap();
             let Some(obj) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("exception is not an object");
             };
@@ -73,7 +74,7 @@ fn assert_type_error(src: &str) {
                     .unwrap_or_default(),
                 _ => String::new(),
             }
-        });
+        };
         assert_eq!(name, "TypeError", "wrong exception class");
     });
 }
@@ -104,12 +105,13 @@ fn constructor_has_no_prototype_and_metadata() {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let name = thread.run_script("Proxy.name").unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let s = unsafe { name.assume_valid(heap) }
             .get_as::<vm::DenseString>()
             .expect("Proxy.name is a string");
         assert!(s.data(heap).matches_ascii(b"Proxy"));
-    });
+    };
 }
 
 // ---- get ---------------------------------------------------------------------

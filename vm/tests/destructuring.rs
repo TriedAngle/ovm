@@ -19,12 +19,13 @@ fn run_str(src: &str) -> String {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let s = unsafe { v.assume_valid(heap) }
             .get_as::<DenseString>()
             .expect("string result");
         s.to_rust_string(heap)
-    })
+    }
 }
 
 fn run_bool(src: &str) -> bool {
@@ -65,7 +66,8 @@ fn throws_named(src: &str, want: &str) -> bool {
             return false;
         };
         let name = thread.intern(&scope, "name");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 return false;
             };
@@ -77,7 +79,7 @@ fn throws_named(src: &str, want: &str) -> bool {
                     .unwrap_or(false),
                 _ => false,
             }
-        })
+        }
     })
 }
 

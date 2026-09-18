@@ -10,11 +10,12 @@ pub fn symbol_constructor(
     nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let desc_text = nctx.heap().no_gc(|heap| {
+    let desc_text = {
+        let heap = &*nctx.heap();
         args.get(heap, 1)
             .and_then(|d| d.get_as::<DenseString>())
             .map(|s| s.to_rust_string(heap))
-    });
+    };
     nctx.handle_scope(|nctx, scope| {
         let mut text = String::from("Symbol(");
         if let Some(d) = &desc_text {

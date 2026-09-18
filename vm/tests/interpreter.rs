@@ -70,7 +70,8 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
     let expected_name = thread.handle_scope(|thread, scope| intern_word(thread, &scope, class));
     thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let Some(o) = unsafe { anchored(heap, ex) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
@@ -80,7 +81,7 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
                 }
                 _ => panic!("error object must have a name property"),
             }
-        });
+        };
     });
     ex
 }
@@ -168,7 +169,8 @@ fn create_closure_of_kind(
             &scope,
         );
         let name = intern_word(&mut *thread, &scope, name);
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             info.heap_ref(heap).set_metadata(
                 heap,
                 Some(unsafe { anchored(heap, name) }),
@@ -176,7 +178,7 @@ fn create_closure_of_kind(
                 kind,
                 strict,
             );
-        });
+        };
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateClosure, &[0]);
@@ -424,7 +426,8 @@ fn array_literal_built_with_manual_stores() {
 
     let result = run_program(&mut thread, program, 5, &[]);
     let array = result.unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let a = unsafe { anchored(heap, array) }
             .get_as::<Object>()
             .expect("array literal result");
@@ -435,7 +438,7 @@ fn array_literal_built_with_manual_stores() {
         assert_eq!(Smi::decode(elements.at(heap, 0).raw()).unwrap().value(), 1);
         assert_eq!(Smi::decode(elements.at(heap, 1).raw()).unwrap().value(), 2);
         assert_eq!(Smi::decode(elements.at(heap, 2).raw()).unwrap().value(), 3);
-    });
+    };
 }
 
 #[test]
@@ -449,7 +452,8 @@ fn create_empty_array_literal_starts_empty() {
 
     let result = run_program(&mut thread, program, 0, &[]);
     let array = result.unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let a = unsafe { anchored(heap, array) }
             .get_as::<Object>()
             .expect("array literal result");
@@ -458,7 +462,7 @@ fn create_empty_array_literal_starts_empty() {
         assert_eq!(a.length(), 0);
         let elements = a.elements_array(heap).expect("array elements");
         assert_eq!(elements.len(), 0);
-    });
+    };
 }
 
 #[test]
@@ -481,7 +485,8 @@ fn array_literal_with_holes_keeps_length() {
 
     let result = run_program(&mut thread, program, 5, &[]);
     let array = result.unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let a = unsafe { anchored(heap, array) }
             .get_as::<Object>()
             .expect("array literal result");
@@ -495,7 +500,7 @@ fn array_literal_with_holes_keeps_length() {
             "elided index stays a hole"
         );
         assert_eq!(Smi::decode(elements.at(heap, 2).raw()).unwrap().value(), 2);
-    });
+    };
 }
 
 #[test]
@@ -541,11 +546,12 @@ fn object_literal_built_with_manual_stores() {
 
     let obj1 = build(&mut thread);
     let obj2 = build(&mut thread);
-    let ((x1, y1, map1), (x2, y2, map2), initial) = thread.heap().no_gc(|heap| {
+    let ((x1, y1, map1), (x2, y2, map2), initial) = {
+        let heap = &*thread.heap();
         let read = |heap: &Heap, obj: Value| {
             let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
             // Safety: `obj` is a strong, live reference to the object
-            // literal, and no collection can happen inside the no-GC scope.
+            // literal, and no collection can happen inside the non-allocating region.
             let o = unsafe { ptr.cast::<Object>().as_ref() };
             let slots = o.slots.get(heap).as_ptr().unwrap();
             // Safety: anchored slot read under `heap`.
@@ -561,7 +567,7 @@ fn object_literal_built_with_manual_stores() {
             read(heap, obj2),
             heap.known().object_initial_map.as_tagged(heap).raw(),
         )
-    });
+    };
     assert_eq!((x1, y1), (7, 9));
     assert_eq!((x2, y2), (7, 9));
     // stores transitioned off the initial map...
@@ -630,11 +636,12 @@ fn define_named_own_property_attributes_and_value() {
     let obj2 = build(&mut thread);
     thread.handle_scope(|thread, scope| {
         let m = intern_word(&mut *thread, &scope, "m");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let read = |heap: &Heap, obj: Value| {
                 let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
                 // Safety: `obj` is a strong, live reference and no collection
-                // can happen inside the no-GC scope.
+                // can happen inside the non-allocating region.
                 let o = unsafe { ptr.cast::<Object>().as_ref() };
                 match o.lookup(heap, name(heap, m)) {
                     Lookup::Data { slot, flags, .. } => {
@@ -655,7 +662,7 @@ fn define_named_own_property_attributes_and_value() {
             let map2 = read(heap, obj2);
             // identically-built defines share one transition map
             assert_eq!(map1, map2);
-        });
+        };
     });
 }
 
@@ -735,10 +742,11 @@ fn define_keyed_own_property_string_and_smi_keys() {
     emit(&mut program, Opcode::Return, &[]);
 
     let obj = run_program_consts(&mut thread, program, 6, &[], &[x]).unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
-        // happen inside the no-GC scope.
+        // happen inside the non-allocating region.
         let o = unsafe { ptr.cast::<Object>().as_ref() };
         let expected_flags = SlotFlags::VALUE
             .union(SlotFlags::WRITABLE)
@@ -758,7 +766,7 @@ fn define_keyed_own_property_string_and_smi_keys() {
             }
             _ => panic!("the smi key must be a named data property"),
         }
-    });
+    };
 }
 
 #[test]
@@ -838,10 +846,11 @@ fn define_own_property_accessor_invokes_getter() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 
     let obj = run_program_consts(&mut thread, accessor_program(false), 6, &[], &constants).unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
-        // happen inside the no-GC scope.
+        // happen inside the non-allocating region.
         let o = unsafe { ptr.cast::<Object>().as_ref() };
         match o.lookup(heap, name(heap, p)) {
             Lookup::Accessor { pair, .. } => {
@@ -861,7 +870,7 @@ fn define_own_property_accessor_invokes_getter() {
             SlotFlags::ACCESSOR.union(SlotFlags::CONFIGURABLE),
             "accessor attributes {{e-, c}}"
         );
-    });
+    };
 }
 
 #[test]
@@ -2124,13 +2133,14 @@ fn arithmetic_overflow_promotes_to_float() {
         &[smi(Smi::MAX - 1), smi(5)],
     );
     let result = result.unwrap();
-    let value = thread.heap().no_gc(|heap| {
+    let value = {
+        let heap = &*thread.heap();
         unsafe { anchored(heap, result) }
             .get_as::<Float>()
             .expect("overflow must promote to float")
             .value
             .get()
-    });
+    };
     assert_eq!(value, (1u64 << 62) as f64);
 }
 
@@ -2158,13 +2168,14 @@ fn run_binary_consts(
 }
 
 fn float_value(thread: &mut Thread, v: Value) -> f64 {
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         unsafe { anchored(heap, v) }
             .get_as::<Float>()
             .expect("expected float result")
             .value
             .get()
-    })
+    }
 }
 
 #[test]
@@ -2700,18 +2711,17 @@ fn empty_object_literal_inherits_from_object_prototype() {
         let proto = global_word(&mut *thread, |k| k.object_prototype);
 
         // host-side: %Object.prototype%.p = 1
-        let outcome = thread
-            .heap()
-            .no_gc(|heap| {
-                unsafe { anchored(heap, proto) }.store_lookup(
-                    heap,
-                    &scope,
-                    name(heap, p),
-                    Smi::new(1).into_tagged(),
-                    StoreSemantics::Shadow,
-                )
-            })
-            .unwrap();
+        let outcome = {
+            let heap = &*thread.heap();
+            unsafe { anchored(heap, proto) }.store_lookup(
+                heap,
+                &scope,
+                name(heap, p),
+                Smi::new(1).into_tagged(),
+                StoreSemantics::Shadow,
+            )
+        }
+        .unwrap();
         match outcome {
             StoreOutcome::Transition { receiver, name } => {
                 let value = scope.handle(Smi::new(1));
@@ -2886,7 +2896,8 @@ fn create_closure_shares_callable_info_template() {
         (result.unwrap(), w20)
     });
 
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let Some(o) = unsafe { anchored(heap, result) }.as_heap_object() else {
             panic!("closure must be an object");
         };
@@ -2905,7 +2916,7 @@ fn create_closure_shares_callable_info_template() {
             context.into_tagged().raw(),
             heap.known().empty_context.as_tagged(heap).raw()
         );
-    });
+    };
 }
 
 #[test]
@@ -2926,7 +2937,8 @@ fn create_closure_function_kind_controls_call_and_construct() {
     );
 
     let prototype = thread.handle_scope(|thread, scope| intern_word(thread, &scope, "prototype"));
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let Some(method) = unsafe { anchored(heap, method) }.as_heap_object() else {
             panic!("method must be an object")
         };
@@ -2937,7 +2949,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
             method.lookup(heap, name(heap, prototype)),
             Lookup::NotFound
         ));
-    });
+    };
 
     let undefined = global_word(&mut thread, |k| k.undefined);
     let mut call = Vec::new();
@@ -2969,7 +2981,8 @@ fn create_closure_function_kind_controls_call_and_construct() {
         FunctionKind::BaseClassConstructor,
         true,
     );
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let Some(constructor) = unsafe { anchored(heap, class_constructor) }.as_heap_object()
         else {
             panic!("class constructor must be an object")
@@ -2982,7 +2995,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
             constructor.as_ref().lookup(heap, name(heap, prototype)),
             Lookup::NotFound
         ));
-    });
+    };
 
     let mut call = Vec::new();
     emit(&mut call, Opcode::LoadConstant, &[0]);
@@ -3586,12 +3599,13 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
             &[obj, smi(1)],
         )
         .unwrap();
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let s = unsafe { anchored(heap, r) }
                 .get_as::<DenseString>()
                 .expect("concat result must be a string");
             assert_eq!(s.to_rust_string(heap), "x1");
-        });
+        };
     });
 }
 
@@ -3612,12 +3626,13 @@ fn add_concatenates_strings() {
         ] {
             let r =
                 run_program(&mut *thread, binary_op_program(Opcode::Add), 0, &[lhs, rhs]).unwrap();
-            thread.heap().no_gc(|heap| {
+            {
+                let heap = &*thread.heap();
                 let s = unsafe { anchored(heap, r) }
                     .get_as::<DenseString>()
                     .expect("concat result must be a string");
                 assert_eq!(s.to_rust_string(heap), expected, "{lhs:?} + {rhs:?}");
-            });
+            };
         }
     });
 }
@@ -3891,13 +3906,14 @@ fn negate_arithmetic_rules() {
 
     // -0 must be the -0.0 HeapNumber (1 / -0 === -Infinity)
     let r = run_program(&mut thread, unary_program(Opcode::Negate), 0, &[smi(0)]).unwrap();
-    let r = thread.heap().no_gc(|heap| {
+    let r = {
+        let heap = &*thread.heap();
         unsafe { anchored(heap, r) }
             .get_as::<Float>()
             .expect("-0 must stay a float")
             .value
             .get()
-    });
+    };
     assert_eq!(r, 0.0);
     assert!(r.is_sign_negative());
 
@@ -4105,7 +4121,8 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
             let heap = &*nctx.heap();
             heap.known().global_object.as_tagged(heap).raw()
         };
-        let outcome = nctx.heap().no_gc(|heap| {
+        let outcome = {
+            let heap = &*nctx.heap();
             unsafe { anchored(heap, global) }.store_lookup(
                 heap,
                 &scope,
@@ -4113,7 +4130,7 @@ fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<V
                 flag,
                 StoreSemantics::WriteThrough,
             )
-        })?;
+        }?;
         match outcome {
             StoreOutcome::Done => {}
             StoreOutcome::Transition { receiver, name } => {
@@ -4279,7 +4296,8 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
         .unwrap();
         assert_eq!(r.to_i64().unwrap(), 2, "acc keeps the value");
 
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             // no own property appeared on the child, the parent is untouched
             let child_ref = child.heap_ref(heap);
             assert_eq!(child_ref.header.map.heap_ref(heap).descriptor_count(), 0);
@@ -4290,7 +4308,7 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
                 }
                 _ => panic!("parent must keep its writable property"),
             }
-        });
+        };
     });
 }
 
@@ -4313,7 +4331,8 @@ fn shadow_store_defines_default_attributes() {
         .unwrap();
         assert_eq!(r.to_i64().unwrap(), 2);
 
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let child_ref = child.heap_ref(heap);
             let map = child_ref.header.map.heap_ref(heap);
             assert_eq!(map.descriptor_count(), 1);
@@ -4338,6 +4357,6 @@ fn shadow_store_defines_default_attributes() {
                 }
                 _ => panic!("parent must keep its writable property"),
             }
-        });
+        };
     });
 }

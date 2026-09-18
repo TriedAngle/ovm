@@ -24,13 +24,14 @@ fn interning_deduplicates_and_preserves_content() {
         assert!(ac_ne);
 
         // content round trip (compressed encoding: Latin1)
-        let (text, hash_a, hash_b) = ctx.heap().no_gc(|heap| {
+        let (text, hash_a, hash_b) = {
+            let heap = &*ctx.heap();
             (
                 a.heap_ref(heap).to_rust_string(heap),
                 a.heap_ref(heap).hash(heap),
                 b.heap_ref(heap).hash(heap),
             )
-        });
+        };
         assert_eq!(text, "hello");
         assert_eq!(hash_a, hash_b);
 
@@ -65,7 +66,8 @@ fn interning_compresses_utf16_to_latin1() {
         };
         assert!(bits_eq);
 
-        ctx.heap().no_gc(|heap| {
+        {
+            let heap = &*ctx.heap();
             use vm::{Encoding, MapKind};
             let l = latin1_content.heap_ref(heap);
             let u = utf16_content.heap_ref(heap);
@@ -78,7 +80,7 @@ fn interning_compresses_utf16_to_latin1() {
             assert_eq!(l.code_unit(heap, 1), 0xE9);
             assert_eq!(u.code_unit(heap, 0), 0x20AC);
             let _ = MapKind::LATIN1;
-        });
+        };
     });
 }
 

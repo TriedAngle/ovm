@@ -18,7 +18,8 @@ fn run_smi(src: &str) -> i64 {
 
 fn run_bool(src: &str) -> bool {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         if result == heap.known().true_object.as_tagged(heap).raw() {
             true
         } else if result == heap.known().false_object.as_tagged(heap).raw() {
@@ -26,7 +27,7 @@ fn run_bool(src: &str) -> bool {
         } else {
             panic!("expected boolean result, got {result:?}");
         }
-    })
+    }
 }
 
 fn run_value(src: &str) -> (Value, Thread) {
@@ -38,12 +39,13 @@ fn run_value(src: &str) -> (Value, Thread) {
 
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
             .get_as::<DenseString>()
             .expect("string result");
         s.to_rust_string(heap)
-    })
+    }
 }
 
 // -- ordinary objects -------------------------------------------------------

@@ -200,12 +200,9 @@ pub fn ordinary_own_descriptor<'a, 's>(
     None
 }
 
-impl<'a> Tagged<'a, Value> {
-    /// Property lookup on any value: non-objects (Smis) find nothing. The
-    /// smi map has no descriptors and a null prototype, so this matches the
-    /// old smi-map walk; primitives with named properties need boxing first.
+impl<'a, T> Tagged<'a, T> {
     pub fn lookup(self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
-        let Some(obj) = self.as_heap_object() else {
+        let Some(obj) = self.erase().as_heap_object() else {
             return Lookup::NotFound;
         };
         obj.as_ref().lookup(heap, name)

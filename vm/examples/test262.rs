@@ -178,7 +178,8 @@ fn exception_name(thread: &mut vm::Thread) -> String {
             return "exception".into();
         };
         let name_key = thread.intern(&scope, "name");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = thread.heap();
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 return "exception".into();
             };
@@ -190,7 +191,7 @@ fn exception_name(thread: &mut vm::Thread) -> String {
                     .unwrap_or_else(|| "exception".into()),
                 _ => "exception".into(),
             }
-        })
+        }
     })
 }
 
@@ -271,9 +272,10 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
     match thread.run_script(&code) {
         Ok(v)
             if {
-                thread
-                    .heap()
-                    .no_gc(|heap| v == heap.known().exception.as_tagged(heap).raw())
+                {
+                    let heap = &*thread.heap();
+                    v == heap.known().exception.as_tagged(heap).raw()
+                }
             } =>
         {
             let name = exception_name(&mut thread);

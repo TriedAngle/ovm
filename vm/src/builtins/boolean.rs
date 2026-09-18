@@ -8,12 +8,13 @@ pub fn boolean_constructor(
     nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let value = nctx.heap().no_gc(|heap| {
+    let value = {
+        let heap = &*nctx.heap();
         let arg = args
             .get(heap, 1)
             .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
         Convert::boolean(heap, Convert::is_truthy(heap, arg)).raw()
-    });
+    };
     if !nctx.is_construct() {
         return Ok(value);
     }
@@ -32,20 +33,20 @@ pub fn boolean_constructor(
 }
 
 pub fn boolean_value_of(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    nctx.heap().no_gc(|heap| {
-        let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
-        wrapper_value(heap, receiver)
-    })
+    let heap = &*nctx.heap();
+    let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+    wrapper_value(heap, receiver)
 }
 
 pub fn boolean_to_string(
     nctx: &mut NativeContext<'_>,
     args: GcSlice<'_>,
 ) -> Result<Value, VmError> {
-    let v = nctx.heap().no_gc(|heap| {
+    let v = {
+        let heap = &*nctx.heap();
         let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
         wrapper_value(heap, receiver)
-    })?;
+    }?;
     nctx.handle_scope(|nctx, scope| {
         let (_vm, heap, _) = nctx.split();
         // Safety: fresh word read above, consumed before any allocation.

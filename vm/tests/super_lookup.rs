@@ -78,12 +78,11 @@ fn slot_name(thread: &mut Thread, name: &str) -> Tagged<'static, SlotName> {
 /// Read an integer data property, or panic.
 fn get_smi(thread: &mut Thread, obj: Value, name: &str) -> i64 {
     let name = slot_name(thread, name);
-    thread.heap().no_gc(
-        |heap| match unsafe { anchored(heap, obj) }.lookup(heap, name) {
-            vm::Lookup::Data { slot, .. } => Smi::decode(slot.get(heap).raw()).unwrap().value(),
-            _ => panic!("property {name:?} must be an own-or-inherited data property"),
-        },
-    )
+    let heap = &*thread.heap();
+    match unsafe { anchored(heap, obj) }.lookup(heap, name) {
+        vm::Lookup::Data { slot, .. } => Smi::decode(slot.get(heap).raw()).unwrap().value(),
+        _ => panic!("property {name:?} must be an own-or-inherited data property"),
+    }
 }
 
 fn parents_of(thread: &mut Thread, p1: Value, p2: Value) -> Value {
@@ -112,21 +111,23 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     let parent = object_with(&mut thread, null, &[("x", 7)]);
     let home = object_with(&mut thread, parent, &[]);
     let x = slot_name(&mut thread, "x");
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         assert!(matches!(
             super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(7)
         ));
-    });
+    };
 
     // null prototype terminates the chain
     let home = object_with(&mut thread, null, &[("x", 7)]);
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         assert!(matches!(
             super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
             LoadOutcome::Value(v) if v.raw() == heap.known().undefined.as_tagged(heap).raw()
         ));
-    });
+    };
 
     // FixedArray: multiple parents (Self-style), priority order
     let p1 = object_with(&mut thread, null, &[("a", 1)]);
@@ -135,7 +136,8 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     let home = object_with(&mut thread, protos, &[]);
     let a = slot_name(&mut thread, "a");
     let b = slot_name(&mut thread, "b");
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         assert!(matches!(
             super_lookup(heap, unsafe { anchored(heap, home) }, a).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(1)
@@ -144,7 +146,7 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
             super_lookup(heap, unsafe { anchored(heap, home) }, b).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(3)
         ));
-    });
+    };
 }
 
 #[test]
@@ -158,7 +160,8 @@ fn lookup_in_parents_respects_priority_order() {
     let b = slot_name(&mut thread, "b");
     let missing = slot_name(&mut thread, "nope");
 
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         // "a" exists on both parents: the first in priority order wins
         match lookup_in_parents(heap, unsafe { anchored(heap, protos) }, a) {
             vm::Lookup::Data { slot, .. } => {
@@ -180,7 +183,7 @@ fn lookup_in_parents_respects_priority_order() {
             lookup_in_parents(heap, unsafe { anchored(heap, null) }, a),
             vm::Lookup::NotFound
         ));
-    });
+    };
 }
 
 #[test]
@@ -193,7 +196,8 @@ fn super_store_shadow_creates_own_property_on_this() {
     let x = slot_name(&mut thread, "x");
 
     thread.handle_scope(|thread, scope| {
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             match super_store_lookup(
                 heap,
                 &scope,
@@ -215,7 +219,7 @@ fn super_store_shadow_creates_own_property_on_this() {
                 }
                 other => panic!("shadow store must define on the receiver, got {other:?}"),
             }
-        });
+        };
     });
     // the parent keeps its value; the transition handler would add `x` to
     // `this`
@@ -232,7 +236,8 @@ fn super_store_write_through_updates_the_holder() {
     let x = slot_name(&mut thread, "x");
 
     thread.handle_scope(|thread, scope| {
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let outcome = super_store_lookup(
                 heap,
                 &scope,
@@ -244,16 +249,17 @@ fn super_store_write_through_updates_the_holder() {
             )
             .unwrap();
             assert!(matches!(outcome, StoreOutcome::Done));
-        });
+        };
     });
     assert_eq!(get_smi(&mut thread, parent, "x"), 42);
     // nothing was created on the receiver
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         assert!(matches!(
             unsafe { anchored(heap, this_) }.lookup(heap, x),
             vm::Lookup::NotFound
         ));
-    });
+    };
 }
 
 #[test]
@@ -268,7 +274,8 @@ fn super_store_write_through_hits_second_parent_holder() {
     let b = slot_name(&mut thread, "b");
 
     thread.handle_scope(|thread, scope| {
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let outcome = super_store_lookup(
                 heap,
                 &scope,
@@ -280,7 +287,7 @@ fn super_store_write_through_hits_second_parent_holder() {
             )
             .unwrap();
             assert!(matches!(outcome, StoreOutcome::Done));
-        });
+        };
     });
     // the holder (second parent) got the write
     assert_eq!(get_smi(&mut thread, p2, "b"), 9);
@@ -324,7 +331,8 @@ fn super_store_readonly_and_nullish_receiver_throw() {
     };
 
     thread.handle_scope(|thread, scope| {
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
                 assert!(matches!(
                     super_store_lookup(
@@ -354,7 +362,7 @@ fn super_store_readonly_and_nullish_receiver_throw() {
                     Err(VmError::Type)
                 ));
             }
-        });
+        };
     });
 }
 
@@ -367,7 +375,8 @@ fn super_store_on_null_proto_chain_defines_on_this() {
     let x = slot_name(&mut thread, "x");
 
     thread.handle_scope(|thread, scope| {
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             // no parent chain at all: both semantics define on the receiver
             for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
                 assert!(matches!(
@@ -385,6 +394,6 @@ fn super_store_on_null_proto_chain_defines_on_this() {
                         if receiver.as_tagged(heap).ptr_eq(unsafe { anchored(heap, this_) })
                 ));
             }
-        });
+        };
     });
 }

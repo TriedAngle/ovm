@@ -10,10 +10,10 @@ pub fn number_constructor(
 ) -> Result<Value, VmError> {
     let n = nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
-        let arg = heap.no_gc(|heap| match args.get(heap, 1) {
+        let arg = match args.get(heap, 1) {
             Some(v) => scope.handle(v),
             None => scope.handle(Smi::new(0).into_tagged()),
-        });
+        };
         Runtime::to_numeric(vm, heap, state, arg)
     })?;
     let Some(n) = n else {
@@ -40,17 +40,17 @@ pub fn number_constructor(
 }
 
 pub fn number_value_of(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    nctx.heap().no_gc(|heap| {
-        let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
-        wrapper_value(heap, receiver)
-    })
+    let heap = &*nctx.heap();
+    let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+    wrapper_value(heap, receiver)
 }
 
 pub fn number_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    let v = nctx.heap().no_gc(|heap| {
+    let v = {
+        let heap = &*nctx.heap();
         let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
         wrapper_value(heap, receiver)
-    })?;
+    }?;
     nctx.handle_scope(|nctx, scope| {
         let (_vm, heap, _) = nctx.split();
         // Safety: fresh word read above, consumed before any allocation.

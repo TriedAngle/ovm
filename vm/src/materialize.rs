@@ -145,16 +145,14 @@ fn materialize_function<'s>(
         parser::FunctionKind::DerivedClassConstructor => FunctionKind::DerivedClassConstructor,
         parser::FunctionKind::DefaultDerivedConstructor => FunctionKind::DefaultDerivedConstructor,
     };
-    heap.no_gc(|heap| {
-        info.heap_ref(heap).set_metadata_full(
-            heap,
-            name.map(|h| h.as_tagged(heap).erase()),
-            function.formal_parameter_count as usize,
-            function.formal_length as usize,
-            kind,
-            function.strict,
-        );
-    });
+    info.heap_ref(heap).set_metadata_full(
+        heap,
+        name.map(|h| h.as_tagged(heap).erase()),
+        function.formal_parameter_count as usize,
+        function.formal_length as usize,
+        kind,
+        function.strict,
+    );
     infos[fid.0 as usize] = Some(info);
     Ok(info)
 }
