@@ -6,10 +6,9 @@
 use core::ptr::NonNull;
 
 use crate::builtins::intrinsics::runtime_fn;
-use crate::errors::error_from_vm_error;
 use crate::interpreter::execute;
 use crate::{
-    ContextState, DenseString, GcSlice, Handle, HandleScope, Heap, Object, Tagged, Thread, VM,
+    ContextState, DenseString, Errors, Handle, HandleScope, HandleSlice, Heap, Object, Tagged, VM,
     Value, VmError,
 };
 
@@ -77,7 +76,7 @@ impl<'a> NativeContext<'a> {
     }
 
     pub fn set_pending_exception(&mut self, err: VmError) {
-        let ex = error_from_vm_error(self.vm, self.heap, self.state, err)
+        let ex = Errors::from_vm_error(self.vm, self.heap, self.state, err)
             .expect("error materialization must not fail");
         self.state.set_pending_exception(ex);
     }
@@ -95,13 +94,13 @@ impl<'a> NativeContext<'a> {
     pub fn call<'s>(
         &mut self,
         callable: Tagged<'_, Value>,
-        args: GcSlice<'s>,
+        args: HandleSlice<'s>,
     ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
         let Some(callable) = scope.cast::<Object>(callable) else {
             return Err(VmError::Type);
         };
-        execute(self.vm, self.heap, self.state, callable, args, None)
+        execute(self.vm, self.heap, self.state, callable, args, None).map(|v| v.raw())
     }
 
     /// Invoke a callable that is already rooted in a handle. This is the
@@ -109,14 +108,14 @@ impl<'a> NativeContext<'a> {
     pub fn call_rooted<'s>(
         &mut self,
         callable: Handle<'_, Value>,
-        args: GcSlice<'s>,
+        args: HandleSlice<'s>,
     ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
         let callable = scope.cast::<Object>(callable.as_tagged(&*self.heap));
         let Some(callable) = callable else {
             return Err(VmError::Type);
         };
-        execute(self.vm, self.heap, self.state, callable, args, None)
+        execute(self.vm, self.heap, self.state, callable, args, None).map(|v| v.raw())
     }
 
     /// Invoke `callable` as a constructor with `new.target` = `new_target`:
@@ -127,7 +126,7 @@ impl<'a> NativeContext<'a> {
         &mut self,
         callable: Tagged<'_, Value>,
         new_target: Tagged<'_, Value>,
-        args: GcSlice<'s>,
+        args: HandleSlice<'s>,
     ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
         let Some(callable) = scope.cast::<Object>(callable) else {
@@ -146,6 +145,7 @@ impl<'a> NativeContext<'a> {
             args,
             Some(new_target),
         )
+        .map(|v| v.raw())
     }
 
     /// Rooted [`Self::call_construct`]: callable and new.target are handles,
@@ -154,7 +154,7 @@ impl<'a> NativeContext<'a> {
         &mut self,
         callable: Handle<'_, Value>,
         new_target: Handle<'_, Value>,
-        args: GcSlice<'s>,
+        args: HandleSlice<'s>,
     ) -> Result<Value, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&self.state.handles)) };
         let Some(callable) = scope.cast::<Object>(callable.as_tagged(&*self.heap)) else {
@@ -174,6 +174,7 @@ impl<'a> NativeContext<'a> {
             args,
             Some(new_target),
         )
+        .map(|v| v.raw())
     }
 
     pub fn take_pending_exception(&self) -> Option<Value> {
@@ -190,7 +191,8 @@ impl<'a> NativeContext<'a> {
     }
 }
 
-pub type NativeFn = for<'a, 's> fn(&mut NativeContext<'a>, GcSlice<'s>) -> Result<Value, VmError>;
+pub type NativeFn =
+    for<'a, 's> fn(&mut NativeContext<'a>, HandleSlice<'s>) -> Result<Value, VmError>;
 
 // TODO: this is still not a sound C interface (Rust-ABI `NativeFn` with
 // reference/slice arguments); decide on the C ABI before exporting.
@@ -198,6 +200,10 @@ pub type NativeFn = for<'a, 's> fn(&mut NativeContext<'a>, GcSlice<'s>) -> Resul
 // Invokes the registered native `index` on `thread` with `argc` raw
 // argument words: errors materialize into the pending exception and the
 // exception sentinel is returned.
+//
+// Disabled: unused, and it hands the native raw caller-owned memory that
+// is not GC-visited, which no longer fits the `HandleSlice` contract.
+/*
 pub unsafe extern "C" fn native_trampoline(
     index: usize,
     thread: *mut Thread,
@@ -207,13 +213,13 @@ pub unsafe extern "C" fn native_trampoline(
     let thread = unsafe { &mut *thread };
     let f = thread.vm().native(NativeIndex(index));
     // SAFETY: caller-owned C memory; the native must not read it after
-    // allocating (see GcSlice)
-    let args = unsafe { GcSlice::from_slice(core::slice::from_raw_parts(args, argc as usize)) };
+    // allocating (see HandleSlice)
+    let args = unsafe { HandleSlice::from_slice(core::slice::from_raw_parts(args, argc as usize)) };
     let mut nctx = NativeContext::new(&thread.vm, &mut thread.heap, &thread.state);
     match f(&mut nctx, args) {
         Ok(v) => v,
         Err(e) => {
-            let ex = error_from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
+            let ex = Errors::from_vm_error(&thread.vm, &mut thread.heap, &thread.state, e)
                 .expect("error materialization must not fail");
             thread.state.set_pending_exception(ex);
             // Safety: singleton word read for immediate return; the
@@ -222,6 +228,7 @@ pub unsafe extern "C" fn native_trampoline(
         }
     }
 }
+*/
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NativeIndex(pub usize);

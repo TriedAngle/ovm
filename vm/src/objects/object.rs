@@ -1,9 +1,9 @@
 use core::alloc::Layout;
 
 use crate::{
-    CallableInfoObject, Context, DenseString, EdgeVisitable, FixedArray, FunctionKind, GcSlice,
-    GcSlot, Handle, HandleScope, Header, Heap, HeapObject, HeapRef, Map, ObjectKind, SlotName, Smi,
-    Tagged, Value, Visitor, VmError,
+    CallableInfoObject, Context, DenseString, EdgeVisitable, FixedArray, FunctionKind, GcSlot,
+    Handle, HandleScope, HandleSlice, Header, Heap, HeapObject, HeapRef, Map, ObjectKind, SlotName,
+    Smi, Tagged, Value, Visitor, VmError,
 };
 
 #[repr(C)]
@@ -27,11 +27,21 @@ impl Object {
         info.get_as::<CallableInfoObject>()
     }
 
-    pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<HeapRef<'a, Context>> {
+    pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, Context>> {
         if !self.header.map.heap_ref(heap).kind().is_callable() {
             return None;
         }
-        self.slots.heap_ref(heap).at(heap, 1).get_as::<Context>()
+        self.slots
+            .heap_ref(heap)
+            .at(heap, 1)
+            .get_as_tagged::<Context>()
+    }
+
+    /// The `idx`-th entry of the callable's constant pool, as a slot name.
+    pub fn constant_slot_name<'a>(&'a self, heap: &'a Heap, idx: usize) -> Tagged<'a, SlotName> {
+        self.callable_info(heap)
+            .expect("callable must have callable info")
+            .constant_slot_name(heap, idx)
     }
 
     pub fn native_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
@@ -114,95 +124,90 @@ pub enum CallTarget<'a> {
     Native(usize),
 }
 
-pub fn call_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
-    let obj = f.as_heap_object()?;
-    let kind = obj.as_ref().header.map.heap_ref(heap).kind();
-    if !kind.is_callable() {
-        return None;
-    }
-    if kind.is_native() {
-        return Some(CallTarget::Native(obj.as_ref().native_index(heap)?));
-    }
-    let info = obj.as_ref().callable_info(heap)?;
-    let register_count = info.register_count.to_smi().value() as usize;
-    Some(CallTarget::Bytecode(
-        obj.into_tagged(),
-        register_count,
-        info.function_kind(),
-    ))
-}
-
-/// The callee's function kind, when it is a bytecode function.
-pub fn function_kind_of<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> Option<FunctionKind> {
-    let obj = v.as_heap_object()?;
-    let info = obj.as_ref().callable_info(heap)?;
-    Some(info.function_kind())
-}
-
-/// Store `value` at element index `i` of an array object, growing the
-/// elements backing store and updating `length` when `i` is past the end.
-pub fn store_array_element(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    receiver: Tagged<'_, Value>,
-    i: usize,
-    value: Tagged<'_, Value>,
-) -> Result<(), VmError> {
-    let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
-    // root up front: the grow path allocates
-    let receiver = scope.cast::<Object>(receiver).ok_or(VmError::Type)?;
-    let value = scope.handle(value);
-
-    let grows = {
-        let obj = receiver.heap_ref(heap);
-        if !obj.as_ref().is_array(heap) {
-            return Err(VmError::Type);
+impl Object {
+    /// Classify a value as a callable: a bytecode function (with register
+    /// count and kind) or a native (with registry index).
+    pub fn call_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
+        let obj = f.as_heap_object()?;
+        let kind = obj.as_ref().header.map.heap_ref(heap).kind();
+        if !kind.is_callable() {
+            return None;
         }
-        // grow only when the store index is past the physical backing
-        // store (its capacity), not the logical length: sequential appends
-        // with headroom must not reallocate every time
-        let capacity = obj
-            .as_ref()
-            .elements_array(heap)
-            .map(|e| e.len())
-            .unwrap_or(0);
-        i >= capacity
-    };
+        if kind.is_native() {
+            return Some(CallTarget::Native(obj.as_ref().native_index(heap)?));
+        }
+        let info = obj.as_ref().callable_info(heap)?;
+        let register_count = info.register_count.to_smi().value() as usize;
+        Some(CallTarget::Bytecode(
+            obj.into_tagged(),
+            register_count,
+            info.function_kind(),
+        ))
+    }
 
-    if grows {
-        let staged = {
-            let heap_ref: &Heap = heap;
-            let obj = receiver.heap_ref(heap_ref);
-            let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
-            let keep = obj.as_ref().length().min(elements.len());
-            let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
-            let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(capacity);
-            for k in 0..keep {
-                values.push(elements.at(heap_ref, k));
+    /// Store `value` at element index `i` of an array object, growing the
+    /// elements backing store and updating `length` when `i` is past the end.
+    /// Both arguments are rooted handles, so the grow path may allocate.
+    pub fn store_array_element(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: &Handle<'_, Object>,
+        i: usize,
+        value: &Handle<'_, Value>,
+    ) -> Result<(), VmError> {
+        let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
+
+        let grows = {
+            let obj = receiver.heap_ref(heap);
+            if !obj.as_ref().is_array(heap) {
+                return Err(VmError::Type);
             }
-            values.resize(
-                capacity,
-                heap_ref.known().the_hole.as_tagged(heap_ref).erase(),
-            );
-            values[i] = value.as_tagged(heap_ref).erase();
-            scope.stage(&values)
+            // grow only when the store index is past the physical backing
+            // store (its capacity), not the logical length: sequential appends
+            // with headroom must not reallocate every time
+            let capacity = obj
+                .as_ref()
+                .elements_array(heap)
+                .map(|e| e.len())
+                .unwrap_or(0);
+            i >= capacity
         };
-        let elements = heap.allocate_handle::<FixedArray>(staged, scope);
-        let obj = receiver.heap_ref(heap);
-        obj.elements
-            .set(heap, obj.erase(), elements.as_tagged(heap).erase());
-        obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
-    } else {
-        let obj = receiver.heap_ref(heap);
-        let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
-        elements.set(heap, i, value.as_tagged(heap));
-        // a store inside the physical capacity but past the logical
-        // length still extends the array
-        if i >= obj.as_ref().length() {
+
+        if grows {
+            let staged = {
+                let heap_ref: &Heap = heap;
+                let obj = receiver.heap_ref(heap_ref);
+                let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
+                let keep = obj.as_ref().length().min(elements.len());
+                let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
+                let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(capacity);
+                for k in 0..keep {
+                    values.push(elements.at(heap_ref, k));
+                }
+                values.resize(
+                    capacity,
+                    heap_ref.known().the_hole.as_tagged(heap_ref).erase(),
+                );
+                values[i] = value.as_tagged(heap_ref).erase();
+                scope.stage(&values)
+            };
+            let elements = heap.allocate_handle::<FixedArray>(staged, scope);
+            let obj = receiver.heap_ref(heap);
+            obj.elements
+                .set(heap, obj.erase(), elements.as_tagged(heap).erase());
             obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
+        } else {
+            let obj = receiver.heap_ref(heap);
+            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+            elements.set(heap, i, value.as_tagged(heap));
+            // a store inside the physical capacity but past the logical
+            // length still extends the array
+            if i >= obj.as_ref().length() {
+                obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
+            }
         }
+        Ok(())
     }
-    Ok(())
 }
 
 pub struct ObjectInit<'a> {
@@ -214,7 +219,7 @@ pub struct ObjectInit<'a> {
 
 pub struct ObjectSlotsInit<'m, 'v> {
     pub map: Handle<'m, Map>,
-    pub values: GcSlice<'v>,
+    pub values: HandleSlice<'v>,
     pub elements: Handle<'m, Value>,
     pub length: usize,
 }

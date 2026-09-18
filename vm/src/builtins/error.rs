@@ -4,41 +4,41 @@ use crate::natives::NativeContext;
 use crate::runtime::Coercion;
 
 use crate::{
-    ContextState, Convert, DenseString, GcSlice, Heap, Object, PropertyDescriptor, Tagged, VM,
+    ContextState, Convert, DenseString, HandleSlice, Heap, Object, PropertyDescriptor, Tagged, VM,
     Value, VmError, runtime::Runtime,
 };
 
 pub fn error_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "Error")
 }
 
 pub fn type_error_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "TypeError")
 }
 
 pub fn reference_error_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "ReferenceError")
 }
 
 pub fn make_error(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
     class: &str,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, _) = nctx.split();
         // root the message right away: the allocations below (new_object,
         // interning) would leave a raw copy stale
-        let message_word = args.get(heap, 1).map(|v| v.raw());
+        let message_word = args.get(1).map(|h| h.as_tagged(heap)).map(|v| v.raw());
         let message = match message_word {
             // Safety: fresh argument word, consumed before any allocation.
             Some(v) => {
@@ -59,7 +59,7 @@ pub fn make_error(
         };
 
         let obj = heap
-            .new_object(&scope, map, GcSlice::EMPTY)
+            .new_object(&scope, map, HandleSlice::EMPTY)
             .into_handle(&scope);
         let name = heap.known().strings.name;
         let message_key = heap.known().strings.message;
@@ -84,14 +84,20 @@ pub fn make_error(
     })
 }
 
-pub fn error_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn error_to_string(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // both [[Get]]s below run user code (getters): the receiver must
         // stay rooted across them
         // Safety: fresh argument word, rooted below before any allocation.
         let receiver_word = {
             let heap = &*nctx.heap();
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw()
         };
         let receiver =
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(receiver_word) });

@@ -1,6 +1,6 @@
 use core::cell::{Cell, RefCell};
 
-use crate::{EdgeVisitable, GcSlice, Heap, Object, Register, Smi, Tagged, Value, Visitor};
+use crate::{EdgeVisitable, HandleSlice, Heap, Object, Register, Smi, Tagged, Value, Visitor};
 
 use crate::VmError;
 
@@ -68,12 +68,12 @@ impl Stack {
         unsafe { &*self.slots.as_ptr().add(index) }
     }
 
-    pub fn value_slice(&self, base: usize, count: usize) -> GcSlice<'_> {
+    pub fn value_slice(&self, base: usize, count: usize) -> HandleSlice<'_> {
         let slots = &self.slots[base..base + count];
         // Safety: stack slots are GC-visited, so the words stay current for
         // as long as the returned slice is alive.
         unsafe {
-            GcSlice::from_slice(core::slice::from_raw_parts(
+            HandleSlice::from_slice(core::slice::from_raw_parts(
                 slots.as_ptr() as *const Value,
                 count,
             ))
@@ -133,7 +133,7 @@ impl Stack {
         self.slot_unchecked(Self::reg_index(meta, i)).store(v);
     }
 
-    pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> GcSlice<'_> {
+    pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> HandleSlice<'_> {
         self.value_slice(Self::reg_index(meta, reg_base), count)
     }
 
@@ -143,17 +143,17 @@ impl Stack {
         register_count: usize,
         context: Tagged<'_, Value>,
         new_target: Tagged<'_, Value>,
-        args: GcSlice<'_>,
+        args: HandleSlice<'_>,
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
         let argc = args.len();
         let padded = args.len().max(formal_min);
         let base = self.reserve(register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
-        debug_assert!(args.words().iter().all(|v| !v.is_weak_ptr()));
+        debug_assert!(args.raw().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
             core::ptr::copy_nonoverlapping(
-                args.words().as_ptr(),
+                args.raw().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             );
@@ -215,17 +215,17 @@ impl Stack {
         callable: Tagged<'_, Value>,
         register_count: usize,
         context: Tagged<'_, Value>,
-        args: GcSlice<'_>,
+        args: HandleSlice<'_>,
         new_target: Tagged<'_, Value>,
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
         let padded = args.len().max(formal_min);
         let base = self.reserve(register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
-        debug_assert!(args.words().iter().all(|v| !v.is_weak_ptr()));
+        debug_assert!(args.raw().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
             core::ptr::copy_nonoverlapping(
-                args.words().as_ptr(),
+                args.raw().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             );
@@ -249,9 +249,9 @@ impl Stack {
     }
 
     /// Copy `args` into a fresh register region above the current top and
-    /// return a `GcSlice` over it (GC-visited: reads stay fresh across
+    /// return a `HandleSlice` over it (GC-visited: reads stay fresh across
     /// allocations). Rewind the region with `set_top(saved_top)` when done.
-    pub fn stage_args(&self, args: GcSlice<'_>) -> Result<(usize, GcSlice<'_>), VmError> {
+    pub fn stage_args(&self, args: HandleSlice<'_>) -> Result<(usize, HandleSlice<'_>), VmError> {
         let saved_top = self.top();
         let base = self.reserve(0, args.len())?;
         let dst = base + HEADER_SLOTS;
@@ -263,7 +263,7 @@ impl Stack {
         }
         unsafe {
             core::ptr::copy_nonoverlapping(
-                args.words().as_ptr(),
+                args.raw().as_ptr(),
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             )

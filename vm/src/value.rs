@@ -365,6 +365,12 @@ impl<'a> Tagged<'a, Value> {
         Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
     }
 
+    /// Like [`Self::get_as`], but yields an anchored [`Tagged`] instead of
+    /// a [`HeapRef`].
+    pub fn get_as_tagged<T: HeapObject>(self) -> Option<Tagged<'a, T>> {
+        self.get_as::<T>().map(HeapRef::into_tagged)
+    }
+
     /// Narrow an anchored value word to a property-name tag (type-level
     /// only: a name is an interned string, a symbol or a Smi, compared
     /// by word identity).
@@ -415,12 +421,32 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
         }
     }
 
+    /// The anchored referent. The `'a` heap borrow proves the pointer is
+    /// live and cannot move for the whole borrow, so no GC can invalidate
+    /// it. (Unlike [`HeapPtr`], which is only usable until the next
+    /// safepoint.)
+    pub fn as_ref(self) -> &'a T {
+        // Safety: a `Tagged<'a, T: HeapObject>` is always a strong heap
+        // pointer valid for `'a` (Smi/weak words have no `HeapObject` type).
+        unsafe { self.as_ptr().expect("strong pointer").as_ref() }
+    }
+
     /// A rooted copy: the value may now cross GC safepoints.
     pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T>
     where
         T: 's,
     {
         scope.create_handle(self)
+    }
+}
+
+impl<'a, T: HeapObject> core::ops::Deref for Tagged<'a, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // Safety: `Tagged<'a, T>` holds a strong pointer valid for `'a`,
+        // so the (shorter) borrow of `self` is valid too.
+        unsafe { self.as_ptr().expect("strong pointer").as_ref() }
     }
 }
 

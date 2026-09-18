@@ -48,8 +48,8 @@ use string::{string_constructor, string_to_string, string_value_of};
 use symbol::symbol_constructor;
 
 use crate::{
-    GcSlice, Handle, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotFlags, SlotName, Smi,
-    Tagged, Value, VmError,
+    Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotFlags, SlotName,
+    Smi, Tagged, Value, VmError,
 };
 
 use crate::Float;
@@ -615,7 +615,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
                 MapKind::OBJECT.union(MapKind::EXTENDABLE),
                 object_prototype,
             )?;
-            roots.create_handle(thread.heap().new_object(&scope, map, GcSlice::EMPTY))
+            roots.create_handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY))
         };
         install_method(
             thread,

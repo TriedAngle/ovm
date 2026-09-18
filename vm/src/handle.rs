@@ -222,14 +222,14 @@ impl<'d> HandleScope<'d> {
 
     /// Root a copy of `values` in contiguous scope slots. The values may be
     /// anchored anywhere: rooting only writes words.
-    pub fn stage<'x, T>(&self, values: &[Tagged<'x, T>]) -> GcSlice<'_> {
+    pub fn stage<'x, T>(&self, values: &[Tagged<'x, T>]) -> HandleSlice<'_> {
         let inner = unsafe { &*self.data.as_ptr() }.inner();
         let start = inner.allocate_block(values.len());
         for (i, v) in values.iter().enumerate() {
             debug_assert!(!v.is_weak_ptr(), "weak value staged for a call");
             unsafe { *start.add(i) = v.raw() };
         }
-        unsafe { GcSlice::from_slice(core::slice::from_raw_parts(start, values.len())) }
+        unsafe { HandleSlice::from_slice(core::slice::from_raw_parts(start, values.len())) }
     }
 
     pub fn cast<T: HeapObject>(&self, value: Tagged<'_, Value>) -> Option<Handle<'_, T>> {
@@ -367,58 +367,58 @@ impl HandleSet for RootHandles {
     }
 }
 
-/// A borrowed view of rooted argument memory. The words live in
-/// GC-visited slots (handle scope blocks or the register file), so they
-/// are *updated in place* by the GC; individual reads must therefore
-/// happen under a heap borrow (see [`GcSlice::get`]) — a word read
-/// earlier may be stale after a collection.
+/// A borrowed view of rooted argument memory: a slice of GC-visited
+/// slots (handle scope blocks or the register file). The words are
+/// updated in place by the GC, so a [`Handle`] can be taken to any
+/// element for free — the slot is already a root, no scope allocation is
+/// needed. Anchored reads go through [`Handle::as_tagged`].
 #[derive(Copy, Clone)]
-pub struct GcSlice<'a> {
-    slice: &'a [Value],
+pub struct HandleSlice<'a> {
+    raw: &'a [Value],
 }
 
-impl<'a> GcSlice<'a> {
+impl<'a> HandleSlice<'a> {
     /// The empty argument list.
-    pub const EMPTY: GcSlice<'static> = GcSlice { slice: &[] };
+    pub const EMPTY: HandleSlice<'static> = HandleSlice { raw: &[] };
 
     /// # Safety
     /// The slice must point at memory the GC visits for as long as it is
-    /// alive: rooted scope slots ([`HandleScope::stage`]), the register
-    /// file, or caller-owned memory that the callee stages into the frame
-    /// before allocating.
-    pub unsafe fn from_slice(slice: &'a [Value]) -> Self {
-        Self { slice }
+    /// alive ([`HandleScope::stage`] slots or the register file), and the
+    /// words must be strong (non-weak) values.
+    pub unsafe fn from_slice(raw: &'a [Value]) -> Self {
+        Self { raw }
+    }
+
+    /// A free handle to the element at `index`: the slot is already
+    /// rooted, so this allocates nothing and the handle survives
+    /// collection for as long as the slice lives.
+    pub fn get(&self, index: usize) -> Option<Handle<'a, Value>> {
+        let raw: &'a [Value] = self.raw;
+        let word = raw.get(index)?;
+        // Safety: `from_slice` guarantees a GC-visited, strong slot.
+        Some(unsafe { Handle::from_location(NonNull::from(word)) })
+    }
+
+    /// Free handles over every element (see [`Self::get`]).
+    pub fn iter(&self) -> impl Iterator<Item = Handle<'a, Value>> + 'a {
+        let raw: &'a [Value] = self.raw;
+        raw.iter().map(|word| {
+            // Safety: see `get`.
+            unsafe { Handle::from_location(NonNull::from(word)) }
+        })
     }
 
     /// Raw words, for storage copies into fresh objects (no GC can run
     /// mid-`init`).
-    pub fn words(&self) -> &'a [Value] {
-        self.slice
+    pub fn raw(&self) -> &'a [Value] {
+        self.raw
     }
 
     pub fn len(&self) -> usize {
-        self.slice.len()
+        self.raw.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.slice.is_empty()
-    }
-
-    /// Re-read an argument under a heap borrow.
-    pub fn get<'h>(&self, _heap: &'h Heap, index: usize) -> Option<Tagged<'h, Value>> {
-        let v = self.slice.get(index).copied()?;
-        // Safety: rooted memory is updated in place by the GC, so the
-        // word is current; the anchor proves no GC runs before its use.
-        Some(unsafe { Tagged::from_value_unchecked(v) })
-    }
-
-    pub fn iter<'h>(&self, _heap: &'h Heap) -> impl Iterator<Item = Tagged<'h, Value>> + 'h
-    where
-        'a: 'h,
-    {
-        self.slice.iter().map(|v| {
-            // Safety: anchored re-read of rooted memory.
-            unsafe { Tagged::from_value_unchecked(*v) }
-        })
+        self.raw.is_empty()
     }
 }

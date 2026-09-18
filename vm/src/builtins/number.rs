@@ -2,15 +2,15 @@
 
 use super::helpers::wrapper_value;
 use crate::natives::NativeContext;
-use crate::{Convert, GcSlice, Smi, Tagged, Value, VmError, runtime::Runtime};
+use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError, runtime::Runtime};
 
 pub fn number_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let n = nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
-        let arg = match args.get(heap, 1) {
+        let arg = match args.get(1).map(|h| h.as_tagged(heap)) {
             Some(v) => scope.handle(v),
             None => scope.handle(Smi::new(0).into_tagged()),
         };
@@ -39,16 +39,28 @@ pub fn number_constructor(
     })
 }
 
-pub fn number_value_of(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn number_value_of(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+    let receiver = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
     wrapper_value(heap, receiver)
 }
 
-pub fn number_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn number_to_string(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let v = {
         let heap = &*nctx.heap();
-        let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+        let receiver = args
+            .get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
         wrapper_value(heap, receiver)
     }?;
     nctx.handle_scope(|nctx, scope| {

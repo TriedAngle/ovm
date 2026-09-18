@@ -26,34 +26,37 @@ pub enum Key<'a> {
     Name(Tagged<'a, SlotName>),
 }
 
-pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key<'a>, VmError> {
-    if let Some(smi) = Smi::decode(key.raw()) {
-        // ES 6.1.7: an array index is 0 ≤ i < 2^32−1; anything else (incl.
-        // 4294967295 itself) is an ordinary named property
-        if smi.value() >= 0 && smi.value() < u32::MAX as i64 {
-            return usize::try_from(smi.value())
-                .map(Key::Element)
-                .map_err(|_| VmError::OutOfBounds);
+impl Lookup<'_> {
+    /// Classify a runtime property key: a canonical array index or a name.
+    pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key<'a>, VmError> {
+        if let Some(smi) = Smi::decode(key.raw()) {
+            // ES 6.1.7: an array index is 0 ≤ i < 2^32−1; anything else (incl.
+            // 4294967295 itself) is an ordinary named property
+            if smi.value() >= 0 && smi.value() < u32::MAX as i64 {
+                return usize::try_from(smi.value())
+                    .map(Key::Element)
+                    .map_err(|_| VmError::OutOfBounds);
+            }
+            return Ok(Key::Name(Tagged::from(smi)));
         }
-        return Ok(Key::Name(Tagged::from(smi)));
-    }
-    if let Some(s) = key.get_as::<DenseString>() {
-        // Canonical index strings ("0", "1", … up to 2^32−2) name the same
-        // property as their numeric form (ES 6.1.7: ToString(i) is the
-        // canonical key); non-canonical spellings ("01", "-0", "1e2") stay
-        // ordinary names. String keys are interned upstream
-        // (ToPropertyKey) — pointer identity identifies the name.
-        if let Some(i) = canonical_index(s.as_ref().data(heap))
-            && i < u32::MAX as usize
-        {
-            return Ok(Key::Element(i));
+        if let Some(s) = key.get_as::<DenseString>() {
+            // Canonical index strings ("0", "1", … up to 2^32−2) name the same
+            // property as their numeric form (ES 6.1.7: ToString(i) is the
+            // canonical key); non-canonical spellings ("01", "-0", "1e2") stay
+            // ordinary names. String keys are interned upstream
+            // (ToPropertyKey) — pointer identity identifies the name.
+            if let Some(i) = canonical_index(s.as_ref().data(heap))
+                && i < u32::MAX as usize
+            {
+                return Ok(Key::Element(i));
+            }
+            return Ok(Key::Name(s.into_tagged().into()));
         }
-        return Ok(Key::Name(s.into_tagged().into()));
+        if let Some(s) = key.get_as::<Symbol>() {
+            return Ok(Key::Name(s.into_tagged().into()));
+        }
+        Err(VmError::Type)
     }
-    if let Some(s) = key.get_as::<Symbol>() {
-        return Ok(Key::Name(s.into_tagged().into()));
-    }
-    Err(VmError::Type)
 }
 
 /// Canonical array-index strings ("0", "1", "42"): digits only, no
@@ -129,15 +132,15 @@ pub fn load_outcome_on<'a>(
     }
 }
 
-pub fn load_outcome<'a>(
-    heap: &'a Heap,
-    receiver: Tagged<'a, Value>,
-    name: Tagged<'a, SlotName>,
-) -> Result<LoadOutcome<'a>, VmError> {
-    load_outcome_on(heap, receiver, name)
-}
-
 impl Lookup<'_> {
+    pub fn load_outcome<'a>(
+        heap: &'a Heap,
+        receiver: Tagged<'a, Value>,
+        name: Tagged<'a, SlotName>,
+    ) -> Result<LoadOutcome<'a>, VmError> {
+        load_outcome_on(heap, receiver, name)
+    }
+
     /// [[Get]] for a keyed load: an element key consults dense array
     /// elements first (falling back to its canonical Smi name), a name
     /// takes the ordinary path. Getters are returned for the caller to
@@ -147,16 +150,16 @@ impl Lookup<'_> {
         receiver: Tagged<'a, Value>,
         key: Tagged<'a, SlotName>,
     ) -> Result<LoadOutcome<'a>, VmError> {
-        match classify_key(heap, key.erase())? {
+        match Lookup::classify_key(heap, key.erase())? {
             Key::Element(i) => match receiver
                 .as_heap_object()
                 .and_then(|obj| obj.as_ref().element_value(heap, i))
             {
                 Some(v) => Ok(LoadOutcome::Value(v)),
                 // past the end, a hole, or a non-array receiver: ordinary lookup
-                None => load_outcome(heap, receiver, Tagged::from(Smi::new(i as i64))),
+                None => Lookup::load_outcome(heap, receiver, Tagged::from(Smi::new(i as i64))),
             },
-            Key::Name(name) => load_outcome(heap, receiver, name),
+            Key::Name(name) => Lookup::load_outcome(heap, receiver, name),
         }
     }
 }
@@ -172,7 +175,7 @@ impl DenseString {
         receiver: Handle<'_, Value>,
         key: Handle<'_, SlotName>,
     ) -> Option<Value> {
-        let Ok(Key::Element(i)) = classify_key(heap, key.as_tagged(heap).erase()) else {
+        let Ok(Key::Element(i)) = Lookup::classify_key(heap, key.as_tagged(heap).erase()) else {
             return None;
         };
         // Safety: fresh rooted-slot word.
@@ -192,7 +195,7 @@ pub fn ordinary_own_descriptor<'a, 's>(
     obj: Tagged<'a, Value>,
     key: Tagged<'a, Value>,
 ) -> Option<PropertyDescriptor<'s>> {
-    if let Ok(Key::Element(i)) = classify_key(heap, key)
+    if let Ok(Key::Element(i)) = Lookup::classify_key(heap, key)
         && let Some(o) = obj.as_heap_object()
         && let Some(v) = o.as_ref().element_value(heap, i)
     {
@@ -251,6 +254,15 @@ impl<'a, T> Tagged<'a, T> {
     }
 }
 
+impl<'s, T> Handle<'s, T> {
+    pub fn lookup<'a>(self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a>
+    where
+        T: 'a,
+    {
+        self.as_tagged(heap).lookup(heap, name)
+    }
+}
+
 /// ES 7.3.11 HasProperty (the `in` operator): walks the prototype chain
 /// without invoking anything. Element indices consult the array elements
 /// (including their backing-store holes); canonical index strings are
@@ -262,7 +274,7 @@ pub fn has_property<'a>(
     receiver: Tagged<'a, Value>,
     name: Tagged<'a, SlotName>,
 ) -> bool {
-    let name = match classify_key(heap, name.erase()) {
+    let name = match Lookup::classify_key(heap, name.erase()) {
         Ok(Key::Element(i)) => {
             // non-array receivers keep index keys as Smi-named
             // descriptors; canonicalize so the named walk finds them
@@ -419,7 +431,7 @@ pub fn super_lookup_from_proto<'a>(
 ) -> Result<LoadOutcome<'a>, VmError> {
     match super_start_from_proto(heap, proto) {
         // single parent: full load semantics
-        SuperStart::Object(start) => load_outcome(heap, start, name),
+        SuperStart::Object(start) => Lookup::load_outcome(heap, start, name),
         SuperStart::Parents(parents) => {
             for i in 0..parents.len() {
                 let parent = parents.at(heap, i);

@@ -2,10 +2,9 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
 use crate::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray,
-    GcSlice, Global, Handle, HandleData, HandleScope, Heap, Map, MapInit, MapKind, Object,
-    ObjectInit, RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol,
-    Tagged, Value,
+    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
+    Handle, HandleData, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, ObjectInit,
+    RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged, Value,
 };
 
 #[derive(Clone, Copy)]
@@ -300,7 +299,7 @@ fn alloc_object(
     roots: &RootHandles,
     map: Global<Map>,
 ) -> Global<Object> {
-    roots.create_handle(heap.new_object(scope, map, GcSlice::EMPTY))
+    roots.create_handle(heap.new_object(scope, map, HandleSlice::EMPTY))
 }
 
 pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
@@ -460,8 +459,8 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
     let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
-    let empty_slots = roots.create_handle(heap.allocate::<FixedArray>(GcSlice::EMPTY));
-    known.empty_fixed_array = roots.create_handle(heap.allocate::<FixedArray>(GcSlice::EMPTY));
+    let empty_slots = roots.create_handle(heap.allocate::<FixedArray>(HandleSlice::EMPTY));
+    known.empty_fixed_array = roots.create_handle(heap.allocate::<FixedArray>(HandleSlice::EMPTY));
     heap.set_known(known);
     let object_prototype = alloc_object(heap, &scope, roots, object_prototype_map);
 

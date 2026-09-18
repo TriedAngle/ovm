@@ -2,18 +2,19 @@
 
 use super::helpers::wrapper_value;
 use crate::natives::NativeContext;
-use crate::{Convert, GcSlice, Tagged, Value, VmError};
+use crate::{Convert, HandleSlice, Tagged, Value, VmError};
 
 pub fn string_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let construct = nctx.is_construct();
         let (_vm, heap, _) = nctx.split();
         // Safety: fresh argument word, consumed before any allocation.
         let arg = args
-            .get(heap, 1)
+            .get(1)
+            .map(|h| h.as_tagged(heap))
             .map(|v| v.raw())
             // Safety: fresh root-slot word read for the immediate use.
             .unwrap_or_else(|| unsafe { heap.known().undefined.read_unchecked() });
@@ -30,14 +31,26 @@ pub fn string_constructor(
     })
 }
 
-pub fn string_value_of(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn string_value_of(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+    let receiver = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
     wrapper_value(heap, receiver)
 }
 
-pub fn string_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn string_to_string(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+    let receiver = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
     wrapper_value(heap, receiver)
 }

@@ -249,7 +249,7 @@ mod tagged {
     fn from_ptr_roundtrip() {
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let tagged = unsafe { Tagged::from_value_unchecked(ptr.encode_strong()) };
+        let tagged = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
 
         assert!(tagged.is_ptr());
         assert!(tagged.is_strong_ptr());

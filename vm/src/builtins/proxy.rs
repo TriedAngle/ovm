@@ -6,14 +6,14 @@ use crate::natives::NativeContext;
 use crate::proxy::Proxy;
 use crate::runtime::Coercion;
 use crate::runtime::Runtime;
-use crate::{GcSlice, Tagged, Value, VmError};
+use crate::{HandleSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
 /// observable (`typeof`, future `Call`/`Construct` dispatch).
 pub fn proxy_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     if !nctx.is_construct() {
         return Err(VmError::Message("constructor Proxy requires 'new'"));
@@ -21,8 +21,14 @@ pub fn proxy_constructor(
     let (target, handler) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 1).ok_or(VmError::Type)?.raw(),
-            args.get(heap, 2).ok_or(VmError::Type)?.raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Type)?
+                .raw(),
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Type)?
+                .raw(),
         )
     };
     let ok = {
@@ -51,12 +57,21 @@ pub fn proxy_constructor(
 /// `{ proxy, revoke }`; the revoke closure is the JS template installed
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
 /// hidden `__revokeProxy` native).
-pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn proxy_revocable(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let (target, handler) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 1).ok_or(VmError::Type)?.raw(),
-            args.get(heap, 2).ok_or(VmError::Type)?.raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Type)?
+                .raw(),
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Type)?
+                .raw(),
         )
     };
     let ok = {
@@ -118,10 +133,13 @@ pub fn proxy_revocable(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
 /// Hidden `__revokeProxy(p)`: nulls the proxy's target/handler slots
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
-pub fn proxy_revoke(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn proxy_revoke(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let proxy = {
         let heap = &*nctx.heap();
-        args.get(heap, 1).ok_or(VmError::Arity)?.raw()
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     Proxy::revoke(
         nctx.heap(),

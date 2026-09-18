@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use crate::{
-    AllocError, FixedArray, Float, GcHost, GcSlice, Handle, HandleScope, HandleSet, HeapBackend,
-    HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit, ObjectSlotsInit, RawCell,
-    STRONG_PTR, SharedHeap, Smi, TAG_MASK, Tagged, TransitionLock, Value, Visitor, Word,
+    AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
+    HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit,
+    ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, TAG_MASK, Tagged, TransitionLock, Value,
+    Visitor, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -115,7 +116,7 @@ impl<'heap> AllocToken<'heap> {
     ) -> HeapRef<'g, T> {
         HeapRef {
             ptr: self
-                .allocate(config)
+                .allocate::<T>(config)
                 .as_ptr()
                 .expect("fresh strong pointer"),
             _phantom: PhantomData,
@@ -461,7 +462,7 @@ impl Heap {
         config: T::Init<'_>,
         scope: &'s HandleScope<'_>,
     ) -> Handle<'s, T> {
-        self.allocate(config).into_handle(scope)
+        self.allocate::<T>(config).into_handle(scope)
     }
 
     // TODO: potentially remove this in favor of a better allocate function
@@ -487,7 +488,7 @@ impl Heap {
         &mut self,
         handles: &'a impl HandleSet,
         map: Handle<'a, Map>,
-        values: GcSlice<'a>,
+        values: HandleSlice<'a>,
     ) -> Tagged<'_, Object> {
         self.allocate_object(
             handles,
@@ -523,14 +524,14 @@ impl Heap {
     pub fn new_array(
         &mut self,
         scope: &HandleScope<'_>,
-        values: GcSlice<'_>,
+        values: HandleSlice<'_>,
     ) -> Tagged<'_, Object> {
         let elements = self.allocate_handle::<FixedArray>(values, scope);
         self.allocate_object(
             scope,
             ObjectSlotsInit {
                 map: self.known().js_array_map,
-                values: GcSlice::EMPTY,
+                values: HandleSlice::EMPTY,
                 elements: elements.erase(),
                 length: values.len(),
             },
@@ -543,7 +544,7 @@ impl Heap {
         f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a Heap) -> R,
     ) -> R {
         let ptr = self
-            .allocate(config)
+            .allocate::<T>(config)
             .as_ptr()
             .expect("fresh strong pointer");
         let heap = &*self;

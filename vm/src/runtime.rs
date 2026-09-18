@@ -1,6 +1,6 @@
 use crate::{
-    CallableInfoObject, Context, Convert, DenseString, FixedArray, Float, GcSlice, Handle,
-    HandleScope, Heap, LoadOutcome, Object, PartialDescriptor, PropertyDescriptor, SlotName, Smi,
+    CallableInfoObject, Context, Convert, DenseString, FixedArray, Float, Handle, HandleScope,
+    HandleSlice, Heap, LoadOutcome, Object, PartialDescriptor, PropertyDescriptor, SlotName, Smi,
     Symbol, Tagged, Value, VmError, load_outcome_on,
 };
 
@@ -105,7 +105,7 @@ impl Runtime {
 
         if kind.needs_prototype() {
             let proto = heap
-                .new_object(scope, heap.known().object_initial_map, GcSlice::EMPTY)
+                .new_object(scope, heap.known().object_initial_map, HandleSlice::EMPTY)
                 .into_handle(scope);
             let constructor = heap.known().strings.constructor;
             let prototype = heap.known().strings.prototype;
@@ -583,27 +583,25 @@ impl Runtime {
     /// the ordinary object prototype (GetPrototypeFromConstructor,
     /// ES 9.1.14). The callee is irrelevant here — `this` always comes from
     /// new.target. `None` means user code threw.
-    pub fn create_construct_receiver(
+    pub fn create_construct_receiver<'a>(
         vm: &VM,
-        heap: &mut Heap,
+        heap: &'a mut Heap,
         state: &ContextState,
         new_target: Handle<'_, Object>,
-    ) -> Result<Option<Value>, VmError> {
-        let new_target = new_target.as_tagged(heap).raw();
-        Self::create_construct_receiver_value(vm, heap, state, new_target)
+    ) -> Result<Option<Tagged<'a, Value>>, VmError> {
+        Self::create_construct_receiver_value(vm, heap, state, new_target.erase())
     }
 
     /// Same, for `new.target` values that may be exotic (a constructor
     /// proxy): only `Get(new.target, "prototype")` is observed.
-    pub fn create_construct_receiver_value(
+    pub fn create_construct_receiver_value<'a>(
         vm: &VM,
-        heap: &mut Heap,
+        heap: &'a mut Heap,
         state: &ContextState,
-        new_target: Value,
-    ) -> Result<Option<Value>, VmError> {
+        new_target: Handle<'_, Value>,
+    ) -> Result<Option<Tagged<'a, Value>>, VmError> {
         state.handle_scope(|scope| {
             let proto_name = scope.handle(heap.known().strings.prototype.as_tagged(heap).erase());
-            let new_target = scope.handle(unsafe { new_target.assume_valid(heap) });
             let proto = Self::get_property(vm, heap, state, new_target, proto_name)?;
             let proto = match proto {
                 Coercion::Threw => return Ok(None),
@@ -613,14 +611,12 @@ impl Runtime {
             let proto = scope.cast::<Object>(proto.as_tagged(heap));
             let known = heap.known();
             let obj = heap
-                .new_object(&scope, known.object_initial_map, GcSlice::EMPTY)
+                .new_object(&scope, known.object_initial_map, HandleSlice::EMPTY)
                 .into_handle(&scope);
             if let Some(proto) = proto {
                 Object::set_prototype(heap, &scope, obj, proto.erase())?;
             }
-            // fresh word at return: callers store it to a register (rooted
-            // memory) immediately
-            Ok(Some(obj.as_tagged(heap).raw()))
+            Ok(Some(obj.as_tagged(heap).erase()))
         })
     }
 }

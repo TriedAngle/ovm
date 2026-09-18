@@ -1,7 +1,7 @@
 use core::alloc::Layout;
 
 use crate::{
-    EdgeVisitable, GcSlice, GcSlot, Header, Heap, HeapObject, ObjectKind, Smi, Tagged, Value,
+    EdgeVisitable, GcSlot, HandleSlice, Header, Heap, HeapObject, ObjectKind, Smi, Tagged, Value,
     Visitor,
 };
 
@@ -49,7 +49,7 @@ impl FixedArray {
 
 impl HeapObject for FixedArray {
     const KIND: ObjectKind = ObjectKind::FixedArray;
-    type Init<'a> = GcSlice<'a>;
+    type Init<'a> = HandleSlice<'a>;
 
     fn layout_for(config: &Self::Init<'_>) -> Layout {
         Self::layout_for(config.len())
@@ -63,7 +63,7 @@ impl HeapObject for FixedArray {
         self.size.set(heap, host, Smi::new(config.len() as i64));
         // Safety: copying words out of rooted memory during init; no GC
         // can run before the new array is rooted by the caller.
-        for (i, v) in config.iter(heap).enumerate() {
+        for (i, v) in config.iter().map(|h| h.as_tagged(heap)).enumerate() {
             self.element_slot(i).set(heap, host, v);
         }
     }

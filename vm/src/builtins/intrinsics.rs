@@ -4,11 +4,11 @@
 //! its ES section), not JS-visible library functions.
 
 use crate::{
-    AccessorPair, Context, Convert, DenseString, FixedArray, GcSlice, Handle, Heap, HeapRef, Key,
-    LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, StoreOutcome,
-    StoreSemantics, StringData, Symbol, Tagged, Value, VmError, classify_key, function_kind_of,
-    home_proto, load_outcome, private_find, runtime::Coercion, super_constructor,
-    super_lookup_from_proto, super_store_lookup,
+    AccessorPair, Context, Convert, DenseString, FixedArray, Handle, HandleSlice, Heap, HeapRef,
+    Key, LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi,
+    StoreOutcome, StoreSemantics, StringData, Symbol, Tagged, Value, VmError, home_proto,
+    private_find, runtime::Coercion, super_constructor, super_lookup_from_proto,
+    super_store_lookup,
 };
 
 use crate::Float;
@@ -77,13 +77,16 @@ pub fn runtime_fn(id: bytecode::RuntimeFn) -> NativeFn {
 /// null/undefined (object destructuring sources).
 fn require_object_coercible(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // internal-native convention: the register list IS the argument list
     // (no receiver slot)
     {
         let heap = &*nctx.heap();
-        let arg = args.get(heap, 0).ok_or(VmError::Arity)?;
+        let arg = args
+            .get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
         let null = heap.known().null.as_tagged(heap);
         let undefined = heap.known().undefined.as_tagged(heap);
         if arg.ptr_eq(null) || arg.ptr_eq(undefined) {
@@ -98,7 +101,7 @@ fn require_object_coercible(
 /// `delete obj.key` in sloppy code: (obj, key) -> bool.
 fn delete_property_sloppy(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     delete_property(nctx, args, false)
 }
@@ -107,14 +110,14 @@ fn delete_property_sloppy(
 /// the delete fails (ES 13.5.1.2 step 4.h).
 fn delete_property_strict(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     delete_property(nctx, args, true)
 }
 
 fn delete_property(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
     strict: bool,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
@@ -122,8 +125,14 @@ fn delete_property(
     let (raw_target, raw_key) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
         )
     };
     // the reference's key is coerced before the base is touched (ES
@@ -264,12 +273,15 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
 /// properties reach here, and sloppy references never throw on failure.
 fn delete_identifier_sloppy(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word, consumed below.
     let name = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     // Safety: fresh root-slot word, consumed by the delete.
     let global = unsafe { nctx.heap().known().global_object.read_unchecked() };
@@ -286,7 +298,7 @@ fn delete_identifier_sloppy(
 /// never coerced — delete-super fails before any ToPropertyKey.
 fn delete_super_property(
     _nctx: &mut NativeContext<'_>,
-    _args: GcSlice<'_>,
+    _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     Err(VmError::Reference)
 }
@@ -311,12 +323,15 @@ const FOR_IN_VISITED: usize = 3;
 /// zero iterations; objects and strings snapshot level 0 of the lazy
 /// chain walk. Other primitives' prototypes are not walked yet (their
 /// own properties are none, so they enumerate empty).
-fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn for_in_enumerate(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before it is
     // rooted.
     let subject = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let nullish = {
         let heap = &*nctx.heap();
@@ -409,7 +424,7 @@ fn for_in_initial_level(heap: &Heap, subject: Tagged<'_, Value>) -> Option<Value
         "Boolean" => strings.boolean_ctor,
         _ => strings.symbol_ctor,
     };
-    let ctor = match load_outcome(
+    let ctor = match Lookup::load_outcome(
         heap,
         unsafe { global.assume_valid(heap) },
         ctor_handle.as_tagged(heap),
@@ -419,7 +434,7 @@ fn for_in_initial_level(heap: &Heap, subject: Tagged<'_, Value>) -> Option<Value
         LoadOutcome::Value(v) if v.is_strong_ptr() => v.raw(),
         _ => return None,
     };
-    match load_outcome(
+    match Lookup::load_outcome(
         heap,
         unsafe { ctor.assume_valid(heap) },
         // Safety: fresh root-slot word read for the lookup.
@@ -534,12 +549,15 @@ fn for_in_level_keys(
 /// an earlier level (yielded or non-enumerable) are skipped; enumerable
 /// survivors are yielded at most once. When a level's snapshot runs
 /// dry, the walk advances to the live prototype and snapshots it.
-fn for_in_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn for_in_next(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before it is
     // rooted.
     let enumerator_word = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     if enumerator_word == {
         let heap = &*nctx.heap();
@@ -737,7 +755,7 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
         // lookups; no user code can run)
         // Safety: fresh root-slot words read for the lookups.
         let global = heap.known().global_object.as_tagged(heap).raw();
-        let Some(string_ctor) = load_outcome(
+        let Some(string_ctor) = Lookup::load_outcome(
             heap,
             // Safety: root-slot word, still fresh.
             unsafe { global.assume_valid(heap) },
@@ -750,7 +768,7 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
         }) else {
             return Ok(None);
         };
-        let proto = load_outcome(
+        let proto = Lookup::load_outcome(
             heap,
             // Safety: walk word, still fresh (no allocation since).
             unsafe { string_ctor.assume_valid(heap) },
@@ -787,7 +805,7 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
 /// the visited set's job.
 fn for_in_own_state(heap: &Heap, level: Value, key: Value) -> Option<bool> {
     // Safety: caller-supplied words, fresh at entry.
-    match classify_key(heap, unsafe { key.assume_valid(heap) }).ok()? {
+    match Lookup::classify_key(heap, unsafe { key.assume_valid(heap) }).ok()? {
         Key::Element(i) => {
             // Safety: caller-supplied word, fresh at entry.
             if let Some(s) = unsafe { level.assume_valid(heap) }.get_as::<DenseString>() {
@@ -825,12 +843,14 @@ fn for_in_own_state(heap: &Heap, level: Value, key: Value) -> Option<bool> {
 }
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
-fn get_iterator(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn get_iterator(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let obj = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 0).ok_or(VmError::Arity)?
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         let (vm, heap, state) = nctx.split();
         let symbol = scope.handle(heap.known().iterator_symbol.as_tagged(heap).erase());
@@ -863,12 +883,14 @@ fn get_iterator(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
 }
 
 /// IteratorNext (ES 8.5.6): (iterator) -> result object.
-fn iterator_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn iterator_next(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let iter = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 0).ok_or(VmError::Arity)?
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         let (vm, heap, state) = nctx.split();
         let next_name = scope.handle(heap.known().strings.next.as_tagged(heap).erase());
@@ -906,10 +928,10 @@ fn iterator_next(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Valu
 }
 
 /// IteratorComplete (ES 8.5.7): (result) -> bool.
-fn iterator_done(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn iterator_done(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
-        let result = scope.handle(args.get(heap, 0).ok_or(VmError::Arity)?);
+        let result = args.get(0).ok_or(VmError::Arity)?;
         let done_name = scope.handle(heap.known().strings.done.as_tagged(heap).erase());
         match Runtime::get_property(vm, heap, state, result, done_name)? {
             Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
@@ -923,10 +945,10 @@ fn iterator_done(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Valu
 }
 
 /// IteratorValue (ES 8.5.8): (result) -> value.
-fn iterator_value(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn iterator_value(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
-        let result = scope.handle(args.get(heap, 0).ok_or(VmError::Arity)?);
+        let result = args.get(0).ok_or(VmError::Arity)?;
         let value_name = scope.handle(heap.known().strings.value.as_tagged(heap).erase());
         match Runtime::get_property(vm, heap, state, result, value_name)? {
             Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
@@ -937,14 +959,20 @@ fn iterator_value(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Val
 
 /// The `in` operator (ES 14.11.2): (key, obj) -> bool. Proxy receivers
 /// run their `has` trap (ES 20.2.5.9).
-fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn has_property(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_key, raw_obj) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
         )
     };
     // the key coercion allocates (wrapper keys run toString/valueOf):
@@ -1001,7 +1029,10 @@ fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
 
 /// CopyDataProperties (ES 8.5.1) with an exclusion list (object rest):
 /// (excluded..., target, source); `excluded` has count−2 entries.
-fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn copy_data_properties(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let n = args.len();
     if n < 2 {
         return Err(VmError::Arity);
@@ -1010,10 +1041,10 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
     let (target, source, excluded) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, n - 2).map(|v| v.raw()),
-            args.get(heap, n - 1).map(|v| v.raw()),
+            args.get(n - 2).map(|h| h.as_tagged(heap)).map(|v| v.raw()),
+            args.get(n - 1).map(|h| h.as_tagged(heap)).map(|v| v.raw()),
             (0..n - 2)
-                .map(|i| args.get(heap, i).map(|v| v.raw()))
+                .map(|i| args.get(i).map(|h| h.as_tagged(heap)).map(|v| v.raw()))
                 .collect::<Option<Vec<_>>>(),
         )
     };
@@ -1117,8 +1148,7 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
                 };
                 // CreateDataProperty: skipped when already present
                 let exists = !matches!(
-                    unsafe { target_handle.read_unchecked().assume_valid(heap) }
-                        .lookup(heap, key.as_tagged(heap).as_name()),
+                    target_handle.lookup(heap, key.as_tagged(heap).as_name()),
                     Lookup::NotFound
                 );
                 if exists {
@@ -1148,10 +1178,14 @@ fn copy_data_properties(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resu
 }
 
 /// A fresh private name: (description) -> Symbol.
-fn create_private_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn create_private_name(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let text = {
         let heap = &*nctx.heap();
-        args.get(heap, 1)
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
             .and_then(|d| d.get_as::<DenseString>())
             .map(|s| s.to_rust_string(heap))
     };
@@ -1165,10 +1199,16 @@ fn create_private_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
 }
 
 /// PrivateGet (ES 7.3.30): (obj, key) -> value, TypeError when absent.
-fn private_get(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn private_get(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    let obj = args.get(heap, 0).ok_or(VmError::Arity)?;
-    let key = args.get(heap, 1).ok_or(VmError::Arity)?;
+    let obj = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
+    let key = args
+        .get(1)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
     match private_find(heap, obj, key).map(|s| s.inner()) {
         Some(v) => Ok(v),
         None => Err(VmError::Type),
@@ -1176,12 +1216,21 @@ fn private_get(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
 }
 
 /// PrivateSet (ES 7.3.31): (obj, key, value), TypeError when absent.
-fn private_set(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn private_set(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let value = {
         let heap = &*nctx.heap();
-        let obj = args.get(heap, 0).ok_or(VmError::Arity)?;
-        let key = args.get(heap, 1).ok_or(VmError::Arity)?;
-        let value = args.get(heap, 2).ok_or(VmError::Arity)?;
+        let obj = args
+            .get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
+        let key = args
+            .get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
+        let value = args
+            .get(2)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
         match private_find(heap, obj, key) {
             Some(slot) => {
                 slot.set(heap, obj.raw(), value);
@@ -1194,11 +1243,17 @@ fn private_set(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value,
 }
 
 /// `#x in obj`: (key, obj) -> bool (own private presence only).
-fn private_in(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn private_in(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let has = {
         let heap = &*nctx.heap();
-        let key = args.get(heap, 0).ok_or(VmError::Arity)?;
-        let obj = args.get(heap, 1).ok_or(VmError::Arity)?;
+        let key = args
+            .get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
+        let obj = args
+            .get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
         Ok::<_, VmError>(private_find(heap, obj, key).is_some())
     }?;
     Ok({
@@ -1209,10 +1264,16 @@ fn private_in(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, 
 
 /// Attach the instance-field array to the class constructor:
 /// (ctor, fields).
-fn set_class_fields(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn set_class_fields(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    let ctor = args.get(heap, 0).ok_or(VmError::Arity)?;
-    let fields = args.get(heap, 1).ok_or(VmError::Arity)?;
+    let ctor = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
+    let fields = args
+        .get(1)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
     let mut ok = false;
     if let Some(obj) = ctor.as_heap_object() {
         let slots = obj.as_ref().slots.heap_ref(heap);
@@ -1238,14 +1299,23 @@ fn set_class_fields(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
 /// InitializeInstanceElements (ES 7.3.33): (ctor, instance) -> instance.
 /// Runs each field initializer with the instance as receiver and defines
 /// the result onto it ({w+, e+, c+}).
-fn init_instance_fields(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn init_instance_fields(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing below allocates before they
     // are rooted / consumed.
     let (ctor, instance) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
         )
     };
     let fields = 'fields: {
@@ -1494,7 +1564,7 @@ fn get_property_lenient(
     // Safety: caller-supplied words, fresh at entry.
     let outcome = {
         let heap = &*nctx.heap();
-        match load_outcome(
+        match Lookup::load_outcome(
             heap,
             unsafe { receiver.assume_valid(heap) },
             // Safety: caller-supplied name word, fresh at entry.
@@ -1534,17 +1604,31 @@ fn get_property_lenient(
 /// constructor after ClassDefinitionEvaluation set its name — an already
 /// explicitly defined `name` wins (ES 15.7.14: SetFunctionName happens
 /// before element installation).
-fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn set_function_name(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (fn_value, raw_key, prefix) = {
         let heap = &*nctx.heap();
-        let prefix = Smi::decode(args.get(heap, 2).ok_or(VmError::Arity)?.raw())
-            .map(|s| s.value())
-            .unwrap_or(0);
+        let prefix = Smi::decode(
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+        )
+        .map(|s| s.value())
+        .unwrap_or(0);
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
             prefix,
         )
     };
@@ -1640,18 +1724,32 @@ fn set_function_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
 /// flags). Defines one accessor half, merging with an existing pair under
 /// the same key; flags bit 0 marks the getter half, PropertyFlags bits
 /// carry enumerability.
-fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn install_accessor(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_target, raw_key, raw_closure, flags) = {
         let heap = &*nctx.heap();
-        let flags = Smi::decode(args.get(heap, 3).ok_or(VmError::Arity)?.raw())
-            .map(|s| s.value() as u32)
-            .unwrap_or(0);
+        let flags = Smi::decode(
+            args.get(3)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+        )
+        .map(|s| s.value() as u32)
+        .unwrap_or(0);
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
             flags,
         )
     };
@@ -1681,7 +1779,7 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
             if target.as_tagged(heap).as_heap_object().is_none() {
                 return Err(VmError::Type);
             }
-            let name = match classify_key(heap, key.as_tagged(heap).erase())? {
+            let name = match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
@@ -1735,18 +1833,35 @@ fn install_accessor(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
 /// installation): (obj, key, value, flags) -> obj. Define sites are
 /// strict-mode code: a rejected define throws a TypeError. flags are
 /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair).
-fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn define_own_property(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (raw_receiver, raw_key, raw_value, flags) = {
         let heap = &*nctx.heap();
-        let flags = Smi::decode(args.get(heap, 3).ok_or(VmError::Arity)?.raw())
-            .map(|s| s.value() as u32)
-            .unwrap_or(0);
+        let flags = Smi::decode(
+            args.get(3)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+        )
+        .map(|s| s.value() as u32)
+        .unwrap_or(0);
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
             flags,
         )
     };
@@ -1826,7 +1941,7 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
                 return Err(VmError::Type);
             }
             // Safety: fresh rooted name word re-read under the anchor.
-            let name = match classify_key(heap, key.as_tagged(heap).erase())? {
+            let name = match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
@@ -1866,16 +1981,20 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
 }
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
-fn set_prototype(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn set_prototype(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument words, rooted below before any allocation.
         let obj = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 0).ok_or(VmError::Arity)?
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         let proto = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 1).ok_or(VmError::Arity)?
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         let obj_ref = scope
             .cast::<Object>(obj.as_tagged(&*nctx.heap()))
@@ -1890,10 +2009,13 @@ fn set_prototype(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Valu
 /// TypeError unless the superclass is null or a constructor.
 fn throw_if_not_constructor_or_null(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    let v = args.get(heap, 0).ok_or(VmError::Arity)?;
+    let v = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
     let ok = if v == heap.known().null.as_tagged(heap) {
         true
     } else {
@@ -1918,11 +2040,14 @@ fn throw_if_not_constructor_or_null(
 /// value is an Object or null.
 fn throw_if_not_object_or_null(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let ok = {
         let heap = &*nctx.heap();
@@ -1939,11 +2064,14 @@ fn throw_if_not_object_or_null(
 /// (value) -> value, ReferenceError when `this` is still the hole.
 fn throw_super_not_called_if_hole(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let cond_31 = {
         let heap = &*nctx.heap();
@@ -1960,11 +2088,14 @@ fn throw_super_not_called_if_hole(
 /// ReferenceError unless `this` is still the hole (super() runs once).
 fn throw_super_already_called_if_not_hole(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let v = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let cond_32 = {
         let heap = &*nctx.heap();
@@ -2000,8 +2131,10 @@ fn construct_super_construct(
         let derived = {
             let heap = &*nctx.heap();
             // Safety: caller-supplied word, fresh at entry.
-            function_kind_of(heap, unsafe { callee_v.assume_valid(heap) })
-                .is_some_and(|k| k.is_derived_class_constructor())
+            unsafe { callee_v.assume_valid(heap) }
+                .as_heap_object()
+                .and_then(|obj| obj.as_ref().callable_info(heap))
+                .is_some_and(|info| info.function_kind().is_derived_class_constructor())
         };
         // Safety: caller-supplied words, fresh at entry, rooted below.
         let Some(callee) =
@@ -2034,11 +2167,7 @@ fn construct_super_construct(
                 // the receiver must stay rooted across the callee call:
                 // a primitive return falls back to it after the call
                 // allocated (and possibly moved it)
-                // Safety: fresh call result, rooted below.
-                Ok(Some(r)) => (
-                    scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(r) }),
-                    true,
-                ),
+                Ok(Some(r)) => (scope.handle(r), true),
                 // Safety: fresh root-slot word read for the immediate return.
                 Ok(None) => return Ok(unsafe { nctx.heap().known().exception.read_unchecked() }),
                 Err(err) => return Err(err),
@@ -2093,7 +2222,7 @@ fn construct_super_construct(
 
 /// super(...): (args...) -> instance. Resolves the super constructor and
 /// new.target from the executing frame.
-fn construct_super(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn construct_super(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let (callee, new_target) = {
         let (_, heap, state) = nctx.split();
         frame_super_parts(heap, state)?
@@ -2101,7 +2230,10 @@ fn construct_super(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
     // Safety: fresh register words, consumed below.
     let arg_words = {
         let heap = &*nctx.heap();
-        args.iter(heap).map(|v| v.raw()).collect::<Vec<_>>()
+        args.iter()
+            .map(|h| h.as_tagged(heap))
+            .map(|v| v.raw())
+            .collect::<Vec<_>>()
     };
     construct_super_construct(nctx, callee, new_target, &arg_words)
 }
@@ -2110,7 +2242,7 @@ fn construct_super(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
 /// derived constructors, ES 15.7.13): () -> instance.
 fn construct_super_all_args(
     nctx: &mut NativeContext<'_>,
-    _args: GcSlice<'_>,
+    _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let (callee, new_target, args) = {
         let (_, heap, state) = nctx.split();
@@ -2122,7 +2254,11 @@ fn construct_super_all_args(
         let argc = state.stack.argc(&meta).saturating_sub(1);
         let slice = state.stack.args(&meta, -2, argc);
         // Safety: fresh register words, consumed below.
-        let args = slice.iter(heap).map(|v| v.raw()).collect::<Vec<_>>();
+        let args = slice
+            .iter()
+            .map(|h| h.as_tagged(heap))
+            .map(|v| v.raw())
+            .collect::<Vec<_>>();
         (callee, new_target, args)
     };
     construct_super_construct(nctx, callee, new_target, &args)
@@ -2131,7 +2267,10 @@ fn construct_super_all_args(
 /// Arrow-delegated super(): (args..., closure, new_target) -> instance.
 /// The constructor closure and its new.target ride the tail of the
 /// argument window (threaded through .this_function).
-fn construct_super_via(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn construct_super_via(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let n = args.len();
     if n < 2 {
         return Err(VmError::Arity);
@@ -2140,10 +2279,16 @@ fn construct_super_via(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
     let (closure, new_target, arg_words) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, n - 2).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, n - 1).ok_or(VmError::Arity)?.raw(),
+            args.get(n - 2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(n - 1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
             (0..n - 2)
-                .map(|i| args.get(heap, i).map(|v| v.raw()))
+                .map(|i| args.get(i).map(|h| h.as_tagged(heap)).map(|v| v.raw()))
                 .collect::<Option<Vec<_>>>()
                 .ok_or(VmError::Arity)?,
         )
@@ -2179,11 +2324,17 @@ fn construct_super_via(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
 
 /// Direct-eval name load: (name) -> value. Walks the frame context chain
 /// by name; unresolved names fall back to the global object.
-fn load_dynamic_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn load_dynamic_name(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument word, consumed below.
     let name = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let found = {
         let (_, heap, state) = nctx.split();
@@ -2203,13 +2354,22 @@ fn load_dynamic_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
 
 /// Direct-eval name store: (value, name) -> value. Writes through to the
 /// context-chain slot; unresolved names store on the global object.
-fn store_dynamic_name(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn store_dynamic_name(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument words, consumed below.
     let (value, name) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
         )
     };
     let found = {
@@ -2273,13 +2433,18 @@ fn is_the_hole(nctx: &mut NativeContext<'_>, v: Value) -> bool {
 /// (first) -> array.
 fn create_rest_parameter(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let first = {
         let heap = &*nctx.heap();
-        Smi::decode(args.get(heap, 0).ok_or(VmError::Arity)?.raw())
-            .map(|s| s.value() as usize)
-            .unwrap_or(0)
+        Smi::decode(
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+        )
+        .map(|s| s.value() as usize)
+        .unwrap_or(0)
     };
     let values: Vec<Value> = {
         let (_, heap, state) = nctx.split();
@@ -2315,7 +2480,7 @@ fn create_rest_parameter(
             &scope,
             ObjectSlotsInit {
                 map,
-                values: GcSlice::EMPTY,
+                values: HandleSlice::EMPTY,
                 elements: elements.erase(),
                 length: values.len(),
             },
@@ -2332,15 +2497,27 @@ fn create_rest_parameter(
 /// object walked with the split receiver/lookup-start; key coercion runs
 /// after the parent link is resolved (user toString must not change the
 /// chain searched).
-fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn super_get_property(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (home, raw_recv, raw_key) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
         )
     };
     let cond_35 = {
@@ -2377,7 +2554,7 @@ fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
         let outcome = {
             let heap = &*nctx.heap();
             let proto = home_proto(heap, home.as_tagged(heap));
-            let name = match classify_key(heap, key.as_tagged(heap).erase())? {
+            let name = match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
@@ -2411,19 +2588,39 @@ fn super_get_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
 /// shadow inherited data properties on `this` unless the write-through
 /// semantics flag is set; the parent link is resolved before any user key
 /// coercion runs.
-fn super_set_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+fn super_set_property(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument words; nothing allocates before they are
     // rooted / consumed below.
     let (home, raw_recv, raw_key, raw_value, semantics_flag) = {
         let heap = &*nctx.heap();
-        let semantics_flag = Smi::decode(args.get(heap, 4).ok_or(VmError::Arity)?.raw())
-            .map(|s| s.value() as u32)
-            .unwrap_or(0);
+        let semantics_flag = Smi::decode(
+            args.get(4)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+        )
+        .map(|s| s.value() as u32)
+        .unwrap_or(0);
         (
-            args.get(heap, 0).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 3).ok_or(VmError::Arity)?.raw(),
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(3)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
             semantics_flag,
         )
     };
@@ -2465,7 +2662,7 @@ fn super_set_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
         let outcome = {
             let heap = &*nctx.heap();
             let proto = home_proto(heap, home.as_tagged(heap));
-            let name = match classify_key(heap, key.as_tagged(heap).erase())? {
+            let name = match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };

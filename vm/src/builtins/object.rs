@@ -9,14 +9,14 @@ use crate::runtime::Coercion;
 use crate::runtime::Runtime;
 
 use crate::{
-    Convert, GcSlice, Handle, HandleScope, Heap, Object, PropertyDescriptor, SlotName, Smi, Tagged,
-    Value, VmError,
+    Convert, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor, SlotName, Smi,
+    Tagged, Value, VmError,
 };
 
 /// Stub: `Object.prototype.toString` returns "[object Object]".
 pub fn object_to_string(
     nctx: &mut NativeContext<'_>,
-    _args: GcSlice<'_>,
+    _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let s = nctx.intern(&scope, "[object Object]");
@@ -31,17 +31,22 @@ pub fn object_to_string(
 /// receiver, so [[Construct]] just returns it.
 pub fn object_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     if nctx.is_construct() {
         return {
             let heap = &*nctx.heap();
-            Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw())
+            Ok(args
+                .get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw())
         };
     }
     let arg = {
         let heap = &*nctx.heap();
-        args.get(heap, 1)
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
             .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase())
             .raw()
     };
@@ -61,10 +66,13 @@ pub fn object_constructor(
 /// ES2015+ boxes them).
 pub fn object_get_prototype_of(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    let arg = args.get(heap, 1).ok_or(VmError::Arity)?;
+    let arg = args
+        .get(1)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
     let Some(obj) = arg.as_heap_object() else {
         return Err(VmError::Type);
     };
@@ -107,16 +115,20 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
 /// only).
 pub fn object_has_own_property(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let receiver = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 0).ok_or(VmError::Arity)?
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         let raw_key = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 1).ok_or(VmError::Arity)?
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         // the key coercion allocates (float/wrapper keys intern or run
         // user code): the receiver must stay rooted across it
@@ -130,13 +142,13 @@ pub fn object_has_own_property(
         let has = 'has: {
             let key = key.as_tagged(heap);
             if let Key::Element(i) =
-                crate::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
+                crate::Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
                 break 'has true;
             }
-            match receiver.as_tagged(heap).lookup(heap, key) {
+            match receiver.lookup(heap, key) {
                 Lookup::NotFound => false,
                 // the array `length` internal slot counts as an own property
                 _ => true,
@@ -149,16 +161,20 @@ pub fn object_has_own_property(
 /// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
 pub fn object_property_is_enumerable(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let receiver = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 0).ok_or(VmError::Arity)?
+            args.get(0)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         let raw_key = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 1).ok_or(VmError::Arity)?
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         // the key coercion allocates (float/wrapper keys intern or run
         // user code): the receiver must stay rooted across it
@@ -172,13 +188,13 @@ pub fn object_property_is_enumerable(
         let enumerable = 'enumerable: {
             let key = key.as_tagged(heap);
             if let Key::Element(i) =
-                crate::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
+                crate::Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
                 break 'enumerable true; // array elements are enumerable
             }
-            match receiver.as_tagged(heap).lookup(heap, key) {
+            match receiver.lookup(heap, key) {
                 Lookup::Data { flags, .. } => flags.is_enumerable(),
                 Lookup::Accessor {
                     holder, map_index, ..
@@ -200,13 +216,16 @@ pub fn object_property_is_enumerable(
 /// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
 pub fn object_get_own_property_names(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before the
     // walk re-reads it under heap-borrow anchors.
     let target = {
         let heap = &*nctx.heap();
-        args.get(heap, 1).ok_or(VmError::Arity)?.raw()
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let names: Vec<Value> = {
         let heap = &*nctx.heap();
@@ -241,7 +260,7 @@ pub fn plain_object(
         let map = nctx.heap().known().object_initial_map;
         let obj = nctx
             .heap()
-            .new_object(&scope, map, GcSlice::EMPTY)
+            .new_object(&scope, map, HandleSlice::EMPTY)
             .into_handle(&scope);
         for (name, value) in fields {
             let name = nctx.intern(&scope, name);
@@ -265,14 +284,20 @@ pub fn plain_object(
 /// to a descriptor object via FromPropertyDescriptor semantics.
 pub fn object_get_own_property_descriptor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (raw_target, raw_key) = {
             let heap = &*nctx.heap();
             (
-                args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
-                args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
+                args.get(1)
+                    .map(|h| h.as_tagged(heap))
+                    .ok_or(VmError::Arity)?
+                    .raw(),
+                args.get(2)
+                    .map(|h| h.as_tagged(heap))
+                    .ok_or(VmError::Arity)?
+                    .raw(),
             )
         };
         // the key coercion allocates (Float keys intern a string): the
@@ -348,15 +373,24 @@ pub fn object_get_own_property_descriptor(
 /// `defineProperty` trap for proxy receivers, ES 20.2.5.6).
 pub fn object_define_property(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (raw_target, raw_key, raw_attrs) = {
             let heap = &*nctx.heap();
             (
-                args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
-                args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
-                args.get(heap, 3).ok_or(VmError::Arity)?.raw(),
+                args.get(1)
+                    .map(|h| h.as_tagged(heap))
+                    .ok_or(VmError::Arity)?
+                    .raw(),
+                args.get(2)
+                    .map(|h| h.as_tagged(heap))
+                    .ok_or(VmError::Arity)?
+                    .raw(),
+                args.get(3)
+                    .map(|h| h.as_tagged(heap))
+                    .ok_or(VmError::Arity)?
+                    .raw(),
             )
         };
         // root the target, key, and descriptor: the key coercion and the
@@ -408,13 +442,19 @@ pub fn object_define_property(
 
 pub fn object_set_prototype_of(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let (target, proto) = {
         let heap = &*nctx.heap();
         (
-            args.get(heap, 1).ok_or(VmError::Arity)?.raw(),
-            args.get(heap, 2).ok_or(VmError::Arity)?.raw(),
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
+            args.get(2)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
+                .raw(),
         )
     };
     let (nullish, target_is_object, proto_ok) = {
@@ -453,13 +493,15 @@ pub fn object_set_prototype_of(
 /// `preventExtensions` trap for proxies (ES 20.2.5.3).
 pub fn object_prevent_extensions(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, rooted below before any allocation.
         let raw_target = scope.handle({
             let heap = &*nctx.heap();
-            args.get(heap, 1).ok_or(VmError::Arity)?
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?
         });
         let target = raw_target.as_tagged(&*nctx.heap()).raw();
         let nullish = {
@@ -508,11 +550,14 @@ pub fn object_prevent_extensions(
 /// proxies run the `isExtensible` trap with its must-match invariant.
 pub fn object_is_extensible(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let target = {
         let heap = &*nctx.heap();
-        args.get(heap, 1).ok_or(VmError::Arity)?.raw()
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let cond_40 = {
         let heap = &*nctx.heap();
@@ -602,12 +647,15 @@ pub fn set_integrity_flags(
 }
 
 /// `Object.seal(O)` (ES 20.1.2.17).
-pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn object_seal(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
     // re-reads under heap-borrow anchors.
     let target = {
         let heap = &*nctx.heap();
-        args.get(heap, 1).ok_or(VmError::Arity)?.raw()
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let nullish = {
         let heap = &*nctx.heap();
@@ -667,12 +715,18 @@ pub fn object_seal(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
 }
 
 /// `Object.freeze(O)` (ES 20.1.2.9).
-pub fn object_freeze(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn object_freeze(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
     // re-reads under heap-borrow anchors.
     let target = {
         let heap = &*nctx.heap();
-        args.get(heap, 1).ok_or(VmError::Arity)?.raw()
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     let nullish = {
         let heap = &*nctx.heap();
