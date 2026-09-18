@@ -2,8 +2,8 @@ use bytecode::{Opcode, PropertyFlags, emit};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, DenseString,
-    FixedArray, FixedByteArray, Float, FunctionKind, GcSlice, Handle, HandleScope, Heap, HeapPtr,
-    Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo,
+    FixedArray, FixedByteArray, Float, FunctionKind, Handle, HandleScope, HandleSlice, Heap,
+    HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo,
     ScopeInfoInit, SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value,
 };
 use vm::{NativeContext, NativeIndex, Thread, VM, VmError};
@@ -35,7 +35,7 @@ fn intern_word(thread: &mut Thread, scope: &HandleScope<'_>, s: &str) -> Value {
 
 /// Stage raw words: every call site in this file stages words loaded or
 /// allocated under a still-live heap borrow, with no GC since the load.
-fn stage_values<'s>(scope: &'s HandleScope<'_>, words: &[Value]) -> GcSlice<'s> {
+fn stage_values<'s>(scope: &'s HandleScope<'_>, words: &[Value]) -> HandleSlice<'s> {
     let tagged: Vec<Tagged<'_, Value>> = words
         .iter()
         .map(|w| unsafe { Tagged::from_value_unchecked(*w) })
@@ -57,7 +57,7 @@ fn name<'a>(heap: &'a Heap, w: Value) -> Tagged<'a, SlotName> {
 /// right before their allocation). Tests only: no collection may run
 /// between the word's last load and its consumption.
 fn raw_name(w: Value) -> Tagged<'static, SlotName> {
-    unsafe { Tagged::from_value_unchecked(w) }.as_name()
+    unsafe { Tagged::<Value>::from_value_unchecked(w) }.as_name()
 }
 
 /// Assert a run escaped uncaught: the sentinel is returned and the pending
@@ -253,10 +253,13 @@ fn load_smi_signed_immediates() {
 
 #[test]
 fn call_runtime_passes_receiver_and_args() {
-    fn add(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+    fn add(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
         let (a, b) = {
             let heap = &*nctx.heap();
-            match (args.get(heap, 1), args.get(heap, 2)) {
+            match (
+                args.get(1).map(|h| h.as_tagged(heap)),
+                args.get(2).map(|h| h.as_tagged(heap)),
+            ) {
                 (Some(a), Some(b)) => (a.raw(), b.raw()),
                 _ => return Err(VmError::Arity),
             }
@@ -298,7 +301,7 @@ fn failed_run_does_not_leak_frames_into_next_run() {
         let known = thread.heap().known();
         let obj = thread
             .heap()
-            .new_object(&scope, known.object_initial_map, GcSlice::EMPTY)
+            .new_object(&scope, known.object_initial_map, HandleSlice::EMPTY)
             .into_handle(&scope);
         word(&*thread.heap(), obj)
     });
@@ -1282,7 +1285,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 &scope,
                 ObjectSlotsInit {
                     map: child_map,
-                    values: GcSlice::EMPTY,
+                    values: HandleSlice::EMPTY,
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -1463,7 +1466,7 @@ fn jump_if_truthy_follows_toboolean() {
                     &scope,
                     ObjectSlotsInit {
                         map,
-                        values: GcSlice::EMPTY,
+                        values: HandleSlice::EMPTY,
                         elements: the_hole.erase(),
                         length: 0,
                     },
@@ -1944,7 +1947,7 @@ fn bytecode_fn(
         .raw()
 }
 
-fn forty_two(_: &mut NativeContext<'_>, _: GcSlice<'_>) -> Result<Value, VmError> {
+fn forty_two(_: &mut NativeContext<'_>, _: HandleSlice<'_>) -> Result<Value, VmError> {
     Ok(smi(42))
 }
 
@@ -2002,7 +2005,10 @@ fn call_dispatches_to_native_function_object() {
 
 /// Native that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the native recovers.
-fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<Value, VmError> {
+fn run_failing_inner(
+    nctx: &mut NativeContext<'_>,
+    _args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // callee: Add on a non-smi accumulator -> TypeError throw
         let mut bad = Vec::new();
@@ -2025,7 +2031,7 @@ fn run_failing_inner(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result
         };
         match nctx.call(
             unsafe { Tagged::from_value_unchecked(caller) },
-            GcSlice::EMPTY,
+            HandleSlice::EMPTY,
         ) {
             Ok(exc) if exc == exception_word => {
                 // the exception escapes the nested run as the sentinel with
@@ -2210,14 +2216,14 @@ fn equal_strict_compares_numbers_strings_and_objects() {
         let obj = {
             let h = thread
                 .heap()
-                .new_object(&scope, object_init_map, GcSlice::EMPTY)
+                .new_object(&scope, object_init_map, HandleSlice::EMPTY)
                 .into_handle(&scope);
             word(&*thread.heap(), h)
         };
         let obj2 = {
             let h = thread
                 .heap()
-                .new_object(&scope, object_init_map, GcSlice::EMPTY)
+                .new_object(&scope, object_init_map, HandleSlice::EMPTY)
                 .into_handle(&scope);
             word(&*thread.heap(), h)
         };
@@ -2913,7 +2919,7 @@ fn create_closure_shares_callable_info_template() {
             .closure_context(heap)
             .expect("closure carries a context");
         assert_eq!(
-            context.into_tagged().raw(),
+            context.raw(),
             heap.known().empty_context.as_tagged(heap).raw()
         );
     };
@@ -3394,7 +3400,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
                 &scope,
                 ObjectSlotsInit {
                     map,
-                    values: GcSlice::EMPTY,
+                    values: HandleSlice::EMPTY,
                     elements: the_hole.erase(),
                     length: 0,
                 },
@@ -3470,7 +3476,7 @@ fn empty_object<'s>(thread: &mut Thread, scope: &'s HandleScope<'_>) -> Handle<'
     let known = thread.heap().known();
     thread
         .heap()
-        .new_object(scope, known.object_initial_map, GcSlice::EMPTY)
+        .new_object(scope, known.object_initial_map, HandleSlice::EMPTY)
         .into_handle(scope)
 }
 
@@ -4113,7 +4119,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
 
 /// Native constructor probe: reports `nctx.is_construct()` by storing 1/0
 /// into the global property "constructProbe".
-fn construct_probe(nctx: &mut NativeContext<'_>, _args: GcSlice<'_>) -> Result<Value, VmError> {
+fn construct_probe(nctx: &mut NativeContext<'_>, _args: HandleSlice<'_>) -> Result<Value, VmError> {
     let flag = Smi::new(if nctx.is_construct() { 1 } else { 0 }).into_tagged();
     nctx.handle_scope(|nctx, scope| {
         let name = nctx.intern(&scope, "constructProbe");
@@ -4250,7 +4256,7 @@ fn shadow_setup<'s>(
             scope,
             ObjectSlotsInit {
                 map: child_map,
-                values: GcSlice::EMPTY,
+                values: HandleSlice::EMPTY,
                 elements: the_hole.erase(),
                 length: 0,
             },

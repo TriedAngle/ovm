@@ -4,9 +4,9 @@ use crate::lookup::has_property;
 use crate::lookup::ordinary_own_descriptor;
 use crate::runtime::{Coercion, Runtime};
 use crate::{
-    Compare, ContextState, Convert, EdgeVisitable, FixedArray, GcSlice, GcSlot, Handle,
-    HandleScope, Header, Heap, HeapObject, Key, Lookup, Map, NativeContext, Object, ObjectKind,
-    PartialDescriptor, PropertyDescriptor, SlotName, Smi, Tagged, VM, Value, Visitor, VmError,
+    Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
+    Header, Heap, HeapObject, Key, Lookup, Map, NativeContext, Object, ObjectKind,
+    PartialDescriptor, PropertyDescriptor, SlotName, Tagged, VM, Value, Visitor, VmError,
     is_compatible_property_descriptor,
 };
 
@@ -343,7 +343,7 @@ fn descriptor_object<'s>(
 ) -> Result<Handle<'s, Value>, VmError> {
     {
         let obj = heap
-            .new_object(scope, heap.known().object_initial_map, GcSlice::EMPTY)
+            .new_object(scope, heap.known().object_initial_map, HandleSlice::EMPTY)
             .into_handle(scope);
         // the well-known field names are persistent roots: they cross the
         // define allocations without further rooting
@@ -375,79 +375,6 @@ fn descriptor_object<'s>(
     }
 }
 
-/// Store `value` at element index `i` of an array object, growing the
-/// elements backing store and updating `length` when `i` is past the
-/// end. Handle-rooted variant of `objects::object::store_array_element`
-/// (the exported one takes `Tagged` args, which cannot be re-read from
-/// handles under a `&mut Heap`).
-fn define_array_element(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    receiver: &Handle<'_, Object>,
-    i: usize,
-    value: &Handle<'_, Value>,
-) -> Result<(), VmError> {
-    let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
-    let grows = {
-        let obj = receiver.heap_ref(heap);
-        if !obj.as_ref().is_array(heap) {
-            return Err(VmError::Type);
-        }
-        // grow only when the store index is past the physical backing
-        // store (its capacity), not the logical length: sequential
-        // appends with headroom must not reallocate every time
-        let capacity = obj
-            .as_ref()
-            .elements_array(heap)
-            .map(|e| e.len())
-            .unwrap_or(0);
-        i >= capacity
-    };
-
-    if grows {
-        let staged = {
-            let heap_ref: &Heap = heap;
-            let obj = receiver.heap_ref(heap_ref);
-            let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
-            let keep = obj.as_ref().length().min(elements.len());
-            let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
-            let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(capacity);
-            for k in 0..keep {
-                values.push(elements.at(heap_ref, k));
-            }
-            values.resize(
-                capacity,
-                heap_ref.known().the_hole.as_tagged(heap_ref).erase(),
-            );
-            values[i] = value.as_tagged(heap_ref);
-            scope.stage(&values)
-        };
-        let elements = heap.allocate_handle::<FixedArray>(staged, scope);
-        let obj = receiver.heap_ref(heap);
-        obj.as_ref()
-            .elements
-            .set(heap, obj.as_ref().erase(), elements.as_tagged(heap).erase());
-        obj.as_ref()
-            .length
-            .set(heap, obj.as_ref().erase(), Smi::new(new_len as i64));
-    } else {
-        {
-            let obj = receiver.heap_ref(heap);
-            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
-            elements.set(heap, i, value.as_tagged(heap));
-            // a store inside the physical capacity but past the logical
-            // length still extends the array
-            if i >= obj.as_ref().length() {
-                obj.as_ref()
-                    .length
-                    .set(heap, obj.as_ref().erase(), Smi::new(new_len as i64));
-            }
-            Ok(())
-        }?;
-    }
-    Ok(())
-}
-
 fn define_internal_h<'s>(
     vm: &VM,
     heap: &mut Heap,
@@ -472,7 +399,7 @@ fn define_internal_h<'s>(
         if !on_array {
             break 'element None;
         }
-        match crate::classify_key(heap, name.as_tagged(heap)) {
+        match crate::Lookup::classify_key(heap, name.as_tagged(heap)) {
             Ok(Key::Element(i)) => Some(i),
             _ => None,
         }
@@ -485,7 +412,7 @@ fn define_internal_h<'s>(
         let array = scope
             .cast::<Object>(obj.as_tagged(heap))
             .expect("array checked above");
-        define_array_element(heap, scope, &array, i, &value)?;
+        Object::store_array_element(heap, scope, &array, i, &value)?;
         return Ok(Flow::Value(true));
     }
     let current = ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap));
@@ -514,7 +441,7 @@ fn ordinary_set_forward<'a>(
     // (which stores into the backing store)
     let classified = (
         matches!(
-            crate::classify_key(heap, name.as_tagged(heap)),
+            crate::Lookup::classify_key(heap, name.as_tagged(heap)),
             Ok(Key::Element(_))
         ),
         target
@@ -536,10 +463,7 @@ fn ordinary_set_forward<'a>(
         Setter(Handle<'s, Value>),
         NotFound,
     }
-    let lookup = match target
-        .as_tagged(heap)
-        .lookup(heap, name.as_tagged(heap).as_name())
-    {
+    let lookup = match target.lookup(heap, name.as_tagged(heap).as_name()) {
         Lookup::Data { flags, .. } => {
             if flags.is_writable() {
                 SetLookup::DataWritable
@@ -1023,13 +947,12 @@ fn construct_h<'a>(
             let receiver = if derived {
                 scope.handle(heap.known().the_hole.as_tagged(heap).erase())
             } else {
-                let Some(r) = Runtime::create_construct_receiver_value(vm, heap, state, unsafe {
-                    new_target.read_unchecked()
-                })?
+                let Some(receiver) =
+                    Runtime::create_construct_receiver_value(vm, heap, state, *new_target)?
                 else {
                     return Ok(Coercion::Threw);
                 };
-                scope.handle(unsafe { r.assume_valid(heap) })
+                scope.handle(receiver)
             };
             let mut all: Vec<Tagged<'_, Value>> = Vec::with_capacity(args.len() + 1);
             all.push(receiver.as_tagged(heap).erase());
@@ -1424,10 +1347,10 @@ impl Proxy {
         heap: &'a mut Heap,
         state: &ContextState,
         proxy: Handle<'_, Value>,
-        args: GcSlice<'_>,
+        args: HandleSlice<'_>,
     ) -> Result<Coercion<'a>, VmError> {
         state.handle_scope(|scope| {
-            let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
+            let args: Vec<Handle<'_, Value>> = args.iter().collect();
             apply_h(vm, heap, state, &scope, &proxy, &args)
         })
     }
@@ -1440,11 +1363,11 @@ impl Proxy {
         heap: &'a mut Heap,
         state: &ContextState,
         proxy: Handle<'_, Value>,
-        args: GcSlice<'_>,
+        args: HandleSlice<'_>,
         new_target: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
         state.handle_scope(|scope| {
-            let args: Vec<Handle<'_, Value>> = args.iter(heap).map(|a| scope.handle(a)).collect();
+            let args: Vec<Handle<'_, Value>> = args.iter().collect();
             construct_h(vm, heap, state, &scope, &proxy, &args, &new_target)
         })
     }

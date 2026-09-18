@@ -4,7 +4,7 @@
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
-    FixedArray, GcSlice, Heap, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi,
+    FixedArray, HandleSlice, Heap, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi,
     StoreOutcome, StoreSemantics, Tagged, Thread, VM, Value, VmError, home_proto,
     lookup_in_parents, super_lookup, super_store_lookup,
 };
@@ -23,7 +23,7 @@ unsafe fn anchored<'a>(heap: &'a Heap, v: Value) -> Tagged<'a, Value> {
 /// A name tag from a raw word. Tests only: no collection may run between
 /// the word's load and its consumption.
 fn raw_name(w: Value) -> Tagged<'static, SlotName> {
-    unsafe { Tagged::from_value_unchecked(w) }.as_name()
+    unsafe { Tagged::<Value>::from_value_unchecked(w) }.as_name()
 }
 
 fn thread() -> (VM, Thread) {
@@ -45,7 +45,7 @@ fn object_with(thread: &mut Thread, proto: Value, props: &[(&str, i64)]) -> Valu
         let map = thread.heap().known().object_initial_map;
         let obj = thread
             .heap()
-            .new_object(&scope, map, GcSlice::EMPTY)
+            .new_object(&scope, map, HandleSlice::EMPTY)
             .into_handle(&scope);
         // Safety: caller-supplied proto word, rooted before any allocation.
         let proto = scope.handle(unsafe { proto.assume_valid(&*thread.heap()) });

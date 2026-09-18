@@ -2,7 +2,7 @@
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
 use crate::natives::NativeContext;
-use crate::{Convert, GcSlice, Smi, Tagged, Value, VmError};
+use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
 
 /// `Array(...)`: call and construct behave the same (ES 23.1.1.1). No
 /// arguments → `[]`; one non-negative Smi → that many holes (negative or
@@ -10,11 +10,11 @@ use crate::{Convert, GcSlice, Smi, Tagged, Value, VmError};
 /// elements.
 pub fn array_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
-        let argv: Vec<Tagged<'_, Value>> = args.iter(heap).skip(1).collect();
+        let argv: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).skip(1).collect();
         let single_len = match argv.as_slice() {
             [v] => match Smi::decode(v.raw()) {
                 Some(s) if s.value() >= 0 => {
@@ -41,10 +41,13 @@ pub fn array_constructor(
 
 /// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):
 /// returns a fresh array-iterator over the receiver (CreateArrayIterator).
-pub fn array_values(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn array_values(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let (receiver, is_array) = {
         let heap = &*nctx.heap();
-        let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+        let receiver = args
+            .get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
         let is_array = receiver
             .as_heap_object()
             .is_some_and(|o| o.as_ref().is_array(heap));
@@ -72,13 +75,16 @@ pub fn array_values(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<V
 /// iterated array, producing `{ value, done }`.
 pub fn array_iterator_next(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     // Safety: fresh argument word; nothing below allocates before its
     // final re-reads under heap-borrow anchors.
     let receiver = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     nctx.handle_scope(|nctx, scope| {
         let (_, heap, _) = nctx.split();
@@ -149,17 +155,25 @@ pub fn array_iterator_next(
 /// `%ArrayIteratorPrototype%[@@iterator]`: returns the receiver.
 pub fn array_iterator_symbol_iterator(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
-    Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw())
+    Ok(args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?
+        .raw())
 }
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).
-pub fn array_is_array(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn array_is_array(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let heap = &*nctx.heap();
     let is_array = args
-        .get(heap, 1)
+        .get(1)
+        .map(|h| h.as_tagged(heap))
         .ok_or(VmError::Arity)?
         .as_heap_object()
         .is_some_and(|o| o.as_ref().is_array(heap));

@@ -34,18 +34,18 @@ pub use cache::StackCache;
 pub use compare::Compare;
 pub use convert::Convert;
 pub use error::VmError;
-pub use errors::error_from_vm_error;
+pub use errors::Errors;
 pub use handle::{
-    EscapableHandleScope, GcSlice, Handle, HandleData, HandleScope, HandleSet, RootHandles,
+    EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, HandleSlice, RootHandles,
 };
 pub use heap::{
     AllocToken, EdgeVisitable, GcSlot, GlobalHeap, Heap, HeapRef, OptionGcSlot, Register, WordType,
 };
 pub use interner::StringInterner;
 pub use lookup::{
-    Key, LoadOutcome, Lookup, classify_key, has_property, home_proto, load_outcome,
-    load_outcome_on, lookup_in_parents, ordinary_own_descriptor, private_find, super_constructor,
-    super_lookup, super_lookup_from_proto,
+    Key, LoadOutcome, Lookup, has_property, home_proto, load_outcome_on, lookup_in_parents,
+    ordinary_own_descriptor, private_find, super_constructor, super_lookup,
+    super_lookup_from_proto,
 };
 pub use natives::{NativeContext, NativeFn, NativeIndex, NativeRegistry};
 pub use objects::{
@@ -53,10 +53,10 @@ pub use objects::{
     DenseString, Encoding, FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry,
     HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map, MapInit, MapKind,
     Object, ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit, ProxyObject, ScopeInfo,
-    ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol, call_target,
-    decode_wtf8, function_kind_of, object_kind, object_layout, store_array_element,
-    string_content_hash, visit_object,
+    ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol, decode_wtf8,
+    object_kind, object_layout, string_content_hash, visit_object,
 };
+pub use runtime::{Coercion, Hint, Runtime};
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
@@ -132,6 +132,17 @@ impl ContextState {
         if self.has_pending_exception.get() {
             self.has_pending_exception.set(false);
             Some(self.pending_exception.inner())
+        } else {
+            None
+        }
+    }
+
+    /// Like [`Self::take_pending_exception`], but anchored to the heap
+    /// borrow: the register is GC-visited, so the read is current.
+    pub fn take_pending_exception_tagged<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
+        if self.has_pending_exception.get() {
+            self.has_pending_exception.set(false);
+            Some(self.pending_exception.read(heap))
         } else {
             None
         }
@@ -240,7 +251,7 @@ impl Thread {
     }
 
     pub fn set_pending_exception(&mut self, err: VmError) {
-        let ex = errors::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
+        let ex = Errors::from_vm_error(&self.vm, &mut self.heap, &self.state, err)
             .expect("error materialization must not fail");
         self.state.set_pending_exception(ex);
     }
@@ -282,11 +293,12 @@ impl Thread {
                     .collect::<Vec<_>>(),
             );
             interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args, None)
+                .map(|v| v.raw())
         })
     }
 
     pub fn error_object(&mut self, err: VmError) -> Result<Value, VmError> {
-        errors::error_from_vm_error(&self.vm, &mut self.heap, &self.state, err)
+        Errors::from_vm_error(&self.vm, &mut self.heap, &self.state, err).map(|v| v.raw())
     }
 
     pub fn run_native(&mut self, f: NativeFn, args: &[Value]) -> Result<Value, VmError> {

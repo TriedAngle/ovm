@@ -2,15 +2,19 @@
 
 use crate::materialize::materialize_closure_vm;
 use crate::natives::NativeContext;
-use crate::{Context, Convert, DenseString, GcSlice, Tagged, Value, VmError, runtime::Runtime};
+use crate::{Context, Convert, DenseString, HandleSlice, Tagged, Value, VmError, runtime::Runtime};
 use base_compiler::compile_eval;
 
-pub fn eval_native(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn eval_native(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         // root the caller context before the allocating ToString below
         let (_vm, heap, state) = nctx.split();
         let context = scope.handle(state.current_context(heap).ok_or(VmError::Type)?);
-        let src = Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw())?;
+        let src = Ok(args
+            .get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw())?;
         // Safety: fresh argument word, consumed before any allocation.
         let src = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(src) });
         let s = Convert::to_string(heap, &scope, src)?;
@@ -47,18 +51,19 @@ pub fn eval_native(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
         nctx.call(
             // Safety: fresh rooted-slot word, consumed by the call.
             unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
-            GcSlice::EMPTY,
+            HandleSlice::EMPTY,
         )
     })
 }
 
 /// `isNaN(x)`: ToNumber(x) is NaN.
-pub fn is_nan(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn is_nan(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let n = nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
         let arg = {
             let v = args
-                .get(heap, 1)
+                .get(1)
+                .map(|h| h.as_tagged(heap))
                 .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
             scope.handle(v)
         };

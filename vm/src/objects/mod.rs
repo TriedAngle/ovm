@@ -18,10 +18,7 @@ pub use context::{
 };
 pub use float::Float;
 pub use map::{AccessorPair, Map, MapInit, MapKind, SlotDescriptor, SlotFlags, SlotName};
-pub use object::{
-    CallTarget, Object, ObjectInit, ObjectSlotsInit, call_target, function_kind_of,
-    store_array_element,
-};
+pub use object::{CallTarget, Object, ObjectInit, ObjectSlotsInit};
 pub use proxy::{ProxyInit, ProxyObject};
 pub use string::{DenseString, Encoding, StringData, decode_wtf8, string_content_hash};
 pub use symbol::Symbol;

@@ -5,13 +5,13 @@ use crate::materialize::materialize_closure_vm;
 use crate::natives::NativeContext;
 use crate::runtime::Coercion;
 use crate::runtime::Runtime;
-use crate::{Context, Convert, DenseString, GcSlice, Smi, Tagged, Value, VmError};
+use crate::{Context, Convert, DenseString, HandleSlice, Smi, Tagged, Value, VmError};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
 pub fn function_to_string(
     nctx: &mut NativeContext<'_>,
-    _args: GcSlice<'_>,
+    _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
         let s = nctx.intern(&scope, "function () { [native code] }");
@@ -22,17 +22,27 @@ pub fn function_to_string(
 }
 
 /// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.4).
-pub fn function_call(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn function_call(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let f = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     if !Runtime::is_callable(nctx.heap(), f) {
         return Err(VmError::Type);
     }
     let call_args: Vec<Value> = {
         let heap = &*nctx.heap();
-        args.iter(heap).skip(1).map(|v| v.raw()).collect()
+        args.iter()
+            .map(|h| h.as_tagged(heap))
+            .skip(1)
+            .map(|v| v.raw())
+            .collect()
     };
     nctx.handle_scope(|nctx, scope| {
         // Safety: fresh argument word, still fresh (no allocation since).
@@ -52,10 +62,16 @@ pub fn function_call(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
 /// `Function.prototype.bind(thisArg, ...prepend)` (ES 20.2.3.5): the
 /// bound function is the JS closure template installed by BIND_PRELUDE,
 /// called with (target, thisArg, prepend-array).
-pub fn function_bind(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn function_bind(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let raw_f = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     if !Runtime::is_callable(nctx.heap(), raw_f) {
         return Err(VmError::Type);
@@ -67,12 +83,16 @@ pub fn function_bind(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
     };
     let raw_this_arg = {
         let heap = &*nctx.heap();
-        args.get(heap, 1).map(|v| v.raw())
+        args.get(1).map(|h| h.as_tagged(heap)).map(|v| v.raw())
     }
     .unwrap_or(undefined);
     let prepend: Vec<Value> = {
         let heap = &*nctx.heap();
-        args.iter(heap).skip(2).map(|v| v.raw()).collect()
+        args.iter()
+            .map(|h| h.as_tagged(heap))
+            .skip(2)
+            .map(|v| v.raw())
+            .collect()
     };
     nctx.handle_scope(|nctx, scope| {
         // everything below allocates (interning, the [[Get]] for
@@ -117,10 +137,16 @@ pub fn function_bind(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<
 }
 
 /// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.3).
-pub fn function_apply(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
+pub fn function_apply(
+    nctx: &mut NativeContext<'_>,
+    args: HandleSlice<'_>,
+) -> Result<Value, VmError> {
     let f = {
         let heap = &*nctx.heap();
-        args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?
+            .raw()
     };
     if !Runtime::is_callable(nctx.heap(), f) {
         return Err(VmError::Type);
@@ -132,12 +158,12 @@ pub fn function_apply(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result
     };
     let this_arg = {
         let heap = &*nctx.heap();
-        args.get(heap, 1).map(|v| v.raw())
+        args.get(1).map(|h| h.as_tagged(heap)).map(|v| v.raw())
     }
     .unwrap_or(undefined);
     let array = {
         let heap = &*nctx.heap();
-        args.get(heap, 2).map(|v| v.raw())
+        args.get(2).map(|h| h.as_tagged(heap)).map(|v| v.raw())
     }
     .unwrap_or(undefined);
     let call_args: Vec<Value> = {
@@ -217,12 +243,12 @@ Function.prototype.__makeBound = function (f, t, p) {
 /// provides the parsing).
 pub fn function_constructor(
     nctx: &mut NativeContext<'_>,
-    args: GcSlice<'_>,
+    args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let argv: Vec<Value> = {
         let heap = &*nctx.heap();
         (1..args.len())
-            .filter_map(|i| args.get(heap, i).map(|v| v.raw()))
+            .filter_map(|i| args.get(i).map(|h| h.as_tagged(heap)).map(|v| v.raw()))
             .collect()
     };
     nctx.handle_scope(|nctx, scope| {
@@ -279,7 +305,7 @@ pub fn function_constructor(
         nctx.call(
             // Safety: fresh rooted-slot word, consumed by the call.
             unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
-            GcSlice::EMPTY,
+            HandleSlice::EMPTY,
         )
     })
 }

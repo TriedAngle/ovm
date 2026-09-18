@@ -5,7 +5,7 @@ use core::alloc::Layout;
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef,
     Key, Lookup, Map, MapInit, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
-    classify_key, lookup_in_parents,
+    lookup_in_parents,
 };
 
 /// Serializes map-transition tree mutations across threads. VM-internal:
@@ -48,8 +48,6 @@ pub enum StoreSemantics {
 #[derive(Debug, Copy, Clone)]
 pub enum StoreOutcome<'s> {
     Done,
-    /// The receiver and name are already rooted in the caller's scope, so
-    /// the transition can be applied after this non-allocating lookup region ends.
     Transition {
         receiver: Handle<'s, Object>,
         name: Handle<'s, SlotName>,
@@ -121,6 +119,21 @@ impl<'a> Tagged<'a, Value> {
                 })
             }
         }
+    }
+}
+
+impl<'s, T> Handle<'s, T> {
+    pub fn store_lookup<'a, 'd>(
+        self,
+        heap: &'a Heap,
+        scope: &'d HandleScope<'_>,
+        name: Tagged<'a, SlotName>,
+        value: Tagged<'a, Value>,
+        semantics: StoreSemantics,
+    ) -> Result<StoreOutcome<'d>, VmError> {
+        self.as_tagged(heap)
+            .erase()
+            .store_lookup(heap, scope, name, value, semantics)
     }
 }
 
@@ -759,7 +772,7 @@ impl Object {
         // non-allocating region; the Tagged name cannot escape it, so it
         // is rooted inside
         let name = 'name: {
-            let key = match classify_key(heap, key.as_tagged(heap)) {
+            let key = match Lookup::classify_key(heap, key.as_tagged(heap)) {
                 Ok(key) => key,
                 Err(err) => return Err(err),
             };

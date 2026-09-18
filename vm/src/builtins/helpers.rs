@@ -7,7 +7,7 @@ use crate::Thread;
 use crate::materialize::materialize_closure_vm;
 use crate::natives::{NativeContext, NativeIndex};
 use crate::{
-    GcSlice, Handle, HandleScope, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
+    Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
     SlotName, Smi, Tagged, Value, VmError,
 };
 
@@ -121,7 +121,7 @@ pub fn run_prelude(
     let result = NativeContext::new(vm, heap, state).call(
         // Safety: fresh rooted-slot word, consumed by the call.
         unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
-        GcSlice::EMPTY,
+        HandleSlice::EMPTY,
     )?;
     if result == unsafe { heap.known().exception.read_unchecked() } {
         if let Some(ex) = state.take_pending_exception() {
@@ -153,7 +153,7 @@ pub fn install_constructor(
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         proto_parent,
     )?;
-    let proto = roots.create_handle(thread.heap().new_object(scope, map, GcSlice::EMPTY));
+    let proto = roots.create_handle(thread.heap().new_object(scope, map, HandleSlice::EMPTY));
 
     // proto.constructor = fn; fn.prototype = proto
     // (built-in methods/constructor properties are non-enumerable, ES 20+)
