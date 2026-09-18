@@ -12,14 +12,14 @@ impl Convert {
         if let Some(smi) = Smi::decode(v.raw()) {
             return smi.value() != 0;
         }
-        if v.raw() == known.false_object.as_tagged(heap).raw()
-            || v.raw() == known.undefined.as_tagged(heap).raw()
-            || v.raw() == known.null.as_tagged(heap).raw()
-            || v.raw() == known.the_hole.as_tagged(heap).raw()
+        if v == known.false_object.as_tagged(heap)
+            || v == known.undefined.as_tagged(heap)
+            || v == known.null.as_tagged(heap)
+            || v == known.the_hole.as_tagged(heap)
         {
             return false;
         }
-        if v.raw() == known.true_object.as_tagged(heap).raw() {
+        if v == known.true_object.as_tagged(heap) {
             return true;
         }
         if let Some(f) = v.get_as::<Float>() {
@@ -38,18 +38,16 @@ impl Convert {
         if let Some(smi) = Smi::decode(v.raw()) {
             return Ok(smi.value() as f64);
         }
-        if v.raw() == known.undefined.as_tagged(heap).raw()
-            || v.raw() == known.the_hole.as_tagged(heap).raw()
-        {
+        if v == known.undefined.as_tagged(heap) || v == known.the_hole.as_tagged(heap) {
             return Ok(f64::NAN);
         }
-        if v.raw() == known.null.as_tagged(heap).raw() {
+        if v == known.null.as_tagged(heap) {
             return Ok(0.0);
         }
-        if v.raw() == known.false_object.as_tagged(heap).raw() {
+        if v == known.false_object.as_tagged(heap) {
             return Ok(0.0);
         }
-        if v.raw() == known.true_object.as_tagged(heap).raw() {
+        if v == known.true_object.as_tagged(heap) {
             return Ok(1.0);
         }
         if let Some(f) = v.get_as::<Float>() {
@@ -116,10 +114,10 @@ impl Convert {
         if v.is_smi() {
             return true;
         }
-        v.raw() == known.undefined.as_tagged(heap).raw()
-            || v.raw() == known.null.as_tagged(heap).raw()
-            || v.raw() == known.true_object.as_tagged(heap).raw()
-            || v.raw() == known.false_object.as_tagged(heap).raw()
+        v == known.undefined.as_tagged(heap)
+            || v == known.null.as_tagged(heap)
+            || v == known.true_object.as_tagged(heap)
+            || v == known.false_object.as_tagged(heap)
             || v.get_as::<Float>().is_some()
             || v.get_as::<DenseString>().is_some()
             || v.get_as::<Symbol>().is_some()
@@ -151,13 +149,13 @@ impl Convert {
             let word = vt.raw();
             if let Some(smi) = Smi::decode(word) {
                 PrimitiveString::Smi(smi.value())
-            } else if word == known.undefined.as_tagged(heap).raw() {
+            } else if word == known.undefined.as_tagged(heap) {
                 PrimitiveString::Undefined
-            } else if word == known.null.as_tagged(heap).raw() {
+            } else if word == known.null.as_tagged(heap) {
                 PrimitiveString::Null
-            } else if word == known.true_object.as_tagged(heap).raw() {
+            } else if word == known.true_object.as_tagged(heap) {
                 PrimitiveString::True
-            } else if word == known.false_object.as_tagged(heap).raw() {
+            } else if word == known.false_object.as_tagged(heap) {
                 PrimitiveString::False
             } else if vt.get_as::<DenseString>().is_some() {
                 PrimitiveString::IsString

@@ -320,7 +320,36 @@ impl<'a, T> Tagged<'a, T> {
     }
 }
 
+/// Identity equality across anchors and phantom types: two `Tagged`s are
+/// equal iff they carry the same word (the same convention as `Value`).
+impl<'a, 'b, T, U> PartialEq<Tagged<'b, U>> for Tagged<'a, T> {
+    fn eq(&self, other: &Tagged<'b, U>) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<'a, T> Eq for Tagged<'a, T> {}
+
+/// A raw word and an anchored word compare by identity too, so `*acc` and
+/// a well-known singleton can be compared without erasing either side.
+impl<'a, T> PartialEq<Value> for Tagged<'a, T> {
+    fn eq(&self, other: &Value) -> bool {
+        self.raw == *other
+    }
+}
+
+impl<'a, T> PartialEq<Tagged<'a, T>> for Value {
+    fn eq(&self, other: &Tagged<'a, T>) -> bool {
+        *self == other.raw
+    }
+}
+
 impl<'a> Tagged<'a, Value> {
+    /// The Smi payload as an `i64`; `None` for pointers (incl. weak).
+    pub fn to_i64(self) -> Option<i64> {
+        self.raw.to_i64()
+    }
+
     pub fn get_as<T: HeapObject>(self) -> Option<HeapRef<'a, T>> {
         let ptr = HeapPtr::decode_strong(self.raw)?;
         // Safety: strong pointer; reads only the header's map slot.

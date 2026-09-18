@@ -168,6 +168,12 @@ impl Acc<'_> {
     pub fn read<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
         self.0.read(heap)
     }
+
+    /// Store into the accumulator register. Takes anything convertible to a
+    /// `Value`, so an anchored `Tagged` can be stored without erasing it.
+    pub fn store(&self, value: impl Into<Value>) {
+        self.0.store(value);
+    }
 }
 
 impl EdgeVisitable for StackCache {

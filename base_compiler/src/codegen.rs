@@ -257,7 +257,7 @@ impl<'a> FunctionGen<'a> {
 
     /// `acc = undefined` (the singleton opcode: no constant-pool slot).
     fn emit_load_undefined(&mut self) {
-        emit(&mut self.code, Opcode::LdaUndefined, &[]);
+        emit(&mut self.code, Opcode::LoadUndefined, &[]);
     }
 
     /// Stage `count` contiguous argument registers with `fill` (given the
@@ -499,12 +499,12 @@ impl<'a> FunctionGen<'a> {
     fn emit_not(&mut self) {
         let mut is_truthy = Label::new();
         emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut is_truthy);
-        emit(&mut self.code, Opcode::LdaTrue, &[]);
+        emit(&mut self.code, Opcode::LoadTrue, &[]);
         let mut end = Label::new();
         emit_jump(&mut self.code, Opcode::Jump, &mut end);
         is_truthy.bind(&self.code);
         is_truthy.patch_all(&mut self.code);
-        emit(&mut self.code, Opcode::LdaFalse, &[]);
+        emit(&mut self.code, Opcode::LoadFalse, &[]);
         end.bind(&self.code);
         end.patch_all(&mut self.code);
     }
@@ -568,12 +568,16 @@ impl<'a> FunctionGen<'a> {
             }
             Node::BigIntLiteral(_) => self.err(node, "BigInt literals"),
             Node::BoolLiteral(b) => {
-                let op = if b { Opcode::LdaTrue } else { Opcode::LdaFalse };
+                let op = if b {
+                    Opcode::LoadTrue
+                } else {
+                    Opcode::LoadFalse
+                };
                 emit(&mut self.code, op, &[]);
                 Ok(())
             }
             Node::NullLiteral => {
-                emit(&mut self.code, Opcode::LdaNull, &[]);
+                emit(&mut self.code, Opcode::LoadNull, &[]);
                 Ok(())
             }
             Node::Identifier { sym } => self.emit_identifier(node, sym),
@@ -620,7 +624,7 @@ impl<'a> FunctionGen<'a> {
                             .expect("arrow new.target forces the slot");
                         emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
                     }
-                    _ => emit(&mut self.code, Opcode::LdaNewTarget, &[]),
+                    _ => emit(&mut self.code, Opcode::LoadNewTarget, &[]),
                 }
                 Ok(())
             }
@@ -652,7 +656,7 @@ impl<'a> FunctionGen<'a> {
                 Ok(())
             }
             TokenKind::Plus => {
-                emit(&mut self.code, Opcode::LdaZero, &[]);
+                emit(&mut self.code, Opcode::LoadZero, &[]);
                 let zero = self.push_value();
                 self.expr(expr)?;
                 emit(&mut self.code, Opcode::Sub, &[zero]);
@@ -760,7 +764,7 @@ impl<'a> FunctionGen<'a> {
                         );
                         self.pop_value();
                     }
-                    _ => emit(&mut self.code, Opcode::LdaFalse, &[]),
+                    _ => emit(&mut self.code, Opcode::LoadFalse, &[]),
                 }
                 Ok(())
             }
@@ -768,7 +772,7 @@ impl<'a> FunctionGen<'a> {
             _ => {
                 // not a reference: side effects only, the result is true
                 self.expr(expr)?;
-                emit(&mut self.code, Opcode::LdaTrue, &[]);
+                emit(&mut self.code, Opcode::LoadTrue, &[]);
                 Ok(())
             }
         }
@@ -1148,7 +1152,7 @@ impl<'a> FunctionGen<'a> {
                 let iter = self.push_value();
                 // done flag (ES 8.5.9: once done, later elements read
                 // undefined without calling next again)
-                emit(&mut self.code, Opcode::LdaZero, &[]);
+                emit(&mut self.code, Opcode::LoadZero, &[]);
                 let done = self.push_value();
                 let items = self.ast.list_items(elements).to_vec();
                 let mut rest: Option<NodeId> = None;
@@ -1180,7 +1184,7 @@ impl<'a> FunctionGen<'a> {
                     // array ← remaining values (loop while !done)
                     emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
                     let arr = self.push_value();
-                    emit(&mut self.code, Opcode::LdaZero, &[]);
+                    emit(&mut self.code, Opcode::LoadZero, &[]);
                     let idx = self.push_value();
                     let head = self.code.len();
                     emit(&mut self.code, Opcode::Load, &[done]);
@@ -1701,7 +1705,7 @@ impl<'a> FunctionGen<'a> {
             let orig = self.push_value();
             emit(&mut self.code, Opcode::LoadSmi, &[delta]);
             let d = self.push_value();
-            emit(&mut self.code, Opcode::LdaZero, &[]);
+            emit(&mut self.code, Opcode::LoadZero, &[]);
             let zero = self.push_value();
             emit(&mut self.code, Opcode::Load, &[orig]);
             emit(&mut self.code, Opcode::Sub, &[zero]);
@@ -1721,7 +1725,7 @@ impl<'a> FunctionGen<'a> {
             let orig = self.push_value();
             emit(&mut self.code, Opcode::LoadSmi, &[delta]);
             let d = self.push_value();
-            emit(&mut self.code, Opcode::LdaZero, &[]);
+            emit(&mut self.code, Opcode::LoadZero, &[]);
             let zero = self.push_value();
             emit(&mut self.code, Opcode::Load, &[orig]);
             emit(&mut self.code, Opcode::Sub, &[zero]);
@@ -2056,7 +2060,7 @@ impl<'a> FunctionGen<'a> {
             emit_jump(&mut self.code, Opcode::Jump, &mut done);
             null_extends.bind(&self.code);
             null_extends.patch_all(&mut self.code);
-            emit(&mut self.code, Opcode::LdaNull, &[]);
+            emit(&mut self.code, Opcode::LoadNull, &[]);
             emit(&mut self.code, Opcode::Store, &[pp]);
             done.bind(&self.code);
             done.patch_all(&mut self.code);
@@ -2561,7 +2565,7 @@ impl<'a> FunctionGen<'a> {
         if self.fn_has_instance_fields(field_owner) {
             let ctor = self.reserve_temp();
             if direct {
-                emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
+                emit(&mut self.code, Opcode::LoadCurrentClosure, &[]);
             } else {
                 let layout = self.resolved.layout(owner);
                 emit(
@@ -3476,7 +3480,7 @@ impl<'a> FunctionGen<'a> {
             // restores absolutely so the catch block's context-slot accesses
             // see the context of the enclosing statement
             let try_ctx = g.reserve_temp();
-            emit(&mut g.code, Opcode::LdaContext, &[]);
+            emit(&mut g.code, Opcode::LoadContext, &[]);
             emit(&mut g.code, Opcode::Store, &[try_ctx]);
             let try_start = g.code.len();
             g.stmt(try_block)?;
@@ -3716,7 +3720,7 @@ impl<'a> FunctionGen<'a> {
                 }
                 // parameters start in their TDZ
                 for i in 0..n {
-                    emit(&mut self.code, Opcode::LdaHole, &[]);
+                    emit(&mut self.code, Opcode::LoadHole, &[]);
                     emit(&mut self.code, Opcode::Store, &[(-(i as i32 + 2)) as u32]);
                 }
                 // left-to-right initialization
@@ -3783,11 +3787,11 @@ impl<'a> FunctionGen<'a> {
         // expose new.target / the running closure to nested arrows
         // (arrow-delegated super() and arrow new.target reads)
         if let Some(slot) = layout.new_target_slot {
-            emit(&mut self.code, Opcode::LdaNewTarget, &[]);
+            emit(&mut self.code, Opcode::LoadNewTarget, &[]);
             emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
         }
         if let Some(slot) = layout.this_function_slot {
-            emit(&mut self.code, Opcode::LdaCurrentClosure, &[]);
+            emit(&mut self.code, Opcode::LoadCurrentClosure, &[]);
             emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
         }
 
@@ -3804,7 +3808,7 @@ impl<'a> FunctionGen<'a> {
                 // InitializeInstanceElements on the bound this:
                 // native(ctor, instance)
                 self.with_temps(|g| {
-                    emit(&mut g.code, Opcode::LdaCurrentClosure, &[]);
+                    emit(&mut g.code, Opcode::LoadCurrentClosure, &[]);
                     let ctor = g.push_value();
                     emit(&mut g.code, Opcode::Load, &[(-1i32) as u32]);
                     g.push_value();
@@ -3828,7 +3832,7 @@ impl<'a> FunctionGen<'a> {
             && self.ctor_has_instance_fields()
         {
             self.with_temps(|g| {
-                emit(&mut g.code, Opcode::LdaCurrentClosure, &[]);
+                emit(&mut g.code, Opcode::LoadCurrentClosure, &[]);
                 let ctor = g.push_value();
                 g.emit_this_load_own();
                 g.push_value();

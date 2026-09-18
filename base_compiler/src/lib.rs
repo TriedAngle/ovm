@@ -14,7 +14,7 @@ use parser::{Ast, FunctionId};
 /// heap objects: interned strings, `Float`s, and shared
 /// `CallableInfoObject` templates for closures. The well-known
 /// singletons (undefined/null/true/false/0) load through their dedicated
-/// `Lda*` opcodes instead of the constant pool.
+/// `Load*` opcodes instead of the constant pool.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Constant {
     /// Interned string (property names, string literals)

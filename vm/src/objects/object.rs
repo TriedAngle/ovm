@@ -101,7 +101,7 @@ impl Object {
         }
         let v = elements.at(heap, i);
         // Safety: fresh root-slot read under the anchor.
-        if v.raw() == unsafe { heap.known().the_hole.read_unchecked() } {
+        if v == unsafe { heap.known().the_hole.read_unchecked() } {
             return None;
         }
         Some(v)

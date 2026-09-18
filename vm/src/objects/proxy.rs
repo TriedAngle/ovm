@@ -30,7 +30,7 @@ impl ProxyObject {
 
     /// Whether the proxy has been revoked (handler nulled).
     pub fn is_revoked(&self, heap: &Heap) -> bool {
-        self.handler.inner() == heap.known().null.as_tagged(heap).raw()
+        self.handler.inner() == heap.known().null.as_tagged(heap)
     }
 
     /// (target, handler) as raw values; caller checks revocation.
@@ -218,8 +218,8 @@ fn get_trap<'s>(
         Coercion::Threw => Ok(TrapLookup::Threw),
         Coercion::Value(v) => {
             let v = scope.handle(v);
-            let nullish = v.as_tagged(heap).raw() == heap.known().undefined.as_tagged(heap).raw()
-                || v.as_tagged(heap).raw() == heap.known().null.as_tagged(heap).raw();
+            let nullish = v.as_tagged(heap) == heap.known().undefined.as_tagged(heap)
+                || v.as_tagged(heap) == heap.known().null.as_tagged(heap);
             if nullish {
                 Ok(TrapLookup::None)
             } else {
@@ -263,7 +263,7 @@ fn enter_trap<'s>(
     trap: Trap,
 ) -> Result<(Handle<'s, Value>, Handle<'s, Value>), VmError> {
     let (target, handler) = parts(heap, proxy.as_tagged(heap)).expect("caller verified a proxy");
-    let revoked = handler == heap.known().null.as_tagged(heap).raw();
+    let revoked = handler == heap.known().null.as_tagged(heap);
     if revoked {
         return Err(revoked_error(trap));
     }
@@ -390,7 +390,7 @@ fn is_extensible_h(
         }));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
-    let revoked = handler == heap.known().null.as_tagged(heap).raw();
+    let revoked = handler == heap.known().null.as_tagged(heap);
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }
@@ -1383,7 +1383,7 @@ fn prevent_extensions_h<'a>(
         return Ok(Coercion::Value(Convert::boolean(heap, true)));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
-    let revoked = handler == heap.known().null.as_tagged(heap).raw();
+    let revoked = handler == heap.known().null.as_tagged(heap);
     if revoked {
         return Err(revoked_error(Trap::PreventExtensions));
     }
@@ -1447,7 +1447,7 @@ fn is_extensible_entry_h<'a>(
         return Ok(Coercion::Value(Convert::boolean(heap, extensible)));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
-    let revoked = handler == heap.known().null.as_tagged(heap).raw();
+    let revoked = handler == heap.known().null.as_tagged(heap);
     if revoked {
         return Err(revoked_error(Trap::IsExtensible));
     }

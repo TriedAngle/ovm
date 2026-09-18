@@ -24,7 +24,7 @@ impl Compare {
             return a == b;
         }
         // identical bits: same interned string, same heap object
-        if x.raw() == y.raw() {
+        if x == y {
             return true;
         }
         if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(), y.get_as::<DenseString>()) {
@@ -44,15 +44,13 @@ impl Compare {
             return Ok(true);
         }
         let nullish = |v: Tagged<'_, Value>| {
-            v.raw() == known.null.as_tagged(heap).raw()
-                || v.raw() == known.undefined.as_tagged(heap).raw()
+            v == known.null.as_tagged(heap) || v == known.undefined.as_tagged(heap)
         };
         if nullish(x) && nullish(y) {
             return Ok(true);
         }
         let is_bool = |v: Tagged<'_, Value>| {
-            v.raw() == known.true_object.as_tagged(heap).raw()
-                || v.raw() == known.false_object.as_tagged(heap).raw()
+            v == known.true_object.as_tagged(heap) || v == known.false_object.as_tagged(heap)
         };
         let is_string = |v: Tagged<'_, Value>| v.get_as::<DenseString>().is_some();
         let is_number = |v: Tagged<'_, Value>| v.is_smi() || v.get_as::<Float>().is_some();
@@ -65,7 +63,7 @@ impl Compare {
         }
         // booleans become numbers (exactly representable as smis, no allocation)
         if is_bool(x) {
-            let n = Smi::new(if x.raw() == known.true_object.as_tagged(heap).raw() {
+            let n = Smi::new(if x == known.true_object.as_tagged(heap) {
                 1
             } else {
                 0
@@ -74,7 +72,7 @@ impl Compare {
             return Self::equal(heap, n, y);
         }
         if is_bool(y) {
-            let n = Smi::new(if y.raw() == known.true_object.as_tagged(heap).raw() {
+            let n = Smi::new(if y == known.true_object.as_tagged(heap) {
                 1
             } else {
                 0
@@ -95,7 +93,7 @@ impl Compare {
     /// strings compare by content (identity for everything else).
     /// Unlike `strict_equal` (===); used by [[DefineOwnProperty]] validation.
     pub fn same_value<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {
-        if x.raw() == y.raw() {
+        if x == y {
             return true;
         }
         let x_num = x.is_smi() || x.get_as::<Float>().is_some();

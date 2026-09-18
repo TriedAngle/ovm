@@ -286,24 +286,18 @@ impl Runtime {
         vm: &VM,
         heap: &mut Heap,
         state: &ContextState,
-        a: Value,
-        b: Value,
+        a: Handle<'_, Value>,
+        b: Handle<'_, Value>,
         op: fn(f64, f64) -> f64,
     ) -> Result<Option<Value>, VmError> {
-        // to_numeric runs user code (valueOf): the second operand must
-        // stay rooted across the first one's coercion
-        state.handle_scope(|scope| {
-            // Safety: caller-supplied words, fresh at entry.
-            let a = scope.handle(unsafe { a.assume_valid(heap) });
-            let b = scope.handle(unsafe { b.assume_valid(heap) });
-            let a = Self::to_numeric(vm, heap, state, a)?;
-            let Some(a) = a else { return Ok(None) };
-            let b = Self::to_numeric(vm, heap, state, b)?;
-            let Some(b) = b else { return Ok(None) };
-            let r = op(a, b);
-            let v = heap.new_number(&scope, r);
-            Ok(Some(v.raw()))
-        })
+        // to_numeric runs user code (valueOf): both operands are rooted by
+        // the caller's handles, so the sibling survives the first coercion.
+        let a = Self::to_numeric(vm, heap, state, a)?;
+        let Some(a) = a else { return Ok(None) };
+        let b = Self::to_numeric(vm, heap, state, b)?;
+        let Some(b) = b else { return Ok(None) };
+        let r = op(a, b);
+        Ok(state.handle_scope(|scope| Some(heap.new_number(&scope, r).raw())))
     }
 
     /// Get a property value with full [[Get]] semantics: accessor getters are
@@ -495,14 +489,14 @@ impl Runtime {
         let strings = heap.known().strings;
         if v.is_smi() || v.get_as::<Float>().is_some() {
             strings.number.as_tagged(heap).erase()
-        } else if v.raw() == heap.known().undefined.as_tagged(heap).raw()
-            || v.raw() == heap.known().the_hole.as_tagged(heap).raw()
+        } else if v == heap.known().undefined.as_tagged(heap)
+            || v == heap.known().the_hole.as_tagged(heap)
         {
             strings.undefined.as_tagged(heap).erase()
-        } else if v.raw() == heap.known().null.as_tagged(heap).raw() {
+        } else if v == heap.known().null.as_tagged(heap) {
             strings.object.as_tagged(heap).erase()
-        } else if v.raw() == heap.known().true_object.as_tagged(heap).raw()
-            || v.raw() == heap.known().false_object.as_tagged(heap).raw()
+        } else if v == heap.known().true_object.as_tagged(heap)
+            || v == heap.known().false_object.as_tagged(heap)
         {
             strings.boolean.as_tagged(heap).erase()
         } else if v.get_as::<DenseString>().is_some() {
@@ -571,7 +565,7 @@ impl Runtime {
         if proto.ptr_eq(target) {
             return true;
         }
-        if proto.raw() == heap.known().null.as_tagged(heap).raw() {
+        if proto == heap.known().null.as_tagged(heap) {
             return false;
         }
         if let Some(parents) = proto.get_as::<FixedArray>() {

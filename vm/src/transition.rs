@@ -94,7 +94,7 @@ impl<'a> Tagged<'a, Value> {
                     return Err(VmError::Type);
                 }
                 let host = holder.as_ref().erase();
-                if semantics == StoreSemantics::Shadow && host != self.raw() {
+                if semantics == StoreSemantics::Shadow && host != self {
                     // inherited writable data property: JS creates an own
                     // property on the receiver
                     return Ok(StoreOutcome::Transition {
@@ -211,7 +211,7 @@ fn super_store_on_receiver<'a, 's>(
             slot,
             flags,
             ..
-        } if holder.as_ref().erase() == recv.raw() => {
+        } if holder.as_ref().erase() == recv => {
             if !flags.is_writable() {
                 return Err(VmError::Type);
             }
@@ -220,9 +220,7 @@ fn super_store_on_receiver<'a, 's>(
         }
         // own accessor: Receiver.[[DefineOwnProperty]]({value}) on an
         // accessor is an incompatible change (ES 9.1.9.2 step 3.d.i)
-        Lookup::Accessor { holder, .. } if holder.as_ref().erase() == recv.raw() => {
-            Err(VmError::Type)
-        }
+        Lookup::Accessor { holder, .. } if holder.as_ref().erase() == recv => Err(VmError::Type),
         // not owned by the receiver: define a fresh own property
         _ => Ok(StoreOutcome::Transition {
             receiver,
