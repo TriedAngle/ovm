@@ -145,7 +145,7 @@ impl Convert {
             False,
             Other,
         }
-        let kind = heap.no_gc(|heap| {
+        let kind = {
             let vt = v.as_tagged(heap);
             let known = heap.known();
             let word = vt.raw();
@@ -166,7 +166,7 @@ impl Convert {
             } else {
                 PrimitiveString::Other
             }
-        });
+        };
         match kind {
             PrimitiveString::Smi(n) => {
                 let s = DenseString::from_utf8(heap, scope, &n.to_string());

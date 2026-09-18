@@ -12,8 +12,9 @@ pub fn string_constructor(
         let construct = nctx.is_construct();
         let (_vm, heap, _) = nctx.split();
         // Safety: fresh argument word, consumed before any allocation.
-        let arg = heap
-            .no_gc(|heap| args.get(heap, 1).map(|v| v.raw()))
+        let arg = args
+            .get(heap, 1)
+            .map(|v| v.raw())
             // Safety: fresh root-slot word read for the immediate use.
             .unwrap_or_else(|| unsafe { heap.known().undefined.read_unchecked() });
         let arg = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(arg) });
@@ -30,15 +31,13 @@ pub fn string_constructor(
 }
 
 pub fn string_value_of(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    nctx.heap().no_gc(|heap| {
-        let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
-        wrapper_value(heap, receiver)
-    })
+    let heap = &*nctx.heap();
+    let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+    wrapper_value(heap, receiver)
 }
 
 pub fn string_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-    nctx.heap().no_gc(|heap| {
-        let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
-        wrapper_value(heap, receiver)
-    })
+    let heap = &*nctx.heap();
+    let receiver = args.get(heap, 0).ok_or(VmError::Arity)?;
+    wrapper_value(heap, receiver)
 }

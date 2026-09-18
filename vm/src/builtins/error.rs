@@ -38,7 +38,8 @@ pub fn make_error(
         let (vm, heap, _) = nctx.split();
         // root the message right away: the allocations below (new_object,
         // interning) would leave a raw copy stale
-        let message = match heap.no_gc(|heap| args.get(heap, 1).map(|v| v.raw())) {
+        let message_word = args.get(heap, 1).map(|v| v.raw());
+        let message = match message_word {
             // Safety: fresh argument word, consumed before any allocation.
             Some(v) => {
                 let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
@@ -88,9 +89,10 @@ pub fn error_to_string(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         // both [[Get]]s below run user code (getters): the receiver must
         // stay rooted across them
         // Safety: fresh argument word, rooted below before any allocation.
-        let receiver_word = nctx
-            .heap()
-            .no_gc(|heap| Ok(args.get(heap, 0).ok_or(VmError::Arity)?.raw()))?;
+        let receiver_word = {
+            let heap = &*nctx.heap();
+            args.get(heap, 0).ok_or(VmError::Arity)?.raw()
+        };
         let receiver =
             scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(receiver_word) });
         let (vm, heap, state) = nctx.split();

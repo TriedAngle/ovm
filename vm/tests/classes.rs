@@ -39,12 +39,13 @@ fn run_bool(src: &str) -> bool {
 
 fn run_str(src: &str) -> String {
     let (result, mut thread) = run_value(src);
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
             .get_as::<DenseString>()
             .expect("string result");
         s.to_rust_string(heap)
-    })
+    }
 }
 
 /// Run a script that must terminate with an uncaught error; returns the
@@ -63,7 +64,8 @@ fn run_error_name(src: &str) -> String {
     let ex = thread.take_pending_exception().expect("pending exception");
     thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name");
-        thread.heap().no_gc(|heap| {
+        {
+            let heap = &*thread.heap();
             let name_key = name.as_tagged(heap).into();
             let o = unsafe { ex.assume_valid(heap) }
                 .as_heap_object()
@@ -78,7 +80,7 @@ fn run_error_name(src: &str) -> String {
                 }
                 _ => panic!("error object must have a name property"),
             }
-        })
+        }
     })
 }
 

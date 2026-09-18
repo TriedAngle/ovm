@@ -122,10 +122,6 @@ impl<'heap> AllocToken<'heap> {
         }
     }
 
-    pub fn enter_no_gc<R>(&self, f: impl for<'a> FnOnce(&'a Heap) -> R) -> R {
-        f(self.heap())
-    }
-
     pub fn remaining(&self) -> usize {
         self.end as usize - self.next.get() as usize
     }
@@ -550,11 +546,10 @@ impl Heap {
             .allocate(config)
             .as_ptr()
             .expect("fresh strong pointer");
-        self.no_gc(|heap| {
-            // Safety: fresh allocation, anchored at `heap`.
-            let r = unsafe { HeapRef::from_ptr(ptr) };
-            f(r, heap)
-        })
+        let heap = &*self;
+        // Safety: fresh allocation, anchored at `heap`.
+        let r = unsafe { HeapRef::from_ptr(ptr) };
+        f(r, heap)
     }
 
     pub fn allocate_token(&mut self, total: Layout) -> AllocToken<'_> {
@@ -573,14 +568,7 @@ impl Heap {
         f: impl for<'a> FnOnce(&AllocToken<'_>, &'a Heap) -> R,
     ) -> R {
         let token = self.allocate_token(total);
-        token.enter_no_gc(|heap| f(&token, heap))
-    }
-
-    /// Borrow the heap for a run of non-allocating operations: the
-    /// `&'a Heap` handed to `f` is the anchor every `Tagged<'a, _>` in
-    /// the scope is tied to, and nothing anchored can escape `f`.
-    pub fn no_gc<R>(&mut self, f: impl for<'a> FnOnce(&'a Heap) -> R) -> R {
-        f(&*self)
+        f(&token, token.heap())
     }
 }
 

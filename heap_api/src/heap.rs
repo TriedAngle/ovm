@@ -43,6 +43,12 @@ impl RawCell {
     pub fn store_raw(&self, w: Word) {
         unsafe { *self.raw.get() = w };
     }
+
+    /// The raw word pointer, for transparent wrappers that layer a typed
+    /// view over the cell (e.g. a register exposed as `&mut Value`).
+    pub fn as_ptr(&self) -> *mut Word {
+        self.raw.get()
+    }
 }
 
 pub trait Visitor {

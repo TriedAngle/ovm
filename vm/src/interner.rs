@@ -50,14 +50,14 @@ impl StringInterner {
         scope: &'s impl HandleSet,
         data: StringData<'_>,
     ) -> Handle<'s, DenseString> {
-        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|heap| {
+        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = {
             let hash = string_content_hash(data);
             let mut table = self.table.lock().unwrap();
             match probe_unlocked(heap, scope, &mut table, hash, data) {
                 Some(handle) => Ok(handle),
                 None => Err((InternKey::from_data(data), hash)),
             }
-        });
+        };
         match staged {
             Ok(handle) => handle,
             Err((key, hash)) => self.insert_new(heap, scope, key, hash),
@@ -83,7 +83,7 @@ impl StringInterner {
         scope: &'s impl HandleSet,
         s: &Handle<'_, DenseString>,
     ) -> Handle<'s, DenseString> {
-        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = heap.no_gc(|heap| {
+        let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = {
             let r = s.heap_ref(heap);
             let hash = r.hash(heap);
             let mut table = self.table.lock().unwrap();
@@ -92,7 +92,7 @@ impl StringInterner {
                 Some(handle) => Ok(handle),
                 None => Err((InternKey::from_data(data), hash)),
             }
-        });
+        };
         match staged {
             Ok(handle) => handle,
             Err((key, hash)) => self.insert_new(heap, scope, key, hash),
@@ -110,7 +110,7 @@ impl StringInterner {
             .allocate::<DenseString>((key.data(), hash))
             .into_handle(scope);
         let mut table = self.table.lock().unwrap();
-        let raced = heap.no_gc(|heap| probe_unlocked(heap, scope, &mut table, hash, key.data()));
+        let raced = probe_unlocked(heap, scope, &mut table, hash, key.data());
         match raced {
             Some(existing) => existing,
             None => {

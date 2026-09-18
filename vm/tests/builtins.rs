@@ -17,12 +17,13 @@ fn run_smi(vm: &VM, src: &str) -> i64 {
 fn run_str(vm: &VM, src: &str) -> String {
     let mut thread = vm.attach();
     let result = thread.run_script(src).unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
             .get_as::<vm::DenseString>()
             .expect("string result");
         s.to_rust_string(heap)
-    })
+    }
 }
 
 fn run_bool(vm: &VM, src: &str) -> bool {

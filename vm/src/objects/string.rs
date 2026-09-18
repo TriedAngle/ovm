@@ -273,7 +273,7 @@ impl DenseString {
         a: Handle<'_, Value>,
         b: Handle<'_, Value>,
     ) -> Handle<'s, DenseString> {
-        let units = heap.no_gc(|heap| {
+        let units = {
             let sa = a
                 .as_tagged(heap)
                 .get_as::<DenseString>()
@@ -288,7 +288,7 @@ impl DenseString {
             sa.data(heap).write_units(&mut out);
             sb.data(heap).write_units(&mut out);
             out
-        });
+        };
         Self::from_units(heap, scope, &units)
     }
 }

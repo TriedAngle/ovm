@@ -74,13 +74,14 @@ where
 
             assert_eq!(string.as_tagged(&*t.heap()).raw().to_bits(), before.0);
             assert_eq!(array.as_tagged(&*t.heap()).raw().to_bits(), before.1);
-            t.heap().no_gc(|heap| {
+            {
+                let heap = &*t.heap();
                 let array = array.heap_ref(heap);
                 assert_eq!(Smi::decode(array.at(heap, 0).raw()).unwrap().value(), 42);
                 assert_eq!(array.at(heap, 1).raw(), string.as_tagged(heap).raw());
                 let string = string.heap_ref(heap);
                 assert!(string.data(heap).matches_ascii(b"survivor"));
-            });
+            };
         }
     });
 }

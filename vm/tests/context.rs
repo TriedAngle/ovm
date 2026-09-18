@@ -14,14 +14,15 @@ fn empty_context_is_the_well_known_root() {
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
-    let (kind, outer, len) = thread.heap().no_gc(|heap| {
+    let (kind, outer, len) = {
+        let heap = &*thread.heap();
         let ctx = heap.known().empty_context.heap_ref(heap).as_ref();
         (
             ctx.header.map.heap_ref(heap).kind().kind(),
             vm::Value::from_bits(ctx.outer.as_raw().load()),
             ctx.slots.heap_ref(heap).as_ref().len(),
         )
-    });
+    };
     assert_eq!(kind, ObjectKind::Context);
     let heap = thread.heap();
     assert_eq!(
@@ -62,7 +63,8 @@ fn contexts_chain_through_outer() {
             &scope,
         );
 
-        let (own, via_outer) = thread.heap().no_gc(|heap| {
+        let (own, via_outer) = {
+            let heap = &*thread.heap();
             let o = outer.heap_ref(heap).as_ref();
             (
                 o.slots.heap_ref(heap).at(heap, 0).raw(),
@@ -75,7 +77,7 @@ fn contexts_chain_through_outer() {
                     .at(heap, 0)
                     .raw(),
             )
-        });
+        };
         assert_eq!(own.to_i64().unwrap(), 7);
         assert_eq!(via_outer.to_i64().unwrap(), 42);
     });
@@ -136,14 +138,15 @@ fn closure_object_carries_typed_context() {
             )
             .into_handle(&scope);
 
-        let slot0 = thread.heap().no_gc(|heap| {
+        let slot0 = {
+            let heap = &*thread.heap();
             let o = obj.heap_ref(heap);
             let context = o
                 .as_ref()
                 .closure_context(heap)
                 .expect("context must be typed as Context");
             context.slots.heap_ref(heap).at(heap, 0).raw()
-        });
+        };
         assert_eq!(slot0.to_i64().unwrap(), 9);
     });
 }

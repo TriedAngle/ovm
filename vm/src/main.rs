@@ -94,7 +94,8 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
     if let Some(smi) = Smi::decode(v) {
         return smi.value().to_string();
     }
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let known = heap.known();
         if v == known.undefined.as_tagged(heap).raw() {
             return "undefined".into();
@@ -115,5 +116,5 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
             return s.to_rust_string(heap);
         }
         format!("{v:?}")
-    })
+    }
 }

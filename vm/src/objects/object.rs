@@ -153,7 +153,7 @@ pub fn store_array_element(
     let receiver = scope.cast::<Object>(receiver).ok_or(VmError::Type)?;
     let value = scope.handle(value);
 
-    let grows = heap.no_gc(|heap| {
+    let grows = {
         let obj = receiver.heap_ref(heap);
         if !obj.as_ref().is_array(heap) {
             return Err(VmError::Type);
@@ -166,8 +166,8 @@ pub fn store_array_element(
             .elements_array(heap)
             .map(|e| e.len())
             .unwrap_or(0);
-        Ok(i >= capacity)
-    })?;
+        i >= capacity
+    };
 
     if grows {
         let staged = {
@@ -188,24 +188,19 @@ pub fn store_array_element(
             scope.stage(&values)
         };
         let elements = heap.allocate_handle::<FixedArray>(staged, scope);
-        heap.no_gc(|heap| {
-            let obj = receiver.heap_ref(heap);
-            obj.elements
-                .set(heap, obj.erase(), elements.as_tagged(heap).erase());
-            obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
-        });
+        let obj = receiver.heap_ref(heap);
+        obj.elements
+            .set(heap, obj.erase(), elements.as_tagged(heap).erase());
+        obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
     } else {
-        heap.no_gc(|heap| {
-            let obj = receiver.heap_ref(heap);
-            let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
-            elements.set(heap, i, value.as_tagged(heap));
-            // a store inside the physical capacity but past the logical
-            // length still extends the array
-            if i >= obj.as_ref().length() {
-                obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
-            }
-            Ok::<_, VmError>(())
-        })?;
+        let obj = receiver.heap_ref(heap);
+        let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+        elements.set(heap, i, value.as_tagged(heap));
+        // a store inside the physical capacity but past the logical
+        // length still extends the array
+        if i >= obj.as_ref().length() {
+            obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
+        }
     }
     Ok(())
 }

@@ -52,7 +52,8 @@ fn registered_native_invokes_and_checks_types() {
 #[test]
 fn native_result_is_boxed_when_not_smi() {
     fn fadd(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
-        let sum = nctx.heap().no_gc(|heap| {
+        let sum = {
+            let heap = &*nctx.heap();
             let (a, b) = match (args.get(heap, 1), args.get(heap, 2)) {
                 (Some(a), Some(b)) => (a, b),
                 _ => return Err(VmError::Arity),
@@ -60,7 +61,7 @@ fn native_result_is_boxed_when_not_smi() {
             let fa = a.get_as::<Float>().ok_or(VmError::Type)?.value.get();
             let fb = b.get_as::<Float>().ok_or(VmError::Type)?.value.get();
             Ok::<f64, VmError>(fa + fb)
-        })?;
+        }?;
         nctx.handle_scope(|nctx, scope| Ok(nctx.heap().new_number(&scope, sum).raw()))
     }
 
@@ -70,13 +71,14 @@ fn native_result_is_boxed_when_not_smi() {
     let fa = float(&mut thread, 1.5);
     let fb = float(&mut thread, 2.25);
     let r = thread.run_native(fadd, &[smi(0), fa, fb]).unwrap();
-    let out = thread.heap().no_gc(|heap| {
+    let out = {
+        let heap = &*thread.heap();
         unsafe { r.assume_valid(heap) }
             .get_as::<Float>()
             .unwrap()
             .value
             .get()
-    });
+    };
     assert_eq!(out, 3.75);
 
     assert_eq!(
@@ -108,7 +110,8 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
     let name = thread.handle_scope(|thread, scope| {
         let name = thread.intern(&scope, "name");
         let type_error = thread.intern(&scope, "TypeError");
-        let (name_ok, type_error_word) = thread.heap().no_gc(|heap| {
+        let (name_ok, type_error_word) = {
+            let heap = &*thread.heap();
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
@@ -119,7 +122,7 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
                 }
                 _ => panic!("error object must have a name property"),
             }
-        });
+        };
         assert!(name_ok, "error object must have a name property");
         type_error_word
     });

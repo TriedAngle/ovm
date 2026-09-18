@@ -18,12 +18,13 @@ fn run_str(src: &str) -> String {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let v = thread.run_script(src).unwrap();
-    thread.heap().no_gc(|heap| {
+    {
+        let heap = &*thread.heap();
         let s = unsafe { v.assume_valid(heap) }
             .get_as::<DenseString>()
             .expect("string result");
         s.to_rust_string(heap)
-    })
+    }
 }
 
 fn run_bool(src: &str) -> bool {

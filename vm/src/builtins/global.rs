@@ -10,18 +10,16 @@ pub fn eval_native(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
         // root the caller context before the allocating ToString below
         let (_vm, heap, state) = nctx.split();
         let context = scope.handle(state.current_context(heap).ok_or(VmError::Type)?);
-        let src = heap.no_gc(|heap| Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw()))?;
+        let src = Ok(args.get(heap, 1).ok_or(VmError::Arity)?.raw())?;
         // Safety: fresh argument word, consumed before any allocation.
         let src = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(src) });
         let s = Convert::to_string(heap, &scope, src)?;
         let s = s.raw();
-        let text = heap.no_gc(|heap| {
-            // Safety: fresh word, no allocation since the read.
+        let text = // Safety: fresh word, no allocation since the read.
             unsafe { s.assume_valid(heap) }
                 .get_as::<DenseString>()
                 .map(|s| s.to_rust_string(heap))
-                .ok_or(VmError::Type)
-        })?;
+                .ok_or(VmError::Type)?;
 
         let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&text));
         if let Err(e) = p.parse_script() {
@@ -58,12 +56,12 @@ pub fn eval_native(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Va
 pub fn is_nan(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, VmError> {
     let n = nctx.handle_scope(|nctx, scope| {
         let (vm, heap, state) = nctx.split();
-        let arg = heap.no_gc(|heap| {
+        let arg = {
             let v = args
                 .get(heap, 1)
                 .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
             scope.handle(v)
-        });
+        };
         Runtime::to_numeric(vm, heap, state, arg)
     })?;
     let Some(n) = n else {
@@ -71,7 +69,8 @@ pub fn is_nan(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value, 
         return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
     };
 
-    Ok(nctx
-        .heap()
-        .no_gc(|heap| Convert::boolean(heap, n.is_nan()).raw()))
+    Ok({
+        let heap = &*nctx.heap();
+        Convert::boolean(heap, n.is_nan()).raw()
+    })
 }
