@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
-    HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, Object, ObjectInit,
+    HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MaybeWeak, Object, ObjectInit,
     ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, TAG_MASK, Tagged, TransitionLock, Value,
     Visitor, Word,
 };
@@ -289,6 +289,79 @@ impl<T: HeapObject> GcSlot<T> {
     }
 }
 
+#[repr(transparent)]
+pub struct MaybeWeakGcSlot<T = Value> {
+    cell: RawCell,
+    _phantom: PhantomData<MaybeWeak<T>>,
+}
+
+impl<T> MaybeWeakGcSlot<T> {
+    pub unsafe fn from_value(v: Value) -> Self {
+        Self {
+            cell: unsafe { RawCell::from_word(v.to_bits()) },
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn get<'a>(&self, _heap: &'a Heap) -> Tagged<'a, MaybeWeak<T>> {
+        unsafe { Tagged::from_maybe_weak_unchecked(Value::from_bits(self.cell.load())) }
+    }
+
+    pub fn inner(&self) -> Value {
+        Value::from_bits(self.cell.load())
+    }
+
+    pub fn is_cleared(&self) -> bool {
+        self.inner().is_cleared()
+    }
+
+    pub fn as_raw(&self) -> &RawCell {
+        &self.cell
+    }
+}
+
+impl<T> MaybeWeakGcSlot<T> {
+    pub fn set_strong<'x>(
+        &self,
+        heap: &Heap,
+        host: impl Into<Value>,
+        value: impl Into<Tagged<'x, T>>,
+    ) where
+        T: 'x,
+    {
+        let strong = value.into().raw();
+        debug_assert!(
+            !strong.is_weak_ptr(),
+            "strong store of a weak/cleared word into a weak slot"
+        );
+        if strong.is_ptr() {
+            heap.write_barrier(host.into(), self.as_raw(), strong);
+        }
+        self.cell.store_raw(strong.to_bits());
+    }
+
+    pub fn set_weak<'x>(&self, _heap: &Heap, value: impl Into<Tagged<'x, T>>)
+    where
+        T: 'x,
+    {
+        let weak = Value::from_bits(value.into().raw().to_bits() | WEAK_PTR);
+        self.cell.store_raw(weak.to_bits());
+    }
+
+    pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<Tagged<'a, T>> {
+        let word = self.inner();
+        if !word.is_ptr() || word.is_cleared() {
+            return None;
+        }
+        let strong = Value::from_bits(word.raw_addr() | STRONG_PTR);
+        Some(unsafe { Tagged::from_value_unchecked(strong) })
+    }
+
+    pub fn strengthen<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, T>> {
+        self.get(heap).strengthen()
+    }
+}
+
 /// A slot that is either empty (the hole) or holds a strong reference to `T`.
 ///
 /// Empty is encoded as the well-known hole object, so the slot is always a
@@ -307,6 +380,14 @@ impl<T> OptionGcSlot<T> {
 
     pub fn inner(&self) -> Value {
         self.slot.inner()
+    }
+
+    pub fn get<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, T>> {
+        // Safety: fresh root-slot read for a word comparison.
+        if self.inner() == unsafe { heap.known().the_hole.read_unchecked() } {
+            return None;
+        }
+        Some(self.slot.get(heap))
     }
 
     pub fn as_raw(&self) -> &RawCell {

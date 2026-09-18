@@ -471,7 +471,14 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
     }
 }
 
-impl<'a, T: HeapObject> Tagged<'a, MaybeWeak<T>> {
+impl<'a, T> Tagged<'a, MaybeWeak<T>> {
+    pub unsafe fn from_maybe_weak_unchecked(value: Value) -> Self {
+        Tagged {
+            raw: value,
+            _phantom: PhantomData,
+        }
+    }
+
     pub fn from_strong(strong: Tagged<'a, T>) -> Self {
         Tagged {
             raw: strong.raw,
@@ -490,5 +497,16 @@ impl<'a, T: HeapObject> Tagged<'a, MaybeWeak<T>> {
 
     pub fn is_cleared(self) -> bool {
         self.raw.is_cleared()
+    }
+}
+
+impl<'a> Tagged<'a, Value> {
+    pub fn as_maybe_weak(self) -> Tagged<'a, MaybeWeak<Value>> {
+        unsafe { Tagged::from_maybe_weak_unchecked(self.raw) }
+    }
+
+    pub fn as_weak(self) -> Tagged<'a, MaybeWeak<Value>> {
+        let weak = Value::from_bits(self.raw.to_bits() | WEAK_PTR);
+        unsafe { Tagged::from_maybe_weak_unchecked(weak) }
     }
 }
