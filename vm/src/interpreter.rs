@@ -1,14 +1,10 @@
 use crate::builtins::intrinsics;
-use crate::proxy::apply;
-use crate::proxy::construct;
-use crate::proxy::get;
-use crate::proxy::is_proxy;
-use crate::proxy::set;
+use crate::proxy::Proxy;
 use bytecode::{Opcode, Operands, decode, jump_target};
 
 use crate::{
     CallTarget, CallableInfoObject, Compare, Context, ContextInit, Convert, DenseString,
-    FixedArray, FunctionKind, GcSlice, Handle, HandleScope, Heap, Key, LoadOutcome, Lookup, Object,
+    FixedArray, FunctionKind, GcSlice, Handle, Heap, Key, LoadOutcome, Lookup, Object,
     PropertyDescriptor, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value,
     call_target, classify_key, function_kind_of, load_outcome, store_array_element,
 };
@@ -59,16 +55,16 @@ fn start(
     new_target: Option<Handle<'_, Value>>,
     base_depth: usize,
 ) -> Result<Value, VmError> {
-    if is_proxy(heap, callable.as_tagged(heap).erase()) {
+    if Proxy::is_proxy(heap, callable.as_tagged(heap).erase()) {
         // no raw copies: stage the args into GC-visited stack memory —
         // trap lookups may run user getters, so raw Vecs would go stale
         return state.handle_scope(|scope| {
             let result = match new_target {
-                None => apply(vm, heap, state, callable.erase(), args),
+                None => Proxy::apply(vm, heap, state, callable.erase(), args),
                 Some(nt) => {
                     let real: Vec<Tagged<'_, Value>> = args.iter(heap).skip(1).collect();
                     let staged = scope.stage(&real);
-                    construct(vm, heap, state, callable.erase(), staged, nt)
+                    Proxy::construct(vm, heap, state, callable.erase(), staged, nt)
                 }
             };
 
@@ -91,7 +87,7 @@ fn start(
             state.stack.set_top(saved_top);
             result
         }
-        Callee::Bytecode(register_count, kind) => {
+        Callee::Bytecode(target, register_count, kind) => {
             if new_target.is_none() && kind.is_class_constructor() {
                 return Err(VmError::Type);
             }
@@ -102,7 +98,6 @@ fn start(
             // the push itself never allocates, so the anchor may span it
             let frame = {
                 let heap: &Heap = heap;
-                let target = callable.as_tagged(heap).erase();
                 let context = closure_context(heap, target);
                 let formal_min = target
                     .as_heap_object()
@@ -130,17 +125,17 @@ fn start(
 
 /// Callee classification for the call paths: the anchored `CallTarget`
 /// payloads erased to plain data so no anchor crosses an allocation.
-enum Callee {
+enum Callee<'a> {
     NotCallable,
     Native(usize),
-    Bytecode(usize, FunctionKind),
+    Bytecode(Tagged<'a, Value>, usize, FunctionKind),
 }
 
-fn classify_callee(heap: &Heap, f: Tagged<'_, Value>) -> Callee {
+fn classify_callee<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Callee<'a> {
     match call_target(heap, f) {
         Some(CallTarget::Native(idx)) => Callee::Native(idx),
         Some(CallTarget::Bytecode(_, register_count, kind)) => {
-            Callee::Bytecode(register_count, kind)
+            Callee::Bytecode(f, register_count, kind)
         }
         None => Callee::NotCallable,
     }
@@ -177,39 +172,40 @@ fn closure_context<'a>(heap: &'a Heap, callable: Tagged<'a, Value>) -> Tagged<'a
 }
 
 /// Result of an inline call attempt (`call_value`).
-enum Called {
+enum Called<'a> {
     /// A bytecode frame was pushed; its `Return` produces the value.
     Frame,
     /// The callee is not callable.
     NotCallable,
     /// The call ran to completion eagerly (proxy `apply`): the value.
-    Immediate(Value),
+    Immediate(Tagged<'a, Value>),
     /// The call threw; the pending exception is set.
     Threw,
 }
 
-fn call_value(
+fn call_value<'a>(
     vm: &VM,
     state: &ContextState,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     stack: &Stack,
     cache: &StackCache,
     meta: FrameMeta,
     handler_pc: usize,
     f: Handle<'_, Value>,
     args: GcSlice<'_>,
-) -> Result<Called, VmError> {
+) -> Result<Called<'a>, VmError> {
     // proxies dispatch through their `apply` trap (or the target call)
     // via a nested run — their callable state lives on a ProxyObject,
     // not in function slots
-    if is_proxy(heap, f.as_tagged(heap).erase()) {
-        return match apply(vm, heap, state, f, args)? {
+    if Proxy::is_proxy(heap, f.as_tagged(heap).erase()) {
+        return match Proxy::apply(vm, heap, state, f, args)? {
             Coercion::Threw => Ok(Called::Threw),
-            Coercion::Value(v) => Ok(Called::Immediate(v.raw())),
+            Coercion::Value(v) => Ok(Called::Immediate(v)),
         };
     }
     // TODO: native getters/setters invoke in place instead of pushing a frame
-    let Callee::Bytecode(register_count, kind) = classify_callee(heap, f.as_tagged(heap).erase())
+    let Callee::Bytecode(_target, register_count, kind) =
+        classify_callee(heap, f.as_tagged(heap).erase())
     else {
         return Ok(Called::NotCallable);
     };
@@ -314,10 +310,10 @@ fn raise(
     exception_dispatch(heap, state, base_depth, pc)
 }
 
-enum Step {
+enum Step<'a> {
     Next,
-    Return(Value),
-    Throw(Value),
+    Return(Tagged<'a, Value>),
+    Throw(Tagged<'a, Value>),
     PendingThrow,
     Error(VmError),
 }
@@ -361,7 +357,7 @@ fn dispatch(
         let result = step(vm, heap, state, base_depth, op, ops, meta, pc);
         match result {
             Step::Next => {}
-            Step::Return(v) => return Ok(v),
+            Step::Return(v) => return Ok(v.into()),
             Step::Throw(v) => {
                 state.set_pending_exception(v);
                 match exception_dispatch(heap, state, base_depth, pc) {
@@ -418,30 +414,16 @@ fn apply_store_outcome(
     }
 }
 
-enum LoadResult<'s> {
-    Value(Handle<'s, Value>),
-    Getter(Handle<'s, Value>),
-}
-
-impl LoadResult<'_> {
-    fn of<'s>(scope: &'s HandleScope<'_>, outcome: LoadOutcome<'_>) -> LoadResult<'s> {
-        match outcome {
-            LoadOutcome::Value(v) => LoadResult::Value(scope.handle(v)),
-            LoadOutcome::Getter(g) => LoadResult::Getter(scope.handle(g)),
-        }
-    }
-}
-
-fn step(
+fn step<'a>(
     vm: &VM,
-    heap: &mut Heap,
+    heap: &'a mut Heap,
     state: &ContextState,
     base_depth: usize,
     op: Opcode,
     ops: Operands,
     meta: FrameMeta,
     pc: usize,
-) -> Step {
+) -> Step<'a> {
     let stack = &state.stack;
     let cache = &state.cache;
     let mut acc = cache.acc_mut();
@@ -449,7 +431,7 @@ fn step(
     match op {
         Opcode::Return => {
             if stack.frame_depth() == base_depth {
-                return Step::Return(*acc);
+                return Step::Return(acc.read(heap));
             }
             let caller = stack
                 .pop_frame(meta.base)
@@ -494,7 +476,7 @@ fn step(
             Step::Next
         }
         Opcode::LoadGlobal | Opcode::LoadGlobalNoThrow => {
-            state.handle_scope(|scope| -> Step {
+            state.handle_scope(|scope| -> Step<'_> {
                 enum GlobalLoad<'s> {
                     Data(Handle<'s, Value>),
                     Getter(Handle<'s, Value>),
@@ -530,7 +512,7 @@ fn step(
                                 Called::NotCallable => {
                                     acc.store(heap.known().undefined.as_tagged(heap));
                                 }
-                                Called::Immediate(v) => *acc = v,
+                                Called::Immediate(v) => acc.store(v),
                                 Called::Threw => return Step::PendingThrow,
                             }
                         }
@@ -551,11 +533,11 @@ fn step(
         }
         Opcode::LoadNamedProperty => {
             // proxies run their `get` trap outside any non-allocating region
-            if is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
+            if Proxy::is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
                 return state.handle_scope(|scope| {
                     let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                     let name = scope.handle(callable_name(heap, stack, &meta, ops.idx(1)).erase());
-                    match step_try!(get(vm, heap, state, receiver, receiver, name)) {
+                    match step_try!(Proxy::get(vm, heap, state, receiver, receiver, name)) {
                         Coercion::Threw => Step::PendingThrow,
                         Coercion::Value(v) => {
                             acc.store(v);
@@ -564,18 +546,18 @@ fn step(
                     }
                 });
             }
-            state.handle_scope(|scope| -> Step {
+            state.handle_scope(|scope| -> Step<'_> {
                 let outcome = step_try!(load_outcome(
                     heap,
                     stack.reg(heap, &meta, ops.reg(0)),
                     callable_name(heap, stack, &meta, ops.idx(1)),
                 ));
-                let outcome = LoadResult::of(&scope, outcome);
                 match outcome {
-                    LoadResult::Value(v) => acc.store(v.as_tagged(heap)),
-                    LoadResult::Getter(getter) => {
+                    LoadOutcome::Value(v) => acc.store(v),
+                    LoadOutcome::Getter(getter) => {
                         let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                         let args = scope.stage(&[receiver.as_tagged(heap).erase()]);
+                        let getter = scope.handle(getter);
                         match step_try!(call_value(
                             vm, state, heap, stack, cache, meta, pc, getter, args
                         )) {
@@ -584,7 +566,7 @@ fn step(
                             Called::NotCallable => {
                                 acc.store(heap.known().undefined.as_tagged(heap));
                             }
-                            Called::Immediate(v) => *acc = v,
+                            Called::Immediate(v) => acc.store(v),
                             Called::Threw => return Step::PendingThrow,
                         }
                     }
@@ -630,8 +612,15 @@ fn step(
                     }
                 }
                 // proxies run their `get` trap outside any non-allocating region
-                if is_proxy(heap, receiver.as_tagged(heap)) {
-                    return match step_try!(get(vm, heap, state, receiver, receiver, key.erase())) {
+                if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
+                    return match step_try!(Proxy::get(
+                        vm,
+                        heap,
+                        state,
+                        receiver,
+                        receiver,
+                        key.erase()
+                    )) {
                         Coercion::Threw => Step::PendingThrow,
                         Coercion::Value(v) => {
                             acc.store(v);
@@ -648,26 +637,25 @@ fn step(
                                     .as_heap_object()
                                     .and_then(|obj| obj.as_ref().element_value(heap, i))
                                 {
-                                    Some(v) => Ok(LoadResult::Value(scope.handle(v))),
+                                    Some(v) => Ok(LoadOutcome::Value(v)),
                                     // past the end, a hole, or a non-array
                                     // receiver: ordinary property lookup
                                     None => load_outcome(
                                         heap,
                                         receiver,
                                         Tagged::from(Smi::new(i as i64)),
-                                    )
-                                    .map(|o| LoadResult::of(&scope, o)),
+                                    ),
                                 }
                             }
-                            Key::Name(name) => load_outcome(heap, receiver, name)
-                                .map(|o| LoadResult::of(&scope, o)),
+                            Key::Name(name) => load_outcome(heap, receiver, name),
                         }
                     })
                 });
                 match outcome {
-                    LoadResult::Value(v) => acc.store(v.as_tagged(heap)),
-                    LoadResult::Getter(getter) => {
+                    LoadOutcome::Value(v) => acc.store(v),
+                    LoadOutcome::Getter(getter) => {
                         let args = scope.stage(&[receiver.as_tagged(heap).erase()]);
+                        let getter = scope.handle(getter);
                         match step_try!(call_value(
                             vm, state, heap, stack, cache, meta, pc, getter, args
                         )) {
@@ -676,7 +664,7 @@ fn step(
                                 // Safety: old-gen singleton word.
                                 acc.store(heap.known().undefined.as_tagged(heap));
                             }
-                            Called::Immediate(v) => *acc = v,
+                            Called::Immediate(v) => acc.store(v),
                             Called::Threw => return Step::PendingThrow,
                         }
                     }
@@ -692,7 +680,7 @@ fn step(
             stack.set_reg(&meta, ops.reg(0), acc.read(heap));
             Step::Next
         }
-        Opcode::StoreGlobal => state.handle_scope(|scope| -> Step {
+        Opcode::StoreGlobal => state.handle_scope(|scope| -> Step<'_> {
             let outcome = step_try!({
                 let name = callable_name(heap, stack, &meta, ops.idx(0));
                 heap.known()
@@ -726,18 +714,18 @@ fn step(
                 _ => StoreSemantics::Shadow,
             };
             // proxies run their `set` trap outside any non-allocating region
-            if is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
+            if Proxy::is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
                 return state.handle_scope(|scope| {
                     let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                     let name = scope.handle(callable_name(heap, stack, &meta, ops.idx(1)).erase());
                     let value = scope.handle(acc.read(heap));
-                    match step_try!(set(vm, heap, state, receiver, name, value, receiver)) {
+                    match step_try!(Proxy::set(vm, heap, state, receiver, name, value, receiver)) {
                         Coercion::Threw => Step::PendingThrow,
                         Coercion::Value(_) => Step::Next,
                     }
                 });
             }
-            state.handle_scope(|scope| -> Step {
+            state.handle_scope(|scope| -> Step<'_> {
                 let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                 let outcome = step_try!({
                     let name = callable_name(heap, stack, &meta, ops.idx(1));
@@ -779,8 +767,8 @@ fn step(
                 let receiver_word = unsafe { receiver.read_unchecked() };
                 // proxies run their `set` trap outside any non-allocating region
                 // (including array-element stores)
-                if is_proxy(heap, receiver.as_tagged(heap)) {
-                    return match step_try!(set(
+                if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
+                    return match step_try!(Proxy::set(
                         vm,
                         heap,
                         state,
@@ -1007,12 +995,12 @@ fn step(
             let count = ops.reg_count(2);
             // a callable proxy dispatches through its `apply` trap (or
             // a nested call of the target)
-            if is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
+            if Proxy::is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
                 return match state.handle_scope(|scope| {
                     // staged: trap lookups may run user getters
                     let callee = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                     let staged = stack.args(&meta, ops.reg_list(1), count);
-                    apply(vm, heap, state, callee, staged)
+                    Proxy::apply(vm, heap, state, callee, staged)
                 }) {
                     Ok(Coercion::Threw) => Step::PendingThrow,
                     Ok(Coercion::Value(v)) => {
@@ -1038,13 +1026,12 @@ fn step(
                         Err(err) => Step::Error(err),
                     }
                 }
-                Callee::Bytecode(register_count, kind) => {
+                Callee::Bytecode(callee, register_count, kind) => {
                     if kind.is_class_constructor() {
                         return Step::Error(VmError::Type);
                     }
                     // one shared anchor covers every read feeding the push
                     let frame = {
-                        let callee = stack.reg(heap, &meta, ops.reg(0));
                         let context = closure_context(heap, callee);
                         let formal_min = callee
                             .as_heap_object()
@@ -1110,13 +1097,13 @@ fn step(
             }
             // a constructor proxy dispatches through its `construct`
             // trap (the target construct synthesizes its own receiver)
-            if is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
+            if Proxy::is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))) {
                 let count = ops.reg_count(2);
                 return match state.handle_scope(|scope| {
                     // staged: trap lookups may run user getters
                     let callee = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                     let staged = stack.args(&meta, ops.reg_list(1), count);
-                    construct(vm, heap, state, callee, staged, callee)
+                    Proxy::construct(vm, heap, state, callee, staged, callee)
                 }) {
                     Ok(Coercion::Threw) => Step::PendingThrow,
                     Ok(Coercion::Value(v)) => {
@@ -1281,7 +1268,7 @@ fn step(
                 Step::Next
             })
         }
-        Opcode::Sub => state.handle_scope(|scope| -> Step {
+        Opcode::Sub => state.handle_scope(|scope| -> Step<'_> {
             let other = stack.reg(heap, &meta, ops.reg(0));
             if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
                 && let Some(r) = a.checked_sub(b)
@@ -1299,7 +1286,7 @@ fn step(
             *acc = v;
             Step::Next
         }),
-        Opcode::Mul => state.handle_scope(|scope| -> Step {
+        Opcode::Mul => state.handle_scope(|scope| -> Step<'_> {
             let other = stack.reg(heap, &meta, ops.reg(0));
             if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
                 && let Some(r) = a.checked_mul(b)
@@ -1317,7 +1304,7 @@ fn step(
             *acc = v;
             Step::Next
         }),
-        Opcode::Div => state.handle_scope(|scope| -> Step {
+        Opcode::Div => state.handle_scope(|scope| -> Step<'_> {
             // JS division is IEEE double division: 7/2 = 3.5, x/0 = ±Infinity
             // or NaN, MIN/-1 overflows to a double.
             let other = stack.reg(heap, &meta, ops.reg(0));
@@ -1338,7 +1325,7 @@ fn step(
             *acc = v;
             Step::Next
         }),
-        Opcode::Mod => state.handle_scope(|scope| -> Step {
+        Opcode::Mod => state.handle_scope(|scope| -> Step<'_> {
             // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.
             let other = stack.reg(heap, &meta, ops.reg(0));
             if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
@@ -1356,7 +1343,7 @@ fn step(
             *acc = v;
             Step::Next
         }),
-        Opcode::Exp => state.handle_scope(|scope| -> Step {
+        Opcode::Exp => state.handle_scope(|scope| -> Step<'_> {
             // JS exponentiation is always IEEE double math; the result only
             // needs a Smi tag when it is an in-range integer.
             let a = scope.handle(acc.read(heap));
@@ -1659,7 +1646,7 @@ fn step(
                 Step::Next
             })
         }
-        Opcode::Throw | Opcode::ReThrow => Step::Throw(*acc),
+        Opcode::Throw | Opcode::ReThrow => Step::Throw(acc.read(heap)),
         Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),
     }
 }

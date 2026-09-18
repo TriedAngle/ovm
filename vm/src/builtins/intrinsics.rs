@@ -19,10 +19,7 @@ use crate::lookup::canonical_index;
 use crate::lookup::has_property as lookup_has_property;
 use crate::natives::{NativeContext, NativeFn};
 use crate::proxy::Flow;
-use crate::proxy::define_internal;
-use crate::proxy::delete;
-use crate::proxy::has;
-use crate::proxy::is_proxy;
+use crate::proxy::Proxy;
 use crate::runtime::Runtime;
 use crate::{ContextState, VM};
 
@@ -156,14 +153,14 @@ fn delete_property(
         let ok = {
             let cond_23 = {
                 let heap = &*nctx.heap();
-                is_proxy(heap, unsafe { target.assume_valid(heap) })
+                Proxy::is_proxy(heap, unsafe { target.assume_valid(heap) })
             };
             if cond_23 {
                 let (vm, heap, state) = nctx.split();
                 // Safety: fresh rooted-slot word (re-read above) plus a fresh
                 // coercion result, both consumed by the trap call.
                 let key_word = unsafe { key.read_unchecked() };
-                match delete(
+                match Proxy::delete(
                     vm,
                     heap,
                     state,
@@ -991,12 +988,12 @@ fn has_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Result<Value
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
         let obj = obj.as_tagged(heap).raw();
-        let cond_27 = is_proxy(heap, unsafe { obj.assume_valid(heap) });
+        let cond_27 = Proxy::is_proxy(heap, unsafe { obj.assume_valid(heap) });
         if cond_27 {
             // Safety: fresh rooted-slot word plus a fresh coercion
             // result, both consumed by the trap call.
             let key_word = unsafe { key.read_unchecked() };
-            return match has(
+            return match Proxy::has(
                 vm,
                 heap,
                 state,
@@ -1795,7 +1792,7 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
         // proxies run their `defineProperty` trap (ES 20.2.5.6); define
         // sites are strict-mode: a rejected define throws
         {
-            let cond_30 = is_proxy(heap, receiver.as_tagged(heap));
+            let cond_30 = Proxy::is_proxy(heap, receiver.as_tagged(heap));
             if cond_30 {
                 let partial = {
                     let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
@@ -1828,7 +1825,7 @@ fn define_own_property(nctx: &mut NativeContext<'_>, args: GcSlice<'_>) -> Resul
                 // Safety: rooted handle words, consumed by the trap call.
                 let recv_word = unsafe { receiver.read_unchecked() };
                 let key_word = unsafe { key.read_unchecked() };
-                return match define_internal(
+                return match Proxy::define_internal(
                     vm,
                     heap,
                     state,
