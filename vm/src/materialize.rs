@@ -1,9 +1,12 @@
-//! Materialization: `base_compiler::CompiledScript` → VM heap objects.
+//! Materialization: `ir::Program` → VM heap objects.
 //!
 //! Each compiled function becomes a `CallableInfoObject` (bytecode +
 //! constants + handler table); closures reference them from the constants
 //! table. Constants are converted to heap values: interned strings,
 //! `Float`s, oddball singletons, and child callable infos.
+//!
+//! The materializer is frontend-agnostic: it consumes the shared [`ir`]
+//! program pools and knows nothing about the language that produced them.
 
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
@@ -11,36 +14,35 @@ use crate::{
     ScopeInfoInit, Tagged, Value, VmError,
 };
 
-use base_compiler::{CompiledScript, Constant};
-use parser::FunctionId;
+use ir::{CallableKind, Constant, FunctionId, Program};
 
 use crate::DenseString;
 use crate::Smi;
 use crate::StringData;
 use crate::{ContextState, Thread, VM};
 
-/// Materialize a compiled script into a closure object (function map,
+/// Materialize a compiled program into a closure object (function map,
 /// empty context) ready for `Thread::execute`.
 pub fn materialize_script<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
-    script: &CompiledScript,
+    program: &Program,
 ) -> Result<Handle<'s, Object>, VmError> {
     let empty = thread.heap().known().empty_context;
-    materialize_closure(thread, scope, script, empty)
+    materialize_closure(thread, scope, program, empty)
 }
 
 pub fn materialize_closure<'s, 'c>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
-    script: &CompiledScript,
+    program: &Program,
     context: Handle<'c, Context>,
 ) -> Result<Handle<'s, Object>, VmError>
 where
     'c: 's,
 {
     let (vm, heap, state) = thread.split();
-    materialize_closure_vm(vm, heap, state, scope, script, context)
+    materialize_closure_vm(vm, heap, state, scope, program, context)
 }
 
 pub fn materialize_closure_vm<'s>(
@@ -48,12 +50,20 @@ pub fn materialize_closure_vm<'s>(
     heap: &mut Heap,
     state: &ContextState,
     scope: &'s HandleScope<'_>,
-    script: &CompiledScript,
+    program: &Program,
     context: Handle<'s, Context>,
 ) -> Result<Handle<'s, Object>, VmError> {
     let mut infos: Vec<Option<Handle<'s, CallableInfoObject>>> =
-        (0..script.functions.len()).map(|_| None).collect();
-    let info = materialize_function(vm, heap, state, scope, script, &mut infos, FunctionId(0))?;
+        (0..program.len()).map(|_| None).collect();
+    let info = materialize_function(
+        vm,
+        heap,
+        state,
+        scope,
+        program,
+        &mut infos,
+        FunctionId::SCRIPT,
+    )?;
 
     let map = heap.known().function_map;
     let slots = scope.stage(&[
@@ -69,23 +79,24 @@ fn materialize_function<'s>(
     heap: &mut Heap,
     state: &ContextState,
     scope: &'s HandleScope<'_>,
-    script: &CompiledScript,
+    program: &Program,
     infos: &mut [Option<Handle<'s, CallableInfoObject>>],
     fid: FunctionId,
 ) -> Result<Handle<'s, CallableInfoObject>, VmError> {
-    if let Some(info) = infos[fid.0 as usize] {
+    if let Some(info) = infos[fid.index()] {
         return Ok(info);
     }
-    let function = &script.functions[fid.0 as usize];
+    let function = program.function(fid);
 
-    let mut constants: Vec<Handle<'s, Value>> = Vec::with_capacity(function.constants.len());
-    for constant in &function.constants {
+    let constants = program.constants(function);
+    let mut materialized: Vec<Handle<'s, Value>> = Vec::with_capacity(constants.len());
+    for constant in constants {
         let value = match constant {
             Constant::String(bytes) => intern(heap, state, scope, vm, bytes).erase(),
             Constant::Smi(v) => scope.handle(Smi::new(*v)),
             Constant::Float(f) => scope.handle(heap.new_number(*f)),
             Constant::Callable(child) => {
-                let info = materialize_function(vm, heap, state, scope, script, infos, *child)?;
+                let info = materialize_function(vm, heap, state, scope, program, infos, *child)?;
                 info.erase()
             }
             Constant::ContextNames(names) => {
@@ -104,17 +115,17 @@ fn materialize_function<'s>(
             Constant::ObjectPrototype => heap.known().object_prototype.erase(),
             Constant::FunctionPrototype => heap.known().function_prototype.erase(),
         };
-        constants.push(value);
+        materialized.push(value);
     }
 
-    let bytecode = heap.allocate_handle::<FixedByteArray>(&function.bytecode, scope);
-    let words: Vec<Tagged<'_, Value>> = constants.iter().map(|h| h.as_tagged(heap)).collect();
+    let bytecode = heap.allocate_handle::<FixedByteArray>(program.code(function), scope);
+    let words: Vec<Tagged<'_, Value>> = materialized.iter().map(|h| h.as_tagged(heap)).collect();
     let constants = heap.allocate_handle::<FixedArray>(scope.stage(&words), scope);
-    let handlers = if function.handlers.is_empty() {
+    let handlers = if program.handlers(function).is_empty() {
         None
     } else {
-        let entries: Vec<HandlerEntryInit> = function
-            .handlers
+        let entries: Vec<HandlerEntryInit> = program
+            .handlers(function)
             .iter()
             .map(|h| HandlerEntryInit::new(h.try_start, h.try_end, h.handler_pc))
             .collect();
@@ -130,30 +141,29 @@ fn materialize_function<'s>(
         },
         scope,
     );
-    let name: Option<Handle<'s, DenseString>> = function
-        .name
-        .as_deref()
+    let name: Option<Handle<'s, DenseString>> = program
+        .name(function)
         .map(|name| intern(heap, state, scope, vm, name));
     let kind = match function.kind {
-        parser::FunctionKind::Normal => FunctionKind::Normal,
-        parser::FunctionKind::Generator => FunctionKind::Generator,
-        parser::FunctionKind::Arrow => FunctionKind::Arrow,
-        parser::FunctionKind::Method => FunctionKind::Method,
-        parser::FunctionKind::Getter => FunctionKind::Getter,
-        parser::FunctionKind::Setter => FunctionKind::Setter,
-        parser::FunctionKind::BaseClassConstructor => FunctionKind::BaseClassConstructor,
-        parser::FunctionKind::DerivedClassConstructor => FunctionKind::DerivedClassConstructor,
-        parser::FunctionKind::DefaultDerivedConstructor => FunctionKind::DefaultDerivedConstructor,
+        CallableKind::Normal => FunctionKind::Normal,
+        CallableKind::Generator => FunctionKind::Generator,
+        CallableKind::Arrow => FunctionKind::Arrow,
+        CallableKind::Method => FunctionKind::Method,
+        CallableKind::Getter => FunctionKind::Getter,
+        CallableKind::Setter => FunctionKind::Setter,
+        CallableKind::BaseClassConstructor => FunctionKind::BaseClassConstructor,
+        CallableKind::DerivedClassConstructor => FunctionKind::DerivedClassConstructor,
+        CallableKind::DefaultDerivedConstructor => FunctionKind::DefaultDerivedConstructor,
     };
     info.heap_ref(heap).set_metadata_full(
         heap,
         name.map(|h| h.as_tagged(heap).erase()),
-        function.formal_parameter_count as usize,
-        function.formal_length as usize,
+        function.arity as usize,
+        function.length as usize,
         kind,
         function.strict,
     );
-    infos[fid.0 as usize] = Some(info);
+    infos[fid.index()] = Some(info);
     Ok(info)
 }
 
@@ -164,6 +174,6 @@ fn intern<'s>(
     vm: &VM,
     s: &[u8],
 ) -> Handle<'s, DenseString> {
-    let units = crate::decode_wtf8(s).expect("parser produces valid WTF-8 string constants");
+    let units = crate::decode_wtf8(s).expect("frontends produce valid WTF-8 string constants");
     vm.interner().intern(heap, scope, StringData::Utf16(&units))
 }

@@ -1,8 +1,7 @@
 [package]
-name = "base_compiler"
+name = "js_parser"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
 bytecode = { path = "../bytecode" }
-parser = { path = "../parser" }

@@ -1,7 +1,7 @@
 //! Dump the AST of a JS file as an indented tree.
-//! Usage: cargo run -p parser --example dump_ast -- <file.js>  (or -e "code")
+//! Usage: cargo run -p js_parser --example dump_ast -- <file.js>  (or -e "code")
 
-use parser::{Ast, Node, NodeId, NodeList, Parser, Symbol, Utf8SliceStream};
+use js_parser::{Ast, Node, NodeId, NodeList, Parser, Symbol, Utf8SliceStream};
 
 fn name_of(ast: &Ast, s: Symbol) -> String {
     String::from_utf8_lossy(ast.symbol(s)).into_owned()
@@ -284,7 +284,14 @@ fn dump(ast: &Ast, id: NodeId, indent: usize) {
     }
 }
 
-fn dump_class(ast: &Ast, id: parser::ClassId, tag: &str, pad: String, at: String, indent: usize) {
+fn dump_class(
+    ast: &Ast,
+    id: js_parser::ClassId,
+    tag: &str,
+    pad: String,
+    at: String,
+    indent: usize,
+) {
     let c = ast.class(id);
     println!(
         "{pad}{tag}({:?} members={}) {at}",

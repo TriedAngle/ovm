@@ -1,6 +1,6 @@
-use parser::Node::*;
-use parser::TokenKind::{self};
-use parser::{Ast, FunctionId, Node, NodeId, ParseError, Parser, Symbol, Utf8SliceStream};
+use js_parser::Node::*;
+use js_parser::TokenKind::{self};
+use js_parser::{Ast, FunctionId, Node, NodeId, ParseError, Parser, Symbol, Utf8SliceStream};
 
 fn parse(src: &str) -> Ast {
     let mut p = Parser::new(Utf8SliceStream::new(src));
@@ -397,7 +397,7 @@ fn var_declarations() {
     let VarDecl { kind, decls } = *stmt(&ast, 0) else {
         panic!()
     };
-    assert_eq!(kind, parser::VarKind::Var);
+    assert_eq!(kind, js_parser::VarKind::Var);
     let decls = ast.list_items(decls);
     assert_eq!(decls.len(), 2);
     let VarDeclarator { target, init } = *ast.node(decls[0]) else {
@@ -419,14 +419,14 @@ fn var_declarations() {
     assert!(matches!(
         stmt(&ast, 1),
         VarDecl {
-            kind: parser::VarKind::Let,
+            kind: js_parser::VarKind::Let,
             ..
         }
     ));
     assert!(matches!(
         stmt(&ast, 2),
         VarDecl {
-            kind: parser::VarKind::Const,
+            kind: js_parser::VarKind::Const,
             ..
         }
     ));
@@ -462,7 +462,7 @@ fn let_is_contextual() {
     assert!(matches!(
         stmt(&ast, 0),
         VarDecl {
-            kind: parser::VarKind::Let,
+            kind: js_parser::VarKind::Let,
             ..
         }
     ));
@@ -690,9 +690,9 @@ fn spans_cover_source() {
     let VarDecl { .. } = *stmt(&ast, 0) else {
         panic!()
     };
-    assert_eq!(ast.span(stmts(&ast)[0]), parser::Span::new(0, 9));
+    assert_eq!(ast.span(stmts(&ast)[0]), js_parser::Span::new(0, 9));
     let f = ast.function(FunctionId(0));
-    assert_eq!(f.span, parser::Span::new(0, 10));
+    assert_eq!(f.span, js_parser::Span::new(0, 10));
 }
 
 // -- try/catch/throw ---------------------------------------------------------------
@@ -850,7 +850,7 @@ fn getters_setters_methods() {
     let ObjectProperty { kind, value, .. } = *ast.node(items[0]) else {
         panic!()
     };
-    assert_eq!(kind, parser::PropKind::Get);
+    assert_eq!(kind, js_parser::PropKind::Get);
     let FunctionExpr { function } = *ast.node(value) else {
         panic!()
     };
@@ -859,7 +859,7 @@ fn getters_setters_methods() {
     let ObjectProperty { kind, value, .. } = *ast.node(items[1]) else {
         panic!()
     };
-    assert_eq!(kind, parser::PropKind::Set);
+    assert_eq!(kind, js_parser::PropKind::Set);
     let FunctionExpr { function } = *ast.node(value) else {
         panic!()
     };
@@ -868,7 +868,7 @@ fn getters_setters_methods() {
     let ObjectProperty { kind, .. } = *ast.node(items[2]) else {
         panic!()
     };
-    assert_eq!(kind, parser::PropKind::Method);
+    assert_eq!(kind, js_parser::PropKind::Method);
 
     // accessor arity is an early error
     parse_err("({ get x(a) {} });");
@@ -885,7 +885,7 @@ fn getters_setters_methods() {
     let ObjectProperty { kind, .. } = *ast.node(ast.list_items(props)[0]) else {
         panic!()
     };
-    assert_eq!(kind, parser::PropKind::Method); // method NAMED get
+    assert_eq!(kind, js_parser::PropKind::Method); // method NAMED get
 }
 
 #[test]
@@ -899,12 +899,12 @@ fn computed_property_keys() {
         panic!()
     };
     assert!(computed);
-    assert_eq!(kind, parser::PropKind::Init);
+    assert_eq!(kind, js_parser::PropKind::Init);
     let ObjectProperty { computed, kind, .. } = *ast.node(items[1]) else {
         panic!()
     };
     assert!(computed);
-    assert_eq!(kind, parser::PropKind::Method);
+    assert_eq!(kind, js_parser::PropKind::Method);
     // shorthand with computed key is an error
     parse_err("({ [k] });");
 }
@@ -922,14 +922,14 @@ fn class_declaration() {
     assert!(c.superclass.is_some());
     assert_eq!(c.members.len(), 1);
     assert!(c.members[0].is_constructor);
-    assert_eq!(c.members[0].kind, parser::PropKind::Method);
+    assert_eq!(c.members[0].kind, js_parser::PropKind::Method);
     let FunctionExpr { function } = *ast.node(c.members[0].value) else {
         panic!()
     };
     assert_eq!(ast.function(function).params.len(), 2);
     assert_eq!(
         ast.function(function).kind,
-        parser::FunctionKind::DerivedClassConstructor
+        js_parser::FunctionKind::DerivedClassConstructor
     );
     // class bodies are always strict
     assert!(ast.function(function).strict);
@@ -953,14 +953,14 @@ fn class_expression_and_members() {
     assert!(c.superclass.is_none());
     assert_eq!(c.members.len(), 4);
     assert!(c.members[0].is_static && !c.members[0].computed);
-    assert_eq!(c.members[1].kind, parser::PropKind::Get);
-    assert_eq!(c.members[2].kind, parser::PropKind::Set);
+    assert_eq!(c.members[1].kind, js_parser::PropKind::Get);
+    assert_eq!(c.members[2].kind, js_parser::PropKind::Set);
     assert!(c.members[3].computed);
     let expected = [
-        parser::FunctionKind::Method,
-        parser::FunctionKind::Getter,
-        parser::FunctionKind::Setter,
-        parser::FunctionKind::Method,
+        js_parser::FunctionKind::Method,
+        js_parser::FunctionKind::Getter,
+        js_parser::FunctionKind::Setter,
+        js_parser::FunctionKind::Method,
     ];
     for (member, expected) in c.members.iter().zip(expected) {
         let FunctionExpr { function } = *ast.node(member.value) else {

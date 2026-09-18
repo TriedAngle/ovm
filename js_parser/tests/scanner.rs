@@ -1,5 +1,5 @@
-use parser::TokenKind::*;
-use parser::{ParseError, Scanner, Span, Token, TokenKind, Utf8SliceStream};
+use js_parser::TokenKind::*;
+use js_parser::{ParseError, Scanner, Span, Token, TokenKind, Utf8SliceStream};
 
 fn scan_all(src: &str) -> Vec<Token> {
     let mut sc = Scanner::new(Utf8SliceStream::new(src));
@@ -175,7 +175,7 @@ b' 'é'"#,
             break;
         }
         assert_eq!(t.kind, String);
-        let sym = parser::Symbol(t.value.symbol().unwrap());
+        let sym = js_parser::Symbol(t.value.symbol().unwrap());
         texts.push(sc.symbols().get(sym).to_vec());
     }
     assert_eq!(
@@ -212,7 +212,7 @@ fn wtf8_string_contents() {
         }
         texts.push(
             sc.symbols()
-                .get(parser::Symbol(t.value.symbol().unwrap()))
+                .get(js_parser::Symbol(t.value.symbol().unwrap()))
                 .to_vec(),
         );
     }
@@ -231,7 +231,7 @@ fn wtf8_string_contents() {
     let t = sc.next_token().expect("scan error");
     assert_eq!(
         sc.symbols()
-            .get(parser::Symbol(t.value.symbol().unwrap()))
+            .get(js_parser::Symbol(t.value.symbol().unwrap()))
             .to_vec(),
         vec![0xC3, 0xA9] // U+00E9
     );
@@ -345,7 +345,7 @@ fn bigint_radix() {
         assert_eq!(t.kind, BigInt, "expected bigint");
         texts.push(
             sc.symbols()
-                .get(parser::Symbol(t.value.symbol().unwrap()))
+                .get(js_parser::Symbol(t.value.symbol().unwrap()))
                 .to_vec(),
         );
     }

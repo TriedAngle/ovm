@@ -1,14 +1,17 @@
 [workspace]
 resolver = "3"
 members = [
-    "base_compiler",
     "bytecode",
     "collectors/dummy_heap",
     "collectors/mark_sweep",
     "heap_api",
     "heap_tests",
     "heap_utils",
-    "parser",
+    "ir",
+    "js_compiler",
+    "js_parser",
+    "kette_compiler",
+    "kette_parser",
     "vm",
 ]
 

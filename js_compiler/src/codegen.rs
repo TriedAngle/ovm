@@ -12,13 +12,16 @@
 //! declaration's owning function.
 
 use bytecode::{Opcode, PropertyFlags, emit};
-use parser::{
+use js_parser::{
     Ast, ClassId, FunctionId, Node, NodeId, PropKind, Resolution, Resolved, ScopeId, ScopeKind,
     Symbol, TokenKind, VarKind,
 };
 
+use crate::CompileError;
 use crate::label::Label;
-use crate::{CompileError, CompiledFunction, CompiledScript, Constant, HandlerEntry};
+use ir::{
+    CallableKind, Constant, FunctionBuilder, FunctionId as IrFunctionId, HandlerEntry, Program,
+};
 
 /// Emit a forced-wide relative jump to `label`; the offset is patched once
 /// the label is bound.
@@ -127,8 +130,26 @@ fn single_return_value(ast: &Ast, body: NodeId) -> Option<NodeId> {
     }
 }
 
-pub fn generate(ast: &Ast, resolved: &Resolved) -> Result<CompiledScript, CompileError> {
-    let mut functions = Vec::with_capacity(ast.function_count());
+/// Map the parser's JavaScript callable taxonomy onto the shared IR kind.
+/// The IR kind is JS-centric, so the mapping is one-to-one.
+fn callable_kind(kind: js_parser::FunctionKind) -> CallableKind {
+    match kind {
+        js_parser::FunctionKind::Normal => CallableKind::Normal,
+        js_parser::FunctionKind::Generator => CallableKind::Generator,
+        js_parser::FunctionKind::Arrow => CallableKind::Arrow,
+        js_parser::FunctionKind::Method => CallableKind::Method,
+        js_parser::FunctionKind::Getter => CallableKind::Getter,
+        js_parser::FunctionKind::Setter => CallableKind::Setter,
+        js_parser::FunctionKind::BaseClassConstructor => CallableKind::BaseClassConstructor,
+        js_parser::FunctionKind::DerivedClassConstructor => CallableKind::DerivedClassConstructor,
+        js_parser::FunctionKind::DefaultDerivedConstructor => {
+            CallableKind::DefaultDerivedConstructor
+        }
+    }
+}
+
+pub fn generate(ast: &Ast, resolved: &Resolved) -> Result<Program, CompileError> {
+    let mut program = Program::with_capacity(ast.function_count());
     for fid in 0..ast.function_count() {
         let fid = FunctionId(fid as u32);
         let mut generator = FunctionGen::new(ast, resolved, fid);
@@ -139,9 +160,9 @@ pub fn generate(ast: &Ast, resolved: &Resolved) -> Result<CompiledScript, Compil
             fid,
             ast.function(fid).kind
         );
-        functions.push(generator.finish());
+        program.add_function(generator.finish());
     }
-    Ok(CompiledScript { functions })
+    Ok(program)
 }
 
 impl<'a> FunctionGen<'a> {
@@ -163,15 +184,15 @@ impl<'a> FunctionGen<'a> {
         }
     }
 
-    fn finish(self) -> CompiledFunction {
+    fn finish(self) -> FunctionBuilder {
         let info = self.ast.function(self.fid);
-        CompiledFunction {
+        FunctionBuilder {
             bytecode: self.code,
             constants: self.constants,
             name: info.name.map(|name| self.ast.symbol(name).to_vec()),
-            formal_parameter_count: info.params.len() as u32,
-            formal_length: info.formal_length,
-            kind: info.kind,
+            arity: info.params.len() as u32,
+            length: info.formal_length,
+            kind: callable_kind(info.kind),
             strict: info.strict,
             register_count: self.reg_base + self.max_temps,
             handlers: self.handlers,
@@ -604,7 +625,7 @@ impl<'a> FunctionGen<'a> {
             Node::ObjectLiteral { props } => self.emit_object_literal(node, props),
             Node::Spread { .. } => self.err(node, "spread"),
             Node::FunctionExpr { function } => {
-                let idx = self.add_constant(Constant::Callable(function));
+                let idx = self.add_constant(Constant::Callable(IrFunctionId(function.0)));
                 emit(&mut self.code, Opcode::CreateClosure, &[idx]);
                 Ok(())
             }
@@ -1788,7 +1809,7 @@ impl<'a> FunctionGen<'a> {
         &mut self,
         _node: NodeId,
         callee: NodeId,
-        args: parser::NodeList,
+        args: js_parser::NodeList,
     ) -> Result<(), CompileError> {
         // Method calls: the receiver is the first register of the argument
         // list, so the argument registers must immediately follow it. The
@@ -1936,7 +1957,7 @@ impl<'a> FunctionGen<'a> {
         &mut self,
         _node: NodeId,
         callee: NodeId,
-        args: Option<parser::NodeList>,
+        args: Option<js_parser::NodeList>,
     ) -> Result<(), CompileError> {
         let items = args
             .map(|a| self.ast.list_items(a).to_vec())
@@ -2076,7 +2097,7 @@ impl<'a> FunctionGen<'a> {
         });
 
         // constructor closure
-        let ctor_idx = self.add_constant(Constant::Callable(info.ctor));
+        let ctor_idx = self.add_constant(Constant::Callable(IrFunctionId(info.ctor.0)));
         emit(&mut self.code, Opcode::CreateClosure, &[ctor_idx]);
         let ctor = self.push_value();
 
@@ -2153,7 +2174,7 @@ impl<'a> FunctionGen<'a> {
                 } else {
                     None
                 };
-                let fn_idx = self.add_constant(Constant::Callable(function));
+                let fn_idx = self.add_constant(Constant::Callable(IrFunctionId(function.0)));
                 emit(&mut self.code, Opcode::CreateClosure, &[fn_idx]);
                 if m.is_static {
                     let closure = self.push_value();
@@ -2226,7 +2247,7 @@ impl<'a> FunctionGen<'a> {
             } else {
                 None
             };
-            let fn_idx = self.add_constant(Constant::Callable(function));
+            let fn_idx = self.add_constant(Constant::Callable(IrFunctionId(function.0)));
             emit(&mut self.code, Opcode::CreateClosure, &[fn_idx]);
             // computed keys name the member after their ToPropertyKey value
             if let Some(k) = key {
@@ -2444,7 +2465,7 @@ impl<'a> FunctionGen<'a> {
     fn emit_super_call(
         &mut self,
         node: NodeId,
-        args: parser::NodeList,
+        args: js_parser::NodeList,
     ) -> Result<(), CompileError> {
         let items = self.ast.list_items(args).to_vec();
         let argc = items.len();
@@ -2598,7 +2619,7 @@ impl<'a> FunctionGen<'a> {
     fn emit_array_literal(
         &mut self,
         node: NodeId,
-        elements: parser::NodeList,
+        elements: js_parser::NodeList,
     ) -> Result<(), CompileError> {
         emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
         let arr = self.push_value();
@@ -2627,7 +2648,7 @@ impl<'a> FunctionGen<'a> {
     fn emit_object_literal(
         &mut self,
         node: NodeId,
-        props: parser::NodeList,
+        props: js_parser::NodeList,
     ) -> Result<(), CompileError> {
         // methods using `super` capture a per-literal home-object context
         // (the literal itself), mirroring class scopes
@@ -2889,7 +2910,7 @@ impl<'a> FunctionGen<'a> {
                 cases,
             } => self.emit_switch(node, disc, cases, labels.clone()),
             Node::FunctionDecl { function } => {
-                let idx = self.add_constant(Constant::Callable(function));
+                let idx = self.add_constant(Constant::Callable(IrFunctionId(function.0)));
                 emit(&mut self.code, Opcode::CreateClosure, &[idx]);
                 let name = self
                     .ast
@@ -2932,7 +2953,7 @@ impl<'a> FunctionGen<'a> {
     fn emit_var_decl(
         &mut self,
         kind: VarKind,
-        decls: parser::NodeList,
+        decls: js_parser::NodeList,
     ) -> Result<(), CompileError> {
         for &d in self.ast.list_items(decls) {
             let Node::VarDeclarator { target, init } = *self.ast.node(d) else {
@@ -3393,7 +3414,7 @@ impl<'a> FunctionGen<'a> {
         &mut self,
         node: NodeId,
         disc: NodeId,
-        cases: parser::NodeList,
+        cases: js_parser::NodeList,
         labels: Vec<Symbol>,
     ) -> Result<(), CompileError> {
         let scope = self.ast.node_scope(node);
@@ -3604,13 +3625,13 @@ impl<'a> FunctionGen<'a> {
             .is_some_and(|c| self.class_has_instance_fields(c))
     }
 
-    fn ctor_class(&self, fid: FunctionId) -> Option<parser::ClassId> {
+    fn ctor_class(&self, fid: FunctionId) -> Option<js_parser::ClassId> {
         (0..self.ast.class_count() as u32)
-            .map(parser::ClassId)
+            .map(js_parser::ClassId)
             .find(|&c| self.ast.class(c).ctor == fid)
     }
 
-    fn class_has_instance_fields(&self, class: parser::ClassId) -> bool {
+    fn class_has_instance_fields(&self, class: js_parser::ClassId) -> bool {
         self.ast
             .class(class)
             .members
@@ -3693,7 +3714,7 @@ impl<'a> FunctionGen<'a> {
         // initialize each binding in order (TDZ until its turn, ES 10.2.11
         // FunctionDeclarationInstantiation); simple lists only copy
         // context-allocated (captured) parameters into their slots
-        let params: Vec<parser::Param> = self.ast.function(self.fid).params.clone();
+        let params: Vec<js_parser::Param> = self.ast.function(self.fid).params.clone();
         let non_simple = params.iter().any(|p| p.is_non_simple(self.ast));
         if let Some(fscope_id) = self.ast.node_scope(body) {
             let fscope = self.ast.scope(fscope_id);
@@ -3763,7 +3784,7 @@ impl<'a> FunctionGen<'a> {
                 // to contexts)
                 let mut param_index = 0u32;
                 for decl in &fscope.decls {
-                    if decl.kind != parser::DeclKind::Param {
+                    if decl.kind != js_parser::DeclKind::Param {
                         continue;
                     }
                     let reg = -(param_index as i32 + 2);
@@ -3797,7 +3818,7 @@ impl<'a> FunctionGen<'a> {
 
         // the synthesized default derived constructor forwards every
         // argument to super() and returns the bound this (ES 15.7.13)
-        if info.kind == parser::FunctionKind::DefaultDerivedConstructor {
+        if info.kind == js_parser::FunctionKind::DefaultDerivedConstructor {
             emit(
                 &mut self.code,
                 Opcode::CallRuntime,
@@ -3828,7 +3849,7 @@ impl<'a> FunctionGen<'a> {
 
         // base class constructors run their instance field initializers
         // right after the receiver exists (ES 7.3.33, before the body)
-        if info.kind == parser::FunctionKind::BaseClassConstructor
+        if info.kind == js_parser::FunctionKind::BaseClassConstructor
             && self.ctor_has_instance_fields()
         {
             self.with_temps(|g| {
