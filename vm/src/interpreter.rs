@@ -1,4 +1,3 @@
-use crate::builtins::intrinsics;
 use crate::proxy::Proxy;
 use bytecode::{Opcode, Operands, decode, jump_target};
 
@@ -577,40 +576,26 @@ fn step<'a>(
         Opcode::LoadKeyedProperty => {
             // the key coercion allocates (to_property_key interns): the
             // receiver must stay rooted across it
-            state.handle_scope(|scope| {
+            state.handle_scope(|scope| -> Step<'_> {
                 let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                 let raw_key = scope.handle(acc.read(heap));
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key,))
+                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key))
                 else {
                     return Step::PendingThrow;
                 };
                 // root the interned key for the acc store and later lookups
                 let key = scope.handle(key);
                 acc.store(key.as_tagged(heap));
+
                 // string primitives expose their code units as index
-                // properties (ES 5.4.3.1): `"ab"[1]` is "b". The one-unit
-                // string is allocated fresh — string comparison is by
-                // content, so identity is unobservable. Out-of-range and
-                // non-string receivers fall through to the ordinary path.
-                let string_index = match classify_key(heap, key.as_tagged(heap).erase()) {
-                    Ok(Key::Element(i))
-                        if receiver.as_tagged(heap).get_as::<DenseString>().is_some() =>
-                    {
-                        Some(i)
-                    }
-                    _ => None,
-                };
-                if let Some(i) = string_index {
-                    // Safety: fresh rooted-slot word.
-                    let receiver_word = receiver.as_tagged(heap).raw();
-                    let unit = state.handle_scope(|scope| {
-                        intrinsics::string_char_at(heap, &scope, receiver_word, i)
-                    });
-                    if let Some(unit) = unit {
-                        *acc = unit;
-                        return Step::Next;
-                    }
+                // properties (ES 5.4.3.1): `"ab"[1]` is "b". Out-of-range
+                // keys and non-string receivers fall through to the
+                // ordinary path.
+                if let Some(unit) = DenseString::index_element(heap, &scope, receiver, key) {
+                    acc.store(unit);
+                    return Step::Next;
                 }
+
                 // proxies run their `get` trap outside any non-allocating region
                 if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
                     return match step_try!(Proxy::get(
@@ -628,41 +613,24 @@ fn step<'a>(
                         }
                     };
                 }
-                let outcome = step_try!({
-                    let receiver = receiver.as_tagged(heap);
-                    classify_key(heap, acc.read(heap)).and_then(|key| {
-                        match key {
-                            Key::Element(i) => {
-                                match receiver
-                                    .as_heap_object()
-                                    .and_then(|obj| obj.as_ref().element_value(heap, i))
-                                {
-                                    Some(v) => Ok(LoadOutcome::Value(v)),
-                                    // past the end, a hole, or a non-array
-                                    // receiver: ordinary property lookup
-                                    None => load_outcome(
-                                        heap,
-                                        receiver,
-                                        Tagged::from(Smi::new(i as i64)),
-                                    ),
-                                }
-                            }
-                            Key::Name(name) => load_outcome(heap, receiver, name),
-                        }
-                    })
-                });
+
+                let outcome = step_try!(Lookup::load_outcome_keyed(
+                    heap,
+                    receiver.as_tagged(heap),
+                    key.as_tagged(heap)
+                ));
                 match outcome {
                     LoadOutcome::Value(v) => acc.store(v),
                     LoadOutcome::Getter(getter) => {
-                        let args = scope.stage(&[receiver.as_tagged(heap).erase()]);
                         let getter = scope.handle(getter);
+                        let args = scope.stage(&[receiver.as_tagged(heap).erase()]);
                         match step_try!(call_value(
                             vm, state, heap, stack, cache, meta, pc, getter, args
                         )) {
                             Called::Frame => {}
+                            // non-callable getter: the load yields undefined
                             Called::NotCallable => {
-                                // Safety: old-gen singleton word.
-                                acc.store(heap.known().undefined.as_tagged(heap));
+                                acc.store(heap.known().undefined.as_tagged(heap))
                             }
                             Called::Immediate(v) => acc.store(v),
                             Called::Threw => return Step::PendingThrow,
