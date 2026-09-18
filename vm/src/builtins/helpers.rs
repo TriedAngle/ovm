@@ -118,12 +118,16 @@ pub fn run_prelude(
         materialize_closure_vm(vm, heap, state, scope, &compiled, empty)?
     };
     let (vm, heap, state) = thread.split();
-    let result = RuntimeContext::new(vm, heap, state).call(
-        // Safety: fresh rooted-slot word, consumed by the call.
-        unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
+    let exception = heap.known().exception.as_tagged(heap).raw();
+    let result = RuntimeContext::call(
+        vm,
+        &mut *heap,
+        state,
+        closure.erase(),
         HandleSlice::EMPTY,
+        None,
     )?;
-    if result == unsafe { heap.known().exception.read_unchecked() } {
+    if result.raw() == exception {
         if let Some(ex) = state.take_pending_exception() {
             eprintln!("{name} prelude threw: {ex:?}")
         }
@@ -258,7 +262,10 @@ pub fn define_non_enumerable(
 }
 
 /// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver.
-pub fn wrapper_value(heap: &Heap, receiver: Tagged<'_, Value>) -> Result<Value, VmError> {
+pub fn wrapper_value<'a>(
+    heap: &'a Heap,
+    receiver: Tagged<'_, Value>,
+) -> Result<Tagged<'a, Value>, VmError> {
     let Some(obj) = receiver.as_heap_object() else {
         return Err(VmError::Type);
     };
@@ -266,5 +273,5 @@ pub fn wrapper_value(heap: &Heap, receiver: Tagged<'_, Value>) -> Result<Value, 
     if !map.kind().contains(MapKind::PRIMITIVE_WRAPPER) {
         return Err(VmError::Type);
     }
-    Ok(obj.as_ref().slots.heap_ref(heap).at(heap, 0).raw())
+    Ok(obj.as_ref().slots.heap_ref(heap).at(heap, 0))
 }

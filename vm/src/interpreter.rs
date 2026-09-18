@@ -69,15 +69,15 @@ pub fn execute<'a>(
     })
 }
 
-fn start<'a>(
-    vm: &VM,
-    heap: &'a mut Heap,
-    state: &ContextState,
+fn start<'b>(
+    vm: &'b VM,
+    heap: &'b mut Heap,
+    state: &'b ContextState,
     callable: Handle<'_, Object>,
     args: HandleSlice<'_>,
-    new_target: Option<Handle<'_, Value>>,
+    new_target: Option<Handle<'b, Value>>,
     base_depth: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Result<Tagged<'b, Value>, VmError> {
     if Proxy::is_proxy(heap, callable.as_tagged(heap).erase()) {
         return state.handle_scope(|scope| {
             let result = match new_target {
@@ -102,11 +102,10 @@ fn start<'a>(
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack.stage_args(args)?;
-            let mut nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
-            let result = f(&mut nctx, fargs);
+            let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
+            let result = f(nctx, fargs);
             state.stack.set_top(saved_top);
-
-            result.map(|v| unsafe { Tagged::from_value_unchecked(v) })
+            result
         }
         Some(CallTarget::Bytecode(target, register_count, kind)) => {
             if new_target.is_none() && kind.is_class_constructor() {
@@ -829,13 +828,14 @@ fn step<'a>(
                 None => Step::Error(VmError::Type),
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
-                    let mut nctx = RuntimeContext::new(vm, heap, state);
-                    let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
+                    let exception = heap.known().exception.as_tagged(heap).raw();
+                    let nctx = RuntimeContext::new(vm, heap, state);
+                    let result = f(nctx, stack.args(&meta, ops.reg_list(1), count));
                     match result {
                         // Safety: old-gen singleton word.
-                        Ok(v) if v == heap.known().exception.as_tagged(heap) => Step::PendingThrow,
+                        Ok(v) if v.raw() == exception => Step::PendingThrow,
                         Ok(v) => {
-                            *acc = v;
+                            acc.store(v);
                             Step::Next
                         }
                         Err(err) => Step::Error(err),
@@ -882,13 +882,14 @@ fn step<'a>(
             // indices 0..RuntimeFn::COUNT
             let f = vm.runtime(RuntimeIndex(ops.idx(0)));
             let count = ops.reg_count(2);
-            let mut nctx = RuntimeContext::new(vm, heap, state);
-            let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
+            let exception = heap.known().exception.as_tagged(heap).raw();
+            let nctx = RuntimeContext::new(vm, heap, state);
+            let result = f(nctx, stack.args(&meta, ops.reg_list(1), count));
             match result {
                 // Safety: old-gen singleton word.
-                Ok(v) if v == heap.known().exception.as_tagged(heap) => Step::PendingThrow,
+                Ok(v) if v.raw() == exception => Step::PendingThrow,
                 Ok(v) => {
-                    *acc = v;
+                    acc.store(v);
                     Step::Next
                 }
                 Err(err) => Step::Error(err),
@@ -952,8 +953,13 @@ fn step<'a>(
             let staged = scope.stage(&args);
 
             let callee = callee.erase();
-            let result = scope.handle(step_try!(RuntimeContext::call_construct_rooted(
-                vm, heap, state, callee, callee, staged
+            let result = scope.handle(step_try!(RuntimeContext::call(
+                vm,
+                heap,
+                state,
+                callee,
+                staged,
+                Some(callee)
             )));
             if result.as_tagged(heap) == heap.known().exception.as_tagged(heap) {
                 return Step::PendingThrow;
@@ -1048,7 +1054,7 @@ fn step<'a>(
                     } else {
                         r
                     };
-                    acc.store(heap.new_number(&scope, r));
+                    acc.store(heap.new_number(r));
                 }
                 Step::Next
             })
@@ -1068,7 +1074,7 @@ fn step<'a>(
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
-            *acc = v;
+            acc.store(v);
             Step::Next
         }),
         Opcode::Mul => state.handle_scope(|scope| -> Step<'_> {
@@ -1086,7 +1092,7 @@ fn step<'a>(
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
-            *acc = v;
+            acc.store(v);
             Step::Next
         }),
         Opcode::Div => state.handle_scope(|scope| -> Step<'_> {
@@ -1107,7 +1113,7 @@ fn step<'a>(
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
-            *acc = v;
+            acc.store(v);
             Step::Next
         }),
         Opcode::Mod => state.handle_scope(|scope| -> Step<'_> {
@@ -1125,7 +1131,7 @@ fn step<'a>(
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
-            *acc = v;
+            acc.store(v);
             Step::Next
         }),
         Opcode::Exp => state.handle_scope(|scope| -> Step<'_> {
@@ -1137,7 +1143,7 @@ fn step<'a>(
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
-            *acc = v;
+            acc.store(v);
             Step::Next
         }),
         Opcode::BitwiseOr => {
@@ -1254,13 +1260,15 @@ fn step<'a>(
         Opcode::Negate => {
             let acc_word = *acc;
             if let Some(v) = acc_word.to_i64() {
-                *acc = if v == 0 {
-                    state.handle_scope(|scope| heap.new_number(&scope, -0.0).raw())
+                if v == 0 {
+                    // preserve -0.0: `-0` must not fold into Smi 0
+                    acc.store(heap.new_number(-0.0));
                 } else if v == Smi::MIN {
-                    state.handle_scope(|scope| heap.new_number(&scope, -(v as f64)).raw())
+                    // `-Smi::MIN` overflows i64
+                    acc.store(heap.new_number(-(v as f64)));
                 } else {
-                    Smi::new(-v).encode()
-                };
+                    acc.store(Smi::new(-v).encode());
+                }
             } else {
                 let n = state.handle_scope(|scope| {
                     let acc = scope.handle(acc.read(heap));
@@ -1270,28 +1278,21 @@ fn step<'a>(
                 let Some(n) = n else {
                     return Step::PendingThrow;
                 };
-                *acc = state.handle_scope(|scope| {
-                    let r = -n;
-                    // preserve -0.0: `-0` must not fold into Smi 0
-                    if r == 0.0 && r.is_sign_negative() {
-                        heap.new_number(&scope, -0.0).raw()
-                    } else {
-                        heap.new_number(&scope, r).raw()
-                    }
-                });
+                // new_number boxes -0.0 itself
+                acc.store(heap.new_number(-n));
             }
             Step::Next
         }
-        Opcode::InstanceOf => {
-            let acc_word = *acc;
-            let other = stack.reg(heap, &meta, ops.reg(0)).raw();
-            let r = step_try!(Object::instance_of(vm, heap, state, acc_word, other));
+        Opcode::InstanceOf => state.handle_scope(|scope| -> Step<'_> {
+            let object = scope.handle(acc.read(heap));
+            let callable = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+            let r = step_try!(Object::instance_of(vm, heap, state, object, callable));
             let Some(r) = r else {
                 return Step::PendingThrow;
             };
             acc.store(Convert::boolean(heap, r));
             Step::Next
-        }
+        }),
         Opcode::EqualStrict => {
             let other = stack.reg(heap, &meta, ops.reg(0));
             let r = Compare::strict_equal(heap, acc.read(heap), other);

@@ -300,13 +300,13 @@ impl Thread {
     }
 
     pub fn run_runtime(&mut self, f: RuntimeCall, args: &[Value]) -> Result<Value, VmError> {
-        let mut nctx = RuntimeContext::new(&self.vm, &mut self.heap, &self.state);
+        let nctx = RuntimeContext::new(&self.vm, &mut self.heap, &self.state);
         // stage a rooted copy: the runtime may keep reading it across its
         // own allocations
         // Safety: caller-owned words staged before any allocation.
         self.state.handle_scope(|scope| {
             f(
-                &mut nctx,
+                nctx,
                 scope.stage(
                     &args
                         .iter()
@@ -314,6 +314,7 @@ impl Thread {
                         .collect::<Vec<_>>(),
                 ),
             )
+            .map(|v| v.raw())
         })
     }
 

@@ -522,9 +522,9 @@ impl Lookup<'_> {
     /// receiver — the proxy forward shape: lookup on the target,
     /// `this` = the proxy.
     pub fn get_property_on<'a>(
-        vm: &VM,
+        vm: &'a VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &'a ContextState,
         holder: Handle<'_, Value>,
         receiver: Handle<'_, Value>,
         name: Handle<'_, Value>,
@@ -533,36 +533,37 @@ impl Lookup<'_> {
         if cond_3 {
             return Proxy::get(vm, heap, state, holder, receiver, name);
         }
-        state.handle_scope(|scope| -> Result<Coercion<'a>, VmError> {
-            let exception = heap.known().exception.as_tagged(heap).raw();
-            let loaded = {
-                let heap_ref: &Heap = heap;
-                load_outcome_on(
-                    heap_ref,
-                    holder.as_tagged(heap_ref),
-                    name.as_tagged(heap_ref).as_name(),
-                )?
-            };
-            match loaded {
-                // Safety: fresh load outcome, no GC since.
-                LoadOutcome::Value(v) => Ok(Coercion::Value(unsafe {
-                    Tagged::from_value_unchecked(v.raw())
-                })),
-                LoadOutcome::Getter(getter) => {
-                    let getter = scope.handle(getter);
-                    let args = scope.stage(&[receiver.as_tagged(&*heap).erase()]);
-                    let result = RuntimeContext::new(vm, heap, state).call_rooted(getter, args)?;
-                    if result == exception {
-                        Ok(Coercion::Threw)
-                    } else {
-                        // Safety: the call just returned; no GC since.
-                        Ok(Coercion::Value(unsafe {
-                            Tagged::from_value_unchecked(result)
-                        }))
+        RuntimeContext::new(vm, heap, state).handle_scope(
+            |vm, heap, state, scope| -> Result<Coercion<'a>, VmError> {
+                let exception = heap.known().exception.as_tagged(heap).raw();
+                let loaded = {
+                    let heap_ref: &Heap = heap;
+                    load_outcome_on(
+                        heap_ref,
+                        holder.as_tagged(heap_ref),
+                        name.as_tagged(heap_ref).as_name(),
+                    )?
+                };
+                match loaded {
+                    LoadOutcome::Value(v) => {
+                        let v = scope.handle(v);
+                        Ok(Coercion::Value(v.as_tagged(heap)))
+                    }
+                    LoadOutcome::Getter(getter) => {
+                        let getter = scope.handle(getter);
+                        let args = scope.stage(&[receiver.as_tagged(&*heap).erase()]);
+                        let result = scope.handle(RuntimeContext::call(
+                            vm, &mut *heap, state, getter, args, None,
+                        )?);
+                        if result.as_tagged(heap).raw() == exception {
+                            Ok(Coercion::Threw)
+                        } else {
+                            Ok(Coercion::Value(result.as_tagged(heap)))
+                        }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 
     pub fn to_property_descriptor<'s>(

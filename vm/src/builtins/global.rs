@@ -3,16 +3,18 @@
 use crate::Object;
 use crate::RuntimeContext;
 use crate::materialize::materialize_closure_vm;
-use crate::{Context, Convert, DenseString, HandleSlice, Tagged, Value, VmError};
+use crate::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
 use base_compiler::compile_eval;
 
-pub fn eval_runtime(
-    nctx: &mut RuntimeContext<'_>,
+pub fn eval_runtime<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         // root the caller context before the allocating ToString below
-        let (_vm, heap, state) = nctx.split();
         let context = scope.handle(state.current_context(heap).ok_or(VmError::Type)?);
         let src = Ok(args
             .get(1)
@@ -33,37 +35,37 @@ pub fn eval_runtime(
         if let Err(e) = p.parse_script() {
             // TODO: a SyntaxError class; approximate with TypeError for now
             let _ = e;
-            nctx.set_pending_exception(VmError::Type);
-            // Safety: fresh root-slot word read for the immediate return.
-            return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+            let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
+            state.set_pending_exception(ex);
+            return Ok(heap.known().exception.as_tagged(heap).erase());
         }
         let ast = p.into_ast();
         let compiled = match compile_eval(&ast) {
             Ok(c) => c,
             Err(_) => {
-                nctx.set_pending_exception(VmError::Type);
-                // Safety: fresh root-slot word read for the immediate return.
-                return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+                let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
+                state.set_pending_exception(ex);
+                return Ok(heap.known().exception.as_tagged(heap).erase());
             }
         };
 
-        let (vm, heap, state) = nctx.split();
         let context = scope
             .cast::<Context>(context.as_tagged(heap))
             .ok_or(VmError::Type)?;
         let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
-        nctx.call(
-            // Safety: fresh rooted-slot word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
-            HandleSlice::EMPTY,
-        )
+        RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
     })
 }
 
 /// `isNaN(x)`: ToNumber(x) is NaN.
-pub fn is_nan(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-    let n = nctx.handle_scope(|nctx, scope| {
-        let (vm, heap, state) = nctx.split();
+pub fn is_nan<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let n = state.handle_scope(|scope| {
         let arg = {
             let v = args
                 .get(1)
@@ -74,12 +76,8 @@ pub fn is_nan(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Va
         Object::to_numeric(vm, heap, state, arg)
     })?;
     let Some(n) = n else {
-        // Safety: fresh root-slot word read for the immediate return.
-        return Ok(unsafe { nctx.heap().known().exception.read_unchecked() });
+        return Ok(heap.known().exception.as_tagged(heap).erase());
     };
 
-    Ok({
-        let heap = &*nctx.heap();
-        Convert::boolean(heap, n.is_nan()).raw()
-    })
+    Ok(Convert::boolean(heap, n.is_nan()))
 }

@@ -253,22 +253,21 @@ fn load_smi_signed_immediates() {
 
 #[test]
 fn call_runtime_passes_receiver_and_args() {
-    fn add(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
-        let (a, b) = {
-            let heap = &*nctx.heap();
-            match (
-                args.get(1).map(|h| h.as_tagged(heap)),
-                args.get(2).map(|h| h.as_tagged(heap)),
-            ) {
-                (Some(a), Some(b)) => (a.raw(), b.raw()),
-                _ => return Err(VmError::Arity),
-            }
+    fn add<'a>(
+        nctx: RuntimeContext<'a>,
+        args: HandleSlice<'_>,
+    ) -> Result<Tagged<'a, Value>, VmError> {
+        let RuntimeContext { heap, .. } = nctx;
+        let (a, b) = match (
+            args.get(1).map(|h| h.as_tagged(heap)),
+            args.get(2).map(|h| h.as_tagged(heap)),
+        ) {
+            (Some(a), Some(b)) => (a.raw(), b.raw()),
+            _ => return Err(VmError::Arity),
         };
-        let (a, b) = (
-            Smi::decode(a).ok_or(VmError::Type)?,
-            Smi::decode(b).ok_or(VmError::Type)?,
-        );
-        Ok(Smi::new(a.value() + b.value()).encode())
+        let a = Smi::decode(a).ok_or(VmError::Type)?;
+        let b = Smi::decode(b).ok_or(VmError::Type)?;
+        Ok(Tagged::from(Smi::new(a.value() + b.value())))
     }
 
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
@@ -1902,22 +1901,18 @@ fn runtime_function<'s>(
 }
 
 /// Build a bytecode function object from inside a runtime.
-fn bytecode_fn(
-    nctx: &mut RuntimeContext<'_>,
+fn bytecode_fn<'a>(
+    heap: &'a mut Heap,
     scope: &HandleScope<'_>,
     program: &[u8],
     constants: &[Value],
     register_count: usize,
-) -> Value {
-    let the_hole = nctx.heap().known().the_hole;
-    let empty_context = nctx.heap().known().empty_context;
-    let bytecode = nctx
-        .heap()
-        .allocate_handle::<FixedByteArray>(program, scope);
-    let constants = nctx
-        .heap()
-        .allocate_handle::<FixedArray>(stage_values(scope, constants), scope);
-    let info = nctx.heap().allocate_handle::<CallableInfoObject>(
+) -> Tagged<'a, Value> {
+    let the_hole = heap.known().the_hole;
+    let empty_context = heap.known().empty_context;
+    let bytecode = heap.allocate_handle::<FixedByteArray>(program, scope);
+    let constants = heap.allocate_handle::<FixedArray>(stage_values(scope, constants), scope);
+    let info = heap.allocate_handle::<CallableInfoObject>(
         CallableInfoInit {
             bytecode,
             constants,
@@ -1926,29 +1921,25 @@ fn bytecode_fn(
         },
         scope,
     );
-    let map = nctx.heap().known().function_map;
-    let values = {
-        let heap = &*nctx.heap();
-        stage_values(
-            scope,
-            &[word(heap, info), word(heap, empty_context.erase())],
-        )
-    };
-    nctx.heap()
-        .allocate_object(
-            scope,
-            ObjectSlotsInit {
-                map,
-                values,
-                elements: the_hole.erase(),
-                length: 0,
-            },
-        )
-        .raw()
+    let map = heap.known().function_map;
+    let values = stage_values(
+        scope,
+        &[word(&*heap, info), word(&*heap, empty_context.erase())],
+    );
+    heap.allocate_object(
+        scope,
+        ObjectSlotsInit {
+            map,
+            values,
+            elements: the_hole.erase(),
+            length: 0,
+        },
+    )
+    .erase()
 }
 
-fn forty_two(_: &mut RuntimeContext<'_>, _: HandleSlice<'_>) -> Result<Value, VmError> {
-    Ok(smi(42))
+fn forty_two<'a>(_: RuntimeContext<'a>, _: HandleSlice<'_>) -> Result<Tagged<'a, Value>, VmError> {
+    Ok(Tagged::from(Smi::new(42)))
 }
 
 #[test]
@@ -2005,16 +1996,19 @@ fn call_dispatches_to_runtime_function_object() {
 
 /// Runtime that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the runtime recovers.
-fn run_failing_inner(
-    nctx: &mut RuntimeContext<'_>,
+fn run_failing_inner<'a>(
+    nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    nctx.handle_scope(|nctx, scope| {
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
         // callee: Add on a non-smi accumulator -> TypeError throw
         let mut bad = Vec::new();
         emit(&mut bad, Opcode::Add, &[1]);
         emit(&mut bad, Opcode::Return, &[]);
-        let callee = bytecode_fn(nctx, &scope, &bad, &[], 2);
+        let callee = scope.handle(bytecode_fn(heap, &scope, &bad, &[], 2));
 
         // caller: calls callee, so one frame is suspended above the base
         // depth when the exception escapes the nested run
@@ -2023,23 +2017,23 @@ fn run_failing_inner(
         emit(&mut program, Opcode::Store, &[0]);
         emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
         emit(&mut program, Opcode::Return, &[]);
-        let caller = bytecode_fn(nctx, &scope, &program, &[callee], 1);
+        let caller = scope.handle(bytecode_fn(
+            heap,
+            &scope,
+            &program,
+            &[callee.as_tagged(heap).raw()],
+            1,
+        ));
 
-        let exception_word = {
-            let heap = &*nctx.heap();
-            heap.known().exception.as_tagged(heap).raw()
-        };
-        match nctx.call(
-            unsafe { Tagged::from_value_unchecked(caller) },
-            HandleSlice::EMPTY,
-        ) {
-            Ok(exc) if exc == exception_word => {
+        let exception_word = heap.known().exception.as_tagged(heap).raw();
+        match RuntimeContext::call(vm, &mut *heap, state, caller, HandleSlice::EMPTY, None) {
+            Ok(exc) if exc.raw() == exception_word => {
                 // the exception escapes the nested run as the sentinel with
                 // the pending exception set; the runtime recovers by
                 // clearing it
-                let ex = nctx.take_pending_exception().expect("pending exception");
+                let ex = state.take_pending_exception().expect("pending exception");
                 assert!(ex.is_strong_ptr());
-                Ok(smi(42))
+                Ok(Tagged::from(Smi::new(42)))
             }
             other => panic!("expected inner escape, got {other:?}"),
         }
@@ -4119,33 +4113,31 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
 
 /// Runtime constructor probe: reports `nctx.is_construct()` by storing 1/0
 /// into the global property "constructProbe".
-fn construct_probe(
-    nctx: &mut RuntimeContext<'_>,
+fn construct_probe<'a>(
+    nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let flag = Smi::new(if nctx.is_construct() { 1 } else { 0 }).into_tagged();
-    nctx.handle_scope(|nctx, scope| {
-        let name = nctx.intern(&scope, "constructProbe");
-        let global = {
-            let heap = &*nctx.heap();
-            heap.known().global_object.as_tagged(heap).raw()
-        };
-        let outcome = {
-            let heap = &*nctx.heap();
-            unsafe { anchored(heap, global) }.store_lookup(
-                heap,
-                &scope,
-                name.as_tagged(heap).into(),
-                flag,
-                StoreSemantics::WriteThrough,
-            )
-        }?;
+) -> Result<Tagged<'a, Value>, VmError> {
+    let is_construct = nctx.is_construct();
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let flag = Smi::new(if is_construct { 1 } else { 0 }).into_tagged();
+    state.handle_scope(|scope| -> Result<(), VmError> {
+        let name = vm.interner().intern_str(heap, &scope, "constructProbe");
+        let global = scope.handle(heap.known().global_object.as_tagged(heap).erase());
+        let outcome = global.store_lookup(
+            heap,
+            &scope,
+            name.as_tagged(heap).into(),
+            flag.erase(),
+            StoreSemantics::WriteThrough,
+        )?;
         match outcome {
             StoreOutcome::Done => {}
             StoreOutcome::Transition { receiver, name } => {
-                let value = scope.handle(flag);
+                let value = scope.handle(flag.erase());
                 Object::define_own_property(
-                    nctx.heap(),
+                    heap,
                     &scope,
                     receiver,
                     name,
@@ -4153,14 +4145,13 @@ fn construct_probe(
                 )?;
             }
             StoreOutcome::CallSetter { setter } => {
-                nctx.handle_scope(|nctx, scope| {
-                    nctx.call_rooted(setter, stage_values(&scope, &[global, flag.raw()]))
-                })?;
+                let args = scope.stage(&[global.as_tagged(heap).erase(), flag.erase()]);
+                RuntimeContext::call(vm, &mut *heap, state, setter, args, None)?;
             }
         }
         Ok(())
     })?;
-    Ok(flag.raw())
+    Ok(flag.erase())
 }
 
 #[test]

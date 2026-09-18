@@ -1,8 +1,9 @@
 //! ES 28.2: the Proxy constructor, Proxy.revocable, and the
 //! revoke-closure prelude.
 
-use super::object::plain_object;
 use crate::Lookup;
+use crate::Object;
+use crate::PropertyDescriptor;
 use crate::RuntimeContext;
 use crate::proxy::Proxy;
 use crate::runtime::Coercion;
@@ -11,28 +12,25 @@ use crate::{HandleSlice, Tagged, Value, VmError};
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
 /// observable (`typeof`, future `Call`/`Construct` dispatch).
-pub fn proxy_constructor(
-    nctx: &mut RuntimeContext<'_>,
+pub fn proxy_constructor<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
+) -> Result<Tagged<'a, Value>, VmError> {
     if !nctx.is_construct() {
         return Err(VmError::Message("constructor Proxy requires 'new'"));
     }
-    let (target, handler) = {
-        let heap = &*nctx.heap();
-        (
-            args.get(1)
-                .map(|h| h.as_tagged(heap))
-                .ok_or(VmError::Type)?
-                .raw(),
-            args.get(2)
-                .map(|h| h.as_tagged(heap))
-                .ok_or(VmError::Type)?
-                .raw(),
-        )
-    };
+    let RuntimeContext { heap, state, .. } = nctx;
+    let (target, handler) = (
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Type)?
+            .raw(),
+        args.get(2)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Type)?
+            .raw(),
+    );
     let ok = {
-        let heap = &*nctx.heap();
         Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
             && Proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     };
@@ -41,15 +39,14 @@ pub fn proxy_constructor(
             "cannot create proxy with a non-object target or handler",
         ));
     }
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         Ok(Proxy::allocate(
-            nctx.heap(),
+            heap,
             &scope,
             // Safety: fresh argument words, consumed by the allocation.
             unsafe { Tagged::<Value>::from_value_unchecked(target) },
             unsafe { Tagged::<Value>::from_value_unchecked(handler) },
-        )
-        .raw())
+        ))
     })
 }
 
@@ -57,25 +54,24 @@ pub fn proxy_constructor(
 /// `{ proxy, revoke }`; the revoke closure is the JS template installed
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
 /// hidden `__revokeProxy` runtime).
-pub fn proxy_revocable(
-    nctx: &mut RuntimeContext<'_>,
+pub fn proxy_revocable<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let (target, handler) = {
-        let heap = &*nctx.heap();
-        (
-            args.get(1)
-                .map(|h| h.as_tagged(heap))
-                .ok_or(VmError::Type)?
-                .raw(),
-            args.get(2)
-                .map(|h| h.as_tagged(heap))
-                .ok_or(VmError::Type)?
-                .raw(),
-        )
-    };
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let (target, handler) = (
+        args.get(1)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Type)?
+            .raw(),
+        args.get(2)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Type)?
+            .raw(),
+    );
     let ok = {
-        let heap = &*nctx.heap();
         Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
             && Proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
     };
@@ -84,9 +80,9 @@ pub fn proxy_revocable(
             "cannot create proxy with a non-object target or handler",
         ));
     }
-    nctx.handle_scope(|nctx, scope| {
+    state.handle_scope(|scope| {
         let proxy = scope.handle(Proxy::allocate(
-            nctx.heap(),
+            heap,
             &scope,
             // Safety: fresh argument words, consumed by the allocation.
             unsafe { Tagged::<Value>::from_value_unchecked(target) },
@@ -94,7 +90,6 @@ pub fn proxy_revocable(
         ));
         // Function.prototype.__makeRevoke (installed by REVOKE_PRELUDE)
         let make_revoke = {
-            let (vm, heap, state) = nctx.split();
             // Safety: fresh interned word, consumed by the lookup.
             let name = vm
                 .interner()
@@ -103,54 +98,70 @@ pub fn proxy_revocable(
             let proto = heap.known().function_prototype.erase();
             match Lookup::get_property_on(vm, heap, state, proto, proto, name)? {
                 Coercion::Threw => {
-                    // Safety: fresh root-slot word read for the return.
-                    return Ok(unsafe { heap.known().exception.read_unchecked() });
+                    return Ok(heap.known().exception.as_tagged(heap).erase());
                 }
                 Coercion::Value(v) => scope.handle(v),
             }
         };
         // Safety: fresh rooted-slot words staged for the call.
-        let undefined = unsafe { nctx.heap().known().undefined.read_unchecked() };
-        let proxy_word = unsafe { proxy.read_unchecked() };
-        let (vm, heap, state) = nctx.split();
-        let revoke = RuntimeContext::new(vm, heap, state).call(
-            // Safety: fresh rooted-slot word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(make_revoke.read_unchecked()) },
-            scope.stage(&[
-                unsafe { Tagged::<Value>::from_value_unchecked(undefined) },
-                unsafe { Tagged::<Value>::from_value_unchecked(proxy_word) },
-            ]),
+        let exception = heap.known().exception.as_tagged(heap).raw();
+        let staged = scope.stage(&[
+            heap.known().undefined.as_tagged(heap).erase(),
+            proxy.as_tagged(heap).erase(),
+        ]);
+        let revoke = {
+            let r = RuntimeContext::call(vm, &mut *heap, state, make_revoke, staged, None)?;
+            if r.raw() == exception {
+                return Ok(heap.known().exception.as_tagged(heap).erase());
+            }
+            // Safety: fresh call result, rooted below.
+            scope.handle(r)
+        };
+        let map = heap.known().object_initial_map;
+        let obj = heap
+            .new_object(&scope, map, HandleSlice::EMPTY)
+            .into_handle(&scope);
+        let proxy_name = vm.interner().intern_str(heap, &scope, "proxy");
+        let proxy_name = scope.handle(proxy_name.as_tagged(heap));
+        Object::define_own_property(
+            heap,
+            &scope,
+            obj,
+            proxy_name,
+            PropertyDescriptor::data(proxy.erase()),
         )?;
-        if revoke == unsafe { heap.known().exception.read_unchecked() } {
-            return Ok(revoke);
-        }
-        // Safety: fresh call result, rooted below.
-        let revoke = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(revoke) });
-        plain_object(nctx, &[("proxy", proxy.erase()), ("revoke", revoke)])
+        let revoke_name = vm.interner().intern_str(heap, &scope, "revoke");
+        let revoke_name = scope.handle(revoke_name.as_tagged(heap));
+        Object::define_own_property(
+            heap,
+            &scope,
+            obj,
+            revoke_name,
+            PropertyDescriptor::data(revoke.erase()),
+        )?;
+        Ok(obj.as_tagged(heap).erase())
     })
 }
 
 /// Hidden `__revokeProxy(p)`: nulls the proxy's target/handler slots
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
-pub fn proxy_revoke(
-    nctx: &mut RuntimeContext<'_>,
+pub fn proxy_revoke<'a>(
+    nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Value, VmError> {
-    let proxy = {
-        let heap = &*nctx.heap();
-        args.get(1)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?
-            .raw()
-    };
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
+    let proxy = args
+        .get(1)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?
+        .raw();
     Proxy::revoke(
-        nctx.heap(),
+        heap,
         // Safety: fresh argument word, consumed with no allocation delay.
         unsafe { Tagged::<Value>::from_value_unchecked(proxy) },
     );
-    // Safety: fresh root-slot word read for the immediate return.
-    Ok(unsafe { nctx.heap().known().undefined.read_unchecked() })
+    Ok(heap.known().undefined.as_tagged(heap).erase())
 }
 
 /// The revoke-closure template: `done` plays [[RevocableProxy]]'s

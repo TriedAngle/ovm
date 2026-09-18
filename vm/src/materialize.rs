@@ -83,7 +83,7 @@ fn materialize_function<'s>(
         let value = match constant {
             Constant::String(bytes) => intern(heap, state, scope, vm, bytes).erase(),
             Constant::Smi(v) => scope.handle(Smi::new(*v)),
-            Constant::Float(f) => scope.handle(heap.new_number(scope, *f)),
+            Constant::Float(f) => scope.handle(heap.new_number(*f)),
             Constant::Callable(child) => {
                 let info = materialize_function(vm, heap, state, scope, script, infos, *child)?;
                 info.erase()
