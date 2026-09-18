@@ -5,11 +5,11 @@ use crate::Global;
 use crate::RootHandles;
 use crate::Thread;
 use crate::materialize::materialize_closure_vm;
-use crate::natives::{NativeContext, NativeIndex};
 use crate::{
     Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
     SlotName, Smi, Tagged, Value, VmError,
 };
+use crate::{RuntimeContext, RuntimeIndex};
 
 pub fn alloc_map(
     heap: &mut Heap,
@@ -40,19 +40,19 @@ pub fn alloc_map_with_slots(
     })))
 }
 
-/// A native function object: `CALLABLE | CONSTRUCTOR | NATIVE`, slots[0] =
-/// native index, slots[1] = empty context, [[Prototype]] = Function.prototype.
-pub fn make_native_function(
+/// A runtime function object: `CALLABLE | CONSTRUCTOR | RUNTIME`, slots[0] =
+/// runtime index, slots[1] = empty context, [[Prototype]] = Function.prototype.
+pub fn make_runtime_function(
     thread: &mut Thread,
     scope: &HandleScope<'_>,
     roots: &RootHandles,
-    index: NativeIndex,
+    index: RuntimeIndex,
 ) -> Result<Global<Object>, VmError> {
     let heap = thread.heap();
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
         .union(MapKind::CONSTRUCTOR)
-        .union(MapKind::NATIVE)
+        .union(MapKind::RUNTIME)
         .union(MapKind::EXTENDABLE);
     let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
     let empty_context = heap.known().empty_context;
@@ -68,17 +68,17 @@ pub fn make_native_function(
     Ok(roots.create_handle(obj))
 }
 
-/// A non-constructor native function (`Proxy.revocable`-style statics).
-pub fn make_native_plain_function(
+/// A non-constructor runtime function (`Proxy.revocable`-style statics).
+pub fn make_runtime_plain_function(
     thread: &mut Thread,
     scope: &HandleScope<'_>,
     roots: &RootHandles,
-    index: NativeIndex,
+    index: RuntimeIndex,
 ) -> Result<Global<Object>, VmError> {
     let heap = thread.heap();
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
-        .union(MapKind::NATIVE)
+        .union(MapKind::RUNTIME)
         .union(MapKind::EXTENDABLE);
     let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
     let empty_context = heap.known().empty_context;
@@ -118,7 +118,7 @@ pub fn run_prelude(
         materialize_closure_vm(vm, heap, state, scope, &compiled, empty)?
     };
     let (vm, heap, state) = thread.split();
-    let result = NativeContext::new(vm, heap, state).call(
+    let result = RuntimeContext::new(vm, heap, state).call(
         // Safety: fresh rooted-slot word, consumed by the call.
         unsafe { Tagged::<Value>::from_value_unchecked(closure.read_unchecked()) },
         HandleSlice::EMPTY,
@@ -138,12 +138,12 @@ pub fn install_constructor(
     thread: &mut Thread,
     scope: &HandleScope<'_>,
     roots: &RootHandles,
-    index: NativeIndex,
+    index: RuntimeIndex,
     name: &str,
     proto_parent: Global<Object>,
 ) -> Result<(Global<Object>, Global<Object>), VmError> {
     let name_str = thread.intern(scope, name);
-    let fn_obj = make_native_function(thread, scope, roots, index)?;
+    let fn_obj = make_runtime_function(thread, scope, roots, index)?;
 
     // prototype object: fresh extendable object chained to proto_parent
     let map = alloc_map(
@@ -186,9 +186,9 @@ pub fn install_method(
     roots: &RootHandles,
     receiver: Global<Object>,
     name: &str,
-    index: NativeIndex,
+    index: RuntimeIndex,
 ) -> Result<(), VmError> {
-    let method = make_native_function(thread, scope, roots, index)?;
+    let method = make_runtime_function(thread, scope, roots, index)?;
     let name_str = thread.intern(scope, name);
     // Safety: fresh interned word, rooted below before any allocation.
     let method_name = scope.handle(name_str.as_tagged(&*thread.heap()));

@@ -1,36 +1,37 @@
 //! ES 20.5: Error constructors, Error.prototype.toString, and error
 //! object materialization.
-use crate::natives::NativeContext;
+use crate::Lookup;
+use crate::RuntimeContext;
 use crate::runtime::Coercion;
 
 use crate::{
     ContextState, Convert, DenseString, HandleSlice, Heap, Object, PropertyDescriptor, Tagged, VM,
-    Value, VmError, runtime::Runtime,
+    Value, VmError,
 };
 
 pub fn error_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "Error")
 }
 
 pub fn type_error_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "TypeError")
 }
 
 pub fn reference_error_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     make_error(nctx, args, "ReferenceError")
 }
 
 pub fn make_error(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
     class: &str,
 ) -> Result<Value, VmError> {
@@ -85,7 +86,7 @@ pub fn make_error(
 }
 
 pub fn error_to_string(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -141,7 +142,7 @@ pub fn get_property(
         );
         // Safety: caller-supplied word, fresh at entry.
         let receiver = scope.handle(unsafe { receiver.assume_valid(heap) });
-        match Runtime::get_property(vm, heap, state, receiver, name)? {
+        match Lookup::get_property_on(vm, heap, state, receiver, receiver, name)? {
             Coercion::Value(v) => Ok(v.raw()),
             Coercion::Threw => Ok(heap.known().exception.as_tagged(heap).raw()),
         }

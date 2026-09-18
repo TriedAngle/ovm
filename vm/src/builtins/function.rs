@@ -1,16 +1,17 @@
 //! ES 20.2: the Function constructor, Function.prototype
 //! toString/call/apply/bind, and the bind-closure prelude.
 
+use crate::Lookup;
+use crate::Object;
+use crate::RuntimeContext;
 use crate::materialize::materialize_closure_vm;
-use crate::natives::NativeContext;
 use crate::runtime::Coercion;
-use crate::runtime::Runtime;
 use crate::{Context, Convert, DenseString, HandleSlice, Smi, Tagged, Value, VmError};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
 pub fn function_to_string(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     _args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     nctx.handle_scope(|nctx, scope| {
@@ -23,19 +24,20 @@ pub fn function_to_string(
 
 /// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.4).
 pub fn function_call(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let f = {
         let heap = &*nctx.heap();
-        args.get(0)
+        let f = args
+            .get(0)
             .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?
-            .raw()
+            .ok_or(VmError::Arity)?;
+        if !Object::is_callable(heap, f) {
+            return Err(VmError::Type);
+        }
+        f.raw()
     };
-    if !Runtime::is_callable(nctx.heap(), f) {
-        return Err(VmError::Type);
-    }
     let call_args: Vec<Value> = {
         let heap = &*nctx.heap();
         args.iter()
@@ -63,19 +65,20 @@ pub fn function_call(
 /// bound function is the JS closure template installed by BIND_PRELUDE,
 /// called with (target, thisArg, prepend-array).
 pub fn function_bind(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let raw_f = {
         let heap = &*nctx.heap();
-        args.get(0)
+        let f = args
+            .get(0)
             .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?
-            .raw()
+            .ok_or(VmError::Arity)?;
+        if !Object::is_callable(heap, f) {
+            return Err(VmError::Type);
+        }
+        f.raw()
     };
-    if !Runtime::is_callable(nctx.heap(), raw_f) {
-        return Err(VmError::Type);
-    }
     // Safety: fresh root-slot word read for the immediate use.
     let undefined = {
         let heap = &*nctx.heap();
@@ -106,7 +109,7 @@ pub fn function_bind(
             let name = nctx.intern(&scope, "__makeBound").erase();
             let proto = nctx.heap().known().function_prototype.erase();
             let (vm, heap, state) = nctx.split();
-            match Runtime::get_property(vm, heap, state, proto, name)? {
+            match Lookup::get_property_on(vm, heap, state, proto, proto, name)? {
                 Coercion::Threw => {
                     // Safety: fresh root-slot word read for the return.
                     return Ok(unsafe { heap.known().exception.read_unchecked() });
@@ -138,19 +141,20 @@ pub fn function_bind(
 
 /// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.3).
 pub fn function_apply(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let f = {
         let heap = &*nctx.heap();
-        args.get(0)
+        let f = args
+            .get(0)
             .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?
-            .raw()
+            .ok_or(VmError::Arity)?;
+        if !Object::is_callable(heap, f) {
+            return Err(VmError::Type);
+        }
+        f.raw()
     };
-    if !Runtime::is_callable(nctx.heap(), f) {
-        return Err(VmError::Type);
-    }
     // Safety: fresh root-slot word read for the immediate use.
     let undefined = {
         let heap = &*nctx.heap();
@@ -223,8 +227,8 @@ pub fn function_apply(
 }
 
 /// The bound-function template: a plain JS closure over (target, bound
-/// this, prepend array). The native `function_bind` builds the prepend
-/// array and delegates here — the native registry holds stateless fn
+/// this, prepend array). The runtime `function_bind` builds the prepend
+/// array and delegates here — the runtime registry holds stateless fn
 /// pointers, so the closure state must live in a JS closure.
 pub const BIND_PRELUDE: &str = r#"
 Function.prototype.__makeBound = function (f, t, p) {
@@ -242,7 +246,7 @@ Function.prototype.__makeBound = function (f, t, p) {
 /// scope (approximated with the caller's context; the direct-eval pipeline
 /// provides the parsing).
 pub fn function_constructor(
-    nctx: &mut NativeContext<'_>,
+    nctx: &mut RuntimeContext<'_>,
     args: HandleSlice<'_>,
 ) -> Result<Value, VmError> {
     let argv: Vec<Value> = {

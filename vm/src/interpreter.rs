@@ -4,8 +4,8 @@ use bytecode::{Opcode, Operands, decode, jump_target};
 use crate::{
     CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
     DenseString, Errors, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint, Key, LoadOutcome,
-    Lookup, NativeContext, NativeIndex, Object, PropertyDescriptor, Runtime, ScopeInfo, SlotName,
-    Smi, Stack, StackCache, StoreOutcome, StoreSemantics, Tagged, VM, Value, VmError,
+    Lookup, Object, PropertyDescriptor, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi,
+    Stack, StackCache, StoreOutcome, StoreSemantics, Tagged, VM, Value, VmError,
 };
 
 enum Called<'a> {
@@ -99,10 +99,10 @@ fn start<'a>(
 
     match Object::call_target(heap, callable.as_tagged(heap).erase()) {
         None => Err(VmError::Type),
-        Some(CallTarget::Native(idx)) => {
-            let f = vm.native(NativeIndex(idx));
+        Some(CallTarget::Runtime(idx)) => {
+            let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack.stage_args(args)?;
-            let mut nctx = NativeContext::with_new_target(vm, heap, state, new_target);
+            let mut nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
             let result = f(&mut nctx, fargs);
             state.stack.set_top(saved_top);
 
@@ -165,7 +165,7 @@ fn call_value<'a>(
             Coercion::Value(v) => Ok(Called::Immediate(v)),
         };
     }
-    // TODO: native getters/setters invoke in place instead of pushing a frame
+    // TODO: runtime getters/setters invoke in place instead of pushing a frame
     let Some(CallTarget::Bytecode(target, register_count, kind)) =
         Object::call_target(heap, f.as_tagged(heap))
     else {
@@ -502,7 +502,7 @@ fn step<'a>(
         Opcode::LoadKeyedProperty => state.handle_scope(|scope| -> Step<'_> {
             let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
             let raw_key = scope.handle(acc.read(heap));
-            let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw_key)) else {
+            let Some(key) = step_try!(Object::to_property_key(vm, heap, state, raw_key)) else {
                 return Step::PendingThrow;
             };
             let key = scope.handle(key);
@@ -620,7 +620,7 @@ fn step<'a>(
             state.handle_scope(|scope| -> Step<'_> {
                 let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
                 let raw = scope.handle(stack.reg(heap, &meta, ops.reg(1)));
-                let Some(key) = step_try!(Runtime::to_property_key(vm, heap, state, raw)) else {
+                let Some(key) = step_try!(Object::to_property_key(vm, heap, state, raw)) else {
                     return Step::PendingThrow;
                 };
                 let key = scope.handle(key);
@@ -827,9 +827,9 @@ fn step<'a>(
             }
             match Object::call_target(heap, stack.reg(heap, &meta, ops.reg(0))) {
                 None => Step::Error(VmError::Type),
-                Some(CallTarget::Native(idx)) => {
-                    let f = vm.native(NativeIndex(idx));
-                    let mut nctx = NativeContext::new(vm, heap, state);
+                Some(CallTarget::Runtime(idx)) => {
+                    let f = vm.runtime(RuntimeIndex(idx));
+                    let mut nctx = RuntimeContext::new(vm, heap, state);
                     let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
                     match result {
                         // Safety: old-gen singleton word.
@@ -878,11 +878,11 @@ fn step<'a>(
         }
         Opcode::CallRuntime => {
             // operand 0 is a RuntimeFn discriminant: the fixed
-            // runtime-helper table (vm::natives::runtime_fn) registered at
+            // runtime-helper table (vm::runtime_fn) registered at
             // indices 0..RuntimeFn::COUNT
-            let f = vm.native(NativeIndex(ops.idx(0)));
+            let f = vm.runtime(RuntimeIndex(ops.idx(0)));
             let count = ops.reg_count(2);
-            let mut nctx = NativeContext::new(vm, heap, state);
+            let mut nctx = RuntimeContext::new(vm, heap, state);
             let result = f(&mut nctx, stack.args(&meta, ops.reg_list(1), count));
             match result {
                 // Safety: old-gen singleton word.
@@ -932,7 +932,7 @@ fn step<'a>(
             let receiver = if derived {
                 scope.handle(heap.known().the_hole.as_tagged(heap).erase())
             } else {
-                match Runtime::create_construct_receiver(vm, heap, state, callee) {
+                match Object::create_construct_receiver_value(vm, heap, state, callee.erase()) {
                     Ok(Some(r)) => scope.handle(r),
                     Ok(None) => return Step::PendingThrow,
                     Err(err) => return Step::Error(err),
@@ -952,20 +952,20 @@ fn step<'a>(
             let staged = scope.stage(&args);
 
             let callee = callee.erase();
-            let result = step_try!(
-                NativeContext::new(vm, heap, state).call_construct_rooted(callee, callee, staged)
-            );
-            if result == heap.known().exception.as_tagged(heap) {
+            let result = scope.handle(step_try!(RuntimeContext::call_construct_rooted(
+                vm, heap, state, callee, callee, staged
+            )));
+            if result.as_tagged(heap) == heap.known().exception.as_tagged(heap) {
                 return Step::PendingThrow;
             }
-            *acc = if Convert::is_primitive(heap, unsafe { result.assume_valid(heap) }) {
+            *acc = if Convert::is_primitive(heap, result.as_tagged(heap)) {
                 if derived {
                     // a derived constructor returned a primitive (ES 9.2.2.1)
                     return Step::Error(VmError::Type);
                 }
                 receiver.as_tagged(heap).raw()
             } else {
-                result
+                result.as_tagged(heap).raw()
             };
             Step::Next
         }),
@@ -994,7 +994,7 @@ fn step<'a>(
             let context = scope
                 .cast::<Context>(stack.context_slot(&meta).read(heap))
                 .expect("frame context slot holds a Context");
-            let obj = step_try!(Runtime::create_closure(heap, &scope, info, context));
+            let obj = step_try!(Object::create_closure(heap, &scope, info, context));
             acc.store(obj);
             Step::Next
         }),
@@ -1014,17 +1014,17 @@ fn step<'a>(
             }
             state.handle_scope(|scope| {
                 let lhs = scope.handle(acc.read(heap));
-                let lhs =
-                    match step_try!(Runtime::to_primitive(vm, heap, state, lhs, Hint::Default)) {
-                        Coercion::Threw => return Step::PendingThrow,
-                        Coercion::Value(v) => scope.handle(v),
-                    };
+                let lhs = match step_try!(Object::to_primitive(vm, heap, state, lhs, Hint::Default))
+                {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
                 let rhs = scope.handle(stack.reg(heap, &meta, other_reg));
-                let rhs =
-                    match step_try!(Runtime::to_primitive(vm, heap, state, rhs, Hint::Default)) {
-                        Coercion::Threw => return Step::PendingThrow,
-                        Coercion::Value(v) => scope.handle(v),
-                    };
+                let rhs = match step_try!(Object::to_primitive(vm, heap, state, rhs, Hint::Default))
+                {
+                    Coercion::Threw => return Step::PendingThrow,
+                    Coercion::Value(v) => scope.handle(v),
+                };
                 let is_string = (
                     lhs.as_tagged(heap).get_as::<DenseString>().is_some(),
                     rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
@@ -1064,7 +1064,7 @@ fn step<'a>(
             }
             let a = scope.handle(acc.read(heap));
             let b = scope.handle(other);
-            let v = step_try!(Runtime::numeric_op(vm, heap, state, a, b, |a, b| a - b));
+            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a - b));
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
@@ -1082,7 +1082,7 @@ fn step<'a>(
             }
             let a = scope.handle(acc.read(heap));
             let b = scope.handle(other);
-            let v = step_try!(Runtime::numeric_op(vm, heap, state, a, b, |a, b| a * b));
+            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a * b));
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
@@ -1103,7 +1103,7 @@ fn step<'a>(
             }
             let a = scope.handle(acc.read(heap));
             let b = scope.handle(other);
-            let v = step_try!(Runtime::numeric_op(vm, heap, state, a, b, |a, b| a / b));
+            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a / b));
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
@@ -1121,7 +1121,7 @@ fn step<'a>(
             }
             let a = scope.handle(acc.read(heap));
             let b = scope.handle(other);
-            let v = step_try!(Runtime::numeric_op(vm, heap, state, a, b, |a, b| a % b));
+            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a % b));
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
@@ -1133,7 +1133,7 @@ fn step<'a>(
             // needs a Smi tag when it is an in-range integer.
             let a = scope.handle(acc.read(heap));
             let b = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let v = step_try!(Runtime::numeric_op(vm, heap, state, a, b, |a, b| a.powf(b)));
+            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a.powf(b)));
             let Some(v) = v else {
                 return Step::PendingThrow;
             };
@@ -1248,7 +1248,7 @@ fn step<'a>(
             Step::Next
         }
         Opcode::TestTypeof => {
-            acc.store(Runtime::type_of(heap, acc.read(heap)));
+            acc.store(Object::type_of(heap, acc.read(heap)));
             Step::Next
         }
         Opcode::Negate => {
@@ -1264,7 +1264,7 @@ fn step<'a>(
             } else {
                 let n = state.handle_scope(|scope| {
                     let acc = scope.handle(acc.read(heap));
-                    Runtime::to_numeric(vm, heap, state, acc)
+                    Object::to_numeric(vm, heap, state, acc)
                 });
                 let n = step_try!(n);
                 let Some(n) = n else {
@@ -1285,7 +1285,7 @@ fn step<'a>(
         Opcode::InstanceOf => {
             let acc_word = *acc;
             let other = stack.reg(heap, &meta, ops.reg(0)).raw();
-            let r = step_try!(Runtime::instance_of(vm, heap, state, acc_word, other));
+            let r = step_try!(Object::instance_of(vm, heap, state, acc_word, other));
             let Some(r) = r else {
                 return Step::PendingThrow;
             };
@@ -1300,12 +1300,12 @@ fn step<'a>(
         }
         Opcode::Equal => state.handle_scope(|scope| {
             let x = scope.handle(acc.read(heap));
-            let x = match step_try!(Runtime::to_primitive(vm, heap, state, x, Hint::Default)) {
+            let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Default)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
             let y = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let y = match step_try!(Runtime::to_primitive(vm, heap, state, y, Hint::Default)) {
+            let y = match step_try!(Object::to_primitive(vm, heap, state, y, Hint::Default)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
@@ -1315,12 +1315,12 @@ fn step<'a>(
         }),
         Opcode::LessThan => state.handle_scope(|scope| {
             let x = scope.handle(acc.read(heap));
-            let x = match step_try!(Runtime::to_primitive(vm, heap, state, x, Hint::Number)) {
+            let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
             let y = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let y = match step_try!(Runtime::to_primitive(vm, heap, state, y, Hint::Number)) {
+            let y = match step_try!(Object::to_primitive(vm, heap, state, y, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
@@ -1334,12 +1334,12 @@ fn step<'a>(
         }),
         Opcode::LessThanOrEqual => state.handle_scope(|scope| {
             let x = scope.handle(acc.read(heap));
-            let x = match step_try!(Runtime::to_primitive(vm, heap, state, x, Hint::Number)) {
+            let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
             let y = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let y = match step_try!(Runtime::to_primitive(vm, heap, state, y, Hint::Number)) {
+            let y = match step_try!(Object::to_primitive(vm, heap, state, y, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
@@ -1353,12 +1353,12 @@ fn step<'a>(
         }),
         Opcode::GreaterThan => state.handle_scope(|scope| {
             let x = scope.handle(acc.read(heap));
-            let x = match step_try!(Runtime::to_primitive(vm, heap, state, x, Hint::Number)) {
+            let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
             let y = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let y = match step_try!(Runtime::to_primitive(vm, heap, state, y, Hint::Number)) {
+            let y = match step_try!(Object::to_primitive(vm, heap, state, y, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
@@ -1372,12 +1372,12 @@ fn step<'a>(
         }),
         Opcode::GreaterThanOrEqual => state.handle_scope(|scope| {
             let x = scope.handle(acc.read(heap));
-            let x = match step_try!(Runtime::to_primitive(vm, heap, state, x, Hint::Number)) {
+            let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
             let y = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let y = match step_try!(Runtime::to_primitive(vm, heap, state, y, Hint::Number)) {
+            let y = match step_try!(Object::to_primitive(vm, heap, state, y, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };

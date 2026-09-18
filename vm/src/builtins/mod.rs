@@ -30,10 +30,10 @@ use function::{
     BIND_PRELUDE, function_apply, function_bind, function_call, function_constructor,
     function_to_string,
 };
-use global::{eval_native, is_nan};
+use global::{eval_runtime, is_nan};
 use helpers::{
     alloc_map, alloc_map_with_slots, define_data, define_method_prop, define_non_enumerable,
-    install_constructor, install_method, make_native_function, make_native_plain_function,
+    install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
     run_prelude,
 };
 use number::{number_constructor, number_to_string, number_value_of};
@@ -53,100 +53,100 @@ use crate::{
 };
 
 use crate::Float;
-use crate::NativeIndex;
+use crate::RuntimeIndex;
 use crate::VM;
 
-/// Register the builtin natives.
-pub fn register_builtin_natives(vm: &mut VM) -> BuiltinIndices {
+/// Register the builtin runtimes.
+pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
     BuiltinIndices {
-        eval: vm.register_native(eval_native),
-        string: vm.register_native(string_constructor),
-        string_value_of: vm.register_native(string_value_of),
-        string_to_string: vm.register_native(string_to_string),
-        reference_error: vm.register_native(reference_error_constructor),
-        function_to_string: vm.register_native(function_to_string),
-        object_to_string: vm.register_native(object_to_string),
-        number: vm.register_native(number_constructor),
-        number_value_of: vm.register_native(number_value_of),
-        number_to_string: vm.register_native(number_to_string),
-        boolean: vm.register_native(boolean_constructor),
-        boolean_value_of: vm.register_native(boolean_value_of),
-        boolean_to_string: vm.register_native(boolean_to_string),
-        error: vm.register_native(error_constructor),
-        type_error: vm.register_native(type_error_constructor),
-        error_to_string: vm.register_native(error_to_string),
-        object: vm.register_native(object_constructor),
-        object_get_prototype_of: vm.register_native(object_get_prototype_of),
-        object_set_prototype_of: vm.register_native(object_set_prototype_of),
-        array: vm.register_native(array_constructor),
-        is_nan: vm.register_native(is_nan),
-        array_values: vm.register_native(array_values),
-        array_iterator_next: vm.register_native(array_iterator_next),
-        array_iterator_symbol_iterator: vm.register_native(array_iterator_symbol_iterator),
-        symbol: vm.register_native(symbol_constructor),
-        object_has_own_property: vm.register_native(object_has_own_property),
-        object_property_is_enumerable: vm.register_native(object_property_is_enumerable),
-        object_get_own_property_names: vm.register_native(object_get_own_property_names),
-        object_get_own_property_descriptor: vm.register_native(object_get_own_property_descriptor),
-        object_define_property: vm.register_native(object_define_property),
-        function_call: vm.register_native(function_call),
-        function_apply: vm.register_native(function_apply),
-        function_bind: vm.register_native(function_bind),
-        function_constructor: vm.register_native(function_constructor),
-        array_is_array: vm.register_native(array_is_array),
-        proxy: vm.register_native(proxy_constructor),
-        proxy_revocable: vm.register_native(proxy_revocable),
-        proxy_revoke: vm.register_native(proxy_revoke),
-        object_prevent_extensions: vm.register_native(object_prevent_extensions),
-        object_is_extensible: vm.register_native(object_is_extensible),
-        object_seal: vm.register_native(object_seal),
-        object_freeze: vm.register_native(object_freeze),
+        eval: vm.register_runtime(eval_runtime),
+        string: vm.register_runtime(string_constructor),
+        string_value_of: vm.register_runtime(string_value_of),
+        string_to_string: vm.register_runtime(string_to_string),
+        reference_error: vm.register_runtime(reference_error_constructor),
+        function_to_string: vm.register_runtime(function_to_string),
+        object_to_string: vm.register_runtime(object_to_string),
+        number: vm.register_runtime(number_constructor),
+        number_value_of: vm.register_runtime(number_value_of),
+        number_to_string: vm.register_runtime(number_to_string),
+        boolean: vm.register_runtime(boolean_constructor),
+        boolean_value_of: vm.register_runtime(boolean_value_of),
+        boolean_to_string: vm.register_runtime(boolean_to_string),
+        error: vm.register_runtime(error_constructor),
+        type_error: vm.register_runtime(type_error_constructor),
+        error_to_string: vm.register_runtime(error_to_string),
+        object: vm.register_runtime(object_constructor),
+        object_get_prototype_of: vm.register_runtime(object_get_prototype_of),
+        object_set_prototype_of: vm.register_runtime(object_set_prototype_of),
+        array: vm.register_runtime(array_constructor),
+        is_nan: vm.register_runtime(is_nan),
+        array_values: vm.register_runtime(array_values),
+        array_iterator_next: vm.register_runtime(array_iterator_next),
+        array_iterator_symbol_iterator: vm.register_runtime(array_iterator_symbol_iterator),
+        symbol: vm.register_runtime(symbol_constructor),
+        object_has_own_property: vm.register_runtime(object_has_own_property),
+        object_property_is_enumerable: vm.register_runtime(object_property_is_enumerable),
+        object_get_own_property_names: vm.register_runtime(object_get_own_property_names),
+        object_get_own_property_descriptor: vm.register_runtime(object_get_own_property_descriptor),
+        object_define_property: vm.register_runtime(object_define_property),
+        function_call: vm.register_runtime(function_call),
+        function_apply: vm.register_runtime(function_apply),
+        function_bind: vm.register_runtime(function_bind),
+        function_constructor: vm.register_runtime(function_constructor),
+        array_is_array: vm.register_runtime(array_is_array),
+        proxy: vm.register_runtime(proxy_constructor),
+        proxy_revocable: vm.register_runtime(proxy_revocable),
+        proxy_revoke: vm.register_runtime(proxy_revoke),
+        object_prevent_extensions: vm.register_runtime(object_prevent_extensions),
+        object_is_extensible: vm.register_runtime(object_is_extensible),
+        object_seal: vm.register_runtime(object_seal),
+        object_freeze: vm.register_runtime(object_freeze),
     }
 }
 
 pub struct BuiltinIndices {
-    pub eval: NativeIndex,
-    pub string: NativeIndex,
-    pub string_value_of: NativeIndex,
-    pub string_to_string: NativeIndex,
-    pub reference_error: NativeIndex,
-    pub function_to_string: NativeIndex,
-    pub object_to_string: NativeIndex,
-    pub number: NativeIndex,
-    pub number_value_of: NativeIndex,
-    pub number_to_string: NativeIndex,
-    pub boolean: NativeIndex,
-    pub boolean_value_of: NativeIndex,
-    pub boolean_to_string: NativeIndex,
-    pub error: NativeIndex,
-    pub type_error: NativeIndex,
-    pub error_to_string: NativeIndex,
-    pub object: NativeIndex,
-    pub object_get_prototype_of: NativeIndex,
-    pub object_set_prototype_of: NativeIndex,
-    pub array: NativeIndex,
-    pub is_nan: NativeIndex,
-    pub array_values: NativeIndex,
-    pub array_iterator_next: NativeIndex,
-    pub array_iterator_symbol_iterator: NativeIndex,
-    pub symbol: NativeIndex,
-    pub object_has_own_property: NativeIndex,
-    pub object_property_is_enumerable: NativeIndex,
-    pub object_get_own_property_names: NativeIndex,
-    pub object_get_own_property_descriptor: NativeIndex,
-    pub object_define_property: NativeIndex,
-    pub function_call: NativeIndex,
-    pub function_apply: NativeIndex,
-    pub function_bind: NativeIndex,
-    pub function_constructor: NativeIndex,
-    pub array_is_array: NativeIndex,
-    pub proxy: NativeIndex,
-    pub proxy_revocable: NativeIndex,
-    pub proxy_revoke: NativeIndex,
-    pub object_prevent_extensions: NativeIndex,
-    pub object_is_extensible: NativeIndex,
-    pub object_seal: NativeIndex,
-    pub object_freeze: NativeIndex,
+    pub eval: RuntimeIndex,
+    pub string: RuntimeIndex,
+    pub string_value_of: RuntimeIndex,
+    pub string_to_string: RuntimeIndex,
+    pub reference_error: RuntimeIndex,
+    pub function_to_string: RuntimeIndex,
+    pub object_to_string: RuntimeIndex,
+    pub number: RuntimeIndex,
+    pub number_value_of: RuntimeIndex,
+    pub number_to_string: RuntimeIndex,
+    pub boolean: RuntimeIndex,
+    pub boolean_value_of: RuntimeIndex,
+    pub boolean_to_string: RuntimeIndex,
+    pub error: RuntimeIndex,
+    pub type_error: RuntimeIndex,
+    pub error_to_string: RuntimeIndex,
+    pub object: RuntimeIndex,
+    pub object_get_prototype_of: RuntimeIndex,
+    pub object_set_prototype_of: RuntimeIndex,
+    pub array: RuntimeIndex,
+    pub is_nan: RuntimeIndex,
+    pub array_values: RuntimeIndex,
+    pub array_iterator_next: RuntimeIndex,
+    pub array_iterator_symbol_iterator: RuntimeIndex,
+    pub symbol: RuntimeIndex,
+    pub object_has_own_property: RuntimeIndex,
+    pub object_property_is_enumerable: RuntimeIndex,
+    pub object_get_own_property_names: RuntimeIndex,
+    pub object_get_own_property_descriptor: RuntimeIndex,
+    pub object_define_property: RuntimeIndex,
+    pub function_call: RuntimeIndex,
+    pub function_apply: RuntimeIndex,
+    pub function_bind: RuntimeIndex,
+    pub function_constructor: RuntimeIndex,
+    pub array_is_array: RuntimeIndex,
+    pub proxy: RuntimeIndex,
+    pub proxy_revocable: RuntimeIndex,
+    pub proxy_revoke: RuntimeIndex,
+    pub object_prevent_extensions: RuntimeIndex,
+    pub object_is_extensible: RuntimeIndex,
+    pub object_seal: RuntimeIndex,
+    pub object_freeze: RuntimeIndex,
 }
 
 /// Build the builtin objects and install them on the global object.
@@ -397,7 +397,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
 
         // ---- Function (constructor: dynamic bodies via eval, ES 20.2.1) --------
         let function_prototype = thread.heap().known().function_prototype;
-        let function_fn = make_native_function(thread, &scope, roots, idx.function_constructor)?;
+        let function_fn = make_runtime_function(thread, &scope, roots, idx.function_constructor)?;
         define_method_prop(
             thread.heap(),
             &scope,
@@ -464,7 +464,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         run_prelude(thread, &scope, REVOKE_PRELUDE, "revoke prelude")?;
 
         // ---- eval -------------------------------------------------------------
-        let eval_fn = make_native_function(thread, &scope, roots, idx.eval)?;
+        let eval_fn = make_runtime_function(thread, &scope, roots, idx.eval)?;
         let global = thread.heap().known().global_object;
         let eval_name = thread.intern(&scope, "eval");
         // Safety: fresh interned word, rooted below before the define.
@@ -502,7 +502,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // %Object.prototype% already exists from bootstrap; link the
         // constructor to it (like Array below)
         let object_prototype = thread.heap().known().object_prototype;
-        let object_fn = make_native_function(thread, &scope, roots, idx.object)?;
+        let object_fn = make_runtime_function(thread, &scope, roots, idx.object)?;
         define_method_prop(
             thread.heap(),
             &scope,
@@ -571,7 +571,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Array ---------------------------------------------------------------
         // %Array.prototype% already exists from bootstrap (an array object
         // whose prototype is %Object.prototype%); just link the constructor
-        let array_fn = make_native_function(thread, &scope, roots, idx.array)?;
+        let array_fn = make_runtime_function(thread, &scope, roots, idx.array)?;
         let array_prototype = thread.heap().known().array_prototype;
         define_method_prop(
             thread.heap(),
@@ -593,7 +593,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         define_data(thread.heap(), &scope, global, array_name, array_fn.erase())?;
 
         // Array.isArray
-        let is_array_fn = make_native_function(thread, &scope, roots, idx.array_is_array)?;
+        let is_array_fn = make_runtime_function(thread, &scope, roots, idx.array_is_array)?;
         let is_array_name = thread.intern(&scope, "isArray");
         // Safety: fresh interned word, rooted below before the define.
         let is_array_name = scope.handle(is_array_name.as_tagged(&*thread.heap()));
@@ -626,7 +626,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             idx.array_iterator_next,
         )?;
         let sym_iterator_iter =
-            make_native_function(thread, &scope, roots, idx.array_iterator_symbol_iterator)?;
+            make_runtime_function(thread, &scope, roots, idx.array_iterator_symbol_iterator)?;
         let iterator_symbol = thread.heap().known().iterator_symbol;
         // Safety: fresh root-slot word, rooted below before the defines.
         let iterator_name = scope.handle(iterator_symbol.as_tagged(&*thread.heap()));
@@ -639,8 +639,8 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         )?;
 
         // Array.prototype.values === Array.prototype[Symbol.iterator]: a
-        // native returning a fresh array-iterator object
-        let values_fn = make_native_function(thread, &scope, roots, idx.array_values)?;
+        // runtime returning a fresh array-iterator object
+        let values_fn = make_runtime_function(thread, &scope, roots, idx.array_values)?;
         let values_name = thread.intern(&scope, "values");
         // Safety: fresh interned word, rooted below before the defines.
         let values_name = scope.handle(values_name.as_tagged(&*thread.heap()));
@@ -724,7 +724,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         known.for_in_enumerator_map = for_in_enumerator_map;
         thread.heap().set_known(known);
 
-        let is_nan_fn = make_native_function(thread, &scope, roots, idx.is_nan)?;
+        let is_nan_fn = make_runtime_function(thread, &scope, roots, idx.is_nan)?;
         let is_nan_name = thread.intern(&scope, "isNaN");
         // Safety: fresh interned word, rooted below before the define.
         let is_nan_name = scope.handle(is_nan_name.as_tagged(&*thread.heap()));
@@ -739,7 +739,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Symbol (minimal: constructor + Symbol.iterator) ---------------
         // enough to author custom iterables; the full Symbol surface stays
         // gated by the test262 feature skip
-        let symbol_fn = make_native_function(thread, &scope, roots, idx.symbol)?;
+        let symbol_fn = make_runtime_function(thread, &scope, roots, idx.symbol)?;
         let symbol_name = thread.intern(&scope, "Symbol");
         // Safety: fresh interned word, rooted below before the define.
         let symbol_name = scope.handle(symbol_name.as_tagged(&*thread.heap()));
@@ -763,10 +763,10 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         )?;
 
         // ---- Proxy ------------------------------------------------------------
-        // The Proxy constructor is a native function *without* a
+        // The Proxy constructor is a runtime function *without* a
         // `.prototype` property (ES 20.2.1: "Proxy.prototype is
         // undefined"); `install_constructor` cannot be used.
-        let proxy_fn = make_native_function(thread, &scope, roots, idx.proxy)?;
+        let proxy_fn = make_runtime_function(thread, &scope, roots, idx.proxy)?;
         let two = scope.handle(Smi::new(2));
         define_non_enumerable(thread.heap(), &scope, proxy_fn, wks.length, two)?;
         let proxy_name = thread.intern(&scope, "Proxy");
@@ -782,8 +782,8 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         define_data(thread.heap(), &scope, global, proxy_name, proxy_fn.erase())?;
         // Proxy.revocable: a non-constructor function returning
         // { proxy, revoke }; the revoke closure is the JS template
-        // installed by REVOKE_PRELUDE (natives cannot carry state).
-        let revocable_fn = make_native_plain_function(thread, &scope, roots, idx.proxy_revocable)?;
+        // installed by REVOKE_PRELUDE (runtimes cannot carry state).
+        let revocable_fn = make_runtime_plain_function(thread, &scope, roots, idx.proxy_revocable)?;
         define_non_enumerable(thread.heap(), &scope, revocable_fn, wks.length, two)?;
         let revocable_name = thread.intern(&scope, "revocable");
         define_non_enumerable(
@@ -802,8 +802,8 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             revocable_name,
             revocable_fn.erase(),
         )?;
-        // hidden revoke native used by the REVOKE_PRELUDE closure
-        let revoke_fn = make_native_plain_function(thread, &scope, roots, idx.proxy_revoke)?;
+        // hidden revoke runtime used by the REVOKE_PRELUDE closure
+        let revoke_fn = make_runtime_plain_function(thread, &scope, roots, idx.proxy_revoke)?;
         let revoke_name = thread.intern(&scope, "__revokeProxy");
         // Safety: fresh interned word, rooted below before the define.
         let revoke_name = scope.handle(revoke_name.as_tagged(&*thread.heap()));

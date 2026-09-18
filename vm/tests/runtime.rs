@@ -1,6 +1,6 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 
-use vm::natives::NativeContext;
+use vm::RuntimeContext;
 use vm::{Float, HandleSlice, Smi, Value};
 use vm::{Thread, VM, VmError};
 
@@ -12,7 +12,7 @@ fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
-fn smi_add(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn smi_add(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
     let (a, b) = {
         let heap = &*nctx.heap();
         match (
@@ -31,30 +31,30 @@ fn smi_add(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value,
 }
 
 #[test]
-fn registered_native_invokes_and_checks_types() {
+fn registered_runtime_invokes_and_checks_types() {
     let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let r = thread
-        .run_native(smi_add, &[smi(0), smi(6), smi(7)])
+        .run_runtime(smi_add, &[smi(0), smi(6), smi(7)])
         .unwrap();
     assert_eq!(r.to_i64().unwrap(), 13);
 
     assert_eq!(
-        thread.run_native(smi_add, &[smi(0), smi(1)]),
+        thread.run_runtime(smi_add, &[smi(0), smi(1)]),
         Err(VmError::Arity)
     );
 
     let f = float(&mut thread, 1.0);
     assert_eq!(
-        thread.run_native(smi_add, &[smi(0), f, smi(1)]),
+        thread.run_runtime(smi_add, &[smi(0), f, smi(1)]),
         Err(VmError::Type)
     );
 }
 
 #[test]
-fn native_result_is_boxed_when_not_smi() {
-    fn fadd(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn runtime_result_is_boxed_when_not_smi() {
+    fn fadd(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
         let sum = {
             let heap = &*nctx.heap();
             let (a, b) = match (
@@ -76,7 +76,7 @@ fn native_result_is_boxed_when_not_smi() {
 
     let fa = float(&mut thread, 1.5);
     let fb = float(&mut thread, 2.25);
-    let r = thread.run_native(fadd, &[smi(0), fa, fb]).unwrap();
+    let r = thread.run_runtime(fadd, &[smi(0), fa, fb]).unwrap();
     let out = {
         let heap = &*thread.heap();
         unsafe { r.assume_valid(heap) }
@@ -88,7 +88,7 @@ fn native_result_is_boxed_when_not_smi() {
     assert_eq!(out, 3.75);
 
     assert_eq!(
-        thread.run_native(fadd, &[smi(0), smi(1), smi(2)]),
+        thread.run_runtime(fadd, &[smi(0), smi(1), smi(2)]),
         Err(VmError::Type)
     );
 }
@@ -97,11 +97,11 @@ fn native_result_is_boxed_when_not_smi() {
 #[test]
 fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let idx = vm.register_native(smi_add);
+    let idx = vm.register_runtime(smi_add);
     let mut thread = vm.attach();
     let args = [smi(0), smi(1)]; // arity error for smi_add
 
-    let result = unsafe { native_trampoline(idx.0, &mut thread, args.as_ptr(), args.len() as u32) };
+    let result = unsafe { runtime_trampoline(idx.0, &mut thread, args.as_ptr(), args.len() as u32) };
 
     let exception_word = {
         let heap = thread.heap();
@@ -143,8 +143,8 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 */
 
 #[test]
-fn register_native_appends_after_well_known() {
-    fn double(nctx: &mut NativeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
+fn register_runtime_appends_after_well_known() {
+    fn double(nctx: &mut RuntimeContext<'_>, args: HandleSlice<'_>) -> Result<Value, VmError> {
         let heap = &*nctx.heap();
         match args.get(1).map(|h| h.as_tagged(heap)) {
             Some(v) => {
@@ -156,16 +156,16 @@ fn register_native_appends_after_well_known() {
     }
 
     let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let idx = vm.register_native(double as vm::NativeFn);
+    let idx = vm.register_runtime(double as vm::RuntimeCall);
     // the registry starts with the fixed RuntimeFn table; dynamic
     // registrations append after it
     let fixed = bytecode::RuntimeFn::COUNT as usize;
     assert_eq!(idx.0, fixed);
-    assert_eq!(vm.natives().len(), fixed + 1);
+    assert_eq!(vm.runtimes().len(), fixed + 1);
 
     let mut thread = vm.attach();
     let r = thread
-        .run_native(vm.native(idx), &[smi(0), smi(21)])
+        .run_runtime(vm.runtime(idx), &[smi(0), smi(21)])
         .unwrap();
     assert_eq!(r.to_i64().unwrap(), 42);
 }

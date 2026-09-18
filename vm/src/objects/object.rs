@@ -1,9 +1,10 @@
 use core::alloc::Layout;
 
 use crate::{
-    CallableInfoObject, Context, DenseString, EdgeVisitable, FixedArray, FunctionKind, GcSlot,
-    Handle, HandleScope, HandleSlice, Header, Heap, HeapObject, HeapRef, Map, ObjectKind, SlotName,
-    Smi, Tagged, Value, Visitor, VmError,
+    CallableInfoObject, Coercion, Context, ContextState, Convert, DenseString, EdgeVisitable,
+    FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
+    HeapObject, HeapRef, Hint, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext,
+    SlotName, Smi, Symbol, Tagged, VM, Value, Visitor, VmError,
 };
 
 #[repr(C)]
@@ -44,8 +45,8 @@ impl Object {
             .constant_slot_name(heap, idx)
     }
 
-    pub fn native_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
-        if !self.header.map.heap_ref(heap).kind().is_native() {
+    pub fn runtime_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
+        if !self.header.map.heap_ref(heap).kind().is_runtime() {
             return None;
         }
         let idx = Smi::decode(self.slots.heap_ref(heap).at(heap, 0).raw())?.value();
@@ -121,20 +122,20 @@ impl Object {
 /// What kind of callable a value refers to.
 pub enum CallTarget<'a> {
     Bytecode(Tagged<'a, Object>, usize, FunctionKind),
-    Native(usize),
+    Runtime(usize),
 }
 
 impl Object {
     /// Classify a value as a callable: a bytecode function (with register
-    /// count and kind) or a native (with registry index).
+    /// count and kind) or a runtime (with registry index).
     pub fn call_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
         let obj = f.as_heap_object()?;
         let kind = obj.as_ref().header.map.heap_ref(heap).kind();
         if !kind.is_callable() {
             return None;
         }
-        if kind.is_native() {
-            return Some(CallTarget::Native(obj.as_ref().native_index(heap)?));
+        if kind.is_runtime() {
+            return Some(CallTarget::Runtime(obj.as_ref().runtime_index(heap)?));
         }
         let info = obj.as_ref().callable_info(heap)?;
         let register_count = info.register_count.to_smi().value() as usize;
@@ -266,5 +267,460 @@ impl EdgeVisitable for Object {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.slots.as_raw());
         visitor.visit(self.elements.as_raw());
+    }
+}
+
+impl Object {
+    pub fn create_closure<'a>(
+        heap: &'a mut Heap,
+        scope: &HandleScope<'_>,
+        info: Handle<'_, CallableInfoObject>,
+        context: Handle<'_, Context>,
+    ) -> Result<Tagged<'a, Value>, VmError> {
+        let (kind, source_name, formal_length) = {
+            let info = info.heap_ref(heap);
+            (
+                info.function_kind(),
+                info.name(heap).map(|name| name.raw()),
+                info.formal_length(),
+            )
+        };
+        let function_name = match source_name {
+            // Safety: the word was read under an anchor one statement ago;
+            // no allocation has run since.
+            Some(name) => scope.handle(unsafe { name.assume_valid(heap) }),
+            None => scope.handle(heap.known().strings.empty.as_tagged(heap).erase()),
+        };
+        let map = match kind {
+            kind if kind.is_class_constructor() => heap.known().class_constructor_map,
+            kind if kind.is_constructible() => heap.known().function_map,
+            _ => heap.known().non_constructor_function_map,
+        };
+        // class constructors carry a third hidden slot: the instance-field
+        // array ([key0, init0, ...]); undefined until SetClassFields
+        let function = if kind.is_class_constructor() {
+            let args = scope.stage(&[
+                info.as_tagged(heap).erase(),
+                context.as_tagged(heap).erase(),
+                heap.known().undefined.as_tagged(heap).erase(),
+            ]);
+            heap.new_object(scope, map, args).into_handle(scope)
+        } else {
+            let args = scope.stage(&[
+                info.as_tagged(heap).erase(),
+                context.as_tagged(heap).erase(),
+            ]);
+            heap.new_object(scope, map, args).into_handle(scope)
+        };
+
+        let length_key = heap.known().strings.length;
+        let name_key = heap.known().strings.name;
+        let defined = Object::define_own_property(
+            heap,
+            scope,
+            function,
+            length_key,
+            PropertyDescriptor::Data {
+                value: scope.handle(Smi::new(formal_length as i64)),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        )?;
+        if !defined {
+            return Err(VmError::Type);
+        }
+        let defined = Object::define_own_property(
+            heap,
+            scope,
+            function,
+            name_key,
+            PropertyDescriptor::Data {
+                value: function_name.erase(),
+                writable: false,
+                enumerable: false,
+                configurable: true,
+            },
+        )?;
+        if !defined {
+            return Err(VmError::Type);
+        }
+
+        if kind.needs_prototype() {
+            let proto = heap
+                .new_object(scope, heap.known().object_initial_map, HandleSlice::EMPTY)
+                .into_handle(scope);
+            let constructor = heap.known().strings.constructor;
+            let prototype = heap.known().strings.prototype;
+            let defined = Object::define_own_property(
+                heap,
+                scope,
+                proto,
+                constructor,
+                PropertyDescriptor::Data {
+                    value: function.erase(),
+                    writable: true,
+                    enumerable: false,
+                    configurable: true,
+                },
+            )?;
+            if !defined {
+                return Err(VmError::Type);
+            }
+            let defined = Object::define_own_property(
+                heap,
+                scope,
+                function,
+                prototype,
+                PropertyDescriptor::Data {
+                    value: proto.erase(),
+                    writable: true,
+                    enumerable: false,
+                    configurable: false,
+                },
+            )?;
+            if !defined {
+                return Err(VmError::Type);
+            }
+        }
+
+        // fresh word under a final shared reborrow; anchored at the `&mut`
+        // borrow, so callers must store or root it before allocating
+        Ok(function.as_tagged(heap).erase())
+    }
+
+    /// ES 7.1.1 ToPrimitive. Primitives pass through untouched. `value` is a
+    /// rooted handle; the result is anchored at the `&mut Heap` borrow, so the
+    /// caller must consume or root it before the next allocation.
+    pub fn to_primitive<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        value: Handle<'_, Value>,
+        hint: Hint,
+    ) -> Result<Coercion<'a>, VmError> {
+        let cond_0 = Convert::is_primitive(heap, value.as_tagged(heap));
+        if cond_0 {
+            return Ok(Coercion::Value(value.as_tagged(heap)));
+        }
+        // the receiver stays rooted throughout: method lookups and calls
+        // below run user code (getters, valueOf/toString), which allocates
+        // and would leave a raw copy dangling
+        state.handle_scope(|scope| {
+            let (exception, undefined, null) = {
+                let known = heap.known();
+                (
+                    known.exception.as_tagged(heap).raw(),
+                    known.undefined.as_tagged(heap).raw(),
+                    known.null.as_tagged(heap).raw(),
+                )
+            };
+
+            let to_primitive_symbol =
+                scope.handle(heap.known().to_primitive_symbol.as_tagged(heap).erase());
+            // 1. exotic @@toPrimitive (GetMethod)
+            let exotic =
+                Lookup::get_property_on(vm, heap, state, value, value, to_primitive_symbol)?;
+            let exotic = match exotic {
+                Coercion::Threw => return Ok(Coercion::Threw),
+                Coercion::Value(v) => scope.handle(v),
+            };
+            let exotic_word = exotic.as_tagged(heap).raw();
+            if exotic_word != undefined && exotic_word != null {
+                if !Self::is_callable(heap, exotic.as_tagged(heap)) {
+                    // GetMethod: a non-callable, non-nullish method is a TypeError
+                    return Err(VmError::Type);
+                }
+                let hint_string = {
+                    let s = heap.known().strings;
+                    match hint {
+                        Hint::Default => s.default.as_tagged(heap).raw(),
+                        Hint::Number => s.number.as_tagged(heap).raw(),
+                        Hint::String => s.string.as_tagged(heap).raw(),
+                    }
+                };
+                let args =
+                    scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(hint_string) }]);
+                let result = RuntimeContext::new(vm, heap, state).call_rooted(exotic, args)?;
+                if result == exception {
+                    return Ok(Coercion::Threw);
+                }
+                return {
+                    let cond_1 = Convert::is_primitive(heap, unsafe { result.assume_valid(heap) });
+                    if cond_1 {
+                        // Safety: the call above just returned; no GC since.
+                        Ok(Coercion::Value(unsafe {
+                            Tagged::from_value_unchecked(result)
+                        }))
+                    } else {
+                        Err(VmError::Type)
+                    }
+                };
+            }
+
+            // 2. OrdinaryToPrimitive: hint string → toString first, else valueOf first
+            let method_names: [Handle<'_, Value>; 2] = {
+                let s = heap.known().strings;
+                if hint == Hint::String {
+                    [
+                        scope.handle(s.to_string.as_tagged(heap).erase()),
+                        scope.handle(s.value_of.as_tagged(heap).erase()),
+                    ]
+                } else {
+                    [
+                        scope.handle(s.value_of.as_tagged(heap).erase()),
+                        scope.handle(s.to_string.as_tagged(heap).erase()),
+                    ]
+                }
+            };
+            for name in method_names {
+                let method = Lookup::get_property_on(vm, heap, state, value, value, name)?;
+                let method = match method {
+                    Coercion::Threw => return Ok(Coercion::Threw),
+                    Coercion::Value(v) => scope.handle(v),
+                };
+                if !Self::is_callable(heap, method.as_tagged(heap)) {
+                    continue;
+                }
+                let receiver = value.as_tagged(heap).raw();
+                let args =
+                    scope.stage(&[unsafe { Tagged::<Value>::from_value_unchecked(receiver) }]);
+                let result = RuntimeContext::new(vm, heap, state).call_rooted(method, args)?;
+                if result == exception {
+                    return Ok(Coercion::Threw);
+                }
+                {
+                    let cond_2 = Convert::is_primitive(heap, unsafe { result.assume_valid(heap) });
+                    if cond_2 {
+                        // Safety: the call above just returned; no GC since.
+                        return Ok(Coercion::Value(unsafe {
+                            Tagged::from_value_unchecked(result)
+                        }));
+                    }
+                }
+                // object result: try the next method name
+            }
+            Err(VmError::Type)
+        })
+    }
+
+    /// ToNumeric (ES 7.1.3): ToPrimitive with hint Number, then ToNumber.
+    /// `None` means user code threw (pending exception holds it).
+    pub fn to_numeric(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        value: Handle<'_, Value>,
+    ) -> Result<Option<f64>, VmError> {
+        state.handle_scope(|scope| {
+            match Self::to_primitive(vm, heap, state, value, Hint::Number)? {
+                Coercion::Threw => Ok(None),
+                // root the anchored result to release the heap borrow
+                Coercion::Value(v) => {
+                    let v = scope.handle(v);
+                    Ok(Some({ Convert::to_number(heap, v.as_tagged(heap)) }?))
+                }
+            }
+        })
+    }
+
+    pub fn numeric_op(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        a: Handle<'_, Value>,
+        b: Handle<'_, Value>,
+        op: fn(f64, f64) -> f64,
+    ) -> Result<Option<Value>, VmError> {
+        // to_numeric runs user code (valueOf): both operands are rooted by
+        // the caller's handles, so the sibling survives the first coercion.
+        let a = Self::to_numeric(vm, heap, state, a)?;
+        let Some(a) = a else { return Ok(None) };
+        let b = Self::to_numeric(vm, heap, state, b)?;
+        let Some(b) = b else { return Ok(None) };
+        let r = op(a, b);
+        Ok(state.handle_scope(|scope| Some(heap.new_number(&scope, r).raw())))
+    }
+
+    pub fn is_callable<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
+        let Some(obj) = v.as_heap_object() else {
+            return false;
+        };
+        obj.as_ref().header.map.heap_ref(heap).kind().is_callable()
+    }
+
+    /// ES 7.1.18 ToPropertyKey: smis and symbols pass through, everything
+    /// else is coerced to its interned canonical string. The returned
+    /// name is anchored at the `&mut Heap` borrow; callers store the word
+    /// (or root it) before the next allocation. `None` means user code
+    /// threw (the pending exception holds it).
+    pub fn to_property_key<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        v: Handle<'_, Value>,
+    ) -> Result<Option<Tagged<'a, SlotName>>, VmError> {
+        // Smis are pointer-free: valid at any lifetime, no rooting needed.
+        if let Some(smi) = Smi::decode(v.as_tagged(heap).raw()) {
+            return Ok(Some(Tagged::from(smi)));
+        }
+        state.handle_scope(|scope| {
+            let cond_5 = v.as_tagged(heap).get_as::<Symbol>().is_some();
+            if cond_5 {
+                return Ok(Some(v.as_tagged(heap).as_name()));
+            }
+            let is_string = v.as_tagged(heap).get_as::<DenseString>().is_some();
+            let primitive: Handle<'_, Value> = if is_string {
+                v
+            } else {
+                match Self::to_primitive(vm, heap, state, v, Hint::String)? {
+                    Coercion::Threw => return Ok(None),
+                    Coercion::Value(p) => scope.handle(p),
+                }
+            };
+            // Named lookup compares interned strings by pointer:
+            // canonicalize exactly once here, then every downstream
+            // bits-compare is sound.
+            let stringified = Convert::to_string(heap, &scope, primitive)?;
+            let interned = match scope.cast::<DenseString>(stringified) {
+                Some(s) => vm.interner().intern_value(heap, &scope, &s),
+                // ToString of a symbol primitive throws (ES 6.1.7.1)
+                None => return Err(VmError::Type),
+            };
+            // fresh anchored re-read of the rooted interned word
+            Ok(Some(interned.as_tagged(heap).into()))
+        })
+    }
+
+    /// ES 13.5.3 typeof: the well-known type string for a value. `null`
+    /// reports `"object"`; callables report `"function"`.
+    pub fn type_of<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> Tagged<'a, Value> {
+        let strings = heap.known().strings;
+        if v.is_smi() || v.get_as::<Float>().is_some() {
+            strings.number.as_tagged(heap).erase()
+        } else if v == heap.known().undefined.as_tagged(heap)
+            || v == heap.known().the_hole.as_tagged(heap)
+        {
+            strings.undefined.as_tagged(heap).erase()
+        } else if v == heap.known().null.as_tagged(heap) {
+            strings.object.as_tagged(heap).erase()
+        } else if v == heap.known().true_object.as_tagged(heap)
+            || v == heap.known().false_object.as_tagged(heap)
+        {
+            strings.boolean.as_tagged(heap).erase()
+        } else if v.get_as::<DenseString>().is_some() {
+            strings.string.as_tagged(heap).erase()
+        } else if v.get_as::<Symbol>().is_some() {
+            strings.symbol.as_tagged(heap).erase()
+        } else if let Some(obj) = v.as_heap_object() {
+            if obj.as_ref().header.map.heap_ref(heap).kind().is_callable() {
+                strings.function.as_tagged(heap).erase()
+            } else {
+                strings.object.as_tagged(heap).erase()
+            }
+        } else {
+            strings.object.as_tagged(heap).erase()
+        }
+    }
+
+    /// ES 13.10.2 instanceof / 7.3.20 OrdinaryHasInstance: `Get(C, "prototype")`
+    /// must yield an object (else TypeError), then walk the object's prototype
+    /// chain for it. `None` means user code threw.
+    pub fn instance_of(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        object: Value,
+        callable: Value,
+    ) -> Result<Option<bool>, VmError> {
+        // 4. P = Get(C, "prototype") — full [[Get]], getters may run user
+        // code: the object must stay rooted across it
+        state.handle_scope(|scope| {
+            // Safety: caller-supplied word, fresh at entry.
+            let object = scope.handle(unsafe { object.assume_valid(heap) });
+            let proxy_callable = scope.handle(unsafe { callable.assume_valid(heap) });
+            if !Self::is_callable(heap, proxy_callable.as_tagged(heap)) {
+                return Err(VmError::Type);
+            }
+            let proto_name = scope.handle(heap.known().strings.prototype.as_tagged(heap).erase());
+            let proto = Lookup::get_property_on(
+                vm,
+                heap,
+                state,
+                proxy_callable,
+                proxy_callable,
+                proto_name,
+            )?;
+            let proto = match proto {
+                Coercion::Threw => return Ok(None),
+                Coercion::Value(v) => scope.handle(v),
+            };
+            // 5. P must be an object
+            {
+                let cond_6 = Convert::is_primitive(heap, proto.as_tagged(heap));
+                if cond_6 {
+                    return Err(VmError::Type);
+                }
+            }
+            Ok(Some({
+                Self::has_proto_in_chain(heap, object.as_tagged(heap), proto.as_tagged(heap))
+            }))
+        })
+    }
+
+    /// OrdinaryHasInstance step 6: walk the prototype chain of `object`.
+    pub fn has_proto_in_chain<'a>(
+        heap: &'a Heap,
+        object: Tagged<'a, Value>,
+        target: Tagged<'a, Value>,
+    ) -> bool {
+        let Some(obj) = object.as_heap_object() else {
+            return false;
+        };
+        let proto = obj.as_ref().header.map.heap_ref(heap).prototype.get(heap);
+        if proto.ptr_eq(target) {
+            return true;
+        }
+        if proto == heap.known().null.as_tagged(heap) {
+            return false;
+        }
+        if let Some(parents) = proto.get_as::<FixedArray>() {
+            for i in 0..parents.len() {
+                if Self::has_proto_in_chain(heap, parents.at(heap, i), target) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        Self::has_proto_in_chain(heap, proto, target)
+    }
+
+    /// Same, for `new.target` values that may be exotic (a constructor
+    /// proxy): only `Get(new.target, "prototype")` is observed.
+    pub fn create_construct_receiver_value<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        new_target: Handle<'_, Value>,
+    ) -> Result<Option<Tagged<'a, Value>>, VmError> {
+        state.handle_scope(|scope| {
+            let proto_name = scope.handle(heap.known().strings.prototype.as_tagged(heap).erase());
+            let proto =
+                Lookup::get_property_on(vm, heap, state, new_target, new_target, proto_name)?;
+            let proto = match proto {
+                Coercion::Threw => return Ok(None),
+                Coercion::Value(v) => scope.handle(v),
+            };
+            // non-object prototypes fall back to the ordinary prototype
+            let proto = scope.cast::<Object>(proto.as_tagged(heap));
+            let known = heap.known();
+            let obj = heap
+                .new_object(&scope, known.object_initial_map, HandleSlice::EMPTY)
+                .into_handle(&scope);
+            if let Some(proto) = proto {
+                Object::set_prototype(heap, &scope, obj, proto.erase())?;
+            }
+            Ok(Some(obj.as_tagged(heap).erase()))
+        })
     }
 }
