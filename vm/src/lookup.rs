@@ -1,7 +1,7 @@
 use crate::{
-    AccessorPair, DenseString, FixedArray, FrameMeta, GcSlot, HandleScope, Heap, HeapRef, Map,
-    Object, PropertyDescriptor, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, Value,
-    VmError,
+    AccessorPair, DenseString, FixedArray, FrameMeta, GcSlot, Handle, HandleScope, Heap, HeapRef,
+    Map, Object, PropertyDescriptor, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged,
+    Value, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -135,6 +135,50 @@ pub fn load_outcome<'a>(
     name: Tagged<'a, SlotName>,
 ) -> Result<LoadOutcome<'a>, VmError> {
     load_outcome_on(heap, receiver, name)
+}
+
+impl Lookup<'_> {
+    /// [[Get]] for a keyed load: an element key consults dense array
+    /// elements first (falling back to its canonical Smi name), a name
+    /// takes the ordinary path. Getters are returned for the caller to
+    /// invoke.
+    pub fn load_outcome_keyed<'a>(
+        heap: &'a Heap,
+        receiver: Tagged<'a, Value>,
+        key: Tagged<'a, SlotName>,
+    ) -> Result<LoadOutcome<'a>, VmError> {
+        match classify_key(heap, key.erase())? {
+            Key::Element(i) => match receiver
+                .as_heap_object()
+                .and_then(|obj| obj.as_ref().element_value(heap, i))
+            {
+                Some(v) => Ok(LoadOutcome::Value(v)),
+                // past the end, a hole, or a non-array receiver: ordinary lookup
+                None => load_outcome(heap, receiver, Tagged::from(Smi::new(i as i64))),
+            },
+            Key::Name(name) => load_outcome(heap, receiver, name),
+        }
+    }
+}
+
+impl DenseString {
+    /// The one-unit string an index load on a string primitive yields
+    /// (ES 5.4.3.1): `"ab"[1]` is "b". `None` for out-of-range keys and
+    /// non-string receivers, which fall through to the ordinary property
+    /// path.
+    pub fn index_element(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: Handle<'_, Value>,
+        key: Handle<'_, SlotName>,
+    ) -> Option<Value> {
+        let Ok(Key::Element(i)) = classify_key(heap, key.as_tagged(heap).erase()) else {
+            return None;
+        };
+        // Safety: fresh rooted-slot word.
+        let receiver = receiver.as_tagged(heap).raw();
+        DenseString::char_at(heap, scope, receiver, i).map(|s| s.as_tagged(heap).raw())
+    }
 }
 
 /// Ordinary [[GetOwnProperty]] as a full descriptor (ES 10.1.5): dense

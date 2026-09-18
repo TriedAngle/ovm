@@ -219,6 +219,24 @@ impl DenseString {
         }
     }
 
+    /// The one-code-unit string at index `i`, freshly allocated (string
+    /// comparisons are by content, so identity never shows). `None` when
+    /// the receiver is not a string or `i` is out of range (ES 6.1.4:
+    /// string indices are code units).
+    pub fn char_at<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        receiver: Value,
+        i: usize,
+    ) -> Option<Handle<'s, DenseString>> {
+        let unit = {
+            // Safety: caller-supplied word, fresh at entry.
+            let s = unsafe { receiver.assume_valid(heap) }.get_as::<DenseString>()?;
+            (i < s.len()).then(|| s.code_unit(heap, i))
+        }?;
+        Some(Self::from_units(heap, scope, &[unit]))
+    }
+
     pub fn to_rust_string(&self, heap: &Heap) -> String {
         self.data(heap).to_rust_string()
     }

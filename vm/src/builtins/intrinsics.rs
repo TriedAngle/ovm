@@ -258,26 +258,6 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
     data.matches_ascii(b"length") || canonical_index(data).is_some_and(|i| i < s.len())
 }
 
-/// The one-code-unit string at index `i` of a string value, freshly
-/// allocated (string comparisons are by content, so identity never
-/// shows). `None` when the receiver is not a string or `i` is out of
-/// range (ES 6.1.4: string indices are code units).
-pub fn string_char_at(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    receiver: Value,
-    i: usize,
-) -> Option<Value> {
-    let units = {
-        // Safety: caller-supplied word, fresh at entry.
-        let s = unsafe { receiver.assume_valid(heap) }.get_as::<DenseString>()?;
-        (i < s.len()).then(|| [s.code_unit(heap, i)])
-    }?;
-    // Safety: fresh rooted-slot word returned without an intervening
-    // allocation.
-    Some(unsafe { DenseString::from_units(heap, scope, &units).read_unchecked() })
-}
-
 /// Sloppy `delete x` on an unresolved name (ES 13.5.1.2 step 5 →
 /// GlobalEnvironmentRecord.DeleteBinding): (name) -> bool. Declared
 /// bindings resolve statically and compile to `false`; only global-object
