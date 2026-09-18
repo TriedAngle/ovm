@@ -1,8 +1,8 @@
 use core::alloc::Layout;
 
 use crate::{
-    Compare, DenseString, EdgeVisitable, FixedArray, GcSlot, Handle, Header, Heap, HeapObject,
-    HeapRef, ObjectKind, OptionGcSlot, Smi, Symbol, Tagged, TransitionGuard, Value, Visitor,
+    Compare, DenseString, EdgeVisitable, GcSlot, Handle, Header, Heap, HeapObject, ObjectKind,
+    OptionGcSlot, Smi, Symbol, Tagged, TransitionGuard, Value, Visitor, WeakFixedArray,
 };
 
 #[repr(C)]
@@ -17,9 +17,8 @@ pub struct Map {
     /// - a `FixedArray` of objects: multiple parents in priority order (Self-style `parent*`)
     /// - the hole: no parents (null-proto root)
     pub prototype: GcSlot,
-    /// Empty, or a `FixedArray` of flat `[name, target_map]` transition pairs.
-    // TODO: make transition targets weak (V8 does this so unused shape subtrees die)
-    pub transitions: OptionGcSlot<FixedArray>,
+    pub pred: OptionGcSlot<Map>,
+    pub transitions: OptionGcSlot<WeakFixedArray>,
     pub descriptors: [SlotDescriptor; 0],
 }
 
@@ -39,6 +38,18 @@ impl Map {
 
     pub fn descriptor_count(&self) -> usize {
         self.descriptor_count.to_smi().value() as usize
+    }
+
+    pub fn pred<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Map>> {
+        self.pred.get(heap)
+    }
+
+    pub fn root_map<'a>(&'a self, heap: &'a Heap) -> Tagged<'a, Map> {
+        let mut current: Tagged<'a, Map> = unsafe { Tagged::from_value_unchecked(self.erase()) };
+        while let Some(pred) = current.pred(heap) {
+            current = pred;
+        }
+        current
     }
 
     pub fn kind(&self) -> MapKind {
@@ -64,7 +75,7 @@ impl Map {
         name: Tagged<'a, SlotName>,
         flags: SlotFlags,
         pair: Option<(Tagged<'a, Value>, Tagged<'a, Value>)>,
-    ) -> Option<HeapRef<'a, Map>> {
+    ) -> Option<Tagged<'a, Map>> {
         let lock = heap.transition_lock();
         let guard = lock.acquire();
         self.find_transition_locked(heap, name, flags, pair, &guard)
@@ -77,7 +88,7 @@ impl Map {
         flags: SlotFlags,
         pair: Option<(Tagged<'a, Value>, Tagged<'a, Value>)>,
         _guard: &TransitionGuard<'_>,
-    ) -> Option<HeapRef<'a, Map>> {
+    ) -> Option<Tagged<'a, Map>> {
         let array = self.transitions.heap_ref(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
@@ -85,14 +96,18 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            if !entry[0].get(heap).ptr_eq(name.erase()) {
+            let Some(key) = entry[0].get(heap).strengthen() else {
+                continue;
+            };
+            if !key.ptr_eq(name.erase()) {
                 continue;
             }
-
-            let target = entry[1]
-                .get(heap)
-                .get_as::<Map>()
-                .expect("transition target must be a map");
+            let Some(target) = entry[1].upgrade(heap) else {
+                continue;
+            };
+            let Some(target) = target.get_as_tagged::<Map>() else {
+                continue;
+            };
 
             // adds append the property (last descriptor), redefines keep
             // its index: either way the descriptor row for `name` must
@@ -137,7 +152,7 @@ impl Map {
         heap: &'a Heap,
         name: Tagged<'a, SlotName>,
         _guard: &TransitionGuard<'_>,
-    ) -> Option<HeapRef<'a, Map>> {
+    ) -> Option<Tagged<'a, Map>> {
         let array = self.transitions.heap_ref(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
@@ -145,13 +160,18 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            if !entry[0].get(heap).ptr_eq(name.erase()) {
+            let Some(key) = entry[0].get(heap).strengthen() else {
+                continue;
+            };
+            if !key.ptr_eq(name.erase()) {
                 continue;
             }
-            let target = entry[1]
-                .get(heap)
-                .get_as::<Map>()
-                .expect("transition target must be a map");
+            let Some(target) = entry[1].upgrade(heap) else {
+                continue;
+            };
+            let Some(target) = target.get_as_tagged::<Map>() else {
+                continue;
+            };
             if target.descriptor_count() + 1 == self.descriptor_count()
                 && !target
                     .descriptors()
@@ -195,6 +215,7 @@ impl HeapObject for Map {
             .set(heap, host, Smi::new(config.kind.bits() as i64));
         self.prototype
             .set(heap, host, config.prototype.as_tagged(heap));
+        self.pred.clear(heap);
         self.transitions.clear(heap);
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let d = self.descriptor(i);
@@ -217,6 +238,7 @@ impl EdgeVisitable for Map {
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.prototype.as_raw());
+        visitor.visit(self.pred.as_raw());
         visitor.visit(self.transitions.as_raw());
         for d in self.descriptors() {
             visitor.visit(d.name.as_raw());

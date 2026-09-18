@@ -4,8 +4,8 @@ use core::alloc::Layout;
 
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef,
-    Key, Lookup, Map, MapInit, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
-    lookup_in_parents,
+    Key, Lookup, Map, MapInit, MaybeWeak, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
+    WeakFixedArray, WeakFixedArrayInit, lookup_in_parents,
 };
 
 /// Serializes map-transition tree mutations across threads. VM-internal:
@@ -314,7 +314,7 @@ impl Transition {
         let appends = usize::from(matches!(change, Change::Append));
 
         let map_layout = Map::layout_for(descriptor_count + appends);
-        let pairs_layout = FixedArray::layout_for(pairs_len + 2);
+        let pairs_layout = WeakFixedArray::<Value>::layout_for(pairs_len + 2);
         let total = match pair.is_some() {
             true => {
                 AllocToken::total_for(&[Layout::new::<AccessorPair>(), map_layout, pairs_layout])
@@ -355,14 +355,20 @@ impl Transition {
                 descriptors: &descriptors,
                 prototype,
             });
+            child
+                .pred
+                .set(heap, child.raw(), parent_ref.clone().into_tagged());
 
-            let mut pairs: Vec<Tagged<'_, Value>> = Vec::with_capacity(pairs_len + 2);
+            let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
             if let Some(old) = parent_ref.transitions.heap_ref(heap) {
-                pairs.extend(old.as_slice().iter().map(|slot| slot.get(heap)));
+                for entry in old.as_slice().as_chunks::<2>().0 {
+                    pairs.push(entry[0].get(heap));
+                    pairs.push(entry[1].get(heap));
+                }
             }
-            pairs.push(name_word.erase());
-            pairs.push(child.erase());
-            let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
+            pairs.push(name_word.erase().as_maybe_weak());
+            pairs.push(child.erase().as_weak());
+            let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
             parent_ref.transitions.set(heap, parent_ref.erase(), pairs);
 
             child.into_handle(scope)
@@ -378,31 +384,31 @@ impl Transition {
         value: Handle<Value>,
     ) {
         let slot_count = receiver.heap_ref(heap).map_ref(heap).value_slot_count() + 1;
-        heap.allocate_token_enter_heap(FixedArray::layout_for(slot_count), |token, heap| {
-            let receiver_ref = receiver.heap_ref(heap);
-            let target = receiver_ref
-                .map_ref(heap)
-                .find_transition(heap, name.as_tagged(heap), flags, None)
-                .expect("transition recorded above");
-            let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(slot_count);
-            values.extend(
-                receiver_ref
-                    .slots
-                    .heap_ref(heap)
-                    .as_slice()
-                    .iter()
-                    .map(|slot| slot.get(heap)),
-            );
-            values.push(value.as_tagged(heap));
-            debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
-            let slots = token.allocate::<FixedArray>(scope.stage(&values));
-            let host = receiver.as_tagged(heap).raw();
-            receiver_ref.slots.set(heap, host, slots);
-            receiver_ref
-                .header
-                .map
-                .set(heap, host, target.into_tagged());
-        });
+        heap.allocate_token_enter_heap(
+            FixedArray::<Value>::layout_for(slot_count),
+            |token, heap| {
+                let receiver_ref = receiver.heap_ref(heap);
+                let target = receiver_ref
+                    .map_ref(heap)
+                    .find_transition(heap, name.as_tagged(heap), flags, None)
+                    .expect("transition recorded above");
+                let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(slot_count);
+                values.extend(
+                    receiver_ref
+                        .slots
+                        .heap_ref(heap)
+                        .as_slice()
+                        .iter()
+                        .map(|slot| slot.get(heap)),
+                );
+                values.push(value.as_tagged(heap));
+                debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
+                let slots = token.allocate::<FixedArray>(scope.stage(&values));
+                let host = receiver.as_tagged(heap).raw();
+                receiver_ref.slots.set(heap, host, slots);
+                receiver_ref.header.map.set(heap, host, target);
+            },
+        );
     }
 
     fn swap_map(
@@ -421,7 +427,7 @@ impl Transition {
         receiver_ref
             .header
             .map
-            .set(heap, receiver.as_tagged(heap).raw(), target.into_tagged());
+            .set(heap, receiver.as_tagged(heap).raw(), target);
     }
 
     fn write_slot(
@@ -528,19 +534,22 @@ impl Transition {
                     values.iter().map(|h| h.as_tagged(heap)).collect();
                 scope.stage(&anchored)
             };
-            heap.allocate_token_enter_heap(FixedArray::layout_for(values.len()), |token, heap| {
-                let obj = receiver.heap_ref(heap);
-                let slots = token.allocate::<FixedArray>(values);
-                let host = receiver.as_tagged(heap).raw();
-                obj.slots.set(heap, host, slots);
-                obj.header.map.set(heap, host, existing.as_tagged(heap));
-            });
+            heap.allocate_token_enter_heap(
+                FixedArray::<Value>::layout_for(values.len()),
+                |token, heap| {
+                    let obj = receiver.heap_ref(heap);
+                    let slots = token.allocate::<FixedArray>(values);
+                    let host = receiver.as_tagged(heap).raw();
+                    obj.slots.set(heap, host, slots);
+                    obj.header.map.set(heap, host, existing.as_tagged(heap));
+                },
+            );
             return;
         }
 
         let map_layout = Map::layout_for(surviving.len());
-        let pairs_layout = FixedArray::layout_for(pairs_len + 2);
-        let slots_layout = FixedArray::layout_for(values.len());
+        let pairs_layout = WeakFixedArray::<Value>::layout_for(pairs_len + 2);
+        let slots_layout = FixedArray::<Value>::layout_for(values.len());
         let total = AllocToken::total_for(&[map_layout, pairs_layout, slots_layout]);
         let values = {
             let anchored: Vec<Tagged<'_, Value>> =
@@ -556,14 +565,20 @@ impl Transition {
                 descriptors: &surviving,
                 prototype,
             });
+            child
+                .pred
+                .set(heap, child.raw(), parent.clone().into_tagged());
             let name_word = name.as_tagged(heap);
-            let mut pairs: Vec<Tagged<'_, Value>> = Vec::with_capacity(pairs_len + 2);
+            let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
             if let Some(old) = parent.transitions.heap_ref(heap) {
-                pairs.extend(old.as_slice().iter().map(|slot| slot.get(heap)));
+                for entry in old.as_slice().as_chunks::<2>().0 {
+                    pairs.push(entry[0].get(heap));
+                    pairs.push(entry[1].get(heap));
+                }
             }
-            pairs.push(name_word.erase());
-            pairs.push(child.erase());
-            let pairs = token.allocate::<FixedArray>(scope.stage(&pairs));
+            pairs.push(name_word.erase().as_maybe_weak());
+            pairs.push(child.erase().as_weak());
+            let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
             parent.transitions.set(heap, parent.erase(), pairs);
             let slots = token.allocate::<FixedArray>(values);
             let host = receiver.as_tagged(heap).raw();

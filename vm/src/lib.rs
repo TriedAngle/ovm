@@ -38,7 +38,8 @@ pub use handle::{
     EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, HandleSlice, RootHandles,
 };
 pub use heap::{
-    AllocToken, EdgeVisitable, GcSlot, GlobalHeap, Heap, HeapRef, OptionGcSlot, Register, WordType,
+    AllocToken, EdgeVisitable, GcSlot, GlobalHeap, Heap, HeapRef, MaybeWeakGcSlot, OptionGcSlot,
+    Register, WordType,
 };
 pub use interner::StringInterner;
 pub use lookup::{
@@ -51,8 +52,8 @@ pub use objects::{
     DenseString, Encoding, FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry,
     HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map, MapInit, MapKind,
     Object, ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit, ProxyObject, ScopeInfo,
-    ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol, decode_wtf8,
-    object_kind, object_layout, string_content_hash, visit_object,
+    ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol, WeakFixedArray,
+    WeakFixedArrayInit, decode_wtf8, object_kind, object_layout, string_content_hash, visit_object,
 };
 pub use runtime::{Coercion, Hint, RuntimeCall, RuntimeContext, RuntimeIndex, RuntimeRegistry};
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
@@ -82,6 +83,7 @@ const _: () = {
     assert!(size_of::<Tagged<Value>>() == size_of::<Word>());
     assert!(size_of::<Tagged<DenseString>>() == size_of::<Word>());
     assert!(size_of::<GcSlot>() == size_of::<Word>());
+    assert!(size_of::<MaybeWeakGcSlot>() == size_of::<Word>());
     assert!(size_of::<OptionGcSlot<FixedArray>>() == size_of::<Word>());
     assert!(size_of::<GcSlot<Smi>>() == size_of::<Word>());
     assert!(size_of::<GcSlot<DenseString>>() == size_of::<Word>());

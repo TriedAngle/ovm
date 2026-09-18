@@ -9,7 +9,7 @@ pub mod proxy;
 pub mod string;
 pub mod symbol;
 
-pub use array::FixedArray;
+pub use array::{FixedArray, WeakFixedArray, WeakFixedArrayInit};
 pub use byte_array::FixedByteArray;
 pub use callable::{CallableInfoInit, CallableInfoObject, FunctionKind};
 pub use context::{
