@@ -1,0 +1,9 @@
+[package]
+name = "kette_compiler"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bytecode = { path = "../bytecode" }
+ir = { path = "../ir" }
+kette_parser = { path = "../kette_parser" }

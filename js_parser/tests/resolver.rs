@@ -1,6 +1,6 @@
-use parser::{Ast, FunctionId, Node, NodeId, Parser, Resolution, Utf8SliceStream, resolve};
+use js_parser::{Ast, FunctionId, Node, NodeId, Parser, Resolution, Utf8SliceStream, resolve};
 
-fn resolve_src(src: &str) -> (Ast, parser::Resolved) {
+fn resolve_src(src: &str) -> (Ast, js_parser::Resolved) {
     let mut p = Parser::new(Utf8SliceStream::new(src));
     p.parse_script()
         .unwrap_or_else(|e| panic!("parse error in {src:?}: {e}"));
@@ -13,7 +13,7 @@ fn resolve_src(src: &str) -> (Ast, parser::Resolved) {
 /// (declarator targets resolve like uses: their resolution is the store
 /// target of the declaration — ES 14.7.5's re-evaluated for-in head
 /// relies on it)
-fn resolutions_of(ast: &Ast, r: &parser::Resolved, name: &str) -> Vec<Resolution> {
+fn resolutions_of(ast: &Ast, r: &js_parser::Resolved, name: &str) -> Vec<Resolution> {
     (0..ast.node_count())
         .map(|i| NodeId(i as u32))
         .filter_map(|id| match ast.node(id) {

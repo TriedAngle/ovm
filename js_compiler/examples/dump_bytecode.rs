@@ -1,31 +1,36 @@
 //! Disassemble a script: parse → compile → print per-function bytecode.
 
 use bytecode::decode;
-use parser::Parser;
+use ir::Constant;
+use js_parser::Parser;
 
 fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: dump_bytecode <script.js>");
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
-    let mut p = Parser::new(parser::Utf8SliceStream::new(&src));
+    let mut p = Parser::new(js_parser::Utf8SliceStream::new(&src));
     p.parse_script().expect("parse");
     let ast = p.into_ast();
-    let compiled = match base_compiler::compile_script(&ast) {
+    let program = match js_compiler::compile_script(&ast) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("compile error: {e}");
             std::process::exit(1);
         }
     };
-    for (i, f) in compiled.functions.iter().enumerate() {
+    for (i, f) in program.functions().enumerate() {
         println!(
             "=== function {i} kind={:?} name={:?} params={} regs={} ===",
-            f.kind, f.name, f.formal_parameter_count, f.register_count
+            f.kind,
+            program.name(f).map(String::from_utf8_lossy),
+            f.arity,
+            f.register_count
         );
+        let code = program.code(f);
         let mut pc = 0usize;
-        while pc < f.bytecode.len() {
-            let (op, ops, next) = decode(&f.bytecode, pc);
+        while pc < code.len() {
+            let (op, ops, next) = decode(code, pc);
             print!("  {pc:4}: {op:?}");
             for (i, kind) in ops.kinds().iter().enumerate() {
                 use bytecode::Operand;
@@ -47,12 +52,12 @@ fn main() {
                 .map(|(i, _)| ops.idx(i))
                 .collect();
             for idx in idx_ops {
-                if let Some(c) = f.constants.get(idx) {
+                if let Some(c) = program.constants(f).get(idx) {
                     match c {
-                        base_compiler::Constant::String(s) => {
+                        Constant::String(s) => {
                             print!("  ; {:?} = {:?}", idx, String::from_utf8_lossy(s))
                         }
-                        base_compiler::Constant::Callable(fid) => print!("  ; {idx} = fn{fid:?}"),
+                        Constant::Callable(fid) => print!("  ; {idx} = fn{fid:?}"),
                         other => print!("  ; {idx} = {:?}", other),
                     }
                 }

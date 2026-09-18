@@ -1,0 +1,9 @@
+[package]
+name = "js_compiler"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bytecode = { path = "../bytecode" }
+ir = { path = "../ir" }
+js_parser = { path = "../js_parser" }

@@ -1,6 +1,6 @@
 //! Parse-only test262 harness.
 //!
-//! Usage: cargo run -p parser --example test262_parse -- <file-or-dir>...
+//! Usage: cargo run -p js_parser --example test262_parse -- <file-or-dir>...
 //! With no args, runs a small default selection known to fit the parser subset.
 //!
 //! Frontmatter handling: files with `negative: { phase: parse|syntax }` are
@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use parser::{Parser, Utf8SliceStream};
+use js_parser::{Parser, Utf8SliceStream};
 
 #[derive(Default)]
 struct Stats {

@@ -105,17 +105,11 @@ pub fn run_prelude(
     let (vm, heap, state) = thread.split();
     let empty = heap.known().empty_context;
     let closure = {
-        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(src));
-        p.parse_script().map_err(|e| {
-            eprintln!("{name} prelude parse error: {e}");
-            VmError::Type
-        })?;
-        let ast = p.into_ast();
-        let compiled = base_compiler::compile_script(&ast).map_err(|e| {
+        let program = js_compiler::compile_js(src, ir::SourceMode::Script).map_err(|e| {
             eprintln!("{name} prelude compile error: {e}");
             VmError::Type
         })?;
-        materialize_closure_vm(vm, heap, state, scope, &compiled, empty)?
+        materialize_closure_vm(vm, heap, state, scope, &program, empty)?
     };
     let (vm, heap, state) = thread.split();
     let exception = heap.known().exception.as_tagged(heap).raw();

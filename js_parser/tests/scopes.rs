@@ -1,4 +1,4 @@
-use parser::{
+use js_parser::{
     Ast, DeclKind, FunctionId, Node, Parser, ScopeId, ScopeKind, Symbol, Utf8SliceStream,
 };
 

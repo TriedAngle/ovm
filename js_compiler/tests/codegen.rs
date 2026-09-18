@@ -1,25 +1,31 @@
 //! Golden bytecode tests: compile snippets and assert on the emitted
 //! instruction stream.
 
-use base_compiler::{CompileError, CompiledScript, Constant, compile_script};
 use bytecode::{Opcode, Operand};
-use parser::{Parser, Utf8SliceStream};
+use ir::{Constant, Function, FunctionId, Program};
+use js_compiler::{CompileError, compile_script};
+use js_parser::{Parser, Utf8SliceStream};
 
-fn compile(src: &str) -> Result<CompiledScript, CompileError> {
+fn compile(src: &str) -> Result<Program, CompileError> {
     let mut p = Parser::new(Utf8SliceStream::new(src));
     p.parse_script().expect("parse failed");
     let ast = p.into_ast();
     compile_script(&ast)
 }
 
+fn script_fn(program: &Program) -> &Function {
+    program.function(FunctionId::SCRIPT)
+}
+
 /// Render the script function's bytecode with constants inlined and jump
 /// operands shown as absolute target pcs.
-fn disasm(script: &CompiledScript) -> Vec<String> {
-    let f = &script.functions[0];
+fn disasm(program: &Program) -> Vec<String> {
+    let f = script_fn(program);
+    let code = program.code(f);
     let mut out = Vec::new();
     let mut pc = 0;
-    while pc < f.bytecode.len() {
-        let (op, ops, next) = bytecode::decode(&f.bytecode, pc);
+    while pc < code.len() {
+        let (op, ops, next) = bytecode::decode(code, pc);
         let mut parts = vec![format!("{op:?}")];
         for (i, kind) in op.operands().iter().enumerate() {
             let v = match kind {
@@ -44,7 +50,7 @@ fn disasm(script: &CompiledScript) -> Vec<String> {
             let v = if *kind == Operand::Index
                 && (op == Opcode::LoadConstant || op == Opcode::CreateClosure)
             {
-                render_constant(&f.constants, ops.idx(i))
+                render_constant(program.constants(f), ops.idx(i))
             } else {
                 v.to_string()
             };
@@ -68,7 +74,7 @@ fn render_constant(constants: &[Constant], idx: usize) -> String {
     }
 }
 
-fn body(script: &CompiledScript) -> Vec<String> {
+fn body(script: &Program) -> Vec<String> {
     disasm(script)
 }
 
@@ -81,7 +87,8 @@ fn add_smi_temps_above_locals() {
     let script = compile("1 + 2;").unwrap();
     let out = body(&script);
     assert_eq!(
-        script.functions[0].register_count, 4,
+        script_fn(&script).register_count,
+        4,
         "locals(0) + ctx + completion + 2 temps"
     );
     let expect = [
@@ -107,7 +114,7 @@ fn add_smi_temps_above_locals() {
 fn nested_binary_reuses_temps() {
     let script = compile("1 + 2 + 3;").unwrap();
     let out = body(&script);
-    assert_eq!(script.functions[0].register_count, 4);
+    assert_eq!(script_fn(&script).register_count, 4);
     let expect = [
         "CreateFunctionContext 0",
         "PushContext 0",
@@ -581,7 +588,7 @@ fn throw_and_catch_binds_param() {
         "Return",
     ];
     assert_eq!(out, expect);
-    let handlers = &script.functions[0].handlers;
+    let handlers = script.handlers(script_fn(&script));
     assert_eq!(handlers.len(), 1);
     assert_eq!(handlers[0].try_start, 10);
     assert_eq!(handlers[0].try_end, 13);
@@ -611,11 +618,12 @@ fn function_declaration_creates_closure_and_stores() {
     ];
     assert_eq!(out, expect);
     // the nested function has its own prologue/epilogue
-    let inner = &script.functions[1];
+    let inner = script.function(FunctionId(1));
+    let inner_code = script.code(inner);
     let mut pc = 0;
     let mut inner_ops = Vec::new();
-    while pc < inner.bytecode.len() {
-        let (op, _, next) = bytecode::decode(&inner.bytecode, pc);
+    while pc < inner_code.len() {
+        let (op, _, next) = bytecode::decode(inner_code, pc);
         inner_ops.push(format!("{op:?}"));
         pc = next;
     }
@@ -637,11 +645,12 @@ fn function_declaration_creates_closure_and_stores() {
 #[test]
 fn parameters_are_negative_registers() {
     let script = compile("function f(a, b) { return a + b; }").unwrap();
-    let inner = &script.functions[1];
+    let inner = script.function(FunctionId(1));
+    let inner_code = script.code(inner);
     let mut pc = 0;
     let mut inner_ops = Vec::new();
-    while pc < inner.bytecode.len() {
-        let (op, ops, next) = bytecode::decode(&inner.bytecode, pc);
+    while pc < inner_code.len() {
+        let (op, ops, next) = bytecode::decode(inner_code, pc);
         let mut s = format!("{op:?}");
         for (i, kind) in op.operands().iter().enumerate() {
             if let Operand::Register = kind {
@@ -661,11 +670,12 @@ fn parameters_are_negative_registers() {
 fn closures_capture_via_context_slots() {
     let script = compile("var x = 1; function f() { return x; }").unwrap();
     // x is captured by f: lives in the script's context (slot 0)
-    let inner = &script.functions[1];
+    let inner = script.function(FunctionId(1));
+    let inner_code = script.code(inner);
     let mut found = false;
     let mut pc = 0;
-    while pc < inner.bytecode.len() {
-        let (op, ops, next) = bytecode::decode(&inner.bytecode, pc);
+    while pc < inner_code.len() {
+        let (op, ops, next) = bytecode::decode(inner_code, pc);
         if op == Opcode::LoadContextSlot {
             assert_eq!(ops.idx(0), 0, "captured slot");
             assert_eq!(ops.uimm(1), 1, "one function hop");

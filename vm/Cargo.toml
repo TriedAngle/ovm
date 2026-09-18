@@ -10,8 +10,8 @@ path = "src/main.rs"
 [dependencies]
 heap_api = { path = "../heap_api" }
 bytecode = { path = "../bytecode" }
-base_compiler = { path = "../base_compiler" }
-parser = { path = "../parser" }
+ir = { path = "../ir" }
+js_compiler = { path = "../js_compiler" }
 mark_sweep = { path = "../collectors/mark_sweep" }
 
 [features]

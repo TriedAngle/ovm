@@ -4,7 +4,6 @@ use crate::Object;
 use crate::RuntimeContext;
 use crate::materialize::materialize_closure_vm;
 use crate::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
-use base_compiler::compile_eval;
 
 pub fn eval_runtime<'a>(
     nctx: RuntimeContext<'a>,
@@ -31,17 +30,9 @@ pub fn eval_runtime<'a>(
                 .map(|s| s.to_rust_string(heap))
                 .ok_or(VmError::Type)?;
 
-        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&text));
-        if let Err(e) = p.parse_script() {
+        let program = match js_compiler::compile_js(&text, ir::SourceMode::Eval) {
+            Ok(program) => program,
             // TODO: a SyntaxError class; approximate with TypeError for now
-            let _ = e;
-            let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
-            state.set_pending_exception(ex);
-            return Ok(heap.known().exception.as_tagged(heap).erase());
-        }
-        let ast = p.into_ast();
-        let compiled = match compile_eval(&ast) {
-            Ok(c) => c,
             Err(_) => {
                 let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
                 state.set_pending_exception(ex);
@@ -52,7 +43,7 @@ pub fn eval_runtime<'a>(
         let context = scope
             .cast::<Context>(context.as_tagged(heap))
             .ok_or(VmError::Type)?;
-        let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
+        let closure = materialize_closure_vm(vm, heap, state, &scope, &program, context)?;
         RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
     })
 }

@@ -278,15 +278,8 @@ pub fn function_constructor<'a>(
             None => (String::new(), String::new()),
         };
         let source = format!("(function ({params}) {{\n{body}\n}})");
-        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(&source));
-        if p.parse_script().is_err() {
-            let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
-            state.set_pending_exception(ex);
-            return Ok(heap.known().exception.as_tagged(heap).erase());
-        }
-        let ast = p.into_ast();
-        let compiled = match base_compiler::compile_eval(&ast) {
-            Ok(c) => c,
+        let program = match js_compiler::compile_js(&source, ir::SourceMode::Eval) {
+            Ok(program) => program,
             Err(_) => {
                 let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
                 state.set_pending_exception(ex);
@@ -296,7 +289,7 @@ pub fn function_constructor<'a>(
         let context = scope
             .cast::<Context>(context.as_tagged(heap))
             .ok_or(VmError::Type)?;
-        let closure = materialize_closure_vm(vm, heap, state, &scope, &compiled, context)?;
+        let closure = materialize_closure_vm(vm, heap, state, &scope, &program, context)?;
         RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
     })
 }

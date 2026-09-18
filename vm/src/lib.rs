@@ -321,26 +321,22 @@ impl Thread {
     }
 
     pub fn run_script(&mut self, src: &str) -> Result<Value, ScriptError> {
-        self.run_compiled(src, base_compiler::compile_script)
+        self.run_source(src, js_compiler::compile_js, ir::SourceMode::Script)
     }
 
     pub fn run_script_repl(&mut self, src: &str) -> Result<Value, ScriptError> {
-        self.run_compiled(src, base_compiler::compile_repl)
+        self.run_source(src, js_compiler::compile_js, ir::SourceMode::Repl)
     }
 
-    fn run_compiled(
+    pub fn run_source(
         &mut self,
         src: &str,
-        compile: fn(
-            &parser::Ast,
-        ) -> Result<base_compiler::CompiledScript, base_compiler::CompileError>,
+        compile: ir::CompileFn,
+        mode: ir::SourceMode,
     ) -> Result<Value, ScriptError> {
-        let mut p = parser::Parser::new(parser::Utf8SliceStream::new(src));
-        p.parse_script().map_err(ScriptError::Parse)?;
-        let ast = p.into_ast();
-        let compiled = compile(&ast).map_err(ScriptError::Compile)?;
+        let program = compile(src, mode).map_err(ScriptError::from_frontend)?;
         self.handle_scope(|thread, scope| {
-            let closure = materialize::materialize_script(thread, &scope, &compiled)
+            let closure = materialize::materialize_script(thread, &scope, &program)
                 .map_err(ScriptError::Vm)?;
             thread.execute(closure, &[]).map_err(ScriptError::Vm)
         })
@@ -350,9 +346,18 @@ impl Thread {
 /// Failure of any stage of [`Thread::run_script`].
 #[derive(Debug)]
 pub enum ScriptError {
-    Parse(parser::ParseError),
-    Compile(base_compiler::CompileError),
+    Parse(ir::FrontendError),
+    Compile(ir::FrontendError),
     Vm(VmError),
+}
+
+impl ScriptError {
+    fn from_frontend(err: ir::FrontendError) -> Self {
+        match err.kind {
+            ir::FrontendErrorKind::Syntax => ScriptError::Parse(err),
+            ir::FrontendErrorKind::Compile => ScriptError::Compile(err),
+        }
+    }
 }
 
 impl core::fmt::Display for ScriptError {
