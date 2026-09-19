@@ -1,16 +1,6 @@
+pub use parser_utils::ByteSpan;
+
 use TokenInfo as I;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Span {
-    pub start: u32,
-    pub end: u32,
-}
-
-impl Span {
-    pub const fn new(start: u32, end: u32) -> Self {
-        Self { start, end }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
@@ -373,11 +363,11 @@ pub struct Token {
     /// A line terminator preceded this token (ASI, restricted productions).
     pub after_newline: bool,
     pub value: TokenValue,
-    pub span: Span,
+    pub span: ByteSpan,
 }
 
 impl Token {
-    pub const fn new(kind: TokenKind, span: Span) -> Self {
+    pub const fn new(kind: TokenKind, span: ByteSpan) -> Self {
         Self {
             kind,
             after_newline: false,

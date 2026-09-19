@@ -7,3 +7,4 @@ edition.workspace = true
 bytecode = { path = "../bytecode" }
 ir = { path = "../ir" }
 js_parser = { path = "../js_parser" }
+parser_utils = { path = "../parser_utils" }

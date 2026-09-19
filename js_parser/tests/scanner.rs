@@ -1,5 +1,5 @@
 use js_parser::TokenKind::*;
-use js_parser::{ParseError, Scanner, Span, Token, TokenKind, Utf8SliceStream};
+use js_parser::{ByteSpan, ParseError, Scanner, Token, TokenKind, Utf8SliceStream};
 
 fn scan_all(src: &str) -> Vec<Token> {
     let mut sc = Scanner::new(Utf8SliceStream::new(src));
@@ -274,9 +274,9 @@ fn asi_newline_flag() {
 #[test]
 fn spans_are_byte_offsets() {
     let toks = scan_all("alpha beta");
-    assert_eq!(toks[0].span, Span::new(0, 5));
-    assert_eq!(toks[1].span, Span::new(6, 10));
-    assert_eq!(toks[2].span, Span::new(10, 10)); // eof
+    assert_eq!(toks[0].span, ByteSpan::new(0, 5));
+    assert_eq!(toks[1].span, ByteSpan::new(6, 10));
+    assert_eq!(toks[2].span, ByteSpan::new(10, 10)); // eof
 }
 
 #[test]

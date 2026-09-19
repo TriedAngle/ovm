@@ -3,18 +3,14 @@ pub mod resolver;
 pub mod scanner;
 pub mod token;
 
-use std::collections::HashMap;
-
-pub use parser::{ParseError, Parser};
+pub use parser::Parser;
+pub use parser_utils::{ByteSpan, CharStream, ParseError, Symbol, SymbolTable, Utf8SliceStream};
 pub use resolver::{FunctionLayout, Resolution, Resolved, resolve, resolve_for_eval};
 pub use scanner::{Bookmark, ScanResult, Scanner};
-pub use token::{Span, Token, TokenInfo, TokenKind, TokenValue};
+pub use token::{Token, TokenInfo, TokenKind, TokenValue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u32);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Symbol(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub u32);
@@ -61,7 +57,7 @@ pub enum DeclKind {
 pub struct Declaration {
     pub name: Symbol,
     pub kind: DeclKind,
-    pub span: Span,
+    pub span: ByteSpan,
     /// positional register index of a plain `DeclKind::Param` declaration
     /// (`None` for pattern-bound param names and every other kind)
     pub param_index: Option<u32>,
@@ -359,7 +355,7 @@ impl Param {
 }
 
 pub struct FunctionInfo {
-    pub span: Span,
+    pub span: ByteSpan,
     pub name: Option<Symbol>,
     pub params: Vec<Param>,
     /// JS-visible `length`: the number of parameters preceding the first
@@ -440,7 +436,7 @@ pub struct ClassMember {
 }
 
 pub struct ClassInfo {
-    pub span: Span,
+    pub span: ByteSpan,
     pub name: Option<Symbol>,
     pub superclass: Option<NodeId>,
     pub members: Vec<ClassMember>,
@@ -460,41 +456,9 @@ pub struct ClassInfo {
     pub privates: Vec<Symbol>,
 }
 
-/// parse-local byte-slice interner; heap internalization at materialization
-#[derive(Default)]
-pub struct SymbolTable {
-    map: HashMap<Vec<u8>, Symbol>,
-    strings: Vec<Vec<u8>>,
-}
-
-impl SymbolTable {
-    pub fn intern(&mut self, s: &[u8]) -> Symbol {
-        if let Some(&sym) = self.map.get(s) {
-            return sym;
-        }
-        let sym = Symbol(self.strings.len() as u32);
-        let owned = s.to_vec();
-        self.strings.push(owned.clone());
-        self.map.insert(owned, sym);
-        sym
-    }
-
-    pub fn get(&self, sym: Symbol) -> &[u8] {
-        &self.strings[sym.0 as usize]
-    }
-
-    pub fn len(&self) -> usize {
-        self.strings.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.strings.is_empty()
-    }
-}
-
 pub struct Ast {
     nodes: Vec<Node>,
-    spans: Vec<Span>,
+    spans: Vec<ByteSpan>,
     /// shared pool backing every NodeList
     lists: Vec<NodeId>,
     strings: SymbolTable,
@@ -526,7 +490,7 @@ impl Ast {
         }
     }
 
-    pub fn add(&mut self, node: Node, span: Span) -> NodeId {
+    pub fn add(&mut self, node: Node, span: ByteSpan) -> NodeId {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(node);
         self.spans.push(span);
@@ -538,7 +502,7 @@ impl Ast {
         &self.nodes[id.0 as usize]
     }
 
-    pub fn span(&self, id: NodeId) -> Span {
+    pub fn span(&self, id: NodeId) -> ByteSpan {
         self.spans[id.0 as usize]
     }
 
@@ -623,7 +587,7 @@ impl Ast {
         self.scopes.len()
     }
 
-    pub fn declare(&mut self, scope: ScopeId, name: Symbol, kind: DeclKind, span: Span) {
+    pub fn declare(&mut self, scope: ScopeId, name: Symbol, kind: DeclKind, span: ByteSpan) {
         self.scopes[scope.0 as usize].decls.push(Declaration {
             name,
             kind,
@@ -638,7 +602,7 @@ impl Ast {
         scope: ScopeId,
         name: Symbol,
         kind: DeclKind,
-        span: Span,
+        span: ByteSpan,
         param_index: u32,
     ) {
         self.scopes[scope.0 as usize].decls.push(Declaration {
@@ -651,7 +615,7 @@ impl Ast {
 
     /// Replace the node stored at `id` (pattern cover-grammar rewrites keep
     /// node ids stable so parent references survive).
-    pub fn replace(&mut self, id: NodeId, node: Node, span: Span) {
+    pub fn replace(&mut self, id: NodeId, node: Node, span: ByteSpan) {
         self.nodes[id.0 as usize] = node;
         self.spans[id.0 as usize] = span;
     }
@@ -666,61 +630,5 @@ impl Ast {
 
     pub fn set_symbol_table(&mut self, strings: SymbolTable) {
         self.strings = strings;
-    }
-}
-
-/// Pull-based stream of decoded code points; the only encoding-specific
-/// layer. UTF-16 streams may yield lone surrogates (0xD800..=0xDFFF).
-pub trait CharStream {
-    /// &mut self: buffered/chunked streams may need to fetch data to answer
-    fn peek(&mut self) -> Option<u32>;
-    fn advance(&mut self);
-    /// byte offset for UTF-8, code units for UTF-16
-    fn pos(&self) -> u32;
-    /// backwards-only, over already-consumed data
-    fn seek(&mut self, pos: u32);
-    /// zero-copy access to a consumed range; `None` if the bytes are not
-    /// contiguous in memory (chunked streams), callers then fall back to
-    /// copying via seek/read
-    fn slice(&self, _start: u32, _end: u32) -> Option<&[u8]> {
-        None
-    }
-}
-
-pub struct Utf8SliceStream<'a> {
-    src: &'a str,
-    pos: usize,
-}
-
-impl<'a> Utf8SliceStream<'a> {
-    pub fn new(src: &'a str) -> Self {
-        Self { src, pos: 0 }
-    }
-}
-
-impl CharStream for Utf8SliceStream<'_> {
-    fn peek(&mut self) -> Option<u32> {
-        self.src[self.pos..].chars().next().map(|c| c as u32)
-    }
-
-    fn advance(&mut self) {
-        if let Some(c) = self.src[self.pos..].chars().next() {
-            self.pos += c.len_utf8();
-        }
-    }
-
-    fn pos(&self) -> u32 {
-        self.pos as u32
-    }
-
-    fn seek(&mut self, pos: u32) {
-        let pos = pos as usize;
-        assert!(pos <= self.pos, "streams only seek backwards");
-        assert!(self.src.is_char_boundary(pos), "seek to non-boundary {pos}");
-        self.pos = pos;
-    }
-
-    fn slice(&self, start: u32, end: u32) -> Option<&[u8]> {
-        Some(&self.src.as_bytes()[start as usize..end as usize])
     }
 }
