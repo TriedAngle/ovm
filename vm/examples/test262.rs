@@ -183,7 +183,7 @@ fn exception_name(thread: &mut vm::Thread) -> String {
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 return "exception".into();
             };
-            match o.as_ref().lookup(heap, name_key.as_tagged(heap).into()) {
+            match o.lookup(heap, name_key.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => slot
                     .get(heap)
                     .get_as::<vm::DenseString>()

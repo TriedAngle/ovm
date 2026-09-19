@@ -155,7 +155,7 @@ fn materialize_function<'s>(
         CallableKind::DerivedClassConstructor => FunctionKind::DerivedClassConstructor,
         CallableKind::DefaultDerivedConstructor => FunctionKind::DefaultDerivedConstructor,
     };
-    info.heap_ref(heap).set_metadata_full(
+    info.as_tagged(heap).set_metadata_full(
         heap,
         name.map(|h| h.as_tagged(heap).erase()),
         function.arity as usize,

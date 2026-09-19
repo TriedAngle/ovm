@@ -174,7 +174,7 @@ fn self_has_no_resolution() {
 
 #[test]
 fn example_ktt_resolves() {
-    let src = include_str!("../../js_parser/example.ktt");
+    let src = include_str!("../example.ktt");
     let mut p = Parser::new(Utf8SliceStream::new(src));
     p.parse_script().expect("parse");
     let ast = p.into_ast();

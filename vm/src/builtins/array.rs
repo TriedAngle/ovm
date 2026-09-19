@@ -91,7 +91,7 @@ pub fn array_iterator_next<'a>(
             let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object() else {
                 return Err(VmError::Type);
             };
-            let slots = obj.as_ref().slots.heap_ref(heap);
+            let slots = obj.as_ref().slots.get(heap);
             if slots.len() < 2 {
                 return Err(VmError::Type);
             }
@@ -132,7 +132,7 @@ pub fn array_iterator_next<'a>(
             let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object() else {
                 return Err(VmError::Type);
             };
-            let slots = obj.as_ref().slots.heap_ref(heap);
+            let slots = obj.as_ref().slots.get(heap);
             slots.set(heap, 1, Smi::new(index.value() + 1).into_tagged());
             Ok(())
         }?;

@@ -263,9 +263,9 @@ pub fn wrapper_value<'a>(
     let Some(obj) = receiver.as_heap_object() else {
         return Err(VmError::Type);
     };
-    let map = obj.as_ref().header.map.heap_ref(heap);
+    let map = obj.as_ref().header.map.get(heap);
     if !map.kind().contains(MapKind::PRIMITIVE_WRAPPER) {
         return Err(VmError::Type);
     }
-    Ok(obj.as_ref().slots.heap_ref(heap).at(heap, 0))
+    Ok(obj.as_ref().slots.get(heap).at(heap, 0))
 }

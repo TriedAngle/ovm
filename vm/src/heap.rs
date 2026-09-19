@@ -12,64 +12,6 @@ use crate::bootstrap::{KnownCell, WellKnown};
 use crate::WEAK_PTR;
 use core::{alloc::Layout, cell::Cell, marker::PhantomData, ops::FnOnce, ptr::NonNull};
 
-/// Direct reference to a heap object, valid only within the borrow of
-/// the heap it was created under (the same anchor a `Tagged<'a, _>`
-/// carries).
-pub struct HeapRef<'scope, T: HeapObject> {
-    ptr: HeapPtr<T>,
-    _phantom: PhantomData<&'scope T>,
-}
-
-impl<T: HeapObject> Clone for HeapRef<'_, T> {
-    fn clone(&self) -> Self {
-        HeapRef {
-            ptr: self.ptr,
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<'scope, T: HeapObject> HeapRef<'scope, T> {
-    pub fn from_ref(r: &'scope T) -> Self {
-        HeapRef {
-            ptr: unsafe { HeapPtr::new(r as *const T as *mut T) },
-            _phantom: PhantomData,
-        }
-    }
-
-    pub unsafe fn from_ptr(ptr: HeapPtr<T>) -> Self {
-        HeapRef {
-            ptr,
-            _phantom: PhantomData,
-        }
-    }
-
-    pub fn as_ref(&self) -> &'scope T {
-        unsafe { self.ptr.as_ref() }
-    }
-
-    pub fn into_ptr(self) -> HeapPtr<T> {
-        self.ptr
-    }
-
-    pub fn into_tagged(self) -> Tagged<'scope, T> {
-        // Safety: `HeapRef` proves the pointer is valid for `'scope`.
-        unsafe { Tagged::from_value_unchecked(self.ptr.encode_strong()) }
-    }
-
-    pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T> {
-        scope.create_handle(self.into_tagged())
-    }
-}
-
-impl<T: HeapObject> core::ops::Deref for HeapRef<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        unsafe { self.ptr.as_ref() }
-    }
-}
-
 pub struct AllocToken<'heap> {
     heap: &'heap mut Heap,
     next: Cell<*mut u8>,
@@ -107,20 +49,6 @@ impl<'heap> AllocToken<'heap> {
         // Safety: fresh strong pointer; the token's heap borrow is the
         // anchor and no GC can run while it is outstanding.
         unsafe { Tagged::from_value_unchecked(HeapPtr::<T>::new(ptr.as_ptr()).encode_strong()) }
-    }
-
-    pub fn allocate_ref<'g, T: HeapObject>(
-        &self,
-        config: T::Init<'_>,
-        _heap: &'g Heap,
-    ) -> HeapRef<'g, T> {
-        HeapRef {
-            ptr: self
-                .allocate::<T>(config)
-                .as_ptr()
-                .expect("fresh strong pointer"),
-            _phantom: PhantomData,
-        }
     }
 
     pub fn remaining(&self) -> usize {
@@ -201,14 +129,14 @@ impl<T: HeapObject> WeakGcCell<T> {
 
     // TODO: this maybe doens't make much sense
     // if a WeakGcCell is always weak, then upgrading it doesn't actually upgrade but only pretend
-    pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<HeapRef<'a, T>> {
+    pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<Tagged<'a, T>> {
         let word = self.cell.load();
         if word == WEAK_PTR {
             return None;
         }
         let strong = Value::from_bits(word & !TAG_MASK | STRONG_PTR);
         // Safety: anchored read of a cell the GC keeps up to date.
-        Some(unsafe { HeapRef::from_ptr(Tagged::<T>::from_value_unchecked(strong).into()) })
+        Some(unsafe { Tagged::from_value_unchecked(strong) })
     }
 }
 
@@ -274,18 +202,6 @@ impl<T> GcSlot<T> {
 impl GcSlot<Smi> {
     pub fn to_smi(&self) -> Smi {
         Smi::decode(self.inner()).expect("GcSlot invariant violated")
-    }
-}
-
-impl<T: HeapObject> GcSlot<T> {
-    /// Reads the slot as a heap reference valid under the current heap borrow.
-    pub fn heap_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, T> {
-        // Safe: `T` is this slot's declared type; the anchor proves no GC
-        // ran since the read.
-        self.get(heap)
-            .as_ptr()
-            .map(|ptr| unsafe { HeapRef::from_ptr(ptr) })
-            .expect("strong slot contents")
     }
 }
 
@@ -406,16 +322,6 @@ impl<T> OptionGcSlot<T> {
         self.slot
             .cell
             .store_raw(unsafe { heap.known().the_hole.read_unchecked() }.to_bits());
-    }
-}
-
-impl<T: HeapObject> OptionGcSlot<T> {
-    pub fn heap_ref<'a>(&self, heap: &'a Heap) -> Option<HeapRef<'a, T>> {
-        // Safety: fresh root-slot read for a word comparison.
-        if self.inner() == unsafe { heap.known().the_hole.read_unchecked() } {
-            return None;
-        }
-        Some(self.slot.heap_ref(heap))
     }
 }
 
@@ -615,21 +521,6 @@ impl Heap {
                 length: values.len(),
             },
         )
-    }
-
-    pub fn allocate_enter_heap<T: HeapObject, R>(
-        &mut self,
-        config: T::Init<'_>,
-        f: impl for<'a> FnOnce(HeapRef<'a, T>, &'a Heap) -> R,
-    ) -> R {
-        let ptr = self
-            .allocate::<T>(config)
-            .as_ptr()
-            .expect("fresh strong pointer");
-        let heap = &*self;
-        // Safety: fresh allocation, anchored at `heap`.
-        let r = unsafe { HeapRef::from_ptr(ptr) };
-        f(r, heap)
     }
 
     pub fn allocate_token(&mut self, total: Layout) -> AllocToken<'_> {

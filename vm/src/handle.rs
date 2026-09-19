@@ -6,8 +6,8 @@ use core::{
 };
 
 use crate::{
-    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, Heap, HeapObject, HeapPtr, HeapRef,
-    Map, RawCell, Register, Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, Heap, HeapObject, HeapPtr, Map,
+    RawCell, Register, Tagged, Value, Visitor,
 };
 
 /// A rooted reference to a `T` that survives relocation by the GC.
@@ -75,16 +75,6 @@ impl<'s, T: HeapObject> Handle<'s, T> {
         // Safety: handle slots only ever hold strong values.
         unsafe { Tagged::<T>::from_value_unchecked(self.read_unchecked()) }
             .as_ptr()
-            .expect("strong local slot must contain strong pointer")
-    }
-
-    pub fn heap_ref<'a>(self, heap: &'a Heap) -> HeapRef<'a, T> {
-        self.as_tagged(heap)
-            .as_ptr()
-            .map(|ptr| {
-                // Safety: anchored at `heap`; strong by handle invariant.
-                unsafe { HeapRef::from_ptr(ptr) }
-            })
             .expect("strong local slot must contain strong pointer")
     }
 }

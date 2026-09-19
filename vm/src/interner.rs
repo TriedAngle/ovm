@@ -84,7 +84,7 @@ impl StringInterner {
         s: &Handle<'_, DenseString>,
     ) -> Handle<'s, DenseString> {
         let staged: Result<Handle<'s, DenseString>, (InternKey, i64)> = {
-            let r = s.heap_ref(heap);
+            let r = s.as_tagged(heap);
             let hash = r.hash(heap);
             let mut table = self.table.lock().unwrap();
             let data = r.data(heap);

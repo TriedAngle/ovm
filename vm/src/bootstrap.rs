@@ -312,7 +312,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         descriptors: &[],
         prototype: roots.create_handle(Smi::new(0)),
     }));
-    map_map.heap_ref(heap).header.map.set(
+    map_map.as_tagged(heap).header.map.set(
         heap,
         map_map.as_tagged(heap).raw(),
         map_map.as_tagged(heap),
@@ -356,15 +356,15 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.null_map = null_map;
     heap.set_known(known);
 
-    map_map.heap_ref(heap).transitions.clear(heap);
-    the_hole_map.heap_ref(heap).transitions.clear(heap);
-    null_map.heap_ref(heap).transitions.clear(heap);
-    the_hole_map.heap_ref(heap).prototype.set(
+    map_map.as_tagged(heap).transitions.clear(heap);
+    the_hole_map.as_tagged(heap).transitions.clear(heap);
+    null_map.as_tagged(heap).transitions.clear(heap);
+    the_hole_map.as_tagged(heap).prototype.set(
         heap,
         the_hole_map.as_tagged(heap).raw(),
         null.as_tagged(heap).erase(),
     );
-    null_map.heap_ref(heap).prototype.set(
+    null_map.as_tagged(heap).prototype.set(
         heap,
         null_map.as_tagged(heap).raw(),
         null.as_tagged(heap).erase(),
@@ -599,7 +599,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     heap.set_known(known);
 
     let null = known.null;
-    let o = null.heap_ref(heap);
+    let o = null.as_tagged(heap);
     o.slots.set(
         heap,
         null.as_tagged(heap).raw(),
@@ -613,21 +613,21 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     // ordinary function objects' [[Prototype]] is %Function.prototype%
     // (ES 19.2.3.1): function_map was created with a null placeholder
     // in bootstrap_basics
-    known.function_map.heap_ref(heap).prototype.set(
+    known.function_map.as_tagged(heap).prototype.set(
         heap,
         known.function_map.as_tagged(heap).raw(),
         function_prototype.as_tagged(heap).erase(),
     );
     known
         .non_constructor_function_map
-        .heap_ref(heap)
+        .as_tagged(heap)
         .prototype
         .set(
             heap,
             known.non_constructor_function_map.as_tagged(heap).raw(),
             function_prototype.as_tagged(heap).erase(),
         );
-    known.class_constructor_map.heap_ref(heap).prototype.set(
+    known.class_constructor_map.as_tagged(heap).prototype.set(
         heap,
         known.class_constructor_map.as_tagged(heap).raw(),
         function_prototype.as_tagged(heap).erase(),

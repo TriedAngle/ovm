@@ -222,10 +222,10 @@ fn exception_dispatch<'a>(
             let Some(info) = obj.as_ref().callable_info(heap) else {
                 break 'handled None;
             };
-            let Some(handlers) = info.handlers.heap_ref(heap) else {
+            let Some(handlers) = info.handlers.get(heap) else {
                 break 'handled None;
             };
-            handlers.lookup(pc)
+            handlers.as_ref().lookup(pc)
         };
         if let Some(handler_pc) = handled {
             let ex = state
@@ -689,14 +689,14 @@ fn step<'a>(
                     None => return Step::Error(VmError::Type),
                 };
                 for _ in 0..depth {
-                    context = match context.as_ref().outer.heap_ref(heap) {
+                    context = match context.as_ref().outer.get(heap) {
                         Some(context) => context,
                         None => return Step::Error(VmError::Type),
                     };
                 }
                 context
                     .slots
-                    .heap_ref(heap)
+                    .get(heap)
                     .as_ref()
                     .element_slot(ops.idx(0))
                     .inner()
@@ -710,16 +710,16 @@ fn step<'a>(
                 None => return Step::Error(VmError::Type),
             };
             for _ in 0..ops.uimm(1) {
-                context = match context.as_ref().outer.heap_ref(heap) {
+                context = match context.as_ref().outer.get(heap) {
                     Some(context) => context,
                     None => return Step::Error(VmError::Type),
                 };
             }
             // Safety: fresh anchored slot read.
-            let host = context.clone().into_tagged().raw();
+            let host = context.raw();
             context
                 .slots
-                .heap_ref(heap)
+                .get(heap)
                 .as_ref()
                 .element_slot(ops.idx(0))
                 .set(heap, host, acc.read(heap));
@@ -733,7 +733,7 @@ fn step<'a>(
                     .constants_ref(heap)
                     .at(heap, ops.idx(0))
                     .get_as::<ScopeInfo>()
-                    .map(|r| r.as_ref().names.heap_ref(heap).len())
+                    .map(|r| r.as_ref().names.get(heap).len())
                     .ok_or(VmError::Type)
             });
             let ctx = state.handle_scope(|scope| {
@@ -904,7 +904,7 @@ fn step<'a>(
             let Some(obj) = callee.as_tagged(heap).as_heap_object() else {
                 return Step::Error(VmError::Type);
             };
-            let kind = obj.as_ref().header.map.heap_ref(heap).kind();
+            let kind = obj.as_ref().header.map.get(heap).kind();
             if !kind.is_constructor() {
                 return Step::Error(VmError::Type);
             }

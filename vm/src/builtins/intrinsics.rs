@@ -4,11 +4,10 @@
 //! its ES section), not JS-visible library functions.
 
 use crate::{
-    AccessorPair, Context, Convert, DenseString, FixedArray, Handle, HandleSlice, Heap, HeapRef,
-    Key, LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi,
-    StoreOutcome, StoreSemantics, StringData, Symbol, Tagged, Value, VmError, home_proto,
-    private_find, runtime::Coercion, super_constructor, super_lookup_from_proto,
-    super_store_lookup,
+    AccessorPair, Context, Convert, DenseString, FixedArray, Handle, HandleSlice, Heap, Key,
+    LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, StoreOutcome,
+    StoreSemantics, StringData, Symbol, Tagged, Value, VmError, home_proto, private_find,
+    runtime::Coercion, super_constructor, super_lookup_from_proto, super_store_lookup,
 };
 
 use crate::Float;
@@ -581,7 +580,7 @@ fn for_in_next<'a>(
                 else {
                     return Err(VmError::Type);
                 };
-                let slots = obj.as_ref().slots.heap_ref(heap);
+                let slots = obj.as_ref().slots.get(heap);
                 let keys = slots
                     .at(heap, FOR_IN_KEYS)
                     .get_as::<FixedArray>()
@@ -603,11 +602,7 @@ fn for_in_next<'a>(
                     else {
                         return Err(VmError::Type);
                     };
-                    obj.as_ref()
-                        .slots
-                        .heap_ref(heap)
-                        .at(heap, FOR_IN_LEVEL)
-                        .raw()
+                    obj.as_ref().slots.get(heap).at(heap, FOR_IN_LEVEL).raw()
                 };
                 let Some(proto) = for_in_next_level(vm, heap, level)? else {
                     return Ok(heap.known().undefined.as_tagged(heap).erase());
@@ -632,7 +627,7 @@ fn for_in_next<'a>(
                 else {
                     return Err(VmError::Type);
                 };
-                let slots = obj.as_ref().slots.heap_ref(heap);
+                let slots = obj.as_ref().slots.get(heap);
                 // Safety: fresh rooted-slot words stored below.
                 slots.set(heap, FOR_IN_LEVEL, proto.as_tagged(heap).erase());
                 slots.set(heap, FOR_IN_KEYS, keys.as_tagged(heap).erase());
@@ -650,11 +645,7 @@ fn for_in_next<'a>(
                 else {
                     return Err(VmError::Type);
                 };
-                obj.as_ref()
-                    .slots
-                    .heap_ref(heap)
-                    .at(heap, FOR_IN_LEVEL)
-                    .raw()
+                obj.as_ref().slots.get(heap).at(heap, FOR_IN_LEVEL).raw()
             };
             let own = for_in_own_state(
                 heap,
@@ -676,7 +667,7 @@ fn for_in_next<'a>(
                 let visited = obj
                     .as_ref()
                     .slots
-                    .heap_ref(heap)
+                    .get(heap)
                     .at(heap, FOR_IN_VISITED)
                     .get_as::<FixedArray>()
                     .ok_or(VmError::Type)?;
@@ -697,7 +688,7 @@ fn for_in_next<'a>(
                     let key_word = unsafe { key.read_unchecked() };
                     obj.as_ref()
                         .slots
-                        .heap_ref(heap)
+                        .get(heap)
                         .at(heap, FOR_IN_VISITED)
                         .get_as::<FixedArray>()
                         .ok_or(VmError::Type)?
@@ -721,7 +712,7 @@ fn for_in_next<'a>(
                 else {
                     return Err(VmError::Type);
                 };
-                obj.as_ref().slots.heap_ref(heap).set(
+                obj.as_ref().slots.get(heap).set(
                     heap,
                     FOR_IN_VISITED,
                     visited.as_tagged(heap).erase(),
@@ -1139,7 +1130,7 @@ fn copy_data_properties<'a>(
                     }
                 }
             }
-            for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
+            for d in obj.as_ref().header.map.get(heap).descriptors() {
                 if d.flags().is_enumerable() {
                     keys.push(d.name(heap).raw());
                 }
@@ -1307,12 +1298,12 @@ fn set_class_fields<'a>(
         .ok_or(VmError::Arity)?;
     let mut ok = false;
     if let Some(obj) = ctor.as_heap_object() {
-        let slots = obj.as_ref().slots.heap_ref(heap);
+        let slots = obj.as_ref().slots.get(heap);
         if obj
             .as_ref()
             .header
             .map
-            .heap_ref(heap)
+            .get(heap)
             .kind()
             .is_class_constructor()
             && slots.len() >= 3
@@ -1357,7 +1348,7 @@ fn init_instance_fields<'a>(
         let Some(obj) = unsafe { ctor.assume_valid(heap) }.as_heap_object() else {
             break 'fields None;
         };
-        let slots = obj.as_ref().slots.heap_ref(heap);
+        let slots = obj.as_ref().slots.get(heap);
         (slots.len() >= 3).then(|| slots.at(heap, 2).raw())
     };
     let Some(fields) = fields else {
@@ -1476,7 +1467,7 @@ fn frame_context_value<'a>(
 /// the slot cell, or Reference when no context in the chain has the name.
 fn dynamic_slot<'a>(
     heap: &'a Heap,
-    context: &mut HeapRef<'a, Context>,
+    context: &mut Tagged<'a, Context>,
     name: Value,
 ) -> Result<&'a GcSlot, VmError> {
     // both sides are interned (constant pool / ScopeInfo names), so
@@ -1487,13 +1478,13 @@ fn dynamic_slot<'a>(
         .ok_or(VmError::Type)?;
     loop {
         let ctx = context.as_ref();
-        let names = ctx.scope_info.heap_ref(heap).as_ref().names.heap_ref(heap);
+        let names = ctx.scope_info.get(heap).as_ref().names.get(heap);
         for i in 0..names.len() {
             if names.at(heap, i) == name {
-                return Ok(ctx.slots.heap_ref(heap).as_ref().element_slot(i));
+                return Ok(ctx.slots.get(heap).as_ref().element_slot(i));
             }
         }
-        match ctx.outer.heap_ref(heap) {
+        match ctx.outer.get(heap) {
             Some(outer) => *context = outer,
             None => return Err(VmError::Reference),
         }
@@ -1728,8 +1719,7 @@ fn set_function_name<'a>(
             // the closure's own placeholder is never writable nor an accessor,
             // so only explicit member defines match here
             let explicit = match fn_obj
-                .heap_ref(heap)
-                .as_ref()
+                .as_tagged(heap)
                 .lookup(heap, name_key.as_tagged(heap))
             {
                 Lookup::Data { flags, .. } => flags.is_writable(),
@@ -1834,7 +1824,7 @@ fn install_accessor<'a>(
             let mut get = heap.known().undefined.as_tagged(heap).erase();
             let mut set = get;
             if let Some(obj) = target.as_tagged(heap).as_heap_object() {
-                for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
+                for d in obj.as_ref().header.map.get(heap).descriptors() {
                     if d.name(heap).ptr_eq(name) && d.flags().is_accessor() {
                         let pair = d
                             .value
@@ -2070,14 +2060,8 @@ fn throw_if_not_constructor_or_null<'a>(
     let ok = if v == heap.known().null.as_tagged(heap) {
         true
     } else {
-        v.as_heap_object().is_some_and(|obj| {
-            obj.as_ref()
-                .header
-                .map
-                .heap_ref(heap)
-                .kind()
-                .is_constructor()
-        })
+        v.as_heap_object()
+            .is_some_and(|obj| obj.as_ref().header.map.get(heap).kind().is_constructor())
     };
     if !ok {
         return Err(VmError::Type);
@@ -2364,7 +2348,7 @@ fn construct_super_via<'a>(
         let Some(obj) = unsafe { closure.assume_valid(heap) }.as_heap_object() else {
             break 'callee None;
         };
-        let proto = obj.as_ref().header.map.heap_ref(heap).prototype.inner();
+        let proto = obj.as_ref().header.map.get(heap).prototype.inner();
         let Some(proto_obj) = unsafe { proto.assume_valid(heap) }.as_heap_object() else {
             break 'callee None;
         };
@@ -2372,7 +2356,7 @@ fn construct_super_via<'a>(
             .as_ref()
             .header
             .map
-            .heap_ref(heap)
+            .get(heap)
             .kind()
             .is_constructor()
         {
@@ -2455,7 +2439,7 @@ fn store_dynamic_name<'a>(
                 let mut context = context.get_as::<Context>().ok_or(VmError::Type)?;
                 let target = dynamic_slot(heap, &mut context, name)?;
                 // Safety: fresh anchored word, stored below.
-                let host = context.into_tagged().raw();
+                let host = context.raw();
                 // Safety: caller-supplied word, fresh at entry, stored now.
                 let v = unsafe { value.assume_valid(heap) };
                 target.set(heap, host, v);

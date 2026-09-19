@@ -70,7 +70,7 @@ fn run_error_name(src: &str) -> String {
             let o = unsafe { ex.assume_valid(heap) }
                 .as_heap_object()
                 .expect("pending exception must be an object");
-            match o.as_ref().lookup(heap, name_key) {
+            match o.lookup(heap, name_key) {
                 vm::Lookup::Data { slot, .. } => {
                     let s = slot
                         .get(heap)

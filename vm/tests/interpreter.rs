@@ -75,7 +75,7 @@ fn expect_escaped(thread: &mut Thread, result: Result<Value, VmError>, class: &s
             let Some(o) = unsafe { anchored(heap, ex) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
+            match o.lookup(heap, name.as_tagged(heap).into()) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(slot.get(heap).raw(), expected_name, "error class name");
                 }
@@ -171,7 +171,7 @@ fn create_closure_of_kind(
         let name = intern_word(&mut *thread, &scope, name);
         {
             let heap = &*thread.heap();
-            info.heap_ref(heap).set_metadata(
+            info.as_tagged(heap).set_metadata(
                 heap,
                 Some(unsafe { anchored(heap, name) }),
                 formal_parameter_count,
@@ -642,9 +642,7 @@ fn define_named_own_property_attributes_and_value() {
             let heap = &*thread.heap();
             let read = |heap: &Heap, obj: Value| {
                 let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
-                // Safety: `obj` is a strong, live reference and no collection
-                // can happen inside the non-allocating region.
-                let o = unsafe { ptr.cast::<Object>().as_ref() };
+                let o = Tagged::from_ptr(heap, unsafe { ptr.cast::<Object>() });
                 match o.lookup(heap, name(heap, m)) {
                     Lookup::Data { slot, flags, .. } => {
                         assert_eq!(slot.get(heap).raw(), smi(8), "re-define updates the value");
@@ -749,7 +747,7 @@ fn define_keyed_own_property_string_and_smi_keys() {
         let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
         // happen inside the non-allocating region.
-        let o = unsafe { ptr.cast::<Object>().as_ref() };
+        let o = Tagged::from_ptr(heap, unsafe { ptr.cast::<Object>() });
         let expected_flags = SlotFlags::VALUE
             .union(SlotFlags::WRITABLE)
             .union(SlotFlags::CONFIGURABLE);
@@ -853,7 +851,7 @@ fn define_own_property_accessor_invokes_getter() {
         let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
         // happen inside the non-allocating region.
-        let o = unsafe { ptr.cast::<Object>().as_ref() };
+        let o = Tagged::from_ptr(heap, unsafe { ptr.cast::<Object>() });
         match o.lookup(heap, name(heap, p)) {
             Lookup::Accessor { pair, .. } => {
                 assert_eq!(pair.get.get(heap).raw(), getter);
@@ -2906,7 +2904,7 @@ fn create_closure_shares_callable_info_template() {
             .callable_info(heap)
             .expect("closure carries a callable info");
         // the info is shared, not copied per closure
-        assert_eq!(info.into_tagged().raw(), template);
+        assert_eq!(info.raw(), template);
         // the closure's context slot is the caller's (empty) context
         let context = o
             .as_ref()
@@ -2942,7 +2940,6 @@ fn create_closure_function_kind_controls_call_and_construct() {
         let Some(method) = unsafe { anchored(heap, method) }.as_heap_object() else {
             panic!("method must be an object")
         };
-        let method = method.as_ref();
         assert!(method.map_ref(heap).kind().is_callable());
         assert!(!method.map_ref(heap).kind().is_constructor());
         assert!(matches!(
@@ -2992,7 +2989,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
         assert!(kind.is_constructor());
         assert!(kind.is_class_constructor());
         assert!(matches!(
-            constructor.as_ref().lookup(heap, name(heap, prototype)),
+            constructor.lookup(heap, name(heap, prototype)),
             Lookup::NotFound
         ));
     };
@@ -4299,10 +4296,10 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
         {
             let heap = &*thread.heap();
             // no own property appeared on the child, the parent is untouched
-            let child_ref = child.heap_ref(heap);
-            assert_eq!(child_ref.header.map.heap_ref(heap).descriptor_count(), 0);
-            let parent_ref = parent.heap_ref(heap);
-            match parent_ref.as_ref().lookup(heap, name(heap, p)) {
+            let child_ref = child.as_tagged(heap);
+            assert_eq!(child_ref.header.map.get(heap).descriptor_count(), 0);
+            let parent_ref = parent.as_tagged(heap);
+            match parent_ref.lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.get(heap).raw()).unwrap().value(), 1);
                 }
@@ -4333,8 +4330,8 @@ fn shadow_store_defines_default_attributes() {
 
         {
             let heap = &*thread.heap();
-            let child_ref = child.heap_ref(heap);
-            let map = child_ref.header.map.heap_ref(heap);
+            let child_ref = child.as_tagged(heap);
+            let map = child_ref.header.map.get(heap);
             assert_eq!(map.descriptor_count(), 1);
             let d = map.descriptor(0);
             assert!(d.name(heap).ptr_eq(name(heap, p)));
@@ -4344,14 +4341,14 @@ fn shadow_store_defines_default_attributes() {
             assert!(d.flags().is_enumerable());
             assert!(d.flags().is_configurable());
             // the own slot wins, the parent keeps its value
-            match child_ref.as_ref().lookup(heap, name(heap, p)) {
+            match child_ref.lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.get(heap).raw()).unwrap().value(), 2);
                 }
                 _ => panic!("expected own data property"),
             }
-            let parent_ref = parent.heap_ref(heap);
-            match parent_ref.as_ref().lookup(heap, name(heap, p)) {
+            let parent_ref = parent.as_tagged(heap);
+            match parent_ref.lookup(heap, name(heap, p)) {
                 Lookup::Data { slot, .. } => {
                     assert_eq!(Smi::decode(slot.get(heap).raw()).unwrap().value(), 1);
                 }

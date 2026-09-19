@@ -26,8 +26,8 @@ fn map_handle<'s>(
     obj: Handle<'_, Object>,
 ) -> Handle<'s, Map> {
     let heap = &*thread.heap();
-    let map = obj.as_tagged(heap).as_ref().header.map.heap_ref(heap);
-    scope.handle(map.into_tagged())
+    let map = obj.as_tagged(heap).as_ref().header.map.get(heap);
+    scope.handle(map)
 }
 
 fn object_map_word(thread: &mut Thread, obj: Handle<'_, Object>) -> Value {
@@ -48,7 +48,7 @@ fn root_word(thread: &mut Thread, map: Value) -> Value {
     let map = unsafe { map.assume_valid(heap) }
         .get_as::<Map>()
         .expect("map");
-    map.into_tagged().root_map(heap).raw()
+    map.root_map(heap).raw()
 }
 
 fn add_prop(
@@ -74,7 +74,7 @@ fn transition_target<'a>(
     map: Tagged<'a, Map>,
     name: Tagged<'a, SlotName>,
 ) -> Option<Tagged<'a, Value>> {
-    let array = map.transitions.heap_ref(heap)?;
+    let array = map.transitions.get(heap)?;
     for entry in array.as_slice().as_chunks::<2>().0 {
         let Some(key) = entry[0].get(heap).strengthen() else {
             continue;
@@ -232,8 +232,7 @@ fn live_transition_subtree_survives_gc() {
         );
         let map_ab = unsafe { map_ab.assume_valid(heap) }
             .get_as::<Map>()
-            .expect("map")
-            .into_tagged();
+            .expect("map");
         assert_eq!(
             map_ab.root_map(heap).raw(),
             root.raw(),

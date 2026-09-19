@@ -89,7 +89,7 @@ impl Map {
         pair: Option<(Tagged<'a, Value>, Tagged<'a, Value>)>,
         _guard: &TransitionGuard<'_>,
     ) -> Option<Tagged<'a, Map>> {
-        let array = self.transitions.heap_ref(heap)?;
+        let array = self.transitions.get(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
             pairs.len() % 2 == 0,
@@ -105,7 +105,7 @@ impl Map {
             let Some(target) = entry[1].upgrade(heap) else {
                 continue;
             };
-            let Some(target) = target.get_as_tagged::<Map>() else {
+            let Some(target) = target.get_as::<Map>() else {
                 continue;
             };
 
@@ -153,7 +153,7 @@ impl Map {
         name: Tagged<'a, SlotName>,
         _guard: &TransitionGuard<'_>,
     ) -> Option<Tagged<'a, Map>> {
-        let array = self.transitions.heap_ref(heap)?;
+        let array = self.transitions.get(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
             pairs.len() % 2 == 0,
@@ -169,7 +169,7 @@ impl Map {
             let Some(target) = entry[1].upgrade(heap) else {
                 continue;
             };
-            let Some(target) = target.get_as_tagged::<Map>() else {
+            let Some(target) = target.get_as::<Map>() else {
                 continue;
             };
             if target.descriptor_count() + 1 == self.descriptor_count()

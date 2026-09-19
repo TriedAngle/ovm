@@ -65,7 +65,7 @@ pub fn object_get_prototype_of<'a>(
     let Some(obj) = arg.as_heap_object() else {
         return Err(VmError::Type);
     };
-    Ok(obj.as_ref().header.map.heap_ref(heap).prototype.get(heap))
+    Ok(obj.as_ref().header.map.get(heap).prototype.get(heap))
 }
 
 /// `Object.setPrototypeOf(O, proto)` (ES 20.1.2.20): primitives return O
@@ -94,7 +94,7 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
             }
         }
     }
-    for d in obj.as_ref().header.map.heap_ref(heap).descriptors() {
+    for d in obj.as_ref().header.map.get(heap).descriptors() {
         keys.push(d.name(heap).raw());
     }
     keys
@@ -189,7 +189,7 @@ pub fn object_property_is_enumerable<'a>(
                     .as_ref()
                     .header
                     .map
-                    .heap_ref(heap)
+                    .get(heap)
                     .descriptor(map_index)
                     .flags()
                     .is_enumerable(),
@@ -532,7 +532,7 @@ pub fn set_integrity_flags(
 ) {
     use crate::{Map, MapInit, MapKind, SlotFlags};
     let (kind, descriptor_count, already) = {
-        let map = obj.heap_ref(heap).map_ref(heap);
+        let map = obj.as_tagged(heap).map_ref(heap);
         (
             map.kind(),
             map.descriptors().len(),
@@ -552,7 +552,7 @@ pub fn set_integrity_flags(
     // read under the enter-heap anchor so the descriptor rows stay
     // anchored across the (allocating) map build
     heap.allocate_token_enter_heap(Map::layout_for(descriptor_count), |token, heap| {
-        let obj_ref = obj.heap_ref(heap);
+        let obj_ref = obj.as_tagged(heap);
         let map = obj_ref.map_ref(heap);
         // Safety: fresh map-slot word, rooted below before the allocation.
         let prototype = scope.handle(map.prototype.get(heap));
