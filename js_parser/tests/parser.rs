@@ -690,9 +690,9 @@ fn spans_cover_source() {
     let VarDecl { .. } = *stmt(&ast, 0) else {
         panic!()
     };
-    assert_eq!(ast.span(stmts(&ast)[0]), js_parser::Span::new(0, 9));
+    assert_eq!(ast.span(stmts(&ast)[0]), js_parser::ByteSpan::new(0, 9));
     let f = ast.function(FunctionId(0));
-    assert_eq!(f.span, js_parser::Span::new(0, 10));
+    assert_eq!(f.span, js_parser::ByteSpan::new(0, 10));
 }
 
 // -- try/catch/throw ---------------------------------------------------------------

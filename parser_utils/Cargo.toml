@@ -1,7 +1,6 @@
 [package]
-name = "kette_parser"
+name = "parser_utils"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-parser_utils = { path = "../parser_utils" }

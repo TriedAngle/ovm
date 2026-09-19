@@ -1,36 +1,11 @@
-use crate::token::{Span, Token, TokenKind};
+use parser_utils::ParseError;
+
+use crate::token::{ByteSpan, Token, TokenKind};
 use crate::{
     Ast, Bookmark, CharStream, ClassInfo, ClassMember, DeclKind, FunctionId, FunctionInfo,
     FunctionKind, Node, NodeId, NodeList, Param, PropKind, Scanner, ScopeId, ScopeKind, Symbol,
     SymbolTable, VarKind,
 };
-
-#[derive(Debug, Clone)]
-pub struct ParseError {
-    pub span: Span,
-    pub message: String,
-}
-
-impl ParseError {
-    pub fn new(span: Span, message: impl Into<String>) -> Self {
-        Self {
-            span,
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} at {}..{}",
-            self.message, self.span.start, self.span.end
-        )
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 fn is_identifier_like(kind: TokenKind) -> bool {
     kind == TokenKind::Identifier || kind.is_contextual()
@@ -75,7 +50,7 @@ struct ClassCtx {
     privates: Vec<Symbol>,
     /// `#name` references inside the body, validated at class end against
     /// this class's and enclosing classes' privates (forward refs are legal)
-    private_uses: Vec<(Symbol, Span)>,
+    private_uses: Vec<(Symbol, ByteSpan)>,
 }
 
 /// How a binding pattern declares its bound identifiers.
@@ -119,7 +94,7 @@ pub struct Parser<S: CharStream> {
     class_stack: Vec<ClassCtx>,
     next_literal_id: u32,
     /// bound names of the parameter list / pattern currently being parsed
-    pattern_names: Vec<(Symbol, Span)>,
+    pattern_names: Vec<(Symbol, ByteSpan)>,
     /// unconverted CoverInitializedName nodes (`{a = 1}` outside a pattern):
     /// a Syntax Error unless the enclosing literal is rewritten to a pattern
     /// (validated at the end of each statement)
@@ -177,7 +152,7 @@ impl<S: CharStream> Parser<S> {
         let start = self.peek()?.span.start;
         let literal_id = self.alloc_literal_id();
         let top_id = self.ast.add_function(FunctionInfo {
-            span: Span::new(start, start),
+            span: ByteSpan::new(start, start),
             name: None,
             params: Vec::new(),
             formal_length: 0,
@@ -193,14 +168,14 @@ impl<S: CharStream> Parser<S> {
             let scope_id = p.scopes.last().unwrap().id;
             let stmts = p.parse_statement_list(TokenKind::Eof)?;
             let end = p.next()?.span.end; // consume Eof
-            let body = p.add_block(stmts, Span::new(start, end));
+            let body = p.add_block(stmts, ByteSpan::new(start, end));
             p.ast.set_node_scope(body, scope_id);
             Ok(body)
         })?;
         let end = self.ast.span(body).end;
         let top = self.ast.function_mut(top_id);
         top.body = Some(body);
-        top.span = Span::new(start, end);
+        top.span = ByteSpan::new(start, end);
         Ok(top_id)
     }
 
@@ -407,7 +382,12 @@ impl<S: CharStream> Parser<S> {
         result
     }
 
-    fn declare_var(&mut self, sym: Symbol, span: Span, kind: DeclKind) -> Result<(), ParseError> {
+    fn declare_var(
+        &mut self,
+        sym: Symbol,
+        span: ByteSpan,
+        kind: DeclKind,
+    ) -> Result<(), ParseError> {
         let idx = self
             .scopes
             .iter()
@@ -428,7 +408,7 @@ impl<S: CharStream> Parser<S> {
     fn declare_lexical(
         &mut self,
         sym: Symbol,
-        span: Span,
+        span: ByteSpan,
         kind: DeclKind,
     ) -> Result<(), ParseError> {
         let scope_id = self.scopes.last().expect("always inside a scope").id;
@@ -444,7 +424,7 @@ impl<S: CharStream> Parser<S> {
     }
 
     /// Function declarations: var-like in a function scope, lexical in a block.
-    fn declare_function(&mut self, sym: Symbol, span: Span) -> Result<(), ParseError> {
+    fn declare_function(&mut self, sym: Symbol, span: ByteSpan) -> Result<(), ParseError> {
         if self.scopes.last().unwrap().is_function {
             self.declare_var(sym, span, DeclKind::Function)
         } else {
@@ -466,7 +446,7 @@ impl<S: CharStream> Parser<S> {
     fn declare_pattern_name(
         &mut self,
         sym: Symbol,
-        span: Span,
+        span: ByteSpan,
         ctx: PatCtx,
     ) -> Result<(), ParseError> {
         if self.pattern_names.iter().any(|&(s, _)| s == sym) {
@@ -534,7 +514,7 @@ impl<S: CharStream> Parser<S> {
                 TokenKind::Ellipsis => {
                     let t = self.next()?;
                     let target = self.parse_binding_pattern_inner(ctx)?;
-                    let span = Span::new(t.span.start, self.ast.span(target).end);
+                    let span = ByteSpan::new(t.span.start, self.ast.span(target).end);
                     elements.push(self.ast.add(Node::PatternRest { target }, span));
                     end = self.expect(TokenKind::RBracket)?.span.end;
                     break;
@@ -552,7 +532,7 @@ impl<S: CharStream> Parser<S> {
                         .unwrap_or(self.ast.span(target).end);
                     elements.push(self.ast.add(
                         Node::PatternElement { target, default },
-                        Span::new(elem_start, elem_end),
+                        ByteSpan::new(elem_start, elem_end),
                     ));
                     if self.eat(TokenKind::Comma)? {
                         continue;
@@ -565,7 +545,7 @@ impl<S: CharStream> Parser<S> {
         let elements = self.ast.list(&elements);
         Ok(self
             .ast
-            .add(Node::ArrayPattern { elements }, Span::new(start, end)))
+            .add(Node::ArrayPattern { elements }, ByteSpan::new(start, end)))
     }
 
     fn parse_object_binding_pattern(&mut self, ctx: PatCtx) -> Result<NodeId, ParseError> {
@@ -579,7 +559,7 @@ impl<S: CharStream> Parser<S> {
             if t.kind == TokenKind::Ellipsis {
                 let t = self.next()?;
                 let target = self.parse_binding_pattern_inner(ctx)?;
-                let span = Span::new(t.span.start, self.ast.span(target).end);
+                let span = ByteSpan::new(t.span.start, self.ast.span(target).end);
                 props.push(self.ast.add(Node::PatternRest { target }, span));
                 if self.eat(TokenKind::Comma)? {
                     continue;
@@ -601,7 +581,7 @@ impl<S: CharStream> Parser<S> {
                     .unwrap_or(self.ast.span(target).end);
                 self.ast.add(
                     Node::PatternElement { target, default },
-                    Span::new(key_span.start, end),
+                    ByteSpan::new(key_span.start, end),
                 )
             } else {
                 // shorthand `{ a }` / `{ a = default }`: identifier key only
@@ -623,7 +603,7 @@ impl<S: CharStream> Parser<S> {
                     .unwrap_or(self.ast.span(target).end);
                 self.ast.add(
                     Node::PatternElement { target, default },
-                    Span::new(key_span.start, end),
+                    ByteSpan::new(key_span.start, end),
                 )
             };
             let end = self.ast.span(elem).end;
@@ -633,7 +613,7 @@ impl<S: CharStream> Parser<S> {
                     value: elem,
                     computed,
                 },
-                Span::new(prop_start, end),
+                ByteSpan::new(prop_start, end),
             ));
             if self.eat(TokenKind::Comma)? {
                 continue;
@@ -643,7 +623,7 @@ impl<S: CharStream> Parser<S> {
         let props = self.ast.list(&props);
         Ok(self
             .ast
-            .add(Node::ObjectPattern { props }, Span::new(start, end)))
+            .add(Node::ObjectPattern { props }, ByteSpan::new(start, end)))
     }
 
     // -- statements -----------------------------------------------------------
@@ -711,7 +691,7 @@ impl<S: CharStream> Parser<S> {
     /// attaches it to loops and switches — whose breakable label set it
     /// becomes — and wraps anything else in break-only `Labeled` nodes.
     fn parse_statement(&mut self) -> Result<NodeId, ParseError> {
-        let mut labels: Vec<(Symbol, Span)> = Vec::new();
+        let mut labels: Vec<(Symbol, ByteSpan)> = Vec::new();
         loop {
             let t = self.peek()?;
             // `label : Statement` (not before function/class). No newline
@@ -754,22 +734,25 @@ impl<S: CharStream> Parser<S> {
         Ok(self.wrap_labels(labels, stmt))
     }
 
-    fn wrap_labels(&mut self, labels: Vec<(Symbol, Span)>, mut node: NodeId) -> NodeId {
+    fn wrap_labels(&mut self, labels: Vec<(Symbol, ByteSpan)>, mut node: NodeId) -> NodeId {
         for (label, span) in labels.into_iter().rev() {
             let end = self.ast.span(node).end;
             node = self.ast.add(
                 Node::Labeled { label, body: node },
-                Span::new(span.start, end),
+                ByteSpan::new(span.start, end),
             );
         }
         node
     }
 
-    fn label_syms(labels: &[(Symbol, Span)]) -> Vec<Symbol> {
+    fn label_syms(labels: &[(Symbol, ByteSpan)]) -> Vec<Symbol> {
         labels.iter().map(|&(l, _)| l).collect()
     }
 
-    fn parse_statement_body(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
+    fn parse_statement_body(
+        &mut self,
+        labels: &[(Symbol, ByteSpan)],
+    ) -> Result<NodeId, ParseError> {
         let t = self.peek()?;
         // a labelled item is a Statement, never a Declaration (ES 14.13):
         // `l: let …` reads `let` as an identifier expression (ASI splits
@@ -836,7 +819,7 @@ impl<S: CharStream> Parser<S> {
         let start = self.expect(TokenKind::LBrace)?.span.start;
         let stmts = self.parse_statement_list(TokenKind::RBrace)?;
         let end = self.expect(TokenKind::RBrace)?.span.end;
-        let block = self.add_block(stmts, Span::new(start, end));
+        let block = self.add_block(stmts, ByteSpan::new(start, end));
         if let Some(scope) = scope {
             self.ast.set_node_scope(block, scope);
         }
@@ -847,7 +830,7 @@ impl<S: CharStream> Parser<S> {
         self.in_scope(ScopeKind::Block, |p, _| p.parse_statement_block())
     }
 
-    fn add_block(&mut self, stmts: Vec<NodeId>, span: Span) -> NodeId {
+    fn add_block(&mut self, stmts: Vec<NodeId>, span: ByteSpan) -> NodeId {
         let stmts = self.ast.list(&stmts);
         self.ast.add(Node::Block { stmts }, span)
     }
@@ -869,7 +852,7 @@ impl<S: CharStream> Parser<S> {
         let decls = self.ast.list(&decls);
         Ok(self
             .ast
-            .add(Node::VarDecl { kind, decls }, Span::new(start, end)))
+            .add(Node::VarDecl { kind, decls }, ByteSpan::new(start, end)))
     }
 
     /// One declarator binding: an identifier (declared in the scope the
@@ -912,9 +895,10 @@ impl<S: CharStream> Parser<S> {
         let end = init
             .map(|i| self.ast.span(i).end)
             .unwrap_or(self.ast.span(target).end);
-        Ok(self
-            .ast
-            .add(Node::VarDeclarator { target, init }, Span::new(start, end)))
+        Ok(self.ast.add(
+            Node::VarDeclarator { target, init },
+            ByteSpan::new(start, end),
+        ))
     }
 
     fn parse_if(&mut self) -> Result<NodeId, ParseError> {
@@ -932,10 +916,10 @@ impl<S: CharStream> Parser<S> {
         let end = self.ast.span(end).end;
         Ok(self
             .ast
-            .add(Node::If { cond, then, else_ }, Span::new(start, end)))
+            .add(Node::If { cond, then, else_ }, ByteSpan::new(start, end)))
     }
 
-    fn parse_while(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
+    fn parse_while(&mut self, labels: &[(Symbol, ByteSpan)]) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::While)?.span.start;
         self.expect(TokenKind::LParen)?;
         let cond = self.parse_expression()?;
@@ -956,11 +940,11 @@ impl<S: CharStream> Parser<S> {
                 cond,
                 body,
             },
-            Span::new(start, end),
+            ByteSpan::new(start, end),
         ))
     }
 
-    fn parse_for(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
+    fn parse_for(&mut self, labels: &[(Symbol, ByteSpan)]) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::For)?.span.start;
         // the head gets its own scope: `for (let i ...)` binds there and does
         // not leak into the enclosing scope
@@ -985,10 +969,10 @@ impl<S: CharStream> Parser<S> {
                 let target = p.parse_declarator_binding(kind)?;
                 if p.eat(TokenKind::In)? {
                     let object = p.parse_expression()?;
-                    let decl_span = Span::new(decl_start, p.ast.span(object).end);
+                    let decl_span = ByteSpan::new(decl_start, p.ast.span(object).end);
                     let declarator = p.ast.add(
                         Node::VarDeclarator { target, init: None },
-                        Span::new(decl_start, p.ast.span(target).end),
+                        ByteSpan::new(decl_start, p.ast.span(target).end),
                     );
                     let decls = p.ast.list(&[declarator]);
                     let left = p.ast.add(Node::VarDecl { kind, decls }, decl_span);
@@ -1002,9 +986,10 @@ impl<S: CharStream> Parser<S> {
                     }
                     let end = p.ast.span(*decls.last().unwrap()).end;
                     let decls = p.ast.list(&decls);
-                    let expr = p
-                        .ast
-                        .add(Node::VarDecl { kind, decls }, Span::new(decl_start, end));
+                    let expr = p.ast.add(
+                        Node::VarDecl { kind, decls },
+                        ByteSpan::new(decl_start, end),
+                    );
                     p.expect(TokenKind::Semicolon)?;
                     Head::Init { expr: Some(expr) }
                 }
@@ -1062,7 +1047,7 @@ impl<S: CharStream> Parser<S> {
                             object,
                             body,
                         },
-                        Span::new(start, end),
+                        ByteSpan::new(start, end),
                     );
                     p.ast.set_node_scope(node, scope_id);
                     Ok(node)
@@ -1098,7 +1083,7 @@ impl<S: CharStream> Parser<S> {
                             next,
                             body,
                         },
-                        Span::new(start, end),
+                        ByteSpan::new(start, end),
                     );
                     p.ast.set_node_scope(node, scope_id);
                     Ok(node)
@@ -1124,7 +1109,7 @@ impl<S: CharStream> Parser<S> {
         self.expect_semicolon()?;
         Ok(self
             .ast
-            .add(Node::Return { value }, Span::new(t.span.start, end)))
+            .add(Node::Return { value }, ByteSpan::new(t.span.start, end)))
     }
 
     fn parse_break_continue(&mut self, kind: TokenKind) -> Result<NodeId, ParseError> {
@@ -1177,7 +1162,7 @@ impl<S: CharStream> Parser<S> {
         } else {
             Node::Continue { label }
         };
-        Ok(self.ast.add(node, Span::new(t.span.start, end)))
+        Ok(self.ast.add(node, ByteSpan::new(t.span.start, end)))
     }
 
     fn parse_expr_stmt(&mut self) -> Result<NodeId, ParseError> {
@@ -1197,12 +1182,12 @@ impl<S: CharStream> Parser<S> {
             ));
         }
         let expr = self.parse_expression()?;
-        let span = Span::new(t.span.start, self.ast.span(expr).end);
+        let span = ByteSpan::new(t.span.start, self.ast.span(expr).end);
         self.expect_semicolon()?;
         Ok(self.ast.add(Node::Throw { expr }, span))
     }
 
-    fn parse_switch(&mut self, labels: &[(Symbol, Span)]) -> Result<NodeId, ParseError> {
+    fn parse_switch(&mut self, labels: &[(Symbol, ByteSpan)]) -> Result<NodeId, ParseError> {
         let start = self.expect(TokenKind::Switch)?.span.start;
         self.expect(TokenKind::LParen)?;
         let disc = self.parse_expression()?;
@@ -1241,10 +1226,10 @@ impl<S: CharStream> Parser<S> {
                         .map(|s| p.ast.span(*s).end)
                         .unwrap_or(case_start);
                     let stmts = p.ast.list(&stmts);
-                    cases.push(
-                        p.ast
-                            .add(Node::SwitchCase { test, stmts }, Span::new(case_start, end)),
-                    );
+                    cases.push(p.ast.add(
+                        Node::SwitchCase { test, stmts },
+                        ByteSpan::new(case_start, end),
+                    ));
                 }
                 Ok(cases)
             })?;
@@ -1256,7 +1241,7 @@ impl<S: CharStream> Parser<S> {
                     disc,
                     cases,
                 },
-                Span::new(start, end),
+                ByteSpan::new(start, end),
             );
             p.ast.set_node_scope(node, scope);
             Ok(node)
@@ -1302,7 +1287,7 @@ impl<S: CharStream> Parser<S> {
         }
         if catch_block.is_none() && finally_block.is_none() {
             return Err(ParseError::new(
-                Span::new(start, self.ast.span(try_block).end),
+                ByteSpan::new(start, self.ast.span(try_block).end),
                 "`try` requires a `catch` or `finally` block",
             ));
         }
@@ -1315,7 +1300,7 @@ impl<S: CharStream> Parser<S> {
                 catch_block,
                 finally_block,
             },
-            Span::new(start, end),
+            ByteSpan::new(start, end),
         );
         if let Some(scope) = catch_scope {
             self.ast.set_node_scope(node, scope);
@@ -1342,7 +1327,7 @@ impl<S: CharStream> Parser<S> {
             None
         };
         if let Some(name) = name.filter(|_| is_declaration) {
-            self.declare_function(name, Span::new(start, start))?;
+            self.declare_function(name, ByteSpan::new(start, start))?;
         }
         self.parse_function_rest(
             start,
@@ -1492,7 +1477,7 @@ impl<S: CharStream> Parser<S> {
             .unwrap_or(params.len()) as u32;
         let literal_id = self.alloc_literal_id();
         self.ast.add_function(FunctionInfo {
-            span: Span::new(start, start),
+            span: ByteSpan::new(start, start),
             name,
             params,
             formal_length,
@@ -1518,12 +1503,12 @@ impl<S: CharStream> Parser<S> {
         let end = self.ast.span(body).end;
         let (strict, params) = {
             let info = self.ast.function_mut(fid);
-            info.span = Span::new(start, end);
+            info.span = ByteSpan::new(start, end);
             info.body = Some(body);
             (info.strict, info.params.clone())
         };
         if strict {
-            let mut names: Vec<(Symbol, Span)> = Vec::new();
+            let mut names: Vec<(Symbol, ByteSpan)> = Vec::new();
             for p in &params {
                 collect_pattern_names(&self.ast, p.target, &mut names);
             }
@@ -1608,7 +1593,7 @@ impl<S: CharStream> Parser<S> {
 
     /// Record a `#name` reference for end-of-class validation (forward
     /// references within the class body are legal, so checks are deferred).
-    fn note_private_use(&mut self, hidden: Symbol, span: Span) -> Result<(), ParseError> {
+    fn note_private_use(&mut self, hidden: Symbol, span: ByteSpan) -> Result<(), ParseError> {
         if self.class_stack.is_empty() {
             return Err(ParseError::new(
                 span,
@@ -1867,16 +1852,16 @@ impl<S: CharStream> Parser<S> {
             // super home-object slots (hidden const bindings in the class scope)
             let (home, static_home) = if ctx.uses_super {
                 let home = p.symbols_mut().intern(b".home_object");
-                p.declare_class_slot(class_scope, home, Span::new(start, start));
+                p.declare_class_slot(class_scope, home, ByteSpan::new(start, start));
                 let static_home = p.symbols_mut().intern(b".static_home_object");
-                p.declare_class_slot(class_scope, static_home, Span::new(start, start));
+                p.declare_class_slot(class_scope, static_home, ByteSpan::new(start, start));
                 (Some(home), Some(static_home))
             } else {
                 (None, None)
             };
 
             let class = p.ast.add_class(ClassInfo {
-                span: Span::new(start, end),
+                span: ByteSpan::new(start, end),
                 name,
                 superclass,
                 members,
@@ -1892,7 +1877,7 @@ impl<S: CharStream> Parser<S> {
                 } else {
                     Node::ClassExpr { class }
                 },
-                Span::new(start, end),
+                ByteSpan::new(start, end),
             );
             p.ast.set_node_scope(node, class_scope);
             Ok(node)
@@ -1948,8 +1933,8 @@ impl<S: CharStream> Parser<S> {
             let end = init.map(|i| p.ast.span(i).end).unwrap_or(start);
             let ret = p
                 .ast
-                .add(Node::Return { value: init }, Span::new(start, end));
-            let block = p.add_block(vec![ret], Span::new(start, end));
+                .add(Node::Return { value: init }, ByteSpan::new(start, end));
+            let block = p.add_block(vec![ret], ByteSpan::new(start, end));
             let scope = p.scopes.last().expect("initializer fn scope").id;
             p.ast.set_node_scope(block, scope);
             Ok(block)
@@ -1959,7 +1944,7 @@ impl<S: CharStream> Parser<S> {
         Ok(self.ast.add(Node::FunctionExpr { function: fid }, span))
     }
 
-    fn declare_class_slot(&mut self, scope: ScopeId, sym: Symbol, span: Span) {
+    fn declare_class_slot(&mut self, scope: ScopeId, sym: Symbol, span: ByteSpan) {
         self.ast.declare(scope, sym, DeclKind::Const, span);
         let s = self.scopes.last_mut().unwrap();
         if !s.lexically_declared.contains(&sym) {
@@ -1993,7 +1978,7 @@ impl<S: CharStream> Parser<S> {
         );
         let scope_id = self.push_scope(ScopeKind::Function);
         self.ast.scope_mut(scope_id).function = Some(fid);
-        let body = self.add_block(Vec::new(), Span::new(start, end));
+        let body = self.add_block(Vec::new(), ByteSpan::new(start, end));
         self.ast.set_node_scope(body, scope_id);
         self.scopes.pop();
         let info = self.ast.function_mut(fid);
@@ -2006,7 +1991,7 @@ impl<S: CharStream> Parser<S> {
 
     /// Parse `super.x`, `super[key]`, or `super(...)` after validating the
     /// syntactic context (ES 15.4).
-    fn parse_super(&mut self, span: Span) -> Result<NodeId, ParseError> {
+    fn parse_super(&mut self, span: ByteSpan) -> Result<NodeId, ParseError> {
         // the nearest enclosing non-arrow function must be a class member
         let fn_idx = self
             .fn_stack
@@ -2044,7 +2029,7 @@ impl<S: CharStream> Parser<S> {
                     _ => return Err(ParseError::new(name.span, "expected property name")),
                 };
                 let key = self.ast.add(Node::StringLiteral(sym), name.span);
-                let span = Span::new(span.start, name.span.end);
+                let span = ByteSpan::new(span.start, name.span.end);
                 self.class_stack[owning].uses_super = true;
                 Ok(self.ast.add(
                     Node::SuperProperty {
@@ -2066,7 +2051,7 @@ impl<S: CharStream> Parser<S> {
                         computed: true,
                         is_static,
                     },
-                    Span::new(span.start, end),
+                    ByteSpan::new(span.start, end),
                 ))
             }
             TokenKind::LParen => {
@@ -2081,7 +2066,7 @@ impl<S: CharStream> Parser<S> {
                 let (args, end) = self.parse_args()?;
                 Ok(self
                     .ast
-                    .add(Node::SuperCall { args }, Span::new(span.start, end)))
+                    .add(Node::SuperCall { args }, ByteSpan::new(span.start, end)))
             }
             _ => Err(ParseError::new(
                 t.span,
@@ -2097,7 +2082,7 @@ impl<S: CharStream> Parser<S> {
         let mut expr = self.parse_assignment()?;
         while self.eat(TokenKind::Comma)? {
             let rhs = self.parse_assignment()?;
-            let span = Span::new(self.ast.span(expr).start, self.ast.span(rhs).end);
+            let span = ByteSpan::new(self.ast.span(expr).start, self.ast.span(rhs).end);
             expr = self.ast.add(
                 Node::Binary {
                     op: TokenKind::Comma,
@@ -2147,7 +2132,7 @@ impl<S: CharStream> Parser<S> {
             let target = self.rewrite_assignment_pattern(lhs)?;
             self.next()?;
             let value = self.parse_assignment()?; // right-associative
-            let span = Span::new(self.ast.span(target).start, self.ast.span(value).end);
+            let span = ByteSpan::new(self.ast.span(target).start, self.ast.span(value).end);
             return Ok(self.ast.add(
                 Node::Assign {
                     op: TokenKind::Assign,
@@ -2161,7 +2146,7 @@ impl<S: CharStream> Parser<S> {
         let op = t.kind;
         self.next()?;
         let value = self.parse_assignment()?; // right-associative
-        let span = Span::new(self.ast.span(lhs).start, self.ast.span(value).end);
+        let span = ByteSpan::new(self.ast.span(lhs).start, self.ast.span(value).end);
         Ok(self.ast.add(
             Node::Assign {
                 op,
@@ -2304,7 +2289,7 @@ impl<S: CharStream> Parser<S> {
         let then = self.parse_assignment()?;
         self.expect(TokenKind::Colon)?;
         let else_ = self.parse_assignment()?;
-        let span = Span::new(self.ast.span(cond).start, self.ast.span(else_).end);
+        let span = ByteSpan::new(self.ast.span(cond).start, self.ast.span(else_).end);
         Ok(self.ast.add(Node::Conditional { cond, then, else_ }, span))
     }
 
@@ -2325,7 +2310,7 @@ impl<S: CharStream> Parser<S> {
                 prec + 1
             };
             let rhs = self.parse_binary(next_min)?;
-            let span = Span::new(self.ast.span(lhs).start, self.ast.span(rhs).end);
+            let span = ByteSpan::new(self.ast.span(lhs).start, self.ast.span(rhs).end);
             lhs = self.ast.add(Node::Binary { op, lhs, rhs }, span);
         }
         Ok(lhs)
@@ -2352,7 +2337,7 @@ impl<S: CharStream> Parser<S> {
             | TokenKind::Delete => {
                 self.next()?;
                 let expr = self.parse_unary()?;
-                let span = Span::new(t.span.start, self.ast.span(expr).end);
+                let span = ByteSpan::new(t.span.start, self.ast.span(expr).end);
                 // ES 13.5.1.1 early errors: strict code cannot delete an
                 // unqualified identifier or a private name. Parenthesized
                 // operands fold to the inner node, so `delete (((x)))` is
@@ -2391,7 +2376,7 @@ impl<S: CharStream> Parser<S> {
                 self.next()?;
                 let target = self.parse_unary()?;
                 self.check_assign_target(target)?;
-                let span = Span::new(t.span.start, self.ast.span(target).end);
+                let span = ByteSpan::new(t.span.start, self.ast.span(target).end);
                 Ok(self.ast.add(
                     Node::Update {
                         op: t.kind,
@@ -2412,7 +2397,7 @@ impl<S: CharStream> Parser<S> {
         if matches!(t.kind, TokenKind::PlusPlus | TokenKind::MinusMinus) && !t.after_newline {
             self.next()?;
             self.check_assign_target(expr)?;
-            let span = Span::new(self.ast.span(expr).start, t.span.end);
+            let span = ByteSpan::new(self.ast.span(expr).start, t.span.end);
             return Ok(self.ast.add(
                 Node::Update {
                     op: t.kind,
@@ -2456,7 +2441,9 @@ impl<S: CharStream> Parser<S> {
                 ));
             }
             self.next()?;
-            return Ok(self.ast.add(Node::NewTarget, Span::new(start, t.span.end)));
+            return Ok(self
+                .ast
+                .add(Node::NewTarget, ByteSpan::new(start, t.span.end)));
         }
         let callee = match self.peek()?.kind {
             TokenKind::New => self.parse_new()?,
@@ -2479,7 +2466,7 @@ impl<S: CharStream> Parser<S> {
         };
         Ok(self
             .ast
-            .add(Node::New { callee, args }, Span::new(start, end)))
+            .add(Node::New { callee, args }, ByteSpan::new(start, end)))
     }
 
     fn parse_member_tail(
@@ -2504,7 +2491,7 @@ impl<S: CharStream> Parser<S> {
                             let hidden = self.private_sym(name_sym);
                             self.note_private_use(hidden, name.span)?;
                             let node = self.ast.add(Node::PrivateName { sym: hidden }, name.span);
-                            let span = Span::new(self.ast.span(expr).start, name.span.end);
+                            let span = ByteSpan::new(self.ast.span(expr).start, name.span.end);
                             expr = self.ast.add(
                                 Node::Property {
                                     object: expr,
@@ -2518,7 +2505,7 @@ impl<S: CharStream> Parser<S> {
                         _ => return Err(ParseError::new(name.span, "expected property name")),
                     };
                     let key = self.ast.add(Node::StringLiteral(sym), name.span);
-                    let span = Span::new(self.ast.span(expr).start, name.span.end);
+                    let span = ByteSpan::new(self.ast.span(expr).start, name.span.end);
                     expr = self.ast.add(
                         Node::Property {
                             object: expr,
@@ -2532,7 +2519,7 @@ impl<S: CharStream> Parser<S> {
                     self.next()?;
                     let key = self.parse_expression()?;
                     let end = self.expect(TokenKind::RBracket)?.span.end;
-                    let span = Span::new(self.ast.span(expr).start, end);
+                    let span = ByteSpan::new(self.ast.span(expr).start, end);
                     expr = self.ast.add(
                         Node::Property {
                             object: expr,
@@ -2565,7 +2552,7 @@ impl<S: CharStream> Parser<S> {
                     let (args, end) = self.parse_args()?;
                     expr = self
                         .ast
-                        .add(Node::Call { callee: expr, args }, Span::new(start, end));
+                        .add(Node::Call { callee: expr, args }, ByteSpan::new(start, end));
                 }
                 _ => break,
             }
@@ -2582,7 +2569,7 @@ impl<S: CharStream> Parser<S> {
                 if t.kind == TokenKind::Ellipsis {
                     self.next()?;
                     let expr = self.parse_assignment()?;
-                    let span = Span::new(t.span.start, self.ast.span(expr).end);
+                    let span = ByteSpan::new(t.span.start, self.ast.span(expr).end);
                     args.push(self.ast.add(Node::Spread { expr }, span));
                 } else {
                     args.push(self.parse_assignment()?);
@@ -2685,7 +2672,7 @@ impl<S: CharStream> Parser<S> {
                 TokenKind::Ellipsis => {
                     self.next()?;
                     let expr = self.parse_assignment()?;
-                    let span = Span::new(t.span.start, self.ast.span(expr).end);
+                    let span = ByteSpan::new(t.span.start, self.ast.span(expr).end);
                     elements.push(self.ast.add(Node::Spread { expr }, span));
                     if self.eat(TokenKind::Comma)? {
                         continue;
@@ -2706,7 +2693,7 @@ impl<S: CharStream> Parser<S> {
         let elements = self.ast.list(&elements);
         Ok(self
             .ast
-            .add(Node::ArrayLiteral { elements }, Span::new(start, end)))
+            .add(Node::ArrayLiteral { elements }, ByteSpan::new(start, end)))
     }
 
     fn parse_object_literal(&mut self) -> Result<NodeId, ParseError> {
@@ -2724,7 +2711,7 @@ impl<S: CharStream> Parser<S> {
                         TokenKind::Ellipsis => {
                             p.next()?;
                             let expr = p.parse_assignment()?;
-                            let span = Span::new(t.span.start, p.ast.span(expr).end);
+                            let span = ByteSpan::new(t.span.start, p.ast.span(expr).end);
                             props.push(p.ast.add(Node::Spread { expr }, span));
                         }
                         _ => {
@@ -2748,12 +2735,12 @@ impl<S: CharStream> Parser<S> {
             }
             if ctx.uses_super {
                 let home = p.symbols_mut().intern(b".home_object");
-                p.declare_class_slot(obj_scope, home, Span::new(start, start));
+                p.declare_class_slot(obj_scope, home, ByteSpan::new(start, start));
             }
             let props = p.ast.list(&props);
             let node = p
                 .ast
-                .add(Node::ObjectLiteral { props }, Span::new(start, end));
+                .add(Node::ObjectLiteral { props }, ByteSpan::new(start, end));
             p.ast.set_node_scope(node, obj_scope);
             Ok(node)
         })
@@ -2788,7 +2775,7 @@ impl<S: CharStream> Parser<S> {
                     kind,
                     computed,
                 },
-                Span::new(t.span.start, vspan.end),
+                ByteSpan::new(t.span.start, vspan.end),
             ));
         }
         let (key, shorthand, computed) = self.parse_property_key()?;
@@ -2816,7 +2803,7 @@ impl<S: CharStream> Parser<S> {
                     kind: PropKind::Method,
                     computed,
                 },
-                Span::new(key_span.start, vspan.end),
+                ByteSpan::new(key_span.start, vspan.end),
             ));
         }
         let value = if self.eat(TokenKind::Colon)? {
@@ -2833,7 +2820,7 @@ impl<S: CharStream> Parser<S> {
             let value = self.ast.add(Node::Identifier { sym }, key_span);
             if self.eat(TokenKind::Assign)? {
                 let default = self.parse_assignment()?;
-                let span = Span::new(key_span.start, self.ast.span(default).end);
+                let span = ByteSpan::new(key_span.start, self.ast.span(default).end);
                 let prop_id = self.ast.add(
                     Node::Assign {
                         op: TokenKind::Assign,
@@ -2851,7 +2838,7 @@ impl<S: CharStream> Parser<S> {
                 value
             }
         };
-        let span = Span::new(key_span.start, self.ast.span(value).end);
+        let span = ByteSpan::new(key_span.start, self.ast.span(value).end);
         Ok(self.ast.add(
             Node::ObjectProperty {
                 key,
@@ -2905,8 +2892,8 @@ impl<S: CharStream> Parser<S> {
         kind: PropKind,
         function_kind: FunctionKind,
         force_strict: bool,
-        err_span: Span,
-    ) -> Result<(NodeId, Span), ParseError> {
+        err_span: ByteSpan,
+    ) -> Result<(NodeId, ByteSpan), ParseError> {
         let fid = self.parse_function_rest(
             start,
             name,
@@ -3012,7 +2999,7 @@ fn function_kind_for_property(kind: PropKind) -> FunctionKind {
 
 /// Collect the (name, span) of every identifier bound by a binding pattern
 /// (the target positions only — default expressions are references).
-pub fn collect_pattern_names(ast: &Ast, id: NodeId, out: &mut Vec<(Symbol, Span)>) {
+pub fn collect_pattern_names(ast: &Ast, id: NodeId, out: &mut Vec<(Symbol, ByteSpan)>) {
     match ast.node(id) {
         Node::Identifier { sym } => out.push((*sym, ast.span(id))),
         Node::ArrayPattern { elements } => {

@@ -4,17 +4,14 @@ pub type ScanResult = Result<Token, ParseError>;
 
 const NL: u32 = 0x0A; // \n
 const CR: u32 = 0x0D; // \r
-const LS: u32 = 0x2028;
-const PS: u32 = 0x2029;
 const BACKSLASH: u32 = 0x5C;
 
 fn is_newline(c: u32) -> bool {
-    matches!(c, NL | CR | LS | PS)
+    matches!(c, NL | CR)
 }
 
 fn is_ident_start(c: u32) -> bool {
     c == b'_' as u32
-        || c == b'$' as u32
         || c < 128 && (c as u8 as char).is_ascii_alphabetic()
         || c >= 0x80 && char::from_u32(c).is_some_and(|ch| ch.is_alphabetic())
 }
@@ -28,53 +25,17 @@ fn is_ident_continue(c: u32) -> bool {
 fn keyword_kind(text: &[u8]) -> Option<TokenKind> {
     use TokenKind::*;
     Some(match text {
-        b"break" => Break,
-        b"case" => Case,
-        b"catch" => Catch,
-        b"class" => Class,
-        b"const" => Const,
-        b"continue" => Continue,
-        b"debugger" => Debugger,
-        b"default" => Default,
-        b"delete" => Delete,
-        b"do" => Do,
-        b"else" => Else,
-        b"enum" => Enum,
-        b"export" => Export,
-        b"extends" => Extends,
-        b"false" => False,
-        b"finally" => Finally,
-        b"for" => For,
-        b"function" => Function,
-        b"if" => If,
-        b"import" => Import,
-        b"in" => In,
-        b"instanceof" => Instanceof,
-        b"new" => New,
-        b"null" => Null,
-        b"return" => Return,
-        b"super" => Super,
-        b"switch" => Switch,
-        b"this" => This,
-        b"throw" => Throw,
-        b"true" => True,
-        b"try" => Try,
-        b"typeof" => Typeof,
-        b"var" => Var,
-        b"void" => Void,
-        b"while" => While,
-        b"with" => With,
-        b"implements" => Implements,
-        b"interface" => Interface,
-        b"package" => Package,
-        b"private" => Private,
-        b"protected" => Protected,
-        b"public" => Public,
-        b"async" => Async,
-        b"await" => Await,
         b"let" => Let,
-        b"static" => Static,
-        b"yield" => Yield,
+        b"if" => If,
+        b"else" => Else,
+        b"while" => While,
+        b"for" => For,
+        b"in" => In,
+        b"match" => Match,
+        b"self" => SelfKw,
+        b"null" => Null,
+        b"true" => True,
+        b"false" => False,
         _ => return None,
     })
 }
@@ -89,8 +50,6 @@ enum Action {
     Punct(TokenKind),
     /// multi-char handling in `scan_special`
     Special,
-    /// `#` private name: `#` + identifier continuation
-    Hash,
 }
 
 const fn first_char_table() -> [Action; 128] {
@@ -108,7 +67,6 @@ const fn first_char_table() -> [Action; 128] {
         c += 1;
     }
     t[b'_' as usize] = IdentStart;
-    t[b'$' as usize] = IdentStart;
 
     let mut c = b'0';
     while c <= b'9' {
@@ -116,8 +74,8 @@ const fn first_char_table() -> [Action; 128] {
         c += 1;
     }
 
-    t[b'\'' as usize] = Quote;
     t[b'"' as usize] = Quote;
+    t[b'\'' as usize] = Quote;
 
     t[b'(' as usize] = Punct(TokenKind::LParen);
     t[b')' as usize] = Punct(TokenKind::RParen);
@@ -125,10 +83,12 @@ const fn first_char_table() -> [Action; 128] {
     t[b'}' as usize] = Punct(TokenKind::RBrace);
     t[b'[' as usize] = Punct(TokenKind::LBracket);
     t[b']' as usize] = Punct(TokenKind::RBracket);
-    t[b';' as usize] = Punct(TokenKind::Semicolon);
     t[b',' as usize] = Punct(TokenKind::Comma);
+    t[b'.' as usize] = Punct(TokenKind::Period);
     t[b':' as usize] = Punct(TokenKind::Colon);
-    t[b'~' as usize] = Punct(TokenKind::Tilde);
+    t[b';' as usize] = Punct(TokenKind::Semicolon);
+    t[b'*' as usize] = Punct(TokenKind::Star);
+    t[b'^' as usize] = Punct(TokenKind::Caret);
 
     t[b'=' as usize] = Special;
     t[b'!' as usize] = Special;
@@ -136,15 +96,10 @@ const fn first_char_table() -> [Action; 128] {
     t[b'>' as usize] = Special;
     t[b'+' as usize] = Special;
     t[b'-' as usize] = Special;
-    t[b'*' as usize] = Special;
     t[b'/' as usize] = Special;
     t[b'%' as usize] = Special;
     t[b'&' as usize] = Special;
     t[b'|' as usize] = Special;
-    t[b'^' as usize] = Special;
-    t[b'?' as usize] = Special;
-    t[b'.' as usize] = Special;
-    t[b'#' as usize] = Hash;
 
     t
 }
@@ -153,45 +108,26 @@ const FIRST_CHAR: [Action; 128] = first_char_table();
 
 /// Longest-match suffixes for multi-char operators: for the consumed first
 /// char, the candidate suffixes (longest first) and the fallback kind.
-/// `?` and `.` have extra digit rules and stay hand-written in scan_special.
+/// `&` and `|` have extra rules and stay hand-written in `scan_special`.
 type Suffixes = (&'static [(&'static str, TokenKind)], TokenKind);
 
 fn special_ops(c: u8) -> Option<Suffixes> {
     use TokenKind::*;
     Some(match c {
-        b'=' => (&[("==", EqEqEq), ("=", EqEq), (">", Arrow)], Assign),
-        b'!' => (&[("==", NotEqEq), ("=", NotEq)], Bang),
-        b'<' => (&[("<=", ShlAssign), ("<", Shl), ("=", LtEq)], Lt),
-        b'>' => (
-            &[
-                (">>=", UshrAssign),
-                (">>", Ushr),
-                (">=", ShrAssign),
-                (">", Shr),
-                ("=", GtEq),
-            ],
-            Gt,
-        ),
-        b'+' => (&[("+", PlusPlus), ("=", PlusAssign)], Plus),
-        b'-' => (&[("-", MinusMinus), ("=", MinusAssign)], Minus),
-        b'*' => (
-            &[("*=", StarStarAssign), ("*", StarStar), ("=", StarAssign)],
-            Star,
-        ),
-        b'/' => (&[("=", SlashAssign)], Slash),
-        b'%' => (&[("=", PercentAssign)], Percent),
-        b'&' => (
-            &[("&=", AmpAmpAssign), ("&", AmpAmp), ("=", AmpAssign)],
-            Amp,
-        ),
-        b'|' => (&[("|=", OrOrAssign), ("|", OrOr), ("=", PipeAssign)], Pipe),
-        b'^' => (&[("=", CaretAssign)], Caret),
+        b'=' => (&[("=", EqEq)], Assign),
+        b'!' => (&[("=", NotEq)], Bang),
+        b'<' => (&[("=", LtEq)], Lt),
+        b'>' => (&[("=", GtEq)], Gt),
+        b'-' => (&[(">", Arrow)], Minus),
+        b'+' => (&[], Plus),
+        b'/' => (&[], Slash),
+        b'%' => (&[], Percent),
         _ => return None,
     })
 }
 
-/// Saved scanner state for backwards rewinds (speculative parses, lazy
-/// re-parse). Only valid within already-consumed input.
+/// Saved scanner state for backwards rewinds (speculative slot-list checks).
+/// Only valid within already-consumed input.
 #[derive(Clone)]
 pub struct Bookmark {
     pos: u32,
@@ -205,7 +141,7 @@ pub struct Scanner<S: CharStream> {
     symbols: SymbolTable,
     /// [current, next-ahead]
     ring: [Option<ScanResult>; 2],
-    /// line terminator crossed since the last produced token (ASI input)
+    /// line terminator crossed since the last produced token
     newline_seen: bool,
     /// sticky first error; scanning never recovers
     failed: Option<ParseError>,
@@ -333,7 +269,6 @@ impl<S: CharStream> Scanner<S> {
                     Token::new(kind, ByteSpan::new(start, self.stream.pos()))
                 }
                 Action::Special => self.scan_special(start)?,
-                Action::Hash => self.scan_private_name(start)?,
             }
         } else if is_ident_start(c) {
             self.scan_identifier(start)?
@@ -354,7 +289,7 @@ impl<S: CharStream> Scanner<S> {
             };
             match c {
                 0x09 | 0x0B | 0x0C | 0x20 => self.stream.advance(),
-                NL | CR | LS | PS => {
+                NL | CR => {
                     self.newline_seen = true;
                     self.stream.advance();
                 }
@@ -372,6 +307,7 @@ impl<S: CharStream> Scanner<S> {
                         }
                         Some(c) if c == b'*' as u32 => {
                             self.stream.advance();
+                            let mut depth = 1u32;
                             loop {
                                 match self.stream.peek() {
                                     None => {
@@ -388,7 +324,17 @@ impl<S: CharStream> Scanner<S> {
                                         self.stream.advance();
                                         if self.stream.peek() == Some(b'/' as u32) {
                                             self.stream.advance();
-                                            break;
+                                            depth -= 1;
+                                            if depth == 0 {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Some(c) if c == b'/' as u32 => {
+                                        self.stream.advance();
+                                        if self.stream.peek() == Some(b'*' as u32) {
+                                            self.stream.advance();
+                                            depth += 1;
                                         }
                                     }
                                     _ => self.stream.advance(),
@@ -436,80 +382,11 @@ impl<S: CharStream> Scanner<S> {
         )
     }
 
-    /// `#name`: a PrivateName token whose symbol excludes the `#` (ES 12.9).
-    fn scan_private_name(&mut self, start: u32) -> ScanResult {
-        self.stream.advance(); // #
-        if !self.stream.peek().is_some_and(is_ident_start) {
-            return Err(ParseError::new(
-                ByteSpan::new(start, self.stream.pos() + 1),
-                "invalid character in private name",
-            ));
-        }
-        while let Some(c) = self.stream.peek() {
-            if !is_ident_continue(c) {
-                break;
-            }
-            self.stream.advance();
-        }
-        let span = ByteSpan::new(start + 1, self.stream.pos());
-        let sym = self.intern_span(span);
-        Ok(Token {
-            kind: TokenKind::PrivateName,
-            after_newline: false,
-            value: TokenValue::Symbol(sym.0),
-            span: ByteSpan::new(start, self.stream.pos()),
-        })
-    }
-
     fn scan_number(&mut self, start: u32) -> ScanResult {
-        // radix literals: 0x.. 0b.. 0o.. (optional `n` suffix for BigInt)
-        if self.stream.peek() == Some(b'0' as u32) {
+        self.consume_digits();
+        if self.stream.peek() == Some(b'.' as u32) {
             let save = self.stream.pos();
             self.stream.advance();
-            let radix = match self.stream.peek() {
-                Some(c) if c == b'x' as u32 || c == b'X' as u32 => Some(16),
-                Some(c) if c == b'b' as u32 || c == b'B' as u32 => Some(2),
-                Some(c) if c == b'o' as u32 || c == b'O' as u32 => Some(8),
-                _ => None,
-            };
-            if let Some(radix) = radix {
-                self.stream.advance();
-                return self.scan_radix_number(start, radix);
-            }
-            self.stream.seek(save);
-        }
-        let started_with_dot = self.stream.peek() == Some(b'.' as u32);
-        if started_with_dot {
-            self.stream.advance();
-            self.consume_digits();
-        } else {
-            self.consume_digits();
-            // BigInt: integer digits followed by `n` (no fraction/exponent)
-            if self.stream.peek() == Some(b'n' as u32) {
-                self.stream.advance();
-                let span = ByteSpan::new(start, self.stream.pos());
-                // intern the digits without the trailing `n`
-                let digits = ByteSpan::new(start, span.end - 1);
-                let sym = self.intern_span(digits);
-                return Ok(Token {
-                    kind: TokenKind::BigInt,
-                    after_newline: false,
-                    value: TokenValue::Symbol(sym.0),
-                    span,
-                });
-            }
-            if self.stream.peek() == Some(b'.' as u32) {
-                self.stream.advance();
-                self.consume_digits();
-            }
-        }
-        // exponent: only consumed if digits actually follow
-        if matches!(self.stream.peek(), Some(c) if c == b'e' as u32 || c == b'E' as u32) {
-            let save = self.stream.pos();
-            self.stream.advance();
-            if matches!(self.stream.peek(), Some(c) if c == b'+' as u32 || c == b'-' as u32) {
-                self.stream.advance();
-            }
             if matches!(self.stream.peek(), Some(c) if c < 128 && (c as u8).is_ascii_digit()) {
                 self.consume_digits();
             } else {
@@ -539,71 +416,7 @@ impl<S: CharStream> Scanner<S> {
         }
     }
 
-    /// After `0x`/`0b`/`0o`: scan radix digits, optional `n` for BigInt.
-    fn scan_radix_number(&mut self, start: u32, radix: u32) -> ScanResult {
-        let digits_start = self.stream.pos();
-        while let Some(c) = self.stream.peek() {
-            match hex_digit(c) {
-                Some(d) if d < radix => {
-                    self.stream.advance();
-                }
-                // a valid digit of a lower radix is still a syntax error:
-                // `0b2`, `0o9`
-                Some(_) => {
-                    return Err(ParseError::new(
-                        ByteSpan::new(self.stream.pos(), self.stream.pos() + 1),
-                        "invalid digit in radix literal",
-                    ));
-                }
-                None => break,
-            }
-        }
-        let digits_end = self.stream.pos();
-        if digits_end == digits_start {
-            return Err(ParseError::new(
-                ByteSpan::new(start, digits_end),
-                "expected digits after radix prefix",
-            ));
-        }
-        let span = ByteSpan::new(start, digits_end);
-        if self.stream.peek() == Some(b'n' as u32) {
-            self.stream.advance();
-            // intern the full literal text minus the `n` (radix via prefix)
-            let sym = self.intern_span(span);
-            return Ok(Token {
-                kind: TokenKind::BigInt,
-                after_newline: false,
-                value: TokenValue::Symbol(sym.0),
-                span: ByteSpan::new(start, digits_end + 1),
-            });
-        }
-        // a letter or digit right after the literal is an error: `0x1g`
-        if matches!(self.stream.peek(), Some(c) if is_ident_continue(c)) {
-            return Err(ParseError::new(
-                ByteSpan::new(self.stream.pos(), self.stream.pos() + 1),
-                "unexpected character after number literal",
-            ));
-        }
-        let value = Self::with_span_bytes(
-            &mut self.stream,
-            &mut self.scratch,
-            ByteSpan::new(digits_start, digits_end),
-            |b| {
-                b.iter().fold(0f64, |v, &c| {
-                    v * radix as f64 + (c as char).to_digit(16).unwrap() as f64
-                })
-            },
-        );
-        Ok(Token {
-            kind: TokenKind::Number,
-            after_newline: false,
-            value: TokenValue::Number(value),
-            span,
-        })
-    }
-
-    /// String literal. Contents are WTF-8: raw source chars pass through,
-    /// escapes are encoded (lone surrogates as the 3-byte pattern).
+    /// String literal. Contents are decoded into a symbol.
     fn scan_string(&mut self, quote: u32, start: u32) -> ScanResult {
         self.stream.advance(); // opening quote
         let content_start = self.stream.pos();
@@ -644,14 +457,12 @@ impl<S: CharStream> Scanner<S> {
             }
             if c > 0x7F || decoded.is_some() {
                 self.ensure_decoded(&mut decoded, content_start);
-                push_wtf8(decoded.as_mut().unwrap(), c);
+                push_utf8(decoded.as_mut().unwrap(), c);
             }
             self.stream.advance();
         }
     }
 
-    /// Switch from the zero-copy span path to the decode buffer: copy the
-    /// string content scanned so far into `decoded` (once).
     fn ensure_decoded(&mut self, decoded: &mut Option<Vec<u8>>, content_start: u32) {
         if decoded.is_none() {
             let mut v = Vec::new();
@@ -679,55 +490,24 @@ impl<S: CharStream> Scanner<S> {
             c if c == b'x' as u32 => {
                 self.stream.advance();
                 let v = self.scan_hex(2)?;
-                // \xNN names a code point (0xNN), not a raw byte: encode
-                // it so "\xE9" equals "é" and the content stays valid WTF-8
-                push_wtf8(out, v);
+                push_utf8(out, v);
                 return Ok(());
             }
             c if c == b'u' as u32 => {
                 self.stream.advance();
-                let v = if self.stream.peek() == Some(b'{' as u32) {
-                    self.stream.advance();
-                    let mut n = 0u32;
-                    while self.stream.peek() != Some(b'}' as u32) {
-                        let Some(d) = self.stream.peek().and_then(hex_digit) else {
-                            return Err(ParseError::new(
-                                ByteSpan::new(pos, self.stream.pos()),
-                                "invalid \\u{...} escape",
-                            ));
-                        };
-                        n = n * 16 + d;
-                        if n > 0x10FFFF {
-                            return Err(ParseError::new(
-                                ByteSpan::new(pos, self.stream.pos()),
-                                "code point out of range in \\u{...} escape",
-                            ));
-                        }
-                        self.stream.advance();
-                    }
-                    n
-                } else {
-                    self.scan_hex(4)?
-                };
-                // lone surrogates are legal JS string content (WTF-8)
-                push_wtf8(out, v);
-                // closing } / last hex char consumed below for the 4-hex case
-                if self.stream.peek() == Some(b'}' as u32) {
-                    self.stream.advance();
-                }
+                let v = self.scan_hex(4)?;
+                push_utf8(out, v);
                 return Ok(());
             }
             NL => {}
             CR => {
-                // \r\n counts as one line continuation
                 self.stream.advance();
                 if self.stream.peek() == Some(NL) {
                     self.stream.advance();
                 }
                 return Ok(());
             }
-            LS | PS => {}
-            c => push_wtf8(out, c), // \', \", \\, and any other char is itself
+            c => push_utf8(out, c), // \', \", \\, and any other char is itself
         }
         self.stream.advance();
         Ok(())
@@ -754,36 +534,21 @@ impl<S: CharStream> Scanner<S> {
         let c = self.stream.peek().unwrap();
         self.stream.advance();
         let kind = match c as u8 {
-            b'?' => {
-                if self.try_consume("?=") {
-                    NullishAssign
-                } else if self.try_consume("?") {
-                    Nullish
-                } else if self.stream.peek() == Some(b'.' as u32) {
-                    // `?.` only when not followed by a digit (`a?.3:b` is a ternary)
-                    let save = self.stream.pos();
-                    self.stream.advance();
-                    let digit = matches!(self.stream.peek(), Some(c) if c < 128 && (c as u8).is_ascii_digit());
-                    if digit {
-                        self.stream.seek(save);
-                        Question
-                    } else {
-                        QuestionDot
-                    }
+            b'|' => {
+                if self.try_consume("|") {
+                    OrOr
                 } else {
-                    Question
+                    Pipe
                 }
             }
-            b'.' => {
-                if matches!(self.stream.peek(), Some(c) if c < 128 && (c as u8).is_ascii_digit()) {
-                    // `.5`: number with a leading dot; scanned from `start`
-                    self.stream.seek(start);
-                    return self.scan_number(start);
-                }
-                if self.try_consume("..") {
-                    Ellipsis
+            b'&' => {
+                if self.try_consume("&") {
+                    AmpAmp
                 } else {
-                    Period
+                    return Err(ParseError::new(
+                        ByteSpan::new(start, self.stream.pos()),
+                        "unexpected `&` (did you mean `&&`?)",
+                    ));
                 }
             }
             c => {
@@ -828,7 +593,6 @@ impl<S: CharStream> Scanner<S> {
 
     /// Borrow the span's bytes zero-copy when the stream supports it,
     /// otherwise copy them into the scratch buffer via seek/read.
-    /// Takes the fields separately so `f` can still touch `self.symbols`.
     fn with_span_bytes<R>(
         stream: &mut S,
         scratch: &mut Vec<u8>,
@@ -870,18 +634,9 @@ fn hex_digit(c: u32) -> Option<u32> {
     (c as u8 as char).to_digit(16)
 }
 
-/// Encode a code point as WTF-8: identical to UTF-8 for scalar values, plus
-/// the 3-byte pattern for lone surrogates (legal JS string content).
-fn push_wtf8(out: &mut Vec<u8>, cp: u32) {
-    match char::from_u32(cp) {
-        Some(ch) => {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-        }
-        None => out.extend_from_slice(&[
-            0xE0 | (cp >> 12) as u8,
-            0x80 | ((cp >> 6) & 0x3F) as u8,
-            0x80 | (cp & 0x3F) as u8,
-        ]),
-    }
+/// Encode a code point as UTF-8 (lone surrogates become the replacement char).
+fn push_utf8(out: &mut Vec<u8>, cp: u32) {
+    let ch = char::from_u32(cp).unwrap_or(char::REPLACEMENT_CHARACTER);
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
 }

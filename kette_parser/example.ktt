@@ -1,0 +1,433 @@
+// A modern Self–JS hybrid
+//
+// Slots are defined with `:`
+//   name: value       named slot
+//   [i]: value        element slot
+//   name*: obj        parent slot (lookup / JS extends)
+// Several `*` slots = multiple inheritance, declaration order.
+//
+// Assignment uses `=` and only writes existing slots:
+//   obj.x = v         write own named slot x, else error
+//   obj[i] = v        write element i; grows the store, holes → null
+// `=` never creates. `:` only appears in literals and Object.extend.
+//
+// Two stores, one object (V8-like):
+//   obj.foo / obj["foo"]   named properties
+//   obj[0]  / obj.0        elements
+//
+// Lambdas (blocks) are `{ |args| body }`; zero-arg is just `{ body }`.
+// `{ ... }` in expression position:
+//   contents are a slot list  → object
+//   anything else             → block
+// This split is exact: slots use `:`, statements use `=`, so a slot
+// list can never be a statement sequence. `{ }` empty is an object.
+// After if / while / for / else, braces are always blocks.
+//
+// Control flow is sugar over sends, like `+` → `.add`:
+// a fixed desugar table, semantics live in the receiver.
+//
+// No copy-down / derive. Arrayness is born in the literal or by index writes.
+
+
+// ---------------------------------------------------------------------------
+// Comments
+// ---------------------------------------------------------------------------
+
+// this is a comment
+
+/*
+  multiline comment /* nests */
+  and can sit in a single line between code
+*/
+
+
+// ---------------------------------------------------------------------------
+// Objects
+// ---------------------------------------------------------------------------
+
+let obj = {
+    parent*: Clonable
+    x: 10
+    y: 20
+}
+
+// Own named slots: parent*, x, y. No elements. length is 0.
+// obj.x = 11        ok
+// obj.z = 1         error: no named slot z
+// obj[0] = 7        ok: creates element 0, length becomes 1
+
+
+// ---------------------------------------------------------------------------
+// Blocks (lambdas)
+// ---------------------------------------------------------------------------
+
+// { |args| body }   with params — leading pipes mark the lambda
+// { body }          zero params — no marker needed
+// { }               empty object, not a block
+//
+// A block is an object that responds to "value" — evaluating a block
+// means sending it value with the arguments. Blocks close over lexicals.
+// Block bodies are the scopes; there are no bare scope-blocks. A raw
+// scope is just { ... }.value().
+
+let inc = { |x| x + 1 }
+inc(41)                 // 42; sugar for inc.value(41)
+
+let greet = { print("hi") }     // zero-arg: contents are statements,
+greet.value()                   // not a slot list, so this is a block
+
+let pair = { |a, b| { first: a, second: b } }
+//          ^lambda        ^object: slot list, unambiguous even nested
+
+
+// ---------------------------------------------------------------------------
+// Functions vs methods
+// ---------------------------------------------------------------------------
+
+let func = { |o| print(o) }
+func(obj)
+
+// Methods are the same lambda, activated by a send.
+// `self` is bound at send time. Illegal in a bare function.
+
+Object.extend(obj, "add", { |other|
+    self.clone({
+        x: self.x + other.x
+        y: self.y + other.y
+    })
+})
+
+// `+` desugars to `.add`. Numbers are objects: `1 + 2` is `1.add(2)`.
+
+let other = obj.clone()
+other.x = 55
+print(obj + other)          // { x: 65, y: 40 }
+
+
+// ---------------------------------------------------------------------------
+// Control flow: one desugar table, no runtime semantics
+// ---------------------------------------------------------------------------
+//
+//   if c { A } else { B }   →  c.ifElse({ A }, { B })
+//   if c { A }              →  c.if({ A })
+//   for x in xs { B }       →  xs.each({ |x| B })
+//   while c { B }           →  { c }.whileTrue({ B })
+//   a && b                  →  a.and({ b })        // lazy
+//   a || b                  →  a.or({ b })         // lazy
+//   match x { arms }        →  x.match(handlers)   // see below
+//   ^expr                   →  return from the enclosing method
+//
+// The parser wraps some argument positions in blocks (that's the whole
+// trick — laziness for while-conditions and && / ||). Everything else
+// is strict left-to-right sends, as always.
+//
+// Arity is part of the name, same as any send: `if` without else calls
+// .if/1, with else calls .ifElse/2. A receiver that only handles one
+// form just errors on the other with the normal "no such slot" error.
+//
+// Every form is an expression, because sends are expressions:
+
+let sign = if n < 0 { -1 } else { 1 }
+
+// Keyword-position braces are always blocks, so this is fine even
+// though the body is assignment-shaped:
+while c { i = i + 1 }
+
+// --- Booleans (prelude) ---
+
+let BooleanTraits = {
+    parent*: Clonable
+    ifElse: { |t, f| error("subclass responsibility") }
+    if:     { |t| self.ifElse(t, { null }) }
+}
+
+let TrueTraits = {
+    parent*: BooleanTraits
+    ifElse: { |t, f| t.value() }
+    and:    { |b| b.value() }
+    or:     { |b| self }
+}
+
+let FalseTraits = {
+    parent*: BooleanTraits
+    ifElse: { |t, f| f.value() }
+    and:    { |b| self }
+    or:     { |b| b.value() }
+}
+
+// `if` is not special. Any object that implements if/ifElse is
+// branchable — Maybe, Result, a test double that takes both branches.
+
+// --- Loops (prelude) ---
+
+let BlockTraits = {
+    parent*: Clonable
+    whileTrue: { |body|
+        // shown as sends; the prelude implements this with a native loop
+        if self.value() {
+            body.value()
+            self.whileTrue(body)
+        }
+    }
+}
+
+// --- Non-local return ---
+
+// `^expr` returns from the enclosing *method*, unwinding through any
+// blocks on the stack. Falling off the end of a block is a normal
+// block return — that's your "continue". `^` is your early exit.
+
+// in some collection traits:
+//   find: { |pred|
+//       self.each({ |x|
+//           if pred.value(x) { ^x }    // escapes find entirely
+//       })
+//       null
+//   }
+//
+// No `break` keyword: use ^ or higher-order sends (takeWhile, any, all).
+// If wanted later, `break` can desugar to throwing a Break object the
+// iterator catches — library, not core.
+
+// --- match ---
+
+// match shape {
+//     Circle -> { |r|    area(r) }
+//     Rect   -> { |w, h| w * h   }
+//     else   -> { 0 }
+// }
+//
+//   →  shape.match({
+//          onCircle: { |r|    area(r) }
+//          onRect:   { |w, h| w * h   }
+//          onElse:   { 0 }
+//      })
+//
+// The object decides how it is matched:
+//   match: { |handlers| handlers.onCircle.value(self.radius) }
+// Structural objects get a default match on shape. Exhaustiveness is
+// tooling, not semantics.
+//
+// Blocks are always passed as explicit arguments: arr.each({ |x| ... }).
+
+
+// ---------------------------------------------------------------------------
+// Lookup and assignment
+// ---------------------------------------------------------------------------
+
+// Read obj.x / obj["x"]
+//   own named slot, then parent* slots in order, no node twice
+//   else error
+//
+// Read obj[i] / obj.i   (integer)
+//   element i if 0 <= i < length
+//   else hole → null          // JS-ish; use error if you want Self vectors
+//
+// Write obj.x = v
+//   x must be an own named slot, else error
+//
+// Write obj[i] = v
+//   write element i; if i >= length, grow and fill holes with null
+//
+// Shape growth for *names*:
+//   listed in a literal (: or *:), or Object.extend(...)
+//
+// let f = a.add
+// f(b)                        error: no self
+
+
+// ---------------------------------------------------------------------------
+// Traits + prototype
+// ---------------------------------------------------------------------------
+
+let Vec2Traits = {
+    parent*: Clonable
+
+    new: { |x, y| Vec2.clone({ x: x, y: y }) }
+
+    add: { |other|
+        self.clone({
+            x: self.x + other.x
+            y: self.y + other.y
+        })
+    }
+}
+
+let Vec2 = {
+    parent*: Vec2Traits
+    x: 0
+    y: 0
+}
+
+let a = Vec2.new(10, 20)
+let b = Vec2.new(20, 20)
+print(a + b)                // { x: 30, y: 40 }
+
+// a.parent        → Vec2Traits
+// a.parent.parent → Clonable
+
+
+// ---------------------------------------------------------------------------
+// Multiple parents
+// ---------------------------------------------------------------------------
+
+let ColorTraits = {
+    parent*: Clonable
+    describe: { self.color }
+}
+
+let ColoredVec2 = {
+    parent*: Vec2Traits
+    mixin*:  ColorTraits
+    x: 0
+    y: 0
+    color: "red"
+}
+
+let c = ColoredVec2.clone({ x: 1, y: 2, color: "blue" })
+print(c + b)
+print(c.describe())         // "blue"
+
+// obj.parent  → Vec2Traits
+// obj.mixin   → ColorTraits
+// obj.parents → [Vec2Traits, ColorTraits]   derived, not assignable
+
+
+// ---------------------------------------------------------------------------
+// clone
+// ---------------------------------------------------------------------------
+
+// Shallow copy of both stores.
+// Same named shape, same parents, copied element vector.
+// The optional object only writes *already own* named slots
+// and/or elements via [i]:.
+// New names in the clone literal are an error.
+
+let p = Vec2.clone({ x: 3, y: 4 })
+// Vec2.clone({ z: 1 })            error
+// Vec2Traits.clone({ x: 1, y: 2 })
+//     error: traits has no x / y
+
+
+// ---------------------------------------------------------------------------
+// Arrays
+// ---------------------------------------------------------------------------
+
+let arr = [10, 20, 30]
+
+// same as
+// let arr = {
+//     parent*: ArrayTraits
+//     [0]: 10
+//     [1]: 20
+//     [2]: 30
+// }
+
+print(arr[0])               // 10
+print(arr.0)                // 10    same element
+print(arr.length)           // 3
+
+arr[3] = 40                 // grows
+arr.push(50)
+
+
+// ---------------------------------------------------------------------------
+// Object + array in one literal
+// ---------------------------------------------------------------------------
+
+let tuple = {
+    parent*: ArrayTraits
+    label: "pair"           // named
+    [0]: 0                  // element
+    [1]: 0
+}
+
+print(tuple[0])             // 0
+print(tuple.0)              // 0
+print(tuple.label)          // "pair"
+
+tuple.label = "xy"          // ok
+tuple.other = 1             // error
+tuple[2] = 1                // ok, grows elements
+
+// Extra names after an array literal:
+let named = Object.extend([0, 0], { label: "pair" })
+
+
+// ---------------------------------------------------------------------------
+// ArrayTraits  (methods only)
+// ---------------------------------------------------------------------------
+
+let ArrayTraits = {
+    parent*: Clonable
+
+    push: { |v|
+        self[self.length] = v
+        self
+    }
+
+    each: { |blk|
+        let i = 0
+        { i < self.length }.whileTrue({
+            blk.value(self[i])
+            i = i + 1
+        })
+        self
+    }
+}
+
+// parent*: ArrayTraits does not copy a backing store.
+// [ ... ] or [i] = is what creates elements.
+// A plain { x: 1 } can still grow elements later with [i] =.
+// Use Object.extend to add names.
+
+
+// ---------------------------------------------------------------------------
+// Object.extend
+// ---------------------------------------------------------------------------
+
+Object.extend(a, "label", "origin")
+print(a.label)
+
+// Or several names:
+Object.extend(a, { label: "origin", tag: 1 })
+
+
+// ---------------------------------------------------------------------------
+// Parents
+// ---------------------------------------------------------------------------
+
+// `*` slots are constant.
+// obj.parent = other        error
+// Change inheritance with Object.extend(..., { parent*: NewTraits })
+// or build a new object.
+//
+// let Child = { parent*: Vec2, x: 1 }
+// Child can read Vec2.y by lookup, cannot write y unless y is own.
+//
+// Specialize by listing the data you own:
+//
+// let Child = {
+//     parent*: ChildTraits    // ChildTraits.parent* = Vec2Traits
+//     x: 1
+//     y: 0
+//     extra: 0
+// }
+
+
+// ---------------------------------------------------------------------------
+// Notes
+// ---------------------------------------------------------------------------
+
+// ASI works.
+// `:` defines, `=` assigns. `=` never creates a slot;
+// `:` never appears outside literals / Object.extend.
+// { |x| ... } is a lambda; { ... } with a slot list is an object;
+// anything else in braces is a zero-arg block; { } is an empty object.
+// Integer names in `{ 0: 10 }` are not used; write `[0]: 10`
+// so the element store is obvious and `"0"` never fights element 0.
+// Prefer traits + prototype for shared methods.
+// methods/functions/lambdas are just normal objects that respond to "value"
+// Control flow adds nothing to the runtime: sends, lambdas, `^`, lookup,
+// plus a two-column desugar table. Booleans, loops, and match ship as
+// prelude source in this language.

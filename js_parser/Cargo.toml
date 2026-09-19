@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 bytecode = { path = "../bytecode" }
+parser_utils = { path = "../parser_utils" }

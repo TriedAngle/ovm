@@ -18,12 +18,12 @@ use ir::{FrontendError, SourceMode};
 /// A construct the materializer does not support yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileError {
-    pub span: js_parser::Span,
+    pub span: parser_utils::ByteSpan,
     pub feature: &'static str,
 }
 
 impl CompileError {
-    fn new(span: js_parser::Span, feature: &'static str) -> Self {
+    fn new(span: parser_utils::ByteSpan, feature: &'static str) -> Self {
         Self { span, feature }
     }
 }
