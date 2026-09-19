@@ -1,8 +1,6 @@
 use core::cell::UnsafeCell;
 
-use crate::{
-    EdgeVisitable, FixedArray, FixedByteArray, Heap, HeapRef, Register, Tagged, Value, Visitor,
-};
+use crate::{EdgeVisitable, FixedArray, FixedByteArray, Heap, Register, Tagged, Value, Visitor};
 
 use crate::{FrameMeta, Stack};
 
@@ -54,11 +52,7 @@ impl StackCache {
     }
 
     pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
-        let tagged = stack.callable(heap, &frame);
-        // Safety: frame callable slots hold strong object pointers.
-        let obj = unsafe {
-            HeapRef::from_ptr(tagged.as_ptr().expect("frame callable must be an object"))
-        };
+        let obj = stack.callable(heap, &frame);
         let info = obj
             .as_ref()
             .callable_info(heap)
@@ -99,34 +93,22 @@ impl StackCache {
         self.get().pc = pc;
     }
 
-    pub fn code_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, FixedByteArray> {
+    pub fn code_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, FixedByteArray> {
         debug_assert!(self.is_active(), "bytecode read from inactive cache");
-        // Safety: the cached register holds a strong FixedByteArray.
-        unsafe {
-            HeapRef::from_ptr(
-                self.get()
-                    .code
-                    .read(heap)
-                    .get_as::<FixedByteArray>()
-                    .expect("strong cache slot")
-                    .into_ptr(),
-            )
-        }
+        self.get()
+            .code
+            .read(heap)
+            .get_as::<FixedByteArray>()
+            .expect("strong cache slot")
     }
 
-    pub fn constants_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, FixedArray> {
+    pub fn constants_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, FixedArray> {
         debug_assert!(self.is_active(), "constants read from inactive cache");
-        // Safety: the cached register holds a strong FixedArray.
-        unsafe {
-            HeapRef::from_ptr(
-                self.get()
-                    .constants
-                    .read(heap)
-                    .get_as::<FixedArray>()
-                    .expect("strong cache slot")
-                    .into_ptr(),
-            )
-        }
+        self.get()
+            .constants
+            .read(heap)
+            .get_as::<FixedArray>()
+            .expect("strong cache slot")
     }
 
     pub fn acc<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {

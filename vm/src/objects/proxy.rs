@@ -944,7 +944,7 @@ fn construct_h<'a>(
                     obj.as_ref()
                         .header
                         .map
-                        .heap_ref(heap)
+                        .get(heap)
                         .kind()
                         .is_class_constructor()
                         .then(|| obj.as_ref().callable_info(heap))
@@ -1027,7 +1027,7 @@ fn construct_h<'a>(
 fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Handle<'_, Object>) {
     use crate::{MapInit, MapKind};
     let (kind, prototype, rows) = {
-        let map = obj.heap_ref(heap).map_ref(heap);
+        let map = obj.as_tagged(heap).map_ref(heap);
         (
             map.kind(),
             scope.handle(map.prototype.get(heap)),
@@ -1049,7 +1049,7 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
         return; // already non-extensible (idempotent)
     }
     heap.allocate_token_enter_heap(Map::layout_for(rows.len()), |token, heap| {
-        let obj_ref = obj.heap_ref(heap);
+        let obj_ref = obj.as_tagged(heap);
         let new_map = token.allocate::<Map>(MapInit {
             kind: MapKind::new(kind.bits() & !MapKind::EXTENDABLE.bits()),
             value_slot_count: obj_ref.map_ref(heap).value_slot_count(),
@@ -1174,7 +1174,7 @@ impl Proxy {
         obj.as_ref()
             .header
             .map
-            .heap_ref(heap)
+            .get(heap)
             .kind()
             .kind()
             .is_js_receiver()
@@ -1197,7 +1197,7 @@ impl Proxy {
                 .as_ref()
                 .header
                 .map
-                .heap_ref(heap)
+                .get(heap)
                 .kind();
             if kind.is_constructor() {
                 known.proxy_constructor_map

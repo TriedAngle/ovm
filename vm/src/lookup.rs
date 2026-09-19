@@ -1,23 +1,23 @@
 use crate::proxy::Proxy;
 use crate::{
     AccessorPair, Coercion, ContextState, Convert, DenseString, FixedArray, FrameMeta, GcSlot,
-    Handle, HandleScope, Heap, HeapRef, Map, Object, PartialDescriptor, PropertyDescriptor,
+    Handle, HandleScope, Heap, HeapObject, Map, Object, PartialDescriptor, PropertyDescriptor,
     RuntimeContext, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, VM, Value,
     VmError,
 };
 
 pub enum Lookup<'a> {
     Data {
-        holder: HeapRef<'a, Object>,
+        holder: Tagged<'a, Object>,
         map_index: usize,
         holder_index: usize,
         slot: &'a GcSlot,
         flags: SlotFlags,
     },
     Accessor {
-        holder: HeapRef<'a, Object>,
+        holder: Tagged<'a, Object>,
         map_index: usize,
-        pair: HeapRef<'a, AccessorPair>,
+        pair: Tagged<'a, AccessorPair>,
     },
     NotFound,
 }
@@ -52,10 +52,10 @@ impl Lookup<'_> {
             {
                 return Ok(Key::Element(i));
             }
-            return Ok(Key::Name(s.into_tagged().into()));
+            return Ok(Key::Name(s.into()));
         }
         if let Some(s) = key.get_as::<Symbol>() {
-            return Ok(Key::Name(s.into_tagged().into()));
+            return Ok(Key::Name(s.into()));
         }
         Err(VmError::Type)
     }
@@ -316,7 +316,7 @@ fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> boo
         if obj.as_ref().is_array(heap) {
             return true;
         }
-        let proto = obj.as_ref().header.map.heap_ref(heap).prototype.get(heap);
+        let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
         if proto == heap.known().null.as_tagged(heap) || !proto.is_strong_ptr() {
             return false;
         }
@@ -336,7 +336,7 @@ impl Map {
     pub fn lookup<'a>(
         &'a self,
         heap: &'a Heap,
-        receiver: HeapRef<'a, Object>,
+        receiver: Tagged<'a, Object>,
         name: Tagged<'a, SlotName>,
     ) -> Lookup<'a> {
         for (index, d) in self.descriptors().iter().enumerate() {
@@ -345,11 +345,11 @@ impl Map {
                     return Lookup::Accessor {
                         holder: receiver,
                         map_index: index,
-                        // Safety: accessor descriptor rows hold an
-                        // AccessorPair; anchored slot read under `heap`.
-                        pair: unsafe {
-                            HeapRef::from_ptr(d.value.get(heap).cast::<AccessorPair>().into())
-                        },
+                        pair: d
+                            .value
+                            .get(heap)
+                            .get_as::<AccessorPair>()
+                            .expect("accessor descriptor holds an AccessorPair"),
                     };
                 }
                 return Lookup::Data {
@@ -389,7 +389,7 @@ pub fn lookup_in_parents<'a>(
 enum SuperStart<'a> {
     End,
     Object(Tagged<'a, Value>),
-    Parents(HeapRef<'a, FixedArray>),
+    Parents(Tagged<'a, FixedArray>),
 }
 
 /// The home object's [[Prototype]] slot, raw (null / object / FixedArray
@@ -398,7 +398,7 @@ enum SuperStart<'a> {
 /// GetSuperBase happens first).
 pub fn home_proto<'a>(heap: &'a Heap, value: Tagged<'a, Value>) -> Option<Tagged<'a, Value>> {
     let obj = value.as_heap_object()?;
-    Some(obj.as_ref().header.map.heap_ref(heap).prototype.get(heap))
+    Some(obj.as_ref().header.map.get(heap).prototype.get(heap))
 }
 
 fn super_start_from_proto<'a>(heap: &'a Heap, proto: Option<Tagged<'a, Value>>) -> SuperStart<'a> {
@@ -473,14 +473,14 @@ pub fn super_constructor<'a>(
 ) -> Option<Tagged<'a, Value>> {
     let callable = stack.callable_slot(meta).read(heap);
     let obj = callable.as_heap_object()?;
-    let proto = obj.as_ref().header.map.heap_ref(heap).prototype.get(heap);
+    let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
     // must be a real constructor
     let proto_obj = proto.as_heap_object()?;
     if !proto_obj
         .as_ref()
         .header
         .map
-        .heap_ref(heap)
+        .get(heap)
         .kind()
         .is_constructor()
     {
@@ -498,7 +498,7 @@ pub fn private_find<'a>(
     key: Tagged<'a, Value>,
 ) -> Option<&'a GcSlot> {
     let o = obj.as_heap_object()?;
-    let map = o.as_ref().header.map.heap_ref(heap);
+    let map = o.as_ref().header.map.get(heap);
     for d in map.descriptors() {
         if d.name(heap).ptr_eq(key.as_name()) && !d.flags().is_accessor() {
             return Some(o.as_ref().slot(heap, d.offset()));
@@ -509,11 +509,14 @@ pub fn private_find<'a>(
 
 impl Object {
     pub fn lookup<'a>(&'a self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
+        // Safety: `self` is borrowed for `'a` and the live heap borrow
+        // proves no collection can run, so the object word is anchored.
+        let receiver: Tagged<'a, Object> = unsafe { Tagged::from_value_unchecked(self.erase()) };
         self.header
             .map
-            .heap_ref(heap)
+            .get(heap)
             .as_ref()
-            .lookup(heap, HeapRef::from_ref(self), name)
+            .lookup(heap, receiver, name)
     }
 }
 

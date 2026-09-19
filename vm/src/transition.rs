@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use core::alloc::Layout;
 
 use crate::{
-    AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, HeapRef,
-    Key, Lookup, Map, MapInit, MaybeWeak, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
+    AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, Key,
+    Lookup, Map, MapInit, MaybeWeak, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
     WeakFixedArray, WeakFixedArrayInit, lookup_in_parents,
 };
 
@@ -255,7 +255,7 @@ impl Transition {
     pub fn target<'s>(
         heap: &mut Heap,
         scope: &'s HandleScope<'_>,
-        parent: impl for<'a> Fn(&'a Heap) -> HeapRef<'a, Map>,
+        parent: impl for<'a> Fn(&'a Heap) -> Tagged<'a, Map>,
         name: Handle<SlotName>,
         flags: SlotFlags,
         pair: Option<(Handle<'_, Value>, Handle<'_, Value>)>,
@@ -291,7 +291,7 @@ impl Transition {
                 parent_ref.kind(),
                 parent_ref.descriptor_count(),
                 parent_ref.value_slot_count(),
-                parent_ref.transitions.heap_ref(heap).map_or(0, |a| a.len()),
+                parent_ref.transitions.get(heap).map_or(0, |a| a.len()),
                 scope.handle(parent_ref.prototype.get(heap)),
                 old_row,
             )
@@ -355,12 +355,10 @@ impl Transition {
                 descriptors: &descriptors,
                 prototype,
             });
-            child
-                .pred
-                .set(heap, child.raw(), parent_ref.clone().into_tagged());
+            child.pred.set(heap, child.raw(), parent_ref);
 
             let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
-            if let Some(old) = parent_ref.transitions.heap_ref(heap) {
+            if let Some(old) = parent_ref.transitions.get(heap) {
                 for entry in old.as_slice().as_chunks::<2>().0 {
                     pairs.push(entry[0].get(heap));
                     pairs.push(entry[1].get(heap));
@@ -383,11 +381,11 @@ impl Transition {
         flags: SlotFlags,
         value: Handle<Value>,
     ) {
-        let slot_count = receiver.heap_ref(heap).map_ref(heap).value_slot_count() + 1;
+        let slot_count = receiver.as_tagged(heap).map_ref(heap).value_slot_count() + 1;
         heap.allocate_token_enter_heap(
             FixedArray::<Value>::layout_for(slot_count),
             |token, heap| {
-                let receiver_ref = receiver.heap_ref(heap);
+                let receiver_ref = receiver.as_tagged(heap);
                 let target = receiver_ref
                     .map_ref(heap)
                     .find_transition(heap, name.as_tagged(heap), flags, None)
@@ -396,7 +394,7 @@ impl Transition {
                 values.extend(
                     receiver_ref
                         .slots
-                        .heap_ref(heap)
+                        .get(heap)
                         .as_slice()
                         .iter()
                         .map(|slot| slot.get(heap)),
@@ -418,7 +416,7 @@ impl Transition {
         flags: SlotFlags,
         pair: Option<(Handle<'_, Value>, Handle<'_, Value>)>,
     ) {
-        let receiver_ref = receiver.heap_ref(heap);
+        let receiver_ref = receiver.as_tagged(heap);
         let pair_values = pair.map(|(get, set)| (get.as_tagged(heap), set.as_tagged(heap)));
         let target = receiver_ref
             .map_ref(heap)
@@ -436,8 +434,8 @@ impl Transition {
         index: usize,
         value: Handle<'_, Value>,
     ) {
-        let offset = receiver.heap_ref(heap).map_ref(heap).descriptors()[index].offset();
-        receiver.heap_ref(heap).slot(heap, offset).set(
+        let offset = receiver.as_tagged(heap).map_ref(heap).descriptors()[index].offset();
+        receiver.as_tagged(heap).slot(heap, offset).set(
             heap,
             receiver.as_tagged(heap).raw(),
             value.as_tagged(heap),
@@ -467,7 +465,7 @@ impl Transition {
 
         let (existing, kind, prototype, surviving, values, pairs_len) = {
             let name_word = name.as_tagged(heap);
-            let obj = receiver.heap_ref(heap);
+            let obj = receiver.as_tagged(heap);
             let parent = obj.map_ref(heap);
             let descriptors = parent.descriptors();
             let index = descriptors
@@ -490,7 +488,7 @@ impl Transition {
             // closure: a Tagged cannot escape this non-allocating region
             let mut surviving: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
                 Vec::with_capacity(descriptors.len() - 1);
-            let mut values: Vec<Handle<'_, Value>> = obj.slots.heap_ref(heap).as_slice()[..base]
+            let mut values: Vec<Handle<'_, Value>> = obj.slots.get(heap).as_slice()[..base]
                 .iter()
                 .map(|slot| scope.handle(slot.get(heap)))
                 .collect();
@@ -516,7 +514,7 @@ impl Transition {
                     ));
                 }
             }
-            let pairs_len = parent.transitions.heap_ref(heap).map_or(0, |a| a.len());
+            let pairs_len = parent.transitions.get(heap).map_or(0, |a| a.len());
             (
                 existing,
                 parent.kind(),
@@ -537,7 +535,7 @@ impl Transition {
             heap.allocate_token_enter_heap(
                 FixedArray::<Value>::layout_for(values.len()),
                 |token, heap| {
-                    let obj = receiver.heap_ref(heap);
+                    let obj = receiver.as_tagged(heap);
                     let slots = token.allocate::<FixedArray>(values);
                     let host = receiver.as_tagged(heap).raw();
                     obj.slots.set(heap, host, slots);
@@ -557,7 +555,7 @@ impl Transition {
             scope.stage(&anchored)
         };
         heap.allocate_token_enter_heap(total, |token, heap| {
-            let obj = receiver.heap_ref(heap);
+            let obj = receiver.as_tagged(heap);
             let parent = obj.map_ref(heap);
             let child = token.allocate::<Map>(MapInit {
                 kind,
@@ -565,12 +563,10 @@ impl Transition {
                 descriptors: &surviving,
                 prototype,
             });
-            child
-                .pred
-                .set(heap, child.raw(), parent.clone().into_tagged());
+            child.pred.set(heap, child.raw(), parent);
             let name_word = name.as_tagged(heap);
             let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
-            if let Some(old) = parent.transitions.heap_ref(heap) {
+            if let Some(old) = parent.transitions.get(heap) {
                 for entry in old.as_slice().as_chunks::<2>().0 {
                     pairs.push(entry[0].get(heap));
                     pairs.push(entry[1].get(heap));
@@ -601,7 +597,7 @@ impl Transition {
                 let grow = match change {
                     Change::Append => true,
                     Change::Replace { index } => {
-                        receiver.heap_ref(heap).map_ref(heap).descriptors()[index]
+                        receiver.as_tagged(heap).map_ref(heap).descriptors()[index]
                             .flags()
                             .is_accessor()
                     }
@@ -609,7 +605,7 @@ impl Transition {
                 Self::target(
                     heap,
                     scope,
-                    |heap| receiver.heap_ref(heap).map_ref(heap),
+                    |heap| receiver.as_tagged(heap).map_ref(heap),
                     name,
                     flags,
                     None,
@@ -629,7 +625,7 @@ impl Transition {
                 Self::target(
                     heap,
                     scope,
-                    |heap| receiver.heap_ref(heap).map_ref(heap),
+                    |heap| receiver.as_tagged(heap).map_ref(heap),
                     name,
                     flags,
                     Some((get, set)),
@@ -724,14 +720,14 @@ impl Object {
     ) -> Result<bool, VmError> {
         debug_assert!(
             !receiver
-                .heap_ref(heap)
+                .as_tagged(heap)
                 .map_ref(heap)
                 .descriptors()
                 .iter()
                 .any(|d| d.name(heap).ptr_eq(name.as_tagged(heap))),
             "add_own_property requires the name to be absent from the receiver's own map"
         );
-        let cond_7 = receiver.heap_ref(heap).is_extendable(heap);
+        let cond_7 = receiver.as_tagged(heap).is_extendable(heap);
         if !cond_7 {
             return Ok(false);
         }
@@ -747,7 +743,7 @@ impl Object {
         desc: PropertyDescriptor<'_>,
     ) -> Result<bool, VmError> {
         let current = receiver
-            .heap_ref(heap)
+            .as_tagged(heap)
             .map_ref(heap)
             .descriptors()
             .iter()
@@ -761,7 +757,7 @@ impl Object {
         let Some(action) = ({
             validate_define(
                 heap,
-                receiver.heap_ref(heap),
+                receiver.as_tagged(heap),
                 cur_flags,
                 cur_desc_value,
                 desc,
@@ -795,7 +791,7 @@ impl Object {
                 Key::Element(i) => {
                     // array elements live in the elements backing store,
                     // outside the descriptors: delete punches a hole
-                    let obj = receiver.heap_ref(heap);
+                    let obj = receiver.as_tagged(heap);
                     if obj.as_ref().is_array(heap) {
                         // indices at/past `length` were never own properties
                         if i < obj.as_ref().length()
@@ -829,7 +825,7 @@ impl Object {
         // descriptors and is non-configurable (ES 10.4.2)
         {
             let cond_8 = receiver
-                .heap_ref(heap)
+                .as_tagged(heap)
                 .as_ref()
                 .array_length(heap, name.as_tagged(heap))
                 .is_some();
@@ -840,7 +836,7 @@ impl Object {
         // OrdinaryDelete: absent → true, non-configurable → false,
         // configurable → remove
         let configurable = receiver
-            .heap_ref(heap)
+            .as_tagged(heap)
             .map_ref(heap)
             .descriptors()
             .iter()
@@ -895,7 +891,7 @@ impl Object {
 
         {
             let cond_9 = receiver
-                .heap_ref(heap)
+                .as_tagged(heap)
                 .map_ref(heap)
                 .prototype
                 .get(heap)
@@ -905,7 +901,11 @@ impl Object {
             }
         }
         {
-            let cond_10 = receiver.heap_ref(heap).map_ref(heap).kind().is_extendable();
+            let cond_10 = receiver
+                .as_tagged(heap)
+                .map_ref(heap)
+                .kind()
+                .is_extendable();
             if !cond_10 {
                 return Err(VmError::NotExtensible);
             }
@@ -944,10 +944,10 @@ impl Object {
             Ok(())
         }?;
 
-        let descriptor_count = receiver.heap_ref(heap).map_ref(heap).descriptor_count();
+        let descriptor_count = receiver.as_tagged(heap).map_ref(heap).descriptor_count();
 
         heap.allocate_token_enter_heap(Map::layout_for(descriptor_count), |token, heap| {
-            let obj = receiver.heap_ref(heap);
+            let obj = receiver.as_tagged(heap);
             let map = obj.map_ref(heap);
             let kind = map.kind();
             let value_slot_count = map.value_slot_count();
@@ -977,7 +977,7 @@ impl Object {
 
 fn validate_define<'a, 's>(
     heap: &'a Heap,
-    receiver: HeapRef<'a, Object>,
+    receiver: Tagged<'a, Object>,
     cur_flags: SlotFlags,
     cur_desc_value: Handle<'s, Value>,
     desc: PropertyDescriptor<'s>,

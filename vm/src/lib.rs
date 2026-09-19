@@ -38,8 +38,8 @@ pub use handle::{
     EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, HandleSlice, RootHandles,
 };
 pub use heap::{
-    AllocToken, EdgeVisitable, GcSlot, GlobalHeap, Heap, HeapRef, MaybeWeakGcSlot, OptionGcSlot,
-    Register, WordType,
+    AllocToken, EdgeVisitable, GcSlot, GlobalHeap, Heap, MaybeWeakGcSlot, OptionGcSlot, Register,
+    WordType,
 };
 pub use interner::StringInterner;
 pub use lookup::{

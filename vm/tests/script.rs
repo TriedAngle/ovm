@@ -284,7 +284,6 @@ fn function_metadata_and_public_properties_survive_materialization() {
             let Some(function) = unsafe { function.assume_valid(heap) }.as_heap_object() else {
                 panic!("result must be a function object")
             };
-            let function = function.as_ref();
             let info = function
                 .callable_info(heap)
                 .expect("function must carry callable info");
@@ -322,10 +321,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
                     let Some(prototype) = slot.get(heap).as_heap_object() else {
                         panic!("function prototype must be an object")
                     };
-                    match prototype
-                        .as_ref()
-                        .lookup(heap, constructor.as_tagged(heap).into())
-                    {
+                    match prototype.lookup(heap, constructor.as_tagged(heap).into()) {
                         Lookup::Data { slot, flags, .. } => {
                             assert_eq!(slot.get(heap).raw(), function_value);
                             assert!(flags.is_writable());
@@ -375,7 +371,7 @@ fn tdz_throws_on_let_before_init() {
             let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("pending exception must be an object");
             };
-            match o.as_ref().lookup(heap, name.as_tagged(heap).into()) {
+            match o.lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => {
                     assert_eq!(slot.get(heap).raw(), expected.as_tagged(heap).raw())
                 }

@@ -27,9 +27,9 @@ fn interning_deduplicates_and_preserves_content() {
         let (text, hash_a, hash_b) = {
             let heap = &*ctx.heap();
             (
-                a.heap_ref(heap).to_rust_string(heap),
-                a.heap_ref(heap).hash(heap),
-                b.heap_ref(heap).hash(heap),
+                a.as_tagged(heap).to_rust_string(heap),
+                a.as_tagged(heap).hash(heap),
+                b.as_tagged(heap).hash(heap),
             )
         };
         assert_eq!(text, "hello");
@@ -69,8 +69,8 @@ fn interning_compresses_utf16_to_latin1() {
         {
             let heap = &*ctx.heap();
             use vm::{Encoding, MapKind};
-            let l = latin1_content.heap_ref(heap);
-            let u = utf16_content.heap_ref(heap);
+            let l = latin1_content.as_tagged(heap);
+            let u = utf16_content.as_tagged(heap);
             // encodings come from the map's kind bits
             assert_eq!(l.encoding(), Encoding::Latin1);
             assert_eq!(u.encoding(), Encoding::Utf16);

@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{Header, Heap, HeapObject, HeapRef, Map, Object, VmError};
+use crate::{Header, Heap, HeapObject, Map, Object, VmError};
 
 // imports flattened
 use crate::Handle;
@@ -350,7 +350,7 @@ impl<'a> Tagged<'a, Value> {
         self.raw.to_i64()
     }
 
-    pub fn get_as<T: HeapObject>(self) -> Option<HeapRef<'a, T>> {
+    pub fn get_as<T: HeapObject>(self) -> Option<Tagged<'a, T>> {
         let ptr = HeapPtr::decode_strong(self.raw)?;
         // Safety: strong pointer; reads only the header's map slot.
         let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.inner();
@@ -362,13 +362,7 @@ impl<'a> Tagged<'a, Value> {
         }
         // Safety: the map-kind check above is the type witness; the
         // anchor `'a` proves no GC ran since the load.
-        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
-    }
-
-    /// Like [`Self::get_as`], but yields an anchored [`Tagged`] instead of
-    /// a [`HeapRef`].
-    pub fn get_as_tagged<T: HeapObject>(self) -> Option<Tagged<'a, T>> {
-        self.get_as::<T>().map(HeapRef::into_tagged)
+        Some(unsafe { Tagged::from_value_unchecked(self.raw) })
     }
 
     /// Narrow an anchored value word to a property-name tag (type-level
@@ -381,10 +375,15 @@ impl<'a> Tagged<'a, Value> {
         }
     }
 
-    pub fn as_heap_object(self) -> Option<HeapRef<'a, Object>> {
-        let ptr = HeapPtr::decode_strong(self.raw)?;
-        // Safety: anchor `'a` proves no GC ran since the load.
-        Some(unsafe { HeapRef::from_ptr(ptr.cast()) })
+    pub fn as_heap_object(self) -> Option<Tagged<'a, Object>> {
+        if self.raw.is_strong_ptr() {
+            // Safety: strong pointer; the anchor `'a` proves no GC ran
+            // since the load. No kind check: `Object` is the widest
+            // header-prefixed view, callers narrow further.
+            Some(unsafe { self.cast() })
+        } else {
+            None
+        }
     }
 }
 

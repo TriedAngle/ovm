@@ -63,10 +63,7 @@ fn assert_type_error(src: &str) {
             let Some(obj) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
                 panic!("exception is not an object");
             };
-            match obj
-                .as_ref()
-                .lookup(heap, name_handle.as_tagged(heap).into())
-            {
+            match obj.lookup(heap, name_handle.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => slot
                     .get(heap)
                     .get_as::<vm::DenseString>()

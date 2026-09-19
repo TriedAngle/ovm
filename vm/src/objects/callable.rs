@@ -214,10 +214,10 @@ impl CallableInfoObject {
     /// Decode a constant-pool property name.
     // TODO: this must handle also non constants and non interned strings and symbols
     pub fn constant_slot_name<'a>(&self, heap: &'a Heap, idx: usize) -> Tagged<'a, SlotName> {
-        let v = self.constants.heap_ref(heap).at(heap, idx);
+        let v = self.constants.get(heap).at(heap, idx);
         let name = v
             .get_as::<DenseString>()
             .expect("property name constant must be an interned string");
-        name.into_tagged().into()
+        name.into()
     }
 }

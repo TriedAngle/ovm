@@ -536,7 +536,7 @@ fn missing_colon_in_object_is_error() {
 
 #[test]
 fn example_ktt_parses() {
-    let src = include_str!("../../js_parser/example.ktt");
+    let src = include_str!("../example.ktt");
     let (ast, root) = parse(src);
     let stmts = stmts(&ast, root);
     assert!(

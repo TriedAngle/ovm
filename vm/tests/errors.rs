@@ -14,7 +14,7 @@ fn get_prop(thread: &mut Thread, obj: Value, name_word: Value) -> Value {
         let Some(o) = unsafe { obj.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
-        match o.as_ref().lookup(heap, name(heap, name_word)) {
+        match o.lookup(heap, name(heap, name_word)) {
             Lookup::Data { slot, .. } => slot.get(heap).raw(),
             _ => panic!("expected a data property"),
         }
@@ -207,7 +207,7 @@ fn prototype_of(thread: &mut Thread, obj: Value) -> Option<Value> {
         let Some(o) = unsafe { obj.assume_valid(heap) }.as_heap_object() else {
             panic!("expected object");
         };
-        let map = o.as_ref().header.map.heap_ref(heap).as_ref();
+        let map = o.as_ref().header.map.get(heap).as_ref();
         let proto = map.prototype.get(heap).raw();
         if proto == heap.known().null.as_tagged(heap).raw() {
             None

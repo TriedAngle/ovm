@@ -3,8 +3,8 @@ use core::alloc::Layout;
 use crate::{
     CallableInfoObject, Coercion, Context, ContextState, Convert, DenseString, EdgeVisitable,
     FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
-    HeapObject, HeapRef, Hint, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext,
-    SlotName, Smi, Symbol, Tagged, VM, Value, Visitor, VmError,
+    HeapObject, Hint, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext, SlotName, Smi,
+    Symbol, Tagged, VM, Value, Visitor, VmError,
 };
 
 #[repr(C)]
@@ -20,22 +20,19 @@ impl Object {
         Layout::new::<Self>()
     }
 
-    pub fn callable_info<'a>(&'a self, heap: &'a Heap) -> Option<HeapRef<'a, CallableInfoObject>> {
-        if !self.header.map.heap_ref(heap).kind().is_callable() {
+    pub fn callable_info<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, CallableInfoObject>> {
+        if !self.header.map.get(heap).kind().is_callable() {
             return None;
         }
-        let info = self.slots.heap_ref(heap).at(heap, 0);
+        let info = self.slots.get(heap).at(heap, 0);
         info.get_as::<CallableInfoObject>()
     }
 
     pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, Context>> {
-        if !self.header.map.heap_ref(heap).kind().is_callable() {
+        if !self.header.map.get(heap).kind().is_callable() {
             return None;
         }
-        self.slots
-            .heap_ref(heap)
-            .at(heap, 1)
-            .get_as_tagged::<Context>()
+        self.slots.get(heap).at(heap, 1).get_as::<Context>()
     }
 
     /// The `idx`-th entry of the callable's constant pool, as a slot name.
@@ -46,15 +43,15 @@ impl Object {
     }
 
     pub fn runtime_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
-        if !self.header.map.heap_ref(heap).kind().is_runtime() {
+        if !self.header.map.get(heap).kind().is_runtime() {
             return None;
         }
-        let idx = Smi::decode(self.slots.heap_ref(heap).at(heap, 0).raw())?.value();
+        let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
         usize::try_from(idx).ok()
     }
 
     pub fn is_array<'a>(&'a self, heap: &'a Heap) -> bool {
-        self.header.map.heap_ref(heap).kind().kind() == ObjectKind::Array
+        self.header.map.get(heap).kind().kind() == ObjectKind::Array
     }
 
     /// The JSArray `length` internal slot, when `self` is an array named
@@ -75,8 +72,8 @@ impl Object {
     }
 
     /// The object's map (shape).
-    pub fn map_ref<'a>(&self, heap: &'a Heap) -> HeapRef<'a, Map> {
-        self.header.map.heap_ref(heap)
+    pub fn map_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, Map> {
+        self.header.map.get(heap)
     }
 
     /// Whether the object's map allows adding new properties.
@@ -86,14 +83,14 @@ impl Object {
 
     /// The slot holding the value of the data slot at `offset`.
     pub fn slot<'a>(&self, heap: &'a Heap, offset: usize) -> &'a GcSlot {
-        self.slots.heap_ref(heap).as_ref().element_slot(offset)
+        self.slots.get(heap).as_ref().element_slot(offset)
     }
 
     pub fn length(&self) -> usize {
         self.length.to_smi().value() as usize
     }
 
-    pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<HeapRef<'a, FixedArray>> {
+    pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, FixedArray>> {
         self.elements.get(heap).get_as::<FixedArray>()
     }
 
@@ -128,7 +125,7 @@ impl Object {
     /// count and kind) or a runtime (with registry index).
     pub fn call_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
         let obj = f.as_heap_object()?;
-        let kind = obj.as_ref().header.map.heap_ref(heap).kind();
+        let kind = obj.as_ref().header.map.get(heap).kind();
         if !kind.is_callable() {
             return None;
         }
@@ -138,7 +135,7 @@ impl Object {
         let info = obj.as_ref().callable_info(heap)?;
         let register_count = info.register_count.to_smi().value() as usize;
         Some(CallTarget::Bytecode(
-            obj.into_tagged(),
+            obj,
             register_count,
             info.function_kind(),
         ))
@@ -157,7 +154,7 @@ impl Object {
         let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
 
         let grows = {
-            let obj = receiver.heap_ref(heap);
+            let obj = receiver.as_tagged(heap);
             if !obj.as_ref().is_array(heap) {
                 return Err(VmError::Type);
             }
@@ -175,7 +172,7 @@ impl Object {
         if grows {
             let staged = {
                 let heap_ref: &Heap = heap;
-                let obj = receiver.heap_ref(heap_ref);
+                let obj = receiver.as_tagged(heap_ref);
                 let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
                 let keep = obj.as_ref().length().min(elements.len());
                 let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
@@ -191,12 +188,12 @@ impl Object {
                 scope.stage(&values)
             };
             let elements = heap.allocate_handle::<FixedArray>(staged, scope);
-            let obj = receiver.heap_ref(heap);
+            let obj = receiver.as_tagged(heap);
             obj.elements
                 .set(heap, obj.erase(), elements.as_tagged(heap).erase());
             obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
         } else {
-            let obj = receiver.heap_ref(heap);
+            let obj = receiver.as_tagged(heap);
             let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
             elements.set(heap, i, value.as_tagged(heap));
             // a store inside the physical capacity but past the logical
@@ -275,7 +272,7 @@ impl Object {
         info: Handle<'_, CallableInfoObject>,
         context: Handle<'_, Context>,
     ) -> Result<Tagged<'a, Object>, VmError> {
-        let info_ref = info.heap_ref(heap);
+        let info_ref = info.as_tagged(heap);
         let kind = info_ref.function_kind();
         let formal_length = info_ref.formal_length();
         let function_name = match info_ref.name(heap) {
@@ -509,7 +506,7 @@ impl Object {
         let Some(obj) = v.as_heap_object() else {
             return false;
         };
-        obj.as_ref().header.map.heap_ref(heap).kind().is_callable()
+        obj.as_ref().header.map.get(heap).kind().is_callable()
     }
 
     /// ES 7.1.18 ToPropertyKey: smis and symbols pass through, everything
@@ -629,7 +626,7 @@ impl Object {
         let Some(obj) = object.as_heap_object() else {
             return false;
         };
-        let proto = obj.as_ref().header.map.heap_ref(heap).prototype.get(heap);
+        let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
         if proto.ptr_eq(target) {
             return true;
         }
