@@ -1,0 +1,27 @@
+// Object literals: named slots and elements live on one object. `=` writes
+// existing slots; `[i] =` writes an existing element in place — it never
+// grows the store (define elements with `[i]:` in a literal).
+//
+// Run: cargo run -q -p kette_compiler --example run -- kette_examples/objects.ktt
+
+let rgb = {
+    label: "red"
+    [0]: 255
+    [1]: 0
+    [2]: 0
+}
+
+rgb.label = "crimson"
+rgb[1] = 32
+
+// `[i] =` writes existing elements only: an out-of-bounds write throws.
+// `try { A } catch e { B }` runs `B` with the exception bound to `e`.
+let message = try {
+    rgb[3] = 255
+    "wrote element 3"
+} catch error {
+    "caught: element 3 does not exist"
+}
+
+// The runner prints the value of the final expression.
+message

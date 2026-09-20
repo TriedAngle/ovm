@@ -42,12 +42,19 @@ pub enum Resolution {
 pub struct Resolved {
     /// parallel to the node arena; `Some` on identifier uses only
     resolutions: Vec<Option<Resolution>>,
+    /// scope owned by a `Block` / the root `StmtList` node
+    node_scopes: Vec<Option<ScopeId>>,
     scopes: Vec<ScopeInfo>,
 }
 
 impl Resolved {
     pub fn resolution(&self, node: NodeId) -> Option<Resolution> {
         self.resolutions[node.0 as usize]
+    }
+
+    /// The scope a block node (or the root statement list) owns.
+    pub fn scope_of(&self, node: NodeId) -> Option<ScopeId> {
+        self.node_scopes[node.0 as usize]
     }
 
     pub fn scope(&self, id: ScopeId) -> &ScopeInfo {
@@ -63,6 +70,7 @@ pub fn resolve(ast: &Ast) -> Resolved {
     let mut resolver = Resolver {
         ast,
         resolutions: vec![None; ast.node_count()],
+        node_scopes: vec![None; ast.node_count()],
         scopes: Vec::new(),
         stack: Vec::new(),
     };
@@ -71,6 +79,7 @@ pub fn resolve(ast: &Ast) -> Resolved {
     }
     Resolved {
         resolutions: resolver.resolutions,
+        node_scopes: resolver.node_scopes,
         scopes: resolver.scopes,
     }
 }
@@ -78,6 +87,7 @@ pub fn resolve(ast: &Ast) -> Resolved {
 struct Resolver<'a> {
     ast: &'a Ast,
     resolutions: Vec<Option<Resolution>>,
+    node_scopes: Vec<Option<ScopeId>>,
     scopes: Vec<ScopeInfo>,
     /// innermost scope last
     stack: Vec<ScopeId>,
@@ -112,7 +122,8 @@ impl Resolver<'_> {
     }
 
     fn resolve_root(&mut self, root: NodeId) {
-        self.push_scope(ScopeKind::Script);
+        let scope = self.push_scope(ScopeKind::Script);
+        self.node_scopes[root.0 as usize] = Some(scope);
         let ast = self.ast;
         if let Node::StmtList { stmts } = ast.node(root) {
             let stmts = *stmts;
@@ -139,7 +150,8 @@ impl Resolver<'_> {
     /// Enter a block's scope: params, then any `extra` bindings (a `for`
     /// loop variable), then the block's own `let`s; then walk the body.
     fn resolve_block(&mut self, block: NodeId, extra: &[Symbol]) {
-        self.push_scope(ScopeKind::Block);
+        let scope = self.push_scope(ScopeKind::Block);
+        self.node_scopes[block.0 as usize] = Some(scope);
         let ast = self.ast;
         if let Node::Block { params, body } = ast.node(block) {
             let (params, body) = (*params, *body);
@@ -252,6 +264,11 @@ impl Resolver<'_> {
                 self.resolve_node(rhs);
             }
             Node::Return { value } => self.resolve_node(*value),
+            Node::Try { body, handler } => {
+                let (body, handler) = (*body, *handler);
+                self.resolve_node(body);
+                self.resolve_node(handler);
+            }
             Node::Slot { .. } | Node::MatchArm { .. } => {}
             Node::Number(_) | Node::String(_) | Node::Bool(_) | Node::Null | Node::Self_ => {}
         }

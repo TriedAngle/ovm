@@ -1261,12 +1261,13 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 },
             )
             .into_handle(&scope);
-        // child: no own slots, prototype = FixedArray([parent]) (multiple
-        // parents in priority order; here a single one)
+        // child: no own slots, prototype = FixedArray([name, parent]) (the
+        // Self-style inline parent pair list)
         let w6 = word(&*thread.heap(), parent);
+        let parent_word = intern_word(&mut *thread, &scope, "parent");
         let parents = thread
             .heap()
-            .allocate_handle::<FixedArray>(stage_values(&scope, &[w6]), &scope);
+            .allocate_handle::<FixedArray>(stage_values(&scope, &[parent_word, w6]), &scope);
         let child_map = thread.heap().allocate_handle::<Map>(
             MapInit {
                 kind: EXTENDABLE,
@@ -4225,9 +4226,11 @@ fn shadow_setup<'s>(
         )
         .into_handle(scope);
     let w31 = word(&*thread.heap(), parent);
+    let parent_word = thread.intern(scope, "parent");
+    let parent_word = parent_word.as_tagged(&*thread.heap()).raw();
     let parents = thread
         .heap()
-        .allocate_handle::<FixedArray>(stage_values(scope, &[w31]), scope);
+        .allocate_handle::<FixedArray>(stage_values(scope, &[parent_word, w31]), scope);
     let child_map = thread.heap().allocate_handle::<Map>(
         MapInit {
             kind: if child_extendable {

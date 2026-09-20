@@ -320,11 +320,14 @@ fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> boo
         if proto == heap.known().null.as_tagged(heap) || !proto.is_strong_ptr() {
             return false;
         }
-        if let Some(parents) = proto.get_as::<FixedArray>() {
-            for i in 0..parents.len() {
-                if array_length_in_chain(heap, parents.at(heap, i)) {
+        if let Some(pairs) = proto.get_as::<FixedArray>() {
+            // Self-style parent pairs: stride over the parent values
+            let mut i = 1;
+            while i < pairs.len() {
+                if array_length_in_chain(heap, pairs.at(heap, i)) {
                     return true;
                 }
+                i += 2;
             }
             return false;
         }
@@ -362,7 +365,24 @@ impl Map {
             }
         }
 
-        lookup_in_parents(heap, self.prototype.get(heap), name)
+        let proto = self.prototype.get(heap);
+        if let Some(pairs) = proto.get_as::<FixedArray>() {
+            let name_word = name.erase();
+            let mut i = 0;
+            while i < pairs.len() {
+                if pairs.at(heap, i).ptr_eq(name_word) {
+                    return Lookup::Data {
+                        holder: receiver,
+                        map_index: i / 2,
+                        holder_index: i + 1,
+                        slot: pairs.as_ref().element_slot(i + 1),
+                        flags: SlotFlags::VALUE,
+                    };
+                }
+                i += 2;
+            }
+        }
+        lookup_in_parents(heap, proto, name)
     }
 }
 
@@ -374,12 +394,15 @@ pub fn lookup_in_parents<'a>(
     if proto == heap.known().null.as_tagged(heap) {
         return Lookup::NotFound;
     }
-    if let Some(parents) = proto.get_as::<FixedArray>() {
-        for i in 0..parents.len() {
-            let result = parents.at(heap, i).lookup(heap, name);
+    if let Some(pairs) = proto.get_as::<FixedArray>() {
+        // look *inside* the parents: the pair names are slots of the child
+        let mut i = 1;
+        while i < pairs.len() {
+            let result = pairs.at(heap, i).lookup(heap, name);
             if !matches!(result, Lookup::NotFound) {
                 return result;
             }
+            i += 2;
         }
         return Lookup::NotFound;
     }
@@ -435,7 +458,8 @@ pub fn super_lookup_from_proto<'a>(
         // single parent: full load semantics
         SuperStart::Object(start) => Lookup::load_outcome(heap, start, name),
         SuperStart::Parents(parents) => {
-            for i in 0..parents.len() {
+            let mut i = 1;
+            while i < parents.len() {
                 let parent = parents.at(heap, i);
                 if let Some(obj) = parent.as_heap_object()
                     && let Some(v) = obj.as_ref().array_length(heap, name)
@@ -449,7 +473,9 @@ pub fn super_lookup_from_proto<'a>(
                     Lookup::Accessor { pair, .. } => {
                         return Ok(LoadOutcome::Getter(pair.get.get(heap)));
                     }
-                    Lookup::NotFound => continue,
+                    Lookup::NotFound => {
+                        i += 2;
+                    }
                 }
             }
             Ok(LoadOutcome::Value(

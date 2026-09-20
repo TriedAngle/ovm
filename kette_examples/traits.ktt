@@ -1,0 +1,25 @@
+// Traits: `parent*:` / `mixin*:` slots form a multi-parent lookup chain in
+// declaration order. Methods get `self` from the send, so `Counter.count`
+// reads the receiver's `n`.
+//
+// Run: cargo run -q -p kette_compiler --example run -- kette_examples/traits.ktt
+
+let Greeter = {
+    greet: { "hello" }
+    describe: { self.name }
+}
+
+let Counter = {
+    count: { self.n }
+}
+
+let Thing = {
+    parent*: Greeter
+    mixin*: Counter
+    name: "thing"
+    n: 41
+}
+
+Thing.greet()
+Thing.describe()
+Thing.count()

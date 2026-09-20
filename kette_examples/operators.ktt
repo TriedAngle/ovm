@@ -1,0 +1,15 @@
+// Binary operators are ordinary sends: `a + b` is `a.add(b)`, `a < b` is
+// `a.lt(b)`, `a == b` is `a.eq(b)`, and so on. The receiver owns the
+// semantics; these stand in for the number prelude.
+//
+// Run: cargo run -q -p kette_compiler --example run -- kette_examples/operators.ktt
+
+let one = { add: { |o| o.x } }
+let two = { x: 41 }
+
+let left = { lt: { |o| o.flag } }
+let right = { flag: 1 }
+
+left < right
+two.x
+one + two

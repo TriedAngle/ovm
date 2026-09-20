@@ -1,5 +1,7 @@
 use std::io::Write;
+use std::path::Path;
 
+use ir::{CompileFn, SourceMode};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{DenseString, Float, Smi, Value};
 use vm::{Thread, VM};
@@ -34,7 +36,16 @@ fn run_file(thread: &mut Thread, path: &str) {
             std::process::exit(1);
         }
     };
-    match thread.run_script(&src) {
+    // the frontend is chosen at the call site; the VM stays language-agnostic
+    let compile: CompileFn = match Path::new(path).extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("js") => js_compiler::compile_js,
+        Some(ext) if ext.eq_ignore_ascii_case("ktt") => kette_compiler::compile_kette,
+        _ => {
+            eprintln!("ovm: cannot tell the language of {path} (expected .js or .ktt)");
+            std::process::exit(1);
+        }
+    };
+    match thread.run_source(&src, compile, SourceMode::Script) {
         Ok(_) => {
             if report_uncaught(thread) {
                 std::process::exit(1);

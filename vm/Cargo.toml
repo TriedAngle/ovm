@@ -12,6 +12,7 @@ heap_api = { path = "../heap_api" }
 bytecode = { path = "../bytecode" }
 ir = { path = "../ir" }
 js_compiler = { path = "../js_compiler" }
+kette_compiler = { path = "../kette_compiler" }
 mark_sweep = { path = "../collectors/mark_sweep" }
 
 [features]

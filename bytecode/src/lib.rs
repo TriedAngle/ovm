@@ -237,8 +237,20 @@ pub enum Opcode {
     // holder, never shadowed on the receiver
     StoreNamedPropertyNoShadow, // acc -> reg (obj) idx (constant pool index string) idx (feedback)
 
+    /// acc -> reg (obj) idx (constant pool name): append a named parent to
+    /// the object's parent list. Parents are stored as inline
+    /// `[name, parent, ...]` pairs, one [[Prototype]] array per object —
+    /// one parent or many, always the pair encoding. Creates no slot.
+    AddParent, // reg (obj) idx (constant pool name)
+
     StoreKeyedProperty,         // acc -> reg (obj) reg (key) idx (feedback)
     StoreKeyedPropertyNoShadow, // acc -> reg (obj) reg (key) idx (feedback)
+
+    /// acc -> reg (obj) reg (key): Kette `obj[key] = value`. Element keys
+    /// are written in place only — a miss or hole is a RangeError, never
+    /// an implicit elements-store growth; name keys use the WriteThrough
+    /// store. (JS keeps `StoreKeyedProperty*`.)
+    StoreKeyedSlot, // reg (obj) reg (key)
 
     Move, // reg -> reg
 
@@ -268,6 +280,9 @@ pub enum Opcode {
     // -- literals and closures --------------------------------------------
     CreateEmptyObjectLiteral, // -> acc (object_initial_map, no slots)
     CreateEmptyArrayLiteral,  // -> acc (js_array_map, empty elements)
+    /// -> acc (plain_object_map: extensible, no [[Prototype]]):
+    /// Self-style (Kette) objects, whose parents are pair-encoded
+    CreateBareObjectLiteral,
 
     CreateClosure, // idx -> acc
 
@@ -422,8 +437,10 @@ impl Opcode {
             b if b == StoreGlobal as u8 => StoreGlobal,
             b if b == StoreNamedProperty as u8 => StoreNamedProperty,
             b if b == StoreNamedPropertyNoShadow as u8 => StoreNamedPropertyNoShadow,
+            b if b == AddParent as u8 => AddParent,
             b if b == StoreKeyedProperty as u8 => StoreKeyedProperty,
             b if b == StoreKeyedPropertyNoShadow as u8 => StoreKeyedPropertyNoShadow,
+            b if b == StoreKeyedSlot as u8 => StoreKeyedSlot,
             b if b == Move as u8 => Move,
             b if b == LoadContextSlot as u8 => LoadContextSlot,
             b if b == StoreContextSlot as u8 => StoreContextSlot,
@@ -439,6 +456,7 @@ impl Opcode {
             b if b == Construct as u8 => Construct,
             b if b == CreateEmptyObjectLiteral as u8 => CreateEmptyObjectLiteral,
             b if b == CreateEmptyArrayLiteral as u8 => CreateEmptyArrayLiteral,
+            b if b == CreateBareObjectLiteral as u8 => CreateBareObjectLiteral,
             b if b == CreateClosure as u8 => CreateClosure,
             b if b == LoadCurrentClosure as u8 => LoadCurrentClosure,
             b if b == Add as u8 => Add,
@@ -500,9 +518,11 @@ impl Opcode {
             Self::StoreNamedProperty | Self::StoreNamedPropertyNoShadow => {
                 &[Register, Index, Index]
             }
+            Self::AddParent => &[Register, Index],
             Self::StoreKeyedProperty | Self::StoreKeyedPropertyNoShadow => {
                 &[Register, Register, Index]
             }
+            Self::StoreKeyedSlot => &[Register, Register],
 
             Self::Move => &[Register, Register],
 
@@ -519,7 +539,9 @@ impl Opcode {
             Self::CallRuntime => &[Index, RegisterListStart, RegisterCount],
             Self::Construct => &[Register, RegisterListStart, RegisterCount],
 
-            Self::CreateEmptyObjectLiteral | Self::CreateEmptyArrayLiteral => &[],
+            Self::CreateEmptyObjectLiteral
+            | Self::CreateEmptyArrayLiteral
+            | Self::CreateBareObjectLiteral => &[],
             Self::CreateClosure => &[Index],
             Self::LoadCurrentClosure => &[],
 

@@ -173,6 +173,19 @@ fn self_has_no_resolution() {
 }
 
 #[test]
+fn catch_binding_is_local_to_the_handler_block() {
+    // root scope 0, try body scope 1, handler scope 2
+    let (ast, res) = compile("try { a } catch e { e }");
+    assert_eq!(
+        ident_resolutions(&ast, &res, "e"),
+        vec![Resolution::Local {
+            scope: ScopeId(2),
+            decl: 0
+        }]
+    );
+}
+
+#[test]
 fn example_ktt_resolves() {
     let src = include_str!("../example.ktt");
     let mut p = Parser::new(Utf8SliceStream::new(src));

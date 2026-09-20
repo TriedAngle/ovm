@@ -735,6 +735,32 @@ impl Object {
         Ok(true)
     }
 
+    pub fn add_parent(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: Handle<Object>,
+        name: Handle<SlotName>,
+        value: Handle<'_, Value>,
+    ) -> Result<(), VmError> {
+        if !receiver.as_tagged(heap).is_extendable(heap) {
+            return Err(VmError::NotExtensible);
+        }
+        let mut pairs: Vec<Handle<'_, Value>> = Vec::new();
+        {
+            let base = receiver.as_tagged(heap).map_ref(heap).prototype.get(heap);
+            if let Some(existing) = base.get_as::<FixedArray>() {
+                for i in 0..existing.len() {
+                    pairs.push(scope.handle(existing.at(heap, i)));
+                }
+            }
+        }
+        pairs.push(name.erase());
+        pairs.push(value);
+        let anchored: Vec<Tagged<'_, Value>> = pairs.iter().map(|h| h.as_tagged(heap)).collect();
+        let pairs = heap.allocate_handle::<FixedArray>(scope.stage(&anchored), scope);
+        Self::set_prototype(heap, scope, receiver, pairs.erase())
+    }
+
     pub fn define_own_property(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
@@ -911,8 +937,6 @@ impl Object {
             }
         }
 
-        // cycle check: the receiver must not appear in any proposed chain
-        // (FixedArray prototypes contribute one chain per element)
         {
             let null = heap.known().null.as_tagged(heap).erase();
             let this = receiver.as_tagged(heap).erase();
@@ -934,9 +958,11 @@ impl Object {
                 }
                 Ok(())
             }
-            if let Some(parents) = start.get_as::<FixedArray>() {
-                for i in 0..parents.len() {
-                    walk(heap, null, this, parents.at(heap, i))?;
+            if let Some(pairs) = start.get_as::<FixedArray>() {
+                let mut i = 1;
+                while i < pairs.len() {
+                    walk(heap, null, this, pairs.at(heap, i))?;
+                    i += 2;
                 }
             } else {
                 walk(heap, null, this, start)?;

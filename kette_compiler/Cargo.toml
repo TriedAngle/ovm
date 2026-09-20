@@ -7,3 +7,7 @@ edition.workspace = true
 bytecode = { path = "../bytecode" }
 ir = { path = "../ir" }
 kette_parser = { path = "../kette_parser" }
+
+[dev-dependencies]
+mark_sweep = { path = "../collectors/mark_sweep" }
+vm = { path = "../vm" }

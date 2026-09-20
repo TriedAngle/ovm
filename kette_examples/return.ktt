@@ -1,0 +1,10 @@
+// `return expr` returns from the enclosing block. Falling off the end is
+// the normal block return: the body's value is its last expression.
+//
+// Run: cargo run -q -p kette_compiler --example run -- kette_examples/return.ktt
+
+let firstOf = { |a, b| return a }
+let secondOf = { |a, b| b }
+
+secondOf(10, 20)
+firstOf(10, 20)

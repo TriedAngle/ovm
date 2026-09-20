@@ -245,7 +245,7 @@ impl<S: CharStream> Parser<S> {
                     span,
                 ))
             }
-            TokenKind::Caret => {
+            TokenKind::Return => {
                 self.next()?;
                 let value = self.parse_unary()?;
                 let span = ByteSpan::new(t.span.start, self.ast.span(value).end);
@@ -377,6 +377,7 @@ impl<S: CharStream> Parser<S> {
             TokenKind::While => self.parse_while(),
             TokenKind::For => self.parse_for(),
             TokenKind::Match => self.parse_match(),
+            TokenKind::Try => self.parse_try(),
             _ => Err(ParseError::new(
                 t.span,
                 format!("expected an expression, found `{}`", t.kind.describe()),
@@ -649,5 +650,39 @@ impl<S: CharStream> Parser<S> {
         let arms = self.ast.list(&arms);
         let span = ByteSpan::new(kw.span.start, close.span.end);
         Ok(self.ast.add(Node::Match { scrut, arms }, span))
+    }
+
+    /// `try { body } catch name { handler }`; the catch binding becomes
+    /// the handler block's first parameter.
+    fn parse_try(&mut self) -> Result<NodeId, ParseError> {
+        let kw = self.expect(TokenKind::Try)?;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::Catch)?;
+        let name_tok = self.expect(TokenKind::Identifier)?;
+        let name = Symbol(
+            name_tok
+                .value
+                .symbol()
+                .expect("identifier carries a symbol"),
+        );
+        let param = self.ast.add(Node::Ident(name), name_tok.span);
+        let params = self.ast.list(&[param]);
+        self.expect(TokenKind::LBrace)?;
+        let stmts = self.parse_statement_list(TokenKind::RBrace)?;
+        let close = self.expect(TokenKind::RBrace)?;
+        let stmt_list = self.ast.list(&stmts);
+        let handler_body_span = ByteSpan::new(name_tok.span.end, close.span.start);
+        let handler_body = self
+            .ast
+            .add(Node::StmtList { stmts: stmt_list }, handler_body_span);
+        let handler = self.ast.add(
+            Node::Block {
+                params,
+                body: handler_body,
+            },
+            ByteSpan::new(name_tok.span.start, close.span.end),
+        );
+        let span = ByteSpan::new(kw.span.start, close.span.end);
+        Ok(self.ast.add(Node::Try { body, handler }, span))
     }
 }

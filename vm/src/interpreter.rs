@@ -611,6 +611,20 @@ fn step<'a>(
                 Step::Next
             })
         }
+        Opcode::AddParent => state.handle_scope(|scope| -> Step<'_> {
+            let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+            let name = stack
+                .callable(heap, &meta)
+                .as_ref()
+                .constant_slot_name(heap, ops.idx(1));
+            let name = scope.handle(name);
+            let value = scope.handle(acc.read(heap));
+            let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+                return Step::Error(VmError::Type);
+            };
+            step_try!(Object::add_parent(heap, &scope, receiver, name, value));
+            Step::Next
+        }),
         Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyNoShadow => {
             let semantics = match op {
                 Opcode::StoreKeyedPropertyNoShadow => StoreSemantics::WriteThrough,
@@ -677,6 +691,69 @@ fn step<'a>(
                 Step::Next
             })
         }
+        Opcode::StoreKeyedSlot => state.handle_scope(|scope| -> Step<'_> {
+            // Kette `obj[key] = value`: elements are written in place only,
+            // never grown; integer keys on plain objects are Smi-named
+            // slots and must already exist; names use the WriteThrough store
+            let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+            let raw = scope.handle(stack.reg(heap, &meta, ops.reg(1)));
+            let Some(key) = step_try!(Object::to_property_key(vm, heap, state, raw)) else {
+                return Step::PendingThrow;
+            };
+            let key = scope.handle(key);
+
+            if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
+                return match step_try!(Proxy::set(
+                    vm,
+                    heap,
+                    state,
+                    receiver,
+                    key.erase(),
+                    scope.handle(acc.read(heap)),
+                    receiver,
+                )) {
+                    Coercion::Threw => Step::PendingThrow,
+                    Coercion::Value(_) => Step::Next,
+                };
+            }
+
+            let name: Handle<'_, SlotName> =
+                match step_try!(Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+                    Key::Element(i) => {
+                        let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+                            return Step::Error(VmError::Type);
+                        };
+                        if obj.as_tagged(heap).as_ref().is_array(heap) {
+                            let value = scope.handle(acc.read(heap));
+                            step_try!(Object::store_array_element_in_place(heap, &obj, i, &value));
+                            return Step::Next;
+                        }
+                        let smi: Handle<'_, Smi> = scope.handle(Smi::new(i as i64));
+                        let name = smi.as_tagged(heap).erase().as_name();
+                        if matches!(
+                            receiver.as_tagged(heap).lookup(heap, name),
+                            Lookup::NotFound
+                        ) {
+                            return Step::Error(VmError::OutOfBounds);
+                        }
+                        scope.handle(name)
+                    }
+                    Key::Name(key) => scope.handle(key),
+                };
+
+            let outcome = step_try!(receiver.as_tagged(heap).store_lookup(
+                heap,
+                &scope,
+                name.as_tagged(heap),
+                acc.read(heap),
+                StoreSemantics::WriteThrough,
+            ));
+            let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+            step_try!(apply_store_outcome(
+                vm, heap, state, stack, cache, meta, pc, receiver, outcome,
+            ));
+            Step::Next
+        }),
         Opcode::Move => {
             stack.set_reg(&meta, ops.reg(0), stack.reg(heap, &meta, ops.reg(1)));
             Step::Next
@@ -986,6 +1063,14 @@ fn step<'a>(
         Opcode::CreateEmptyArrayLiteral => {
             let obj = state.handle_scope(|scope| {
                 let map = heap.known().js_array_map;
+                heap.new_object(&scope, map, HandleSlice::EMPTY).raw()
+            });
+            *acc = obj;
+            Step::Next
+        }
+        Opcode::CreateBareObjectLiteral => {
+            let obj = state.handle_scope(|scope| {
+                let map = heap.known().plain_object_map;
                 heap.new_object(&scope, map, HandleSlice::EMPTY).raw()
             });
             *acc = obj;
