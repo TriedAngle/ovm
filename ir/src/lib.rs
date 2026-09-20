@@ -154,6 +154,9 @@ pub struct Function {
     pub arity: u32,
     /// JS-visible `length`: parameters before the first default/rest/pattern.
     pub length: u32,
+    /// Feedback-vector slots (inline-cache state) the function needs.
+    /// Property-access sites index into it via their feedback operand.
+    pub feedback_count: u32,
     /// Preserved for strict-sensitive runtime operations; enforcement is
     /// intentionally deferred until the VM has language-mode-aware stores.
     pub strict: bool,
@@ -173,6 +176,7 @@ pub struct FunctionBuilder {
     pub kind: CallableKind,
     pub arity: u32,
     pub length: u32,
+    pub feedback_count: u32,
     pub strict: bool,
 }
 
@@ -227,6 +231,7 @@ impl Program {
             kind: builder.kind,
             arity: builder.arity,
             length: builder.length,
+            feedback_count: builder.feedback_count,
             strict: builder.strict,
         };
         FunctionId(self.functions.insert(function))

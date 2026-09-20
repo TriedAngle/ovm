@@ -11,7 +11,7 @@
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
     Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ScopeInfo,
-    ScopeInfoInit, Tagged, Value, VmError,
+    ScopeInfoInit, Tagged, Value, VmError, decode_wtf8, new_feedback_vector,
 };
 
 use ir::{CallableKind, Constant, FunctionId, Program};
@@ -141,6 +141,9 @@ fn materialize_function<'s>(
         },
         scope,
     );
+    if let Some(feedback) = new_feedback_vector(heap, scope, function.feedback_count as usize) {
+        info.as_tagged(heap).set_feedback(heap, feedback);
+    }
     let name: Option<Handle<'s, DenseString>> = program
         .name(function)
         .map(|name| intern(heap, state, scope, vm, name));
@@ -174,6 +177,6 @@ fn intern<'s>(
     vm: &VM,
     s: &[u8],
 ) -> Handle<'s, DenseString> {
-    let units = crate::decode_wtf8(s).expect("frontends produce valid WTF-8 string constants");
+    let units = decode_wtf8(s).expect("frontends produce valid WTF-8 string constants");
     vm.interner().intern(heap, scope, StringData::Utf16(&units))
 }

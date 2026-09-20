@@ -1,6 +1,9 @@
 use core::cell::UnsafeCell;
 
-use crate::{EdgeVisitable, FixedArray, FixedByteArray, Heap, Register, Tagged, Value, Visitor};
+use crate::{
+    EdgeVisitable, FeedbackVector, FixedArray, FixedByteArray, Heap, Register, Tagged, Value,
+    Visitor,
+};
 
 use crate::{FrameMeta, Stack};
 
@@ -10,6 +13,7 @@ struct StackCacheImpl {
     acc: Register,
     code: Register,
     constants: Register,
+    feedback: Register,
     pc: usize,
     base: usize,
     register_count: usize,
@@ -23,6 +27,7 @@ impl StackCache {
             acc: unsafe { Register::from_value(the_hole) },
             code: unsafe { Register::from_value(the_hole) },
             constants: unsafe { Register::from_value(the_hole) },
+            feedback: unsafe { Register::from_value(the_hole) },
             pc: 0,
             base: 0,
             register_count: 0,
@@ -60,6 +65,11 @@ impl StackCache {
         let cache = self.get();
         cache.code.store(info.bytecode.get(heap).raw());
         cache.constants.store(info.constants.get(heap).raw());
+        cache.feedback.store(
+            info.feedback
+                .get(heap)
+                .map_or_else(|| heap.known().the_hole.as_tagged(heap).raw(), |v| v.raw()),
+        );
         cache.pc = frame.pc;
         cache.base = frame.base;
         cache.register_count = frame.register_count;
@@ -71,6 +81,7 @@ impl StackCache {
         cache.acc.store(the_hole);
         cache.code.store(the_hole);
         cache.constants.store(the_hole);
+        cache.feedback.store(the_hole);
         cache.active = false;
     }
 
@@ -109,6 +120,12 @@ impl StackCache {
             .read(heap)
             .get_as::<FixedArray>()
             .expect("strong cache slot")
+    }
+
+    /// The current frame's feedback vector, or `None` for functions without
+    /// feedback slots (or while inactive).
+    pub fn feedback_ref<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, FeedbackVector>> {
+        self.get().feedback.read(heap).get_as::<FeedbackVector>()
     }
 
     pub fn acc<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
@@ -164,6 +181,7 @@ impl EdgeVisitable for StackCache {
         visitor.visit(cache.acc.as_raw());
         visitor.visit(cache.code.as_raw());
         visitor.visit(cache.constants.as_raw());
+        visitor.visit(cache.feedback.as_raw());
         visitor.visit(cache.the_hole.as_raw());
     }
 }

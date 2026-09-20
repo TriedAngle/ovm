@@ -1,8 +1,9 @@
 use core::alloc::Layout;
 
 use crate::{
-    DenseString, EdgeVisitable, FixedArray, FixedByteArray, GcSlot, Handle, HandlerTable, Header,
-    Heap, HeapObject, ObjectKind, OptionGcSlot, SlotName, Smi, Tagged, Value, Visitor,
+    DenseString, EdgeVisitable, FeedbackVector, FixedArray, FixedByteArray, GcSlot, Handle,
+    HandlerTable, Header, Heap, HeapObject, ObjectKind, OptionGcSlot, SlotName, Smi, Tagged, Value,
+    Visitor,
 };
 
 #[repr(C)]
@@ -12,6 +13,9 @@ pub struct CallableInfoObject {
     pub constants: GcSlot<FixedArray>,
     pub register_count: GcSlot<Smi>,
     pub handlers: OptionGcSlot<HandlerTable>,
+    /// Inline-cache state for this function's property-access sites;
+    /// the hole while the function has no feedback slots.
+    pub feedback: OptionGcSlot<FeedbackVector>,
     pub name: GcSlot,
     pub formal_parameter_count: GcSlot<Smi>,
     /// JS-visible `length` (differs from `formal_parameter_count` when the
@@ -117,6 +121,7 @@ impl HeapObject for CallableInfoObject {
             Some(handlers) => self.handlers.set(heap, host, handlers.as_tagged(heap)),
             None => self.handlers.clear(heap),
         }
+        self.feedback.clear(heap);
         self.name
             .set(heap, host, heap.known().the_hole.as_tagged(heap).erase());
         self.formal_parameter_count.set(heap, host, Smi::new(0));
@@ -141,6 +146,7 @@ impl EdgeVisitable for CallableInfoObject {
         visitor.visit(self.bytecode.as_raw());
         visitor.visit(self.constants.as_raw());
         visitor.visit(self.handlers.as_raw());
+        visitor.visit(self.feedback.as_raw());
         visitor.visit(self.name.as_raw());
     }
 }
@@ -185,6 +191,16 @@ impl CallableInfoObject {
             .set(heap, host, Smi::new(formal_length as i64));
         self.kind.set(heap, host, Smi::new(kind as i64));
         self.strict.set(heap, host, Smi::new(i64::from(strict)));
+    }
+
+    /// Attach the (already allocated) inline-cache state.
+    pub fn set_feedback(&self, heap: &Heap, vector: Handle<'_, FeedbackVector>) {
+        self.feedback
+            .set(heap, self.erase(), vector.as_tagged(heap));
+    }
+
+    pub fn feedback<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, FeedbackVector>> {
+        self.feedback.get(heap)
     }
 
     pub fn name<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {

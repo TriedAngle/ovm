@@ -2,6 +2,7 @@ pub mod array;
 pub mod byte_array;
 pub mod callable;
 pub mod context;
+pub mod feedback;
 pub mod float;
 pub mod map;
 pub mod object;
@@ -16,6 +17,7 @@ pub use context::{
     Context, ContextInit, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit,
     ScopeInfo, ScopeInfoInit,
 };
+pub use feedback::{FeedbackVector, FeedbackVectorInit, new_feedback_vector};
 pub use float::Float;
 pub use map::{AccessorPair, Map, MapInit, MapKind, SlotDescriptor, SlotFlags, SlotName};
 pub use object::{CallTarget, Object, ObjectInit, ObjectSlotsInit};
@@ -91,21 +93,22 @@ pub enum ObjectKind {
     HandlerTable = 9,
     Context = 10,
     ScopeInfo = 11,
-    BuiltinEnd = 12,
+    FeedbackVector = 12,
+    BuiltinEnd = 13,
 
     /// `elements` points to the well-known `empty_fixed_array`, `len` is 0
-    Object = 13,
+    Object = 14,
     /// `elements` points to a `FixedArray`.
-    Array = 14,
+    Array = 15,
     /// `elements` points to a `FixedByteArray`.
-    ByteArray = 15,
+    ByteArray = 16,
     /// `elements` points to a `DenseString`.
-    String = 16,
+    String = 17,
     /// A Proxy exotic object (`ProxyObject`): no own properties, all
     /// internal methods dispatch through handler traps.
-    Proxy = 17,
+    Proxy = 18,
     /// Sentinel and odd heap values
-    Oddball = 18,
+    Oddball = 19,
 }
 
 impl ObjectKind {
@@ -148,6 +151,7 @@ pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
             ObjectKind::HandlerTable => (*addr.cast::<HandlerTable>().as_ptr()).layout(),
             ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).layout(),
             ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).layout(),
+            ObjectKind::FeedbackVector => (*addr.cast::<FeedbackVector>().as_ptr()).layout(),
             ObjectKind::Object
             | ObjectKind::Array
             | ObjectKind::ByteArray
@@ -184,6 +188,9 @@ pub unsafe fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
             }
             ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).visit_edges(visitor),
             ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).visit_edges(visitor),
+            ObjectKind::FeedbackVector => {
+                (*addr.cast::<FeedbackVector>().as_ptr()).visit_edges(visitor)
+            }
             ObjectKind::Object
             | ObjectKind::Array
             | ObjectKind::ByteArray

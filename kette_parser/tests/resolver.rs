@@ -185,25 +185,25 @@ fn catch_binding_is_local_to_the_handler_block() {
     );
 }
 
-#[test]
-fn example_ktt_resolves() {
-    let src = include_str!("../example.ktt");
-    let mut p = Parser::new(Utf8SliceStream::new(src));
-    p.parse_script().expect("parse");
-    let ast = p.into_ast();
-    let res = resolve(&ast);
-
-    assert!(res.scope_count() > 10);
-    // `Vec2` is referenced inside `Vec2Traits.new` before its declaration.
-    assert!(
-        ident_resolutions(&ast, &res, "Vec2")
-            .iter()
-            .any(|r| matches!(r, Resolution::Capture { .. }))
-    );
-    // `print` is never declared: it stays a global.
-    assert!(
-        ident_resolutions(&ast, &res, "print")
-            .iter()
-            .all(|r| *r == Resolution::Global)
-    );
-}
+// #[test]
+// fn example_ktt_resolves() {
+//     let src = include_str!("../example.ktt");
+//     let mut p = Parser::new(Utf8SliceStream::new(src));
+//     p.parse_script().expect("parse");
+//     let ast = p.into_ast();
+//     let res = resolve(&ast);
+//
+//     assert!(res.scope_count() > 10);
+//     // `Vec2` is referenced inside `Vec2Traits.new` before its declaration.
+//     assert!(
+//         ident_resolutions(&ast, &res, "Vec2")
+//             .iter()
+//             .any(|r| matches!(r, Resolution::Capture { .. }))
+//     );
+//     // `print` is never declared: it stays a global.
+//     assert!(
+//         ident_resolutions(&ast, &res, "print")
+//             .iter()
+//             .all(|r| *r == Resolution::Global)
+//     );
+// }

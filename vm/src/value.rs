@@ -494,6 +494,18 @@ impl<'a, T> Tagged<'a, MaybeWeak<T>> {
         }
     }
 
+    /// Strong view of a live weak reference; `None` for cleared or
+    /// non-pointer words.
+    pub fn upgrade(self) -> Option<Tagged<'a, T>> {
+        if !self.raw.is_ptr() || self.raw.is_cleared() {
+            return None;
+        }
+        // SAFETY: live pointer; the weak bit is cleared.
+        Some(unsafe {
+            Tagged::from_value_unchecked(Value::from_bits(self.raw.raw_addr() | STRONG_PTR))
+        })
+    }
+
     pub fn is_cleared(self) -> bool {
         self.raw.is_cleared()
     }

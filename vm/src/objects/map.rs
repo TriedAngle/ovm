@@ -281,6 +281,7 @@ impl MapKind {
     pub const HANDLER_TABLE: MapKind = MapKind(ObjectKind::HandlerTable as u64);
     pub const CONTEXT: MapKind = MapKind(ObjectKind::Context as u64);
     pub const SCOPE_INFO: MapKind = MapKind(ObjectKind::ScopeInfo as u64);
+    pub const FEEDBACK_VECTOR: MapKind = MapKind(ObjectKind::FeedbackVector as u64);
     pub const OBJECT: MapKind = MapKind(ObjectKind::Object as u64);
     pub const ARRAY: MapKind = MapKind(ObjectKind::Array as u64);
     pub const BYTE_ARRAY: MapKind = MapKind(ObjectKind::ByteArray as u64);
@@ -318,6 +319,7 @@ impl MapKind {
             Self::HANDLER_TABLE => ObjectKind::HandlerTable,
             Self::CONTEXT => ObjectKind::Context,
             Self::SCOPE_INFO => ObjectKind::ScopeInfo,
+            Self::FEEDBACK_VECTOR => ObjectKind::FeedbackVector,
             Self::OBJECT => ObjectKind::Object,
             Self::ARRAY => ObjectKind::Array,
             Self::BYTE_ARRAY => ObjectKind::ByteArray,

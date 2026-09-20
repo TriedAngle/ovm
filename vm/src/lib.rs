@@ -12,6 +12,7 @@ pub mod error;
 pub mod errors;
 pub mod handle;
 pub mod heap;
+pub mod ic;
 pub mod interner;
 pub mod interpreter;
 pub mod lookup;
@@ -29,7 +30,7 @@ pub use bootstrap::{
     KnownCell, WellKnown, WellKnownStrings, bootstrap_basics, bootstrap_well_known,
     intern_well_known_strings,
 };
-pub use cache::StackCache;
+pub use cache::{Acc, StackCache};
 pub use compare::Compare;
 pub use convert::Convert;
 pub use error::VmError;
@@ -49,11 +50,12 @@ pub use lookup::{
 };
 pub use objects::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
-    DenseString, Encoding, FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry,
-    HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map, MapInit, MapKind,
-    Object, ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit, ProxyObject, ScopeInfo,
-    ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol, WeakFixedArray,
-    WeakFixedArrayInit, decode_wtf8, object_kind, object_layout, string_content_hash, visit_object,
+    DenseString, Encoding, FeedbackVector, FeedbackVectorInit, FixedArray, FixedByteArray, Float,
+    FunctionKind, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit, Header,
+    HeapObject, Map, MapInit, MapKind, Object, ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit,
+    ProxyObject, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol,
+    WeakFixedArray, WeakFixedArrayInit, decode_wtf8, new_feedback_vector, object_kind,
+    object_layout, string_content_hash, visit_object,
 };
 pub use runtime::{Coercion, Hint, RuntimeCall, RuntimeContext, RuntimeIndex, RuntimeRegistry};
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};

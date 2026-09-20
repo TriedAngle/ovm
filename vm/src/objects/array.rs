@@ -150,7 +150,7 @@ impl<T: 'static> WeakFixedArray<T> {
     where
         T: 'a,
     {
-        self.element_slot(i).set_weak(heap, v);
+        self.element_slot(i).set_weak(heap, self.erase(), v);
     }
 }
 
