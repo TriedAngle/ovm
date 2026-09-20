@@ -33,6 +33,7 @@ pub struct WellKnown {
     pub handler_table_map: Global<Map>,
     pub context_map: Global<Map>,
     pub scope_info_map: Global<Map>,
+    pub feedback_vector_map: Global<Map>,
     /// Shared immutable scope description for contexts without named slots
     /// (block/catch contexts, the empty context)
     pub empty_scope_info: Global<ScopeInfo>,
@@ -91,6 +92,9 @@ pub struct WellKnown {
     pub to_primitive_symbol: Global<Symbol>,
     /// The `@@iterator` well-known symbol (internal: no Symbol global yet)
     pub iterator_symbol: Global<Symbol>,
+    /// Inline-cache state sentinel (never user-visible): a feedback slot
+    /// holding it permanently takes the slow path
+    pub megamorphic_symbol: Global<Symbol>,
     /// Map of array-iterator objects (slots: [iterated array, next index])
     pub array_iterator_map: Global<Map>,
     /// %ArrayIteratorPrototype% (holds `next` and @@iterator)
@@ -206,6 +210,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     let array = unsafe { smi_handle::<FixedArray>(roots) };
     let context = unsafe { smi_handle::<Context>(roots) };
     let scope_info = unsafe { smi_handle::<ScopeInfo>(roots) };
+    let symbol = unsafe { smi_handle::<Symbol>(roots) };
     WellKnown {
         map_map: map,
         the_hole: obj,
@@ -225,6 +230,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         handler_table_map: map,
         context_map: map,
         scope_info_map: map,
+        feedback_vector_map: map,
         empty_scope_info: scope_info,
         undefined: obj,
         undefined_map: map,
@@ -251,8 +257,9 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         function_map: map,
         non_constructor_function_map: map,
         class_constructor_map: map,
-        to_primitive_symbol: unsafe { smi_handle::<Symbol>(roots) },
-        iterator_symbol: unsafe { smi_handle::<Symbol>(roots) },
+        to_primitive_symbol: symbol,
+        iterator_symbol: symbol,
+        megamorphic_symbol: symbol,
         array_iterator_map: map,
         array_iterator_prototype: obj,
         iterator_result_map: map,
@@ -389,6 +396,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let handler_table_map = alloc_map(heap, roots, MapKind::HANDLER_TABLE);
     let context_map = alloc_map(heap, roots, MapKind::CONTEXT);
     let scope_info_map = alloc_map(heap, roots, MapKind::SCOPE_INFO);
+    let feedback_vector_map = alloc_map(heap, roots, MapKind::FEEDBACK_VECTOR);
 
     let function_map = roots.create_handle(
         heap.allocate::<Map>(MapInit {
@@ -438,6 +446,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.handler_table_map = handler_table_map;
     known.context_map = context_map;
     known.scope_info_map = scope_info_map;
+    known.feedback_vector_map = feedback_vector_map;
     known.function_map = function_map;
     known.non_constructor_function_map = non_constructor_function_map;
     known.class_constructor_map = class_constructor_map;
@@ -527,6 +536,10 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         roots.create_handle(Symbol::new(heap, &scope, b"Symbol.toPrimitive").as_tagged(heap));
     let iterator_symbol =
         roots.create_handle(Symbol::new(heap, &scope, b"Symbol.iterator").as_tagged(heap));
+    // IC state sentinel (never user-visible): a feedback slot holding it
+    // permanently takes the slow path
+    let megamorphic_symbol =
+        roots.create_handle(Symbol::new(heap, &scope, b"<megamorphic>").as_tagged(heap));
 
     let empty_scope_info =
         roots.create_handle(heap.allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots }));
@@ -577,6 +590,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.exception = exception;
     known.to_primitive_symbol = to_primitive_symbol;
     known.iterator_symbol = iterator_symbol;
+    known.megamorphic_symbol = megamorphic_symbol;
     known.object_prototype = object_prototype;
     known.array_prototype = array_prototype;
     known.error_prototype = error_prototype;

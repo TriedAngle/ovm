@@ -190,6 +190,9 @@ struct FunctionGen<'a> {
     reg_base: u32,
     next_temp: u32,
     max_temps: u32,
+    /// inline-cache slots consumed so far (in slots; each property-access
+    /// site reserves a [state, handler] pair)
+    feedback_slots: u32,
     /// decl index of the next `let` in this body (params come first)
     next_let: usize,
 }
@@ -239,6 +242,7 @@ impl<'a> FunctionGen<'a> {
             reg_base: local_count + 2,
             next_temp: 0,
             max_temps: 0,
+            feedback_slots: 0,
             next_let: param_count,
         }
     }
@@ -254,11 +258,23 @@ impl<'a> FunctionGen<'a> {
             arity: self.param_count as u32,
             length: self.param_count as u32,
             strict: true,
+            feedback_count: self.feedback_slots,
         }
     }
 
     fn err<T>(&self, node: NodeId, feature: &'static str) -> Result<T, CompileError> {
         Err(CompileError::new(self.ast.span(node), feature))
+    }
+
+    // -- feedback -----------------------------------------------------------
+
+    /// Reserve a `[state, handler]` feedback-slot pair for a property-access
+    /// site and return the base index embedded as the site's feedback
+    /// operand.
+    fn feedback_slot(&mut self) -> u32 {
+        let slot = self.feedback_slots;
+        self.feedback_slots += 2;
+        slot
     }
 
     // -- temps -------------------------------------------------------------
@@ -327,7 +343,8 @@ impl<'a> FunctionGen<'a> {
                     unreachable!("identifier nodes carry a symbol");
                 };
                 let idx = self.name_constant(sym);
-                emit(&mut self.code, Opcode::LoadGlobal, &[idx, 0]);
+                let feedback = self.feedback_slot();
+                emit(&mut self.code, Opcode::LoadGlobal, &[idx, feedback]);
             }
         }
     }
@@ -343,7 +360,8 @@ impl<'a> FunctionGen<'a> {
                     unreachable!("identifier nodes carry a symbol");
                 };
                 let idx = self.name_constant(sym);
-                emit(&mut self.code, Opcode::StoreGlobal, &[idx, 0]);
+                let feedback = self.feedback_slot();
+                emit(&mut self.code, Opcode::StoreGlobal, &[idx, feedback]);
             }
         }
     }
@@ -463,7 +481,12 @@ impl<'a> FunctionGen<'a> {
                 self.expr(recv)?;
                 let obj = self.push_value();
                 let name = self.name_constant(name);
-                emit(&mut self.code, Opcode::LoadNamedProperty, &[obj, name, 0]);
+                let feedback = self.feedback_slot();
+                emit(
+                    &mut self.code,
+                    Opcode::LoadNamedProperty,
+                    &[obj, name, feedback],
+                );
                 self.pop_value();
                 Ok(())
             }
@@ -471,7 +494,8 @@ impl<'a> FunctionGen<'a> {
                 self.expr(recv)?;
                 let obj = self.push_value();
                 self.expr(key)?;
-                emit(&mut self.code, Opcode::LoadKeyedProperty, &[obj, 0]);
+                let feedback = self.feedback_slot();
+                emit(&mut self.code, Opcode::LoadKeyedProperty, &[obj, feedback]);
                 self.pop_value();
                 Ok(())
             }
@@ -513,10 +537,11 @@ impl<'a> FunctionGen<'a> {
         self.expr(recv)?;
         let recv_reg = self.push_value();
         let name = self.name_constant(name);
+        let feedback = self.feedback_slot();
         emit(
             &mut self.code,
             Opcode::LoadNamedProperty,
-            &[recv_reg, name, 0],
+            &[recv_reg, name, feedback],
         );
         let callee_reg = self.reg_base + self.next_temp + argc;
         emit(&mut self.code, Opcode::Store, &[callee_reg]);
@@ -629,10 +654,11 @@ impl<'a> FunctionGen<'a> {
                 let obj = self.push_value();
                 let name = self.name_constant(name);
                 self.expr(value)?;
+                let feedback = self.feedback_slot();
                 emit(
                     &mut self.code,
                     Opcode::StoreNamedPropertyNoShadow,
-                    &[obj, name, 0],
+                    &[obj, name, feedback],
                 );
                 self.pop_value();
                 Ok(())
@@ -686,7 +712,12 @@ impl<'a> FunctionGen<'a> {
                     };
                     let name = self.name_constant(sym);
                     self.expr(value)?;
-                    emit(&mut self.code, Opcode::StoreNamedProperty, &[obj, name, 0]);
+                    let feedback = self.feedback_slot();
+                    emit(
+                        &mut self.code,
+                        Opcode::StoreNamedProperty,
+                        &[obj, name, feedback],
+                    );
                 }
                 Node::Slot {
                     kind: SlotKind::Element,
@@ -696,7 +727,12 @@ impl<'a> FunctionGen<'a> {
                     self.expr(key)?;
                     let key = self.push_value();
                     self.expr(value)?;
-                    emit(&mut self.code, Opcode::StoreKeyedProperty, &[obj, key, 0]);
+                    let feedback = self.feedback_slot();
+                    emit(
+                        &mut self.code,
+                        Opcode::StoreKeyedProperty,
+                        &[obj, key, feedback],
+                    );
                     self.pop_value();
                 }
                 _ => unreachable!("object slots are Slot nodes"),
@@ -717,10 +753,11 @@ impl<'a> FunctionGen<'a> {
             let index = self.push_value();
             self.expr(element)?;
             // literal elements are explicit layout: the store may grow
+            let feedback = self.feedback_slot();
             emit(
                 &mut self.code,
                 Opcode::StoreKeyedProperty,
-                &[array, index, 0],
+                &[array, index, feedback],
             );
             self.pop_value();
         }

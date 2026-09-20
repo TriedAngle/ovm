@@ -1,6 +1,7 @@
 use crate::proxy::Proxy;
 use bytecode::{Opcode, Operands, decode, jump_target};
 
+use crate::ic::{Hit, InlineCache, StoreHit, StoreOutcomeKind};
 use crate::{
     CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
     DenseString, Errors, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint, Key, LoadOutcome,
@@ -421,15 +422,73 @@ fn step<'a>(
         Opcode::LoadGlobal | Opcode::LoadGlobalNoThrow => {
             state.handle_scope(|scope| -> Step<'_> {
                 let global = heap.known().global_object;
-                let name = stack
-                    .callable(heap, &meta)
-                    .as_ref()
-                    .constant_slot_name(heap, ops.idx(0));
+                let name = scope.handle(
+                    stack
+                        .callable(heap, &meta)
+                        .as_ref()
+                        .constant_slot_name(heap, ops.idx(0)),
+                );
 
-                match global.lookup(heap, name) {
-                    Lookup::Data { slot, .. } => acc.store(slot.get(heap)),
+                // inline cache on the global object's map (globals are
+                // ordinary properties; var/function declarations change
+                // the map and the site re-misses)
+                if let Some(hit) = InlineCache::try_load(
+                    heap,
+                    cache.feedback_ref(heap),
+                    ops.idx(1),
+                    global.as_tagged(heap).erase(),
+                ) {
+                    match hit {
+                        Hit::Value(v) => acc.store(v),
+                        Hit::Getter(getter) => {
+                            let args = scope.stage(&[global.as_tagged(heap).erase()]);
+                            let getter = scope.handle(getter);
+                            match step_try!(call_value(
+                                vm, state, heap, stack, cache, meta, pc, getter, args
+                            )) {
+                                Called::Frame => {}
+                                Called::NotCallable => {
+                                    acc.store(heap.known().undefined.as_tagged(heap));
+                                }
+                                Called::Immediate(v) => acc.store(v),
+                                Called::Threw => return Step::PendingThrow,
+                            }
+                        }
+                        // absent globals are uncached (transient: hoisting)
+                        Hit::NotFound => {
+                            if op == Opcode::LoadGlobal {
+                                return Step::Error(VmError::Reference);
+                            }
+                            acc.store(heap.known().undefined.as_tagged(heap));
+                        }
+                    }
+                    return Step::Next;
+                }
+
+                match global.lookup(heap, name.as_tagged(heap)) {
+                    Lookup::Data { slot, .. } => {
+                        acc.store(slot.get(heap));
+                        InlineCache::update_load(
+                            heap,
+                            &scope,
+                            cache.feedback_ref(heap).map(|v| scope.handle(v)),
+                            ops.idx(1),
+                            Some(scope.handle(global.as_tagged(heap))),
+                            name,
+                            false,
+                        );
+                    }
                     Lookup::Accessor { pair, .. } => {
                         let getter = scope.handle(pair.get.get(heap));
+                        InlineCache::update_load(
+                            heap,
+                            &scope,
+                            cache.feedback_ref(heap).map(|v| scope.handle(v)),
+                            ops.idx(1),
+                            Some(scope.handle(global.as_tagged(heap))),
+                            name,
+                            false,
+                        );
                         if getter.as_tagged(heap) == heap.known().undefined.as_tagged(heap) {
                             acc.store(heap.known().undefined.as_tagged(heap));
                         } else {
@@ -462,13 +521,15 @@ fn step<'a>(
         }
         Opcode::LoadNamedProperty => state.handle_scope(|scope| -> Step<'_> {
             let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let name = stack
-                .callable(heap, &meta)
-                .as_ref()
-                .constant_slot_name(heap, ops.idx(1));
+            let name = scope.handle(
+                stack
+                    .callable(heap, &meta)
+                    .as_ref()
+                    .constant_slot_name(heap, ops.idx(1)),
+            );
 
             if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
-                let name = scope.handle(name.erase());
+                let name = scope.handle(name.as_tagged(heap).erase());
                 return match step_try!(Proxy::get(vm, heap, state, receiver, receiver, name)) {
                     Coercion::Threw => Step::PendingThrow,
                     Coercion::Value(v) => {
@@ -478,12 +539,72 @@ fn step<'a>(
                 };
             }
 
-            let outcome = step_try!(Lookup::load_outcome(heap, receiver.as_tagged(heap), name));
+            // inline cache: a hit resolves the load without the lookup
+            if let Some(hit) = InlineCache::try_load(
+                heap,
+                cache.feedback_ref(heap),
+                ops.idx(2),
+                receiver.as_tagged(heap),
+            ) {
+                match hit {
+                    Hit::Value(v) => acc.store(v),
+                    Hit::Getter(getter) => {
+                        let args = scope.stage(&[receiver.as_tagged(heap).erase()]);
+                        let getter = scope.handle(getter);
+                        match step_try!(call_value(
+                            vm, state, heap, stack, cache, meta, pc, getter, args
+                        )) {
+                            Called::Frame => {}
+                            Called::NotCallable => {
+                                acc.store(heap.known().undefined.as_tagged(heap));
+                            }
+                            Called::Immediate(v) => acc.store(v),
+                            Called::Threw => return Step::PendingThrow,
+                        }
+                    }
+                    Hit::NotFound => {
+                        acc.store(heap.known().undefined.as_tagged(heap));
+                    }
+                }
+                return Step::Next;
+            }
+
+            let outcome = step_try!(Lookup::load_outcome(
+                heap,
+                receiver.as_tagged(heap),
+                name.as_tagged(heap)
+            ));
             match outcome {
-                LoadOutcome::Value(v) => acc.store(v),
+                LoadOutcome::Value(v) => {
+                    acc.store(v);
+                    InlineCache::update_load(
+                        heap,
+                        &scope,
+                        cache.feedback_ref(heap).map(|v| scope.handle(v)),
+                        ops.idx(2),
+                        receiver
+                            .as_tagged(heap)
+                            .as_heap_object()
+                            .map(|o| scope.handle(o)),
+                        name,
+                        true,
+                    );
+                }
                 LoadOutcome::Getter(getter) => {
-                    let args = scope.stage(&[receiver.as_tagged(heap).erase()]);
                     let getter = scope.handle(getter);
+                    InlineCache::update_load(
+                        heap,
+                        &scope,
+                        cache.feedback_ref(heap).map(|v| scope.handle(v)),
+                        ops.idx(2),
+                        receiver
+                            .as_tagged(heap)
+                            .as_heap_object()
+                            .map(|o| scope.handle(o)),
+                        name,
+                        true,
+                    );
+                    let args = scope.stage(&[receiver.as_tagged(heap).erase()]);
                     match step_try!(call_value(
                         vm, state, heap, stack, cache, meta, pc, getter, args
                     )) {
@@ -586,13 +707,18 @@ fn step<'a>(
             };
             state.handle_scope(|scope| -> Step<'_> {
                 let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-                let name = stack
-                    .callable(heap, &meta)
-                    .as_ref()
-                    .constant_slot_name(heap, ops.idx(1));
+                let name = scope.handle(
+                    stack
+                        .callable(heap, &meta)
+                        .as_ref()
+                        .constant_slot_name(heap, ops.idx(1)),
+                );
+                let vector = cache.feedback_ref(heap).map(|v| scope.handle(v));
+                // the stored value stays in the accumulator (a root); the
+                // IC re-reads it fresh at each use
 
                 if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
-                    let name = scope.handle(name.erase());
+                    let name = scope.handle(name.as_tagged(heap).erase());
                     let value = scope.handle(acc.read(heap));
                     return match step_try!(Proxy::set(
                         vm, heap, state, receiver, name, value, receiver
@@ -602,12 +728,89 @@ fn step<'a>(
                     };
                 }
 
-                let outcome =
-                    step_try!(receiver.store_lookup(heap, &scope, name, acc.read(heap), semantics));
-                let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+                // inline cache (Shadow semantics only: WriteThrough stores
+                // into parent-pair arrays that no map describes)
+                if op == Opcode::StoreNamedProperty
+                    && let Some(hit) = InlineCache::try_store(
+                        heap,
+                        &scope,
+                        vector,
+                        ops.idx(2),
+                        receiver,
+                        name,
+                        &acc,
+                    )
+                {
+                    match hit {
+                        StoreHit::Done => {}
+                        StoreHit::Setter(setter) => {
+                            let setter = scope.handle(setter);
+                            let args =
+                                scope.stage(&[receiver.as_tagged(heap).erase(), acc.read(heap)]);
+                            match step_try!(call_value(
+                                vm, state, heap, stack, cache, meta, pc, setter, args
+                            )) {
+                                Called::Frame | Called::NotCallable | Called::Immediate(_) => {}
+                                Called::Threw => return Step::PendingThrow,
+                            }
+                        }
+                    }
+                    return Step::Next;
+                }
+
+                // the receiver's map before the store: the state key when
+                // the outcome transitions it
+                let prev = receiver
+                    .as_tagged(heap)
+                    .as_heap_object()
+                    .map(|o| scope.handle(o.as_ref().map_ref(heap)));
+                let outcome = step_try!(receiver.store_lookup(
+                    heap,
+                    &scope,
+                    name.as_tagged(heap),
+                    acc.read(heap),
+                    semantics
+                ));
+                // update the IC before invoking a setter (mirrors loads)
+                let kind = match outcome {
+                    StoreOutcome::Done => StoreOutcomeKind::Done,
+                    StoreOutcome::Transition { .. } => StoreOutcomeKind::Transition,
+                    StoreOutcome::CallSetter { .. } => StoreOutcomeKind::CallSetter,
+                };
+                if op == Opcode::StoreNamedProperty
+                    && let Some(prev) = prev
+                    && kind != StoreOutcomeKind::Transition
+                {
+                    InlineCache::update_store(
+                        heap,
+                        &scope,
+                        vector,
+                        ops.idx(2),
+                        receiver,
+                        name,
+                        prev,
+                        kind,
+                    );
+                }
                 step_try!(apply_store_outcome(
                     vm, heap, state, stack, cache, meta, pc, receiver, outcome,
                 ));
+                // a transitioned store: cache prev -> the produced map
+                if op == Opcode::StoreNamedProperty
+                    && let Some(prev) = prev
+                    && kind == StoreOutcomeKind::Transition
+                {
+                    InlineCache::update_store(
+                        heap,
+                        &scope,
+                        vector,
+                        ops.idx(2),
+                        receiver,
+                        name,
+                        prev,
+                        kind,
+                    );
+                }
                 Step::Next
             })
         }

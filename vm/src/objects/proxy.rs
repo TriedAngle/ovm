@@ -398,7 +398,7 @@ fn define_internal_h<'s>(
         if !on_array {
             break 'element None;
         }
-        match crate::Lookup::classify_key(heap, name.as_tagged(heap)) {
+        match Lookup::classify_key(heap, name.as_tagged(heap)) {
             Ok(Key::Element(i)) => Some(i),
             _ => None,
         }
@@ -440,7 +440,7 @@ fn ordinary_set_forward<'a>(
     // (which stores into the backing store)
     let classified = (
         matches!(
-            crate::Lookup::classify_key(heap, name.as_tagged(heap)),
+            Lookup::classify_key(heap, name.as_tagged(heap)),
             Ok(Key::Element(_))
         ),
         target

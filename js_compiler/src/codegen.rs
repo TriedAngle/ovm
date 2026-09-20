@@ -111,6 +111,9 @@ struct FunctionGen<'a> {
     /// temps currently allocated (monotonic within an expression)
     next_temp: u32,
     max_temps: u32,
+    /// inline-cache slots consumed so far (in slots; each property-access
+    /// site reserves a [state, handler] pair)
+    feedback_slots: u32,
     /// lexical scope stack, innermost last; for decl lookups
     scopes: Vec<ScopeId>,
     breakables: Vec<Breakable>,
@@ -179,6 +182,7 @@ impl<'a> FunctionGen<'a> {
             completion: None,
             next_temp: 0,
             max_temps: 0,
+            feedback_slots: 0,
             scopes: Vec::new(),
             breakables: Vec::new(),
         }
@@ -196,6 +200,7 @@ impl<'a> FunctionGen<'a> {
             strict: info.strict,
             register_count: self.reg_base + self.max_temps,
             handlers: self.handlers,
+            feedback_count: self.feedback_slots,
         }
     }
 
@@ -262,6 +267,17 @@ impl<'a> FunctionGen<'a> {
         let result = f(self);
         self.scopes.pop();
         result
+    }
+
+    // -- feedback -----------------------------------------------------------
+
+    /// Reserve a `[state, handler]` feedback-slot pair for a property-access
+    /// site and return the base index embedded as the site's feedback
+    /// operand.
+    fn feedback_slot(&mut self) -> u32 {
+        let slot = self.feedback_slots;
+        self.feedback_slots += 2;
+        slot
     }
 
     // -- constants ----------------------------------------------------------
@@ -428,7 +444,8 @@ impl<'a> FunctionGen<'a> {
         match res {
             Resolution::GlobalObject => {
                 let idx = self.add_constant(Constant::String(self.ast.symbol(name).to_vec()));
-                emit(&mut self.code, Opcode::StoreGlobal, &[idx, 0]);
+                let feedback = self.feedback_slot();
+                emit(&mut self.code, Opcode::StoreGlobal, &[idx, feedback]);
             }
             other => self.store_resolution(other),
         }
@@ -442,7 +459,8 @@ impl<'a> FunctionGen<'a> {
         match res {
             Resolution::GlobalObject => {
                 let idx = self.add_constant(Constant::String(self.ast.symbol(name).to_vec()));
-                emit(&mut self.code, Opcode::StoreGlobal, &[idx, 0]);
+                let feedback = self.feedback_slot();
+                emit(&mut self.code, Opcode::StoreGlobal, &[idx, feedback]);
                 Ok(())
             }
             Resolution::Dynamic => {
@@ -499,7 +517,8 @@ impl<'a> FunctionGen<'a> {
             }
             Resolution::GlobalObject => {
                 let idx = self.add_constant(Constant::String(self.ast.symbol(name).to_vec()));
-                emit(&mut self.code, Opcode::LoadGlobal, &[idx, 0]);
+                let feedback = self.feedback_slot();
+                emit(&mut self.code, Opcode::LoadGlobal, &[idx, feedback]);
                 Ok(())
             }
             Resolution::Dynamic => {
@@ -694,7 +713,8 @@ impl<'a> FunctionGen<'a> {
                     ) {
                         let idx =
                             self.add_constant(Constant::String(self.ast.symbol(sym).to_vec()));
-                        emit(&mut self.code, Opcode::LoadGlobalNoThrow, &[idx, 0]);
+                        let feedback = self.feedback_slot();
+                        emit(&mut self.code, Opcode::LoadGlobalNoThrow, &[idx, feedback]);
                         emit(&mut self.code, Opcode::TestTypeof, &[]);
                         return Ok(());
                     }
@@ -1133,20 +1153,22 @@ impl<'a> FunctionGen<'a> {
                             match key_reg {
                                 Some(k) => {
                                     emit(&mut self.code, Opcode::Load, &[k]);
+                                    let feedback = self.feedback_slot();
                                     emit(
                                         &mut self.code,
                                         Opcode::LoadKeyedProperty,
-                                        &[value_reg, 0],
+                                        &[value_reg, feedback],
                                     );
                                 }
                                 None => {
                                     let NameHint::Const(name_idx) = name_hint else {
                                         unreachable!("constant keys have a constant hint")
                                     };
+                                    let feedback = self.feedback_slot();
                                     emit(
                                         &mut self.code,
                                         Opcode::LoadNamedProperty,
-                                        &[value_reg, name_idx, 0],
+                                        &[value_reg, name_idx, feedback],
                                     );
                                 }
                             }
@@ -1235,10 +1257,11 @@ impl<'a> FunctionGen<'a> {
                         Opcode::CallRuntime,
                         &[bytecode::RuntimeFn::IteratorValue as u32, result, 1],
                     );
+                    let feedback = self.feedback_slot();
                     emit(
                         &mut self.code,
                         Opcode::StoreKeyedPropertyNoShadow,
-                        &[arr, idx, 0],
+                        &[arr, idx, feedback],
                     );
                     emit(&mut self.code, Opcode::Load, &[idx]);
                     emit(&mut self.code, Opcode::LoadSmi, &[1]);
@@ -1468,14 +1491,20 @@ impl<'a> FunctionGen<'a> {
     fn emit_property_store(&mut self, store: &StoreTarget) {
         match store {
             StoreTarget::Named { obj, name_idx } => {
+                let feedback = self.feedback_slot();
                 emit(
                     &mut self.code,
                     Opcode::StoreNamedProperty,
-                    &[*obj, *name_idx, 0],
+                    &[*obj, *name_idx, feedback],
                 );
             }
             StoreTarget::Keyed { obj, key } => {
-                emit(&mut self.code, Opcode::StoreKeyedProperty, &[*obj, *key, 0]);
+                let feedback = self.feedback_slot();
+                emit(
+                    &mut self.code,
+                    Opcode::StoreKeyedProperty,
+                    &[*obj, *key, feedback],
+                );
             }
             StoreTarget::PrivateKeyed { obj, key: _ } => {
                 // (obj, key, value): the value is in the accumulator
@@ -1520,15 +1549,17 @@ impl<'a> FunctionGen<'a> {
     fn emit_property_load_of(&mut self, store: &StoreTarget) {
         match store {
             StoreTarget::Named { obj, name_idx } => {
+                let feedback = self.feedback_slot();
                 emit(
                     &mut self.code,
                     Opcode::LoadNamedProperty,
-                    &[*obj, *name_idx, 0],
+                    &[*obj, *name_idx, feedback],
                 );
             }
             StoreTarget::Keyed { obj, key } => {
+                let feedback = self.feedback_slot();
                 emit(&mut self.code, Opcode::Load, &[*key]);
-                emit(&mut self.code, Opcode::LoadKeyedProperty, &[*obj, 0]);
+                emit(&mut self.code, Opcode::LoadKeyedProperty, &[*obj, feedback]);
             }
             StoreTarget::PrivateKeyed { obj, key } => {
                 emit(&mut self.code, Opcode::Load, &[*key]);
@@ -1789,16 +1820,18 @@ impl<'a> FunctionGen<'a> {
             self.expr(object)?;
             let obj = self.push_value();
             self.expr(key)?;
-            emit(&mut self.code, Opcode::LoadKeyedProperty, &[obj, 0]);
+            let feedback = self.feedback_slot();
+            emit(&mut self.code, Opcode::LoadKeyedProperty, &[obj, feedback]);
             self.pop_value();
         } else {
             self.expr(object)?;
             let obj = self.push_value();
             let name_idx = self.name_constant(key)?;
+            let feedback = self.feedback_slot();
             emit(
                 &mut self.code,
                 Opcode::LoadNamedProperty,
-                &[obj, name_idx, 0],
+                &[obj, name_idx, feedback],
             );
             self.pop_value();
         }
@@ -1877,10 +1910,11 @@ impl<'a> FunctionGen<'a> {
             self.expr(object)?;
             let recv = self.push_value();
             let name_idx = self.name_constant(key)?;
+            let feedback = self.feedback_slot();
             emit(
                 &mut self.code,
                 Opcode::LoadNamedProperty,
-                &[recv, name_idx, 0],
+                &[recv, name_idx, feedback],
             );
             let callee_reg = self.reg_base + self.next_temp + argc as u32;
             emit(&mut self.code, Opcode::Store, &[callee_reg]);
@@ -1910,7 +1944,8 @@ impl<'a> FunctionGen<'a> {
             self.expr(object)?;
             let recv = self.push_value();
             self.expr(key)?;
-            emit(&mut self.code, Opcode::LoadKeyedProperty, &[recv, 0]);
+            let feedback = self.feedback_slot();
+            emit(&mut self.code, Opcode::LoadKeyedProperty, &[recv, feedback]);
             let callee_reg = self.reg_base + self.next_temp + argc as u32;
             emit(&mut self.code, Opcode::Store, &[callee_reg]);
             self.next_temp += argc as u32 + 1;
@@ -2066,10 +2101,11 @@ impl<'a> FunctionGen<'a> {
             emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut null_extends);
             // protoParent = Get(superCtor, "prototype") (full [[Get]])
             let proto_name = self.add_constant(Constant::String(b"prototype".to_vec()));
+            let feedback = self.feedback_slot();
             emit(
                 &mut self.code,
                 Opcode::LoadNamedProperty,
-                &[sup, proto_name, 0],
+                &[sup, proto_name, feedback],
             );
             emit(&mut self.code, Opcode::Store, &[pp]);
             self.emit_runtime_call(bytecode::RuntimeFn::ThrowIfNotObjectOrNull, 1, |g, b| {
@@ -2192,19 +2228,21 @@ impl<'a> FunctionGen<'a> {
                     match key_reg {
                         Some(k) => {
                             emit(&mut self.code, Opcode::Load, &[k]);
+                            let feedback = self.feedback_slot();
                             emit(
                                 &mut self.code,
                                 Opcode::StoreKeyedPropertyNoShadow,
-                                &[arr, i, 0],
+                                &[arr, i, feedback],
                             );
                         }
                         None => {
                             let name_idx = self.name_constant(m.key)?;
                             emit(&mut self.code, Opcode::LoadConstant, &[name_idx]);
+                            let feedback = self.feedback_slot();
                             emit(
                                 &mut self.code,
                                 Opcode::StoreKeyedPropertyNoShadow,
-                                &[arr, i, 0],
+                                &[arr, i, feedback],
                             );
                         }
                     }
@@ -2212,10 +2250,11 @@ impl<'a> FunctionGen<'a> {
                     emit(&mut self.code, Opcode::LoadSmi, &[field_index + 1]);
                     emit(&mut self.code, Opcode::Store, &[i]);
                     emit(&mut self.code, Opcode::Load, &[closure]);
+                    let feedback = self.feedback_slot();
                     emit(
                         &mut self.code,
                         Opcode::StoreKeyedPropertyNoShadow,
-                        &[arr, i, 0],
+                        &[arr, i, feedback],
                     );
                     self.pop_value(); // i
                     self.pop_value(); // closure
@@ -2631,10 +2670,11 @@ impl<'a> FunctionGen<'a> {
                     emit(&mut self.code, Opcode::LoadSmi, &[i as u32]);
                     let idx = self.push_value();
                     self.expr(el)?;
+                    let feedback = self.feedback_slot();
                     emit(
                         &mut self.code,
                         Opcode::StoreKeyedPropertyNoShadow,
-                        &[arr, idx, 0],
+                        &[arr, idx, feedback],
                     );
                     self.pop_value();
                 }
@@ -2693,17 +2733,23 @@ impl<'a> FunctionGen<'a> {
                                     if self.is_anon_function(value) {
                                         self.emit_set_name_by_const(name_idx);
                                     }
+                                    let feedback = self.feedback_slot();
                                     emit(
                                         &mut self.code,
                                         Opcode::StoreNamedProperty,
-                                        &[obj, name_idx, 0],
+                                        &[obj, name_idx, feedback],
                                     );
                                 }
                                 Some(k) => {
                                     if self.is_anon_function(value) {
                                         self.emit_set_name_by_reg(k, 0);
                                     }
-                                    emit(&mut self.code, Opcode::StoreKeyedProperty, &[obj, k, 0]);
+                                    let feedback = self.feedback_slot();
+                                    emit(
+                                        &mut self.code,
+                                        Opcode::StoreKeyedProperty,
+                                        &[obj, k, feedback],
+                                    );
                                 }
                             }
                         }
@@ -2751,17 +2797,19 @@ impl<'a> FunctionGen<'a> {
                                 }
                                 PropKind::Method => {
                                     if let Some(k) = key_reg {
+                                        let feedback = self.feedback_slot();
                                         emit(
                                             &mut self.code,
                                             Opcode::StoreKeyedProperty,
-                                            &[obj, k, 0],
+                                            &[obj, k, feedback],
                                         );
                                     } else {
                                         let name_idx = self.name_constant(key)?;
+                                        let feedback = self.feedback_slot();
                                         emit(
                                             &mut self.code,
                                             Opcode::StoreNamedProperty,
-                                            &[obj, name_idx, 0],
+                                            &[obj, name_idx, feedback],
                                         );
                                     }
                                 }

@@ -38,10 +38,10 @@ use helpers::{
 };
 use number::{number_constructor, number_to_string, number_value_of};
 use object::{
-    object_constructor, object_define_property, object_freeze, object_get_own_property_descriptor,
-    object_get_own_property_names, object_get_prototype_of, object_has_own_property,
-    object_is_extensible, object_prevent_extensions, object_property_is_enumerable, object_seal,
-    object_set_prototype_of, object_to_string,
+    object_constructor, object_create, object_define_property, object_freeze,
+    object_get_own_property_descriptor, object_get_own_property_names, object_get_prototype_of,
+    object_has_own_property, object_is_extensible, object_prevent_extensions,
+    object_property_is_enumerable, object_seal, object_set_prototype_of, object_to_string,
 };
 use proxy::{REVOKE_PRELUDE, proxy_constructor, proxy_revocable, proxy_revoke};
 use string::{string_constructor, string_to_string, string_value_of};
@@ -76,6 +76,7 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
         type_error: vm.register_runtime(type_error_constructor),
         error_to_string: vm.register_runtime(error_to_string),
         object: vm.register_runtime(object_constructor),
+        object_create: vm.register_runtime(object_create),
         object_get_prototype_of: vm.register_runtime(object_get_prototype_of),
         object_set_prototype_of: vm.register_runtime(object_set_prototype_of),
         array: vm.register_runtime(array_constructor),
@@ -122,6 +123,7 @@ pub struct BuiltinIndices {
     pub type_error: RuntimeIndex,
     pub error_to_string: RuntimeIndex,
     pub object: RuntimeIndex,
+    pub object_create: RuntimeIndex,
     pub object_get_prototype_of: RuntimeIndex,
     pub object_set_prototype_of: RuntimeIndex,
     pub array: RuntimeIndex,
@@ -526,6 +528,14 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             global,
             object_name,
             object_fn.erase(),
+        )?;
+        install_method(
+            thread,
+            &scope,
+            roots,
+            object_fn,
+            "create",
+            idx.object_create,
         )?;
         install_method(
             thread,

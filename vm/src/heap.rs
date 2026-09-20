@@ -256,11 +256,18 @@ impl<T> MaybeWeakGcSlot<T> {
         self.cell.store_raw(strong.to_bits());
     }
 
-    pub fn set_weak<'x>(&self, _heap: &Heap, value: impl Into<Tagged<'x, T>>)
+    pub fn set_weak<'x>(&self, heap: &Heap, host: impl Into<Value>, value: impl Into<Tagged<'x, T>>)
     where
         T: 'x,
     {
-        let weak = Value::from_bits(value.into().raw().to_bits() | WEAK_PTR);
+        let strong = value.into().raw();
+        // the weak reference still participates in the generational
+        // barrier: an old slot holding a young target must be remembered
+        // so the minor collection can forward or clear it
+        if strong.is_ptr() {
+            heap.write_barrier(host.into(), self.as_raw(), strong);
+        }
+        let weak = Value::from_bits(strong.to_bits() | WEAK_PTR);
         self.cell.store_raw(weak.to_bits());
     }
 

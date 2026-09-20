@@ -68,6 +68,45 @@ pub fn object_get_prototype_of<'a>(
     Ok(obj.as_ref().header.map.get(heap).prototype.get(heap))
 }
 
+/// `Object.create(O [, Properties])` (ES 20.1.2.2): a fresh extensible
+/// ordinary object with `O` as its [[Prototype]] and no own properties.
+/// The `Properties` argument is accepted only as `undefined` (property
+/// descriptors are not implemented for it yet).
+pub fn object_create<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
+    state.handle_scope(|scope| {
+        let proto = scope.handle(
+            args.get(1)
+                .map(|h| h.as_tagged(heap))
+                .ok_or(VmError::Arity)?,
+        );
+        // If Type(O) is neither Object nor Null, throw a TypeError
+        let null = heap.known().null.as_tagged(heap).raw();
+        let proto_ok = proto.as_tagged(heap).raw() == null
+            || !Convert::is_primitive(heap, proto.as_tagged(heap));
+        if !proto_ok {
+            return Err(VmError::Type);
+        }
+        if let Some(props) = args.get(2) {
+            let undefined = heap.known().undefined.as_tagged(heap).raw();
+            if props.as_tagged(heap).raw() != undefined {
+                return Err(VmError::Type);
+            }
+        }
+        let map = heap.known().object_initial_map;
+        let empty: [Tagged<'_, Value>; 0] = [];
+        let obj = scope.handle(heap.new_object(&scope, map, scope.stage(&empty)));
+        let obj = scope
+            .cast::<Object>(obj.as_tagged(heap).erase())
+            .expect("fresh object");
+        Object::set_prototype(heap, &scope, obj, proto)?;
+        Ok(obj.as_tagged(heap).erase())
+    })
+}
+
 /// `Object.setPrototypeOf(O, proto)` (ES 20.1.2.20): primitives return O
 /// unchanged (after RequireObjectCoercible); proto must be an object or
 /// null; the underlying [[SetPrototypeOf]] may reject (non-extensible
@@ -130,7 +169,7 @@ pub fn object_has_own_property<'a>(
         let has = 'has: {
             let key = key.as_tagged(heap);
             if let Key::Element(i) =
-                crate::Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
+                Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -175,7 +214,7 @@ pub fn object_property_is_enumerable<'a>(
         let enumerable = 'enumerable: {
             let key = key.as_tagged(heap);
             if let Key::Element(i) =
-                crate::Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
+                Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
