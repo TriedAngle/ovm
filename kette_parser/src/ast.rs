@@ -124,9 +124,16 @@ pub enum Node {
         lhs: NodeId,
         rhs: NodeId,
     },
-    /// `^expr` (non-local return)
+    /// `return expr` returns from the enclosing block
     Return {
         value: NodeId,
+    },
+
+    /// `try { body } catch name { handler }`; both arms are `Block`s and
+    /// the catch binding is the handler's first parameter
+    Try {
+        body: NodeId,
+        handler: NodeId,
     },
 
     Let {
@@ -206,6 +213,13 @@ impl Ast {
 
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
+    }
+
+    /// Overwrite the node stored at `id` in place. Children keep their
+    /// ids, so parents referencing `id` observe the replacement. Used by
+    /// the lowering pass to rewrite nodes without rebuilding the tree.
+    pub fn replace(&mut self, id: NodeId, node: Node) {
+        self.nodes[id.0 as usize] = node;
     }
 
     pub fn span(&self, id: NodeId) -> ByteSpan {

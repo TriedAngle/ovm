@@ -1,0 +1,17 @@
+// Blocks are closures. `{ |params| body }` is a lambda, `{ body }` is a
+// zero-arg block; a block's value is its last expression. Blocks capture
+// the lexicals around them.
+//
+// Run: cargo run -q -p kette_compiler --example run -- kette_examples/blocks.ktt
+
+let pair = { |a, b| { first: a, second: b } }
+let oneTwo = pair(1, 2)
+
+let makeAdder = { |n| { |x| n } }
+let add5 = makeAdder(5)
+
+let greeting = { "hello from a zero-arg block" }
+
+greeting()
+oneTwo.second
+add5(0)

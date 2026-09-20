@@ -36,6 +36,9 @@ fn keyword_kind(text: &[u8]) -> Option<TokenKind> {
         b"null" => Null,
         b"true" => True,
         b"false" => False,
+        b"return" => Return,
+        b"try" => Try,
+        b"catch" => Catch,
         _ => return None,
     })
 }

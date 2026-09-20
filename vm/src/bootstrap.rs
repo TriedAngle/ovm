@@ -76,6 +76,9 @@ pub struct WellKnown {
     /// Initial map of `%Object.prototype%`: every fresh `{}` gets it
     /// (extendable, parent = object_prototype). Shared with `global_object`.
     pub object_initial_map: Global<Map>,
+    /// Map of Self-style (Kette) objects: extensible, no [[Prototype]]
+    /// inheritance — the prototype link is an empty parent pair list.
+    pub plain_object_map: Global<Map>,
     /// Function object map
     /// slots[0] = shared CallableInfoObject, slots[1] = closure context.
     pub function_map: Global<Map>,
@@ -244,6 +247,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         function_prototype: obj,
         global_object: obj,
         object_initial_map: map,
+        plain_object_map: map,
         function_map: map,
         non_constructor_function_map: map,
         class_constructor_map: map,
@@ -499,6 +503,14 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         object_prototype,
     );
+    // Self-style objects start with an empty parent pair list, not the JS
+    // root: their parents are exactly the ones the source declares
+    let plain_object_map = roots.create_handle(heap.allocate::<Map>(MapInit {
+        kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+        value_slot_count: 0,
+        descriptors: &[],
+        prototype: known.empty_fixed_array.erase(),
+    }));
     let global_object = alloc_object(heap, &scope, roots, object_initial_map);
 
     let undefined_map = alloc_parent_map(heap, roots, MapKind::ODDBALL, object_prototype);
@@ -596,6 +608,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.empty_scope_info = empty_scope_info;
     known.global_object = global_object;
     known.object_initial_map = object_initial_map;
+    known.plain_object_map = plain_object_map;
     heap.set_known(known);
 
     let null = known.null;

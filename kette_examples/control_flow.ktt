@@ -1,0 +1,20 @@
+// `if c { A }` / `if c { A } else { B }` desugar to `c.if({ A })` /
+// `c.ifElse({ A }, { B })`, so any receiver can decide. The branches are
+// blocks: they only run when the receiver evaluates them.
+//
+// `a && b` / `a || b` desugar to `a.and({ b })` / `a.or({ b })` with the
+// right-hand side wrapped in a block, so it is lazy too.
+//
+// Run: cargo run -q -p kette_compiler --example run -- kette_examples/control_flow.ktt
+
+let yes = { ifElse: { |t, f| t() } }
+let no = { ifElse: { |t, f| f() } }
+
+if yes { 7 } else { 9 }
+if no { 7 } else { 9 }
+
+let gate = { and: { |b| b() } }
+let fallback = { or: { |b| b() } }
+
+gate && 5
+fallback || 11

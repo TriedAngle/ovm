@@ -411,10 +411,29 @@ fn for_in_loop() {
 }
 
 #[test]
-fn non_local_return() {
-    let (ast, root) = parse("^x");
+fn explicit_return() {
+    let (ast, root) = parse("return x");
     let expr = expr_of(&ast, only_stmt(&ast, root));
     assert!(matches!(ast.node(expr), Node::Return { .. }));
+}
+
+#[test]
+fn try_catch_parses() {
+    let (ast, root) = parse("try { a } catch e { e }");
+    let expr = expr_of(&ast, only_stmt(&ast, root));
+    match ast.node(expr) {
+        Node::Try { handler, .. } => match ast.node(*handler) {
+            Node::Block { params, .. } => {
+                assert_eq!(
+                    ast.list_items(*params).len(),
+                    1,
+                    "catch binding is a parameter"
+                );
+            }
+            other => panic!("expected handler block, got {other:?}"),
+        },
+        other => panic!("expected try, got {other:?}"),
+    }
 }
 
 #[test]

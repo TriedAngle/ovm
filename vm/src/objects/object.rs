@@ -204,6 +204,24 @@ impl Object {
         }
         Ok(())
     }
+
+    pub fn store_array_element_in_place(
+        heap: &mut Heap,
+        receiver: &Handle<'_, Object>,
+        i: usize,
+        value: &Handle<'_, Value>,
+    ) -> Result<(), VmError> {
+        let obj = receiver.as_tagged(heap);
+        if !obj.as_ref().is_array(heap) {
+            return Err(VmError::Type);
+        }
+        if obj.as_ref().element_value(heap, i).is_none() {
+            return Err(VmError::OutOfBounds);
+        }
+        let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+        elements.set(heap, i, value.as_tagged(heap));
+        Ok(())
+    }
 }
 
 pub struct ObjectInit<'a> {

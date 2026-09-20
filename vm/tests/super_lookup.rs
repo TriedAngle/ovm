@@ -87,11 +87,19 @@ fn get_smi(thread: &mut Thread, obj: Value, name: &str) -> i64 {
 
 fn parents_of(thread: &mut Thread, p1: Value, p2: Value) -> Value {
     thread.handle_scope(|thread, scope| {
+        let first = thread.intern(&scope, "parent");
+        let second = thread.intern(&scope, "mixin");
+        let (first, second) = {
+            let heap = &*thread.heap();
+            (first.as_tagged(heap).raw(), second.as_tagged(heap).raw())
+        };
         let arr = {
             let _heap = &*thread.heap();
             thread.heap().allocate_handle::<FixedArray>(
                 scope.stage(&[
-                    unsafe { Tagged::<Value>::from_value_unchecked(p1) },
+                    unsafe { Tagged::<Value>::from_value_unchecked(first) },
+                    unsafe { Tagged::from_value_unchecked(p1) },
+                    unsafe { Tagged::from_value_unchecked(second) },
                     unsafe { Tagged::from_value_unchecked(p2) },
                 ]),
                 &scope,
