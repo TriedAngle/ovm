@@ -32,7 +32,7 @@ impl ProxyObject {
 
     /// Whether the proxy has been revoked (handler nulled).
     pub fn is_revoked(&self, heap: &Heap) -> bool {
-        self.handler.inner() == heap.known().null.as_tagged(heap)
+        self.handler.raw() == heap.known().null.as_tagged(heap)
     }
 
     /// (target, handler) anchored to `heap`; caller checks revocation.
@@ -343,7 +343,7 @@ fn descriptor_object<'s>(
     {
         let obj = heap
             .new_object(scope, heap.known().object_initial_map, HandleSlice::EMPTY)
-            .into_handle(scope);
+            .as_handle(scope);
         // the well-known field names are persistent roots: they cross the
         // define allocations without further rooting
         let s = heap.known().strings;
@@ -906,7 +906,7 @@ fn apply_h<'a>(
                 args[1..].iter().map(|h| h.as_tagged(heap)).collect();
             let arr = heap
                 .new_array(scope, scope.stage(&words))
-                .into_handle(scope)
+                .as_handle(scope)
                 .erase();
             let result = call_trap(
                 vm,
@@ -994,7 +994,7 @@ fn construct_h<'a>(
             let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
             let arr = heap
                 .new_array(scope, scope.stage(&words))
-                .into_handle(scope)
+                .as_handle(scope)
                 .erase();
             let result = call_trap(
                 vm,

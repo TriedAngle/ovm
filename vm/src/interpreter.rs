@@ -217,7 +217,7 @@ fn exception_dispatch<'a>(
         let handled = 'handled: {
             let Some(obj) = stack
                 .callable_slot(&cache.frame_meta())
-                .read(heap)
+                .get(heap)
                 .as_heap_object()
             else {
                 break 'handled None;
@@ -304,7 +304,7 @@ fn dispatch<'a>(
         let result = step(vm, heap, state, base_depth, op, ops, meta, pc);
         match result {
             Step::Next => {}
-            Step::Return => return Ok(acc.read(heap)),
+            Step::Return => return Ok(acc.get(heap)),
             Step::Throw(v) => {
                 state.set_pending_exception(v);
                 match exception_dispatch(heap, state, base_depth, pc) {
@@ -623,7 +623,7 @@ fn step<'a>(
         }),
         Opcode::LoadKeyedProperty => state.handle_scope(|scope| -> Step<'_> {
             let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
-            let raw_key = scope.handle(acc.read(heap));
+            let raw_key = scope.handle(acc.get(heap));
             let Some(key) = step_try!(Object::to_property_key(vm, heap, state, raw_key)) else {
                 return Step::PendingThrow;
             };
@@ -668,11 +668,11 @@ fn step<'a>(
             Step::Next
         }),
         Opcode::LoadNewTarget => {
-            acc.store(stack.new_target_slot(&meta).read(heap));
+            acc.store(stack.new_target_slot(&meta).get(heap));
             Step::Next
         }
         Opcode::Store => {
-            stack.set_reg(&meta, ops.reg(0), acc.read(heap));
+            stack.set_reg(&meta, ops.reg(0), acc.get(heap));
             Step::Next
         }
         Opcode::StoreGlobal => state.handle_scope(|scope| -> Step<'_> {
@@ -685,7 +685,7 @@ fn step<'a>(
                     heap,
                     &scope,
                     name,
-                    acc.read(heap),
+                    acc.get(heap),
                     StoreSemantics::WriteThrough,
                 )
             });
@@ -721,7 +721,7 @@ fn step<'a>(
 
                 if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
                     let name = scope.handle(name.as_tagged(heap).erase());
-                    let value = scope.handle(acc.read(heap));
+                    let value = scope.handle(acc.get(heap));
                     return match step_try!(Proxy::set(
                         vm, heap, state, receiver, name, value, receiver
                     )) {
@@ -748,7 +748,7 @@ fn step<'a>(
                         StoreHit::Setter(setter) => {
                             let setter = scope.handle(setter);
                             let args =
-                                scope.stage(&[receiver.as_tagged(heap).erase(), acc.read(heap)]);
+                                scope.stage(&[receiver.as_tagged(heap).erase(), acc.get(heap)]);
                             match step_try!(call_value(
                                 vm, state, heap, stack, cache, meta, pc, setter, args
                             )) {
@@ -770,7 +770,7 @@ fn step<'a>(
                     heap,
                     &scope,
                     name.as_tagged(heap),
-                    acc.read(heap),
+                    acc.get(heap),
                     semantics
                 ));
                 // update the IC before invoking a setter (mirrors loads)
@@ -823,7 +823,7 @@ fn step<'a>(
                 .as_ref()
                 .constant_slot_name(heap, ops.idx(1));
             let name = scope.handle(name);
-            let value = scope.handle(acc.read(heap));
+            let value = scope.handle(acc.get(heap));
             let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
                 return Step::Error(VmError::Type);
             };
@@ -850,7 +850,7 @@ fn step<'a>(
                         state,
                         receiver,
                         key.erase(),
-                        scope.handle(acc.read(heap)),
+                        scope.handle(acc.get(heap)),
                         receiver,
                     )) {
                         Coercion::Threw => Step::PendingThrow,
@@ -870,7 +870,7 @@ fn step<'a>(
                                 let receiver = scope
                                     .cast::<Object>(receiver.as_tagged(heap))
                                     .expect("array receiver is an object");
-                                let value = scope.handle(acc.read(heap));
+                                let value = scope.handle(acc.get(heap));
                                 step_try!(Object::store_array_element(
                                     heap, &scope, &receiver, i, &value
                                 ));
@@ -886,7 +886,7 @@ fn step<'a>(
                     heap,
                     &scope,
                     name.as_tagged(heap),
-                    acc.read(heap),
+                    acc.get(heap),
                     semantics,
                 ));
                 let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
@@ -914,7 +914,7 @@ fn step<'a>(
                     state,
                     receiver,
                     key.erase(),
-                    scope.handle(acc.read(heap)),
+                    scope.handle(acc.get(heap)),
                     receiver,
                 )) {
                     Coercion::Threw => Step::PendingThrow,
@@ -929,7 +929,7 @@ fn step<'a>(
                             return Step::Error(VmError::Type);
                         };
                         if obj.as_tagged(heap).as_ref().is_array(heap) {
-                            let value = scope.handle(acc.read(heap));
+                            let value = scope.handle(acc.get(heap));
                             step_try!(Object::store_array_element_in_place(heap, &obj, i, &value));
                             return Step::Next;
                         }
@@ -950,7 +950,7 @@ fn step<'a>(
                 heap,
                 &scope,
                 name.as_tagged(heap),
-                acc.read(heap),
+                acc.get(heap),
                 StoreSemantics::WriteThrough,
             ));
             let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
@@ -966,7 +966,7 @@ fn step<'a>(
         Opcode::LoadContextSlot => {
             let depth = ops.uimm(1);
             let v = {
-                let mut context = match stack.context_slot(&meta).read(heap).get_as::<Context>() {
+                let mut context = match stack.context_slot(&meta).get(heap).get_as::<Context>() {
                     Some(context) => context,
                     None => return Step::Error(VmError::Type),
                 };
@@ -987,7 +987,7 @@ fn step<'a>(
             Step::Next
         }
         Opcode::StoreContextSlot => {
-            let mut context = match stack.context_slot(&meta).read(heap).get_as::<Context>() {
+            let mut context = match stack.context_slot(&meta).get(heap).get_as::<Context>() {
                 Some(context) => context,
                 None => return Step::Error(VmError::Type),
             };
@@ -1004,7 +1004,7 @@ fn step<'a>(
                 .get(heap)
                 .as_ref()
                 .element_slot(ops.idx(0))
-                .set(heap, host, acc.read(heap));
+                .set(heap, host, acc.get(heap));
             Step::Next
         }
         Opcode::CreateFunctionContext => {
@@ -1020,7 +1020,7 @@ fn step<'a>(
             });
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(stack.context_slot(&meta).read(heap))
+                    .cast::<Context>(stack.context_slot(&meta).get(heap))
                     .expect("frame context slot holds a Context");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
@@ -1041,7 +1041,7 @@ fn step<'a>(
             let count = ops.uimm(0) as usize;
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(stack.context_slot(&meta).read(heap))
+                    .cast::<Context>(stack.context_slot(&meta).get(heap))
                     .expect("frame context slot holds a Context");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
@@ -1056,9 +1056,9 @@ fn step<'a>(
             Step::Next
         }
         Opcode::PushContext => {
-            let old = stack.context_slot(&meta).read(heap);
+            let old = stack.context_slot(&meta).get(heap);
             stack.set_reg(&meta, ops.reg(0), old);
-            let context = acc.read(heap);
+            let context = acc.get(heap);
             if context.get_as::<Context>().is_none() {
                 return Step::Error(VmError::Type);
             }
@@ -1080,7 +1080,7 @@ fn step<'a>(
             Step::Next
         }
         Opcode::LoadContext => {
-            acc.store(stack.context_slot(&meta).read(heap));
+            acc.store(stack.context_slot(&meta).get(heap));
             Step::Next
         }
         // TODO: feedback vectors and separation once they are there
@@ -1288,14 +1288,14 @@ fn step<'a>(
                 return Step::Error(VmError::Type);
             };
             let context = scope
-                .cast::<Context>(stack.context_slot(&meta).read(heap))
+                .cast::<Context>(stack.context_slot(&meta).get(heap))
                 .expect("frame context slot holds a Context");
             let obj = step_try!(Object::create_closure(heap, &scope, info, context));
             acc.store(obj);
             Step::Next
         }),
         Opcode::LoadCurrentClosure => {
-            acc.store(stack.callable_slot(&meta).read(heap));
+            acc.store(stack.callable_slot(&meta).get(heap));
             Step::Next
         }
         Opcode::Add => {
@@ -1309,7 +1309,7 @@ fn step<'a>(
                 return Step::Next;
             }
             state.handle_scope(|scope| {
-                let lhs = scope.handle(acc.read(heap));
+                let lhs = scope.handle(acc.get(heap));
                 let lhs = match step_try!(Object::to_primitive(vm, heap, state, lhs, Hint::Default))
                 {
                     Coercion::Threw => return Step::PendingThrow,
@@ -1354,7 +1354,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            let a = scope.handle(acc.read(heap));
+            let a = scope.handle(acc.get(heap));
             let b = scope.handle(other);
             let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a - b));
             let Some(v) = v else {
@@ -1372,7 +1372,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            let a = scope.handle(acc.read(heap));
+            let a = scope.handle(acc.get(heap));
             let b = scope.handle(other);
             let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a * b));
             let Some(v) = v else {
@@ -1393,7 +1393,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            let a = scope.handle(acc.read(heap));
+            let a = scope.handle(acc.get(heap));
             let b = scope.handle(other);
             let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a / b));
             let Some(v) = v else {
@@ -1411,7 +1411,7 @@ fn step<'a>(
                 acc.store(Smi::new(a % b).into_tagged());
                 return Step::Next;
             }
-            let a = scope.handle(acc.read(heap));
+            let a = scope.handle(acc.get(heap));
             let b = scope.handle(other);
             let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a % b));
             let Some(v) = v else {
@@ -1423,7 +1423,7 @@ fn step<'a>(
         Opcode::Exp => state.handle_scope(|scope| -> Step<'_> {
             // JS exponentiation is always IEEE double math; the result only
             // needs a Smi tag when it is an in-range integer.
-            let a = scope.handle(acc.read(heap));
+            let a = scope.handle(acc.get(heap));
             let b = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
             let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a.powf(b)));
             let Some(v) = v else {
@@ -1512,13 +1512,13 @@ fn step<'a>(
             Step::Next
         }
         Opcode::JumpIfTruthy => {
-            if Convert::is_truthy(heap, acc.read(heap)) {
+            if Convert::is_truthy(heap, acc.get(heap)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
         }
         Opcode::JumpIfFalsy => {
-            if !Convert::is_truthy(heap, acc.read(heap)) {
+            if !Convert::is_truthy(heap, acc.get(heap)) {
                 cache.set_pc(jump_target(pc, ops.imm(0)));
             }
             Step::Next
@@ -1540,7 +1540,7 @@ fn step<'a>(
             Step::Next
         }
         Opcode::TestTypeof => {
-            acc.store(Object::type_of(heap, acc.read(heap)));
+            acc.store(Object::type_of(heap, acc.get(heap)));
             Step::Next
         }
         Opcode::Negate => {
@@ -1557,7 +1557,7 @@ fn step<'a>(
                 }
             } else {
                 let n = state.handle_scope(|scope| {
-                    let acc = scope.handle(acc.read(heap));
+                    let acc = scope.handle(acc.get(heap));
                     Object::to_numeric(vm, heap, state, acc)
                 });
                 let n = step_try!(n);
@@ -1570,7 +1570,7 @@ fn step<'a>(
             Step::Next
         }
         Opcode::InstanceOf => state.handle_scope(|scope| -> Step<'_> {
-            let object = scope.handle(acc.read(heap));
+            let object = scope.handle(acc.get(heap));
             let callable = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
             let r = step_try!(Object::instance_of(vm, heap, state, object, callable));
             let Some(r) = r else {
@@ -1581,12 +1581,12 @@ fn step<'a>(
         }),
         Opcode::EqualStrict => {
             let other = stack.reg(heap, &meta, ops.reg(0));
-            let r = Compare::strict_equal(heap, acc.read(heap), other);
+            let r = Compare::strict_equal(heap, acc.get(heap), other);
             acc.store(Convert::boolean(heap, r));
             Step::Next
         }
         Opcode::Equal => state.handle_scope(|scope| {
-            let x = scope.handle(acc.read(heap));
+            let x = scope.handle(acc.get(heap));
             let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Default)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
@@ -1601,7 +1601,7 @@ fn step<'a>(
             Step::Next
         }),
         Opcode::LessThan => state.handle_scope(|scope| {
-            let x = scope.handle(acc.read(heap));
+            let x = scope.handle(acc.get(heap));
             let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
@@ -1620,7 +1620,7 @@ fn step<'a>(
             Step::Next
         }),
         Opcode::LessThanOrEqual => state.handle_scope(|scope| {
-            let x = scope.handle(acc.read(heap));
+            let x = scope.handle(acc.get(heap));
             let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
@@ -1639,7 +1639,7 @@ fn step<'a>(
             Step::Next
         }),
         Opcode::GreaterThan => state.handle_scope(|scope| {
-            let x = scope.handle(acc.read(heap));
+            let x = scope.handle(acc.get(heap));
             let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
@@ -1658,7 +1658,7 @@ fn step<'a>(
             Step::Next
         }),
         Opcode::GreaterThanOrEqual => state.handle_scope(|scope| {
-            let x = scope.handle(acc.read(heap));
+            let x = scope.handle(acc.get(heap));
             let x = match step_try!(Object::to_primitive(vm, heap, state, x, Hint::Number)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
@@ -1676,7 +1676,7 @@ fn step<'a>(
             acc.store(Convert::boolean(heap, r));
             Step::Next
         }),
-        Opcode::Throw | Opcode::ReThrow => Step::Throw(acc.read(heap)),
+        Opcode::Throw | Opcode::ReThrow => Step::Throw(acc.get(heap)),
         Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),
     }
 }

@@ -152,7 +152,7 @@ impl DenseString {
 
     fn encoding_of(header: &Header) -> Encoding {
         // Safety: raw header read (encoding is map-kind metadata).
-        let map = header.map.inner();
+        let map = header.map.raw();
         let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
         if map_ref.kind().contains(MapKind::LATIN1) {
             Encoding::Latin1

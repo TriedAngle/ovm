@@ -64,16 +64,20 @@ where
                 scope.stage(&[Smi::new(42).into_tagged(), string.as_tagged(heap).erase()])
             };
             let array = t.heap().allocate_handle::<FixedArray>(staged, &scope);
-            let before = (
-                string.as_tagged(&*t.heap()).raw().to_bits(),
-                array.as_tagged(&*t.heap()).raw().to_bits(),
-            );
 
             t.heap().collect();
             t.heap().collect();
 
-            assert_eq!(string.as_tagged(&*t.heap()).raw().to_bits(), before.0);
-            assert_eq!(array.as_tagged(&*t.heap()).raw().to_bits(), before.1);
+            // a full collection promotes (moves) young objects, so compare
+            // survival, not addresses: the rooted handles must still resolve
+            // to live strong pointers in the heap
+            {
+                let heap = &*t.heap();
+                let string = string.as_tagged(heap).raw();
+                let array = array.as_tagged(heap).raw();
+                assert!(string.is_strong_ptr() && vm.heap().contains(string.raw_addr()));
+                assert!(array.is_strong_ptr() && vm.heap().contains(array.raw_addr()));
+            }
             {
                 let heap = &*t.heap();
                 let array = array.as_tagged(heap);

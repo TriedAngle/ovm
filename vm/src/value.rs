@@ -36,6 +36,17 @@ impl Value {
         self.0 & !TAG_MASK
     }
 
+    /// The canonical comparison word: for pointers the weak tag bit is
+    /// cleared, so a strong and a weak reference to the same object match;
+    /// Smis keep their encoded value (bit 1 is data, not a tag).
+    pub const fn raw_address_word(self) -> Word {
+        if self.is_ptr() {
+            self.0 & !WEAK_BIT
+        } else {
+            self.0
+        }
+    }
+
     pub const fn is_smi(self) -> bool {
         self.0 & PTR_BIT == TAG_SMI
     }
@@ -288,7 +299,14 @@ impl<'a, T> Tagged<'a, T> {
 
     /// Erase the phantom type only: the anchor is unchanged. This is
     /// purely type-level (any heap object is a `Value`).
+    ///
+    /// Must not be used on a weak word: `Tagged<Value>` means "strong".
+    /// Use [`Tagged::erase_weak`] for [`Tagged<MaybeWeak>`].
     pub fn erase(self) -> Tagged<'a, Value> {
+        debug_assert!(
+            !self.raw.is_weak_ptr(),
+            "erase() on a weak Tagged promotes it to strong; use erase_weak()"
+        );
         Tagged {
             raw: self.raw,
             _phantom: PhantomData,
@@ -315,8 +333,11 @@ impl<'a, T> Tagged<'a, T> {
         self.raw.is_weak_ptr()
     }
 
+    /// Pointer equality: compares the canonical address word
+    /// ([`Value::raw_address_word`]), so strong and weak references to the
+    /// same object are equal and Smis compare by their encoded value.
     pub fn ptr_eq<U>(self, other: Tagged<'a, U>) -> bool {
-        self.raw.to_bits() == other.raw.to_bits()
+        self.raw.raw_address_word() == other.raw.raw_address_word()
     }
 }
 
@@ -353,7 +374,7 @@ impl<'a> Tagged<'a, Value> {
     pub fn get_as<T: HeapObject>(self) -> Option<Tagged<'a, T>> {
         let ptr = HeapPtr::decode_strong(self.raw)?;
         // Safety: strong pointer; reads only the header's map slot.
-        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.inner();
+        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.raw();
         // Safety: raw header read under the anchor.
         let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
         let kind = map_ref.kind().kind();
@@ -431,7 +452,7 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
     }
 
     /// A rooted copy: the value may now cross GC safepoints.
-    pub fn into_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T>
+    pub fn as_handle<'s>(self, scope: &'s impl HandleSet) -> Handle<'s, T>
     where
         T: 's,
     {
@@ -455,8 +476,18 @@ impl<'a, T: HeapObject> From<Tagged<'a, T>> for HeapPtr<T> {
     }
 }
 
-impl<'a, T: HeapObject> Tagged<'a, T> {
-    pub fn make_weak(self) -> Tagged<'a, MaybeWeak<T>> {
+impl<'a, T> Tagged<'a, T> {
+    /// The maybe-weak view of this word, without changing it.
+    pub fn as_maybe_weak(self) -> Tagged<'a, MaybeWeak<T>> {
+        Tagged {
+            raw: self.raw,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// The weak view of this word: sets the weak tag bit. Callers are
+    /// responsible for the word being a heap pointer.
+    pub fn as_weak(self) -> Tagged<'a, MaybeWeak<T>> {
         Tagged {
             raw: Value(self.raw.to_bits() | WEAK_PTR),
             _phantom: PhantomData,
@@ -472,25 +503,19 @@ impl<'a, T> Tagged<'a, MaybeWeak<T>> {
         }
     }
 
-    pub fn from_strong(strong: Tagged<'a, T>) -> Self {
+    /// Erase the phantom type to the erased maybe-weak form, keeping the
+    /// word (and its weak tag) exactly as stored. The counterpart of
+    /// [`Tagged::erase`] for weak words.
+    pub fn erase_weak(self) -> Tagged<'a, MaybeWeak<Value>> {
         Tagged {
-            raw: strong.raw,
+            raw: self.raw,
             _phantom: PhantomData,
         }
     }
 
-    pub fn strengthen(self) -> Option<Tagged<'a, T>> {
-        if self.raw.is_weak_ptr() {
-            None
-        } else {
-            // SAFETY: the weak bit is clear.
-            Some(unsafe { Tagged::from_value_unchecked(self.raw) })
-        }
-    }
-
-    /// Strong view of a live weak reference; `None` for cleared or
+    /// The strong view of a live reference; `None` for cleared or
     /// non-pointer words.
-    pub fn upgrade(self) -> Option<Tagged<'a, T>> {
+    pub fn as_strong(self) -> Option<Tagged<'a, T>> {
         if !self.raw.is_ptr() || self.raw.is_cleared() {
             return None;
         }
@@ -502,16 +527,5 @@ impl<'a, T> Tagged<'a, MaybeWeak<T>> {
 
     pub fn is_cleared(self) -> bool {
         self.raw.is_cleared()
-    }
-}
-
-impl<'a> Tagged<'a, Value> {
-    pub fn as_maybe_weak(self) -> Tagged<'a, MaybeWeak<Value>> {
-        unsafe { Tagged::from_maybe_weak_unchecked(self.raw) }
-    }
-
-    pub fn as_weak(self) -> Tagged<'a, MaybeWeak<Value>> {
-        let weak = Value::from_bits(self.raw.to_bits() | WEAK_PTR);
-        unsafe { Tagged::from_maybe_weak_unchecked(weak) }
     }
 }

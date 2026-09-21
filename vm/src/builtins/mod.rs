@@ -32,9 +32,8 @@ use function::{
 };
 use global::{eval_runtime, is_nan};
 use helpers::{
-    alloc_map, alloc_map_with_slots, define_data, define_method_prop, define_non_enumerable,
-    install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
-    run_prelude,
+    define_data, define_method_prop, define_non_enumerable, install_constructor, install_method,
+    make_runtime_function, make_runtime_plain_function, run_prelude,
 };
 use number::{number_constructor, number_to_string, number_value_of};
 use object::{
@@ -159,36 +158,28 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
     thread.handle_scope(|thread, scope| {
         // ---- Number ----------------------------------------------------------
         let object_prototype = thread.heap().known().object_prototype;
-        let (number_fn, number_proto) = install_constructor(
-            thread,
-            &scope,
-            roots,
-            idx.number,
-            "Number",
-            object_prototype,
-        )?;
+        let (number_fn, number_proto) =
+            install_constructor(thread, &scope, idx.number, "Number", object_prototype)?;
+        install_method(thread, &scope, number_proto, "valueOf", idx.number_value_of)?;
         install_method(
             thread,
             &scope,
-            roots,
-            number_proto,
-            "valueOf",
-            idx.number_value_of,
-        )?;
-        install_method(
-            thread,
-            &scope,
-            roots,
             number_proto,
             "toString",
             idx.number_to_string,
         )?;
         // static data properties on the Number constructor
-        let pos_inf = roots.create_handle(thread.heap().allocate::<Float>(f64::INFINITY));
-        let neg_inf = roots.create_handle(thread.heap().allocate::<Float>(f64::NEG_INFINITY));
-        let max_value = roots.create_handle(thread.heap().allocate::<Float>(f64::MAX));
-        let min_value = roots.create_handle(thread.heap().allocate::<Float>(f64::MIN_POSITIVE));
-        let number_nan = roots.create_handle(thread.heap().allocate::<Float>(f64::NAN));
+        let pos_inf = thread
+            .heap()
+            .allocate_handle::<Float>(f64::INFINITY, &scope);
+        let neg_inf = thread
+            .heap()
+            .allocate_handle::<Float>(f64::NEG_INFINITY, &scope);
+        let max_value = thread.heap().allocate_handle::<Float>(f64::MAX, &scope);
+        let min_value = thread
+            .heap()
+            .allocate_handle::<Float>(f64::MIN_POSITIVE, &scope);
+        let number_nan = thread.heap().allocate_handle::<Float>(f64::NAN, &scope);
         for (name, value) in [
             ("POSITIVE_INFINITY", pos_inf),
             ("NEGATIVE_INFINITY", neg_inf),
@@ -202,32 +193,25 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             define_data(thread.heap(), &scope, number_fn, n, value.erase())?;
         }
         let mut known = *thread.heap().known();
-        known.number_wrapper_map = alloc_map_with_slots(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT
-                .union(MapKind::EXTENDABLE)
-                .union(MapKind::PRIMITIVE_WRAPPER),
-            number_proto,
-            1,
-        )?;
+        known.number_wrapper_map = roots.create_handle(
+            thread.heap().allocate::<Map>(MapInit {
+                kind: MapKind::OBJECT
+                    .union(MapKind::EXTENDABLE)
+                    .union(MapKind::PRIMITIVE_WRAPPER),
+                value_slot_count: 1,
+                descriptors: &[],
+                prototype: number_proto.erase(),
+            }),
+        );
         thread.heap().set_known(known);
         let _ = number_fn;
 
         // ---- Boolean ----------------------------------------------------------
-        let (_, boolean_proto) = install_constructor(
-            thread,
-            &scope,
-            roots,
-            idx.boolean,
-            "Boolean",
-            object_prototype,
-        )?;
+        let (_, boolean_proto) =
+            install_constructor(thread, &scope, idx.boolean, "Boolean", object_prototype)?;
         install_method(
             thread,
             &scope,
-            roots,
             boolean_proto,
             "valueOf",
             idx.boolean_value_of,
@@ -235,65 +219,50 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             boolean_proto,
             "toString",
             idx.boolean_to_string,
         )?;
         let mut known = *thread.heap().known();
-        known.boolean_wrapper_map = alloc_map_with_slots(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT
-                .union(MapKind::EXTENDABLE)
-                .union(MapKind::PRIMITIVE_WRAPPER),
-            boolean_proto,
-            1,
-        )?;
+        known.boolean_wrapper_map = roots.create_handle(
+            thread.heap().allocate::<Map>(MapInit {
+                kind: MapKind::OBJECT
+                    .union(MapKind::EXTENDABLE)
+                    .union(MapKind::PRIMITIVE_WRAPPER),
+                value_slot_count: 1,
+                descriptors: &[],
+                prototype: boolean_proto.erase(),
+            }),
+        );
         thread.heap().set_known(known);
 
         // ---- String -----------------------------------------------------------
-        let (_, string_proto) = install_constructor(
-            thread,
-            &scope,
-            roots,
-            idx.string,
-            "String",
-            object_prototype,
-        )?;
+        let (_, string_proto) =
+            install_constructor(thread, &scope, idx.string, "String", object_prototype)?;
+        install_method(thread, &scope, string_proto, "valueOf", idx.string_value_of)?;
         install_method(
             thread,
             &scope,
-            roots,
-            string_proto,
-            "valueOf",
-            idx.string_value_of,
-        )?;
-        install_method(
-            thread,
-            &scope,
-            roots,
             string_proto,
             "toString",
             idx.string_to_string,
         )?;
         let mut known = *thread.heap().known();
-        known.string_wrapper_map = alloc_map_with_slots(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT
-                .union(MapKind::EXTENDABLE)
-                .union(MapKind::PRIMITIVE_WRAPPER),
-            string_proto,
-            1,
-        )?;
+        known.string_wrapper_map = roots.create_handle(
+            thread.heap().allocate::<Map>(MapInit {
+                kind: MapKind::OBJECT
+                    .union(MapKind::EXTENDABLE)
+                    .union(MapKind::PRIMITIVE_WRAPPER),
+                value_slot_count: 1,
+                descriptors: &[],
+                prototype: string_proto.erase(),
+            }),
+        );
         thread.heap().set_known(known);
 
         // ---- Error / TypeError / ReferenceError ---------------------------------
         let (_, error_proto) =
-            install_constructor(thread, &scope, roots, idx.error, "Error", object_prototype)?;
+            install_constructor(thread, &scope, idx.error, "Error", object_prototype)?;
         let known = thread.heap().known();
         let error_name = thread.intern(&scope, "Error");
         define_data(
@@ -310,35 +279,21 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             known.strings.message,
             known.strings.empty.erase(),
         )?;
-        install_method(
-            thread,
-            &scope,
-            roots,
-            error_proto,
-            "toString",
-            idx.error_to_string,
-        )?;
+        install_method(thread, &scope, error_proto, "toString", idx.error_to_string)?;
 
         // the bootstrap error_map chains to a placeholder prototype;
         // repoint it at the real Error.prototype
         let mut known = *thread.heap().known();
-        known.error_map = alloc_map(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT.union(MapKind::EXTENDABLE),
-            error_proto,
-        )?;
+        known.error_map = roots.create_handle(thread.heap().allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            value_slot_count: 0,
+            descriptors: &[],
+            prototype: error_proto.erase(),
+        }));
         thread.heap().set_known(known);
 
-        let (_, type_error_proto) = install_constructor(
-            thread,
-            &scope,
-            roots,
-            idx.type_error,
-            "TypeError",
-            error_proto,
-        )?;
+        let (_, type_error_proto) =
+            install_constructor(thread, &scope, idx.type_error, "TypeError", error_proto)?;
         let type_error_name = thread.intern(&scope, "TypeError");
         define_data(
             thread.heap(),
@@ -355,19 +310,17 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             wks.empty.erase(),
         )?;
         let mut known = *thread.heap().known();
-        known.type_error_map = alloc_map(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT.union(MapKind::EXTENDABLE),
-            type_error_proto,
-        )?;
+        known.type_error_map = roots.create_handle(thread.heap().allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            value_slot_count: 0,
+            descriptors: &[],
+            prototype: type_error_proto.erase(),
+        }));
         thread.heap().set_known(known);
 
         let (_, reference_error_proto) = install_constructor(
             thread,
             &scope,
-            roots,
             idx.reference_error,
             "ReferenceError",
             error_proto,
@@ -388,18 +341,17 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             wks.empty.erase(),
         )?;
         let mut known = *thread.heap().known();
-        known.reference_error_map = alloc_map(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT.union(MapKind::EXTENDABLE),
-            reference_error_proto,
-        )?;
+        known.reference_error_map = roots.create_handle(thread.heap().allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            value_slot_count: 0,
+            descriptors: &[],
+            prototype: reference_error_proto.erase(),
+        }));
         thread.heap().set_known(known);
 
         // ---- Function (constructor: dynamic bodies via eval, ES 20.2.1) --------
         let function_prototype = thread.heap().known().function_prototype;
-        let function_fn = make_runtime_function(thread, &scope, roots, idx.function_constructor)?;
+        let function_fn = make_runtime_function(thread, &scope, idx.function_constructor)?;
         define_method_prop(
             thread.heap(),
             &scope,
@@ -430,7 +382,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             function_prototype,
             "toString",
             idx.function_to_string,
@@ -438,7 +389,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             function_prototype,
             "call",
             idx.function_call,
@@ -446,7 +396,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             function_prototype,
             "apply",
             idx.function_apply,
@@ -454,7 +403,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             function_prototype,
             "bind",
             idx.function_bind,
@@ -466,7 +414,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         run_prelude(thread, &scope, REVOKE_PRELUDE, "revoke prelude")?;
 
         // ---- eval -------------------------------------------------------------
-        let eval_fn = make_runtime_function(thread, &scope, roots, idx.eval)?;
+        let eval_fn = make_runtime_function(thread, &scope, idx.eval)?;
         let global = thread.heap().known().global_object;
         let eval_name = thread.intern(&scope, "eval");
         // Safety: fresh interned word, rooted below before the define.
@@ -478,7 +426,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_prototype,
             "toString",
             idx.object_to_string,
@@ -486,7 +433,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_prototype,
             "hasOwnProperty",
             idx.object_has_own_property,
@@ -494,7 +440,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_prototype,
             "propertyIsEnumerable",
             idx.object_property_is_enumerable,
@@ -504,7 +449,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // %Object.prototype% already exists from bootstrap; link the
         // constructor to it (like Array below)
         let object_prototype = thread.heap().known().object_prototype;
-        let object_fn = make_runtime_function(thread, &scope, roots, idx.object)?;
+        let object_fn = make_runtime_function(thread, &scope, idx.object)?;
         define_method_prop(
             thread.heap(),
             &scope,
@@ -529,18 +474,10 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             object_name,
             object_fn.erase(),
         )?;
+        install_method(thread, &scope, object_fn, "create", idx.object_create)?;
         install_method(
             thread,
             &scope,
-            roots,
-            object_fn,
-            "create",
-            idx.object_create,
-        )?;
-        install_method(
-            thread,
-            &scope,
-            roots,
             object_fn,
             "getPrototypeOf",
             idx.object_get_prototype_of,
@@ -548,7 +485,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_fn,
             "getOwnPropertyNames",
             idx.object_get_own_property_names,
@@ -556,7 +492,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_fn,
             "getOwnPropertyDescriptor",
             idx.object_get_own_property_descriptor,
@@ -564,7 +499,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_fn,
             "defineProperty",
             idx.object_define_property,
@@ -572,7 +506,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_fn,
             "setPrototypeOf",
             idx.object_set_prototype_of,
@@ -581,7 +514,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Array ---------------------------------------------------------------
         // %Array.prototype% already exists from bootstrap (an array object
         // whose prototype is %Object.prototype%); just link the constructor
-        let array_fn = make_runtime_function(thread, &scope, roots, idx.array)?;
+        let array_fn = make_runtime_function(thread, &scope, idx.array)?;
         let array_prototype = thread.heap().known().array_prototype;
         define_method_prop(
             thread.heap(),
@@ -603,7 +536,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         define_data(thread.heap(), &scope, global, array_name, array_fn.erase())?;
 
         // Array.isArray
-        let is_array_fn = make_runtime_function(thread, &scope, roots, idx.array_is_array)?;
+        let is_array_fn = make_runtime_function(thread, &scope, idx.array_is_array)?;
         let is_array_name = thread.intern(&scope, "isArray");
         // Safety: fresh interned word, rooted below before the define.
         let is_array_name = scope.handle(is_array_name.as_tagged(&*thread.heap()));
@@ -618,25 +551,26 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Array iteration (the iterator protocol minimum) ---------------------
         // %ArrayIteratorPrototype%: next + @@iterator (returns the receiver)
         let array_iterator_prototype = {
-            let map = alloc_map(
-                thread.heap(),
+            let map = thread.heap().allocate_handle::<Map>(
+                MapInit {
+                    kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                    value_slot_count: 0,
+                    descriptors: &[],
+                    prototype: object_prototype.erase(),
+                },
                 &scope,
-                roots,
-                MapKind::OBJECT.union(MapKind::EXTENDABLE),
-                object_prototype,
-            )?;
+            );
             roots.create_handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY))
         };
         install_method(
             thread,
             &scope,
-            roots,
             array_iterator_prototype,
             "next",
             idx.array_iterator_next,
         )?;
         let sym_iterator_iter =
-            make_runtime_function(thread, &scope, roots, idx.array_iterator_symbol_iterator)?;
+            make_runtime_function(thread, &scope, idx.array_iterator_symbol_iterator)?;
         let iterator_symbol = thread.heap().known().iterator_symbol;
         // Safety: fresh root-slot word, rooted below before the defines.
         let iterator_name = scope.handle(iterator_symbol.as_tagged(&*thread.heap()));
@@ -650,7 +584,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
 
         // Array.prototype.values === Array.prototype[Symbol.iterator]: a
         // runtime returning a fresh array-iterator object
-        let values_fn = make_runtime_function(thread, &scope, roots, idx.array_values)?;
+        let values_fn = make_runtime_function(thread, &scope, idx.array_values)?;
         let values_name = thread.intern(&scope, "values");
         // Safety: fresh interned word, rooted below before the defines.
         let values_name = scope.handle(values_name.as_tagged(&*thread.heap()));
@@ -671,14 +605,12 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
 
         // array-iterator map: slots [iterated array, next index], prototype
         // %ArrayIteratorPrototype%
-        let array_iterator_map = alloc_map_with_slots(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT.union(MapKind::EXTENDABLE),
-            array_iterator_prototype,
-            2,
-        )?;
+        let array_iterator_map = roots.create_handle(thread.heap().allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            value_slot_count: 2,
+            descriptors: &[],
+            prototype: array_iterator_prototype.erase(),
+        }));
 
         // iterator-result map: { value, done } both {w+, e+, c+}
         let iterator_result_map = {
@@ -688,9 +620,8 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
                 .union(SlotFlags::CONFIGURABLE)
                 .union(SlotFlags::ENUMERABLE);
             // Safety: fresh root-slot word, rooted below before any allocation.
-            let proto = scope.handle(unsafe {
-                Tagged::<Value>::from_value_unchecked(object_prototype.read_unchecked())
-            });
+            let proto = scope
+                .handle(unsafe { Tagged::<Value>::from_value_unchecked(object_prototype.raw()) });
             thread
                 .heap()
                 .allocate_token_enter_heap(Map::layout_for(2), |token, heap| {
@@ -723,18 +654,16 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // for-in enumerator map: slots [level, keys, index, visited],
         // prototype Object.prototype (it must survive `x in Object.prototype`
         // style probes without special cases; the object is never exposed)
-        let for_in_enumerator_map = alloc_map_with_slots(
-            thread.heap(),
-            &scope,
-            roots,
-            MapKind::OBJECT.union(MapKind::EXTENDABLE),
-            object_prototype,
-            4,
-        )?;
+        let for_in_enumerator_map = roots.create_handle(thread.heap().allocate::<Map>(MapInit {
+            kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            value_slot_count: 4,
+            descriptors: &[],
+            prototype: object_prototype.erase(),
+        }));
         known.for_in_enumerator_map = for_in_enumerator_map;
         thread.heap().set_known(known);
 
-        let is_nan_fn = make_runtime_function(thread, &scope, roots, idx.is_nan)?;
+        let is_nan_fn = make_runtime_function(thread, &scope, idx.is_nan)?;
         let is_nan_name = thread.intern(&scope, "isNaN");
         // Safety: fresh interned word, rooted below before the define.
         let is_nan_name = scope.handle(is_nan_name.as_tagged(&*thread.heap()));
@@ -749,7 +678,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Symbol (minimal: constructor + Symbol.iterator) ---------------
         // enough to author custom iterables; the full Symbol surface stays
         // gated by the test262 feature skip
-        let symbol_fn = make_runtime_function(thread, &scope, roots, idx.symbol)?;
+        let symbol_fn = make_runtime_function(thread, &scope, idx.symbol)?;
         let symbol_name = thread.intern(&scope, "Symbol");
         // Safety: fresh interned word, rooted below before the define.
         let symbol_name = scope.handle(symbol_name.as_tagged(&*thread.heap()));
@@ -776,7 +705,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // The Proxy constructor is a runtime function *without* a
         // `.prototype` property (ES 20.2.1: "Proxy.prototype is
         // undefined"); `install_constructor` cannot be used.
-        let proxy_fn = make_runtime_function(thread, &scope, roots, idx.proxy)?;
+        let proxy_fn = make_runtime_function(thread, &scope, idx.proxy)?;
         let two = scope.handle(Smi::new(2));
         define_non_enumerable(thread.heap(), &scope, proxy_fn, wks.length, two)?;
         let proxy_name = thread.intern(&scope, "Proxy");
@@ -793,7 +722,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // Proxy.revocable: a non-constructor function returning
         // { proxy, revoke }; the revoke closure is the JS template
         // installed by REVOKE_PRELUDE (runtimes cannot carry state).
-        let revocable_fn = make_runtime_plain_function(thread, &scope, roots, idx.proxy_revocable)?;
+        let revocable_fn = make_runtime_plain_function(thread, &scope, idx.proxy_revocable)?;
         define_non_enumerable(thread.heap(), &scope, revocable_fn, wks.length, two)?;
         let revocable_name = thread.intern(&scope, "revocable");
         define_non_enumerable(
@@ -813,7 +742,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             revocable_fn.erase(),
         )?;
         // hidden revoke runtime used by the REVOKE_PRELUDE closure
-        let revoke_fn = make_runtime_plain_function(thread, &scope, roots, idx.proxy_revoke)?;
+        let revoke_fn = make_runtime_plain_function(thread, &scope, idx.proxy_revoke)?;
         let revoke_name = thread.intern(&scope, "__revokeProxy");
         // Safety: fresh interned word, rooted below before the define.
         let revoke_name = scope.handle(revoke_name.as_tagged(&*thread.heap()));
@@ -829,7 +758,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_fn,
             "preventExtensions",
             idx.object_prevent_extensions,
@@ -837,24 +765,18 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(
             thread,
             &scope,
-            roots,
             object_fn,
             "isExtensible",
             idx.object_is_extensible,
         )?;
-        install_method(thread, &scope, roots, object_fn, "seal", idx.object_seal)?;
-        install_method(
-            thread,
-            &scope,
-            roots,
-            object_fn,
-            "freeze",
-            idx.object_freeze,
-        )?;
+        install_method(thread, &scope, object_fn, "seal", idx.object_seal)?;
+        install_method(thread, &scope, object_fn, "freeze", idx.object_freeze)?;
 
         // ---- value properties of the global object -----------------------------
-        let infinity = roots.create_handle(thread.heap().allocate::<Float>(f64::INFINITY));
-        let nan = roots.create_handle(thread.heap().allocate::<Float>(f64::NAN));
+        let infinity = thread
+            .heap()
+            .allocate_handle::<Float>(f64::INFINITY, &scope);
+        let nan = thread.heap().allocate_handle::<Float>(f64::NAN, &scope);
         let undefined = thread.heap().known().undefined;
         for name in ["Infinity", "NaN", "undefined"] {
             let n = thread.intern(&scope, name);
@@ -870,8 +792,8 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             };
             // Safety: fresh root-slot words, rooted below before any
             // allocation.
-            let receiver = scope
-                .handle(unsafe { Tagged::<Object>::from_value_unchecked(global.read_unchecked()) });
+            let receiver =
+                scope.handle(unsafe { Tagged::<Object>::from_value_unchecked(global.raw()) });
             let key = scope.handle(n.as_tagged(&*thread.heap()));
             Object::define_own_property(
                 thread.heap(),

@@ -76,11 +76,8 @@ fn transition_target<'a>(
 ) -> Option<Tagged<'a, Value>> {
     let array = map.transitions.get(heap)?;
     for entry in array.as_slice().as_chunks::<2>().0 {
-        let Some(key) = entry[0].get(heap).strengthen() else {
-            continue;
-        };
-        if key.ptr_eq(name.erase()) {
-            return entry[1].upgrade(heap);
+        if entry[0].get(heap).ptr_eq(name.erase()) {
+            return entry[1].get_strong(heap);
         }
     }
     None
@@ -98,7 +95,7 @@ fn append_records_pred_and_shares_transitions() {
         let obj = thread
             .heap()
             .new_object(&scope, root_handle, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         add_prop(thread, &scope, obj, name_a, 1);
         let map_a = map_handle(thread, &scope, obj);
         add_prop(thread, &scope, obj, name_b, 2);
@@ -107,7 +104,7 @@ fn append_records_pred_and_shares_transitions() {
         let other = thread
             .heap()
             .new_object(&scope, root_handle, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         add_prop(thread, &scope, other, name_a, 3);
         let map_a_again = map_handle(thread, &scope, other);
 
@@ -138,7 +135,7 @@ fn redefine_records_pred() {
         let obj = thread
             .heap()
             .new_object(&scope, root, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
 
         add_prop(thread, &scope, obj, name_a, 1);
         let map_a = map_handle(thread, &scope, obj);
@@ -181,7 +178,7 @@ fn delete_records_pred() {
         let obj = thread
             .heap()
             .new_object(&scope, root, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
 
         add_prop(thread, &scope, obj, name_a, 1);
         add_prop(thread, &scope, obj, name_b, 2);
@@ -217,7 +214,7 @@ fn live_transition_subtree_survives_gc() {
         let obj = thread
             .heap()
             .new_object(&scope, root_handle, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         add_prop(thread, &scope, obj, name_a, 1);
         add_prop(thread, &scope, obj, name_b, 2);
 
@@ -258,14 +255,14 @@ fn dead_transition_targets_are_cleared_by_gc() {
         let live = thread
             .heap()
             .new_object(&scope, root_handle, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         add_prop(thread, &scope, live, name_a, 1);
 
         thread.handle_scope(|thread, inner| {
             let dead = thread
                 .heap()
                 .new_object(&inner, root_handle, HandleSlice::EMPTY)
-                .into_handle(&inner);
+                .as_handle(&inner);
             add_prop(thread, &inner, dead, name_b, 2);
         });
 
@@ -302,7 +299,7 @@ fn unused_whole_subtree_is_collected() {
             let obj = thread
                 .heap()
                 .new_object(&inner, root_handle, HandleSlice::EMPTY)
-                .into_handle(&inner);
+                .as_handle(&inner);
             add_prop(thread, &inner, obj, name_a, 1);
             add_prop(thread, &inner, obj, name_b, 2);
         });

@@ -51,7 +51,7 @@ impl FeedbackVector {
 
     /// The raw word in slot `i`: a Smi, strong or weak heap reference.
     pub fn inner(&self, i: usize) -> Value {
-        self.slot(i).inner()
+        self.slot(i).raw()
     }
 }
 
@@ -113,12 +113,12 @@ impl FeedbackVector {
     ) {
         let host = self.tagged(heap);
         self.slot(slot).set_weak(heap, host, map.erase());
-        Self::store_word(self.slot(slot + 1), heap, host, handler);
+        self.slot(slot + 1).set(heap, host, handler);
     }
 
     /// Overwrite the handler half of a site's pair.
     pub fn set_handler(&self, heap: &Heap, slot: usize, handler: Tagged<'_, MaybeWeak<Value>>) {
-        Self::store_word(self.slot(slot + 1), heap, self.tagged(heap), handler);
+        self.slot(slot + 1).set(heap, self.tagged(heap), handler);
     }
 
     /// Point the state slot at a polymorphic pair array.
@@ -134,21 +134,6 @@ impl FeedbackVector {
             host,
             heap.known().megamorphic_symbol.as_tagged(heap).erase(),
         );
-    }
-
-    /// Smis and strong pointers store strong; weak map words store weak
-    /// (both take the barrier).
-    fn store_word(
-        slot: &MaybeWeakGcSlot,
-        heap: &Heap,
-        host: Tagged<'_, Value>,
-        word: Tagged<'_, MaybeWeak<Value>>,
-    ) {
-        if let Some(strong) = word.strengthen() {
-            slot.set_strong(heap, host, strong);
-        } else if let Some(live) = word.upgrade() {
-            slot.set_weak(heap, host, live);
-        }
     }
 }
 

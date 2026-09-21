@@ -113,8 +113,18 @@ impl<T> GcSlot<T> {
         unsafe { Tagged::from_value_unchecked(Value::from_bits(self.cell.load())) }
     }
 
-    pub fn inner(&self) -> Value {
+    /// The current word without an anchor. It may be moved by a later
+    /// collection; only safe to use as an opaque `Value`.
+    pub fn raw(&self) -> Value {
         Value::from_bits(self.cell.load())
+    }
+
+    /// The anchored referent, valid for the heap borrow.
+    pub fn as_ref<'a>(&self, heap: &'a Heap) -> &'a T
+    where
+        T: HeapObject,
+    {
+        self.get(heap).as_ref()
     }
 
     pub fn set<'h, 'x>(&self, heap: &Heap, host: Tagged<'h, Value>, value: impl Into<Tagged<'x, T>>)
@@ -141,7 +151,7 @@ impl<T> GcSlot<T> {
 
 impl GcSlot<Smi> {
     pub fn to_smi(&self) -> Smi {
-        Smi::decode(self.inner()).expect("GcSlot invariant violated")
+        Smi::decode(self.raw()).expect("GcSlot invariant violated")
     }
 }
 
@@ -178,12 +188,23 @@ impl<T> MaybeWeakGcSlot<T> {
         unsafe { Tagged::from_maybe_weak_unchecked(Value::from_bits(self.cell.load())) }
     }
 
-    pub fn inner(&self) -> Value {
+    /// The current word without an anchor. It may be moved by a later
+    /// collection; only safe to use as an opaque `Value`.
+    pub fn raw(&self) -> Value {
         Value::from_bits(self.cell.load())
     }
 
     pub fn is_cleared(&self) -> bool {
-        self.inner().is_cleared()
+        self.raw().is_cleared()
+    }
+
+    /// The anchored referent if the slot holds a live reference (strong or
+    /// weak); `None` once it is cleared.
+    pub fn as_ref<'a>(&self, heap: &'a Heap) -> Option<&'a T>
+    where
+        T: HeapObject,
+    {
+        self.get(heap).as_strong().map(|t| t.as_ref())
     }
 
     pub fn as_raw(&self) -> &RawCell {
@@ -240,23 +261,21 @@ impl<T> MaybeWeakGcSlot<T> {
         host: Tagged<'h, Value>,
         value: Tagged<'x, MaybeWeak<T>>,
     ) {
-        if let Some(live) = value.upgrade() {
+        if let Some(live) = value.as_strong() {
             heap.write_barrier(host, self.as_raw(), live.erase());
         }
         self.cell.store_raw(value.raw().to_bits());
     }
 
-    pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<Tagged<'a, T>> {
-        let word = self.inner();
+    /// Resolve a live reference (strong or weak) to its strong view;
+    /// `None` once cleared.
+    pub fn get_strong<'a>(&self, _heap: &'a Heap) -> Option<Tagged<'a, T>> {
+        let word = self.raw();
         if !word.is_ptr() || word.is_cleared() {
             return None;
         }
         let strong = Value::from_bits(word.raw_addr() | STRONG_PTR);
         Some(unsafe { Tagged::from_value_unchecked(strong) })
-    }
-
-    pub fn strengthen<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, T>> {
-        self.get(heap).strengthen()
     }
 }
 
@@ -276,16 +295,24 @@ impl<T> OptionGcSlot<T> {
         }
     }
 
-    pub fn inner(&self) -> Value {
-        self.slot.inner()
+    pub fn raw(&self) -> Value {
+        self.slot.raw()
     }
 
     pub fn get<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, T>> {
         // Safety: fresh root-slot read for a word comparison.
-        if self.inner() == unsafe { heap.known().the_hole.read_unchecked() } {
+        if self.raw() == heap.known().the_hole.raw() {
             return None;
         }
         Some(self.slot.get(heap))
+    }
+
+    /// The anchored referent if the slot is not the hole.
+    pub fn as_ref<'a>(&self, heap: &'a Heap) -> Option<&'a T>
+    where
+        T: HeapObject,
+    {
+        self.get(heap).map(|t| t.as_ref())
     }
 
     pub fn as_raw(&self) -> &RawCell {
@@ -303,7 +330,7 @@ impl<T> OptionGcSlot<T> {
         // Safety: fresh root-slot read for a word store.
         self.slot
             .cell
-            .store_raw(unsafe { heap.known().the_hole.read_unchecked() }.to_bits());
+            .store_raw(heap.known().the_hole.raw().to_bits());
     }
 }
 
@@ -318,7 +345,7 @@ impl Register {
     /// Re-read the register under a heap borrow. Registers live in rooted
     /// memory that the GC updates in place, so the word is current; the
     /// anchor proves no GC runs before its use.
-    pub fn read<'a>(&self, _heap: &'a Heap) -> Tagged<'a, Value> {
+    pub fn get<'a>(&self, _heap: &'a Heap) -> Tagged<'a, Value> {
         // Safety: see method docs.
         unsafe { Tagged::from_value_unchecked(Value::from_bits(self.0.load())) }
     }
@@ -329,8 +356,17 @@ impl Register {
         Smi::decode(Value::from_bits(self.0.load())).expect("register holds a Smi")
     }
 
-    pub fn inner(&self) -> Value {
+    /// The current word without an anchor. It may be moved by a later
+    /// collection; only safe to use as an opaque `Value`.
+    pub fn raw(&self) -> Value {
         Value::from_bits(self.0.load())
+    }
+
+    /// The raw word as a reference into the register cell. The anchor
+    /// proves no GC (and no `store`) runs for `'a`.
+    pub fn as_ref<'a>(&self, _heap: &'a Heap) -> &'a Value {
+        // Safety: rooted cell the GC updates in place; no mutation during `'a`.
+        unsafe { &*self.0.as_ptr().cast::<Value>() }
     }
 
     pub fn store<'x, T: 'x>(&self, v: Tagged<'x, T>) {
@@ -429,9 +465,9 @@ impl Heap {
     pub fn allocate_handle<'s, T: HeapObject>(
         &mut self,
         config: T::Init<'_>,
-        scope: &'s HandleScope<'_>,
+        handles: &'s impl HandleSet,
     ) -> Handle<'s, T> {
-        self.allocate::<T>(config).into_handle(scope)
+        self.allocate::<T>(config).as_handle(handles)
     }
 
     // TODO: potentially remove this in favor of a better allocate function
@@ -443,7 +479,7 @@ impl Heap {
         let slots: Handle<'a, FixedArray> = if config.values.is_empty() {
             self.known().empty_fixed_array
         } else {
-            handles.create_handle(self.allocate::<FixedArray>(config.values))
+            self.allocate_handle::<FixedArray>(config.values, handles)
         };
         self.allocate::<Object>(ObjectInit {
             map: config.map,

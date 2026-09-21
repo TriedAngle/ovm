@@ -73,7 +73,7 @@ impl StackCache {
 
     pub fn deactivate(&self, heap: &Heap) {
         let cache = self.get();
-        let the_hole = cache.the_hole.read(heap);
+        let the_hole = cache.the_hole.get(heap);
         cache.acc.store(the_hole);
         cache.code.store(the_hole);
         cache.constants.store(the_hole);
@@ -104,7 +104,7 @@ impl StackCache {
         debug_assert!(self.is_active(), "bytecode read from inactive cache");
         self.get()
             .code
-            .read(heap)
+            .get(heap)
             .get_as::<FixedByteArray>()
             .expect("strong cache slot")
     }
@@ -113,7 +113,7 @@ impl StackCache {
         debug_assert!(self.is_active(), "constants read from inactive cache");
         self.get()
             .constants
-            .read(heap)
+            .get(heap)
             .get_as::<FixedArray>()
             .expect("strong cache slot")
     }
@@ -121,11 +121,11 @@ impl StackCache {
     /// The current frame's feedback vector, or `None` for functions without
     /// feedback slots (or while inactive).
     pub fn feedback_ref<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, FeedbackVector>> {
-        self.get().feedback.read(heap).get_as::<FeedbackVector>()
+        self.get().feedback.get(heap).get_as::<FeedbackVector>()
     }
 
     pub fn acc<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
-        self.get().acc.read(heap)
+        self.get().acc.get(heap)
     }
 
     pub fn acc_mut(&self) -> Acc<'_> {
@@ -154,8 +154,8 @@ impl core::ops::Deref for Acc<'_> {
 }
 
 impl Acc<'_> {
-    pub fn read<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
-        self.0.read(heap)
+    pub fn get<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
+        self.0.get(heap)
     }
 
     /// Store into the accumulator register. Only an anchored `Tagged` may be

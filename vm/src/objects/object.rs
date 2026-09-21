@@ -318,7 +318,7 @@ impl Object {
                 context.as_tagged(heap).erase(),
             ])
         };
-        let function = heap.new_object(scope, map, args).into_handle(scope);
+        let function = heap.new_object(scope, map, args).as_handle(scope);
 
         let length_key = heap.known().strings.length;
         let name_key = heap.known().strings.name;
@@ -354,7 +354,7 @@ impl Object {
         if kind.needs_prototype() {
             let proto = heap
                 .new_object(scope, heap.known().object_initial_map, HandleSlice::EMPTY)
-                .into_handle(scope);
+                .as_handle(scope);
             let constructor = heap.known().strings.constructor;
             let prototype = heap.known().strings.prototype;
             if !Object::define_own_property(
@@ -683,7 +683,7 @@ impl Object {
             let known = heap.known();
             let obj = heap
                 .new_object(&scope, known.object_initial_map, HandleSlice::EMPTY)
-                .into_handle(&scope);
+                .as_handle(&scope);
             if let Some(proto) = proto {
                 Object::set_prototype(heap, &scope, obj, proto.erase())?;
             }

@@ -96,13 +96,10 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            let Some(key) = entry[0].get(heap).strengthen() else {
-                continue;
-            };
-            if !key.ptr_eq(name.erase()) {
+            if !entry[0].get(heap).ptr_eq(name.erase()) {
                 continue;
             }
-            let Some(target) = entry[1].upgrade(heap) else {
+            let Some(target) = entry[1].get_strong(heap) else {
                 continue;
             };
             let Some(target) = target.get_as::<Map>() else {
@@ -160,13 +157,10 @@ impl Map {
             "transition pairs are flat [name, map]"
         );
         for entry in pairs.as_chunks::<2>().0 {
-            let Some(key) = entry[0].get(heap).strengthen() else {
-                continue;
-            };
-            if !key.ptr_eq(name.erase()) {
+            if !entry[0].get(heap).ptr_eq(name.erase()) {
                 continue;
             }
-            let Some(target) = entry[1].upgrade(heap) else {
+            let Some(target) = entry[1].get_strong(heap) else {
                 continue;
             };
             let Some(target) = target.get_as::<Map>() else {
@@ -417,9 +411,7 @@ impl SlotDescriptor {
     }
 
     pub fn offset(&self) -> usize {
-        Smi::decode(self.value.inner())
-            .expect("slot offset")
-            .value() as usize
+        Smi::decode(self.value.raw()).expect("slot offset").value() as usize
     }
 }
 

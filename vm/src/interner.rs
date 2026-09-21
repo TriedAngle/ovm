@@ -108,7 +108,7 @@ impl StringInterner {
     ) -> Handle<'s, DenseString> {
         let handle = heap
             .allocate::<DenseString>((key.data(), hash))
-            .into_handle(scope);
+            .as_handle(scope);
         let mut table = self.table.lock().unwrap();
         let raced = probe_unlocked(heap, scope, &mut table, hash, key.data());
         match raced {
@@ -135,8 +135,8 @@ fn probe_unlocked<'s>(
     let mut i = 0;
     while i < bucket.len() {
         if bucket[i].0.data().eq(&data) {
-            if let Some(r) = bucket[i].1.upgrade(heap) {
-                return Some(r.into_handle(scope));
+            if let Some(r) = bucket[i].1.get_strong(heap) {
+                return Some(r.as_handle(scope));
             }
             // dead entry: prune and keep scanning
             bucket.swap_remove(i);

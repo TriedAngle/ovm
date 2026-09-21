@@ -1,97 +1,75 @@
-//! Install helpers: map/function-object allocation and property-definition
-//! utilities shared by the builtin installation in `mod.rs`.
-
-use crate::Global;
-use crate::RootHandles;
 use crate::Thread;
-use crate::materialize::materialize_closure_vm;
+use crate::materialize::Materialize;
 use crate::{
     Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
     SlotName, Smi, Tagged, Value, VmError,
 };
 use crate::{RuntimeContext, RuntimeIndex};
 
-pub fn alloc_map(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    roots: &RootHandles,
-    kind: MapKind,
-    prototype: Global<Object>,
-) -> Result<Global<Map>, VmError> {
-    alloc_map_with_slots(heap, scope, roots, kind, prototype, 0)
-}
-
-pub fn alloc_map_with_slots(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    roots: &RootHandles,
-    kind: MapKind,
-    prototype: Global<Object>,
-    value_slot_count: usize,
-) -> Result<Global<Map>, VmError> {
-    // Safety: fresh root-slot word, rooted below before any allocation.
-    let proto =
-        scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(prototype.read_unchecked()) });
-    Ok(roots.create_handle(heap.allocate::<Map>(MapInit {
-        kind,
-        value_slot_count,
-        descriptors: &[],
-        prototype: proto,
-    })))
-}
-
 /// A runtime function object: `CALLABLE | CONSTRUCTOR | RUNTIME`, slots[0] =
 /// runtime index, slots[1] = empty context, [[Prototype]] = Function.prototype.
-pub fn make_runtime_function(
+pub fn make_runtime_function<'s>(
     thread: &mut Thread,
-    scope: &HandleScope<'_>,
-    roots: &RootHandles,
+    scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
-) -> Result<Global<Object>, VmError> {
+) -> Result<Handle<'s, Object>, VmError> {
     let heap = thread.heap();
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
         .union(MapKind::CONSTRUCTOR)
         .union(MapKind::RUNTIME)
         .union(MapKind::EXTENDABLE);
-    let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
+    let map = heap.allocate_handle::<Map>(
+        MapInit {
+            kind,
+            value_slot_count: 2,
+            descriptors: &[],
+            prototype: heap.known().function_prototype.erase(),
+        },
+        scope,
+    );
     let empty_context = heap.known().empty_context;
     let obj = heap.new_object(
         scope,
         map,
         scope.stage(&[
             Smi::new(index.0 as i64).into_tagged(),
-            // Safety: fresh root-slot word staged into rooted slots.
-            unsafe { Tagged::<Value>::from_value_unchecked(empty_context.read_unchecked()) },
+            empty_context.as_tagged(heap).erase(),
         ]),
     );
-    Ok(roots.create_handle(obj))
+    Ok(scope.handle(obj))
 }
 
 /// A non-constructor runtime function (`Proxy.revocable`-style statics).
-pub fn make_runtime_plain_function(
+pub fn make_runtime_plain_function<'s>(
     thread: &mut Thread,
-    scope: &HandleScope<'_>,
-    roots: &RootHandles,
+    scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
-) -> Result<Global<Object>, VmError> {
+) -> Result<Handle<'s, Object>, VmError> {
     let heap = thread.heap();
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
         .union(MapKind::RUNTIME)
         .union(MapKind::EXTENDABLE);
-    let map = alloc_map_with_slots(heap, scope, roots, kind, heap.known().function_prototype, 2)?;
+    let map = heap.allocate_handle::<Map>(
+        MapInit {
+            kind,
+            value_slot_count: 2,
+            descriptors: &[],
+            prototype: heap.known().function_prototype.erase(),
+        },
+        scope,
+    );
     let empty_context = heap.known().empty_context;
     let obj = heap.new_object(
         scope,
         map,
         scope.stage(&[
             Smi::new(index.0 as i64).into_tagged(),
-            // Safety: fresh root-slot word staged into rooted slots.
-            unsafe { Tagged::<Value>::from_value_unchecked(empty_context.read_unchecked()) },
+            empty_context.as_tagged(heap).erase(),
         ]),
     );
-    Ok(roots.create_handle(obj))
+    Ok(scope.handle(obj))
 }
 
 /// Compile and run a JS prelude once at install time (BIND_PRELUDE,
@@ -109,7 +87,7 @@ pub fn run_prelude(
             eprintln!("{name} prelude compile error: {e}");
             VmError::Type
         })?;
-        materialize_closure_vm(vm, heap, state, scope, &program, empty)?
+        Materialize::closure_vm(vm, heap, state, scope, &program, empty)?
     };
     let (vm, heap, state) = thread.split();
     let exception = heap.known().exception.as_tagged(heap).raw();
@@ -132,26 +110,27 @@ pub fn run_prelude(
 
 /// A constructor function + its prototype object (with `.constructor`),
 /// the function installed on the global object under `name`.
-pub fn install_constructor(
+pub fn install_constructor<'s>(
     thread: &mut Thread,
-    scope: &HandleScope<'_>,
-    roots: &RootHandles,
+    scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
     name: &str,
-    proto_parent: Global<Object>,
-) -> Result<(Global<Object>, Global<Object>), VmError> {
+    proto_parent: Handle<'_, Object>,
+) -> Result<(Handle<'s, Object>, Handle<'s, Object>), VmError> {
     let name_str = thread.intern(scope, name);
-    let fn_obj = make_runtime_function(thread, scope, roots, index)?;
+    let fn_obj = make_runtime_function(thread, scope, index)?;
 
     // prototype object: fresh extendable object chained to proto_parent
-    let map = alloc_map(
-        thread.heap(),
+    let map = thread.heap().allocate_handle::<Map>(
+        MapInit {
+            kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+            value_slot_count: 0,
+            descriptors: &[],
+            prototype: proto_parent.erase(),
+        },
         scope,
-        roots,
-        MapKind::OBJECT.union(MapKind::EXTENDABLE),
-        proto_parent,
-    )?;
-    let proto = roots.create_handle(thread.heap().new_object(scope, map, HandleSlice::EMPTY));
+    );
+    let proto = scope.handle(thread.heap().new_object(scope, map, HandleSlice::EMPTY));
 
     // proto.constructor = fn; fn.prototype = proto
     // (built-in methods/constructor properties are non-enumerable, ES 20+)
@@ -181,12 +160,11 @@ pub fn install_constructor(
 pub fn install_method(
     thread: &mut Thread,
     scope: &HandleScope<'_>,
-    roots: &RootHandles,
-    receiver: Global<Object>,
+    receiver: Handle<'_, Object>,
     name: &str,
     index: RuntimeIndex,
 ) -> Result<(), VmError> {
-    let method = make_runtime_function(thread, scope, roots, index)?;
+    let method = make_runtime_function(thread, scope, index)?;
     let name_str = thread.intern(scope, name);
     // Safety: fresh interned word, rooted below before any allocation.
     let method_name = scope.handle(name_str.as_tagged(&*thread.heap()));
@@ -201,7 +179,7 @@ pub fn install_method(
 pub fn define_method_prop(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    object: Global<Object>,
+    object: Handle<'_, Object>,
     name: Handle<'_, SlotName>,
     value: Handle<'_, Value>,
 ) -> Result<(), VmError> {
@@ -223,7 +201,7 @@ pub fn define_method_prop(
 pub fn define_data(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    object: Global<Object>,
+    object: Handle<'_, Object>,
     name: Handle<'_, SlotName>,
     value: Handle<'_, Value>,
 ) -> Result<(), VmError> {
@@ -236,7 +214,7 @@ pub fn define_data(
 pub fn define_non_enumerable(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
-    object: Global<Object>,
+    object: Handle<'_, Object>,
     name: Handle<'_, SlotName>,
     value: Handle<'_, Value>,
 ) -> Result<(), VmError> {

@@ -2,7 +2,7 @@
 
 use crate::Object;
 use crate::RuntimeContext;
-use crate::materialize::materialize_closure_vm;
+use crate::materialize::Materialize;
 use crate::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
 
 pub fn eval_runtime<'a>(
@@ -43,7 +43,7 @@ pub fn eval_runtime<'a>(
         let context = scope
             .cast::<Context>(context.as_tagged(heap))
             .ok_or(VmError::Type)?;
-        let closure = materialize_closure_vm(vm, heap, state, &scope, &program, context)?;
+        let closure = Materialize::closure_vm(vm, heap, state, &scope, &program, context)?;
         RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
     })
 }

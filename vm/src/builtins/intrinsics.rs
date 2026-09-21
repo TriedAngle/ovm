@@ -164,7 +164,7 @@ fn delete_property<'a>(
             if cond_23 {
                 // Safety: fresh rooted-slot word (re-read above) plus a fresh
                 // coercion result, both consumed by the trap call.
-                let key_word = unsafe { key.read_unchecked() };
+                let key_word = key.raw();
                 match Proxy::delete(
                     vm,
                     heap,
@@ -182,7 +182,7 @@ fn delete_property<'a>(
                 }
             } else {
                 // Safety: fresh rooted name word, consumed by the delete.
-                delete_property_core(heap, &scope, target, unsafe { key.read_unchecked() })?
+                delete_property_core(heap, &scope, target, key.raw())?
             }
         };
         if strict && !ok {
@@ -276,7 +276,7 @@ fn delete_identifier_sloppy<'a>(
             .raw()
     };
     // Safety: fresh root-slot word, consumed by the delete.
-    let global = unsafe { heap.known().global_object.read_unchecked() };
+    let global = heap.known().global_object.raw();
     let ok = state.handle_scope(|scope| delete_property_core(heap, &scope, global, name))?;
     Ok(Convert::boolean(heap, ok))
 }
@@ -531,7 +531,7 @@ fn for_in_level_keys(
     keys.extend(names);
     // fresh words out of the rooted slots, consumed by the caller's
     // immediate staging
-    Ok(keys.iter().map(|h| unsafe { h.read_unchecked() }).collect())
+    Ok(keys.iter().map(|h| h.raw()).collect())
 }
 
 /// for-in iteration step (ES 14.7.5.9 EnumerateObjectProperties):
@@ -575,8 +575,7 @@ fn for_in_next<'a>(
             // one candidate per turn: the cursor advances before the
             // key is examined, so skipped keys are never revisited
             let candidate = 'candidate: {
-                let Some(obj) =
-                    unsafe { enumerator.read_unchecked().assume_valid(heap) }.as_heap_object()
+                let Some(obj) = unsafe { enumerator.raw().assume_valid(heap) }.as_heap_object()
                 else {
                     return Err(VmError::Type);
                 };
@@ -597,8 +596,7 @@ fn for_in_next<'a>(
             let Some(key) = candidate else {
                 // snapshot exhausted: advance to the live prototype
                 let level = {
-                    let Some(obj) =
-                        unsafe { enumerator.read_unchecked().assume_valid(heap) }.as_heap_object()
+                    let Some(obj) = unsafe { enumerator.raw().assume_valid(heap) }.as_heap_object()
                     else {
                         return Err(VmError::Type);
                     };
@@ -622,8 +620,7 @@ fn for_in_next<'a>(
                     ),
                     &scope,
                 );
-                let Some(obj) =
-                    unsafe { enumerator.read_unchecked().assume_valid(heap) }.as_heap_object()
+                let Some(obj) = unsafe { enumerator.raw().assume_valid(heap) }.as_heap_object()
                 else {
                     return Err(VmError::Type);
                 };
@@ -640,8 +637,7 @@ fn for_in_next<'a>(
             // lazy [[GetOwnProperty]] on the key's own level: a key
             // deleted since the snapshot is skipped without registering
             let level = {
-                let Some(obj) =
-                    unsafe { enumerator.read_unchecked().assume_valid(heap) }.as_heap_object()
+                let Some(obj) = unsafe { enumerator.raw().assume_valid(heap) }.as_heap_object()
                 else {
                     return Err(VmError::Type);
                 };
@@ -651,7 +647,7 @@ fn for_in_next<'a>(
                 heap,
                 // Safety: fresh rooted-slot words, re-read now.
                 unsafe { level.assume_valid(heap) }.raw(),
-                unsafe { key.read_unchecked().assume_valid(heap) }.raw(),
+                unsafe { key.raw().assume_valid(heap) }.raw(),
             );
             let Some(enumerable) = own else {
                 continue;
@@ -659,8 +655,7 @@ fn for_in_next<'a>(
             // already registered (yielded earlier, or shadowing
             // non-enumerable on a closer level): skip
             let seen = {
-                let Some(obj) =
-                    unsafe { enumerator.read_unchecked().assume_valid(heap) }.as_heap_object()
+                let Some(obj) = unsafe { enumerator.raw().assume_valid(heap) }.as_heap_object()
                 else {
                     return Err(VmError::Type);
                 };
@@ -671,8 +666,8 @@ fn for_in_next<'a>(
                     .at(heap, FOR_IN_VISITED)
                     .get_as::<FixedArray>()
                     .ok_or(VmError::Type)?;
-                let key_word = unsafe { key.read_unchecked() };
-                visited.as_slice().iter().any(|s| s.inner() == key_word)
+                let key_word = key.raw();
+                visited.as_slice().iter().any(|s| s.raw() == key_word)
             };
             if seen {
                 continue;
@@ -680,12 +675,11 @@ fn for_in_next<'a>(
             // register the key — yielded or shadowing, both at most once
             {
                 let visited = {
-                    let Some(obj) =
-                        unsafe { enumerator.read_unchecked().assume_valid(heap) }.as_heap_object()
+                    let Some(obj) = unsafe { enumerator.raw().assume_valid(heap) }.as_heap_object()
                     else {
                         return Err(VmError::Type);
                     };
-                    let key_word = unsafe { key.read_unchecked() };
+                    let key_word = key.raw();
                     obj.as_ref()
                         .slots
                         .get(heap)
@@ -694,7 +688,7 @@ fn for_in_next<'a>(
                         .ok_or(VmError::Type)?
                         .as_slice()
                         .iter()
-                        .map(|s| s.inner())
+                        .map(|s| s.raw())
                         .chain([key_word])
                         .collect::<Vec<_>>()
                 };
@@ -707,8 +701,7 @@ fn for_in_next<'a>(
                     ),
                     &scope,
                 );
-                let Some(obj) =
-                    unsafe { enumerator.read_unchecked().assume_valid(heap) }.as_heap_object()
+                let Some(obj) = unsafe { enumerator.raw().assume_valid(heap) }.as_heap_object()
                 else {
                     return Err(VmError::Type);
                 };
@@ -771,7 +764,7 @@ fn for_in_next_level(_vm: &VM, heap: &mut Heap, level: Value) -> Result<Option<V
     let Some(obj) = unsafe { level.assume_valid(heap) }.as_heap_object() else {
         return Ok(None);
     };
-    let proto = obj.as_ref().map_ref(heap).prototype.inner();
+    let proto = obj.as_ref().map_ref(heap).prototype.raw();
     let hole = heap.known().the_hole.as_tagged(heap).raw();
     let null = heap.known().null.as_tagged(heap).raw();
     if proto == hole || proto == null {
@@ -1012,7 +1005,7 @@ fn has_property<'a>(
         if cond_27 {
             // Safety: fresh rooted-slot word plus a fresh coercion
             // result, both consumed by the trap call.
-            let key_word = unsafe { key.read_unchecked() };
+            let key_word = key.raw();
             let has = match Proxy::has(
                 vm,
                 heap,
@@ -1112,8 +1105,7 @@ fn copy_data_properties<'a>(
         let mut keys: Vec<Value> = Vec::new();
         'collect: {
             let heap = &*heap;
-            let Some(obj) =
-                unsafe { source_handle.read_unchecked().assume_valid(heap) }.as_heap_object()
+            let Some(obj) = unsafe { source_handle.raw().assume_valid(heap) }.as_heap_object()
             else {
                 break 'collect;
             };
@@ -1382,7 +1374,7 @@ fn init_instance_fields<'a>(
         while i + 1 < count {
             let raw_key = {
                 let heap = &*heap;
-                unsafe { fields.read_unchecked().assume_valid(heap) }
+                unsafe { fields.raw().assume_valid(heap) }
                     .as_heap_object()
                     .and_then(|o| o.as_ref().element_value(heap, i))
                     .map(|v| v.raw())
@@ -1406,7 +1398,7 @@ fn init_instance_fields<'a>(
             // re-read the initializer after the coercion (it allocated)
             let init = {
                 let heap = &*heap;
-                unsafe { fields.read_unchecked().assume_valid(heap) }
+                unsafe { fields.raw().assume_valid(heap) }
                     .as_heap_object()
                     .and_then(|o| o.as_ref().element_value(heap, i + 1))
                     .map(|v| v.raw())
@@ -1505,7 +1497,7 @@ fn dynamic_lookup_frame(
     let context = frame_context_value(state, heap)?;
     let mut context = context.get_as::<Context>().ok_or(VmError::Type)?;
     match dynamic_slot(heap, &mut context, name) {
-        Ok(slot) => Ok(Some(slot.inner())),
+        Ok(slot) => Ok(Some(slot.raw())),
         Err(VmError::Reference) => Ok(None),
         Err(e) => Err(e),
     }
@@ -1522,7 +1514,7 @@ fn frame_super_parts(heap: &mut Heap, state: &ContextState) -> Result<(Value, Va
     let Some(callee) = super_constructor(heap, &state.stack, &meta) else {
         return Err(VmError::Type);
     };
-    Ok((callee.raw(), state.stack.new_target_slot(&meta).inner()))
+    Ok((callee.raw(), state.stack.new_target_slot(&meta).raw()))
 }
 
 // ---- store outcomes ---------------------------------------------------------
@@ -1707,12 +1699,9 @@ fn set_function_name<'a>(
             })
         })?;
         let name = state.handle_scope(|scope| {
-            // Safety: fresh rooted-slot word read for the immediate use.
-            unsafe {
-                vm.interner()
-                    .intern(heap, &scope, StringData::Utf16(&units))
-                    .read_unchecked()
-            }
+            vm.interner()
+                .intern(heap, &scope, StringData::Utf16(&units))
+                .raw()
         });
         let defined = {
             let Some(fn_obj) = scope.cast::<Object>(fn_value.as_tagged(heap)) else {
@@ -1959,8 +1948,8 @@ fn define_own_property<'a>(
                     }
                 }?;
                 // Safety: rooted handle words, consumed by the trap call.
-                let recv_word = unsafe { receiver.read_unchecked() };
-                let key_word = unsafe { key.read_unchecked() };
+                let recv_word = receiver.raw();
+                let key_word = key.raw();
                 return match Proxy::define_internal(
                     vm,
                     heap,
@@ -2216,7 +2205,7 @@ fn construct_super_construct<'a>(
         // Safety: fresh rooted-slot words staged for the call.
         let mut args_v = Vec::with_capacity(args.len() + 1);
         args_v.push(receiver.as_tagged(&*heap).raw());
-        args_v.extend(args.iter().map(|h| unsafe { h.read_unchecked() }));
+        args_v.extend(args.iter().map(|h| h.raw()));
         let result = scope.handle(RuntimeContext::call(
             vm,
             &mut *heap,
@@ -2351,7 +2340,7 @@ fn construct_super_via<'a>(
         let Some(obj) = unsafe { closure.assume_valid(heap) }.as_heap_object() else {
             break 'callee None;
         };
-        let proto = obj.as_ref().header.map.get(heap).prototype.inner();
+        let proto = obj.as_ref().header.map.get(heap).prototype.raw();
         let Some(proto_obj) = unsafe { proto.assume_valid(heap) }.as_heap_object() else {
             break 'callee None;
         };
@@ -2404,7 +2393,7 @@ fn load_dynamic_name<'a>(
         None => {
             // unresolved: fall back to a global object property
             // Safety: fresh root-slot word, consumed below.
-            let global = unsafe { heap.known().global_object.read_unchecked() };
+            let global = heap.known().global_object.raw();
             get_property_lenient(RuntimeContext::new(vm, heap, state), global, name)
         }
     }
@@ -2452,7 +2441,7 @@ fn store_dynamic_name<'a>(
         Some(_) => return Err(VmError::Reference),
         None => {
             // Safety: fresh root-slot word, consumed below.
-            let global = unsafe { heap.known().global_object.read_unchecked() };
+            let global = heap.known().global_object.raw();
             let threw = state.handle_scope(|scope| -> Result<bool, VmError> {
                 let outcome = {
                     let heap = &*heap;
@@ -2720,8 +2709,8 @@ fn super_set_property<'a>(
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
         // Safety: rooted handle words, consumed below.
-        let recv_word = unsafe { recv.read_unchecked() };
-        let value_word = unsafe { value.read_unchecked() };
+        let recv_word = recv.raw();
+        let value_word = value.raw();
         let semantics = if semantics_flag & bytecode::SUPER_STORE_WRITE_THROUGH != 0 {
             StoreSemantics::WriteThrough
         } else {

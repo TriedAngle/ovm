@@ -114,7 +114,7 @@ fn callable_object<'s>(
                 length: 0,
             },
         )
-        .into_handle(scope)
+        .as_handle(scope)
 }
 
 fn run_program(
@@ -301,7 +301,7 @@ fn failed_run_does_not_leak_frames_into_next_run() {
         let obj = thread
             .heap()
             .new_object(&scope, known.object_initial_map, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         word(&*thread.heap(), obj)
     });
     let mut bad = Vec::new();
@@ -1107,7 +1107,7 @@ fn transition_object_program(
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
         let w5 = word(&*thread.heap(), obj);
         let consts = thread
             .heap()
@@ -1260,7 +1260,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
         // child: no own slots, prototype = FixedArray([name, parent]) (the
         // Self-style inline parent pair list)
         let w6 = word(&*thread.heap(), parent);
@@ -1288,7 +1288,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
         let w7 = word(&*thread.heap(), child);
         let w8 = word(&*thread.heap(), parent);
         let consts = thread
@@ -1469,7 +1469,7 @@ fn jump_if_truthy_follows_toboolean() {
                         length: 0,
                     },
                 )
-                .into_handle(&scope);
+                .as_handle(&scope);
 
             word(&*thread.heap(), obj)
         };
@@ -1631,7 +1631,7 @@ fn accessor_object_program(
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
         let w10 = word(&*thread.heap(), obj);
         let consts = thread.heap().allocate_handle::<FixedArray>(
             stage_values(&scope, &[w10, x_word, y_word, z_word]),
@@ -1791,7 +1791,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
 
         // define `x` as an accessor with a getter (this.y) and no setter
         let getter = {
@@ -1896,7 +1896,7 @@ fn runtime_function<'s>(
                 length: 0,
             },
         )
-        .into_handle(scope)
+        .as_handle(scope)
 }
 
 /// Build a bytecode function object from inside a runtime.
@@ -2210,14 +2210,14 @@ fn equal_strict_compares_numbers_strings_and_objects() {
             let h = thread
                 .heap()
                 .new_object(&scope, object_init_map, HandleSlice::EMPTY)
-                .into_handle(&scope);
+                .as_handle(&scope);
             word(&*thread.heap(), h)
         };
         let obj2 = {
             let h = thread
                 .heap()
                 .new_object(&scope, object_init_map, HandleSlice::EMPTY)
-                .into_handle(&scope);
+                .as_handle(&scope);
             word(&*thread.heap(), h)
         };
 
@@ -2859,7 +2859,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
         thread.execute(caller, &[])
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
@@ -3234,7 +3234,7 @@ fn proto_object<'s>(
                 length: 0,
             },
         )
-        .into_handle(scope)
+        .as_handle(scope)
 }
 
 #[test]
@@ -3397,7 +3397,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
         let w29 = word(&*thread.heap(), frozen);
         let w30 = word(&*thread.heap(), obj_b);
         let consts = thread
@@ -3469,7 +3469,7 @@ fn empty_object<'s>(thread: &mut Thread, scope: &'s HandleScope<'_>) -> Handle<'
     thread
         .heap()
         .new_object(scope, known.object_initial_map, HandleSlice::EMPTY)
-        .into_handle(scope)
+        .as_handle(scope)
 }
 
 /// Own callable data property `name` -> function running `program`.
@@ -4224,7 +4224,7 @@ fn shadow_setup<'s>(
                 length: 0,
             },
         )
-        .into_handle(scope);
+        .as_handle(scope);
     let w31 = word(&*thread.heap(), parent);
     let parent_word = thread.intern(scope, "parent");
     let parent_word = parent_word.as_tagged(&*thread.heap()).raw();
@@ -4255,7 +4255,7 @@ fn shadow_setup<'s>(
                 length: 0,
             },
         )
-        .into_handle(scope);
+        .as_handle(scope);
     let p_word = {
         let heap = &*thread.heap();
         p.as_tagged(heap).raw()

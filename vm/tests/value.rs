@@ -1,6 +1,6 @@
 use core::alloc::Layout;
 
-use vm::{Header, Heap, HeapObject, HeapPtr, MaybeWeak, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
+use vm::{Header, Heap, HeapObject, HeapPtr, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
 
 /// Stand-in heap object, aligned like a real heap allocation.
 #[repr(align(8))]
@@ -134,7 +134,7 @@ mod heap_ptr {
         let ptr = unsafe { HeapPtr::new(raw) };
 
         let v = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }
-            .make_weak()
+            .as_weak()
             .raw();
         assert!(v.is_weak_ptr());
         assert!(v.is_ptr());
@@ -267,11 +267,11 @@ mod tagged {
 
         let raw = alloc_test_obj();
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        // weak references live in MaybeWeak: strengthening fails, so a weak
-        // word can never reach `as_ptr` on a strong Tagged
+        // weak references live in MaybeWeak: the weak tag keeps them out of a
+        // strong Tagged, so a weak word can never reach `as_ptr`
         let weak =
-            unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }.make_weak();
-        assert!(weak.strengthen().is_none());
+            unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }.as_weak();
+        assert!(weak.raw().is_weak_ptr());
 
         unsafe { free_test_obj(raw) };
     }
@@ -282,15 +282,15 @@ mod tagged {
         let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
         let strong = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
 
-        let weak = strong.make_weak();
+        let weak = strong.as_weak();
         assert!(weak.raw().is_weak_ptr());
         assert!(!weak.raw().is_strong_ptr());
         assert_eq!(weak.raw().raw_addr(), raw as u64);
-        assert!(weak.strengthen().is_none());
+        assert_eq!(weak.as_strong().unwrap().raw(), strong.raw());
 
-        let maybe = Tagged::<MaybeWeak<TestObj>>::from_strong(strong);
+        let maybe = strong.as_maybe_weak();
         assert!(!maybe.is_cleared());
-        assert_eq!(maybe.strengthen().unwrap().raw(), strong.raw());
+        assert_eq!(maybe.as_strong().unwrap().raw(), strong.raw());
         assert_eq!(maybe.raw(), strong.raw());
 
         unsafe { free_test_obj(raw) };

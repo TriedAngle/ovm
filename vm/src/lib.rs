@@ -133,7 +133,7 @@ impl ContextState {
     pub fn take_pending_exception(&self) -> Option<Value> {
         if self.has_pending_exception.get() {
             self.has_pending_exception.set(false);
-            Some(self.pending_exception.inner())
+            Some(self.pending_exception.raw())
         } else {
             None
         }
@@ -144,7 +144,7 @@ impl ContextState {
     pub fn take_pending_exception_tagged<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
         if self.has_pending_exception.get() {
             self.has_pending_exception.set(false);
-            Some(self.pending_exception.read(heap))
+            Some(self.pending_exception.get(heap))
         } else {
             None
         }
@@ -338,7 +338,7 @@ impl Thread {
     ) -> Result<Value, ScriptError> {
         let program = compile(src, mode).map_err(ScriptError::from_frontend)?;
         self.handle_scope(|thread, scope| {
-            let closure = materialize::materialize_script(thread, &scope, &program)
+            let closure = materialize::Materialize::script(thread, &scope, &program)
                 .map_err(ScriptError::Vm)?;
             thread.execute(closure, &[]).map_err(ScriptError::Vm)
         })
@@ -457,8 +457,8 @@ impl VM {
     pub fn attach(&self) -> Thread {
         let heap = self.shared.heap.new_local(&self.shared.known);
         // Safety: root-slot reads stored straight into rooted fill cells.
-        let the_hole = unsafe { heap.known().the_hole.read_unchecked() };
-        let undefined = unsafe { heap.known().undefined.read_unchecked() };
+        let the_hole = heap.known().the_hole.raw();
+        let undefined = heap.known().undefined.raw();
         let state = Arc::new(ContextState {
             handles: HandleData::new(the_hole),
             stack: Stack::new(STACK_SLOTS, the_hole, undefined),

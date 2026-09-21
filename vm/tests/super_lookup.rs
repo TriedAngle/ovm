@@ -46,7 +46,7 @@ fn object_with(thread: &mut Thread, proto: Value, props: &[(&str, i64)]) -> Valu
         let obj = thread
             .heap()
             .new_object(&scope, map, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         // Safety: caller-supplied proto word, rooted before any allocation.
         let proto = scope.handle(unsafe { proto.assume_valid(&*thread.heap()) });
         Object::set_prototype(thread.heap(), &scope, obj, proto).unwrap();

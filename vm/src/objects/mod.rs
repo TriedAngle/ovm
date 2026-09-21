@@ -141,7 +141,7 @@ impl ObjectKind {
 pub unsafe fn object_kind(addr: NonNull<()>) -> ObjectKind {
     let header = unsafe { &*addr.cast::<Header>().as_ptr() };
     // Safety: GC-callback context; raw header read.
-    let map = header.map.inner();
+    let map = header.map.raw();
     let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
     map_ref.kind().kind()
 }

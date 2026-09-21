@@ -206,7 +206,7 @@ impl CallableInfoObject {
     pub fn name<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
         self.name.get(heap).get_as::<DenseString>().map(|_| {
             // Safety: fresh slot read under the anchor.
-            unsafe { Tagged::from_value_unchecked(self.name.inner()) }
+            unsafe { Tagged::from_value_unchecked(self.name.raw()) }
         })
     }
 
