@@ -1,4 +1,4 @@
-pub use parser_utils::ByteSpan;
+pub use crate::plumbing::ByteSpan;
 
 use TokenInfo as I;
 

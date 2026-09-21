@@ -747,8 +747,9 @@ fn super_in_nested_arrows() {
 
 #[test]
 fn new_target_basic_forms() {
-    // undefined outside construction
-    assert!(run_bool("new.target === undefined;"));
+    // `new.target` outside a function is a Syntax Error (ES 13.3.11);
+    // inside a plain call it evaluates to undefined
+    assert!(run("new.target;").is_err());
     assert!(run_bool(
         "function f() { return new.target; } f() === undefined;"
     ));

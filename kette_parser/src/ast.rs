@@ -1,4 +1,4 @@
-use parser_utils::{ByteSpan, Symbol, SymbolTable};
+use crate::plumbing::{ByteSpan, Symbol, SymbolTable};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u32);

@@ -1,4 +1,4 @@
-use parser_utils::ParseError;
+use crate::plumbing::ParseError;
 
 use crate::ast::{Ast, BinaryOp, Node, NodeId, SlotKind, UnaryOp};
 use crate::token::{ByteSpan, Token, TokenKind, TokenValue};

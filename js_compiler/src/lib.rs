@@ -1,75 +1,60 @@
-//! AST → shared IR lowering.
+//! JavaScript frontend: oxc parse + semantic analysis → shared IR.
 //!
-//! A single naive pass over a resolved parser AST, in the Ignition style:
-//! one walk, an implicit register file, temporaries stacked above the
-//! resolver's per-function layout. Output is a heap-free [`ir::Program`];
-//! the `vm` crate owns converting that to VM objects.
+//! [`compile_js`] is the whole pipeline. oxc provides parsing, name
+//! resolution, the scope tree, var hoisting, strict-mode propagation and
+//! direct-eval detection; the [`analysis`] module derives the VM's layout
+//! facts oxc does not compute (IR function ids incl. synthesized
+//! constructors/field initializers, the captured-symbol set, `super` /
+//! `this` / `new.target` capture info, hoisting lists); [`codegen`] walks
+//! the oxc AST and emits the Ignition-style IR, assigning each
+//! function's registers and context slots at its prologue.
 
+pub mod analysis;
 pub mod codegen;
 mod label;
 
-use js_parser::Ast;
+pub use codegen::CompileError;
 
-pub use ir::{
-    CallableKind, Constant, Function, FunctionBuilder, FunctionId, HandlerEntry, Program,
-};
-use ir::{FrontendError, SourceMode};
+use oxc_allocator::Allocator;
+use oxc_span::SourceType;
+use oxc_parser::{ParseOptions, Parser};
+use oxc_semantic::SemanticBuilder;
 
-/// A construct the materializer does not support yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompileError {
-    pub span: parser_utils::ByteSpan,
-    pub feature: &'static str,
-}
+pub use ir::{FrontendError, Program, SourceMode};
 
-impl CompileError {
-    fn new(span: parser_utils::ByteSpan, feature: &'static str) -> Self {
-        Self { span, feature }
-    }
-}
-
-impl core::fmt::Display for CompileError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "unsupported: {} at {}..{}",
-            self.feature, self.span.start, self.span.end
-        )
-    }
-}
-
-/// Resolve + compile a parsed script. `functions[0]` is the script body.
-pub fn compile_script(ast: &Ast) -> Result<Program, CompileError> {
-    let resolved = js_parser::resolver::resolve(ast);
-    codegen::generate(ast, &resolved)
-}
-
-/// Resolve + compile direct eval source: unresolved names are compiled as
-/// runtime lookups through the caller's context chain (`LoadDynamicName`).
-pub fn compile_eval(ast: &Ast) -> Result<Program, CompileError> {
-    let resolved = js_parser::resolver::resolve_for_eval(ast);
-    codegen::generate(ast, &resolved)
-}
-
-/// Resolve + compile a REPL entry: top-level declarations become global
-/// object properties so they persist across entries
-pub fn compile_repl(ast: &Ast) -> Result<Program, CompileError> {
-    let resolved = js_parser::resolver::resolve_repl(ast);
-    codegen::generate(ast, &resolved)
-}
-
-/// JavaScript frontend entry point: parse `source` and lower it to the
-/// shared IR, mapping failures into the language-neutral [`FrontendError`].
+/// Parse + analyze + lower `source` in the given mode.
 pub fn compile_js(source: &str, mode: SourceMode) -> Result<Program, FrontendError> {
-    let mut parser = js_parser::Parser::new(js_parser::Utf8SliceStream::new(source));
-    parser
-        .parse_script()
-        .map_err(|e| FrontendError::syntax(e.to_string()))?;
-    let ast = parser.into_ast();
-    let result = match mode {
-        SourceMode::Script => compile_script(&ast),
-        SourceMode::Eval => compile_eval(&ast),
-        SourceMode::Repl => compile_repl(&ast),
-    };
-    result.map_err(|e| FrontendError::compile(e.to_string()))
+    let allocator = Allocator::default();
+    let parser = Parser::new(&allocator, source, SourceType::script()).with_options(
+        ParseOptions {
+            // the old parser dropped parens; also keeps NamedEvaluation
+            // semantics uniform
+            preserve_parens: false,
+            // scripts and REPL entries may `return` at the top level
+            allow_return_outside_function: true,
+            ..ParseOptions::default()
+        },
+    );
+    let ret = parser.parse();
+    if let Some(err) = ret.diagnostics.first() {
+        return Err(FrontendError::syntax(err.to_string()));
+    }
+    let semantic = SemanticBuilder::new()
+        .with_build_nodes(true)
+        .with_check_syntax_error(true)
+        .build(&ret.program);
+    if let Some(err) = semantic.diagnostics.first() {
+        return Err(FrontendError::syntax(err.to_string()));
+    }
+    let facts = analysis::analyze(
+        &ret.program,
+        &semantic.semantic,
+        match mode {
+            SourceMode::Script => analysis::Mode::Script,
+            SourceMode::Eval => analysis::Mode::Eval,
+            SourceMode::Repl => analysis::Mode::Repl,
+        },
+    );
+    codegen::generate(semantic.semantic.scoping(), &facts)
+        .map_err(|e| FrontendError::compile(e.to_string()))
 }

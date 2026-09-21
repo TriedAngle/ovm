@@ -1,4 +1,4 @@
-use parser_utils::{ByteSpan, Symbol};
+use crate::plumbing::{ByteSpan, Symbol};
 
 use crate::{Ast, Node, NodeId, SlotKind};
 
