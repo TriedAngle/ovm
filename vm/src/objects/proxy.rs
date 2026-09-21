@@ -1,13 +1,10 @@
 use core::alloc::Layout;
 
-use crate::lookup::has_property;
-use crate::lookup::ordinary_own_descriptor;
 use crate::runtime::Coercion;
 use crate::{
     Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
     Header, Heap, HeapObject, Key, Lookup, Map, Object, ObjectKind, PartialDescriptor,
-    PropertyDescriptor, RuntimeContext, SlotName, Tagged, VM, Value, Visitor, VmError,
-    is_compatible_property_descriptor,
+    PropertyDescriptor, RuntimeContext, SlotName, Tagged, Transition, VM, Value, Visitor, VmError,
 };
 
 pub struct Proxy;
@@ -235,7 +232,8 @@ fn own_descriptor_h<'s>(
 ) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
     let cond_11 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if !cond_11 {
-        let desc = ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), key.as_tagged(heap));
+        let desc =
+            Lookup::ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), key.as_tagged(heap));
         return Ok(Flow::Value(desc.as_ref().map(PartialDescriptor::from)));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
@@ -414,7 +412,8 @@ fn define_internal_h<'s>(
         Object::store_array_element(heap, scope, &array, i, &value)?;
         return Ok(Flow::Value(true));
     }
-    let current = ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap));
+    let current =
+        Lookup::ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap));
     let full = partial.complete_against(undefined, current.as_ref());
     let obj_ref = scope
         .cast::<Object>(obj.as_tagged(heap))
@@ -678,8 +677,11 @@ fn has_h<'a>(
             if cond_15 {
                 has_h(vm, heap, state, scope, &target, name)
             } else {
-                let found =
-                    has_property(heap, target.as_tagged(heap), name.as_tagged(heap).as_name());
+                let found = Lookup::has_property(
+                    heap,
+                    target.as_tagged(heap),
+                    name.as_tagged(heap).as_name(),
+                );
                 Ok(Coercion::Value(Convert::boolean(heap, found)))
             }
         }
@@ -838,7 +840,7 @@ fn proxy_define_h(
                 Some(d) => {
                     let compatible = {
                         let p = partial;
-                        is_compatible_property_descriptor(heap, extensible, &p, Some(d))
+                        Transition::is_compatible_property_descriptor(heap, extensible, &p, Some(d))
                     };
                     if !compatible {
                         return Err(VmError::Message(
@@ -1265,12 +1267,10 @@ impl Proxy {
         heap: &mut Heap,
         state: &ContextState,
         scope: &'s HandleScope<'_>,
-        obj: Tagged<'_, Value>,
-        name: Tagged<'_, Value>,
+        obj: Handle<'_, Value>,
+        name: Handle<'_, Value>,
         partial: PartialDescriptor<'s>,
     ) -> Result<Flow<bool>, VmError> {
-        let obj = scope.handle(obj);
-        let name = scope.handle(name);
         define_internal_h(vm, heap, state, scope, &obj, &name, partial)
     }
 
@@ -1306,14 +1306,10 @@ impl Proxy {
         vm: &VM,
         heap: &'a mut Heap,
         state: &ContextState,
-        proxy: Tagged<'_, Value>,
-        name: Tagged<'_, Value>,
+        proxy: Handle<'_, Value>,
+        name: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
-        state.handle_scope(|scope| {
-            let proxy = scope.handle(proxy);
-            let name = scope.handle(name);
-            has_h(vm, heap, state, &scope, &proxy, &name)
-        })
+        state.handle_scope(|scope| has_h(vm, heap, state, &scope, &proxy, &name))
     }
 
     /// Proxy `[[Delete]]` (ES 20.2.5.4). The strict-mode false→TypeError
@@ -1322,14 +1318,10 @@ impl Proxy {
         vm: &VM,
         heap: &'a mut Heap,
         state: &ContextState,
-        proxy: Tagged<'_, Value>,
-        key: Tagged<'_, Value>,
+        proxy: Handle<'_, Value>,
+        key: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
-        state.handle_scope(|scope| {
-            let proxy = scope.handle(proxy);
-            let key = scope.handle(key);
-            delete_h(vm, heap, state, &scope, &proxy, &key)
-        })
+        state.handle_scope(|scope| delete_h(vm, heap, state, &scope, &proxy, &key))
     }
 
     /// Proxy `[[DefineOwnProperty]]` (ES 20.2.5.6).

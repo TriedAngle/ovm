@@ -43,11 +43,7 @@ pub use heap::{
     WordType,
 };
 pub use interner::StringInterner;
-pub use lookup::{
-    Key, LoadOutcome, Lookup, has_property, home_proto, load_outcome_on, lookup_in_parents,
-    ordinary_own_descriptor, private_find, super_constructor, super_lookup,
-    super_lookup_from_proto,
-};
+pub use lookup::{Key, LoadOutcome, Lookup};
 pub use objects::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
     DenseString, Encoding, FeedbackVector, FeedbackVectorInit, FixedArray, FixedByteArray, Float,
@@ -61,7 +57,7 @@ pub use runtime::{Coercion, Hint, RuntimeCall, RuntimeContext, RuntimeIndex, Run
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
-    TransitionGuard, TransitionLock, is_compatible_property_descriptor, super_store_lookup,
+    TransitionGuard, TransitionLock,
 };
 pub use value::{
     HeapPtr, MaybeWeak, PTR_BIT, STRONG_PTR, Smi, TAG_MASK, TAG_SMI, Tagged, Value, WEAK_BIT,

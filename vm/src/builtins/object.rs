@@ -2,7 +2,6 @@
 use crate::Key;
 use crate::Lookup;
 use crate::RuntimeContext;
-use crate::lookup::ordinary_own_descriptor;
 use crate::proxy::Flow;
 use crate::proxy::Proxy;
 use crate::runtime::Coercion;
@@ -292,7 +291,7 @@ pub fn plain_object<'a>(
 }
 
 /// `Object.getOwnPropertyDescriptor(O, P)` (ES 20.1.2.5): the shared
-/// raw descriptor reader (`lookup::ordinary_own_descriptor`) converted
+/// raw descriptor reader (`Lookup::ordinary_own_descriptor`) converted
 /// to a descriptor object via FromPropertyDescriptor semantics.
 pub fn object_get_own_property_descriptor<'a>(
     nctx: RuntimeContext<'a>,
@@ -319,7 +318,7 @@ pub fn object_get_own_property_descriptor<'a>(
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
-        let desc = ordinary_own_descriptor(
+        let desc = Lookup::ordinary_own_descriptor(
             heap,
             &scope,
             target.as_tagged(heap),
@@ -407,17 +406,7 @@ pub fn object_define_property<'a>(
             Some(partial) => partial,
             None => return Ok(heap.known().exception.as_tagged(heap).erase()),
         };
-        // Safety: fresh rooted-slot words, consumed by the call.
-        match Proxy::define_internal(
-            vm,
-            heap,
-            state,
-            &scope,
-            unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) },
-            // Safety: fresh rooted name word, consumed by the trap call.
-            unsafe { Tagged::<Value>::from_value_unchecked(key.raw()) },
-            partial,
-        )? {
+        match Proxy::define_internal(vm, heap, state, &scope, target, key.erase(), partial)? {
             Flow::Threw => Ok(heap.known().exception.as_tagged(heap).erase()),
             Flow::Value(false) => Err(VmError::Type),
             Flow::Value(true) => Ok(target.as_tagged(heap).erase()),

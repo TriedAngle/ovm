@@ -86,10 +86,17 @@ pub struct HandleData {
     inner: UnsafeCell<HandleDataImpl>,
 }
 
+/// Slots handed out while this block was the active one; root scanning
+/// never visits past this watermark.
+struct HandleBlock {
+    slots: Box<[Value]>,
+    used: usize,
+}
+
 struct HandleDataImpl {
     // Note: the memory MUST stay stable, this is why its necessary to use additional blocks
     // instead of a single Vec<T>, because we can add/remove blocks without moving any blocks.
-    blocks: Vec<Box<[Value]>>,
+    blocks: Vec<HandleBlock>,
     next: *mut Value,
     limit: *mut Value,
     level: usize,
@@ -111,10 +118,26 @@ impl HandleDataImpl {
     }
 
     fn extend_sized(&mut self, size: usize) {
+        let live = self.live_in_active();
+        if let Some(block) = self.blocks.last_mut() {
+            block.used = live;
+        }
         let block = vec![self.fill.raw(); size].into_boxed_slice();
         self.next = block.as_ptr() as *mut Value;
         self.limit = unsafe { self.next.add(block.len()) };
-        self.blocks.push(block);
+        self.blocks.push(HandleBlock {
+            slots: block,
+            used: 0,
+        });
+    }
+
+    fn live_in_active(&self) -> usize {
+        let Some(block) = self.blocks.last() else {
+            return 0;
+        };
+        let start = block.slots.as_ptr() as *mut Value;
+        debug_assert!(start <= self.next && self.next <= self.limit);
+        (self.next as usize - start as usize) / core::mem::size_of::<Value>()
     }
 
     /// Reserve `n` contiguous slots in the current block, extending first
@@ -133,13 +156,15 @@ impl HandleDataImpl {
 
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.fill.as_raw());
-        for block in &self.blocks {
-            let start = block.as_ptr() as *mut Value;
-            let end = unsafe { start.add(block.len()) };
-            let used_end = if (start..end).contains(&self.next) {
+        let Some(active) = self.blocks.len().checked_sub(1) else {
+            return;
+        };
+        for (i, block) in self.blocks.iter().enumerate() {
+            let start = block.slots.as_ptr() as *mut Value;
+            let used_end = if i == active {
                 self.next
             } else {
-                end
+                unsafe { start.add(block.used) }
             };
             let mut slot = start;
             while slot < used_end {
@@ -147,6 +172,14 @@ impl HandleDataImpl {
                 slot = unsafe { slot.add(1) };
             }
         }
+    }
+
+    #[cfg(debug_assertions)]
+    fn fill_range(&self, from: *mut Value, to: *mut Value) {
+        const FILL: Value = Value::from_bits(0x1bad_dead0_bad_deaf);
+        debug_assert!(from <= to);
+        let len = unsafe { to.offset_from(from) } as usize;
+        unsafe { core::slice::from_raw_parts_mut(from, len) }.fill(FILL);
     }
 }
 
@@ -257,6 +290,16 @@ impl<'d> HandleScope<'d> {
 impl Drop for HandleScope<'_> {
     fn drop(&mut self) {
         let inner = unsafe { &*self.data.as_ptr() }.inner();
+        #[cfg(debug_assertions)]
+        {
+            // block addresses are unordered: compare counts, not pointers
+            let to = if inner.blocks.len() > self.prev_block_count {
+                self.prev_limit
+            } else {
+                inner.next
+            };
+            inner.fill_range(self.prev_next, to);
+        }
         inner.level -= 1;
         inner.next = self.prev_next;
         inner.limit = self.prev_limit;
@@ -298,6 +341,16 @@ impl<'i, 'o> EscapableHandleScope<'i, 'o> {
 impl Drop for EscapableHandleScope<'_, '_> {
     fn drop(&mut self) {
         let inner = self.data().inner();
+        #[cfg(debug_assertions)]
+        {
+            // block addresses are unordered: compare counts, not pointers
+            let to = if inner.blocks.len() > self.prev_block_count {
+                self.prev_limit
+            } else {
+                inner.next
+            };
+            inner.fill_range(self.prev_next, to);
+        }
         inner.level -= 1;
         inner.next = self.prev_next;
         inner.limit = self.prev_limit;

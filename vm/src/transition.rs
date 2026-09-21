@@ -5,7 +5,7 @@ use core::alloc::Layout;
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, Key,
     Lookup, Map, MapInit, MaybeWeak, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
-    WeakFixedArray, WeakFixedArrayInit, lookup_in_parents,
+    WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Serializes map-transition tree mutations across threads. VM-internal:
@@ -134,68 +134,6 @@ impl<'s, T> Handle<'s, T> {
         self.as_tagged(heap)
             .erase()
             .store_lookup(heap, scope, name, value, semantics)
-    }
-}
-
-/// `super.x = v` (ES 15.4.4 PutValue on a super reference): the store
-/// walks the chain starting at the pre-resolved parent link (read
-/// before ToPropertyKey; any of the three prototype shapes) but the
-/// receiver is `this`:
-/// - `Shadow` (JS): inherited writable data properties create an own
-///   property on the receiver (OrdinarySet's receiver != O path),
-///   setters run with the receiver, misses define on the receiver
-/// - `WriteThrough` (Self-style): inherited writable data properties
-///   are written at the holder instead of shadowing
-pub fn super_store_lookup<'a, 's>(
-    heap: &'a Heap,
-    scope: &'s HandleScope<'_>,
-    proto: Option<Tagged<'a, Value>>,
-    recv: Tagged<'a, Value>,
-    name: Tagged<'a, SlotName>,
-    value: Tagged<'a, Value>,
-    semantics: StoreSemantics,
-) -> Result<StoreOutcome<'s>, VmError> {
-    if recv.ptr_eq(heap.known().null.as_tagged(heap).erase())
-        || recv.ptr_eq(heap.known().undefined.as_tagged(heap).erase())
-    {
-        return Err(VmError::Type);
-    }
-    let Some(proto) = proto else {
-        // non-object home: no parent chain, define on the receiver
-        return super_store_on_receiver(heap, scope, recv, name, value);
-    };
-    match lookup_in_parents(heap, proto, name) {
-        Lookup::Data {
-            slot,
-            holder,
-            flags,
-            ..
-        } => {
-            if !flags.is_writable() {
-                return Err(VmError::Type);
-            }
-            match semantics {
-                StoreSemantics::WriteThrough => {
-                    let host = holder.erase();
-                    slot.set(heap, host, value);
-                    Ok(StoreOutcome::Done)
-                }
-                // receiver (`this`) differs from the holder by
-                // construction: OrdinarySet creates an own property on
-                // the receiver
-                StoreSemantics::Shadow => super_store_on_receiver(heap, scope, recv, name, value),
-            }
-        }
-        Lookup::NotFound => super_store_on_receiver(heap, scope, recv, name, value),
-        Lookup::Accessor { pair, .. } => {
-            let setter = pair.set.get(heap);
-            if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase()) {
-                return Ok(StoreOutcome::Done);
-            }
-            Ok(StoreOutcome::CallSetter {
-                setter: scope.handle(setter),
-            })
-        }
     }
 }
 
@@ -634,6 +572,132 @@ impl Transition {
                 Self::swap_map(heap, receiver, name, flags, Some((get, set)));
             }
         }
+    }
+
+    /// `super.x = v` (ES 15.4.4 PutValue on a super reference): the store
+    /// walks the chain starting at the pre-resolved parent link (read
+    /// before ToPropertyKey; any of the three prototype shapes) but the
+    /// receiver is `this`:
+    /// - `Shadow` (JS): inherited writable data properties create an own
+    ///   property on the receiver (OrdinarySet's receiver != O path),
+    ///   setters run with the receiver, misses define on the receiver
+    /// - `WriteThrough` (Self-style): inherited writable data properties
+    ///   are written at the holder instead of shadowing
+    pub fn super_store_lookup<'a, 's>(
+        heap: &'a Heap,
+        scope: &'s HandleScope<'_>,
+        proto: Option<Tagged<'a, Value>>,
+        recv: Tagged<'a, Value>,
+        name: Tagged<'a, SlotName>,
+        value: Tagged<'a, Value>,
+        semantics: StoreSemantics,
+    ) -> Result<StoreOutcome<'s>, VmError> {
+        if recv.ptr_eq(heap.known().null.as_tagged(heap).erase())
+            || recv.ptr_eq(heap.known().undefined.as_tagged(heap).erase())
+        {
+            return Err(VmError::Type);
+        }
+        let Some(proto) = proto else {
+            // non-object home: no parent chain, define on the receiver
+            return super_store_on_receiver(heap, scope, recv, name, value);
+        };
+        match Lookup::lookup_in_parents(heap, proto, name) {
+            Lookup::Data {
+                slot,
+                holder,
+                flags,
+                ..
+            } => {
+                if !flags.is_writable() {
+                    return Err(VmError::Type);
+                }
+                match semantics {
+                    StoreSemantics::WriteThrough => {
+                        let host = holder.erase();
+                        slot.set(heap, host, value);
+                        Ok(StoreOutcome::Done)
+                    }
+                    // receiver (`this`) differs from the holder by
+                    // construction: OrdinarySet creates an own property on
+                    // the receiver
+                    StoreSemantics::Shadow => {
+                        super_store_on_receiver(heap, scope, recv, name, value)
+                    }
+                }
+            }
+            Lookup::NotFound => super_store_on_receiver(heap, scope, recv, name, value),
+            Lookup::Accessor { pair, .. } => {
+                let setter = pair.set.get(heap);
+                if setter.ptr_eq(heap.known().undefined.as_tagged(heap).erase()) {
+                    return Ok(StoreOutcome::Done);
+                }
+                Ok(StoreOutcome::CallSetter {
+                    setter: scope.handle(setter),
+                })
+            }
+        }
+    }
+
+    pub fn is_compatible_property_descriptor(
+        heap: &Heap,
+        extensible: bool,
+        desc: &PartialDescriptor<'_>,
+        current: Option<&PartialDescriptor<'_>>,
+    ) -> bool {
+        let Some(current) = current else {
+            return extensible;
+        };
+
+        if current.configurable != Some(false) {
+            return true;
+        }
+        if desc.configurable == Some(true) {
+            return false;
+        }
+        if let Some(e) = desc.enumerable
+            && e != current.enumerable.unwrap_or(false)
+        {
+            return false;
+        }
+        // a non-configurable property cannot change kind
+        let cur_is_data = current.is_data_descriptor();
+        if !desc.is_generic_descriptor() && desc.is_data_descriptor() != cur_is_data {
+            return false;
+        }
+        let undefined = heap.known().undefined.as_tagged(heap).erase();
+        if cur_is_data && desc.is_data_descriptor() {
+            if current.writable != Some(true) {
+                if desc.writable == Some(true) {
+                    return false;
+                }
+                if let Some(v) = desc.value
+                    && !Compare::same_value(
+                        heap,
+                        v.as_tagged(heap),
+                        current.value.map_or(undefined, |w| w.as_tagged(heap)),
+                    )
+                {
+                    return false;
+                }
+            }
+        } else if !cur_is_data && desc.is_accessor_descriptor() {
+            let is_absent = |h: Option<Handle<'_, Value>>| {
+                h.is_none_or(|h| h.as_tagged(heap).ptr_eq(undefined))
+            };
+            if is_absent(current.get)
+                && let Some(g) = desc.get
+                && !g.as_tagged(heap).ptr_eq(undefined)
+            {
+                return false;
+            }
+            if is_absent(current.set)
+                && let Some(s) = desc.set
+                && !s.as_tagged(heap).ptr_eq(undefined)
+            {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -1218,65 +1282,4 @@ fn c_writable(d: &PropertyDescriptor<'_>) -> Option<bool> {
         PropertyDescriptor::Data { writable, .. } => Some(*writable),
         PropertyDescriptor::Accessor { .. } => None,
     }
-}
-
-pub fn is_compatible_property_descriptor(
-    heap: &Heap,
-    extensible: bool,
-    desc: &PartialDescriptor<'_>,
-    current: Option<&PartialDescriptor<'_>>,
-) -> bool {
-    let Some(current) = current else {
-        return extensible;
-    };
-
-    if current.configurable != Some(false) {
-        return true;
-    }
-    if desc.configurable == Some(true) {
-        return false;
-    }
-    if let Some(e) = desc.enumerable
-        && e != current.enumerable.unwrap_or(false)
-    {
-        return false;
-    }
-    // a non-configurable property cannot change kind
-    let cur_is_data = current.is_data_descriptor();
-    if !desc.is_generic_descriptor() && desc.is_data_descriptor() != cur_is_data {
-        return false;
-    }
-    let undefined = heap.known().undefined.as_tagged(heap).erase();
-    if cur_is_data && desc.is_data_descriptor() {
-        if current.writable != Some(true) {
-            if desc.writable == Some(true) {
-                return false;
-            }
-            if let Some(v) = desc.value
-                && !Compare::same_value(
-                    heap,
-                    v.as_tagged(heap),
-                    current.value.map_or(undefined, |w| w.as_tagged(heap)),
-                )
-            {
-                return false;
-            }
-        }
-    } else if !cur_is_data && desc.is_accessor_descriptor() {
-        let is_absent =
-            |h: Option<Handle<'_, Value>>| h.is_none_or(|h| h.as_tagged(heap).ptr_eq(undefined));
-        if is_absent(current.get)
-            && let Some(g) = desc.get
-            && !g.as_tagged(heap).ptr_eq(undefined)
-        {
-            return false;
-        }
-        if is_absent(current.set)
-            && let Some(s) = desc.set
-            && !s.as_tagged(heap).ptr_eq(undefined)
-        {
-            return false;
-        }
-    }
-    true
 }

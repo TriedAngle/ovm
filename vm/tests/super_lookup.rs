@@ -4,9 +4,8 @@
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
-    FixedArray, HandleSlice, Heap, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi,
-    StoreOutcome, StoreSemantics, Tagged, Thread, VM, Value, VmError, home_proto,
-    lookup_in_parents, super_lookup, super_store_lookup,
+    FixedArray, HandleSlice, Heap, LoadOutcome, Lookup, Object, PropertyDescriptor, SlotName, Smi,
+    StoreOutcome, StoreSemantics, Tagged, Thread, Transition, VM, Value, VmError,
 };
 
 fn smi(v: i64) -> Value {
@@ -122,7 +121,7 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     {
         let heap = &*thread.heap();
         assert!(matches!(
-            super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
+            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(7)
         ));
     };
@@ -132,7 +131,7 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     {
         let heap = &*thread.heap();
         assert!(matches!(
-            super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
+            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
             LoadOutcome::Value(v) if v.raw() == heap.known().undefined.as_tagged(heap).raw()
         ));
     };
@@ -147,11 +146,11 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     {
         let heap = &*thread.heap();
         assert!(matches!(
-            super_lookup(heap, unsafe { anchored(heap, home) }, a).unwrap(),
+            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, a).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(1)
         ));
         assert!(matches!(
-            super_lookup(heap, unsafe { anchored(heap, home) }, b).unwrap(),
+            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, b).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(3)
         ));
     };
@@ -171,24 +170,24 @@ fn lookup_in_parents_respects_priority_order() {
     {
         let heap = &*thread.heap();
         // "a" exists on both parents: the first in priority order wins
-        match lookup_in_parents(heap, unsafe { anchored(heap, protos) }, a) {
+        match Lookup::lookup_in_parents(heap, unsafe { anchored(heap, protos) }, a) {
             vm::Lookup::Data { slot, .. } => {
                 assert_eq!(slot.get(heap).raw(), smi(1));
             }
             _ => panic!("a must resolve through the first parent"),
         }
         // "b" only exists on the second parent
-        match lookup_in_parents(heap, unsafe { anchored(heap, protos) }, b) {
+        match Lookup::lookup_in_parents(heap, unsafe { anchored(heap, protos) }, b) {
             vm::Lookup::Data { slot, .. } => assert_eq!(slot.get(heap).raw(), smi(3)),
             _ => panic!("b must resolve through the second parent"),
         }
         assert!(matches!(
-            lookup_in_parents(heap, unsafe { anchored(heap, protos) }, missing),
+            Lookup::lookup_in_parents(heap, unsafe { anchored(heap, protos) }, missing),
             vm::Lookup::NotFound
         ));
         // null terminates the chain
         assert!(matches!(
-            lookup_in_parents(heap, unsafe { anchored(heap, null) }, a),
+            Lookup::lookup_in_parents(heap, unsafe { anchored(heap, null) }, a),
             vm::Lookup::NotFound
         ));
     };
@@ -206,10 +205,10 @@ fn super_store_shadow_creates_own_property_on_this() {
     thread.handle_scope(|thread, scope| {
         {
             let heap = &*thread.heap();
-            match super_store_lookup(
+            match Transition::super_store_lookup(
                 heap,
                 &scope,
-                home_proto(heap, unsafe { anchored(heap, home) }),
+                Lookup::home_proto(heap, unsafe { anchored(heap, home) }),
                 unsafe { anchored(heap, this_) },
                 x,
                 unsafe { anchored(heap, smi(42)) },
@@ -246,10 +245,10 @@ fn super_store_write_through_updates_the_holder() {
     thread.handle_scope(|thread, scope| {
         {
             let heap = &*thread.heap();
-            let outcome = super_store_lookup(
+            let outcome = Transition::super_store_lookup(
                 heap,
                 &scope,
-                home_proto(heap, unsafe { anchored(heap, home) }),
+                Lookup::home_proto(heap, unsafe { anchored(heap, home) }),
                 unsafe { anchored(heap, this_) },
                 x,
                 unsafe { anchored(heap, smi(42)) },
@@ -284,10 +283,10 @@ fn super_store_write_through_hits_second_parent_holder() {
     thread.handle_scope(|thread, scope| {
         {
             let heap = &*thread.heap();
-            let outcome = super_store_lookup(
+            let outcome = Transition::super_store_lookup(
                 heap,
                 &scope,
-                home_proto(heap, unsafe { anchored(heap, home) }),
+                Lookup::home_proto(heap, unsafe { anchored(heap, home) }),
                 unsafe { anchored(heap, this_) },
                 b,
                 unsafe { anchored(heap, smi(9)) },
@@ -343,10 +342,10 @@ fn super_store_readonly_and_nullish_receiver_throw() {
             let heap = &*thread.heap();
             for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
                 assert!(matches!(
-                    super_store_lookup(
+                    Transition::super_store_lookup(
                         heap,
                         &scope,
-                        home_proto(heap, unsafe { anchored(heap, home) }),
+                        Lookup::home_proto(heap, unsafe { anchored(heap, home) }),
                         unsafe { anchored(heap, this_) },
                         x,
                         unsafe { anchored(heap, smi(2)) },
@@ -358,10 +357,10 @@ fn super_store_readonly_and_nullish_receiver_throw() {
             // nullish receivers are invalid property store receivers
             for bad in [null, undefined] {
                 assert!(matches!(
-                    super_store_lookup(
+                    Transition::super_store_lookup(
                         heap,
                         &scope,
-                        home_proto(heap, unsafe { anchored(heap, home) }),
+                        Lookup::home_proto(heap, unsafe { anchored(heap, home) }),
                         unsafe { anchored(heap, bad) },
                         x,
                         unsafe { anchored(heap, smi(2)) },
@@ -388,10 +387,10 @@ fn super_store_on_null_proto_chain_defines_on_this() {
             // no parent chain at all: both semantics define on the receiver
             for semantics in [StoreSemantics::Shadow, StoreSemantics::WriteThrough] {
                 assert!(matches!(
-                    super_store_lookup(
+                    Transition::super_store_lookup(
                         heap,
                         &scope,
-                        home_proto(heap, unsafe { anchored(heap, home) }),
+                        Lookup::home_proto(heap, unsafe { anchored(heap, home) }),
                         unsafe { anchored(heap, this_) },
                         x,
                         unsafe { anchored(heap, smi(2)) },
