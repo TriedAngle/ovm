@@ -325,7 +325,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     }));
     map_map.as_tagged(heap).header.map.set(
         heap,
-        map_map.as_tagged(heap).raw(),
+        map_map.as_tagged(heap).erase(),
         map_map.as_tagged(heap),
     );
     known.map_map = map_map;
@@ -372,12 +372,12 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     null_map.as_tagged(heap).transitions.clear(heap);
     the_hole_map.as_tagged(heap).prototype.set(
         heap,
-        the_hole_map.as_tagged(heap).raw(),
+        the_hole_map.as_tagged(heap).erase(),
         null.as_tagged(heap).erase(),
     );
     null_map.as_tagged(heap).prototype.set(
         heap,
-        null_map.as_tagged(heap).raw(),
+        null_map.as_tagged(heap).erase(),
         null.as_tagged(heap).erase(),
     );
 
@@ -629,12 +629,12 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let o = null.as_tagged(heap);
     o.slots.set(
         heap,
-        null.as_tagged(heap).raw(),
+        null.as_tagged(heap).erase(),
         known.empty_fixed_array.as_tagged(heap),
     );
     o.elements.set(
         heap,
-        null.as_tagged(heap).raw(),
+        null.as_tagged(heap).erase(),
         known.empty_fixed_array.as_tagged(heap).erase(),
     );
     // ordinary function objects' [[Prototype]] is %Function.prototype%
@@ -642,7 +642,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     // in bootstrap_basics
     known.function_map.as_tagged(heap).prototype.set(
         heap,
-        known.function_map.as_tagged(heap).raw(),
+        known.function_map.as_tagged(heap).erase(),
         function_prototype.as_tagged(heap).erase(),
     );
     known
@@ -651,12 +651,12 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         .prototype
         .set(
             heap,
-            known.non_constructor_function_map.as_tagged(heap).raw(),
+            known.non_constructor_function_map.as_tagged(heap).erase(),
             function_prototype.as_tagged(heap).erase(),
         );
     known.class_constructor_map.as_tagged(heap).prototype.set(
         heap,
-        known.class_constructor_map.as_tagged(heap).raw(),
+        known.class_constructor_map.as_tagged(heap).erase(),
         function_prototype.as_tagged(heap).erase(),
     );
 }

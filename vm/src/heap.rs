@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
     HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MaybeWeak, Object, ObjectInit,
-    ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, TAG_MASK, Tagged, TransitionLock, Value,
-    Visitor, Word,
+    ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, TransitionLock, Value, Visitor,
+    Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -80,66 +80,6 @@ impl Drop for AllocToken<'_> {
     }
 }
 
-/// A strong cell holding a weak reference: does not keep the target
-/// alive and is cleared by the GC once the target dies.
-/// TODO: potentially remove this in favor of weak collections (vm intern table)
-/// and having "MaybeWeakGcCell" for VM objects that have weak semantics
-#[repr(transparent)]
-pub struct WeakGcCell<T: HeapObject> {
-    cell: RawCell,
-    _phantom: PhantomData<T>,
-}
-
-unsafe impl<T: HeapObject> Send for WeakGcCell<T> {}
-unsafe impl<T: HeapObject> Sync for WeakGcCell<T> {}
-
-impl<T: HeapObject> WeakGcCell<T> {
-    pub fn new(ptr: HeapPtr<T>) -> Self {
-        // Safety: constructing the storage word of a weak cell.
-        let tagged = unsafe { Tagged::<T>::from_value_unchecked(ptr.encode_strong()) };
-        Self {
-            cell: unsafe { RawCell::from_word(tagged.make_weak().raw().to_bits()) },
-            _phantom: PhantomData,
-        }
-    }
-
-    /// A "maybe-weak" cell holding a strong reference for now: the GC treats
-    /// it as reachable until we decide to weaken selected entries.
-    pub fn new_strong(ptr: HeapPtr<T>) -> Self {
-        Self {
-            cell: unsafe {
-                // Safety: constructing the storage word of a cell.
-                RawCell::from_word(
-                    Tagged::<T>::from_value_unchecked(ptr.encode_strong())
-                        .raw()
-                        .to_bits(),
-                )
-            },
-            _phantom: PhantomData,
-        }
-    }
-
-    pub fn as_raw(&self) -> &RawCell {
-        &self.cell
-    }
-
-    pub fn is_cleared(&self) -> bool {
-        Value::from_bits(self.cell.load()).is_cleared()
-    }
-
-    // TODO: this maybe doens't make much sense
-    // if a WeakGcCell is always weak, then upgrading it doesn't actually upgrade but only pretend
-    pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<Tagged<'a, T>> {
-        let word = self.cell.load();
-        if word == WEAK_PTR {
-            return None;
-        }
-        let strong = Value::from_bits(word & !TAG_MASK | STRONG_PTR);
-        // Safety: anchored read of a cell the GC keeps up to date.
-        Some(unsafe { Tagged::from_value_unchecked(strong) })
-    }
-}
-
 pub trait WordType: 'static {
     const IS_HEAP: bool;
 }
@@ -177,15 +117,15 @@ impl<T> GcSlot<T> {
         Value::from_bits(self.cell.load())
     }
 
-    pub fn set<'x>(&self, heap: &Heap, host: impl Into<Value>, value: impl Into<Tagged<'x, T>>)
+    pub fn set<'h, 'x>(&self, heap: &Heap, host: Tagged<'h, Value>, value: impl Into<Tagged<'x, T>>)
     where
         T: 'x,
     {
-        let host = host.into();
-        let v = value.into().raw();
+        let value = value.into();
+        let v = value.raw();
         debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
         if v.is_ptr() {
-            heap.write_barrier(host, self.as_raw(), v);
+            heap.write_barrier(host, self.as_raw(), value.erase());
         }
         self.cell.store_raw(v.to_bits());
     }
@@ -209,6 +149,21 @@ impl GcSlot<Smi> {
 pub struct MaybeWeakGcSlot<T = Value> {
     cell: RawCell,
     _phantom: PhantomData<MaybeWeak<T>>,
+}
+
+unsafe impl<T> Send for MaybeWeakGcSlot<T> {}
+unsafe impl<T> Sync for MaybeWeakGcSlot<T> {}
+
+impl<T: HeapObject> MaybeWeakGcSlot<T> {
+    /// A standalone cell holding a strong reference: the GC treats it as
+    /// reachable until the entry is weakened.
+    pub fn new_strong(ptr: HeapPtr<T>) -> Self {
+        Self {
+            // Safety: constructing the storage word of a fresh cell.
+            cell: unsafe { RawCell::from_word(ptr.encode_strong().to_bits()) },
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<T> MaybeWeakGcSlot<T> {
@@ -237,38 +192,58 @@ impl<T> MaybeWeakGcSlot<T> {
 }
 
 impl<T> MaybeWeakGcSlot<T> {
-    pub fn set_strong<'x>(
+    pub fn set_strong<'h, 'x>(
         &self,
         heap: &Heap,
-        host: impl Into<Value>,
+        host: Tagged<'h, Value>,
         value: impl Into<Tagged<'x, T>>,
     ) where
         T: 'x,
     {
-        let strong = value.into().raw();
+        let value = value.into();
+        let strong = value.raw();
         debug_assert!(
             !strong.is_weak_ptr(),
             "strong store of a weak/cleared word into a weak slot"
         );
         if strong.is_ptr() {
-            heap.write_barrier(host.into(), self.as_raw(), strong);
+            heap.write_barrier(host, self.as_raw(), value.erase());
         }
         self.cell.store_raw(strong.to_bits());
     }
 
-    pub fn set_weak<'x>(&self, heap: &Heap, host: impl Into<Value>, value: impl Into<Tagged<'x, T>>)
-    where
+    pub fn set_weak<'h, 'x>(
+        &self,
+        heap: &Heap,
+        host: Tagged<'h, Value>,
+        value: impl Into<Tagged<'x, T>>,
+    ) where
         T: 'x,
     {
-        let strong = value.into().raw();
+        let value = value.into();
+        let strong = value.raw();
         // the weak reference still participates in the generational
         // barrier: an old slot holding a young target must be remembered
         // so the minor collection can forward or clear it
         if strong.is_ptr() {
-            heap.write_barrier(host.into(), self.as_raw(), strong);
+            heap.write_barrier(host, self.as_raw(), value.erase());
         }
         let weak = Value::from_bits(strong.to_bits() | WEAK_PTR);
         self.cell.store_raw(weak.to_bits());
+    }
+
+    /// Store an already-encoded maybe-weak word verbatim, taking the barrier
+    /// when it points at a live heap object.
+    pub fn set<'h, 'x>(
+        &self,
+        heap: &Heap,
+        host: Tagged<'h, Value>,
+        value: Tagged<'x, MaybeWeak<T>>,
+    ) {
+        if let Some(live) = value.upgrade() {
+            heap.write_barrier(host, self.as_raw(), live.erase());
+        }
+        self.cell.store_raw(value.raw().to_bits());
     }
 
     pub fn upgrade<'a>(&self, _heap: &'a Heap) -> Option<Tagged<'a, T>> {
@@ -317,7 +292,7 @@ impl<T> OptionGcSlot<T> {
         self.slot.as_raw()
     }
 
-    pub fn set<'x>(&self, heap: &Heap, host: impl Into<Value>, value: impl Into<Tagged<'x, T>>)
+    pub fn set<'h, 'x>(&self, heap: &Heap, host: Tagged<'h, Value>, value: impl Into<Tagged<'x, T>>)
     where
         T: 'x,
     {
@@ -358,10 +333,10 @@ impl Register {
         Value::from_bits(self.0.load())
     }
 
-    pub fn store(&self, v: impl Into<Value>) {
-        let v = v.into();
-        debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
-        self.0.store_raw(v.to_bits());
+    pub fn store<'x, T: 'x>(&self, v: Tagged<'x, T>) {
+        let raw = v.raw();
+        debug_assert!(!raw.is_weak_ptr(), "weak value stored into a strong slot");
+        self.0.store_raw(raw.to_bits());
     }
 
     pub fn as_raw(&self) -> &RawCell {
@@ -401,9 +376,9 @@ impl Heap {
         self.transition_lock.clone()
     }
 
-    pub fn write_barrier(&self, host: Value, slot: &RawCell, value: Value) {
+    pub fn write_barrier(&self, host: Tagged<'_, Value>, slot: &RawCell, value: Tagged<'_, Value>) {
         self.local
-            .write_barrier(host.to_bits(), slot, value.to_bits())
+            .write_barrier(host.raw().to_bits(), slot, value.raw().to_bits())
     }
 
     pub fn collection_requested(&self) -> bool {

@@ -125,7 +125,7 @@ impl ContextState {
         &self.stack
     }
 
-    pub fn set_pending_exception(&self, value: impl Into<Value>) {
+    pub fn set_pending_exception<'x, T: 'x>(&self, value: Tagged<'x, T>) {
         self.pending_exception.store(value);
         self.has_pending_exception.set(true);
     }
@@ -438,10 +438,11 @@ impl VM {
         self.shared.visit_roots(visitor)
     }
 
-    /// Register a weak slot for `value` (must be a strong heap pointer);
-    /// returns its index. The GC clears the slot once the target dies.
-    pub fn track_weak(&self, value: Value) -> usize {
-        let weak = Value::from_bits(value.to_bits() | WEAK_BIT);
+    /// Register a weak slot for `value` (must be an anchored strong heap
+    /// pointer); returns its index. The GC clears the slot once the target
+    /// dies.
+    pub fn track_weak<'x, T: 'x>(&self, value: Tagged<'x, T>) -> usize {
+        let weak = value.erase().as_weak().raw();
         let mut slots = self.shared.weak_slots.lock().unwrap();
         slots.push(unsafe { RawCell::from_word(weak.to_bits()) });
         slots.len() - 1

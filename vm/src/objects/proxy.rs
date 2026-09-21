@@ -50,7 +50,7 @@ impl HeapObject for ProxyObject {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header.map.set(heap, host, config.map.as_tagged(heap));
         self.target
             .set(heap, host, config.target.as_tagged(heap).erase());
@@ -1222,7 +1222,7 @@ impl Proxy {
         if p.as_ref().is_revoked(heap) {
             return;
         }
-        let host = proxy.raw();
+        let host = proxy.erase();
         let null = heap.known().null.as_tagged(heap).erase();
         p.as_ref().target.set(heap, host, null);
         p.as_ref().handler.set(heap, host, null);

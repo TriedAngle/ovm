@@ -48,7 +48,7 @@ fn weak_to_dead_is_cleared_and_does_not_retain() {
         let target = t
             .heap()
             .allocate_handle::<FixedArray>(scope.stage(&smis), &scope);
-        let index = vm.track_weak(target.as_tagged(&*t.heap()).raw());
+        let index = vm.track_weak(target.as_tagged(&*t.heap()));
         assert!(!vm.weak_value(index).is_cleared());
         index
     });
@@ -73,7 +73,7 @@ fn weak_to_live_stays_uncleared() {
         let target = t
             .heap()
             .allocate_handle::<FixedArray>(scope.stage(&[vm::Smi::new(1).into_tagged()]), &scope);
-        let index = vm.track_weak(target.as_tagged(&*t.heap()).raw());
+        let index = vm.track_weak(target.as_tagged(&*t.heap()));
 
         t.heap().collect();
 

@@ -258,7 +258,7 @@ impl HeapObject for Object {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header.map.set(heap, host, config.map.as_tagged(heap));
         self.slots.set(heap, host, config.slots.as_tagged(heap));
         self.elements

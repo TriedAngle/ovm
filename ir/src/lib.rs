@@ -1,20 +1,7 @@
-//! Shared compiler → VM program IR.
-//!
-//! Frontends (`js_compiler`, `kette_compiler`, ...) lower their ASTs into a
-//! [`Program`]; the VM's materializer turns that into heap objects without
-//! knowing which language produced it. The IR is deliberately language
-//! neutral apart from the JS-centric [`CallableKind`] and well-known
-//! [`Constant`] singletons, which other prototype-based languages reuse.
-//!
-//! Storage is arena/pool based: functions live in an [`Arena`], and their
-//! bytecode, constants, handler table and name are runs inside shared
-//! [`Pool`]s addressed by [`Span`]. The program is append-only.
-
 mod arena;
 
 pub use arena::{Arena, Pool, Span};
 
-/// Typed index of a function in the program's function arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FunctionId(pub u32);
 
@@ -27,16 +14,12 @@ impl FunctionId {
     }
 }
 
-/// What kind of source unit a frontend is asked to compile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceMode {
-    /// A top-level program: declarations resolve normally.
     Script,
-    /// Direct eval: unresolved names become dynamic lookups through the
-    /// caller's context chain.
+    /// unresolved names become dynamic lookups through the caller's context chain.
     Eval,
-    /// A REPL entry: top-level declarations become global object properties
-    /// so they persist across entries.
+    /// top-level declarations become global object properties
     Repl,
 }
 

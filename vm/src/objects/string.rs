@@ -191,7 +191,7 @@ impl DenseString {
             Some(h) => h,
             None => {
                 let h = string_content_hash(self.data(heap));
-                self.hash.set(heap, self.erase(), Smi::new(h));
+                self.hash.set(heap, self.tagged(heap), Smi::new(h));
                 h
             }
         }
@@ -331,7 +331,7 @@ impl HeapObject for DenseString {
             config.0.is_compressed(),
             "heap strings are always in the compressed encoding"
         );
-        let host = self.erase();
+        let host = self.tagged(heap);
         let map = match config.0.encoding() {
             Encoding::Latin1 => heap.known().dense_latin1_string_map,
             Encoding::Utf16 => heap.known().dense_utf16_string_map,

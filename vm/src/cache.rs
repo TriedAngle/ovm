@@ -50,10 +50,7 @@ impl StackCache {
         let cache = self.get();
         cache.active = true;
         // the accumulator is undefined on frame entry
-        // Safety: fresh root-slot read stored immediately.
-        cache
-            .acc
-            .store(unsafe { heap.known().undefined.read_unchecked() });
+        cache.acc.store(heap.known().undefined.as_tagged(heap));
     }
 
     pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
@@ -63,21 +60,20 @@ impl StackCache {
             .callable_info(heap)
             .expect("frame callable must have callable info");
         let cache = self.get();
-        cache.code.store(info.bytecode.get(heap).raw());
-        cache.constants.store(info.constants.get(heap).raw());
-        cache.feedback.store(
-            info.feedback
-                .get(heap)
-                .map_or_else(|| heap.known().the_hole.as_tagged(heap).raw(), |v| v.raw()),
-        );
+        cache.code.store(info.bytecode.get(heap));
+        cache.constants.store(info.constants.get(heap));
+        cache.feedback.store(info.feedback.get(heap).map_or_else(
+            || heap.known().the_hole.as_tagged(heap).erase(),
+            |v| v.erase(),
+        ));
         cache.pc = frame.pc;
         cache.base = frame.base;
         cache.register_count = frame.register_count;
     }
 
-    pub fn deactivate(&self) {
+    pub fn deactivate(&self, heap: &Heap) {
         let cache = self.get();
-        let the_hole = cache.the_hole.inner();
+        let the_hole = cache.the_hole.read(heap);
         cache.acc.store(the_hole);
         cache.code.store(the_hole);
         cache.constants.store(the_hole);
@@ -136,8 +132,8 @@ impl StackCache {
         Acc(&self.get().acc)
     }
 
-    pub fn set_acc<'a, T: 'a>(&self, v: impl Into<Tagged<'a, T>>) {
-        self.get().acc.store(v.into().raw());
+    pub fn set_acc<'a, T: 'a>(&self, v: Tagged<'a, T>) {
+        self.get().acc.store(v);
     }
 }
 
@@ -157,20 +153,14 @@ impl core::ops::Deref for Acc<'_> {
     }
 }
 
-impl core::ops::DerefMut for Acc<'_> {
-    fn deref_mut(&mut self) -> &mut Value {
-        unsafe { &mut *self.word_ptr() }
-    }
-}
-
 impl Acc<'_> {
     pub fn read<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
         self.0.read(heap)
     }
 
-    /// Store into the accumulator register. Takes anything convertible to a
-    /// `Value`, so an anchored `Tagged` can be stored without erasing it.
-    pub fn store(&self, value: impl Into<Value>) {
+    /// Store into the accumulator register. Only an anchored `Tagged` may be
+    /// stored, so a stale raw `Value` cannot cross a GC safepoint.
+    pub fn store<'x, T: 'x>(&self, value: Tagged<'x, T>) {
         self.0.store(value);
     }
 }

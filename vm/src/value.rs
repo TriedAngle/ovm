@@ -455,12 +455,6 @@ impl<'a, T: HeapObject> From<Tagged<'a, T>> for HeapPtr<T> {
     }
 }
 
-impl<'a, T> From<Tagged<'a, T>> for Value {
-    fn from(tagged: Tagged<'a, T>) -> Self {
-        tagged.raw()
-    }
-}
-
 impl<'a, T: HeapObject> Tagged<'a, T> {
     pub fn make_weak(self) -> Tagged<'a, MaybeWeak<T>> {
         Tagged {

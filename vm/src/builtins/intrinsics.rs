@@ -1250,7 +1250,7 @@ fn private_set<'a>(
             .ok_or(VmError::Arity)?;
         match private_find(heap, obj, key) {
             Some(slot) => {
-                slot.set(heap, obj.raw(), value);
+                slot.set(heap, obj.erase(), value);
                 Ok(value)
             }
             None => Err(VmError::Type),
@@ -1308,7 +1308,10 @@ fn set_class_fields<'a>(
             .is_class_constructor()
             && slots.len() >= 3
         {
-            slots.as_ref().element_slot(2).set(heap, ctor.raw(), fields);
+            slots
+                .as_ref()
+                .element_slot(2)
+                .set(heap, ctor.erase(), fields);
             ok = true;
         }
     }
@@ -2439,7 +2442,7 @@ fn store_dynamic_name<'a>(
                 let mut context = context.get_as::<Context>().ok_or(VmError::Type)?;
                 let target = dynamic_slot(heap, &mut context, name)?;
                 // Safety: fresh anchored word, stored below.
-                let host = context.raw();
+                let host = context.erase();
                 // Safety: caller-supplied word, fresh at entry, stored now.
                 let v = unsafe { value.assume_valid(heap) };
                 target.set(heap, host, v);

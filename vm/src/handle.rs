@@ -11,7 +11,7 @@ use crate::{
 };
 
 /// A rooted reference to a `T` that survives relocation by the GC.
-/// Weak references cannot be rooted: they live in `WeakGcCell`s as
+/// Weak references cannot be rooted: they live in `MaybeWeakGcSlot`s as
 /// `Tagged<MaybeWeak<T>>` words.
 ///
 /// The handle itself is only a location; reading it back as a

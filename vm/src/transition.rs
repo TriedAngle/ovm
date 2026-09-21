@@ -91,7 +91,7 @@ impl<'a> Tagged<'a, Value> {
                 if !flags.is_writable() {
                     return Err(VmError::Type);
                 }
-                let host = holder.as_ref().erase();
+                let host = holder.erase();
                 if semantics == StoreSemantics::Shadow && host != self {
                     // inherited writable data property: JS creates an own
                     // property on the receiver
@@ -176,7 +176,7 @@ pub fn super_store_lookup<'a, 's>(
             }
             match semantics {
                 StoreSemantics::WriteThrough => {
-                    let host = holder.as_ref().erase();
+                    let host = holder.erase();
                     slot.set(heap, host, value);
                     Ok(StoreOutcome::Done)
                 }
@@ -228,7 +228,7 @@ fn super_store_on_receiver<'a, 's>(
             if !flags.is_writable() {
                 return Err(VmError::Type);
             }
-            slot.set(heap, recv.raw(), value);
+            slot.set(heap, recv, value);
             Ok(StoreOutcome::Done)
         }
         // own accessor: Receiver.[[DefineOwnProperty]]({value}) on an
@@ -355,7 +355,7 @@ impl Transition {
                 descriptors: &descriptors,
                 prototype,
             });
-            child.pred.set(heap, child.raw(), parent_ref);
+            child.pred.set(heap, child.erase(), parent_ref);
 
             let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
             if let Some(old) = parent_ref.transitions.get(heap) {
@@ -402,7 +402,7 @@ impl Transition {
                 values.push(value.as_tagged(heap));
                 debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
                 let slots = token.allocate::<FixedArray>(scope.stage(&values));
-                let host = receiver.as_tagged(heap).raw();
+                let host = receiver.as_tagged(heap).erase();
                 receiver_ref.slots.set(heap, host, slots);
                 receiver_ref.header.map.set(heap, host, target);
             },
@@ -425,7 +425,7 @@ impl Transition {
         receiver_ref
             .header
             .map
-            .set(heap, receiver.as_tagged(heap).raw(), target);
+            .set(heap, receiver.as_tagged(heap).erase(), target);
     }
 
     fn write_slot(
@@ -437,7 +437,7 @@ impl Transition {
         let offset = receiver.as_tagged(heap).map_ref(heap).descriptors()[index].offset();
         receiver.as_tagged(heap).slot(heap, offset).set(
             heap,
-            receiver.as_tagged(heap).raw(),
+            receiver.as_tagged(heap).erase(),
             value.as_tagged(heap),
         );
     }
@@ -537,7 +537,7 @@ impl Transition {
                 |token, heap| {
                     let obj = receiver.as_tagged(heap);
                     let slots = token.allocate::<FixedArray>(values);
-                    let host = receiver.as_tagged(heap).raw();
+                    let host = receiver.as_tagged(heap).erase();
                     obj.slots.set(heap, host, slots);
                     obj.header.map.set(heap, host, existing.as_tagged(heap));
                 },
@@ -563,7 +563,7 @@ impl Transition {
                 descriptors: &surviving,
                 prototype,
             });
-            child.pred.set(heap, child.raw(), parent);
+            child.pred.set(heap, child.erase(), parent);
             let name_word = name.as_tagged(heap);
             let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
             if let Some(old) = parent.transitions.get(heap) {
@@ -577,7 +577,7 @@ impl Transition {
             let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
             parent.transitions.set(heap, parent.erase(), pairs);
             let slots = token.allocate::<FixedArray>(values);
-            let host = receiver.as_tagged(heap).raw();
+            let host = receiver.as_tagged(heap).erase();
             obj.slots.set(heap, host, slots);
             obj.header.map.set(heap, host, child);
         });
@@ -994,7 +994,7 @@ impl Object {
                 descriptors: &descriptors,
                 prototype: proto,
             });
-            let host = receiver.as_tagged(heap).raw();
+            let host = receiver.as_tagged(heap).erase();
             obj.header.map.set(heap, host, new_map);
             Ok(())
         })

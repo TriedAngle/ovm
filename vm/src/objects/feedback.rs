@@ -5,7 +5,6 @@ use crate::{
     MaybeWeakGcSlot, ObjectKind, Smi, Tagged, Value, Visitor, WeakFixedArray,
 };
 
-
 /// `[feedback, feedback_extra]` and encodes its IC state in
 /// the base slot's contents:
 ///
@@ -21,8 +20,6 @@ pub struct FeedbackVector {
 }
 
 pub struct FeedbackVectorInit {
-    /// Initial word of every slot (the uninitialized hole sentinel).
-    pub fill: Value,
     pub length: usize,
 }
 
@@ -67,13 +64,14 @@ impl HeapObject for FeedbackVector {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().feedback_vector_map.as_tagged(heap));
         self.length.set(heap, host, Smi::new(config.length as i64));
+        let fill = heap.known().the_hole.as_tagged(heap).erase();
         for i in 0..config.length {
-            self.slot(i).as_raw().store_raw(config.fill.to_bits());
+            self.slot(i).set_strong(heap, host, fill);
         }
     }
 
@@ -113,24 +111,24 @@ impl FeedbackVector {
         map: Tagged<'_, Map>,
         handler: Tagged<'_, MaybeWeak<Value>>,
     ) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.slot(slot).set_weak(heap, host, map.erase());
         Self::store_word(self.slot(slot + 1), heap, host, handler);
     }
 
     /// Overwrite the handler half of a site's pair.
     pub fn set_handler(&self, heap: &Heap, slot: usize, handler: Tagged<'_, MaybeWeak<Value>>) {
-        Self::store_word(self.slot(slot + 1), heap, self.erase(), handler);
+        Self::store_word(self.slot(slot + 1), heap, self.tagged(heap), handler);
     }
 
     /// Point the state slot at a polymorphic pair array.
     pub fn set_poly(&self, heap: &Heap, slot: usize, pairs: Tagged<'_, WeakFixedArray>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.slot(slot).set_strong(heap, host, pairs.erase());
     }
 
     pub fn set_megamorphic(&self, heap: &Heap, slot: usize) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.slot(slot).set_strong(
             heap,
             host,
@@ -143,7 +141,7 @@ impl FeedbackVector {
     fn store_word(
         slot: &MaybeWeakGcSlot,
         heap: &Heap,
-        host: Value,
+        host: Tagged<'_, Value>,
         word: Tagged<'_, MaybeWeak<Value>>,
     ) {
         if let Some(strong) = word.strengthen() {
@@ -164,13 +162,5 @@ pub fn new_feedback_vector<'s>(
     if slot_count == 0 {
         return None;
     }
-    // Safety: root-slot read of a permanent well-known object.
-    let fill = unsafe { heap.known().the_hole.read_unchecked() };
-    Some(heap.allocate_handle::<FeedbackVector>(
-        FeedbackVectorInit {
-            fill,
-            length: slot_count,
-        },
-        scope,
-    ))
+    Some(heap.allocate_handle::<FeedbackVector>(FeedbackVectorInit { length: slot_count }, scope))
 }

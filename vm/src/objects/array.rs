@@ -50,7 +50,7 @@ impl<T: 'static> FixedArray<T> {
     where
         T: 'a,
     {
-        self.element_slot(i).set(heap, self.erase(), v);
+        self.element_slot(i).set(heap, self.tagged(heap), v);
     }
 }
 
@@ -63,15 +63,15 @@ impl<T: 'static> HeapObject for FixedArray<T> {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().array_map.as_tagged(heap));
         self.size.set(heap, host, Smi::new(config.len() as i64));
-        // Safety: copying words out of rooted memory during init; no GC
-        // can run before the new array is rooted by the caller.
-        for (i, v) in config.iter().map(|h| h.as_tagged(heap)).enumerate() {
-            self.element_slot(i).as_raw().store_raw(v.raw().to_bits());
+        for (i, v) in config.iter().enumerate() {
+            // Safety: the caller stages words of the array's element type.
+            let v: Tagged<'_, T> = unsafe { v.as_tagged(heap).cast::<T>() };
+            self.element_slot(i).set(heap, host, v);
         }
     }
 
@@ -143,14 +143,14 @@ impl<T: 'static> WeakFixedArray<T> {
     where
         T: 'a,
     {
-        self.element_slot(i).set_strong(heap, self.erase(), v);
+        self.element_slot(i).set_strong(heap, self.tagged(heap), v);
     }
 
     pub fn set_weak<'a>(&self, heap: &Heap, i: usize, v: impl Into<Tagged<'a, T>>)
     where
         T: 'a,
     {
-        self.element_slot(i).set_weak(heap, self.erase(), v);
+        self.element_slot(i).set_weak(heap, self.tagged(heap), v);
     }
 }
 
@@ -163,14 +163,14 @@ impl<T: 'static> HeapObject for WeakFixedArray<T> {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().array_map.as_tagged(heap));
         self.size
             .set(heap, host, Smi::new(config.values.len() as i64));
         for (i, v) in config.values.iter().enumerate() {
-            self.element_slot(i).as_raw().store_raw(v.raw().to_bits());
+            self.element_slot(i).set(heap, host, *v);
         }
     }
 

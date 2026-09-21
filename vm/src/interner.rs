@@ -5,7 +5,7 @@ use crate::{
     DenseString, EdgeVisitable, Handle, HandleSet, Heap, StringData, Visitor, string_content_hash,
 };
 
-use crate::heap::WeakGcCell;
+use crate::heap::MaybeWeakGcSlot;
 
 enum InternKey {
     Latin1(Box<[u8]>),
@@ -31,7 +31,7 @@ impl InternKey {
     }
 }
 
-type InternTable = HashMap<i64, Vec<(InternKey, WeakGcCell<DenseString>)>>;
+type InternTable = HashMap<i64, Vec<(InternKey, MaybeWeakGcSlot<DenseString>)>>;
 
 pub struct StringInterner {
     table: Mutex<InternTable>,
@@ -117,7 +117,7 @@ impl StringInterner {
                 table
                     .entry(hash)
                     .or_default()
-                    .push((key, WeakGcCell::new_strong(handle.get())));
+                    .push((key, MaybeWeakGcSlot::new_strong(handle.get())));
                 handle
             }
         }

@@ -64,7 +64,7 @@ pub fn execute<'a>(
             cache.load(stack, outer, heap);
         } else {
             stack.set_top(saved_top);
-            cache.deactivate();
+            cache.deactivate(heap);
         }
         Ok(rooted.as_tagged(heap))
     })
@@ -102,7 +102,7 @@ fn start<'b>(
         None => Err(VmError::Type),
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
-            let (saved_top, fargs) = state.stack.stage_args(args)?;
+            let (saved_top, fargs) = state.stack.stage_args(heap, args)?;
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
             let result = f(nctx, fargs);
             state.stack.set_top(saved_top);
@@ -134,6 +134,7 @@ fn start<'b>(
                     None => heap.known().undefined.as_tagged(heap).erase(),
                 };
                 stack.push_initial_frame(
+                    heap,
                     target.erase(),
                     register_count,
                     context,
@@ -188,6 +189,7 @@ fn call_value<'a>(
     let target = target.erase();
     let undefined = heap.known().undefined.as_tagged(heap).erase();
     let callee = stack.push_frame_with_args(
+        heap,
         meta,
         handler_pc,
         target,
@@ -370,7 +372,7 @@ fn step<'a>(
 ) -> Step<'a> {
     let stack = &state.stack;
     let cache = &state.cache;
-    let mut acc = cache.acc_mut();
+    let acc = cache.acc_mut();
 
     match op {
         Opcode::Return => {
@@ -388,7 +390,7 @@ fn step<'a>(
             Step::Next
         }
         Opcode::LoadSmi => {
-            *acc = Smi::new(ops.imm(0) as i64).encode();
+            acc.store(Smi::new(ops.imm(0) as i64).into_tagged());
             Step::Next
         }
         Opcode::LoadConstant => {
@@ -396,7 +398,7 @@ fn step<'a>(
             Step::Next
         }
         Opcode::LoadZero => {
-            *acc = Smi::new(0).encode();
+            acc.store(Smi::new(0).into_tagged());
             Step::Next
         }
         Opcode::LoadUndefined => {
@@ -979,9 +981,9 @@ fn step<'a>(
                     .get(heap)
                     .as_ref()
                     .element_slot(ops.idx(0))
-                    .inner()
+                    .get(heap)
             };
-            *acc = v;
+            acc.store(v);
             Step::Next
         }
         Opcode::StoreContextSlot => {
@@ -996,7 +998,7 @@ fn step<'a>(
                 };
             }
             // Safety: fresh anchored slot read.
-            let host = context.raw();
+            let host = context.erase();
             context
                 .slots
                 .get(heap)
@@ -1049,9 +1051,8 @@ fn step<'a>(
                     slots,
                     scope_info: heap.known().empty_scope_info,
                 })
-                .raw()
             });
-            *acc = ctx;
+            acc.store(ctx);
             Step::Next
         }
         Opcode::PushContext => {
@@ -1140,6 +1141,7 @@ fn step<'a>(
                         let callee = callee.erase();
                         let undefined = heap.known().undefined.as_tagged(heap).erase();
                         step_try!(stack.push_frame(
+                            heap,
                             meta,
                             pc,
                             callee,
@@ -1244,39 +1246,39 @@ fn step<'a>(
             if result.as_tagged(heap) == heap.known().exception.as_tagged(heap) {
                 return Step::PendingThrow;
             }
-            *acc = if Convert::is_primitive(heap, result.as_tagged(heap)) {
+            acc.store(if Convert::is_primitive(heap, result.as_tagged(heap)) {
                 if derived {
                     // a derived constructor returned a primitive (ES 9.2.2.1)
                     return Step::Error(VmError::Type);
                 }
-                receiver.as_tagged(heap).raw()
+                receiver.as_tagged(heap).erase()
             } else {
-                result.as_tagged(heap).raw()
-            };
+                result.as_tagged(heap).erase()
+            });
             Step::Next
         }),
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
                 let map = heap.known().object_initial_map;
-                heap.new_object(&scope, map, HandleSlice::EMPTY).raw()
+                heap.new_object(&scope, map, HandleSlice::EMPTY)
             });
-            *acc = obj;
+            acc.store(obj);
             Step::Next
         }
         Opcode::CreateEmptyArrayLiteral => {
             let obj = state.handle_scope(|scope| {
                 let map = heap.known().js_array_map;
-                heap.new_object(&scope, map, HandleSlice::EMPTY).raw()
+                heap.new_object(&scope, map, HandleSlice::EMPTY)
             });
-            *acc = obj;
+            acc.store(obj);
             Step::Next
         }
         Opcode::CreateBareObjectLiteral => {
             let obj = state.handle_scope(|scope| {
                 let map = heap.known().plain_object_map;
-                heap.new_object(&scope, map, HandleSlice::EMPTY).raw()
+                heap.new_object(&scope, map, HandleSlice::EMPTY)
             });
-            *acc = obj;
+            acc.store(obj);
             Step::Next
         }
         Opcode::CreateClosure => state.handle_scope(|scope| -> Step<'_> {
@@ -1303,7 +1305,7 @@ fn step<'a>(
                 && let Some(r) = a.checked_add(b)
                 && Smi::in_range(r)
             {
-                *acc = Smi::new(r).encode();
+                acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
             state.handle_scope(|scope| {
@@ -1324,14 +1326,10 @@ fn step<'a>(
                     rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
                 );
                 if is_string.0 || is_string.1 {
-                    let s = step_try!((|| -> Result<Value, VmError> {
-                        let a = scope.handle(Convert::to_string(heap, &scope, lhs)?);
-                        let b = scope.handle(Convert::to_string(heap, &scope, rhs)?);
-                        Ok(DenseString::concat(heap, &scope, a, b)
-                            .as_tagged(heap)
-                            .raw())
-                    })());
-                    *acc = s;
+                    let a = scope.handle(step_try!(Convert::to_string(heap, &scope, lhs)));
+                    let b = scope.handle(step_try!(Convert::to_string(heap, &scope, rhs)));
+                    let s = DenseString::concat(heap, &scope, a, b).as_tagged(heap);
+                    acc.store(s);
                 } else {
                     let a = step_try!(Convert::to_number(heap, lhs.as_tagged(heap)));
                     let b = step_try!(Convert::to_number(heap, rhs.as_tagged(heap)));
@@ -1353,7 +1351,7 @@ fn step<'a>(
                 && let Some(r) = a.checked_sub(b)
                 && Smi::in_range(r)
             {
-                *acc = Smi::new(r).encode();
+                acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
             let a = scope.handle(acc.read(heap));
@@ -1371,7 +1369,7 @@ fn step<'a>(
                 && let Some(r) = a.checked_mul(b)
                 && Smi::in_range(r)
             {
-                *acc = Smi::new(r).encode();
+                acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
             let a = scope.handle(acc.read(heap));
@@ -1392,7 +1390,7 @@ fn step<'a>(
                 && a % b == 0
                 && let Some(r) = a.checked_div(b)
             {
-                *acc = Smi::new(r).encode();
+                acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
             let a = scope.handle(acc.read(heap));
@@ -1410,7 +1408,7 @@ fn step<'a>(
             if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
                 && b != 0
             {
-                *acc = Smi::new(a % b).encode();
+                acc.store(Smi::new(a % b).into_tagged());
                 return Step::Next;
             }
             let a = scope.handle(acc.read(heap));
@@ -1443,7 +1441,7 @@ fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            *acc = Smi::new((a | b) as i64).encode();
+            acc.store(Smi::new((a | b) as i64).into_tagged());
             Step::Next
         }
         Opcode::BitwiseXor => {
@@ -1454,7 +1452,7 @@ fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            *acc = Smi::new((a ^ b) as i64).encode();
+            acc.store(Smi::new((a ^ b) as i64).into_tagged());
             Step::Next
         }
         Opcode::BitwiseAnd => {
@@ -1465,7 +1463,7 @@ fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            *acc = Smi::new((a & b) as i64).encode();
+            acc.store(Smi::new((a & b) as i64).into_tagged());
             Step::Next
         }
         Opcode::ShiftLeft => {
@@ -1477,7 +1475,7 @@ fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as u32;
-            *acc = Smi::new(a.wrapping_shl(b & 31) as i64).encode();
+            acc.store(Smi::new(a.wrapping_shl(b & 31) as i64).into_tagged());
             Step::Next
         }
         Opcode::ShiftRight => {
@@ -1489,7 +1487,7 @@ fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as u32;
-            *acc = Smi::new(a.wrapping_shr(b & 31) as i64).encode();
+            acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
             Step::Next
         }
         Opcode::ShiftRightLogical => {
@@ -1501,7 +1499,7 @@ fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as u32;
-            *acc = Smi::new(a.wrapping_shr(b & 31) as i64).encode();
+            acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
             Step::Next
         }
         Opcode::Jump => {
@@ -1555,7 +1553,7 @@ fn step<'a>(
                     // `-Smi::MIN` overflows i64
                     acc.store(heap.new_number(-(v as f64)));
                 } else {
-                    acc.store(Smi::new(-v).encode());
+                    acc.store(Smi::new(-v).into_tagged());
                 }
             } else {
                 let n = state.handle_scope(|scope| {

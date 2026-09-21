@@ -31,7 +31,7 @@ impl HeapObject for Symbol {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().symbol_map.as_tagged(heap));

@@ -26,7 +26,7 @@ impl HeapObject for ScopeInfo {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().scope_info_map.as_tagged(heap));
@@ -72,7 +72,7 @@ impl HeapObject for Context {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().context_map.as_tagged(heap));
@@ -191,7 +191,7 @@ impl HeapObject for HandlerTable {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().handler_table_map.as_tagged(heap));

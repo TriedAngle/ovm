@@ -58,6 +58,16 @@ pub trait HeapObject: 'static {
         Value::from_bits(addr | STRONG_PTR)
     }
 
+    fn tagged<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value>
+    where
+        Self: Sized,
+    {
+        Tagged::from_ptr(heap, unsafe {
+            HeapPtr::new(self as *const Self as *mut Self)
+        })
+        .erase()
+    }
+
     fn erase_weak(&self) -> Value
     where
         Self: Sized,
