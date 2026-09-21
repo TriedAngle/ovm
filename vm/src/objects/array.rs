@@ -152,6 +152,12 @@ impl<T: 'static> WeakFixedArray<T> {
     {
         self.element_slot(i).set_weak(heap, self.tagged(heap), v);
     }
+
+    /// Store an already-encoded maybe-weak word verbatim (strong, weak, Smi
+    /// or cleared), taking the write barrier for live references.
+    pub fn set<'a>(&self, heap: &Heap, i: usize, v: Tagged<'a, MaybeWeak<T>>) {
+        self.element_slot(i).set(heap, self.tagged(heap), v);
+    }
 }
 
 impl<T: 'static> HeapObject for WeakFixedArray<T> {

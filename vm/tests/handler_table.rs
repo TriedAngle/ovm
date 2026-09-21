@@ -166,7 +166,7 @@ fn callable_info_carries_handler_table() {
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
 
         let result = {
             let heap = &*thread.heap();

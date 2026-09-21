@@ -281,7 +281,7 @@ pub fn plain_object<'a>(
         let map = heap.known().object_initial_map;
         let obj = heap
             .new_object(&scope, map, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         for (name, value) in fields {
             let name = vm.interner().intern_str(heap, &scope, name);
             let name = scope.handle(name.as_tagged(heap));
@@ -413,9 +413,9 @@ pub fn object_define_property<'a>(
             heap,
             state,
             &scope,
-            unsafe { Tagged::<Value>::from_value_unchecked(target.read_unchecked()) },
+            unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) },
             // Safety: fresh rooted name word, consumed by the trap call.
-            unsafe { Tagged::<Value>::from_value_unchecked(key.read_unchecked()) },
+            unsafe { Tagged::<Value>::from_value_unchecked(key.raw()) },
             partial,
         )? {
             Flow::Threw => Ok(heap.known().exception.as_tagged(heap).erase()),
@@ -503,7 +503,7 @@ pub fn object_prevent_extensions<'a>(
             heap,
             state,
             // Safety: fresh rooted-slot word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(target.read_unchecked()) },
+            unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) },
         )? {
             Coercion::Threw => None,
             Coercion::Value(v) => Some(v.raw()),
@@ -657,7 +657,7 @@ pub fn object_seal<'a>(
             heap,
             state,
             // Safety: fresh rooted-slot word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(target_handle.read_unchecked()) },
+            unsafe { Tagged::<Value>::from_value_unchecked(target_handle.raw()) },
         )? {
             Coercion::Threw => None,
             Coercion::Value(v) => Some(v.raw()),
@@ -717,7 +717,7 @@ pub fn object_freeze<'a>(
             heap,
             state,
             // Safety: fresh rooted-slot word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(target_handle.read_unchecked()) },
+            unsafe { Tagged::<Value>::from_value_unchecked(target_handle.raw()) },
         )? {
             Coercion::Threw => None,
             Coercion::Value(v) => Some(v.raw()),

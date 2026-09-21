@@ -4,7 +4,7 @@
 use crate::Lookup;
 use crate::Object;
 use crate::RuntimeContext;
-use crate::materialize::materialize_closure_vm;
+use crate::materialize::Materialize;
 use crate::runtime::Coercion;
 use crate::{Context, Convert, DenseString, Errors, HandleSlice, Smi, Tagged, Value, VmError};
 
@@ -289,7 +289,7 @@ pub fn function_constructor<'a>(
         let context = scope
             .cast::<Context>(context.as_tagged(heap))
             .ok_or(VmError::Type)?;
-        let closure = materialize_closure_vm(vm, heap, state, &scope, &program, context)?;
+        let closure = Materialize::closure_vm(vm, heap, state, &scope, &program, context)?;
         RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
     })
 }

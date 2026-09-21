@@ -497,7 +497,7 @@ pub fn super_constructor<'a>(
     stack: &Stack,
     meta: &FrameMeta,
 ) -> Option<Tagged<'a, Value>> {
-    let callable = stack.callable_slot(meta).read(heap);
+    let callable = stack.callable_slot(meta).get(heap);
     let obj = callable.as_heap_object()?;
     let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
     // must be a real constructor

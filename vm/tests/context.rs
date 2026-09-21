@@ -136,7 +136,7 @@ fn closure_object_carries_typed_context() {
                     length: 0,
                 },
             )
-            .into_handle(&scope);
+            .as_handle(&scope);
 
         let slot0 = {
             let heap = &*thread.heap();

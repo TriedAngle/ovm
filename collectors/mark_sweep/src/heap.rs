@@ -218,82 +218,93 @@ impl MarkSweepState {
         let host = self.host();
         self.safepoint
             .stop_the_world(requester.map(|local| &local.node), || {
-                self.finish_sweeping(&host);
-                let young = self.alloc.lock().unwrap().young_indices();
-                if young.is_empty() {
-                    self.alloc.lock().unwrap().set_sweep_block(false);
-                    return;
-                }
-                let starved = {
-                    let heap = self.alloc.lock().unwrap();
-                    heap.available_chunks() < 2 * young.len()
-                };
-                if starved {
-                    let completed = self.full_collect_stw(&host);
-                    if let Some(live) = completed {
-                        self.update_threshold(live);
-                    }
-                    self.cycles.fetch_add(1, Ordering::Relaxed);
-                    return;
-                }
-
-                let mut job = MinorJob {
-                    state: self,
-                    host,
-                    promote: Vec::new(),
-                    worklist: Vec::new(),
-                    deferred_weak: Vec::new(),
-                    survivors: 0,
-                };
-                {
-                    let mut scanner = MinorScanner { job: &mut job };
-                    (host.visit_roots)(host.ctx, &mut scanner);
-                }
-                // bind first: the temporary guard must not outlive the
-                // statement, the scanner below re-enters the alloc lock
-                let remembered = self.alloc.lock().unwrap().remembered_slots();
-                for slot_addr in remembered {
-                    let cell = unsafe { &*(slot_addr as *const RawCell) };
-                    let mut scanner = MinorScanner { job: &mut job };
-                    scanner.visit(cell);
-                }
-                job.drain();
-
-                // weak references to young objects settle only after the
-                // strong closure: forwarded targets move the cell, dead
-                // targets clear it
-                for cell in job.deferred_weak {
-                    let cell = unsafe { &*cell };
-                    let word = cell.load();
-                    if word & TAG_MASK == WEAK_PTR && word != CLEARED {
-                        let addr = (word & !TAG_MASK) as usize;
-                        let young = self.is_young_addr(addr);
-                        if young {
-                            let header = unsafe { *(addr as *const Word) };
-                            if header & TAG_MASK == FORWARD_TAG {
-                                cell.store_raw((header & !TAG_MASK) as Word | WEAK_PTR);
-                            } else {
-                                cell.store_raw(CLEARED);
-                            }
-                        }
-                    }
-                }
-
-                let survivors;
-                {
-                    let mut heap = self.alloc.lock().unwrap();
-                    for (chunk, cursor) in &job.promote {
-                        heap.finish_promotion(chunk, *cursor);
-                    }
-                    heap.remove_chunks(&young);
-                    heap.clear_remembered_sets();
-                    survivors = job.survivors;
-                    let chunk_size = heap.chunk_size();
-                    heap.set_sweep_block(false);
-                    self.update_young_limit(survivors, chunk_size);
-                }
-                self.minor_cycles.fetch_add(1, Ordering::Relaxed);
+                self.collect_minor_stw(&host, true);
             });
+    }
+
+    /// Evacuate the nursery. Must be called while the world is stopped.
+    ///
+    /// When there are too few free chunks to promote into, `fallback_to_full`
+    /// selects between bailing out to a full collection (a plain minor) and
+    /// simply leaving the nursery for the caller's own full collection.
+    fn collect_minor_stw(&self, host: &GcHost, fallback_to_full: bool) {
+        self.finish_sweeping(host);
+        let young = self.alloc.lock().unwrap().young_indices();
+        if young.is_empty() {
+            self.alloc.lock().unwrap().set_sweep_block(false);
+            return;
+        }
+        let starved = {
+            let heap = self.alloc.lock().unwrap();
+            heap.available_chunks() < 2 * young.len()
+        };
+        if starved {
+            if fallback_to_full {
+                let completed = self.full_collect_stw(host);
+                if let Some(live) = completed {
+                    self.update_threshold(live);
+                }
+                self.cycles.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
+
+        let mut job = MinorJob {
+            state: self,
+            host: *host,
+            promote: Vec::new(),
+            worklist: Vec::new(),
+            deferred_weak: Vec::new(),
+            survivors: 0,
+        };
+        {
+            let mut scanner = MinorScanner { job: &mut job };
+            (host.visit_roots)(host.ctx, &mut scanner);
+        }
+        // bind first: the temporary guard must not outlive the
+        // statement, the scanner below re-enters the alloc lock
+        let remembered = self.alloc.lock().unwrap().remembered_slots();
+        for slot_addr in remembered {
+            let cell = unsafe { &*(slot_addr as *const RawCell) };
+            let mut scanner = MinorScanner { job: &mut job };
+            scanner.visit(cell);
+        }
+        job.drain();
+
+        // weak references to young objects settle only after the
+        // strong closure: forwarded targets move the cell, dead
+        // targets clear it
+        for cell in job.deferred_weak {
+            let cell = unsafe { &*cell };
+            let word = cell.load();
+            if word & TAG_MASK == WEAK_PTR && word != CLEARED {
+                let addr = (word & !TAG_MASK) as usize;
+                let young = self.is_young_addr(addr);
+                if young {
+                    let header = unsafe { *(addr as *const Word) };
+                    if header & TAG_MASK == FORWARD_TAG {
+                        cell.store_raw((header & !TAG_MASK) as Word | WEAK_PTR);
+                    } else {
+                        cell.store_raw(CLEARED);
+                    }
+                }
+            }
+        }
+
+        let survivors;
+        {
+            let mut heap = self.alloc.lock().unwrap();
+            for (chunk, cursor) in &job.promote {
+                heap.finish_promotion(chunk, *cursor);
+            }
+            heap.remove_chunks(&young);
+            heap.clear_remembered_sets();
+            survivors = job.survivors;
+            let chunk_size = heap.chunk_size();
+            heap.set_sweep_block(false);
+            self.update_young_limit(survivors, chunk_size);
+        }
+        self.minor_cycles.fetch_add(1, Ordering::Relaxed);
     }
 
     fn finish_sweeping(&self, host: &GcHost) {
@@ -317,6 +328,11 @@ impl MarkSweepState {
         let host = self.host();
         self.safepoint
             .stop_the_world(requester.map(|local| &local.node), || {
+                // Evacuate the nursery first, under the same stop-the-world:
+                // this empties the young generation and clears the remembered
+                // set, so the major below cannot trip over stale old->young
+                // remembered bits left behind by an earlier sweep.
+                self.collect_minor_stw(&host, false);
                 self.finish_sweeping(&host);
                 let completed = {
                     let mut heap = self.alloc.lock().unwrap();

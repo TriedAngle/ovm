@@ -58,7 +58,10 @@ impl<'s, T> Handle<'s, T> {
         unsafe { Tagged::from_value_unchecked(*self.location.as_ptr()) }
     }
 
-    pub unsafe fn read_unchecked(self) -> Value {
+    /// The current word without an anchor. It may be moved by a later
+    /// collection; only safe to use as an opaque `Value` or re-anchored
+    /// (`Value::assume_valid`).
+    pub fn raw(self) -> Value {
         unsafe { *self.location.as_ptr() }
     }
 
@@ -73,7 +76,7 @@ impl<'s, T> Handle<'s, T> {
 impl<'s, T: HeapObject> Handle<'s, T> {
     pub fn get(self) -> HeapPtr<T> {
         // Safety: handle slots only ever hold strong values.
-        unsafe { Tagged::<T>::from_value_unchecked(self.read_unchecked()) }
+        unsafe { Tagged::<T>::from_value_unchecked(self.raw()) }
             .as_ptr()
             .expect("strong local slot must contain strong pointer")
     }
@@ -108,7 +111,7 @@ impl HandleDataImpl {
     }
 
     fn extend_sized(&mut self, size: usize) {
-        let block = vec![self.fill.inner(); size].into_boxed_slice();
+        let block = vec![self.fill.raw(); size].into_boxed_slice();
         self.next = block.as_ptr() as *mut Value;
         self.limit = unsafe { self.next.add(block.len()) };
         self.blocks.push(block);
@@ -225,7 +228,7 @@ impl<'d> HandleScope<'d> {
     pub fn cast<T: HeapObject>(&self, value: Tagged<'_, Value>) -> Option<Handle<'_, T>> {
         let ptr = HeapPtr::decode_strong(value.raw())?;
         // Safety: raw header read for a kind check.
-        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.inner();
+        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.raw();
         let kind = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() }
             .kind()
             .kind();
@@ -287,7 +290,7 @@ impl<'i, 'o> EscapableHandleScope<'i, 'o> {
         debug_assert!(!self.escaped.get(), "only one handle can escape a scope");
         self.escaped.set(true);
         // Safety: moving one rooted word into another rooted slot.
-        unsafe { *self.escape_slot = handle.read_unchecked() };
+        unsafe { *self.escape_slot = handle.raw() };
         unsafe { Handle::from_location(NonNull::new_unchecked(self.escape_slot)) }
     }
 }

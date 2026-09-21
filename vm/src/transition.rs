@@ -270,7 +270,7 @@ impl Transition {
             let pair_values = pair.map(|(get, set)| (get.as_tagged(heap), set.as_tagged(heap)));
             parent(heap)
                 .find_transition_locked(heap, name.as_tagged(heap), flags, pair_values, &guard)
-                .map(|m| m.into_handle(scope))
+                .map(|m| m.as_handle(scope))
         } {
             return target;
         }
@@ -369,7 +369,7 @@ impl Transition {
             let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
             parent_ref.transitions.set(heap, parent_ref.erase(), pairs);
 
-            child.into_handle(scope)
+            child.as_handle(scope)
         })
     }
 
@@ -483,7 +483,7 @@ impl Transition {
                 .unwrap_or(parent.value_slot_count());
             let existing = parent
                 .find_remove_transition_locked(heap, name_word, &guard)
-                .map(|m| m.into_handle(scope));
+                .map(|m| m.as_handle(scope));
             // names are rooted here and re-anchored in the allocating
             // closure: a Tagged cannot escape this non-allocating region
             let mut surviving: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =

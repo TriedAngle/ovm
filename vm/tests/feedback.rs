@@ -71,7 +71,7 @@ fn materialized_vector_is_hole_filled() {
     let mut thread = vm.attach();
     thread.handle_scope(|thread, scope| {
         let closure =
-            vm::materialize::materialize_script(thread, &scope, &program).expect("materialize");
+            vm::materialize::Materialize::script(thread, &scope, &program).expect("materialize");
         // script closure: slots[0] = CallableInfoObject
         let heap = thread.heap();
         let info = closure

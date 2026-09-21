@@ -464,11 +464,11 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let mut known = *heap.known();
     let the_hole = known.the_hole;
     debug_assert!(
-        !unsafe { the_hole.read_unchecked() }.is_smi(),
+        !the_hole.raw().is_smi(),
         "bootstrap_basics must run before bootstrap_well_known"
     );
 
-    let data = HandleData::new(unsafe { the_hole.read_unchecked() });
+    let data = HandleData::new(the_hole.raw());
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
     let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
@@ -564,7 +564,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         object_prototype,
         2, // [callable info, context], like function_map
     );
-    let empty_code = heap.allocate::<FixedByteArray>(&[1]).into_handle(&scope);
+    let empty_code = heap.allocate::<FixedByteArray>(&[1]).as_handle(&scope);
     let empty_info = heap
         .allocate::<CallableInfoObject>(CallableInfoInit {
             bytecode: empty_code,
@@ -572,7 +572,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
             register_count: 0,
             handlers: None,
         })
-        .into_handle(&scope);
+        .as_handle(&scope);
     let function_prototype = roots.create_handle(heap.new_object(
         &scope,
         function_prototype_map,

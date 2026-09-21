@@ -83,7 +83,7 @@ impl Stack {
     /// The frame's callable, re-read under a heap borrow.
     pub fn callable<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Object> {
         // Safety: frame callable slots hold strong object pointers.
-        unsafe { self.callable_slot(meta).read(heap).cast::<Object>() }
+        unsafe { self.callable_slot(meta).get(heap).cast::<Object>() }
     }
 
     pub fn callable_slot(&self, meta: &FrameMeta) -> &Register {
@@ -92,7 +92,7 @@ impl Stack {
 
     /// The frame's current context, re-read under a heap borrow.
     pub fn context<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Value> {
-        self.context_slot(meta).read(heap)
+        self.context_slot(meta).get(heap)
     }
 
     pub fn context_slot(&self, meta: &FrameMeta) -> &Register {
@@ -101,7 +101,7 @@ impl Stack {
 
     /// The frame's `new.target`, re-read under a heap borrow.
     pub fn new_target<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Value> {
-        self.new_target_slot(meta).read(heap)
+        self.new_target_slot(meta).get(heap)
     }
 
     pub fn new_target_slot(&self, meta: &FrameMeta) -> &Register {
@@ -126,7 +126,7 @@ impl Stack {
     /// Read a register under a heap borrow: rooted memory is updated in
     /// place by the GC, so the word is current and valid for `'a`.
     pub fn reg<'a>(&self, _heap: &'a Heap, meta: &FrameMeta, i: i32) -> Tagged<'a, Value> {
-        self.slot_unchecked(Self::reg_index(meta, i)).read(_heap)
+        self.slot_unchecked(Self::reg_index(meta, i)).get(_heap)
     }
 
     pub fn set_reg<'x, T: 'x>(&self, meta: &FrameMeta, i: i32, v: Tagged<'x, T>) {
@@ -159,7 +159,7 @@ impl Stack {
                 args.len(),
             );
             // missing arguments are undefined (registers are the hole)
-            let undefined = self.undefined.read(heap);
+            let undefined = self.undefined.get(heap);
             for i in args.len()..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -188,7 +188,7 @@ impl Stack {
         debug_assert!(
             self.slots[src..src + count]
                 .iter()
-                .all(|r| !r.inner().is_weak_ptr())
+                .all(|r| !r.raw().is_weak_ptr())
         );
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -196,7 +196,7 @@ impl Stack {
                 self.slots.as_ptr().add(dst) as *mut Value,
                 count,
             );
-            let undefined = self.undefined.read(heap);
+            let undefined = self.undefined.get(heap);
             for i in count..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -232,7 +232,7 @@ impl Stack {
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             );
-            let undefined = self.undefined.read(heap);
+            let undefined = self.undefined.get(heap);
             for i in args.len()..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -265,7 +265,7 @@ impl Stack {
         // the staged region reserves frame-header slots it never writes:
         // they sit below `top`, so the GC would scan whatever stale words
         // previous frames left there — fill them like fresh registers
-        let fill = self.fill.read(heap);
+        let fill = self.fill.get(heap);
         for i in 0..HEADER_SLOTS {
             self.slot_unchecked(base + i).store(fill);
         }
@@ -304,7 +304,7 @@ impl Stack {
         if base + size > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
-        let fill = self.fill.read(heap);
+        let fill = self.fill.get(heap);
         for i in 0..register_count {
             self.slot_unchecked(base + i).store(fill);
         }

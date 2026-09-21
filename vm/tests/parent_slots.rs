@@ -20,7 +20,7 @@ fn fresh_object<'s>(thread: &mut Thread, scope: &'s HandleScope<'_>) -> Handle<'
     thread
         .heap()
         .new_object(scope, map, HandleSlice::EMPTY)
-        .into_handle(scope)
+        .as_handle(scope)
 }
 
 fn intern_name<'s>(

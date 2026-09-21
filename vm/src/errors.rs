@@ -34,7 +34,7 @@ impl Errors {
             };
             let obj = heap
                 .new_object(&scope, map, HandleSlice::EMPTY)
-                .into_handle(&scope);
+                .as_handle(&scope);
             let name = heap.known().strings.name;
             let message = heap.known().strings.message;
             // root fresh copies before the (allocating) defines below

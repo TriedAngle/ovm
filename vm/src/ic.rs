@@ -73,20 +73,17 @@ fn probe<'a>(
     map: Tagged<'a, Map>,
 ) -> Option<Tagged<'a, MaybeWeak<Value>>> {
     let state = vector.as_ref().slot(slot).get(heap);
-    if !state.raw().is_ptr() {
-        return None;
-    }
     if state.raw().is_weak_ptr() {
-        if !state.upgrade()?.ptr_eq(map) {
+        if !state.ptr_eq(map) {
             return None;
         }
         return Some(vector.as_ref().slot(slot + 1).get(heap));
     }
-    let pairs = state.strengthen()?.get_as::<WeakFixedArray>()?;
+    let pairs = state.as_strong()?.get_as::<WeakFixedArray>()?;
     let len = pairs.as_ref().len();
     let mut i = 0;
     while i + 1 < len {
-        if let Some(m) = pairs.get(heap, i).upgrade()
+        if let Some(m) = pairs.get(heap, i).as_strong()
             && m.ptr_eq(map)
         {
             return Some(pairs.as_ref().get(heap, i + 1));
@@ -124,11 +121,7 @@ fn set_word_at(
     i: usize,
     word: Tagged<'_, MaybeWeak<Value>>,
 ) {
-    if let Some(strong) = word.strengthen() {
-        arr.as_ref().set_strong(heap, i, strong);
-    } else if let Some(live) = word.upgrade() {
-        arr.as_ref().set_weak(heap, i, live);
-    }
+    arr.as_ref().set(heap, i, word);
 }
 
 struct ChainEntry<'s> {
@@ -248,7 +241,7 @@ fn verify_chain<'a>(
         let base = 2 + e * 3;
         let hop = Smi::decode(chain_ref.get(heap, base).raw())?.value();
         let owner_idx = Smi::decode(chain_ref.get(heap, base + 1).raw())?.value();
-        let expected = chain_ref.get(heap, base + 2).upgrade()?;
+        let expected = chain_ref.get(heap, base + 2).as_strong()?;
         let owner: Tagged<'a, Object> = if owner_idx < 0 {
             receiver
         } else {
@@ -427,14 +420,17 @@ fn apply_load_handler<'a>(
             _ => None,
         };
     }
-    let chain = handler.strengthen()?.get_as::<WeakFixedArray>()?;
+    let chain = handler.as_strong()?.get_as::<WeakFixedArray>()?;
     let chain_ref = chain.as_ref();
     let head = decode_smi(chain_ref.get(heap, 0))?;
     let holder = verify_chain(heap, receiver, chain)?;
     match head.0 {
         CHAIN_FIELD => Some(Hit::Value(holder.slot(heap, head.1 as usize).get(heap))),
         CHAIN_ACCESSOR => {
-            let pair = chain_ref.get(heap, 1).upgrade()?.get_as::<AccessorPair>()?;
+            let pair = chain_ref
+                .get(heap, 1)
+                .as_strong()?
+                .get_as::<AccessorPair>()?;
             let getter = pair.get.get(heap);
             Some(if getter == heap.known().undefined.as_tagged(heap) {
                 Hit::Value(heap.known().undefined.as_tagged(heap).erase())
@@ -585,16 +581,19 @@ impl InlineCache {
                     _ => return None,
                 }
             } else if handler.raw().is_weak_ptr() {
-                let target = handler.upgrade()?.get_as::<Map>()?;
+                let target = handler.as_strong()?.get_as::<Map>()?;
                 StoreAction::Transition(scope.handle(target))
             } else {
-                let chain = handler.strengthen()?.get_as::<WeakFixedArray>()?;
+                let chain = handler.as_strong()?.get_as::<WeakFixedArray>()?;
                 let chain_ref = chain.as_ref();
                 if decode_smi(chain_ref.get(heap, 0))?.0 != CHAIN_SETTER {
                     return None;
                 }
                 verify_chain(heap, recv, chain)?;
-                let pair = chain_ref.get(heap, 1).upgrade()?.get_as::<AccessorPair>()?;
+                let pair = chain_ref
+                    .get(heap, 1)
+                    .as_strong()?
+                    .get_as::<AccessorPair>()?;
                 let setter = pair.set.get(heap);
                 if setter == heap.known().undefined.as_tagged(heap) {
                     StoreAction::Noop
@@ -609,7 +608,7 @@ impl InlineCache {
                 let host = recv.erase();
                 recv.as_ref()
                     .slot(heap, offset)
-                    .set(heap, host, acc.read(heap));
+                    .set(heap, host, acc.get(heap));
                 Some(StoreHit::Done)
             }
             StoreAction::Transition(target) => {
@@ -678,7 +677,7 @@ fn apply_transition(
 
     if new_len == old_len && offset < old_len {
         let host = recv.erase();
-        recv.slot(heap, offset).set(heap, host, acc.read(heap));
+        recv.slot(heap, offset).set(heap, host, acc.get(heap));
         recv.as_ref()
             .header
             .map
@@ -701,7 +700,7 @@ fn apply_transition(
             .iter()
             .map(|slot| slot.get(heap))
             .collect();
-        values.push(acc.read(heap));
+        values.push(acc.get(heap));
         let slots = token.allocate::<FixedArray>(scope.stage(&values));
         let host = recv.erase();
         recv.slots.set(heap, host, slots);
@@ -729,7 +728,7 @@ fn update_site(
         return;
     }
     if state.raw().is_weak_ptr() {
-        if let Some(current) = state.upgrade() {
+        if let Some(current) = state.as_strong() {
             if current.ptr_eq(map.as_tagged(heap)) {
                 // Same map but the handler missed: a chain changed behind
                 // an identical receiver map, or the payload died. A Slow
@@ -744,7 +743,7 @@ fn update_site(
             promote_from_mono(heap, scope, vector, slot, map, handler);
             return;
         }
-    } else if let Some(strong) = state.strengthen() {
+    } else if let Some(strong) = state.as_strong() {
         if strong.ptr_eq(heap.known().megamorphic_symbol.as_tagged(heap).erase()) {
             return;
         }
@@ -772,7 +771,7 @@ fn promote_from_mono(
         let old_map = vec_t
             .slot(slot)
             .get(heap)
-            .upgrade()
+            .as_strong()
             .expect("caller checked live");
         let old_handler = vec_t.as_ref().slot(slot + 1).get(heap);
         let words = [
@@ -806,7 +805,7 @@ fn update_poly(
     let mut live = 0usize;
     let mut i = 0;
     while i + 1 < len {
-        if let Some(m) = pairs_t.get(heap, i).upgrade() {
+        if let Some(m) = pairs_t.get(heap, i).as_strong() {
             if m.ptr_eq(map.as_tagged(heap)) {
                 found_at = Some(i + 1);
                 break;
@@ -831,7 +830,7 @@ fn update_poly(
         let mut words: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(new_len);
         let mut i = 0;
         while i + 1 < len {
-            if let Some(m) = pairs_t.get(heap, i).upgrade() {
+            if let Some(m) = pairs_t.get(heap, i).as_strong() {
                 words.push(m.as_weak());
                 words.push(pairs_t.as_ref().get(heap, i + 1));
             }

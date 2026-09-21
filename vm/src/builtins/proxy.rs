@@ -120,7 +120,7 @@ pub fn proxy_revocable<'a>(
         let map = heap.known().object_initial_map;
         let obj = heap
             .new_object(&scope, map, HandleSlice::EMPTY)
-            .into_handle(&scope);
+            .as_handle(&scope);
         let proxy_name = vm.interner().intern_str(heap, &scope, "proxy");
         let proxy_name = scope.handle(proxy_name.as_tagged(heap));
         Object::define_own_property(

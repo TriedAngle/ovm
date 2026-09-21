@@ -247,12 +247,12 @@ fn own_field_hit_goes_monomorphic() {
     let slot = first_named_load_slot(heap, result);
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
     let state = vector.as_ref().slot(slot);
-    let word = state.inner();
+    let word = state.raw();
     assert!(
         word.is_ptr() && word.is_weak_ptr(),
         "mono state is a weak map"
     );
-    let handler = vector.as_ref().slot(slot + 1).inner();
+    let handler = vector.as_ref().slot(slot + 1).raw();
     let (kind, offset) = decode_handler(handler).expect("own-field Smi handler");
     assert_eq!((kind, offset), (0, 0), "OwnField at offset 0");
 }
@@ -267,7 +267,7 @@ fn second_shape_goes_polymorphic() {
     let heap = &*thread.heap();
     let slot = first_named_load_slot(heap, result);
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
-    let word = vector.as_ref().slot(slot).inner();
+    let word = vector.as_ref().slot(slot).raw();
     let pairs = unsafe { Tagged::<Value>::from_value_unchecked(word) }
         .get_as::<WeakFixedArray>()
         .expect("poly state is a WeakFixedArray");
@@ -284,7 +284,7 @@ fn five_shapes_go_megamorphic() {
     let heap = &*thread.heap();
     let slot = first_named_load_slot(heap, result);
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
-    let word = vector.as_ref().slot(slot).inner();
+    let word = vector.as_ref().slot(slot).raw();
     assert_eq!(
         word,
         heap.known().megamorphic_symbol.as_tagged(heap).raw(),
@@ -301,12 +301,12 @@ fn prototype_hit_installs_chain_handler() {
     let heap = &*thread.heap();
     let slot = first_named_load_slot(heap, result);
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
-    let state = vector.as_ref().slot(slot).inner();
+    let state = vector.as_ref().slot(slot).raw();
     assert!(
         state.is_ptr() && state.is_weak_ptr(),
         "mono on the receiver map"
     );
-    let handler = vector.as_ref().slot(slot + 1).inner();
+    let handler = vector.as_ref().slot(slot + 1).raw();
     let chain = unsafe { Tagged::<Value>::from_value_unchecked(handler) }
         .get_as::<WeakFixedArray>()
         .expect("chain handler array");
@@ -502,12 +502,12 @@ fn store_transition_handler_is_weak_target_map() {
     let heap = &*thread.heap();
     let slot = first_named_store_slot(heap, result);
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
-    let state = vector.as_ref().slot(slot).inner();
+    let state = vector.as_ref().slot(slot).raw();
     assert!(
         state.is_ptr() && state.is_weak_ptr(),
         "mono state is the pre-store map"
     );
-    let handler = vector.as_ref().slot(slot + 1).inner();
+    let handler = vector.as_ref().slot(slot + 1).raw();
     assert!(
         handler.is_ptr() && handler.is_weak_ptr(),
         "transition handler is a weak map word"
@@ -528,9 +528,9 @@ fn store_field_handler_is_smi() {
     let heap = &*thread.heap();
     let slot = first_named_store_slot(heap, result);
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
-    let state = vector.as_ref().slot(slot).inner();
+    let state = vector.as_ref().slot(slot).raw();
     assert!(state.is_ptr() && state.is_weak_ptr(), "mono state");
-    let handler = vector.as_ref().slot(slot + 1).inner();
+    let handler = vector.as_ref().slot(slot + 1).raw();
     let (kind, offset) = decode_handler(handler).expect("StoreField Smi handler");
     assert_eq!((kind, offset), (0, 0), "StoreField at offset 0");
 }
@@ -545,7 +545,7 @@ fn store_second_shape_goes_polymorphic() {
     let heap = &*thread.heap();
     let slot = first_named_store_slot(heap, result);
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
-    let word = vector.as_ref().slot(slot).inner();
+    let word = vector.as_ref().slot(slot).raw();
     let pairs = unsafe { Tagged::<Value>::from_value_unchecked(word) }
         .get_as::<WeakFixedArray>()
         .expect("poly state");
@@ -731,12 +731,12 @@ fn kette_chain_handler_records_parent_hop() {
         pc = next;
     }
     let slot = slot.expect("load site");
-    let state = vector.as_ref().slot(slot).inner();
+    let state = vector.as_ref().slot(slot).raw();
     assert!(
         state.is_ptr() && state.is_weak_ptr(),
         "mono on the receiver map"
     );
-    let handler = vector.as_ref().slot(slot + 1).inner();
+    let handler = vector.as_ref().slot(slot + 1).raw();
     let chain = unsafe { Tagged::<Value>::from_value_unchecked(handler) }
         .get_as::<WeakFixedArray>()
         .expect("chain handler");

@@ -21,57 +21,62 @@ use crate::Smi;
 use crate::StringData;
 use crate::{ContextState, Thread, VM};
 
-/// Materialize a compiled program into a closure object (function map,
-/// empty context) ready for `Thread::execute`.
-pub fn materialize_script<'s>(
-    thread: &mut Thread,
-    scope: &'s HandleScope<'_>,
-    program: &Program,
-) -> Result<Handle<'s, Object>, VmError> {
-    let empty = thread.heap().known().empty_context;
-    materialize_closure(thread, scope, program, empty)
-}
+/// Namespace for turning compiled programs into VM heap objects.
+pub struct Materialize;
 
-pub fn materialize_closure<'s, 'c>(
-    thread: &mut Thread,
-    scope: &'s HandleScope<'_>,
-    program: &Program,
-    context: Handle<'c, Context>,
-) -> Result<Handle<'s, Object>, VmError>
-where
-    'c: 's,
-{
-    let (vm, heap, state) = thread.split();
-    materialize_closure_vm(vm, heap, state, scope, program, context)
-}
+impl Materialize {
+    /// Materialize a compiled program into a closure object (function map,
+    /// empty context) ready for `Thread::execute`.
+    pub fn script<'s>(
+        thread: &mut Thread,
+        scope: &'s HandleScope<'_>,
+        program: &Program,
+    ) -> Result<Handle<'s, Object>, VmError> {
+        let empty = thread.heap().known().empty_context;
+        Self::closure(thread, scope, program, empty)
+    }
 
-pub fn materialize_closure_vm<'s>(
-    vm: &VM,
-    heap: &mut Heap,
-    state: &ContextState,
-    scope: &'s HandleScope<'_>,
-    program: &Program,
-    context: Handle<'s, Context>,
-) -> Result<Handle<'s, Object>, VmError> {
-    let mut infos: Vec<Option<Handle<'s, CallableInfoObject>>> =
-        (0..program.len()).map(|_| None).collect();
-    let info = materialize_function(
-        vm,
-        heap,
-        state,
-        scope,
-        program,
-        &mut infos,
-        FunctionId::SCRIPT,
-    )?;
+    pub fn closure<'s, 'c>(
+        thread: &mut Thread,
+        scope: &'s HandleScope<'_>,
+        program: &Program,
+        context: Handle<'c, Context>,
+    ) -> Result<Handle<'s, Object>, VmError>
+    where
+        'c: 's,
+    {
+        let (vm, heap, state) = thread.split();
+        Self::closure_vm(vm, heap, state, scope, program, context)
+    }
 
-    let map = heap.known().function_map;
-    let slots = scope.stage(&[
-        info.as_tagged(heap).erase(),
-        context.as_tagged(heap).erase(),
-    ]);
-    let object = heap.new_object(scope, map, slots).into_handle(scope);
-    Ok(object)
+    pub fn closure_vm<'s>(
+        vm: &VM,
+        heap: &mut Heap,
+        state: &ContextState,
+        scope: &'s HandleScope<'_>,
+        program: &Program,
+        context: Handle<'s, Context>,
+    ) -> Result<Handle<'s, Object>, VmError> {
+        let mut infos: Vec<Option<Handle<'s, CallableInfoObject>>> =
+            (0..program.len()).map(|_| None).collect();
+        let info = materialize_function(
+            vm,
+            heap,
+            state,
+            scope,
+            program,
+            &mut infos,
+            FunctionId::SCRIPT,
+        )?;
+
+        let map = heap.known().function_map;
+        let slots = scope.stage(&[
+            info.as_tagged(heap).erase(),
+            context.as_tagged(heap).erase(),
+        ]);
+        let object = heap.new_object(scope, map, slots).as_handle(scope);
+        Ok(object)
+    }
 }
 
 fn materialize_function<'s>(
