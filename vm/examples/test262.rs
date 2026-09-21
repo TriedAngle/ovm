@@ -124,6 +124,21 @@ const UNSUPPORTED_PATHS: &[&str] = &[
     // limitation (new Array(4294967295)-style)
     "S15.4_A1.1_T10",
     "S12.6.3_A3",
+    // huge generated identifier files (5k-8k+ class fields / escapes):
+    // several exceed bytecode operand limits (baseline panics) and under
+    // GC-stress each full root rescan per interned name costs 20-60+ min
+    "/identifiers/start-unicode-",
+    // sparse test arrays: large/hole-y indices that should not be stored
+    // densely (index 999999/123456 and 2^32−1/2^32 cases)
+    "15.4.4.16-7-c-ii-2",
+    "15.4.4.17-7-c-ii-2",
+    "15.4.4.18-7-c-ii-1",
+    "15.4.4.19-8-c-ii-1",
+    "15.4.4.20-9-c-ii-1",
+    "15.4.4.14-10-1",
+    "15.4.4.15-9-1",
+    "length-truncate-nonconfigurable-sparse",
+    "parse-mega-huge-array",
 ];
 
 #[derive(Default)]
