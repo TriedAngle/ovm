@@ -9,10 +9,8 @@ members = [
     "heap_utils",
     "ir",
     "js_compiler",
-    "js_parser",
     "kette_compiler",
     "kette_parser",
-    "parser_utils",
     "vm",
 ]
 
