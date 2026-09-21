@@ -107,7 +107,7 @@ impl HeapObject for CallableInfoObject {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().callable_map.as_tagged(heap));
@@ -179,7 +179,7 @@ impl CallableInfoObject {
         kind: FunctionKind,
         strict: bool,
     ) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.name.set(
             heap,
             host,
@@ -196,7 +196,7 @@ impl CallableInfoObject {
     /// Attach the (already allocated) inline-cache state.
     pub fn set_feedback(&self, heap: &Heap, vector: Handle<'_, FeedbackVector>) {
         self.feedback
-            .set(heap, self.erase(), vector.as_tagged(heap));
+            .set(heap, self.tagged(heap), vector.as_tagged(heap));
     }
 
     pub fn feedback<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, FeedbackVector>> {

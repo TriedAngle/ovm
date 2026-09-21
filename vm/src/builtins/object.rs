@@ -617,11 +617,10 @@ pub fn set_integrity_flags(
             descriptors: &descriptors,
             prototype,
         });
-        // Safety: fresh handle word re-read under the anchor.
         obj_ref
             .header
             .map
-            .set(heap, obj.as_tagged(heap).raw(), new_map);
+            .set(heap, obj.as_tagged(heap).erase(), new_map);
     });
 }
 

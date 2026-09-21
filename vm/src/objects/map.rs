@@ -203,7 +203,7 @@ impl HeapObject for Map {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().map_map.as_tagged(heap));
@@ -472,7 +472,7 @@ impl HeapObject for AccessorPair {
     }
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
-        let host = self.erase();
+        let host = self.tagged(heap);
         self.header
             .map
             .set(heap, host, heap.known().accessor_pair_map.as_tagged(heap));

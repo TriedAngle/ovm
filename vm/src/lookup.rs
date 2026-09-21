@@ -171,18 +171,18 @@ impl DenseString {
     /// (ES 5.4.3.1): `"ab"[1]` is "b". `None` for out-of-range keys and
     /// non-string receivers, which fall through to the ordinary property
     /// path.
-    pub fn index_element(
-        heap: &mut Heap,
+    pub fn index_element<'a>(
+        heap: &'a mut Heap,
         scope: &HandleScope<'_>,
         receiver: Handle<'_, Value>,
         key: Handle<'_, SlotName>,
-    ) -> Option<Value> {
+    ) -> Option<Tagged<'a, Value>> {
         let Ok(Key::Element(i)) = Lookup::classify_key(heap, key.as_tagged(heap).erase()) else {
             return None;
         };
         // Safety: fresh rooted-slot word.
         let receiver = receiver.as_tagged(heap).raw();
-        DenseString::char_at(heap, scope, receiver, i).map(|s| s.as_tagged(heap).raw())
+        DenseString::char_at(heap, scope, receiver, i).map(|s| s.as_tagged(heap).erase())
     }
 }
 

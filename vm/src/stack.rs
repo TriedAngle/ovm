@@ -129,7 +129,7 @@ impl Stack {
         self.slot_unchecked(Self::reg_index(meta, i)).read(_heap)
     }
 
-    pub fn set_reg(&self, meta: &FrameMeta, i: i32, v: impl Into<Value>) {
+    pub fn set_reg<'x, T: 'x>(&self, meta: &FrameMeta, i: i32, v: Tagged<'x, T>) {
         self.slot_unchecked(Self::reg_index(meta, i)).store(v);
     }
 
@@ -139,6 +139,7 @@ impl Stack {
 
     pub fn push_initial_frame(
         &self,
+        heap: &Heap,
         callable: Tagged<'_, Value>,
         register_count: usize,
         context: Tagged<'_, Value>,
@@ -148,7 +149,7 @@ impl Stack {
     ) -> Result<FrameMeta, VmError> {
         let argc = args.len();
         let padded = args.len().max(formal_min);
-        let base = self.reserve(register_count, padded)?;
+        let base = self.reserve(heap, register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
         debug_assert!(args.raw().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
@@ -158,7 +159,7 @@ impl Stack {
                 args.len(),
             );
             // missing arguments are undefined (registers are the hole)
-            let undefined = self.undefined.inner();
+            let undefined = self.undefined.read(heap);
             for i in args.len()..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -169,6 +170,7 @@ impl Stack {
     #[allow(clippy::too_many_arguments)]
     pub fn push_frame(
         &self,
+        heap: &Heap,
         caller: FrameMeta,
         handler_pc: usize,
         callable: Tagged<'_, Value>,
@@ -180,7 +182,7 @@ impl Stack {
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
         let padded = count.max(formal_min);
-        let base = self.reserve(register_count, padded)?;
+        let base = self.reserve(heap, register_count, padded)?;
         let src = Self::reg_index(&caller, src_reg_base);
         let dst = base + register_count + HEADER_SLOTS;
         debug_assert!(
@@ -194,7 +196,7 @@ impl Stack {
                 self.slots.as_ptr().add(dst) as *mut Value,
                 count,
             );
-            let undefined = self.undefined.inner();
+            let undefined = self.undefined.read(heap);
             for i in count..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -210,6 +212,7 @@ impl Stack {
     #[allow(clippy::too_many_arguments)]
     pub fn push_frame_with_args(
         &self,
+        heap: &Heap,
         caller: FrameMeta,
         handler_pc: usize,
         callable: Tagged<'_, Value>,
@@ -220,7 +223,7 @@ impl Stack {
         formal_min: usize,
     ) -> Result<FrameMeta, VmError> {
         let padded = args.len().max(formal_min);
-        let base = self.reserve(register_count, padded)?;
+        let base = self.reserve(heap, register_count, padded)?;
         let dst = base + register_count + HEADER_SLOTS;
         debug_assert!(args.raw().iter().all(|v| !v.is_weak_ptr()));
         unsafe {
@@ -229,7 +232,7 @@ impl Stack {
                 self.slots.as_ptr().add(dst) as *mut Value,
                 args.len(),
             );
-            let undefined = self.undefined.inner();
+            let undefined = self.undefined.read(heap);
             for i in args.len()..padded {
                 self.slot_unchecked(dst + i).store(undefined);
             }
@@ -251,15 +254,20 @@ impl Stack {
     /// Copy `args` into a fresh register region above the current top and
     /// return a `HandleSlice` over it (GC-visited: reads stay fresh across
     /// allocations). Rewind the region with `set_top(saved_top)` when done.
-    pub fn stage_args(&self, args: HandleSlice<'_>) -> Result<(usize, HandleSlice<'_>), VmError> {
+    pub fn stage_args(
+        &self,
+        heap: &Heap,
+        args: HandleSlice<'_>,
+    ) -> Result<(usize, HandleSlice<'_>), VmError> {
         let saved_top = self.top();
-        let base = self.reserve(0, args.len())?;
+        let base = self.reserve(heap, 0, args.len())?;
         let dst = base + HEADER_SLOTS;
         // the staged region reserves frame-header slots it never writes:
         // they sit below `top`, so the GC would scan whatever stale words
         // previous frames left there — fill them like fresh registers
+        let fill = self.fill.read(heap);
         for i in 0..HEADER_SLOTS {
-            self.slot_unchecked(base + i).store(self.fill.inner());
+            self.slot_unchecked(base + i).store(fill);
         }
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -290,14 +298,15 @@ impl Stack {
         self.frames.borrow_mut().truncate(depth);
     }
 
-    fn reserve(&self, register_count: usize, argc: usize) -> Result<usize, VmError> {
+    fn reserve(&self, heap: &Heap, register_count: usize, argc: usize) -> Result<usize, VmError> {
         let base = self.top();
         let size = register_count + HEADER_SLOTS + argc;
         if base + size > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
+        let fill = self.fill.read(heap);
         for i in 0..register_count {
-            self.slot_unchecked(base + i).store(self.fill.inner());
+            self.slot_unchecked(base + i).store(fill);
         }
         self.set_top(base + size);
         Ok(base)
@@ -313,9 +322,9 @@ impl Stack {
         argc: usize,
     ) -> FrameMeta {
         self.slot_unchecked(base + register_count + CALLABLE_OFFSET)
-            .store(callable.raw());
+            .store(callable);
         self.slot_unchecked(base + register_count + ARGC_OFFSET)
-            .store(Smi::new(argc as i64).encode());
+            .store(Smi::new(argc as i64).into_tagged());
         self.slot_unchecked(base + register_count + CONTEXT_OFFSET)
             .store(context);
         self.slot_unchecked(base + register_count + NEW_TARGET_OFFSET)
