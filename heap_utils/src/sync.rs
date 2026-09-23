@@ -4,11 +4,16 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 
 const PARKED: u8 = 0b01;
 const REQUESTED: u8 = 0b10;
+const CANCEL: u8 = 0b100;
 
 /// a node is:
 /// - `PARKED` while its thread sleeps inside the barrier
 /// - `REQUESTED` while an armed cycle waits for it to reach a safepoint.
-/// - A running node with `REQUESTED` set is part of the armed cycle's target.
+///   A running node with `REQUESTED` set is part of the armed cycle's target.
+/// - `CANCEL` set from a shutdown protocol until the thread takes it: the
+///   node's current execution is cancelled and every future safepoint
+///   reports it. Unlike `REQUESTED`, collection cycles do not consume it
+///   (a cancel survives arbitrary GC cycles).
 pub struct LocalNode {
     state: AtomicU8,
     linked: AtomicBool,
@@ -31,6 +36,14 @@ impl LocalNode {
 
     pub fn requested(&self) -> bool {
         self.state.load(Ordering::Relaxed) & REQUESTED != 0
+    }
+
+    pub fn pending(&self) -> bool {
+        self.state.load(Ordering::Relaxed) & (REQUESTED | CANCEL) != 0
+    }
+
+    pub fn take_cancel(&self) -> bool {
+        self.state.fetch_and(!CANCEL, Ordering::AcqRel) & CANCEL != 0
     }
 }
 
@@ -86,13 +99,10 @@ impl Safepoint {
         self.barrier.lock().unwrap().armed
     }
 
-    /// Installs the closure parked threads run each time the armer publishes
-    /// work. Installed once, before any thread parks.
     pub fn set_work(&self, work: Box<dyn Fn() + Send + Sync>) {
         let _ = self.work.set(work);
     }
 
-    /// Wakes parked threads to run the installed work closure.
     pub fn publish_work(&self) {
         let mut barrier = self.barrier.lock().unwrap();
         barrier.work_generation += 1;
@@ -128,9 +138,6 @@ impl Safepoint {
             }
             list.count += 1;
             if barrier.armed {
-                // Relaxed: this thread owns the node and re-reads the bit
-                // itself in `park_for_collection`; the barrier lock orders it
-                // against the armer's `target` bookkeeping.
                 node.state.fetch_or(REQUESTED, Ordering::Relaxed);
                 barrier.target += 1;
                 true
@@ -145,7 +152,7 @@ impl Safepoint {
 
     pub fn detach(&self, node: &LocalNode) {
         loop {
-            if node.requested() {
+            if node.pending() {
                 self.park_for_collection(node);
             }
             let mut list = self.list.lock().unwrap();
@@ -167,36 +174,32 @@ impl Safepoint {
                 (*node).prev = ptr::null_mut();
                 (*node).next = ptr::null_mut();
                 (*node).linked.store(false, Ordering::Relaxed);
+                // unlinked: a stale cancel on the leaving node is moot
+                (*node).state.fetch_and(!CANCEL, Ordering::Release);
             }
             list.count -= 1;
             return;
         }
     }
 
-    pub fn park_for_collection(&self, node: &LocalNode) {
+    pub fn park_for_collection(&self, node: &LocalNode) -> bool {
         loop {
-            // Fast path: nothing pending. PARKED is only ever written by this
-            // thread, so an exact `0` cannot hide our own parked state; a
-            // stale REQUESTED only means the armer already counted us as a
-            // target, and we will observe it at our next safepoint.
-            if node.state.load(Ordering::Relaxed) == 0 {
-                return;
+            let state = node.state.load(Ordering::Relaxed);
+            if state == 0 {
+                return false;
             }
-            // Mark ourselves parked. `prev` comes from an RMW, so it is the
-            // current value: the decision below can never be made on a stale
-            // REQUESTED read (the old load-then-act fast path could, and then
-            // wait for a disarm that a counted target never performs).
+            if state & CANCEL != 0 && state & REQUESTED == 0 {
+                node.state.fetch_and(!PARKED, Ordering::AcqRel);
+                return true;
+            }
             let prev = node.state.fetch_or(PARKED, Ordering::AcqRel);
             if prev & REQUESTED == 0 {
-                // No cycle pending: leave the barrier. If one armed while we
-                // were deciding, the CAS sees REQUESTED and fails, and we
-                // re-evaluate from the fresh value.
                 if node
                     .state
                     .compare_exchange(PARKED, 0, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
-                    return;
+                    return false;
                 }
                 continue;
             }
@@ -205,8 +208,77 @@ impl Safepoint {
             } else {
                 self.count_in_and_wait();
             }
-            // PARKED stays set across the wait, then this loop clears it (or
-            // handles a newly armed cycle).
+            if node.state.fetch_and(!PARKED, Ordering::AcqRel) & REQUESTED != 0 {
+                continue;
+            }
+            return true;
+        }
+    }
+
+    pub fn cancel_executions(&self, requester: &LocalNode, protocol: impl FnOnce()) {
+        loop {
+            let armed_here = {
+                let list = self.list.lock().unwrap();
+                let mut barrier = self.barrier.lock().unwrap();
+                if barrier.armed {
+                    false
+                } else {
+                    barrier.armed = true;
+                    barrier.stopped = 0;
+                    barrier.target = 0;
+                    let req = ptr::from_ref(requester);
+                    let mut node = list.head;
+                    while !node.is_null() {
+                        let n = unsafe { &*node };
+                        if ptr::from_ref(n) != req {
+                            let old = n.state.fetch_or(REQUESTED, Ordering::AcqRel);
+                            if old & PARKED == 0 {
+                                barrier.target += 1;
+                            }
+                            debug_assert_eq!(old & REQUESTED, 0);
+                        }
+                        node = n.next;
+                    }
+                    true
+                }
+            };
+            if armed_here {
+                let mut barrier = self.barrier.lock().unwrap();
+                while barrier.stopped < barrier.target {
+                    barrier = self.cond_stopped.wait(barrier).unwrap();
+                }
+                drop(barrier);
+                // World stopped: run the protocol (a save would happen here).
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(protocol));
+                {
+                    let list = self.list.lock().unwrap();
+                    let mut barrier = self.barrier.lock().unwrap();
+                    barrier.armed = false;
+                    barrier.stopped = 0;
+                    let req = ptr::from_ref(requester);
+                    let mut node = list.head;
+                    while !node.is_null() {
+                        let n = unsafe { &*node };
+                        if ptr::from_ref(n) != req {
+                            // cancel survives later collection cycles (they
+                            // clear REQUESTED, never CANCEL)
+                            n.state.fetch_and(!REQUESTED, Ordering::Release);
+                            n.state.fetch_or(CANCEL, Ordering::Release);
+                        }
+                        node = n.next;
+                    }
+                    drop(barrier);
+                    drop(list);
+                    self.cond_resume.notify_all();
+                }
+                if let Err(panic) = result {
+                    std::panic::resume_unwind(panic);
+                }
+                return;
+            }
+            // Another thread's cycle is in flight: participate in it, then
+            // retry.
+            self.park_for_collection(requester);
         }
     }
 

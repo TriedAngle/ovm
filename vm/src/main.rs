@@ -23,6 +23,9 @@ fn main() {
     }
     for path in &files {
         run_file(&mut thread, path);
+        if thread.vm().is_shutdown() {
+            return;
+        }
     }
     if files.is_empty() || then_repl {
         repl(&mut thread);
@@ -62,6 +65,9 @@ fn run_file(thread: &mut Thread, path: &str) {
 fn repl(thread: &mut Thread) {
     let stdin = std::io::stdin();
     loop {
+        if thread.vm().is_shutdown() {
+            break;
+        }
         print!("> ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();

@@ -15,6 +15,7 @@ use crate::HandleScope;
 use crate::PartialDescriptor;
 use crate::proxy::Flow;
 use crate::proxy::Proxy;
+use crate::tools::KetteTools;
 use crate::{ContextState, VM};
 use crate::{RuntimeCall, RuntimeContext};
 
@@ -63,6 +64,9 @@ pub fn runtime_fn(id: bytecode::RuntimeFn) -> RuntimeCall {
         bytecode::RuntimeFn::CreateRestParameter => create_rest_parameter,
         bytecode::RuntimeFn::SuperGetProperty => super_get_property,
         bytecode::RuntimeFn::SuperSetProperty => super_set_property,
+        bytecode::RuntimeFn::ForceMinorGc => KetteTools::force_minor_gc,
+        bytecode::RuntimeFn::ForceMajorGc => KetteTools::force_major_gc,
+        bytecode::RuntimeFn::ShutdownVm => KetteTools::shutdown,
     }
 }
 

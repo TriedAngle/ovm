@@ -3,9 +3,9 @@
 //! handler ranges, accumulator elision, and validation.
 
 use bytecode::{
-    BuildError, CallableKind, Constant, ConstIdx, FnBuilder, FunctionId, FunctionMeta, Opcode,
-    Operand, Program, Reg, RegList, RtArg, RuntimeFn, ValidationError, validate, validate_function,
-    try_decode,
+    BuildError, CallableKind, ConstIdx, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode,
+    Operand, Program, Reg, RegList, RtArg, RuntimeFn, ValidationError, try_decode, validate,
+    validate_function,
 };
 
 #[derive(Debug, PartialEq)]
@@ -111,7 +111,10 @@ fn constant_pool_dedups() {
 
     let func = b.finish(meta()).unwrap();
     assert_eq!(func.constants.len(), 9);
-    assert!(matches!(func.constants[x.index() as usize], Constant::String(_)));
+    assert!(matches!(
+        func.constants[x.index() as usize],
+        Constant::String(_)
+    ));
 }
 
 #[test]
@@ -136,16 +139,56 @@ fn staged_runtime_calls_lay_out_the_window_in_order() {
     assert_eq!(
         instrs,
         vec![
-            Instr { op: Opcode::LoadConstant, ops: vec![0], at: 0 }, // "fn"
-            Instr { op: Opcode::Store, ops: vec![0], at: 2 },        // obj = temp 0
-            Instr { op: Opcode::Store, ops: vec![1], at: 4 },        // acc -> window slot 0
-            Instr { op: Opcode::LoadConstant, ops: vec![1], at: 6 }, // "key"
-            Instr { op: Opcode::Store, ops: vec![2], at: 8 },
-            Instr { op: Opcode::LoadSmi, ops: vec![2], at: 10 },
-            Instr { op: Opcode::Store, ops: vec![3], at: 12 },
-            Instr { op: Opcode::CallRuntime, ops: vec![19, 1, 3], at: 14 }, // SetFunctionName discriminant
-            Instr { op: Opcode::Load, ops: vec![0], at: 18 },
-            Instr { op: Opcode::Return, ops: vec![], at: 20 },
+            Instr {
+                op: Opcode::LoadConstant,
+                ops: vec![0],
+                at: 0
+            }, // "fn"
+            Instr {
+                op: Opcode::Store,
+                ops: vec![0],
+                at: 2
+            }, // obj = temp 0
+            Instr {
+                op: Opcode::Store,
+                ops: vec![1],
+                at: 4
+            }, // acc -> window slot 0
+            Instr {
+                op: Opcode::LoadConstant,
+                ops: vec![1],
+                at: 6
+            }, // "key"
+            Instr {
+                op: Opcode::Store,
+                ops: vec![2],
+                at: 8
+            },
+            Instr {
+                op: Opcode::LoadSmi,
+                ops: vec![2],
+                at: 10
+            },
+            Instr {
+                op: Opcode::Store,
+                ops: vec![3],
+                at: 12
+            },
+            Instr {
+                op: Opcode::CallRuntime,
+                ops: vec![19, 1, 3],
+                at: 14
+            }, // SetFunctionName discriminant
+            Instr {
+                op: Opcode::Load,
+                ops: vec![0],
+                at: 18
+            },
+            Instr {
+                op: Opcode::Return,
+                ops: vec![],
+                at: 20
+            },
         ]
     );
     validate_function(&f, 0).unwrap();
@@ -180,14 +223,28 @@ fn smi_loads_pick_the_cheapest_encoding() {
     b.ret();
     let f = b.finish(meta()).unwrap();
     assert_eq!(f.code.len(), 3);
-    assert_eq!(decoded(&f.code)[0], Instr { op: Opcode::LoadSmi, ops: vec![5], at: 0 });
+    assert_eq!(
+        decoded(&f.code)[0],
+        Instr {
+            op: Opcode::LoadSmi,
+            ops: vec![5],
+            at: 0
+        }
+    );
 
     let mut b = FnBuilder::new(0);
     b.load_smi(200); // > i8::MAX: auto-widens instead of failing
     b.ret();
     let f = b.finish(meta()).unwrap();
     assert_eq!(f.code[0], Opcode::Wide as u8);
-    assert_eq!(decoded(&f.code)[0], Instr { op: Opcode::LoadSmi, ops: vec![200], at: 0 });
+    assert_eq!(
+        decoded(&f.code)[0],
+        Instr {
+            op: Opcode::LoadSmi,
+            ops: vec![200],
+            at: 0
+        }
+    );
 
     let mut b = FnBuilder::new(0);
     b.load_smi(100_000); // beyond i16: rides the constant pool
@@ -195,7 +252,11 @@ fn smi_loads_pick_the_cheapest_encoding() {
     let f = b.finish(meta()).unwrap();
     assert_eq!(
         decoded(&f.code)[0],
-        Instr { op: Opcode::LoadConstant, ops: vec![0], at: 0 }
+        Instr {
+            op: Opcode::LoadConstant,
+            ops: vec![0],
+            at: 0
+        }
     );
     assert_eq!(f.constants, vec![Constant::Smi(100_000)]);
 }
@@ -219,7 +280,11 @@ fn wide_operands_scale_whole_instruction() {
     assert_eq!(f.code[2], Opcode::Wide as u8);
     assert_eq!(
         decoded(&f.code)[1],
-        Instr { op: Opcode::LoadGlobal, ops: vec![300, 0], at: 2 }
+        Instr {
+            op: Opcode::LoadGlobal,
+            ops: vec![300, 0],
+            at: 2
+        }
     );
     validate_function(&f, 0).unwrap();
 }
@@ -313,8 +378,16 @@ fn emitted_param_loads_use_the_vm_convention() {
     assert_eq!(
         decoded(&f.code),
         vec![
-            Instr { op: Opcode::Load, ops: vec![-2], at: 0 },
-            Instr { op: Opcode::Return, ops: vec![], at: 2 },
+            Instr {
+                op: Opcode::Load,
+                ops: vec![-2],
+                at: 0
+            },
+            Instr {
+                op: Opcode::Return,
+                ops: vec![],
+                at: 2
+            },
         ]
     );
     validate_function(&f, 0).unwrap();
@@ -357,7 +430,14 @@ fn short_forward_jump_stays_narrow() {
     let f = b.finish(meta()).unwrap();
     let instrs = decoded(&f.code);
     assert_eq!(f.code[0], Opcode::Jump as u8, "no Wide prefix needed");
-    assert_eq!(instrs[0], Instr { op: Opcode::Jump, ops: vec![5], at: 0 });
+    assert_eq!(
+        instrs[0],
+        Instr {
+            op: Opcode::Jump,
+            ops: vec![5],
+            at: 0
+        }
+    );
     assert_eq!(instrs.len(), 4);
     validate_function(&f, 0).unwrap();
 }
@@ -376,9 +456,20 @@ fn long_forward_jump_widens_automatically() {
     assert_eq!(f.code.len(), 4 + 130 + 1, "4-byte jump + body + Return");
 
     let instrs = decoded(&f.code);
-    assert_eq!(instrs[0], Instr { op: Opcode::Jump, ops: vec![134], at: 0 });
+    assert_eq!(
+        instrs[0],
+        Instr {
+            op: Opcode::Jump,
+            ops: vec![134],
+            at: 0
+        }
+    );
     assert_eq!(instrs[1].at, 4);
-    assert_eq!(instrs.last().unwrap().at, 134, "jump lands exactly on Return");
+    assert_eq!(
+        instrs.last().unwrap().at,
+        134,
+        "jump lands exactly on Return"
+    );
     validate_function(&f, 0).unwrap();
 }
 
@@ -398,7 +489,11 @@ fn backward_jump_loop_stays_narrow() {
     let instrs = decoded(&f.code);
     assert_eq!(
         instrs[2],
-        Instr { op: Opcode::JumpLoop, ops: vec![-3], at: 3 }
+        Instr {
+            op: Opcode::JumpLoop,
+            ops: vec![-3],
+            at: 3
+        }
     );
     validate_function(&f, 0).unwrap();
 }
@@ -419,7 +514,11 @@ fn wide_loop_body_widens_its_back_edge() {
     let instrs = decoded(&f.code);
     assert_eq!(
         instrs[130],
-        Instr { op: Opcode::JumpLoop, ops: vec![-130], at: 130 }
+        Instr {
+            op: Opcode::JumpLoop,
+            ops: vec![-130],
+            at: 130
+        }
     );
     validate_function(&f, 0).unwrap();
 }
@@ -476,7 +575,14 @@ fn conditional_jumps_read_the_accumulator_but_keep_its_state() {
     let f = b.finish(meta()).unwrap();
     let instrs = decoded(&f.code);
     assert_eq!(instrs.len(), 3);
-    assert_eq!(instrs[1], Instr { op: Opcode::JumpIfFalsy, ops: vec![2], at: 2 });
+    assert_eq!(
+        instrs[1],
+        Instr {
+            op: Opcode::JumpIfFalsy,
+            ops: vec![2],
+            at: 2
+        }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -521,8 +627,14 @@ fn handler_anchors_survive_jump_widening() {
     let f = b.finish(meta()).unwrap();
     let h = f.handlers[0];
     assert_eq!(h.try_start, 0);
-    assert_eq!(h.try_end, 130, "handler range is unchanged by later widening");
-    assert_eq!(h.handler_pc, 134, "4-byte jump sits between try_end and handler");
+    assert_eq!(
+        h.try_end, 130,
+        "handler range is unchanged by later widening"
+    );
+    assert_eq!(
+        h.handler_pc, 134,
+        "4-byte jump sits between try_end and handler"
+    );
     assert_eq!(f.code[130], Opcode::Wide as u8);
     validate_function(&f, 0).unwrap();
 }
@@ -568,9 +680,21 @@ fn store_then_load_costs_only_the_store() {
     assert_eq!(
         decoded(&f.code),
         vec![
-            Instr { op: Opcode::Load, ops: vec![0], at: 0 },
-            Instr { op: Opcode::Store, ops: vec![1], at: 2 },
-            Instr { op: Opcode::Return, ops: vec![], at: 4 },
+            Instr {
+                op: Opcode::Load,
+                ops: vec![0],
+                at: 0
+            },
+            Instr {
+                op: Opcode::Store,
+                ops: vec![1],
+                at: 2
+            },
+            Instr {
+                op: Opcode::Return,
+                ops: vec![],
+                at: 4
+            },
         ]
     );
 }
@@ -591,8 +715,16 @@ fn dead_load_store_pair_vanishes() {
     assert_eq!(
         decoded(&f.code),
         vec![
-            Instr { op: Opcode::Load, ops: vec![0], at: 0 },
-            Instr { op: Opcode::Return, ops: vec![], at: 2 },
+            Instr {
+                op: Opcode::Load,
+                ops: vec![0],
+                at: 0
+            },
+            Instr {
+                op: Opcode::Return,
+                ops: vec![],
+                at: 2
+            },
         ]
     );
 }
@@ -611,9 +743,21 @@ fn repeated_constant_and_singleton_loads_are_elided() {
     assert_eq!(
         decoded(&f.code),
         vec![
-            Instr { op: Opcode::LoadConstant, ops: vec![0], at: 0 },
-            Instr { op: Opcode::LoadUndefined, ops: vec![], at: 2 },
-            Instr { op: Opcode::Return, ops: vec![], at: 3 },
+            Instr {
+                op: Opcode::LoadConstant,
+                ops: vec![0],
+                at: 0
+            },
+            Instr {
+                op: Opcode::LoadUndefined,
+                ops: vec![],
+                at: 2
+            },
+            Instr {
+                op: Opcode::Return,
+                ops: vec![],
+                at: 3
+            },
         ]
     );
 }
@@ -642,7 +786,11 @@ fn register_writes_invalidate_accumulator_knowledge() {
     b.move_reg(Reg::new(1), Reg::new(0)); // dst = 1
     b.load(Reg::new(0));
     b.ret();
-    assert_eq!(decoded(&b.finish(meta()).unwrap().code).len(), 3, "Load, Move, Return");
+    assert_eq!(
+        decoded(&b.finish(meta()).unwrap().code).len(),
+        3,
+        "Load, Move, Return"
+    );
 
     // PushContext saves the old context into its operand register
     let mut b = FnBuilder::new(0);
@@ -834,7 +982,10 @@ fn validate_rejects_forward_jump_loop() {
     let target = jump.at + jump.ops[0] as usize;
     assert_eq!(
         validate_function(&f, 0),
-        Err(ValidationError::ForwardJumpLoop { pc: jump.at, target })
+        Err(ValidationError::ForwardJumpLoop {
+            pc: jump.at,
+            target
+        })
     );
 }
 
@@ -899,7 +1050,10 @@ fn validate_rejects_falling_off_the_end() {
     let mut b = FnBuilder::new(0);
     b.load_zero(); // no terminal instruction
     let f = b.finish(meta()).unwrap();
-    assert_eq!(validate_function(&f, 0), Err(ValidationError::MissingTerminal));
+    assert_eq!(
+        validate_function(&f, 0),
+        Err(ValidationError::MissingTerminal)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -928,9 +1082,15 @@ fn program_collects_functions_and_checks_cross_references() {
     assert_eq!(inner_id, FunctionId(1));
 
     assert_eq!(p.len(), 2);
-    assert_eq!(p.function_ids().collect::<Vec<_>>(), vec![FunctionId(0), FunctionId(1)]);
+    assert_eq!(
+        p.function_ids().collect::<Vec<_>>(),
+        vec![FunctionId(0), FunctionId(1)]
+    );
     assert_eq!(p.function(script_id).register_count, 0);
-    assert_eq!(p.constant(p.function(script_id), 0), &Constant::Callable(FunctionId(1)));
+    assert_eq!(
+        p.constant(p.function(script_id), 0),
+        &Constant::Callable(FunctionId(1))
+    );
     assert_eq!(p.name(p.function(script_id)), Some(&b"test"[..]));
 
     validate(&p).unwrap();
@@ -999,13 +1159,14 @@ fn worked_example_builds_valid_bytecode() {
     b.load(sum);
     b.ret();
 
-    let f = b.finish(FunctionMeta {
-        name: Some(b"f".as_slice().into()),
-        kind: CallableKind::Normal,
-        length: 1,
-        strict: false,
-    })
-    .unwrap();
+    let f = b
+        .finish(FunctionMeta {
+            name: Some(b"f".as_slice().into()),
+            kind: CallableKind::Normal,
+            length: 1,
+            strict: false,
+        })
+        .unwrap();
 
     assert_eq!(f.arity, 1);
     assert_eq!(f.register_count, 3, "locals 0,1 plus the staged temp at 2");

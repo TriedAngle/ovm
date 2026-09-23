@@ -12,7 +12,7 @@
 //! the locals, like `js_compiler`.
 
 use bytecode::{
-    CallableKind, Constant, ConstIdx, FnBuilder, FunctionId, FunctionMeta, Program, Reg, RegList,
+    CallableKind, ConstIdx, Constant, FnBuilder, FunctionId, FunctionMeta, Program, Reg, RegList,
 };
 use kette_parser::{Ast, Node, NodeId, NodeList, Resolution, Resolved, ScopeId, SlotKind, Symbol};
 
@@ -392,7 +392,9 @@ impl<'a> FunctionGen<'a> {
                 Ok(())
             }
             Node::String(sym) => {
-                let c = self.b.constant(Constant::String(self.ast.symbol(sym).into()));
+                let c = self
+                    .b
+                    .constant(Constant::String(self.ast.symbol(sym).into()));
                 self.b.load_constant(c);
                 Ok(())
             }

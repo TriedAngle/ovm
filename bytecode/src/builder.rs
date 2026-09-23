@@ -423,7 +423,10 @@ impl FnBuilder {
     pub fn new_label(&mut self) -> Label {
         let id = self.labels.len() as u32;
         self.labels.push(LabelRec::default());
-        Label { id, origin: self.origin }
+        Label {
+            id,
+            origin: self.origin,
+        }
     }
 
     /// Fix `label` at the next instruction's position. Every path into a
@@ -444,7 +447,10 @@ impl FnBuilder {
             try_end: None,
             handler_pc: None,
         });
-        TryBlock { id, origin: self.origin }
+        TryBlock {
+            id,
+            origin: self.origin,
+        }
     }
 
     /// Anchor the exclusive end of a try region. Exceptions raised at pcs
@@ -784,9 +790,7 @@ impl FnBuilder {
     /// final offset. Returns the code plus the resolved final positions of
     /// every label bind, jump site, and handler anchor.
     #[allow(clippy::type_complexity)]
-    fn layout(
-        &mut self,
-    ) -> Result<(Vec<u8>, Vec<usize>, Vec<usize>, Vec<[usize; 3]>), BuildError> {
+    fn layout(&mut self) -> Result<(Vec<u8>, Vec<usize>, Vec<usize>, Vec<[usize; 3]>), BuildError> {
         let mut events: Vec<(usize, bool, Ev)> = Vec::new();
         for (i, label) in self.labels.iter().enumerate() {
             if let Some(pos) = label.bind {
@@ -950,8 +954,7 @@ impl FnBuilder {
 
     fn check_label(&self, label: Label) {
         debug_assert_eq!(
-            label.origin,
-            self.origin,
+            label.origin, self.origin,
             "label created by a different FnBuilder"
         );
         debug_assert!(
@@ -962,10 +965,12 @@ impl FnBuilder {
 
     fn check_try(&self, t: TryBlock) {
         debug_assert_eq!(
-            t.origin,
-            self.origin,
+            t.origin, self.origin,
             "try block created by a different FnBuilder"
         );
-        debug_assert!((t.id as usize) < self.handlers.len(), "try block id out of range");
+        debug_assert!(
+            (t.id as usize) < self.handlers.len(),
+            "try block id out of range"
+        );
     }
 }

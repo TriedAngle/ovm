@@ -1,7 +1,7 @@
 //! Disassemble a script: parse → compile → print per-function bytecode.
 
-use bytecode::decode;
 use bytecode::Constant;
+use bytecode::decode;
 
 fn main() {
     let path = std::env::args()

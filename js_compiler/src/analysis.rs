@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
-use oxc_ast::ast::*;
 use oxc_ast::AstKind;
+use oxc_ast::ast::*;
 use oxc_ast_visit::{
     Visit,
     walk::{walk_for_in_statement, walk_for_of_statement, walk_for_statement},
@@ -25,13 +25,30 @@ pub struct ClassIdx(pub u32);
 /// `this`, `new.target`, `super(...)`, `super.x`, private names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Special {
-    This { owner: Fid, depth: u32 },
-    NewTarget { owner: Fid, depth: u32 },
-    SuperCall { owner: Fid, depth: u32 },
+    This {
+        owner: Fid,
+        depth: u32,
+    },
+    NewTarget {
+        owner: Fid,
+        depth: u32,
+    },
+    SuperCall {
+        owner: Fid,
+        depth: u32,
+    },
     /// `super.x`: home-object context slot + receiver owner
-    Super { home: Home, depth: u32, this_owner: Fid, this_depth: u32 },
+    Super {
+        home: Home,
+        depth: u32,
+        this_owner: Fid,
+        this_depth: u32,
+    },
     /// private name: class-context slot
-    Private { slot: u32, depth: u32 },
+    Private {
+        slot: u32,
+        depth: u32,
+    },
 }
 
 /// Where a `super.x` home object lives.
@@ -307,9 +324,7 @@ impl<'a, 'p> Collector<'a, 'p> {
                 if let Some(&fid) = self.fn_scope_to_fid.get(&cur) {
                     break fid;
                 }
-                if self.class_of_scope.contains_key(&cur)
-                    || self.for_of_scope.contains_key(&cur)
-                {
+                if self.class_of_scope.contains_key(&cur) || self.for_of_scope.contains_key(&cur) {
                     // class / for contexts have their own slot spaces
                     break Fid(u32::MAX);
                 }
@@ -324,7 +339,10 @@ impl<'a, 'p> Collector<'a, 'p> {
         // per-iteration loops: for heads whose lexical bindings are captured
         let mut per_iteration = HashSet::new();
         for (sid, &node) in &self.for_of_scope {
-            if self.scoping.iter_bindings_in(*sid).any(|sym| captured.contains(&sym))
+            if self
+                .scoping
+                .iter_bindings_in(*sid)
+                .any(|sym| captured.contains(&sym))
             {
                 per_iteration.insert(node);
             }
@@ -334,7 +352,9 @@ impl<'a, 'p> Collector<'a, 'p> {
         let mut hoist_vars: HashMap<Fid, Vec<SymbolId>> = HashMap::new();
         for s in 0..self.scoping.scopes_len() {
             let sid = ScopeId::from_usize(s);
-            let Some(&owner) = scope_owner.get(&sid) else { continue };
+            let Some(&owner) = scope_owner.get(&sid) else {
+                continue;
+            };
             if owner == Fid(u32::MAX) {
                 continue;
             }
@@ -452,11 +472,9 @@ impl<'a, 'p> Collector<'a, 'p> {
         // names bound by non-identifier parameter patterns are TDZ locals
         // stored by the destructuring prologue, not param registers
         if !matches!(p, BindingPattern::BindingIdentifier(_)) {
-            collect_binding_symbols(p)
-                .into_iter()
-                .for_each(|sym| {
-                    self.pattern_params.insert(sym);
-                });
+            collect_binding_symbols(p).into_iter().for_each(|sym| {
+                self.pattern_params.insert(sym);
+            });
         }
     }
 
@@ -753,11 +771,10 @@ impl<'a, 'p> Visit<'a> for Collector<'a, 'p> {
             private_slots: Vec::new(),
             slot_count: 0,
             has_instance_fields,
-            decl_symbol: it.id.as_ref().and_then(|id| {
-                id.symbol_id
-                    .get()
-                    .map(|sym| (sym, id.name.to_string()))
-            }),
+            decl_symbol: it
+                .id
+                .as_ref()
+                .and_then(|id| id.symbol_id.get().map(|sym| (sym, id.name.to_string()))),
         });
 
         // walk: heritage evaluates inside the class context
@@ -907,9 +924,15 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
     /// display name (the Collector sees them as plain functions).
     fn patch_object_methods(&mut self) {
         for node in self.nodes.iter() {
-            let AstKind::ObjectProperty(p) = node.kind() else { continue };
-            let Expression::FunctionExpression(f) = &p.value else { continue };
-            let Some(&fid) = self.fn_of_node.get(&f.node_id.get()) else { continue };
+            let AstKind::ObjectProperty(p) = node.kind() else {
+                continue;
+            };
+            let Expression::FunctionExpression(f) = &p.value else {
+                continue;
+            };
+            let Some(&fid) = self.fn_of_node.get(&f.node_id.get()) else {
+                continue;
+            };
             let name = |prefix: Option<&str>, key: &PropertyKey| match key {
                 PropertyKey::StaticIdentifier(i) => match prefix {
                     Some(p) => Some(format!("{p}{}", i.name)),
@@ -952,12 +975,17 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
             let id = node.id();
             match node.kind() {
                 AstKind::ThisExpression(t) => {
-                    let Some((owner, depth)) = self.fn_owner_and_depth(id) else { continue };
+                    let Some((owner, depth)) = self.fn_owner_and_depth(id) else {
+                        continue;
+                    };
                     self.captures_this.insert(owner);
-                    self.special.insert(t.node_id.get(), Special::This { owner, depth });
+                    self.special
+                        .insert(t.node_id.get(), Special::This { owner, depth });
                 }
                 AstKind::NewTarget(m) => {
-                    let Some((owner, depth)) = self.fn_owner_and_depth(id) else { continue };
+                    let Some((owner, depth)) = self.fn_owner_and_depth(id) else {
+                        continue;
+                    };
                     if owner != self.current_fn_of(id) {
                         self.captures_new_target.insert(owner);
                     }
@@ -965,7 +993,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
                         .insert(m.node_id.get(), Special::NewTarget { owner, depth });
                 }
                 AstKind::CallExpression(c) if matches!(c.callee, Expression::Super(_)) => {
-                    let Some((owner, depth)) = self.fn_owner_and_depth(id) else { continue };
+                    let Some((owner, depth)) = self.fn_owner_and_depth(id) else {
+                        continue;
+                    };
                     if owner != self.current_fn_of(id) {
                         self.needs_this_function.insert(owner);
                         self.captures_new_target.insert(owner);
@@ -977,7 +1007,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
                     let is_static = self.enclosing_member_is_static(id);
                     self.resolve_super(id, is_static);
                 }
-                AstKind::ComputedMemberExpression(e) if matches!(e.object, Expression::Super(_)) => {
+                AstKind::ComputedMemberExpression(e)
+                    if matches!(e.object, Expression::Super(_)) =>
+                {
                     let is_static = self.enclosing_member_is_static(id);
                     self.resolve_super(id, is_static);
                 }
@@ -1109,7 +1141,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
     }
 
     fn resolve_super(&mut self, node: NodeId, is_static: bool) {
-        let Some((this_owner, this_depth)) = self.fn_owner_and_depth(node) else { return };
+        let Some((this_owner, this_depth)) = self.fn_owner_and_depth(node) else {
+            return;
+        };
         self.captures_this.insert(this_owner);
         let mut home = None;
         let mut depth = 0u32;
@@ -1146,7 +1180,12 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         if let Some(home) = home {
             self.special.insert(
                 node,
-                Special::Super { home, depth, this_owner, this_depth },
+                Special::Super {
+                    home,
+                    depth,
+                    this_owner,
+                    this_depth,
+                },
             );
         }
     }
@@ -1176,7 +1215,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         for rid in 0..self.scoping.references_len() {
             let rid = ReferenceId::from_usize(rid);
             let reference = self.scoping.get_reference(rid);
-            let Some(symbol) = reference.symbol_id() else { continue };
+            let Some(symbol) = reference.symbol_id() else {
+                continue;
+            };
             let decl_owner = self.scope_owner(self.scoping.symbol_scope_id(symbol));
             let use_owner = self.use_function_of(reference.node_id());
             if decl_owner != use_owner {
@@ -1192,9 +1233,7 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         match anc_kind {
             AstKind::PropertyDefinition(p) => {
                 let key_span = GetSpan::span(&p.key);
-                p.computed
-                    && ref_span.start >= key_span.start
-                    && ref_span.end <= key_span.end
+                p.computed && ref_span.start >= key_span.start && ref_span.end <= key_span.end
             }
             _ => false,
         }
@@ -1223,7 +1262,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         for rid in 0..self.scoping.references_len() {
             let rid = ReferenceId::from_usize(rid);
             let reference = self.scoping.get_reference(rid);
-            let Some(symbol) = reference.symbol_id() else { continue };
+            let Some(symbol) = reference.symbol_id() else {
+                continue;
+            };
             // only context loads need a depth: captured symbols, and
             // class / for-head slots (always context-allocated). Local
             // and param references never consult the table.
@@ -1248,7 +1289,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
                     continue;
                 }
             }
-            let Some(host) = self.hosting_node(decl_scope) else { continue };
+            let Some(host) = self.hosting_node(decl_scope) else {
+                continue;
+            };
             let depth = self.ctx_hops_from_ref(reference.node_id(), host);
             self.ref_depth.insert(rid, depth);
         }
@@ -1355,8 +1398,7 @@ fn collect_params<'a>(ps: &'a FormalParameters<'a>) -> (Vec<ParamData<'a>>, u32)
     let mut simple = true;
     for p in &ps.items {
         if simple {
-            if p.initializer.is_some()
-                || !matches!(p.pattern, BindingPattern::BindingIdentifier(_))
+            if p.initializer.is_some() || !matches!(p.pattern, BindingPattern::BindingIdentifier(_))
             {
                 simple = false;
             } else {

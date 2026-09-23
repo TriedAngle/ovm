@@ -2,8 +2,8 @@
 //! and assert on function metadata and the emitted instruction stream.
 //! (Runtime behavior is covered by the `vm` test suite.)
 
-use bytecode::{Opcode, Operand};
 use bytecode::{FrontendErrorKind, Function, FunctionId, Program, SourceMode};
+use bytecode::{Opcode, Operand};
 use js_compiler::compile_js;
 
 fn compile(src: &str, mode: SourceMode) -> Program {
@@ -124,7 +124,10 @@ fn strict_directive_propagates() {
 #[test]
 fn hoisted_function_declarations_are_initialized_in_the_prologue() {
     // the closure creation must precede any body code
-    let p = compile("var r = f(); function f() { return 1; }", SourceMode::Script);
+    let p = compile(
+        "var r = f(); function f() { return 1; }",
+        SourceMode::Script,
+    );
     let f = script_fn(&p);
     let first_create = position(&p, f, Opcode::CreateClosure);
     let first_call = position(&p, f, Opcode::CallNoFeedback);

@@ -910,11 +910,12 @@ impl MarkSweepLocal {
         }
     }
 
-    fn park_if_requested(&self) {
+    fn park_if_requested(&self) -> bool {
         if self.node.requested() {
             self.invalidate_tlab();
-            self.state.safepoint.park_for_collection(&self.node);
+            return self.state.safepoint.park_for_collection(&self.node);
         }
+        false
     }
 
     fn tlab_bump(&self, need: usize) -> Option<NonNull<u8>> {
@@ -987,11 +988,21 @@ impl LocalHeap for MarkSweepLocal {
     }
 
     fn collection_requested(&self) -> bool {
-        self.node.requested()
+        self.node.pending()
     }
 
-    fn park_for_collection(&self) {
-        self.park_if_requested();
+    fn park_for_collection(&self) -> bool {
+        self.park_if_requested()
+    }
+
+    fn take_cancel(&self) -> bool {
+        self.node.take_cancel()
+    }
+
+    fn cancel_executions(&self, protocol: &dyn Fn()) {
+        self.state
+            .safepoint
+            .cancel_executions(&self.node, || protocol());
     }
 
     fn force_collect(&self) {

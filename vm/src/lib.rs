@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use core::cell::Cell;
@@ -20,6 +21,7 @@ pub mod materialize;
 pub mod objects;
 pub mod runtime;
 pub mod stack;
+pub mod tools;
 pub mod transition;
 pub mod value;
 
@@ -55,6 +57,7 @@ pub use objects::{
 };
 pub use runtime::{Coercion, Hint, RuntimeCall, RuntimeContext, RuntimeIndex, RuntimeRegistry};
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
+pub use tools::{KetteTools, Termination};
 pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
     TransitionGuard, TransitionLock,
@@ -102,6 +105,10 @@ pub struct SharedVM {
     /// Weak slots the GC clears when their targets die; used for tests and
     /// the seed of a weak-registry feature.
     weak_slots: Mutex<Vec<RawCell>>,
+    /// Informational only: set once `KetteTools.shutdown()` ran. Cancels
+    /// live on the safepoint nodes, not here — the VM stays usable after a
+    /// shutdown.
+    shutdown_requested: AtomicBool,
 }
 
 pub struct VM {
@@ -114,6 +121,10 @@ pub struct ContextState {
     cache: StackCache,
     pending_exception: Register,
     has_pending_exception: Cell<bool>,
+    /// Why this thread's execution terminated, if it did. Set exactly once,
+    /// right before the uncatchable unwind; guest code can never observe or
+    /// intercept it.
+    termination: Cell<Option<Termination>>,
 }
 
 impl ContextState {
@@ -148,6 +159,21 @@ impl ContextState {
 
     pub fn has_pending_exception(&self) -> bool {
         self.has_pending_exception.get()
+    }
+
+    /// Why this thread terminated, if it did (uncatchable by guest code).
+    pub fn termination(&self) -> Option<Termination> {
+        self.termination.get()
+    }
+
+    pub fn set_termination(&self, termination: Termination) {
+        self.termination.set(Some(termination));
+    }
+
+    /// Reset the termination marker for a fresh run: a terminated
+    /// execution ends here, the thread itself keeps going.
+    pub fn clear_termination(&self) {
+        self.termination.set(None);
     }
 
     /// The current frame's context (the chain `LoadContextSlot` walks),
@@ -195,6 +221,17 @@ impl SharedVM {
             layout_of: host_layout_of,
             visit_object: host_visit_object,
         }
+    }
+
+    /// Install `KetteTools` on the global object. Owns the bootstrap-style
+    /// stack handle scope; the installed object stays reachable through
+    /// the global object after it dies.
+    fn install_tools(&self, local: &mut Heap) {
+        let data = HandleData::new(local.known().the_hole.raw());
+        // Safety: `data` outlives every use of the scope below.
+        let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
+        KetteTools::install(local, &self.interner, &scope)
+            .expect("installing KetteTools must not fail");
     }
 }
 
@@ -281,9 +318,9 @@ impl Thread {
 
         // don't leak pending exception if it exists
         let _ = self.state.take_pending_exception();
-        // Safety: caller-owned argument words staged into rooted slots
-        // before anything can allocate.
-        self.state.handle_scope(|scope| {
+        self.state.clear_termination();
+        let _ = self.heap.take_cancel();
+        let result = self.state.handle_scope(|scope| {
             let args = scope.stage(
                 &args
                     .iter()
@@ -292,7 +329,13 @@ impl Thread {
             );
             interpreter::execute(&self.vm, &mut self.heap, &self.state, callable, args, None)
                 .map(|v| v.raw())
-        })
+        });
+        if self.state.termination().is_some() {
+            let _ = self.state.take_pending_exception();
+            let heap = &self.heap;
+            return Ok(heap.known().undefined.as_tagged(heap).raw());
+        }
+        result
     }
 
     pub fn error_object(&mut self, err: VmError) -> Result<Value, VmError> {
@@ -391,17 +434,29 @@ impl VM {
             interner,
             runtimes: RuntimeRegistry::new(),
             weak_slots: Mutex::new(Vec::new()),
+            shutdown_requested: AtomicBool::new(false),
         });
         shared.heap.set_host(shared.gc_host());
         let mut local = shared.heap.new_local(&shared.known);
         bootstrap_basics(&mut local, &shared.roots);
         intern_well_known_strings(&mut local, &shared.interner, &shared.roots);
         bootstrap_well_known(&mut local, &shared.roots);
+        shared.install_tools(&mut local);
         Ok(Self { shared })
     }
 
     pub fn heap(&self) -> &GlobalHeap {
         &self.shared.heap
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.shared.shutdown_requested.load(Ordering::Acquire)
+    }
+
+    pub fn note_shutdown(&self) {
+        self.shared
+            .shutdown_requested
+            .store(true, Ordering::Release);
     }
 
     pub fn known(&self) -> &WellKnown {
@@ -461,6 +516,7 @@ impl VM {
             cache: StackCache::new(the_hole),
             pending_exception: unsafe { Register::from_value(the_hole) },
             has_pending_exception: Cell::new(false),
+            termination: Cell::new(None),
         });
         let mut threads = self.shared.threads.lock().unwrap();
         // TODO: should we really call this every attach() ?

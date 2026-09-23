@@ -727,6 +727,24 @@ impl<'s> PropertyDescriptor<'s> {
         }
     }
 
+    pub const fn method(value: Handle<'s, Value>) -> Self {
+        Self::Data {
+            value,
+            writable: true,
+            enumerable: false,
+            configurable: true,
+        }
+    }
+
+    pub const fn non_enumerable(value: Handle<'s, Value>) -> Self {
+        Self::Data {
+            value,
+            writable: false,
+            enumerable: false,
+            configurable: true,
+        }
+    }
+
     pub const fn flags(self) -> SlotFlags {
         match self {
             Self::Data {

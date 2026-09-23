@@ -1,8 +1,8 @@
 //! Feedback-vector plumbing: slot allocation in codegen, transport through
 //! the IR, and materialization into a hole-filled `FeedbackVector`.
 
-use bytecode::{Opcode, decode};
 use bytecode::{FunctionId, Program, SourceMode};
+use bytecode::{Opcode, decode};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::VM;
 
