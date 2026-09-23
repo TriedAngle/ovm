@@ -7,10 +7,10 @@ members = [
     "heap_api",
     "heap_tests",
     "heap_utils",
-    "ir",
     "js_compiler",
     "kette_compiler",
     "kette_parser",
+    "trace",
     "vm",
 ]
 

@@ -1,7 +1,7 @@
 //! Run Kette source: `cargo run -p kette_compiler --example run -- file.ktt`
 //! (reads stdin when no path is given). Prints the script's value.
 
-use ir::SourceMode;
+use bytecode::SourceMode;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{DenseString, Float, Smi, Thread, VM, Value};
 

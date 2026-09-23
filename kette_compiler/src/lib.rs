@@ -1,16 +1,14 @@
-//! Kette AST → shared IR lowering.
+//! Kette AST → bytecode lowering.
 //!
 //! Pipeline: parse → [`desugar`] (control flow / operators become sends,
 //! in place) → resolve → [`codegen`]. The output is a heap-free
-//! [`ir::Program`]; the `vm` crate owns converting it to VM objects.
+//! [`bytecode::Program`]; the `vm` crate owns converting it to VM objects.
 
 pub mod codegen;
 pub mod desugar;
-mod label;
 
-use ir::{FrontendError, Program, SourceMode};
+use bytecode::{FrontendError, Program, SourceMode};
 use kette_parser::{Ast, ByteSpan, Parser, Utf8SliceStream, resolve};
-
 /// A construct the lowering does not support yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompileError {
@@ -36,13 +34,23 @@ impl core::fmt::Display for CompileError {
 
 /// Desugar + resolve + lower a parsed unit. `functions[0]` is the script.
 pub fn compile_ast(ast: &mut Ast) -> Result<Program, CompileError> {
-    desugar::desugar(ast);
-    let resolved = resolve(ast);
-    codegen::generate(ast, &resolved)
+    let _pipeline = trace::info_span!("kette::compile");
+    {
+        let _span = trace::info_span!("kette::desugar").entered();
+        desugar::desugar(ast);
+    }
+    let resolved = {
+        let _span = trace::info_span!("kette::resolve").entered();
+        resolve(ast)
+    };
+    {
+        let _span = trace::info_span!("kette::codegen").entered();
+        codegen::generate(ast, &resolved)
+    }
 }
 
-/// Kette frontend entry point: parse `source` and lower it to the shared
-/// IR, mapping failures into the language-neutral [`FrontendError`].
+/// Kette frontend entry point: parse `source` and lower it to bytecode,
+/// mapping failures into the language-neutral [`FrontendError`].
 pub fn compile_kette(source: &str, mode: SourceMode) -> Result<Program, FrontendError> {
     if mode != SourceMode::Script {
         return Err(FrontendError::compile(

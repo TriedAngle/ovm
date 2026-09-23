@@ -1,14 +1,14 @@
 //! Disassemble a script: parse → compile → print per-function bytecode.
 
 use bytecode::decode;
-use ir::Constant;
+use bytecode::Constant;
 
 fn main() {
     let path = std::env::args()
         .nth(1)
         .expect("usage: dump_bytecode <script.js>");
     let src = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
-    let program = match js_compiler::compile_js(&src, ir::SourceMode::Script) {
+    let program = match js_compiler::compile_js(&src, bytecode::SourceMode::Script) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("compile error: {e}");

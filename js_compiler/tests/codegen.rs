@@ -3,18 +3,18 @@
 //! (Runtime behavior is covered by the `vm` test suite.)
 
 use bytecode::{Opcode, Operand};
-use ir::{FrontendErrorKind, FunctionId, Program, SourceMode};
+use bytecode::{FrontendErrorKind, Function, FunctionId, Program, SourceMode};
 use js_compiler::compile_js;
 
 fn compile(src: &str, mode: SourceMode) -> Program {
     compile_js(src, mode).expect("compile")
 }
 
-fn script_fn(program: &Program) -> &ir::Function {
+fn script_fn(program: &Program) -> &Function {
     program.function(FunctionId::SCRIPT)
 }
 
-fn ops(program: &Program, f: &ir::Function) -> Vec<Opcode> {
+fn ops(program: &Program, f: &Function) -> Vec<Opcode> {
     let code = program.code(f);
     let mut out = Vec::new();
     let mut pc = 0;
@@ -26,7 +26,7 @@ fn ops(program: &Program, f: &ir::Function) -> Vec<Opcode> {
     out
 }
 
-fn contains(program: &Program, f: &ir::Function, op: Opcode) -> bool {
+fn contains(program: &Program, f: &Function, op: Opcode) -> bool {
     ops(program, f).contains(&op)
 }
 
@@ -142,7 +142,7 @@ fn class_declarations_compile_with_synthesized_members() {
     assert_eq!(p.len(), 4);
 }
 
-fn position(program: &Program, f: &ir::Function, op: Opcode) -> usize {
+fn position(program: &Program, f: &Function, op: Opcode) -> usize {
     let code = program.code(f);
     let mut pc = 0;
     while pc < code.len() {
@@ -156,7 +156,7 @@ fn position(program: &Program, f: &ir::Function, op: Opcode) -> usize {
 }
 
 /// (opcode, formatted operands) pairs for targeted assertions.
-fn program_code<'p>(program: &'p Program, f: &'p ir::Function) -> Vec<(Opcode, Vec<u32>)> {
+fn program_code<'p>(program: &'p Program, f: &'p Function) -> Vec<(Opcode, Vec<u32>)> {
     let code = program.code(f);
     let mut out = Vec::new();
     let mut pc = 0;

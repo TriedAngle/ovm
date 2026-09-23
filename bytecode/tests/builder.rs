@@ -3,8 +3,9 @@
 //! handler ranges, accumulator elision, and validation.
 
 use bytecode::{
-    BuildError, CallableKind, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode, Operand,
-    Program, Reg, RegList, ValidationError, validate, validate_function, try_decode,
+    BuildError, CallableKind, Constant, ConstIdx, FnBuilder, FunctionId, FunctionMeta, Opcode,
+    Operand, Program, Reg, RegList, RtArg, RuntimeFn, ValidationError, validate, validate_function,
+    try_decode,
 };
 
 #[derive(Debug, PartialEq)]
@@ -111,6 +112,43 @@ fn constant_pool_dedups() {
     let func = b.finish(meta()).unwrap();
     assert_eq!(func.constants.len(), 9);
     assert!(matches!(func.constants[x.index() as usize], Constant::String(_)));
+}
+
+#[test]
+fn staged_runtime_calls_lay_out_the_window_in_order() {
+    // SetFunctionName(closure = acc, name, prefix): the accumulator value
+    // must be captured into slot 0 even though later loads clobber acc
+    let mut b = FnBuilder::new(0);
+    b.load_name(b"fn");
+    let obj = b.stage_acc();
+    let name = b.name(b"key");
+    b.call_runtime_staged(
+        RuntimeFn::SetFunctionName,
+        &[RtArg::Acc, RtArg::Const(name), RtArg::Smi(2)],
+    );
+    b.load(obj);
+    b.drop_temp();
+    b.ret();
+
+    let f = b.finish(meta()).unwrap();
+    let instrs = decoded(&f.code);
+    // obj staged at temp 0; the window occupies temps 1..4
+    assert_eq!(
+        instrs,
+        vec![
+            Instr { op: Opcode::LoadConstant, ops: vec![0], at: 0 }, // "fn"
+            Instr { op: Opcode::Store, ops: vec![0], at: 2 },        // obj = temp 0
+            Instr { op: Opcode::Store, ops: vec![1], at: 4 },        // acc -> window slot 0
+            Instr { op: Opcode::LoadConstant, ops: vec![1], at: 6 }, // "key"
+            Instr { op: Opcode::Store, ops: vec![2], at: 8 },
+            Instr { op: Opcode::LoadSmi, ops: vec![2], at: 10 },
+            Instr { op: Opcode::Store, ops: vec![3], at: 12 },
+            Instr { op: Opcode::CallRuntime, ops: vec![19, 1, 3], at: 14 }, // SetFunctionName discriminant
+            Instr { op: Opcode::Load, ops: vec![0], at: 18 },
+            Instr { op: Opcode::Return, ops: vec![], at: 20 },
+        ]
+    );
+    validate_function(&f, 0).unwrap();
 }
 
 #[test]

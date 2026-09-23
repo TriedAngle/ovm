@@ -1,12 +1,13 @@
 use std::io::Write;
 use std::path::Path;
 
-use ir::{CompileFn, SourceMode};
+use bytecode::{CompileFn, SourceMode};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{DenseString, Float, Smi, Value};
 use vm::{Thread, VM};
 
 fn main() {
+    trace::init();
     let vm =
         VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).expect("failed to create heap");
     let mut thread = vm.attach();

@@ -278,7 +278,7 @@ pub fn function_constructor<'a>(
             None => (String::new(), String::new()),
         };
         let source = format!("(function ({params}) {{\n{body}\n}})");
-        let program = match js_compiler::compile_js(&source, ir::SourceMode::Eval) {
+        let program = match js_compiler::compile_js(&source, bytecode::SourceMode::Eval) {
             Ok(program) => program,
             Err(_) => {
                 let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;

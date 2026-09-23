@@ -1,8 +1,7 @@
 //! Golden bytecode tests: compile snippets and assert on the emitted
 //! instruction stream (constants inlined, jump targets absolute).
 
-use bytecode::{Opcode, Operand};
-use ir::{Constant, Function, FunctionId, Program};
+use bytecode::{Constant, Function, FunctionId, Opcode, Operand, Program};
 use kette_compiler::CompileError;
 
 fn compile(src: &str) -> Program {

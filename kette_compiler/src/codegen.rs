@@ -11,28 +11,12 @@
 //! the prologue). Expression results use the implicit temp stack above
 //! the locals, like `js_compiler`.
 
-use bytecode::{Opcode, emit};
-use ir::{
-    CallableKind, Constant, FunctionBuilder, FunctionId as IrFunctionId, HandlerEntry, Program,
+use bytecode::{
+    CallableKind, Constant, ConstIdx, FnBuilder, FunctionId, FunctionMeta, Program, Reg, RegList,
 };
 use kette_parser::{Ast, Node, NodeId, NodeList, Resolution, Resolved, ScopeId, SlotKind, Symbol};
 
 use crate::CompileError;
-use crate::label::Label;
-
-/// Emit a forced-wide relative jump to `label`; the offset is patched once
-/// the label is bound.
-fn emit_jump(code: &mut Vec<u8>, op: Opcode, label: &mut Label) {
-    debug_assert!(matches!(
-        op,
-        Opcode::Jump | Opcode::JumpIfTruthy | Opcode::JumpIfFalsy
-    ));
-    let pc = code.len();
-    code.push(Opcode::Wide as u8);
-    code.push(op as u8);
-    code.extend_from_slice(&[0, 0]);
-    label.patch_here(pc);
-}
 
 /// `node -> function index` for every `Node::Block` (script is 0).
 fn collect_blocks(ast: &Ast, node: NodeId, out: &mut Vec<NodeId>) {
@@ -164,6 +148,7 @@ pub fn generate(ast: &Ast, resolved: &Resolved) -> Result<Program, CompileError>
         generator.generate()?;
         program.add_function(generator.finish());
     }
+    debug_assert!(bytecode::validate(&program).is_ok());
     Ok(program)
 }
 
@@ -175,24 +160,15 @@ struct FunctionGen<'a> {
     /// per scope decl: context-allocated because a nested block captures it
     captured: Vec<bool>,
     /// per scope decl: frame register, when not captured
-    reg_of: Vec<Option<u32>>,
+    reg_of: Vec<Option<Reg>>,
     param_count: usize,
     /// `node -> function index` for closure creation
     block_fids: &'a [Option<u32>],
-    code: Vec<u8>,
-    constants: Vec<Constant>,
-    handlers: Vec<HandlerEntry>,
+    b: FnBuilder,
     /// register holding the pushed-over context (prologue/epilogue)
-    ctx_save: u32,
+    ctx_save: Reg,
     /// block/script result register (last expression statement)
-    completion: u32,
-    /// first temp register, above the locals
-    reg_base: u32,
-    next_temp: u32,
-    max_temps: u32,
-    /// inline-cache slots consumed so far (in slots; each property-access
-    /// site reserves a [state, handler] pair)
-    feedback_slots: u32,
+    completion: Reg,
     /// decl index of the next `let` in this body (params come first)
     next_let: usize,
 }
@@ -221,10 +197,16 @@ impl<'a> FunctionGen<'a> {
         let mut local_count = 0u32;
         for (decl, is_captured) in captured.iter().enumerate() {
             if !is_captured {
-                reg_of[decl] = Some(local_count);
+                reg_of[decl] = Some(Reg::new(local_count as i32));
                 local_count += 1;
             }
         }
+        // frame layout: locals, then the context-save and completion
+        // registers, then the temp stack
+        let ctx_save = Reg::new(local_count as i32);
+        let completion = Reg::new(local_count as i32 + 1);
+        let mut b = FnBuilder::new(param_count as u32);
+        b.set_temp_base(local_count + 2);
         Self {
             ast,
             resolved,
@@ -234,101 +216,54 @@ impl<'a> FunctionGen<'a> {
             reg_of,
             param_count,
             block_fids,
-            code: Vec::new(),
-            constants: Vec::new(),
-            handlers: Vec::new(),
-            ctx_save: local_count,
-            completion: local_count + 1,
-            reg_base: local_count + 2,
-            next_temp: 0,
-            max_temps: 0,
-            feedback_slots: 0,
+            b,
+            ctx_save,
+            completion,
             next_let: param_count,
         }
     }
 
-    fn finish(self) -> FunctionBuilder {
-        FunctionBuilder {
-            bytecode: self.code,
-            constants: self.constants,
-            handlers: self.handlers,
-            name: None,
-            register_count: self.reg_base + self.max_temps,
-            kind: CallableKind::Method,
-            arity: self.param_count as u32,
-            length: self.param_count as u32,
-            strict: true,
-            feedback_count: self.feedback_slots,
-        }
+    fn finish(self) -> bytecode::Function {
+        // build failures (unbalanced temps, unbound labels) are compiler
+        // bugs here: every emit path pairs its temp marks and binds its
+        // labels by construction
+        self.b
+            .finish(FunctionMeta {
+                name: None,
+                kind: CallableKind::Method,
+                length: self.param_count as u32,
+                strict: true,
+            })
+            .expect("kette function builder invariants")
     }
 
     fn err<T>(&self, node: NodeId, feature: &'static str) -> Result<T, CompileError> {
         Err(CompileError::new(self.ast.span(node), feature))
     }
 
-    // -- feedback -----------------------------------------------------------
+    // -- constants -----------------------------------------------------------
 
-    /// Reserve a `[state, handler]` feedback-slot pair for a property-access
-    /// site and return the base index embedded as the site's feedback
-    /// operand.
-    fn feedback_slot(&mut self) -> u32 {
-        let slot = self.feedback_slots;
-        self.feedback_slots += 2;
-        slot
-    }
-
-    // -- temps -------------------------------------------------------------
-
-    fn push_value(&mut self) -> u32 {
-        let r = self.reg_base + self.next_temp;
-        self.next_temp += 1;
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(&mut self.code, Opcode::Store, &[r]);
-        r
-    }
-
-    fn pop_value(&mut self) {
-        debug_assert!(self.next_temp > 0, "temp underflow");
-        self.next_temp -= 1;
-    }
-
-    fn add_constant(&mut self, c: Constant) -> u32 {
-        self.constants.push(c);
-        (self.constants.len() - 1) as u32
-    }
-
-    fn emit_load_constant(&mut self, c: Constant) {
-        let idx = self.add_constant(c);
-        emit(&mut self.code, Opcode::LoadConstant, &[idx]);
-    }
-
-    fn name_constant(&mut self, name: Symbol) -> u32 {
-        self.add_constant(Constant::String(self.ast.symbol(name).to_vec()))
+    fn name_constant(&mut self, name: Symbol) -> ConstIdx {
+        self.b.name(self.ast.symbol(name))
     }
 
     // -- locals ------------------------------------------------------------
 
     fn load_decl(&mut self, decl: usize) {
         if self.captured[decl] {
-            emit(&mut self.code, Opcode::LoadContextSlot, &[decl as u32, 0]);
+            self.b.load_context_slot(decl as u32, 0);
         } else {
-            emit(
-                &mut self.code,
-                Opcode::Load,
-                &[self.reg_of[decl].expect("uncaptured decl has a register")],
-            );
+            let reg = self.reg_of[decl].expect("uncaptured decl has a register");
+            self.b.load(reg);
         }
     }
 
     fn store_decl(&mut self, decl: usize) {
         if self.captured[decl] {
-            emit(&mut self.code, Opcode::StoreContextSlot, &[decl as u32, 0]);
+            self.b.store_context_slot(decl as u32, 0);
         } else {
-            emit(
-                &mut self.code,
-                Opcode::Store,
-                &[self.reg_of[decl].expect("uncaptured decl has a register")],
-            );
+            let reg = self.reg_of[decl].expect("uncaptured decl has a register");
+            self.b.store(reg);
         }
     }
 
@@ -336,15 +271,15 @@ impl<'a> FunctionGen<'a> {
         match self.resolved.resolution(node) {
             Some(Resolution::Local { decl, .. }) => self.load_decl(decl as usize),
             Some(Resolution::Capture { decl, depth, .. }) => {
-                emit(&mut self.code, Opcode::LoadContextSlot, &[decl, depth]);
+                self.b.load_context_slot(decl, depth);
             }
             Some(Resolution::Global) | None => {
                 let Node::Ident(sym) = *self.ast.node(node) else {
                     unreachable!("identifier nodes carry a symbol");
                 };
                 let idx = self.name_constant(sym);
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::LoadGlobal, &[idx, feedback]);
+                let feedback = self.b.new_feedback();
+                self.b.load_global(idx, feedback);
             }
         }
     }
@@ -353,15 +288,15 @@ impl<'a> FunctionGen<'a> {
         match self.resolved.resolution(node) {
             Some(Resolution::Local { decl, .. }) => self.store_decl(decl as usize),
             Some(Resolution::Capture { decl, depth, .. }) => {
-                emit(&mut self.code, Opcode::StoreContextSlot, &[decl, depth]);
+                self.b.store_context_slot(decl, depth);
             }
             Some(Resolution::Global) | None => {
                 let Node::Ident(sym) = *self.ast.node(node) else {
                     unreachable!("identifier nodes carry a symbol");
                 };
                 let idx = self.name_constant(sym);
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::StoreGlobal, &[idx, feedback]);
+                let feedback = self.b.new_feedback();
+                self.b.store_global(idx, feedback);
             }
         }
     }
@@ -371,30 +306,31 @@ impl<'a> FunctionGen<'a> {
     fn generate(&mut self) -> Result<(), CompileError> {
         // prologue: one context per function (uniform chain); the shared
         // ScopeInfo (constant 0) names every slot for dynamic resolution
-        let names: Vec<Vec<u8>> = self
+        let names: Vec<Box<[u8]>> = self
             .resolved
             .scope(self.scope)
             .decls
             .iter()
-            .map(|d| self.ast.symbol(d.name).to_vec())
+            .map(|d| self.ast.symbol(d.name).into())
             .collect();
-        let ctx_info = self.add_constant(Constant::ContextNames(names));
-        emit(&mut self.code, Opcode::CreateFunctionContext, &[ctx_info]);
-        emit(&mut self.code, Opcode::PushContext, &[self.ctx_save]);
-        emit(&mut self.code, Opcode::LoadUndefined, &[]);
-        emit(&mut self.code, Opcode::Store, &[self.completion]);
+        let ctx_info = self.b.constant(Constant::ContextNames(names));
+        self.b.create_function_context(ctx_info);
+        self.b.push_context(self.ctx_save);
+        self.b.load_undefined();
+        self.b.store(self.completion);
 
         // parameters arrive at -(i + 2); bind them (context copies included)
         for i in 0..self.param_count {
-            emit(&mut self.code, Opcode::Load, &[(-(i as i32 + 2)) as u32]);
+            let param = self.b.param(i as u32);
+            self.b.load(param);
             self.store_decl(i);
         }
 
         self.emit_stmts(self.body)?;
 
-        emit(&mut self.code, Opcode::Load, &[self.completion]);
-        emit(&mut self.code, Opcode::PopContext, &[self.ctx_save]);
-        emit(&mut self.code, Opcode::Return, &[]);
+        self.b.load(self.completion);
+        self.b.pop_context(self.ctx_save);
+        self.b.ret();
         Ok(())
     }
 
@@ -404,6 +340,11 @@ impl<'a> FunctionGen<'a> {
         };
         let stmts = self.ast.list_items(stmts).to_vec();
         for stmt in stmts {
+            // a terminating expression (`return` is kette's expression
+            // statement) makes the remaining statements unreachable
+            if !self.b.is_live() {
+                break;
+            }
             self.emit_stmt(stmt)?;
         }
         Ok(())
@@ -420,7 +361,11 @@ impl<'a> FunctionGen<'a> {
             }
             Node::ExprStmt { expr } => {
                 self.expr(expr)?;
-                emit(&mut self.code, Opcode::Store, &[self.completion]);
+                // `return x` terminates mid-statement: the completion
+                // store would read a dead accumulator
+                if self.b.is_live() {
+                    self.b.store(self.completion);
+                }
                 Ok(())
             }
             _ => self.err(stmt, "statement"),
@@ -436,33 +381,36 @@ impl<'a> FunctionGen<'a> {
                 const MAX_EXACT_INT: f64 = 9007199254740991.0;
                 let is_int = f.fract() == 0.0 && !(f == 0.0 && f.is_sign_negative());
                 if is_int && f >= i16::MIN as f64 && f <= i16::MAX as f64 {
-                    emit(&mut self.code, Opcode::LoadSmi, &[f as i32 as u32]);
+                    self.b.load_smi(f as i32);
                 } else if is_int && f.abs() <= MAX_EXACT_INT {
-                    self.emit_load_constant(Constant::Smi(f as i64));
+                    let c = self.b.constant(Constant::Smi(f as i64));
+                    self.b.load_constant(c);
                 } else {
-                    self.emit_load_constant(Constant::Float(f));
+                    let c = self.b.constant(Constant::Float(f));
+                    self.b.load_constant(c);
                 }
                 Ok(())
             }
             Node::String(sym) => {
-                self.emit_load_constant(Constant::String(self.ast.symbol(sym).to_vec()));
+                let c = self.b.constant(Constant::String(self.ast.symbol(sym).into()));
+                self.b.load_constant(c);
                 Ok(())
             }
             Node::Bool(true) => {
-                emit(&mut self.code, Opcode::LoadTrue, &[]);
+                self.b.load_true();
                 Ok(())
             }
             Node::Bool(false) => {
-                emit(&mut self.code, Opcode::LoadFalse, &[]);
+                self.b.load_false();
                 Ok(())
             }
             Node::Null => {
-                emit(&mut self.code, Opcode::LoadNull, &[]);
+                self.b.load_null();
                 Ok(())
             }
             Node::Self_ => {
-                // `self` is the frame receiver (param 0), bound at send time
-                emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+                // `self` is the frame receiver, bound at send time
+                self.b.load(self.b.this_reg());
                 Ok(())
             }
             Node::Ident(_) => {
@@ -473,30 +421,26 @@ impl<'a> FunctionGen<'a> {
             Node::Array { elements } => self.emit_array(elements),
             Node::Block { .. } => {
                 let child = self.block_fids[node.0 as usize].expect("block was collected");
-                let idx = self.add_constant(Constant::Callable(IrFunctionId(child)));
-                emit(&mut self.code, Opcode::CreateClosure, &[idx]);
+                let idx = self.b.constant(Constant::Callable(FunctionId(child)));
+                self.b.create_closure(idx);
                 Ok(())
             }
             Node::Get { recv, name } => {
                 self.expr(recv)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 let name = self.name_constant(name);
-                let feedback = self.feedback_slot();
-                emit(
-                    &mut self.code,
-                    Opcode::LoadNamedProperty,
-                    &[obj, name, feedback],
-                );
-                self.pop_value();
+                let feedback = self.b.new_feedback();
+                self.b.load_named_property(obj, name, feedback);
+                self.b.drop_temp();
                 Ok(())
             }
             Node::Index { recv, key } => {
                 self.expr(recv)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 self.expr(key)?;
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::LoadKeyedProperty, &[obj, feedback]);
-                self.pop_value();
+                let feedback = self.b.new_feedback();
+                self.b.load_keyed_property(obj, feedback);
+                self.b.drop_temp();
                 Ok(())
             }
             Node::Send { recv, name, args } => self.emit_send(recv, name, args),
@@ -504,8 +448,8 @@ impl<'a> FunctionGen<'a> {
             Node::Assign { target, value } => self.emit_assign(target, value),
             Node::Return { value } => {
                 self.expr(value)?;
-                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save]);
-                emit(&mut self.code, Opcode::Return, &[]);
+                self.b.pop_context(self.ctx_save);
+                self.b.ret();
                 Ok(())
             }
             Node::Try { body, handler } => self.emit_try(body, handler),
@@ -534,30 +478,25 @@ impl<'a> FunctionGen<'a> {
     ) -> Result<(), CompileError> {
         let args: Vec<NodeId> = self.ast.list_items(args).to_vec();
         let argc = args.len() as u32;
+        let mark = self.b.temp_depth();
         self.expr(recv)?;
-        let recv_reg = self.push_value();
+        let recv_reg = self.b.stage_acc();
         let name = self.name_constant(name);
-        let feedback = self.feedback_slot();
-        emit(
-            &mut self.code,
-            Opcode::LoadNamedProperty,
-            &[recv_reg, name, feedback],
-        );
-        let callee_reg = self.reg_base + self.next_temp + argc;
-        emit(&mut self.code, Opcode::Store, &[callee_reg]);
-        self.next_temp += argc + 1;
+        let feedback = self.b.new_feedback();
+        self.b.load_named_property(recv_reg, name, feedback);
+        // argument window [recv, args...] plus the callee slot above it;
+        // the method rides the accumulator straight into its slot before
+        // argument evaluation clobbers it
+        let args_base = self.b.reserve_temps(argc + 1);
+        let callee_reg = Reg::new(args_base.index() + argc as i32);
+        self.b.store(callee_reg);
         for (i, &arg) in args.iter().enumerate() {
             self.expr(arg)?;
-            emit(&mut self.code, Opcode::Store, &[recv_reg + 1 + i as u32]);
+            self.b.store(Reg::new(args_base.index() + i as i32));
         }
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(
-            &mut self.code,
-            Opcode::CallNoFeedback,
-            &[callee_reg, recv_reg, argc + 1],
-        );
-        self.next_temp -= argc + 1;
-        self.pop_value();
+        self.b
+            .call_no_feedback(callee_reg, RegList::new(recv_reg, argc + 1));
+        self.b.drop_temps(mark);
         Ok(())
     }
 
@@ -566,24 +505,21 @@ impl<'a> FunctionGen<'a> {
     fn emit_call(&mut self, callee: NodeId, args: NodeList) -> Result<(), CompileError> {
         let args: Vec<NodeId> = self.ast.list_items(args).to_vec();
         let argc = args.len() as u32;
+        let mark = self.b.temp_depth();
         self.expr(callee)?;
-        let callee_reg = self.reg_base + self.next_temp + 1 + argc;
-        emit(&mut self.code, Opcode::Store, &[callee_reg]);
-        emit(&mut self.code, Opcode::LoadUndefined, &[]);
-        let recv = self.push_value();
-        self.next_temp += argc + 1;
+        // window [recv, args...] plus the callee slot above it
+        let args_base = self.b.reserve_temps(argc + 2);
+        let callee_reg = Reg::new(args_base.index() + argc as i32 + 1);
+        self.b.store(callee_reg);
+        self.b.load_undefined();
+        self.b.store(args_base);
         for (i, &arg) in args.iter().enumerate() {
             self.expr(arg)?;
-            emit(&mut self.code, Opcode::Store, &[recv + 1 + i as u32]);
+            self.b.store(Reg::new(args_base.index() + 1 + i as i32));
         }
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(
-            &mut self.code,
-            Opcode::CallNoFeedback,
-            &[callee_reg, recv, argc + 1],
-        );
-        self.next_temp -= argc + 1;
-        self.pop_value();
+        self.b
+            .call_no_feedback(callee_reg, RegList::new(args_base, argc + 1));
+        self.b.drop_temps(mark);
         Ok(())
     }
 
@@ -595,47 +531,40 @@ impl<'a> FunctionGen<'a> {
     fn emit_try(&mut self, body: NodeId, handler: NodeId) -> Result<(), CompileError> {
         let body_fid = self.block_fids[body.0 as usize].expect("try body collected");
         let handler_fid = self.block_fids[handler.0 as usize].expect("catch handler collected");
-        let body_idx = self.add_constant(Constant::Callable(IrFunctionId(body_fid)));
-        let handler_idx = self.add_constant(Constant::Callable(IrFunctionId(handler_fid)));
+        let body_idx = self.b.constant(Constant::Callable(FunctionId(body_fid)));
+        let handler_idx = self.b.constant(Constant::Callable(FunctionId(handler_fid)));
 
         // call the body closure with no receiver and no arguments
-        let mark = self.next_temp;
-        self.next_temp += 2; // [recv, callee]
-        let base = self.reg_base + mark;
-        let callee = base + 1;
-        emit(&mut self.code, Opcode::CreateClosure, &[body_idx]);
-        emit(&mut self.code, Opcode::Store, &[callee]);
-        emit(&mut self.code, Opcode::LoadUndefined, &[]);
-        emit(&mut self.code, Opcode::Store, &[base]);
-        let try_start = self.code.len();
-        emit(&mut self.code, Opcode::CallNoFeedback, &[callee, base, 1]);
-        let try_end = self.code.len();
-        let mut end = Label::new();
-        emit_jump(&mut self.code, Opcode::Jump, &mut end);
+        let mark = self.b.temp_depth();
+        let base = self.b.reserve_temps(2); // [recv, callee]
+        let callee = Reg::new(base.index() + 1);
+        self.b.create_closure(body_idx);
+        self.b.store(callee);
+        self.b.load_undefined();
+        self.b.store(base);
+        let t = self.b.begin_try();
+        self.b.call_no_feedback(callee, RegList::new(base, 1));
+        self.b.end_try(t);
+
+        let end = self.b.new_label();
+        self.b.jump(end);
 
         // handler entry: the exception arrives in the accumulator; pass it
         // as the catch binding (the handler block's first parameter)
-        let handler_pc = self.code.len();
-        let exception = self.push_value();
-        emit(&mut self.code, Opcode::CreateClosure, &[handler_idx]);
-        let hcallee = self.reg_base + self.next_temp + 2;
-        emit(&mut self.code, Opcode::Store, &[hcallee]);
-        emit(&mut self.code, Opcode::LoadUndefined, &[]);
-        let hrecv = self.push_value();
-        self.next_temp += 2; // [arg0, callee]
-        emit(&mut self.code, Opcode::Load, &[exception]);
-        emit(&mut self.code, Opcode::Store, &[hrecv + 1]);
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(&mut self.code, Opcode::CallNoFeedback, &[hcallee, hrecv, 2]);
-        self.next_temp = mark;
+        self.b.handler_entry(t);
+        let exception = self.b.stage_acc();
+        self.b.create_closure(handler_idx);
+        let hwindow = self.b.reserve_temps(3); // [recv, arg0, callee]
+        let hcallee = Reg::new(hwindow.index() + 2);
+        self.b.store(hcallee);
+        self.b.load_undefined();
+        self.b.store(hwindow);
+        self.b.load(exception);
+        self.b.store(Reg::new(hwindow.index() + 1));
+        self.b.call_no_feedback(hcallee, RegList::new(hwindow, 2));
+        self.b.drop_temps(mark);
 
-        self.handlers.push(HandlerEntry {
-            try_start,
-            try_end,
-            handler_pc,
-        });
-        end.bind(&self.code);
-        end.patch_all(&mut self.code);
+        self.b.bind(end);
         Ok(())
     }
 
@@ -651,27 +580,23 @@ impl<'a> FunctionGen<'a> {
             }
             Node::Get { recv, name } => {
                 self.expr(recv)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 let name = self.name_constant(name);
                 self.expr(value)?;
-                let feedback = self.feedback_slot();
-                emit(
-                    &mut self.code,
-                    Opcode::StoreNamedPropertyNoShadow,
-                    &[obj, name, feedback],
-                );
-                self.pop_value();
+                let feedback = self.b.new_feedback();
+                self.b.store_named_property_no_shadow(obj, name, feedback);
+                self.b.drop_temp();
                 Ok(())
             }
             Node::Index { recv, key } => {
                 self.expr(recv)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 self.expr(key)?;
-                let key = self.push_value();
+                let key = self.b.stage_acc();
                 self.expr(value)?;
-                emit(&mut self.code, Opcode::StoreKeyedSlot, &[obj, key]);
-                self.pop_value();
-                self.pop_value();
+                self.b.store_keyed_slot(obj, key);
+                self.b.drop_temp();
+                self.b.drop_temp();
                 Ok(())
             }
             _ => self.err(target, "assignment target"),
@@ -683,8 +608,8 @@ impl<'a> FunctionGen<'a> {
     /// and element slots go through the ordinary stores.
     fn emit_object(&mut self, slots: NodeList) -> Result<(), CompileError> {
         let slots: Vec<NodeId> = self.ast.list_items(slots).to_vec();
-        emit(&mut self.code, Opcode::CreateBareObjectLiteral, &[]);
-        let obj = self.push_value();
+        self.b.create_bare_object_literal();
+        let obj = self.b.stage_acc();
 
         for &slot in &slots {
             match *self.ast.node(slot) {
@@ -700,7 +625,7 @@ impl<'a> FunctionGen<'a> {
                     };
                     let name = self.name_constant(sym);
                     self.expr(value)?;
-                    emit(&mut self.code, Opcode::AddParent, &[obj, name]);
+                    self.b.add_parent(obj, name);
                 }
                 Node::Slot {
                     kind: SlotKind::Named,
@@ -712,12 +637,8 @@ impl<'a> FunctionGen<'a> {
                     };
                     let name = self.name_constant(sym);
                     self.expr(value)?;
-                    let feedback = self.feedback_slot();
-                    emit(
-                        &mut self.code,
-                        Opcode::StoreNamedProperty,
-                        &[obj, name, feedback],
-                    );
+                    let feedback = self.b.new_feedback();
+                    self.b.store_named_property(obj, name, feedback);
                 }
                 Node::Slot {
                     kind: SlotKind::Element,
@@ -725,44 +646,36 @@ impl<'a> FunctionGen<'a> {
                     value,
                 } => {
                     self.expr(key)?;
-                    let key = self.push_value();
+                    let key = self.b.stage_acc();
                     self.expr(value)?;
-                    let feedback = self.feedback_slot();
-                    emit(
-                        &mut self.code,
-                        Opcode::StoreKeyedProperty,
-                        &[obj, key, feedback],
-                    );
-                    self.pop_value();
+                    let feedback = self.b.new_feedback();
+                    self.b.store_keyed_property(obj, key, feedback);
+                    self.b.drop_temp();
                 }
                 _ => unreachable!("object slots are Slot nodes"),
             }
         }
 
-        emit(&mut self.code, Opcode::Load, &[obj]);
-        self.pop_value();
+        self.b.load(obj);
+        self.b.drop_temp();
         Ok(())
     }
 
     fn emit_array(&mut self, elements: NodeList) -> Result<(), CompileError> {
         let elements: Vec<NodeId> = self.ast.list_items(elements).to_vec();
-        emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
-        let array = self.push_value();
+        self.b.create_empty_array_literal();
+        let array = self.b.stage_acc();
         for (i, &element) in elements.iter().enumerate() {
-            emit(&mut self.code, Opcode::LoadSmi, &[i as u32]);
-            let index = self.push_value();
+            self.b.load_smi(i as i32);
+            let index = self.b.stage_acc();
             self.expr(element)?;
             // literal elements are explicit layout: the store may grow
-            let feedback = self.feedback_slot();
-            emit(
-                &mut self.code,
-                Opcode::StoreKeyedProperty,
-                &[array, index, feedback],
-            );
-            self.pop_value();
+            let feedback = self.b.new_feedback();
+            self.b.store_keyed_property(array, index, feedback);
+            self.b.drop_temp();
         }
-        emit(&mut self.code, Opcode::Load, &[array]);
-        self.pop_value();
+        self.b.load(array);
+        self.b.drop_temp();
         Ok(())
     }
 }

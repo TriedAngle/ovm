@@ -8,9 +8,6 @@
 use std::collections::HashMap;
 
 /// A half-open `[start, end)` range of byte offsets into the source text.
-///
-/// Named `ByteSpan` to keep it distinct from [`ir::Span`], which addresses a
-/// run inside a pool rather than a region of the source.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ByteSpan {
     pub start: u32,
