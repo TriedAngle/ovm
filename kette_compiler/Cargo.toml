@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 bytecode = { path = "../bytecode" }
-ir = { path = "../ir" }
 kette_parser = { path = "../kette_parser" }
+trace = { path = "../trace" }
 
 [dev-dependencies]
 mark_sweep = { path = "../collectors/mark_sweep" }

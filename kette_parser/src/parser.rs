@@ -70,6 +70,7 @@ impl<S: CharStream> Parser<S> {
     }
 
     pub fn parse_script(&mut self) -> Result<NodeId, ParseError> {
+        let _span = trace::info_span!("kette::parse").entered();
         let start = self.peek()?.span.start;
         let stmts = self.parse_statement_list(TokenKind::Eof)?;
         let end = self.peek()?.span.end;

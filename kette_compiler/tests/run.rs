@@ -1,7 +1,7 @@
 //! End-to-end tests: compile Kette source to the shared IR, materialize
 //! it in a real VM, and run it.
 
-use ir::SourceMode;
+use bytecode::SourceMode;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Smi, VM};
 

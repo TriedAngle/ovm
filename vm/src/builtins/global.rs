@@ -30,7 +30,7 @@ pub fn eval_runtime<'a>(
                 .map(|s| s.to_rust_string(heap))
                 .ok_or(VmError::Type)?;
 
-        let program = match js_compiler::compile_js(&text, ir::SourceMode::Eval) {
+        let program = match js_compiler::compile_js(&text, bytecode::SourceMode::Eval) {
             Ok(program) => program,
             // TODO: a SyntaxError class; approximate with TypeError for now
             Err(_) => {

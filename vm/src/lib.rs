@@ -319,18 +319,18 @@ impl Thread {
     }
 
     pub fn run_script(&mut self, src: &str) -> Result<Value, ScriptError> {
-        self.run_source(src, js_compiler::compile_js, ir::SourceMode::Script)
+        self.run_source(src, js_compiler::compile_js, bytecode::SourceMode::Script)
     }
 
     pub fn run_script_repl(&mut self, src: &str) -> Result<Value, ScriptError> {
-        self.run_source(src, js_compiler::compile_js, ir::SourceMode::Repl)
+        self.run_source(src, js_compiler::compile_js, bytecode::SourceMode::Repl)
     }
 
     pub fn run_source(
         &mut self,
         src: &str,
-        compile: ir::CompileFn,
-        mode: ir::SourceMode,
+        compile: bytecode::CompileFn,
+        mode: bytecode::SourceMode,
     ) -> Result<Value, ScriptError> {
         let program = compile(src, mode).map_err(ScriptError::from_frontend)?;
         self.handle_scope(|thread, scope| {
@@ -344,16 +344,16 @@ impl Thread {
 /// Failure of any stage of [`Thread::run_script`].
 #[derive(Debug)]
 pub enum ScriptError {
-    Parse(ir::FrontendError),
-    Compile(ir::FrontendError),
+    Parse(bytecode::FrontendError),
+    Compile(bytecode::FrontendError),
     Vm(VmError),
 }
 
 impl ScriptError {
-    fn from_frontend(err: ir::FrontendError) -> Self {
+    fn from_frontend(err: bytecode::FrontendError) -> Self {
         match err.kind {
-            ir::FrontendErrorKind::Syntax => ScriptError::Parse(err),
-            ir::FrontendErrorKind::Compile => ScriptError::Compile(err),
+            bytecode::FrontendErrorKind::Syntax => ScriptError::Parse(err),
+            bytecode::FrontendErrorKind::Compile => ScriptError::Compile(err),
         }
     }
 }

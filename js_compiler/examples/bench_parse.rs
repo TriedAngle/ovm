@@ -23,7 +23,7 @@ fn main() {
     let mb = src.len() as f64 / (1024.0 * 1024.0);
 
     // --- correctness gate: the frontend must accept the corpus ---
-    match js_compiler::compile_js(&src, ir::SourceMode::Script) {
+    match js_compiler::compile_js(&src, bytecode::SourceMode::Script) {
         Ok(_) => {}
         Err(e) => panic!("frontend rejected the corpus: {e}"),
     }
@@ -101,7 +101,7 @@ fn main() {
 
         // end to end
         let t = Instant::now();
-        let program = js_compiler::compile_js(&src, ir::SourceMode::Script).expect("compile");
+        let program = js_compiler::compile_js(&src, bytecode::SourceMode::Script).expect("compile");
         full.push(t.elapsed());
         drop(program);
     }

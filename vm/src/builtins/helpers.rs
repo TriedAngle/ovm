@@ -83,7 +83,7 @@ pub fn run_prelude(
     let (vm, heap, state) = thread.split();
     let empty = heap.known().empty_context;
     let closure = {
-        let program = js_compiler::compile_js(src, ir::SourceMode::Script).map_err(|e| {
+        let program = js_compiler::compile_js(src, bytecode::SourceMode::Script).map_err(|e| {
             eprintln!("{name} prelude compile error: {e}");
             VmError::Type
         })?;

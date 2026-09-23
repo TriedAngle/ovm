@@ -7,11 +7,12 @@ use oxc_syntax::node::NodeId;
 use oxc_syntax::scope::{ScopeFlags, ScopeId};
 use oxc_syntax::symbol::{SymbolFlags, SymbolId};
 
-use bytecode::{Opcode, PropertyFlags, emit};
-use ir::{CallableKind, Constant, FunctionBuilder, FunctionId as IrFunctionId, Program};
+use bytecode::{
+    CallableKind, Constant, ConstIdx, FnBuilder, FunctionId, FunctionMeta, Label, Opcode, Program,
+    PropertyFlags, Reg, RegList, RtArg, RuntimeFn,
+};
 
 use crate::analysis::{ClassIdx, Fid, Facts, FnBody, FnKind, Home, MemberKind, Mode, Special};
-use crate::label::Label;
 
 /// A construct the materializer does not support yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,38 +37,29 @@ impl core::fmt::Display for CompileError {
     }
 }
 
-/// Emit a forced-wide relative jump to `label`.
-fn emit_jump(code: &mut Vec<u8>, op: Opcode, label: &mut Label) {
-    let pc = code.len();
-    code.push(Opcode::Wide as u8);
-    code.push(op as u8);
-    code.extend_from_slice(&[0, 0]);
-    label.patch_here(pc);
-}
-
 /// A breakable statement: loops add a continue target, switches don't.
 struct Breakable {
     labels: Vec<String>,
     breaks: Label,
     continues: Option<Label>,
     /// loops owning a head context: jumps out must unwind past it
-    unwind_ctx: Option<u32>,
+    unwind_ctx: Option<Reg>,
 }
 
 /// A store target ready for the final store.
 enum StoreTarget {
-    Named { obj: u32, name_idx: u32 },
-    Keyed { obj: u32, key: u32 },
+    Named { obj: Reg, name_idx: ConstIdx },
+    Keyed { obj: Reg, key: Reg },
     /// `this.#x = v`
-    PrivateKeyed { obj: u32, key: u32 },
-    SuperNamed { recv: u32, home: u32, name_idx: u32 },
-    SuperKeyed { recv: u32, home: u32, key: u32 },
+    PrivateKeyed { obj: Reg, key: Reg },
+    SuperNamed { recv: Reg, home: Reg, name_idx: ConstIdx },
+    SuperKeyed { recv: Reg, home: Reg, key: Reg },
 }
 
 /// Name hint for NamedEvaluation in pattern defaults (ES 8.4.3).
 enum NameHint {
-    Const(u32),
-    Reg(u32),
+    Const(ConstIdx),
+    Reg(Reg),
     None,
 }
 
@@ -397,103 +389,17 @@ pub fn generate<'a>(scoping: &Scoping, facts: &Facts<'a>) -> Result<Program, Com
     };
     let mut program = Program::with_capacity(n);
     for fid in 0..n as u32 {
+        let _span = trace::debug_span!("js::function", fid).entered();
         let mut fgen = FunctionGen::new(&mut compiler, Fid(fid));
         fgen.emit_function_body()?;
-        debug_assert!(fgen.next_temp == 0, "unbalanced temp allocation in {fid}");
         program.add_function(fgen.finish());
     }
-    validate_ir(&program);
+    #[cfg(debug_assertions)]
+    if let Err(err) = bytecode::validate(&program) {
+        panic!("invalid bytecode: {err:?}");
+    }
     Ok(program)
 }
-
-/// Debug-mode IR contract check: every register operand must land inside
-/// the frame (params at `-(arity+1)..-1`, locals/temps in
-/// `0..register_count`), every feedback operand inside the feedback
-/// vector, every jump inside the code. Violations are frontend bugs; a
-/// clean pass shifts suspicion to the VM.
-#[cfg(debug_assertions)]
-fn validate_ir(program: &Program) {
-    use bytecode::Operand;
-    for (fi, f) in program.functions().enumerate() {
-        let arity = f.arity as i32;
-        let code = program.code(f);
-        let mut pc = 0usize;
-        while pc < code.len() {
-            let (op, ops, next) = bytecode::decode(code, pc);
-            let mut reg_window: Option<(i32, u32)> = None;
-            for (i, kind) in op.operands().iter().enumerate() {
-                match kind {
-                    Operand::Register => {
-                        let r = ops.reg(i);
-                        assert!(
-                            r >= -(arity + 1) && r < f.register_count as i32,
-                            "function {fi} pc {pc}: {op:?} register {r} outside frame                              (arity {arity}, register_count {})",
-                            f.register_count
-                        );
-                    }
-                    Operand::RegisterListStart => {
-                        let base = ops.reg_list(i);
-                        if let Some(count_operand) = op
-                            .operands()
-                            .iter()
-                            .position(|k| matches!(k, Operand::RegisterCount))
-                        {
-                            reg_window = Some((base, ops.reg_count(count_operand) as u32));
-                        }
-                    }
-                    Operand::RegisterCount | Operand::Immediate => {}
-                    Operand::UImmediate => {
-                        let v = ops.uimm(i);
-                        if matches!(op, Opcode::LoadGlobal | Opcode::LoadGlobalNoThrow | Opcode::StoreGlobal) && i == 1
-                            || matches!(
-                                op,
-                                Opcode::LoadNamedProperty
-                                    | Opcode::StoreNamedProperty
-                                    | Opcode::LoadKeyedProperty
-                                    | Opcode::StoreKeyedProperty
-                                    | Opcode::StoreKeyedPropertyNoShadow
-                            ) && i == op.operands().len() - 1
-                        {
-                            assert!(
-                                v < f.feedback_count,
-                                "function {fi} pc {pc}: {op:?} feedback {v} >= {}",
-                                f.feedback_count
-                            );
-                        }
-                    }
-                    Operand::Index => {}
-                }
-            }
-            if let Some((base, count)) = reg_window {
-                assert!(
-                    base + count as i32 <= f.register_count as i32 && base >= -(arity + 1),
-                    "function {fi} pc {pc}: {op:?} register window {base}..{} outside frame                      (register_count {})",
-                    base + count as i32,
-                    f.register_count
-                );
-            }
-            if matches!(
-                op,
-                Opcode::Jump
-                    | Opcode::JumpLoop
-                    | Opcode::JumpIfTruthy
-                    | Opcode::JumpIfFalsy
-                    | Opcode::JumpIfNotUndefined
-            ) {
-                let target = pc as i64 + ops.imm(0) as i64;
-                assert!(
-                    (0..code.len() as i64).contains(&target),
-                    "function {fi} pc {pc}: {op:?} jumps to {target}, code is {} bytes",
-                    code.len()
-                );
-            }
-            pc = next;
-        }
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn validate_ir(_program: &Program) {}
 
 
 impl<'a, 'p> Compiler<'a, 'p> {
@@ -671,18 +577,11 @@ impl<'a, 'p> Compiler<'a, 'p> {
 struct FunctionGen<'c, 'a, 'p> {
     c: &'c mut Compiler<'a, 'p>,
     fid: Fid,
-    code: Vec<u8>,
-    constants: Vec<Constant>,
-    handlers: Vec<ir::HandlerEntry>,
-    /// first temp register: locals + 1 (context-save slot)
-    reg_base: u32,
+    b: FnBuilder,
     /// register holding the pushed-over context for prologue/epilogue
-    ctx_save: i32,
+    ctx_save: Reg,
     /// script completion-value register (scripts/eval only)
-    completion: Option<u32>,
-    next_temp: u32,
-    max_temps: u32,
-    feedback_slots: u32,
+    completion: Option<Reg>,
     breakables: Vec<Breakable>,
     /// labels forwarded into an enclosing loop/switch by LabeledStatements
     nested_labels: Vec<String>,
@@ -690,154 +589,58 @@ struct FunctionGen<'c, 'a, 'p> {
 
 impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn new(c: &'c mut Compiler<'a, 'p>, fid: Fid) -> Self {
+        let arity = c.facts.functions[fid.0 as usize].params.len() as u32;
         Self {
             c,
             fid,
-            code: Vec::new(),
-            constants: Vec::new(),
-            handlers: Vec::new(),
-            reg_base: 0,
-            ctx_save: 0,
+            b: FnBuilder::new(arity),
+            ctx_save: Reg::new(0),
             completion: None,
-            next_temp: 0,
-            max_temps: 0,
-            feedback_slots: 0,
             breakables: Vec::new(),
             nested_labels: Vec::new(),
         }
     }
 
-    fn finish(self) -> FunctionBuilder {
+    fn finish(self) -> bytecode::Function {
         let info = &self.c.facts.functions[self.fid.0 as usize];
-        let layout = &self.c.layouts[self.fid.0 as usize];
-        FunctionBuilder {
-            bytecode: self.code,
-            constants: self.constants,
-            name: info.name.clone().map(String::into_bytes),
-            arity: info.params.len() as u32,
-            length: info.formal_length,
+        let meta = FunctionMeta {
+            name: info.name.clone().map(|n| n.into_bytes().into()),
             kind: callable_kind(info.kind),
+            length: info.formal_length,
             strict: info.strict,
-            register_count: layout.register_count
-                + 1
-                + u32::from(self.completion.is_some())
-                + self.max_temps,
-            handlers: self.handlers,
-            feedback_count: self.feedback_slots,
-        }
+        };
+        // build failures (unbalanced temps, unbound labels) are compiler
+        // bugs: every emit path pairs its temp marks and binds its labels
+        self.b.finish(meta).expect("js function builder invariants")
     }
 
     fn err<T>(&self, span: Span, feature: &'static str) -> Result<T, CompileError> {
         Err(CompileError::new(span, feature))
     }
 
-    // -- temps ------------------------------------------------------------
-
-    fn push_value(&mut self) -> u32 {
-        let r = self.reg_base + self.next_temp;
-        self.next_temp += 1;
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(&mut self.code, Opcode::Store, &[r]);
-        r
-    }
-
-    fn pop_value(&mut self) {
-        debug_assert!(self.next_temp > 0, "temp underflow");
-        self.next_temp -= 1;
-    }
-
-    fn reserve_temp(&mut self) -> u32 {
-        let r = self.reg_base + self.next_temp;
-        self.next_temp += 1;
-        self.max_temps = self.max_temps.max(self.next_temp);
-        r
-    }
-
-    fn reserve_temps(&mut self, n: u32) -> u32 {
-        let r = self.reg_base + self.next_temp;
-        self.next_temp += n;
-        self.max_temps = self.max_temps.max(self.next_temp);
-        r
-    }
+    // -- staging helpers ----------------------------------------------------
 
     fn with_temps<F, T>(&mut self, f: F) -> Result<T, CompileError>
     where
         F: FnOnce(&mut Self) -> Result<T, CompileError>,
     {
-        let mark = self.next_temp;
+        let mark = self.b.temp_depth();
         let result = f(self);
-        self.next_temp = mark;
+        self.b.drop_temps(mark);
         result
     }
 
-    // -- feedback / constants ------------------------------------------------
-
-    fn feedback_slot(&mut self) -> u32 {
-        let slot = self.feedback_slots;
-        self.feedback_slots += 2;
-        slot
-    }
-
-    fn add_constant(&mut self, c: Constant) -> u32 {
-        self.constants.push(c);
-        (self.constants.len() - 1) as u32
-    }
-
-    fn emit_load_constant(&mut self, c: Constant) {
-        let idx = self.add_constant(c);
-        emit(&mut self.code, Opcode::LoadConstant, &[idx]);
-    }
-
-    fn emit_load_undefined(&mut self) {
-        emit(&mut self.code, Opcode::LoadUndefined, &[]);
-    }
-
-    fn emit_runtime_call<F>(&mut self, f: bytecode::RuntimeFn, count: u32, fill: F)
-    where
-        F: FnOnce(&mut Self, u32),
-    {
-        let base = self.reserve_temps(count);
-        fill(self, base);
-        emit(&mut self.code, Opcode::CallRuntime, &[f as u32, base, count]);
-        self.next_temp -= count;
-    }
-
-    fn stage_reg(&mut self, src: u32, dst: u32) {
-        emit(&mut self.code, Opcode::Load, &[src]);
-        emit(&mut self.code, Opcode::Store, &[dst]);
-    }
-
-    fn stage_constant(&mut self, idx: u32, dst: u32) {
-        emit(&mut self.code, Opcode::LoadConstant, &[idx]);
-        emit(&mut self.code, Opcode::Store, &[dst]);
-    }
-
-    fn stage_smi(&mut self, v: u32, dst: u32) {
-        emit(&mut self.code, Opcode::LoadSmi, &[v]);
-        emit(&mut self.code, Opcode::Store, &[dst]);
-    }
-
-    fn stage_acc(&mut self, dst: u32) {
-        emit(&mut self.code, Opcode::Store, &[dst]);
-    }
-
     fn emit_this_initialized_check(&mut self) {
-        let t = self.push_value();
-        emit(
-            &mut self.code,
-            Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::ThrowSuperNotCalledIfHole as u32, t, 1],
-        );
-        self.pop_value();
+        self.b
+            .call_runtime_staged(RuntimeFn::ThrowSuperNotCalledIfHole, &[RtArg::Acc]);
     }
 
-    fn name_constant(&mut self, key: &PropertyKey<'_>) -> Result<u32, CompileError> {
-        let bytes: Vec<u8> = match key {
-            PropertyKey::StaticIdentifier(i) => i.name.as_bytes().to_vec(),
-            PropertyKey::StringLiteral(s) => s.value.as_bytes().to_vec(),
-            _ => return self.err(key.span(), "non-string property names"),
-        };
-        Ok(self.add_constant(Constant::String(bytes)))
+    fn name_constant(&mut self, key: &PropertyKey<'_>) -> Result<ConstIdx, CompileError> {
+        match key {
+            PropertyKey::StaticIdentifier(i) => Ok(self.b.name(i.name.as_bytes())),
+            PropertyKey::StringLiteral(s) => Ok(self.b.name(s.value.as_bytes())),
+            _ => self.err(key.span(), "non-string property names"),
+        }
     }
 
     /// ES 8.4.2 IsAnonymousFunctionDefinition.
@@ -850,35 +653,25 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     }
 
     fn emit_set_name_const(&mut self, bytes: &[u8]) {
-        let idx = self.add_constant(Constant::String(bytes.to_vec()));
+        let idx = self.b.name(bytes);
         self.emit_set_name_by_const(idx);
     }
 
-    fn emit_set_name_by_const(&mut self, idx: u32) {
-        self.emit_runtime_call(bytecode::RuntimeFn::SetFunctionName, 3, |g, b| {
-            g.stage_acc(b);
-            g.stage_constant(idx, b + 1);
-            g.stage_smi(0, b + 2);
-        });
+    fn emit_set_name_by_const(&mut self, idx: ConstIdx) {
+        self.b.call_runtime_staged(RuntimeFn::SetFunctionName, &[RtArg::Acc, RtArg::Const(idx), RtArg::Smi(0)]);
     }
 
-    fn emit_set_name_by_reg(&mut self, key: u32, prefix: u32) {
-        self.emit_runtime_call(bytecode::RuntimeFn::SetFunctionName, 3, |g, b| {
-            g.stage_acc(b);
-            g.stage_reg(key, b + 1);
-            g.stage_smi(prefix, b + 2);
-        });
+    fn emit_set_name_by_reg(&mut self, key: Reg, prefix: u32) {
+        self.b.call_runtime_staged(RuntimeFn::SetFunctionName, &[RtArg::Acc, RtArg::Reg(key), RtArg::Smi(prefix)]);
     }
 
     fn emit_set_name_for_key_node(&mut self, key: &PropertyKey<'_>) {
         match key {
             PropertyKey::StaticIdentifier(i) => {
-                let bytes = i.name.as_bytes().to_vec();
-                self.emit_set_name_const(&bytes);
+                self.emit_set_name_const(i.name.as_bytes());
             }
             PropertyKey::StringLiteral(s) => {
-                let bytes = s.value.as_bytes().to_vec();
-                self.emit_set_name_const(&bytes);
+                self.emit_set_name_const(s.value.as_bytes());
             }
             _ => {}
         }
@@ -891,19 +684,17 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn store_symbol(&mut self, sym: SymbolId, name: &str) -> Result<(), CompileError> {
         match self.c.slot_of(sym) {
             Slot::Global => {
-                let idx = self.add_constant(Constant::String(name.as_bytes().to_vec()));
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::StoreGlobal, &[idx, feedback]);
+                let idx = self.b.name(name.as_bytes());
+                let feedback = self.b.new_feedback();
+                self.b.store_global(idx, feedback);
             }
             Slot::Param { index, .. } => {
-                emit(&mut self.code, Opcode::Store, &[(-(index as i32 + 2)) as u32]);
+                let reg = self.b.param(index);
+                self.b.store(reg);
             }
-            Slot::Local { reg, .. } => emit(&mut self.code, Opcode::Store, &[reg]),
-            Slot::Ctx { slot, .. } => {
-                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
-            }
-            Slot::CtxAt { slot, .. } => {
-                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            Slot::Local { reg, .. } => self.b.store(Reg::new(reg as i32)),
+            Slot::Ctx { slot, .. } | Slot::CtxAt { slot, .. } => {
+                self.b.store_context_slot(slot, 0);
             }
         }
         Ok(())
@@ -913,28 +704,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn store_name(&mut self, ident: &IdentifierReference<'_>) -> Result<(), CompileError> {
         match self.identifier_resolution(ident)? {
             IdRes::Global => {
-                let idx = self.add_constant(Constant::String(ident.name.as_bytes().to_vec()));
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::StoreGlobal, &[idx, feedback]);
+                let idx = self.b.name(ident.name.as_bytes());
+                let feedback = self.b.new_feedback();
+                self.b.store_global(idx, feedback);
             }
             IdRes::Dynamic => {
-                let idx = self.add_constant(Constant::String(ident.name.as_bytes().to_vec()));
-                self.emit_runtime_call(bytecode::RuntimeFn::StoreDynamicName, 2, |g, b| {
-                    g.stage_acc(b);
-                    g.stage_constant(idx, b + 1);
-                });
+                let idx = self.b.name(ident.name.as_bytes());
+                self.b.call_runtime_staged(RuntimeFn::StoreDynamicName, &[RtArg::Acc, RtArg::Const(idx)]);
             }
             IdRes::Slot(slot, depth) => match slot {
                 Slot::Param { index, .. } => {
-                    emit(&mut self.code, Opcode::Store, &[(-(index as i32 + 2)) as u32]);
-                    let _ = depth;
+                    let reg = self.b.param(index);
+                    self.b.store(reg);
                 }
-                Slot::Local { reg, .. } => emit(&mut self.code, Opcode::Store, &[reg]),
-                Slot::Ctx { slot, .. } => {
-                    emit(&mut self.code, Opcode::StoreContextSlot, &[slot, depth]);
-                }
-                Slot::CtxAt { slot, .. } => {
-                    emit(&mut self.code, Opcode::StoreContextSlot, &[slot, depth]);
+                Slot::Local { reg, .. } => self.b.store(Reg::new(reg as i32)),
+                Slot::Ctx { slot, .. } | Slot::CtxAt { slot, .. } => {
+                    self.b.store_context_slot(slot, depth);
                 }
                 Slot::Global => unreachable!(),
             },
@@ -945,41 +730,39 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_identifier(&mut self, ident: &IdentifierReference<'_>) -> Result<(), CompileError> {
         match self.identifier_resolution(ident)? {
             IdRes::Global => {
-                let idx = self.add_constant(Constant::String(ident.name.as_bytes().to_vec()));
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::LoadGlobal, &[idx, feedback]);
+                let idx = self.b.name(ident.name.as_bytes());
+                let feedback = self.b.new_feedback();
+                self.b.load_global(idx, feedback);
             }
             IdRes::Dynamic => {
-                let idx = self.add_constant(Constant::String(ident.name.as_bytes().to_vec()));
-                self.emit_runtime_call(bytecode::RuntimeFn::LoadDynamicName, 1, |g, b| {
-                    g.stage_constant(idx, b);
-                });
+                let idx = self.b.name(ident.name.as_bytes());
+                self.b
+                    .call_runtime_staged(RuntimeFn::LoadDynamicName, &[RtArg::Const(idx)]);
             }
-            IdRes::Slot(Slot::Param { index, hole_check }, _) => {
-                emit(&mut self.code, Opcode::Load, &[(-(index as i32 + 2)) as u32]);
-                if hole_check {
-                    emit(&mut self.code, Opcode::ThrowReferenceErrorIfHole, &[]);
+            IdRes::Slot(slot, depth) => {
+                match slot {
+                    Slot::Param { index, hole_check } => {
+                        let reg = self.b.param(index);
+                        self.b.load(reg);
+                        if hole_check {
+                            self.b.throw_reference_error_if_hole();
+                        }
+                    }
+                    Slot::Local { reg, hole_check } => {
+                        self.b.load(Reg::new(reg as i32));
+                        if hole_check {
+                            self.b.throw_reference_error_if_hole();
+                        }
+                    }
+                    Slot::Ctx { slot, hole_check } | Slot::CtxAt { slot, hole_check } => {
+                        self.b.load_context_slot(slot, depth);
+                        if hole_check {
+                            self.b.throw_reference_error_if_hole();
+                        }
+                    }
+                    Slot::Global => unreachable!(),
                 }
             }
-            IdRes::Slot(Slot::Local { reg, hole_check }, _) => {
-                emit(&mut self.code, Opcode::Load, &[reg]);
-                if hole_check {
-                    emit(&mut self.code, Opcode::ThrowReferenceErrorIfHole, &[]);
-                }
-            }
-            IdRes::Slot(Slot::Ctx { slot, hole_check }, depth) => {
-                emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
-                if hole_check {
-                    emit(&mut self.code, Opcode::ThrowReferenceErrorIfHole, &[]);
-                }
-            }
-            IdRes::Slot(Slot::CtxAt { slot, hole_check }, depth) => {
-                emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
-                if hole_check {
-                    emit(&mut self.code, Opcode::ThrowReferenceErrorIfHole, &[]);
-                }
-            }
-            IdRes::Slot(Slot::Global, _) => unreachable!(),
         }
         Ok(())
     }
@@ -1033,23 +816,21 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     }
 
     fn emit_not(&mut self) {
-        let mut is_truthy = Label::new();
-        emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut is_truthy);
-        emit(&mut self.code, Opcode::LoadTrue, &[]);
-        let mut end = Label::new();
-        emit_jump(&mut self.code, Opcode::Jump, &mut end);
-        is_truthy.bind(&self.code);
-        is_truthy.patch_all(&mut self.code);
-        emit(&mut self.code, Opcode::LoadFalse, &[]);
-        end.bind(&self.code);
-        end.patch_all(&mut self.code);
+        let is_truthy = self.b.new_label();
+        self.b.jump_if_truthy(is_truthy);
+        self.b.load_true();
+        let end = self.b.new_label();
+        self.b.jump(end);
+        self.b.bind(is_truthy);
+        self.b.load_false();
+        self.b.bind(end);
     }
 
     /// Load a private-name symbol from its class-context slot.
     fn emit_private_key_load(&mut self, node: NodeId, span: Span) -> Result<(), CompileError> {
         match self.c.facts.special.get(&node) {
             Some(Special::Private { slot, depth }) => {
-                emit(&mut self.code, Opcode::LoadContextSlot, &[*slot, *depth]);
+                self.b.load_context_slot(*slot, *depth);
                 Ok(())
             }
             _ => self.err(span, "private name outside its class"),
@@ -1063,11 +844,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             let slot = self.c.layouts[owner.0 as usize]
                 .this_slot
                 .expect("owner captures this");
-            emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
+            self.b.load_context_slot(slot, depth);
         } else if let Some(slot) = self.c.layouts[self.fid.0 as usize].this_slot {
-            emit(&mut self.code, Opcode::LoadContextSlot, &[slot, 0]);
+            self.b.load_context_slot(slot, 0);
         } else {
-            emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+            self.b.load(self.b.this_reg());
         }
         if self.c.facts.functions[owner.0 as usize]
             .kind
@@ -1087,27 +868,33 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 let f = n.value;
                 let is_int = f.fract() == 0.0 && !(f == 0.0 && f.is_sign_negative());
                 if is_int && f >= i16::MIN as f64 && f <= i16::MAX as f64 {
-                    emit(&mut self.code, Opcode::LoadSmi, &[f as i32 as u32]);
+                    self.b.load_smi(f as i32);
                 } else if is_int && f.abs() <= MAX_EXACT_INT {
-                    self.emit_load_constant(Constant::Smi(f as i64));
+                    let c = self.b.constant(Constant::Smi(f as i64));
+                    self.b.load_constant(c);
                 } else {
-                    self.emit_load_constant(Constant::Float(f));
+                    let c = self.b.constant(Constant::Float(f));
+                    self.b.load_constant(c);
                 }
                 Ok(())
             }
             Expression::StringLiteral(s) => {
-                self.emit_load_constant(Constant::String(s.value.as_bytes().to_vec()));
+                let c = self.b.constant(Constant::String(s.value.as_bytes().into()));
+                self.b.load_constant(c);
                 Ok(())
             }
             Expression::BigIntLiteral(_) => self.err(e.span(), "BigInt literals"),
             Expression::RegExpLiteral(_) => self.err(e.span(), "regular expressions"),
             Expression::BooleanLiteral(b) => {
-                let op = if b.value { Opcode::LoadTrue } else { Opcode::LoadFalse };
-                emit(&mut self.code, op, &[]);
+                if b.value {
+                    self.b.load_true();
+                } else {
+                    self.b.load_false();
+                }
                 Ok(())
             }
             Expression::NullLiteral(_) => {
-                emit(&mut self.code, Opcode::LoadNull, &[]);
+                self.b.load_null();
                 Ok(())
             }
             Expression::Identifier(i) => self.emit_identifier(i),
@@ -1124,16 +911,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             Expression::LogicalExpression(l) => self.emit_logical(l),
             Expression::ConditionalExpression(c) => {
                 self.expr(&c.test)?;
-                let mut else_l = Label::new();
-                emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut else_l);
+                let else_l = self.b.new_label();
+                self.b.jump_if_falsy(else_l);
                 self.expr(&c.consequent)?;
-                let mut end = Label::new();
-                emit_jump(&mut self.code, Opcode::Jump, &mut end);
-                else_l.bind(&self.code);
-                else_l.patch_all(&mut self.code);
+                let end = self.b.new_label();
+                self.b.jump(end);
+                self.b.bind(else_l);
                 self.expr(&c.alternate)?;
-                end.bind(&self.code);
-                end.patch_all(&mut self.code);
+                self.b.bind(end);
                 Ok(())
             }
             Expression::AssignmentExpression(a) => self.emit_assign(a),
@@ -1161,14 +946,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             Expression::ObjectExpression(o) => self.emit_object_literal(o),
             Expression::FunctionExpression(f) => {
                 let fid = self.c.facts.fn_of_node[&f.node_id.get()];
-                let idx = self.add_constant(Constant::Callable(IrFunctionId(fid.0)));
-                emit(&mut self.code, Opcode::CreateClosure, &[idx]);
+                let idx = self.b.constant(Constant::Callable(FunctionId(fid.0)));
+                self.b.create_closure(idx);
                 Ok(())
             }
             Expression::ArrowFunctionExpression(f) => {
                 let fid = self.c.facts.fn_of_node[&f.node_id.get()];
-                let idx = self.add_constant(Constant::Callable(IrFunctionId(fid.0)));
-                emit(&mut self.code, Opcode::CreateClosure, &[idx]);
+                let idx = self.b.constant(Constant::Callable(FunctionId(fid.0)));
+                self.b.create_closure(idx);
                 Ok(())
             }
             Expression::ClassExpression(c) => {
@@ -1181,9 +966,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         let slot = self.c.layouts[owner.0 as usize]
                             .new_target_slot
                             .expect("arrow new.target forces the slot");
-                        emit(&mut self.code, Opcode::LoadContextSlot, &[slot, *depth]);
+                        self.b.load_context_slot(slot, *depth);
                     }
-                    _ => emit(&mut self.code, Opcode::LoadNewTarget, &[]),
+                    _ => {
+                        self.b.load_new_target();
+                    }
                 }
                 Ok(())
             }
@@ -1191,16 +978,12 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             Expression::PrivateInExpression(p) => {
                 // `#x in obj`: (key, obj) -> bool
                 self.emit_private_key_load(p.left.node_id.get(), p.left.span)?;
-                let base = self.push_value();
+                let base = self.b.stage_acc();
                 self.expr(&p.right)?;
-                self.push_value();
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::PrivateIn as u32, base, 2],
-                );
-                self.pop_value();
-                self.pop_value();
+                self.b.stage_acc();
+                self.b.call_runtime(RuntimeFn::PrivateIn, RegList::new(base, 2));
+                self.b.drop_temp();
+                self.b.drop_temp();
                 Ok(())
             }
             Expression::ParenthesizedExpression(_) => {
@@ -1227,15 +1010,15 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             UnaryOperator::UnaryNegation => {
                 self.expr(&u.argument)?;
-                emit(&mut self.code, Opcode::Negate, &[]);
+                self.b.negate();
                 Ok(())
             }
             UnaryOperator::UnaryPlus => {
-                emit(&mut self.code, Opcode::LoadZero, &[]);
-                let zero = self.push_value();
+                self.b.load_zero();
+                let zero = self.b.stage_acc();
                 self.expr(&u.argument)?;
-                emit(&mut self.code, Opcode::Sub, &[zero]);
-                self.pop_value();
+                self.b.sub(zero);
+                self.b.drop_temp();
                 Ok(())
             }
             UnaryOperator::Typeof => {
@@ -1244,19 +1027,19 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 if let Expression::Identifier(i) = &u.argument
                     && self.resolves_global(i)
                 {
-                    let idx = self.add_constant(Constant::String(i.name.as_bytes().to_vec()));
-                    let feedback = self.feedback_slot();
-                    emit(&mut self.code, Opcode::LoadGlobalNoThrow, &[idx, feedback]);
-                    emit(&mut self.code, Opcode::TestTypeof, &[]);
+                    let idx = self.b.name(i.name.as_bytes());
+                    let feedback = self.b.new_feedback();
+                    self.b.load_global_no_throw(idx, feedback);
+                    self.b.test_typeof();
                     return Ok(());
                 }
                 self.expr(&u.argument)?;
-                emit(&mut self.code, Opcode::TestTypeof, &[]);
+                self.b.test_typeof();
                 Ok(())
             }
             UnaryOperator::Void => {
                 self.expr(&u.argument)?;
-                self.emit_load_undefined();
+                self.b.load_undefined();
                 Ok(())
             }
             UnaryOperator::BitwiseNot => self.err(u.span, "bitwise not"),
@@ -1274,11 +1057,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     return self.err(u.span, "super property");
                 };
                 self.release_store(&store);
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::DeleteSuperProperty as u32, 0, 0],
-                );
+                self.b
+                    .call_runtime(RuntimeFn::DeleteSuperProperty, RegList::new(Reg::new(0), 0));
                 Ok(())
             }
             e if MemberRef::of(e).is_some() => {
@@ -1292,31 +1072,26 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     MemberRef::Private(_) => unreachable!(),
                 };
                 self.expr(object)?;
-                let base = self.push_value();
+                let base = self.b.stage_acc();
                 match m {
                     MemberRef::Static(s) => {
-                        let idx = self
-                            .add_constant(Constant::String(s.property.name.as_bytes().to_vec()));
-                        emit(&mut self.code, Opcode::LoadConstant, &[idx]);
+                        let idx = self.b.name(s.property.name.as_bytes());
+                        self.b.load_constant(idx);
                     }
                     MemberRef::Computed(c) => {
                         self.expr(&c.expression)?;
                     }
                     MemberRef::Private(_) => unreachable!(),
                 }
-                self.push_value();
+                self.b.stage_acc();
                 let runtime_fn = if self.c.facts.functions[self.fid.0 as usize].strict {
-                    bytecode::RuntimeFn::DeletePropertyStrict
+                    RuntimeFn::DeletePropertyStrict
                 } else {
-                    bytecode::RuntimeFn::DeletePropertySloppy
+                    RuntimeFn::DeletePropertySloppy
                 };
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[runtime_fn as u32, base, 2],
-                );
-                self.pop_value();
-                self.pop_value();
+                self.b.call_runtime(runtime_fn, RegList::new(base, 2));
+                self.b.drop_temp();
+                self.b.drop_temp();
                 Ok(())
             }
             Expression::Identifier(i) => {
@@ -1325,24 +1100,21 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 // names are global-object properties
                 match self.identifier_resolution(i)? {
                     IdRes::Global | IdRes::Dynamic => {
-                        let idx = self.add_constant(Constant::String(i.name.as_bytes().to_vec()));
-                        emit(&mut self.code, Opcode::LoadConstant, &[idx]);
-                        let name = self.push_value();
-                        emit(
-                            &mut self.code,
-                            Opcode::CallRuntime,
-                            &[bytecode::RuntimeFn::DeleteIdentifierSloppy as u32, name, 1],
-                        );
-                        self.pop_value();
+                        let idx = self.b.name(i.name.as_bytes());
+                        self.b.load_constant(idx);
+                        let name = self.b.stage_acc();
+                        self.b
+                            .call_runtime(RuntimeFn::DeleteIdentifierSloppy, RegList::new(name, 1));
+                        self.b.drop_temp();
                     }
-                    _ => emit(&mut self.code, Opcode::LoadFalse, &[]),
+                    _ => self.b.load_false(),
                 }
                 Ok(())
             }
             _ => {
                 // not a reference: side effects only, the result is true
                 self.expr(&u.argument)?;
-                emit(&mut self.code, Opcode::LoadTrue, &[]);
+                self.b.load_true();
                 Ok(())
             }
         }
@@ -1364,25 +1136,21 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             Op::Instanceof => {
                 // acc = lhs instanceof rhs: evaluate rhs first
                 self.expr(&b.right)?;
-                let r = self.push_value();
+                let r = self.b.stage_acc();
                 self.expr(&b.left)?;
-                emit(&mut self.code, Opcode::InstanceOf, &[r]);
-                self.pop_value();
+                self.b.instance_of(r);
+                self.b.drop_temp();
                 Ok(())
             }
             Op::In => {
                 // `key in obj`: (key, obj) -> bool
                 self.expr(&b.left)?;
-                let base = self.push_value();
+                let base = self.b.stage_acc();
                 self.expr(&b.right)?;
-                self.push_value();
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::HasProperty as u32, base, 2],
-                );
-                self.pop_value();
-                self.pop_value();
+                self.b.stage_acc();
+                self.b.call_runtime(RuntimeFn::HasProperty, RegList::new(base, 2));
+                self.b.drop_temp();
+                self.b.drop_temp();
                 Ok(())
             }
             _ => {
@@ -1413,24 +1181,26 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     }
 
     fn emit_logical(&mut self, l: &LogicalExpression<'_>) -> Result<(), CompileError> {
-        let op = match l.operator {
-            LogicalOperator::And => Opcode::JumpIfFalsy,
-            LogicalOperator::Or => Opcode::JumpIfTruthy,
+        let truthy = match l.operator {
+            LogicalOperator::And => false,
+            LogicalOperator::Or => true,
             LogicalOperator::Coalesce => return self.err(l.span, "nullish coalescing"),
         };
         self.expr(&l.left)?;
-        let t = self.push_value();
-        let mut short = Label::new();
-        emit_jump(&mut self.code, op, &mut short);
+        let t = self.b.stage_acc();
+        let short = self.b.new_label();
+        if truthy {
+            self.b.jump_if_truthy(short);
+        } else {
+            self.b.jump_if_falsy(short);
+        }
         self.expr(&l.right)?;
-        let mut end = Label::new();
-        emit_jump(&mut self.code, Opcode::Jump, &mut end);
-        short.bind(&self.code);
-        short.patch_all(&mut self.code);
-        emit(&mut self.code, Opcode::Load, &[t]);
-        end.bind(&self.code);
-        end.patch_all(&mut self.code);
-        self.pop_value();
+        let end = self.b.new_label();
+        self.b.jump(end);
+        self.b.bind(short);
+        self.b.load(t);
+        self.b.bind(end);
+        self.b.drop_temp();
         Ok(())
     }
 
@@ -1441,13 +1211,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         op: Opcode,
     ) -> Result<(), CompileError> {
         self.expr(lhs)?;
-        let a = self.push_value();
+        let a = self.b.stage_acc();
         self.expr(rhs)?;
-        let b = self.push_value();
-        self.pop_value();
-        self.pop_value();
-        emit(&mut self.code, Opcode::Load, &[a]);
-        emit(&mut self.code, op, &[b]);
+        let b = self.b.stage_acc();
+        self.b.load(a);
+        self.b.raw(op, &[b.operand()]);
+        self.b.drop_temp();
+        self.b.drop_temp();
         Ok(())
     }
 
@@ -1462,10 +1232,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // destructuring assignment (ES 14.13.3): the RHS value, then
             // the pattern against it; the expression evaluates to the value
             self.expr(&a.right)?;
-            let v = self.push_value();
+            let v = self.b.stage_acc();
             self.emit_assign_target_pattern(&a.left, v)?;
-            emit(&mut self.code, Opcode::Load, &[v]);
-            self.pop_value();
+            self.b.load(v);
+            self.b.drop_temp();
             return Ok(());
         }
         if a.operator.is_logical() {
@@ -1528,10 +1298,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         match target {
             AssignmentTarget::AssignmentTargetIdentifier(i) => {
                 self.expr(value)?;
-                let v = self.push_value();
+                let v = self.b.stage_acc();
                 self.emit_identifier(i)?;
-                emit(&mut self.code, op, &[v]);
-                self.pop_value();
+                self.b.raw(op, &[v.operand()]);
+                self.b.drop_temp();
                 self.store_name(i)?;
                 Ok(())
             }
@@ -1543,10 +1313,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     self.prepare_property_store(m)?
                 };
                 self.expr(value)?;
-                let v = self.push_value();
+                let v = self.b.stage_acc();
                 self.emit_property_load_of(&store);
-                emit(&mut self.code, op, &[v]);
-                self.pop_value();
+                self.b.raw(op, &[v.operand()]);
+                self.b.drop_temp();
                 self.emit_property_store(&store);
                 self.release_store(&store);
                 Ok(())
@@ -1555,31 +1325,40 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
     }
 
+    /// With the old value staged in `orig` and the step in `d`: replace
+    /// the accumulator with `ToNumber(orig) ± d` (`orig - 0` performs the
+    /// ToNumber, ES 13.5.6.2).
+    fn emit_add_delta(&mut self, arith: Opcode, orig: Reg, d: Reg) {
+        self.b.load_zero();
+        let zero = self.b.stage_acc();
+        self.b.load(orig);
+        self.b.sub(zero);
+        self.b.drop_temp(); // zero
+        self.b.raw(arith, &[d.operand()]);
+        self.b.drop_temp(); // d
+    }
+
     fn emit_update(&mut self, u: &UpdateExpression<'_>) -> Result<(), CompileError> {
-        let delta = match u.operator {
-            UpdateOperator::Increment => 1i32,
-            UpdateOperator::Decrement => -1i32,
+        let delta: i32 = match u.operator {
+            UpdateOperator::Increment => 1,
+            UpdateOperator::Decrement => -1,
         };
         let arith = if delta > 0 { Opcode::Add } else { Opcode::Sub };
         let delta = delta.unsigned_abs();
 
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(i) = &u.argument {
             self.emit_identifier(i)?;
-            let orig = self.push_value();
-            emit(&mut self.code, Opcode::LoadSmi, &[delta]);
-            let d = self.push_value();
-            emit(&mut self.code, Opcode::LoadZero, &[]);
-            let zero = self.push_value();
-            emit(&mut self.code, Opcode::Load, &[orig]);
-            emit(&mut self.code, Opcode::Sub, &[zero]);
-            self.pop_value();
-            emit(&mut self.code, arith, &[d]);
-            self.pop_value();
+            let mark = self.b.temp_depth();
+            let orig = self.b.stage_acc();
+            self.b.load_smi(delta as i32);
+            let d = self.b.stage_acc();
+            self.emit_add_delta(arith, orig, d);
             self.store_name(i)?;
             if !u.prefix {
-                emit(&mut self.code, Opcode::Load, &[orig]);
+                self.b.load(orig);
             }
-            self.pop_value();
+            self.b.drop_temp(); // orig
+            self.b.drop_temps(mark);
             return Ok(());
         }
         if let Some(m) = simple_member_ref(&u.argument) {
@@ -1589,21 +1368,17 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.prepare_property_store(m)?
             };
             self.emit_property_load_of(&store);
-            let orig = self.push_value();
-            emit(&mut self.code, Opcode::LoadSmi, &[delta]);
-            let d = self.push_value();
-            emit(&mut self.code, Opcode::LoadZero, &[]);
-            let zero = self.push_value();
-            emit(&mut self.code, Opcode::Load, &[orig]);
-            emit(&mut self.code, Opcode::Sub, &[zero]);
-            self.pop_value();
-            emit(&mut self.code, arith, &[d]);
-            self.pop_value();
+            let mark = self.b.temp_depth();
+            let orig = self.b.stage_acc();
+            self.b.load_smi(delta as i32);
+            let d = self.b.stage_acc();
+            self.emit_add_delta(arith, orig, d);
             self.emit_property_store(&store);
             if !u.prefix {
-                emit(&mut self.code, Opcode::Load, &[orig]);
+                self.b.load(orig);
             }
-            self.pop_value();
+            self.b.drop_temp(); // orig
+            self.b.drop_temps(mark);
             self.release_store(&store);
             return Ok(());
         }
@@ -1616,7 +1391,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 // ---------------------------------------------------------------------------
 
 impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
-    fn emit_binding_pattern(&mut self, p: &BindingPattern<'_>, v: u32) -> Result<(), CompileError> {
+    fn emit_binding_pattern(&mut self, p: &BindingPattern<'_>, v: Reg) -> Result<(), CompileError> {
         match p {
             BindingPattern::ObjectPattern(o) => {
                 self.emit_object_pattern(object_binding_props(o), v, true)
@@ -1631,7 +1406,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_assign_target_pattern(
         &mut self,
         t: &AssignmentTarget<'_>,
-        v: u32,
+        v: Reg,
     ) -> Result<(), CompileError> {
         match t {
             AssignmentTarget::ArrayAssignmentTarget(a) => {
@@ -1648,36 +1423,30 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_object_pattern(
         &mut self,
         props: Vec<PatProperty<'_, '_>>,
-        value_reg: u32,
+        value_reg: Reg,
         binding: bool,
     ) -> Result<(), CompileError> {
         // RequireObjectCoercible runs even for the empty pattern
-        emit(
-            &mut self.code,
-            Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::RequireObjectCoercible as u32, value_reg, 1],
-        );
-        emit(&mut self.code, Opcode::Store, &[value_reg]);
+        self.b
+            .call_runtime(RuntimeFn::RequireObjectCoercible, RegList::new(value_reg, 1));
+        self.b.store(value_reg);
         let has_rest = matches!(props.last(), Some(PatProperty::Rest(_)));
         // with a rest property, every earlier key stays live in contiguous
         // registers as the CopyDataProperties exclusion set
-        let excl_base = self.reg_base + self.next_temp;
+        let mut excl_base: Option<Reg> = None;
         let mut excluded = 0u32;
         for prop in &props {
             match prop {
                 PatProperty::Named { name, target, default } => {
-                    let name_idx = self.add_constant(Constant::String(name.clone()));
+                    let name_idx = self.b.name(name);
                     if has_rest {
-                        emit(&mut self.code, Opcode::LoadConstant, &[name_idx]);
-                        self.push_value();
+                        self.b.load_constant(name_idx);
+                        let r = self.b.stage_acc();
+                        excl_base.get_or_insert(r);
                         excluded += 1;
                     }
-                    let feedback = self.feedback_slot();
-                    emit(
-                        &mut self.code,
-                        Opcode::LoadNamedProperty,
-                        &[value_reg, name_idx, feedback],
-                    );
+                    let feedback = self.b.new_feedback();
+                    self.b.load_named_property(value_reg, name_idx, feedback);
                     self.emit_pattern_element(
                         *target,
                         *default,
@@ -1686,87 +1455,71 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     )?;
                 }
                 PatProperty::Rest(target) => {
-                    // native layout: (excluded..., target, source)
-                    emit(&mut self.code, Opcode::CreateEmptyObjectLiteral, &[]);
-                    let rest_obj = self.push_value();
-                    emit(&mut self.code, Opcode::Load, &[value_reg]);
-                    self.push_value();
-                    emit(
-                        &mut self.code,
-                        Opcode::CallRuntime,
-                        &[
-                            bytecode::RuntimeFn::CopyDataProperties as u32,
-                            excl_base,
-                            excluded + 2,
-                        ],
+                    // native layout: (excluded..., target, source); with no
+                    // earlier keys the window is just [target, source]
+                    self.b.create_empty_object_literal();
+                    let rest_obj = self.b.stage_acc();
+                    self.b.load(value_reg);
+                    self.b.stage_acc();
+                    let base = excl_base.unwrap_or(rest_obj);
+                    self.b.call_runtime(
+                        RuntimeFn::CopyDataProperties,
+                        RegList::new(base, excluded + 2),
                     );
-                    emit(&mut self.code, Opcode::Store, &[rest_obj]);
+                    self.b.store(rest_obj);
                     self.emit_pattern_leaf(*target, rest_obj, binding)?;
-                    self.pop_value();
-                    self.pop_value();
+                    self.b.drop_temp(); // source
+                    self.b.drop_temp(); // rest object
                 }
                 PatProperty::Prop { key, computed, target, default } => {
-                    let key_reg = if *computed {
-                        if let Some(e) = key.as_expression() {
-                            self.expr(e)?;
-                        }
-                        Some(self.push_value())
-                    } else if matches!(key, PropertyKey::NumericLiteral(_)) {
-                        self.emit_number_key(key);
-                        Some(self.push_value())
-                    } else {
-                        None
-                    };
+                    let key_reg = self.stage_key(key, *computed)?;
                     let name_hint = match key_reg {
                         Some(r) => NameHint::Reg(r),
                         None => NameHint::Const(self.name_constant(key)?),
                     };
                     if has_rest {
                         match key_reg {
-                            Some(_) => excluded += 1,
+                            Some(r) => {
+                                excl_base.get_or_insert(r);
+                                excluded += 1;
+                            }
                             None => {
                                 // materialize the constant key for the
                                 // exclusion set
                                 if let NameHint::Const(idx) = name_hint {
-                                    emit(&mut self.code, Opcode::LoadConstant, &[idx]);
-                                    self.push_value();
+                                    self.b.load_constant(idx);
+                                    let r = self.b.stage_acc();
+                                    excl_base.get_or_insert(r);
                                     excluded += 1;
                                 }
                             }
                         }
                     }
-                    // v = GetV(value, P)
+                    // v = GetV(value, P); computed keys read the value
+                    // straight from their register via the accumulator
                     match key_reg {
                         Some(k) => {
-                            emit(&mut self.code, Opcode::Load, &[k]);
-                            let feedback = self.feedback_slot();
-                            emit(
-                                &mut self.code,
-                                Opcode::LoadKeyedProperty,
-                                &[value_reg, feedback],
-                            );
+                            self.b.load(k);
+                            let feedback = self.b.new_feedback();
+                            self.b.load_keyed_property(value_reg, feedback);
                         }
                         None => {
                             let NameHint::Const(name_idx) = name_hint else {
                                 unreachable!("constant keys have a constant hint")
                             };
-                            let feedback = self.feedback_slot();
-                            emit(
-                                &mut self.code,
-                                Opcode::LoadNamedProperty,
-                                &[value_reg, name_idx, feedback],
-                            );
+                            let feedback = self.b.new_feedback();
+                            self.b.load_named_property(value_reg, name_idx, feedback);
                         }
                     }
                     self.emit_pattern_element(*target, *default, binding, name_hint)?;
                     if !has_rest && key_reg.is_some() {
-                        self.pop_value();
+                        self.b.drop_temp();
                     }
                 }
             }
         }
         for _ in 0..excluded {
-            self.pop_value();
+            self.b.drop_temp();
         }
         Ok(())
     }
@@ -1775,35 +1528,28 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_array_pattern(
         &mut self,
         elements: Vec<PatElement<'_, '_>>,
-        value_reg: u32,
+        value_reg: Reg,
         binding: bool,
     ) -> Result<(), CompileError> {
         // iterator = GetIterator(value)
-        emit(
-            &mut self.code,
-            Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::GetIterator as u32, value_reg, 1],
-        );
-        let iter = self.push_value();
+        self.b
+            .call_runtime(RuntimeFn::GetIterator, RegList::new(value_reg, 1));
+        let iter = self.b.stage_acc();
         // done flag (ES 8.5.9: once done, later elements read undefined
         // without calling next again)
-        emit(&mut self.code, Opcode::LoadZero, &[]);
-        let done = self.push_value();
+        self.b.load_zero();
+        let done = self.b.stage_acc();
         let mut rest: Option<PatTarget<'_, '_>> = None;
         for el in &elements {
             match el {
                 PatElement::Hole => {
                     // elision still consumes one iterator step
-                    emit(&mut self.code, Opcode::Load, &[done]);
-                    let mut skip = Label::new();
-                    emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut skip);
-                    emit(
-                        &mut self.code,
-                        Opcode::CallRuntime,
-                        &[bytecode::RuntimeFn::IteratorNext as u32, iter, 1],
-                    );
-                    skip.bind(&self.code);
-                    skip.patch_all(&mut self.code);
+                    self.b.load(done);
+                    let skip = self.b.new_label();
+                    self.b.jump_if_truthy(skip);
+                    self.b
+                        .call_runtime(RuntimeFn::IteratorNext, RegList::new(iter, 1));
+                    self.b.bind(skip);
                 }
                 PatElement::Rest(target) => {
                     rest = Some(*target);
@@ -1815,65 +1561,47 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
         if let Some(target) = rest {
             // array ← remaining values (loop while !done)
-            emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
-            let arr = self.push_value();
-            emit(&mut self.code, Opcode::LoadZero, &[]);
-            let idx = self.push_value();
-            let head = self.code.len();
-            emit(&mut self.code, Opcode::Load, &[done]);
-            let mut exit = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut exit);
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::IteratorNext as u32, iter, 1],
-            );
-            let result = self.push_value();
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::IteratorDone as u32, result, 1],
-            );
-            let mut have = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut have);
-            emit(&mut self.code, Opcode::LoadSmi, &[1]);
-            emit(&mut self.code, Opcode::Store, &[done]);
-            let mut after = Label::new();
-            emit_jump(&mut self.code, Opcode::Jump, &mut after);
-            have.bind(&self.code);
-            have.patch_all(&mut self.code);
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::IteratorValue as u32, result, 1],
-            );
-            let feedback = self.feedback_slot();
-            emit(
-                &mut self.code,
-                Opcode::StoreKeyedPropertyNoShadow,
-                &[arr, idx, feedback],
-            );
-            emit(&mut self.code, Opcode::Load, &[idx]);
-            emit(&mut self.code, Opcode::LoadSmi, &[1]);
-            emit(&mut self.code, Opcode::Add, &[idx]);
-            emit(&mut self.code, Opcode::Store, &[idx]);
-            let mut back = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpLoop, &mut back);
-            back.bind_at(head);
-            back.patch_all(&mut self.code);
-            after.bind(&self.code);
-            after.patch_all(&mut self.code);
-            self.pop_value(); // result
-            self.pop_value(); // idx
+            self.b.create_empty_array_literal();
+            let arr = self.b.stage_acc();
+            self.b.load_zero();
+            let idx = self.b.stage_acc();
+            let back = self.b.new_label();
+            self.b.bind(back); // loop head
+            self.b.load(done);
+            let exit = self.b.new_label();
+            self.b.jump_if_truthy(exit);
+            self.b
+                .call_runtime(RuntimeFn::IteratorNext, RegList::new(iter, 1));
+            let result = self.b.stage_acc();
+            self.b
+                .call_runtime(RuntimeFn::IteratorDone, RegList::new(result, 1));
+            let have = self.b.new_label();
+            self.b.jump_if_falsy(have);
+            self.b.load_smi(1);
+            self.b.store(done);
+            let after = self.b.new_label();
+            self.b.jump(after);
+            self.b.bind(have);
+            self.b
+                .call_runtime(RuntimeFn::IteratorValue, RegList::new(result, 1));
+            let feedback = self.b.new_feedback();
+            self.b.store_keyed_property_no_shadow(arr, idx, feedback);
+            self.b.load(idx);
+            self.b.load_smi(1);
+            self.b.add(idx);
+            self.b.store(idx);
+            self.b.jump_loop(back);
+            self.b.bind(after);
+            self.b.drop_temp(); // result
+            self.b.drop_temp(); // idx
             // both loop exits converge here
-            exit.bind(&self.code);
-            exit.patch_all(&mut self.code);
-            emit(&mut self.code, Opcode::Load, &[arr]);
+            self.b.bind(exit);
+            self.b.load(arr);
             self.emit_pattern_leaf(target, arr, binding)?;
-            self.pop_value(); // arr
+            self.b.drop_temp(); // arr
         }
-        self.pop_value(); // done
-        self.pop_value(); // iter
+        self.b.drop_temp(); // done
+        self.b.drop_temp(); // iter
         Ok(())
     }
 
@@ -1882,10 +1610,32 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         if let PropertyKey::NumericLiteral(n) = key {
             let f = n.value;
             if f.fract() == 0.0 && f.is_sign_positive() && f <= i16::MAX as f64 {
-                emit(&mut self.code, Opcode::LoadSmi, &[f as i32 as u32]);
+                self.b.load_smi(f as i32);
             } else {
-                self.emit_load_constant(Constant::Float(f));
+                let c = self.b.constant(Constant::Float(f));
+                self.b.load_constant(c);
             }
+        }
+    }
+
+    /// Stage a property key for the keyed paths: computed keys evaluate
+    /// into a register, numeric literal keys load their literal; string
+    /// keys stay pooled (`None`, addressed by name).
+    fn stage_key(
+        &mut self,
+        key: &PropertyKey<'_>,
+        computed: bool,
+    ) -> Result<Option<Reg>, CompileError> {
+        if computed {
+            if let Some(e) = key.as_expression() {
+                self.expr(e)?;
+            }
+            Ok(Some(self.b.stage_acc()))
+        } else if matches!(key, PropertyKey::NumericLiteral(_)) {
+            self.emit_number_key(key);
+            Ok(Some(self.b.stage_acc()))
+        } else {
+            Ok(None)
         }
     }
 
@@ -1895,45 +1645,33 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         &mut self,
         target: PatTarget<'_, '_>,
         default: Option<&Expression<'_>>,
-        iter: u32,
-        done: u32,
+        iter: Reg,
+        done: Reg,
         binding: bool,
     ) -> Result<(), CompileError> {
-        self.emit_load_undefined();
-        let v = self.push_value();
-        emit(&mut self.code, Opcode::Load, &[done]);
-        let mut skip_next = Label::new();
-        emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut skip_next);
-        emit(
-            &mut self.code,
-            Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::IteratorNext as u32, iter, 1],
-        );
-        let result = self.push_value();
-        emit(
-            &mut self.code,
-            Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::IteratorDone as u32, result, 1],
-        );
-        let mut have = Label::new();
-        emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut have);
-        emit(&mut self.code, Opcode::LoadSmi, &[1]);
-        emit(&mut self.code, Opcode::Store, &[done]);
-        let mut after = Label::new();
-        emit_jump(&mut self.code, Opcode::Jump, &mut after);
-        have.bind(&self.code);
-        have.patch_all(&mut self.code);
-        emit(
-            &mut self.code,
-            Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::IteratorValue as u32, result, 1],
-        );
-        emit(&mut self.code, Opcode::Store, &[v]);
-        after.bind(&self.code);
-        after.patch_all(&mut self.code);
-        self.pop_value(); // result
-        skip_next.bind(&self.code);
-        skip_next.patch_all(&mut self.code);
+        self.b.load_undefined();
+        let v = self.b.stage_acc();
+        self.b.load(done);
+        let skip_next = self.b.new_label();
+        self.b.jump_if_truthy(skip_next);
+        self.b
+            .call_runtime(RuntimeFn::IteratorNext, RegList::new(iter, 1));
+        let result = self.b.stage_acc();
+        self.b
+            .call_runtime(RuntimeFn::IteratorDone, RegList::new(result, 1));
+        let have = self.b.new_label();
+        self.b.jump_if_falsy(have);
+        self.b.load_smi(1);
+        self.b.store(done);
+        let after = self.b.new_label();
+        self.b.jump(after);
+        self.b.bind(have);
+        self.b
+            .call_runtime(RuntimeFn::IteratorValue, RegList::new(result, 1));
+        self.b.store(v);
+        self.b.bind(after);
+        self.b.drop_temp(); // result
+        self.b.bind(skip_next);
         // array-element defaults name anonymous functions after the
         // binding identifier (ES 8.6.2: NamedEvaluation with bindingName)
         let bind_name: Option<Vec<u8>> = match target {
@@ -1946,13 +1684,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             _ => None,
         };
         let hint = if default.is_some_and(|d| self.is_anon_function(d)) && bind_name.is_some() {
-            let idx = self.add_constant(Constant::String(bind_name.unwrap()));
+            let idx = self.b.name(&bind_name.unwrap());
             NameHint::Const(idx)
         } else {
             NameHint::None
         };
         self.emit_pattern_element_with(target, default, v, binding, hint)?;
-        self.pop_value(); // v
+        self.b.drop_temp(); // v
         Ok(())
     }
 
@@ -1962,14 +1700,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         &mut self,
         target: PatTarget<'_, '_>,
         default: Option<&Expression<'_>>,
-        v: u32,
+        v: Reg,
         binding: bool,
         name_hint: NameHint,
     ) -> Result<(), CompileError> {
         if let Some(default) = default {
-            emit(&mut self.code, Opcode::Load, &[v]);
-            let mut skip = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpIfNotUndefined, &mut skip);
+            self.b.load(v);
+            let skip = self.b.new_label();
+            self.b.jump_if_not_undefined(skip);
             self.expr(default)?;
             // NamedEvaluation: `{a = function(){}} = x` names the closure
             // after the property key / array index (ES 8.4.3). Binding
@@ -1990,11 +1728,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     NameHint::None => {}
                 }
             }
-            emit(&mut self.code, Opcode::Store, &[v]);
-            skip.bind(&self.code);
-            skip.patch_all(&mut self.code);
+            self.b.store(v);
+            self.b.bind(skip);
         }
-        emit(&mut self.code, Opcode::Load, &[v]);
+        self.b.load(v);
         self.emit_pattern_leaf(target, v, binding)
     }
 
@@ -2007,9 +1744,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         binding: bool,
         name_hint: NameHint,
     ) -> Result<(), CompileError> {
-        let v = self.push_value();
+        let v = self.b.stage_acc();
         self.emit_pattern_element_with(target, default, v, binding, name_hint)?;
-        self.pop_value();
+        self.b.drop_temp();
         Ok(())
     }
 
@@ -2018,7 +1755,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_pattern_leaf(
         &mut self,
         target: PatTarget<'_, '_>,
-        value_reg: u32,
+        value_reg: Reg,
         binding: bool,
     ) -> Result<(), CompileError> {
         match target {
@@ -2034,16 +1771,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             PatTarget::AssignIdent(i) => self.store_name(i),
             PatTarget::Assign(t) if assign_member_ref(t).is_some() => {
                 let m = assign_member_ref(t).unwrap();
-                let value = self.push_value();
+                let value = self.b.stage_acc();
                 let store = if is_super_member(m) {
                     self.prepare_super_store(m)?
                 } else {
                     self.prepare_property_store(m)?
                 };
-                emit(&mut self.code, Opcode::Load, &[value]);
+                self.b.load(value);
                 self.emit_property_store(&store);
                 self.release_store(&store);
-                self.pop_value(); // value
+                self.b.drop_temp(); // value
                 Ok(())
             }
             PatTarget::Binding(BindingPattern::ObjectPattern(o)) => {
@@ -2067,46 +1804,26 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_property_store(&mut self, store: &StoreTarget) {
         match store {
             StoreTarget::Named { obj, name_idx } => {
-                let feedback = self.feedback_slot();
-                emit(
-                    &mut self.code,
-                    Opcode::StoreNamedProperty,
-                    &[*obj, *name_idx, feedback],
-                );
+                let feedback = self.b.new_feedback();
+                self.b.store_named_property(*obj, *name_idx, feedback);
             }
             StoreTarget::Keyed { obj, key } => {
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::StoreKeyedProperty, &[*obj, *key, feedback]);
+                let feedback = self.b.new_feedback();
+                self.b.store_keyed_property(*obj, *key, feedback);
             }
             StoreTarget::PrivateKeyed { obj, key: _ } => {
                 // (obj, key, value): the value is in the accumulator
-                let _ = self.push_value();
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::PrivateSet as u32, *obj, 3],
-                );
-                self.pop_value();
+                let mark = self.b.temp_depth();
+                self.b.stage_acc();
+                self.b.call_runtime(RuntimeFn::PrivateSet, RegList::new(*obj, 3));
+                self.b.drop_temps(mark);
             }
+            // runtime(home, recv, key, value = acc, semantics: shadow)
             StoreTarget::SuperNamed { recv, home, name_idx } => {
-                // runtime(home, recv, key, value = acc, semantics: shadow)
-                self.emit_runtime_call(bytecode::RuntimeFn::SuperSetProperty, 5, |g, b| {
-                    // the value is in the accumulator: stage it first
-                    g.stage_acc(b + 3);
-                    g.stage_reg(*home, b);
-                    g.stage_reg(*recv, b + 1);
-                    g.stage_constant(*name_idx, b + 2);
-                    g.stage_smi(0, b + 4);
-                });
+                self.b.call_runtime_staged(RuntimeFn::SuperSetProperty, &[RtArg::Reg(*home), RtArg::Reg(*recv), RtArg::Const(*name_idx), RtArg::Acc, RtArg::Smi(0)]);
             }
             StoreTarget::SuperKeyed { recv, home, key } => {
-                self.emit_runtime_call(bytecode::RuntimeFn::SuperSetProperty, 5, |g, b| {
-                    g.stage_acc(b + 3);
-                    g.stage_reg(*home, b);
-                    g.stage_reg(*recv, b + 1);
-                    g.stage_reg(*key, b + 2);
-                    g.stage_smi(0, b + 4);
-                });
+                self.b.call_runtime_staged(RuntimeFn::SuperSetProperty, &[RtArg::Reg(*home), RtArg::Reg(*recv), RtArg::Reg(*key), RtArg::Acc, RtArg::Smi(0)]);
             }
         }
     }
@@ -2114,59 +1831,43 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_property_load_of(&mut self, store: &StoreTarget) {
         match store {
             StoreTarget::Named { obj, name_idx } => {
-                let feedback = self.feedback_slot();
-                emit(
-                    &mut self.code,
-                    Opcode::LoadNamedProperty,
-                    &[*obj, *name_idx, feedback],
-                );
+                let feedback = self.b.new_feedback();
+                self.b.load_named_property(*obj, *name_idx, feedback);
             }
             StoreTarget::Keyed { obj, key } => {
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::Load, &[*key]);
-                emit(&mut self.code, Opcode::LoadKeyedProperty, &[*obj, feedback]);
+                let feedback = self.b.new_feedback();
+                self.b.load(*key);
+                self.b.load_keyed_property(*obj, feedback);
             }
             StoreTarget::PrivateKeyed { obj, key } => {
-                emit(&mut self.code, Opcode::Load, &[*key]);
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::PrivateGet as u32, *obj, 2],
-                );
+                self.b.load(*key);
+                self.b.call_runtime(RuntimeFn::PrivateGet, RegList::new(*obj, 2));
             }
+            // runtime(home, recv, key) -> value
             StoreTarget::SuperNamed { recv, home, name_idx } => {
-                // runtime(home, recv, key) -> value
-                self.emit_runtime_call(bytecode::RuntimeFn::SuperGetProperty, 3, |g, b| {
-                    g.stage_reg(*home, b);
-                    g.stage_reg(*recv, b + 1);
-                    g.stage_constant(*name_idx, b + 2);
-                });
+                self.b.call_runtime_staged(RuntimeFn::SuperGetProperty, &[RtArg::Reg(*home), RtArg::Reg(*recv), RtArg::Const(*name_idx)]);
             }
             StoreTarget::SuperKeyed { recv, home, key } => {
-                self.emit_runtime_call(bytecode::RuntimeFn::SuperGetProperty, 3, |g, b| {
-                    g.stage_reg(*home, b);
-                    g.stage_reg(*recv, b + 1);
-                    g.stage_reg(*key, b + 2);
-                });
+                self.b.call_runtime_staged(RuntimeFn::SuperGetProperty, &[RtArg::Reg(*home), RtArg::Reg(*recv), RtArg::Reg(*key)]);
             }
         }
     }
 
     fn release_store(&mut self, store: &StoreTarget) {
         match store {
-            StoreTarget::Named { .. } => self.pop_value(), // obj
+            StoreTarget::Named { .. } => self.b.drop_temp(), // obj
             StoreTarget::Keyed { .. } | StoreTarget::PrivateKeyed { .. } => {
-                self.pop_value(); // key
-                self.pop_value(); // obj
+                self.b.drop_temp(); // key
+                self.b.drop_temp(); // obj
             }
             StoreTarget::SuperNamed { .. } => {
-                self.pop_value(); // home
-                self.pop_value(); // recv
+                self.b.drop_temp(); // home
+                self.b.drop_temp(); // recv
             }
             StoreTarget::SuperKeyed { .. } => {
-                self.pop_value(); // home
-                self.pop_value(); // key
-                self.pop_value(); // recv
+                self.b.drop_temp(); // home
+                self.b.drop_temp(); // key
+                self.b.drop_temp(); // recv
             }
         }
     }
@@ -2178,23 +1879,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         match m {
             MemberRef::Private(p) => {
                 self.expr(&p.object)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 self.emit_private_key_load(p.field.node_id.get(), p.field.span)?;
-                let k = self.push_value();
+                let k = self.b.stage_acc();
                 Ok(StoreTarget::PrivateKeyed { obj, key: k })
             }
             MemberRef::Static(s) => {
                 self.expr(&s.object)?;
-                let obj = self.push_value();
-                let name_idx = self
-                    .add_constant(Constant::String(s.property.name.as_bytes().to_vec()));
+                let obj = self.b.stage_acc();
+                let name_idx = self.b.name(s.property.name.as_bytes());
                 Ok(StoreTarget::Named { obj, name_idx })
             }
             MemberRef::Computed(c) => {
                 self.expr(&c.object)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 self.expr(&c.expression)?;
-                let k = self.push_value();
+                let k = self.b.stage_acc();
                 Ok(StoreTarget::Keyed { obj, key: k })
             }
         }
@@ -2213,7 +1913,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             return Ok(None);
         };
         self.emit_this_for(this_owner, this_depth);
-        let recv = self.push_value();
+        let recv = self.b.stage_acc();
         let (home_slot, home_depth) = match home {
             Home::Class(_, slot) => (slot, depth),
             Home::Object(_) => (0, depth),
@@ -2221,16 +1921,15 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         match m {
             MemberRef::Computed(c) => {
                 self.expr(&c.expression)?;
-                let k = self.push_value();
-                emit(&mut self.code, Opcode::LoadContextSlot, &[home_slot, home_depth]);
-                let home = self.push_value();
+                let k = self.b.stage_acc();
+                self.b.load_context_slot(home_slot, home_depth);
+                let home = self.b.stage_acc();
                 Ok(Some(StoreTarget::SuperKeyed { recv, home, key: k }))
             }
             MemberRef::Static(s) => {
-                let name_idx = self
-                    .add_constant(Constant::String(s.property.name.as_bytes().to_vec()));
-                emit(&mut self.code, Opcode::LoadContextSlot, &[home_slot, home_depth]);
-                let home = self.push_value();
+                let name_idx = self.b.name(s.property.name.as_bytes());
+                self.b.load_context_slot(home_slot, home_depth);
+                let home = self.b.stage_acc();
                 Ok(Some(StoreTarget::SuperNamed { recv, home, name_idx }))
             }
             MemberRef::Private(p) => {
@@ -2245,59 +1944,42 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     }
 
     fn emit_property_load(&mut self, m: MemberRef<'_>) -> Result<(), CompileError> {
+        if is_super_member(m) {
+            let Some(store) = self.prepare_super_parts(m)? else {
+                return self.err(m.span(), "super property");
+            };
+            self.emit_property_load_of(&store);
+            self.release_store(&store);
+            return Ok(());
+        }
         match m {
             MemberRef::Private(p) => {
                 // PrivateGet: `obj.#x` — own private field or TypeError
                 self.expr(&p.object)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 self.emit_private_key_load(p.field.node_id.get(), p.field.span)?;
-                self.push_value();
-                emit(
-                    &mut self.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::PrivateGet as u32, obj, 2],
-                );
-                self.pop_value();
-                self.pop_value();
+                self.b.stage_acc();
+                self.b.call_runtime(RuntimeFn::PrivateGet, RegList::new(obj, 2));
+                self.b.drop_temp();
+                self.b.drop_temp();
                 Ok(())
             }
             MemberRef::Computed(c) => {
-                if is_super_member(m) {
-                    let Some(store) = self.prepare_super_parts(m)? else {
-                        return self.err(c.span, "super property");
-                    };
-                    self.emit_property_load_of(&store);
-                    self.release_store(&store);
-                    return Ok(());
-                }
                 self.expr(&c.object)?;
-                let obj = self.push_value();
+                let obj = self.b.stage_acc();
                 self.expr(&c.expression)?;
-                let feedback = self.feedback_slot();
-                emit(&mut self.code, Opcode::LoadKeyedProperty, &[obj, feedback]);
-                self.pop_value();
+                let feedback = self.b.new_feedback();
+                self.b.load_keyed_property(obj, feedback);
+                self.b.drop_temp();
                 Ok(())
             }
             MemberRef::Static(s) => {
-                if is_super_member(m) {
-                    let Some(store) = self.prepare_super_parts(m)? else {
-                        return self.err(s.span, "super property");
-                    };
-                    self.emit_property_load_of(&store);
-                    self.release_store(&store);
-                    return Ok(());
-                }
                 self.expr(&s.object)?;
-                let obj = self.push_value();
-                let name_idx = self
-                    .add_constant(Constant::String(s.property.name.as_bytes().to_vec()));
-                let feedback = self.feedback_slot();
-                emit(
-                    &mut self.code,
-                    Opcode::LoadNamedProperty,
-                    &[obj, name_idx, feedback],
-                );
-                self.pop_value();
+                let obj = self.b.stage_acc();
+                let name_idx = self.b.name(s.property.name.as_bytes());
+                let feedback = self.b.new_feedback();
+                self.b.load_named_property(obj, name_idx, feedback);
+                self.b.drop_temp();
                 Ok(())
             }
         }
@@ -2312,6 +1994,35 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
     }
 
+    /// Stage a method-call window: `[recv, args..., callee]` with the
+    /// receiver already staged and the callee in the accumulator.
+    /// Returns `(callee, args_base, argc + 1, base_mark)` — callers drop
+    /// back to `base_mark` (the depth before the window) after the call.
+    /// A method call `recv.<method>(args...)`: `load_method` evaluates and
+    /// stages the receiver, loads the method into the accumulator, and
+    /// returns the receiver's register. The callee then sits in a fixed
+    /// slot above the contiguous `[recv, args...]` window.
+    fn emit_method_call(
+        &mut self,
+        c: &CallExpression<'_>,
+        load_method: impl FnOnce(&mut Self) -> Result<Reg, CompileError>,
+    ) -> Result<(), CompileError> {
+        let argc = c.arguments.len() as u32;
+        let mark = self.b.temp_depth();
+        let recv = load_method(self)?;
+        // reserve args + callee so nested argument temps land above
+        let args_base = self.b.reserve_temps(argc + 1);
+        let callee = Reg::new(args_base.index() + argc as i32);
+        self.b.store(callee);
+        for (i, arg) in c.arguments.iter().enumerate() {
+            self.call_argument(arg)?;
+            self.b.store(Reg::new(args_base.index() + i as i32));
+        }
+        self.b.call_no_feedback(callee, RegList::new(recv, argc + 1));
+        self.b.drop_temps(mark);
+        Ok(())
+    }
+
     fn emit_call(&mut self, c: &CallExpression<'_>) -> Result<(), CompileError> {
         // super.m(...): the method comes from the home-object chain and
         // runs with the current `this`
@@ -2324,86 +2035,47 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             return self.emit_super_call(c);
         }
         // method calls: the receiver is the first register of the argument
-        // list; the callee sits in a fixed slot above the args (evaluation
-        // order: receiver, property get, then arguments)
+        // list (evaluation order: receiver, property get, then arguments)
         if let Expression::StaticMemberExpression(s) = &c.callee {
-            let argc = c.arguments.len();
-            self.expr(&s.object)?;
-            let recv = self.push_value();
-            let name_idx = self
-                .add_constant(Constant::String(s.property.name.as_bytes().to_vec()));
-            let feedback = self.feedback_slot();
-            emit(
-                &mut self.code,
-                Opcode::LoadNamedProperty,
-                &[recv, name_idx, feedback],
-            );
-            let callee_reg = self.reg_base + self.next_temp + argc as u32;
-            emit(&mut self.code, Opcode::Store, &[callee_reg]);
-            // reserve args + callee so nested argument temps land above
-            self.next_temp += argc as u32 + 1;
-            for (i, arg) in c.arguments.iter().enumerate() {
-                self.call_argument(arg)?;
-                emit(&mut self.code, Opcode::Store, &[recv + 1 + i as u32]);
-            }
-            self.max_temps = self.max_temps.max(self.next_temp);
-            emit(
-                &mut self.code,
-                Opcode::CallNoFeedback,
-                &[callee_reg, recv, (argc + 1) as u32],
-            );
-            self.next_temp -= argc as u32 + 1;
-            self.pop_value(); // recv
-            return Ok(());
+            let name_idx = self.b.name(s.property.name.as_bytes());
+            return self.emit_method_call(c, |g| {
+                g.expr(&s.object)?;
+                let recv = g.b.stage_acc();
+                let feedback = g.b.new_feedback();
+                g.b.load_named_property(recv, name_idx, feedback);
+                Ok(recv)
+            });
         }
         if let Expression::ComputedMemberExpression(cm) = &c.callee {
-            let argc = c.arguments.len();
-            self.expr(&cm.object)?;
-            let recv = self.push_value();
-            self.expr(&cm.expression)?;
-            let feedback = self.feedback_slot();
-            emit(&mut self.code, Opcode::LoadKeyedProperty, &[recv, feedback]);
-            let callee_reg = self.reg_base + self.next_temp + argc as u32;
-            emit(&mut self.code, Opcode::Store, &[callee_reg]);
-            self.next_temp += argc as u32 + 1;
-            for (i, arg) in c.arguments.iter().enumerate() {
-                self.call_argument(arg)?;
-                emit(&mut self.code, Opcode::Store, &[recv + 1 + i as u32]);
-            }
-            self.max_temps = self.max_temps.max(self.next_temp);
-            emit(
-                &mut self.code,
-                Opcode::CallNoFeedback,
-                &[callee_reg, recv, (argc + 1) as u32],
-            );
-            self.next_temp -= argc as u32 + 1;
-            self.pop_value(); // recv
-            return Ok(());
+            return self.emit_method_call(c, |g| {
+                g.expr(&cm.object)?;
+                let recv = g.b.stage_acc();
+                g.expr(&cm.expression)?;
+                let feedback = g.b.new_feedback();
+                g.b.load_keyed_property(recv, feedback);
+                Ok(recv)
+            });
         }
         if let Expression::PrivateFieldExpression(p) = &c.callee {
             return self.err(p.span, "calling a private method");
         }
         // plain call: receiver = undefined (slot 0), callee evaluated
         // first, then arguments
-        let argc = c.arguments.len();
+        let argc = c.arguments.len() as u32;
+        let mark = self.b.temp_depth();
         self.expr(&c.callee)?;
-        let callee_reg = self.reg_base + self.next_temp + 1 + argc as u32;
-        emit(&mut self.code, Opcode::Store, &[callee_reg]);
-        self.emit_load_undefined();
-        let recv = self.push_value();
-        self.next_temp += argc as u32 + 1;
+        let args_base = self.b.reserve_temps(argc + 2);
+        let callee = Reg::new(args_base.index() + argc as i32 + 1);
+        self.b.store(callee);
+        self.b.load_undefined();
+        let recv = args_base;
+        self.b.store(recv);
         for (i, arg) in c.arguments.iter().enumerate() {
             self.call_argument(arg)?;
-            emit(&mut self.code, Opcode::Store, &[recv + 1 + i as u32]);
+            self.b.store(Reg::new(args_base.index() + 1 + i as i32));
         }
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(
-            &mut self.code,
-            Opcode::CallNoFeedback,
-            &[callee_reg, recv, (argc + 1) as u32],
-        );
-        self.next_temp -= argc as u32 + 1;
-        self.pop_value(); // recv
+        self.b.call_no_feedback(callee, RegList::new(recv, argc + 1));
+        self.b.drop_temps(mark);
         Ok(())
     }
 
@@ -2412,59 +2084,47 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         c: &CallExpression<'_>,
         m: MemberRef<'_>,
     ) -> Result<(), CompileError> {
-        let argc = c.arguments.len();
-        let Some(store) = self.prepare_super_parts(m)? else {
-            return self.err(c.span, "super method call");
-        };
-        self.emit_property_load_of(&store);
-        let recv = match &store {
-            StoreTarget::SuperNamed { recv, .. } => *recv,
-            StoreTarget::SuperKeyed { recv, .. } => *recv,
-            _ => unreachable!("super store parts"),
-        };
-        let callee_reg = self.reg_base + self.next_temp + argc as u32;
-        emit(&mut self.code, Opcode::Store, &[callee_reg]);
-        self.next_temp += argc as u32 + 1;
-        for (i, arg) in c.arguments.iter().enumerate() {
-            self.call_argument(arg)?;
-            emit(&mut self.code, Opcode::Store, &[recv + 1 + i as u32]);
-        }
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(
-            &mut self.code,
-            Opcode::CallNoFeedback,
-            &[callee_reg, recv, (argc + 1) as u32],
-        );
-        self.next_temp -= argc as u32 + 1;
-        self.release_store(&store);
-        Ok(())
+        self.emit_method_call(c, |g| {
+            let Some(store) = g.prepare_super_parts(m)? else {
+                return Err(CompileError::new(c.span, "super method call"));
+            };
+            g.emit_property_load_of(&store);
+            let (recv, dead_parts) = match &store {
+                StoreTarget::SuperNamed { recv, .. } => (*recv, 1),
+                StoreTarget::SuperKeyed { recv, .. } => (*recv, 2),
+                _ => unreachable!("super store parts"),
+            };
+            // the home/key parts above the receiver are dead once the
+            // method is loaded; dropping them keeps the argument window
+            // contiguous with the receiver
+            for _ in 0..dead_parts {
+                g.b.drop_temp();
+            }
+            Ok(recv)
+        })
     }
 
     fn emit_new(&mut self, n: &NewExpression<'_>) -> Result<(), CompileError> {
-        let argc = n.arguments.len();
+        let argc = n.arguments.len() as u32;
+        let mark = self.b.temp_depth();
         self.expr(&n.callee)?;
-        let callee_reg = self.reg_base + self.next_temp + argc as u32;
-        emit(&mut self.code, Opcode::Store, &[callee_reg]);
-        let arg_base = self.reg_base + self.next_temp;
-        self.next_temp += argc as u32 + 1;
+        // window [args..., callee]: construct takes no receiver
+        let args_base = self.b.reserve_temps(argc + 1);
+        let callee = Reg::new(args_base.index() + argc as i32);
+        self.b.store(callee);
         for (i, arg) in n.arguments.iter().enumerate() {
             self.call_argument(arg)?;
-            emit(&mut self.code, Opcode::Store, &[arg_base + i as u32]);
+            self.b.store(Reg::new(args_base.index() + i as i32));
         }
-        self.max_temps = self.max_temps.max(self.next_temp);
-        emit(
-            &mut self.code,
-            Opcode::Construct,
-            &[callee_reg, arg_base, argc as u32],
-        );
-        self.next_temp -= argc as u32 + 1;
+        self.b.construct(callee, RegList::new(args_base, argc));
+        self.b.drop_temps(mark);
         Ok(())
     }
 
     /// `super(...)`: construct the superclass with the constructor's
     /// new.target and initialize `this` with the result (ES 15.4.3).
     fn emit_super_call(&mut self, c: &CallExpression<'_>) -> Result<(), CompileError> {
-        let argc = c.arguments.len();
+        let argc = c.arguments.len() as u32;
         let (owner, owner_depth) = match self.c.facts.special.get(&c.node_id.get()) {
             Some(Special::SuperCall { owner, depth }) => (*owner, *depth),
             _ => (self.fid, 0),
@@ -2480,22 +2140,18 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             )
         };
 
-        let arg_base = self.reg_base + self.next_temp;
+        let mark = self.b.temp_depth();
         // reserve arguments + result (+ closure/new.target registers for
         // the delegated variant) so nested temps land above
-        let reserved = argc as u32 + 1 + u32::from(!direct) * 2;
-        self.next_temp += reserved;
+        let reserved = argc + 1 + u32::from(!direct) * 2;
+        let arg_base = self.b.reserve_temps(reserved);
         for (i, arg) in c.arguments.iter().enumerate() {
             self.call_argument(arg)?;
-            emit(&mut self.code, Opcode::Store, &[arg_base + i as u32]);
+            self.b.store(Reg::new(arg_base.index() + i as i32));
         }
-        self.max_temps = self.max_temps.max(self.next_temp);
         if direct {
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::ConstructSuper as u32, arg_base, argc as u32],
-            );
+            self.b
+                .call_runtime(RuntimeFn::ConstructSuper, RegList::new(arg_base, argc));
         } else {
             // .this_function and .new.target of the owning constructor
             // (runtime ABI: (args..., closure, new_target))
@@ -2508,57 +2164,45 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         .expect("delegated super() forces the new.target slot"),
                 )
             };
-            let closure_reg = arg_base + argc as u32;
-            let new_target_reg = closure_reg + 1;
-            emit(
-                &mut self.code,
-                Opcode::LoadContextSlot,
-                &[this_function_slot, owner_depth],
-            );
-            emit(&mut self.code, Opcode::Store, &[closure_reg]);
-            emit(
-                &mut self.code,
-                Opcode::LoadContextSlot,
-                &[new_target_slot, owner_depth],
-            );
-            emit(&mut self.code, Opcode::Store, &[new_target_reg]);
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[
-                    bytecode::RuntimeFn::ConstructSuperVia as u32,
-                    arg_base,
-                    (argc + 2) as u32,
-                ],
+            let closure_reg = Reg::new(arg_base.index() + argc as i32);
+            let new_target_reg = Reg::new(closure_reg.index() + 1);
+            self.b.load_context_slot(this_function_slot, owner_depth);
+            self.b.store(closure_reg);
+            self.b.load_context_slot(new_target_slot, owner_depth);
+            self.b.store(new_target_reg);
+            self.b.call_runtime(
+                RuntimeFn::ConstructSuperVia,
+                RegList::new(arg_base, argc + 2),
             );
         }
         // the constructed instance lands above the (contiguous) runtime
         // argument window
-        let result = arg_base + argc as u32 + u32::from(!direct) * 2;
-        emit(&mut self.code, Opcode::Store, &[result]);
+        let result = Reg::new(arg_base.index() + argc as i32 + i32::from(!direct) * 2);
+        self.b.store(result);
         // InitializeThisBinding: this must still be uninitialized
         let super_once_check = |g: &mut Self| {
-            let t = g.push_value();
-            emit(
-                &mut g.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::ThrowSuperAlreadyCalledIfNotHole as u32, t, 1],
+            let mark = g.b.temp_depth();
+            let t = g.b.stage_acc();
+            g.b.call_runtime(
+                RuntimeFn::ThrowSuperAlreadyCalledIfNotHole,
+                RegList::new(t, 1),
             );
-            g.pop_value();
+            g.b.drop_temps(mark);
         };
         match this_slot {
             Some(slot) => {
                 let depth = if direct { 0 } else { owner_depth };
-                emit(&mut self.code, Opcode::LoadContextSlot, &[slot, depth]);
+                self.b.load_context_slot(slot, depth);
                 super_once_check(self);
-                emit(&mut self.code, Opcode::Load, &[result]);
-                emit(&mut self.code, Opcode::StoreContextSlot, &[slot, depth]);
+                self.b.load(result);
+                self.b.store_context_slot(slot, depth);
             }
             None => {
-                emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
+                let this = self.b.this_reg();
+                self.b.load(this);
                 super_once_check(self);
-                emit(&mut self.code, Opcode::Load, &[result]);
-                emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
+                self.b.load(result);
+                self.b.store(this);
             }
         }
         // InitializeInstanceElements (ES 7.3.33): the derived
@@ -2566,27 +2210,25 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // instance (for arrow-delegated super(), the owner is the ctor)
         let field_owner = if direct { self.fid } else { owner };
         if self.fn_has_instance_fields(field_owner) {
-            let ctor = self.reserve_temp();
+            let ctor = self.b.temp();
             if direct {
-                emit(&mut self.code, Opcode::LoadCurrentClosure, &[]);
+                self.b.load_current_closure();
             } else {
                 let slot = self.c.layouts[owner.0 as usize]
                     .this_function_slot
                     .expect("delegated super() forces the closure slot");
-                emit(&mut self.code, Opcode::LoadContextSlot, &[slot, owner_depth]);
+                self.b.load_context_slot(slot, owner_depth);
             }
-            emit(&mut self.code, Opcode::Store, &[ctor]);
-            emit(&mut self.code, Opcode::Load, &[result]);
-            self.push_value();
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
-            );
-            self.next_temp -= 2;
+            self.b.store(ctor);
+            self.b.load(result);
+            self.b.stage_acc();
+            self.b
+                .call_runtime(RuntimeFn::InitInstanceFields, RegList::new(ctor, 2));
+            self.b.drop_temp(); // instance
+            self.b.drop_temp(); // ctor
         }
-        emit(&mut self.code, Opcode::Load, &[result]);
-        self.next_temp -= reserved;
+        self.b.load(result);
+        self.b.drop_temps(mark);
         Ok(())
     }
 
@@ -2610,9 +2252,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // exists) and the super home objects; captured by member closures.
         // Pushed before the superclass evaluation (ES 15.7.14 step 8).
         let ctx_save = if slot_count > 0 {
-            emit(&mut self.code, Opcode::CreateBlockContext, &[slot_count]);
-            let save = self.reserve_temp();
-            emit(&mut self.code, Opcode::PushContext, &[save]);
+            self.b.create_block_context(slot_count);
+            let save = self.b.temp();
+            self.b.push_context(save);
             Some(save)
         } else {
             None
@@ -2624,114 +2266,85 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let privates = self.c.facts.classes[idx.0 as usize].privates.clone();
         let private_slots = self.c.facts.classes[idx.0 as usize].private_slots.clone();
         for (name, slot) in privates.iter().zip(&private_slots) {
-            let desc = self.add_constant(Constant::String(name.as_bytes().to_vec()));
-            emit(&mut self.code, Opcode::LoadConstant, &[desc]);
-            let desc_reg = self.push_value();
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::CreatePrivateName as u32, desc_reg, 1],
-            );
-            self.pop_value();
-            emit(&mut self.code, Opcode::StoreContextSlot, &[*slot, 0]);
+            let desc = self.b.name(name.as_bytes());
+            self.b.load_constant(desc);
+            let desc_reg = self.b.stage_acc();
+            self.b
+                .call_runtime(RuntimeFn::CreatePrivateName, RegList::new(desc_reg, 1));
+            self.b.drop_temp();
+            self.b.store_context_slot(*slot, 0);
         }
 
         // superclass: must be null or a constructor
         let sup = if let Some(sup) = superclass {
             self.expr(sup)?;
-            let sup = self.push_value();
-            self.emit_runtime_call(bytecode::RuntimeFn::ThrowIfNotConstructorOrNull, 1, |g, b| {
-                g.stage_reg(sup, b);
-            });
+            let sup = self.b.stage_acc();
+            self.b
+                .call_runtime_staged(RuntimeFn::ThrowIfNotConstructorOrNull, &[RtArg::Reg(sup)]);
             Some(sup)
         } else {
             None
         };
 
         // prototype/constructor parents; defaults are the no-extends case
-        self.emit_load_constant(Constant::ObjectPrototype);
-        let pp = self.push_value();
-        self.emit_load_constant(Constant::FunctionPrototype);
-        let cp = self.push_value();
+        let obj_proto = self.b.constant(Constant::ObjectPrototype);
+        self.b.load_constant(obj_proto);
+        let pp = self.b.stage_acc();
+        let fn_proto = self.b.constant(Constant::FunctionPrototype);
+        self.b.load_constant(fn_proto);
+        let cp = self.b.stage_acc();
         if let Some(sup) = sup {
             // null superclass → null-proto prototype; ctor parent stays
             // %Function.prototype% (objects are always truthy, so the
             // falsy test identifies null)
-            emit(&mut self.code, Opcode::Load, &[sup]);
-            let mut null_extends = Label::new();
-            emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut null_extends);
+            self.b.load(sup);
+            let null_extends = self.b.new_label();
+            self.b.jump_if_falsy(null_extends);
             // protoParent = Get(superCtor, "prototype") (full [[Get]])
-            let proto_name = self.add_constant(Constant::String(b"prototype".to_vec()));
-            let feedback = self.feedback_slot();
-            emit(
-                &mut self.code,
-                Opcode::LoadNamedProperty,
-                &[sup, proto_name, feedback],
-            );
-            emit(&mut self.code, Opcode::Store, &[pp]);
-            self.emit_runtime_call(bytecode::RuntimeFn::ThrowIfNotObjectOrNull, 1, |g, b| {
-                g.stage_reg(pp, b);
-            });
-            emit(&mut self.code, Opcode::Load, &[sup]);
-            emit(&mut self.code, Opcode::Store, &[cp]);
-            let mut done = Label::new();
-            emit_jump(&mut self.code, Opcode::Jump, &mut done);
-            null_extends.bind(&self.code);
-            null_extends.patch_all(&mut self.code);
-            emit(&mut self.code, Opcode::LoadNull, &[]);
-            emit(&mut self.code, Opcode::Store, &[pp]);
-            done.bind(&self.code);
-            done.patch_all(&mut self.code);
+            let proto_name = self.b.name(b"prototype");
+            let feedback = self.b.new_feedback();
+            self.b.load_named_property(sup, proto_name, feedback);
+            self.b.store(pp);
+            self.b
+                .call_runtime_staged(RuntimeFn::ThrowIfNotObjectOrNull, &[RtArg::Reg(pp)]);
+            self.b.load(sup);
+            self.b.store(cp);
+            let done = self.b.new_label();
+            self.b.jump(done);
+            self.b.bind(null_extends);
+            self.b.load_null();
+            self.b.store(pp);
+            self.b.bind(done);
         }
 
         // prototype: a fresh ordinary object with protoParent
-        emit(&mut self.code, Opcode::CreateEmptyObjectLiteral, &[]);
-        let proto = self.push_value();
-        self.emit_runtime_call(bytecode::RuntimeFn::SetPrototype, 2, |g, b| {
-            g.stage_reg(proto, b);
-            g.stage_reg(pp, b + 1);
-        });
+        self.b.create_empty_object_literal();
+        let proto = self.b.stage_acc();
+        self.b.call_runtime_staged(RuntimeFn::SetPrototype,&[RtArg::Reg(proto), RtArg::Reg(pp)]);
 
         // constructor closure
-        let ctor_idx = self.add_constant(Constant::Callable(IrFunctionId(ctor.0)));
-        emit(&mut self.code, Opcode::CreateClosure, &[ctor_idx]);
-        let ctor = self.push_value();
+        let ctor_idx = self.b.constant(Constant::Callable(FunctionId(ctor.0)));
+        self.b.create_closure(ctor_idx);
+        let ctor = self.b.stage_acc();
 
         // wiring before member installation (ES 15.7.14 steps 17–18
         // precede the element loop): computed `['constructor']` members
         // overwrite proto.constructor, computed static `['prototype']`
         // defines fail against the non-configurable ctor.prototype
         // proto.constructor → the class {w+, e−, c+}
-        let ctor_name = self.add_constant(Constant::String(b"constructor".to_vec()));
-        let (proto_reg, ctor_reg) = (proto, ctor);
-        self.emit_runtime_call(bytecode::RuntimeFn::DefineOwnProperty, 4, |g, b| {
-            g.stage_reg(proto_reg, b);
-            g.stage_constant(ctor_name, b + 1);
-            g.stage_reg(ctor_reg, b + 2);
-            g.stage_smi(PropertyFlags::DontEnum.bits(), b + 3);
-        });
+        let ctor_name = self.b.name(b"constructor");
+        self.b.call_runtime_staged(RuntimeFn::DefineOwnProperty, &[RtArg::Reg(proto), RtArg::Const(ctor_name), RtArg::Reg(ctor), RtArg::Smi(PropertyFlags::DontEnum.bits())]);
         // ctor.prototype → the prototype {w+, e−, c−}
-        let proto_name = self.add_constant(Constant::String(b"prototype".to_vec()));
-        self.emit_runtime_call(bytecode::RuntimeFn::DefineOwnProperty, 4, |g, b| {
-            g.stage_reg(ctor_reg, b);
-            g.stage_constant(proto_name, b + 1);
-            g.stage_reg(proto_reg, b + 2);
-            g.stage_smi(
-                PropertyFlags::DontEnum.bits() | PropertyFlags::DontDelete.bits(),
-                b + 3,
-            );
-        });
+        let proto_name = self.b.name(b"prototype");
+        self.b.call_runtime_staged(RuntimeFn::DefineOwnProperty, &[RtArg::Reg(ctor), RtArg::Const(proto_name), RtArg::Reg(proto), RtArg::Smi(PropertyFlags::DontEnum.bits() | PropertyFlags::DontDelete.bits())]);
         // the class itself inherits from the superclass constructor
-        self.emit_runtime_call(bytecode::RuntimeFn::SetPrototype, 2, |g, b| {
-            g.stage_reg(ctor_reg, b);
-            g.stage_reg(cp, b + 1);
-        });
+        self.b.call_runtime_staged(RuntimeFn::SetPrototype,&[RtArg::Reg(ctor), RtArg::Reg(cp)]);
 
         // instance field list: a JS array [key0, init0, key1, init1, ...]
         // attached to the constructor (its hidden fields slot)
         let fields_arr = if has_instance_fields {
-            emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
-            Some(self.push_value())
+            self.b.create_empty_array_literal();
+            Some(self.b.stage_acc())
         } else {
             None
         };
@@ -2739,7 +2352,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // static field keys (evaluated in element order) stay live until
         // the deferred initializer calls after the class is complete
         // (closure register, key register, constant-key name index)
-        let mut static_fields: Vec<(u32, Option<u32>, Option<u32>)> = Vec::new();
+        let mut static_fields: Vec<(Reg, Option<Reg>, Option<ConstIdx>)> = Vec::new();
 
         // members in declaration order; the constructor is already installed
         for mi in 0..member_count {
@@ -2753,22 +2366,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     if let PropertyKey::PrivateIdentifier(p) = key {
                         self.emit_private_key_load(p.node_id.get(), p.span)?;
                     }
-                    Some(self.push_value())
-                } else if computed {
-                    if let Some(e) = key.as_expression() {
-                        self.expr(e)?;
-                    }
-                    Some(self.push_value())
-                } else if matches!(key, PropertyKey::NumericLiteral(_)) {
-                    self.emit_number_key(key);
-                    Some(self.push_value())
+                    Some(self.b.stage_acc())
                 } else {
-                    None
+                    self.stage_key(key, computed)?
                 };
-                let fn_idx = self.add_constant(Constant::Callable(IrFunctionId(fid.0)));
-                emit(&mut self.code, Opcode::CreateClosure, &[fn_idx]);
+                let fn_idx = self.b.constant(Constant::Callable(FunctionId(fid.0)));
+                self.b.create_closure(fn_idx);
                 if is_static {
-                    let closure = self.push_value();
+                    let closure = self.b.stage_acc();
                     let name_idx = match key_reg {
                         Some(_) => None,
                         None => Some(self.name_constant(key)?),
@@ -2777,45 +2382,33 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 } else {
                     // append [key, initializer] to the instance field list
                     let arr = fields_arr.expect("instance fields allocate the list");
-                    let closure = self.push_value();
-                    emit(&mut self.code, Opcode::LoadSmi, &[field_index]);
-                    let i = self.push_value();
+                    let closure = self.b.stage_acc();
+                    self.b.load_smi(field_index as i32);
+                    let i = self.b.stage_acc();
                     match key_reg {
                         Some(k) => {
-                            emit(&mut self.code, Opcode::Load, &[k]);
-                            let feedback = self.feedback_slot();
-                            emit(
-                                &mut self.code,
-                                Opcode::StoreKeyedPropertyNoShadow,
-                                &[arr, i, feedback],
-                            );
+                            self.b.load(k);
+                            let feedback = self.b.new_feedback();
+                            self.b.store_keyed_property_no_shadow(arr, i, feedback);
                         }
                         None => {
                             let name_idx = self.name_constant(key)?;
-                            emit(&mut self.code, Opcode::LoadConstant, &[name_idx]);
-                            let feedback = self.feedback_slot();
-                            emit(
-                                &mut self.code,
-                                Opcode::StoreKeyedPropertyNoShadow,
-                                &[arr, i, feedback],
-                            );
+                            self.b.load_constant(name_idx);
+                            let feedback = self.b.new_feedback();
+                            self.b.store_keyed_property_no_shadow(arr, i, feedback);
                         }
                     }
                     // initializer at the next slot
-                    emit(&mut self.code, Opcode::LoadSmi, &[field_index + 1]);
-                    emit(&mut self.code, Opcode::Store, &[i]);
-                    emit(&mut self.code, Opcode::Load, &[closure]);
-                    let feedback = self.feedback_slot();
-                    emit(
-                        &mut self.code,
-                        Opcode::StoreKeyedPropertyNoShadow,
-                        &[arr, i, feedback],
-                    );
-                    self.pop_value(); // i
-                    self.pop_value(); // closure
+                    self.b.load_smi(field_index as i32 + 1);
+                    self.b.store(i);
+                    self.b.load(closure);
+                    let feedback = self.b.new_feedback();
+                    self.b.store_keyed_property_no_shadow(arr, i, feedback);
+                    self.b.drop_temp(); // i
+                    self.b.drop_temp(); // closure
                     field_index += 2;
                     if key_reg.is_some() {
-                        self.pop_value();
+                        self.b.drop_temp();
                     }
                 }
                 continue;
@@ -2823,21 +2416,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             let target = if is_static { ctor } else { proto };
             // non-computed keys are strings or numbers; numbers go through
             // the keyed define with the literal loaded into a register
-            let numeric_key = !computed && matches!(key, PropertyKey::NumericLiteral(_));
-            let key_reg = if computed || numeric_key {
-                if computed {
-                    if let Some(e) = key.as_expression() {
-                        self.expr(e)?;
-                    }
-                } else {
-                    self.emit_number_key(key);
-                }
-                Some(self.push_value())
-            } else {
-                None
-            };
-            let fn_idx = self.add_constant(Constant::Callable(IrFunctionId(fid.0)));
-            emit(&mut self.code, Opcode::CreateClosure, &[fn_idx]);
+            let key_reg = self.stage_key(key, computed)?;
+            let fn_idx = self.b.constant(Constant::Callable(FunctionId(fid.0)));
+            self.b.create_closure(fn_idx);
             // computed keys name the member after their ToPropertyKey value
             if let Some(k) = key_reg {
                 let prefix = match kind {
@@ -2854,17 +2435,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             match kind {
                 MemberKind::Method => {
                     // {w+, e−, c+}: runtime(obj, key, value = acc, flags)
-                    self.emit_runtime_call(bytecode::RuntimeFn::DefineOwnProperty, 4, |g, b| {
-                        // the member value is in the accumulator: stage it
-                        // before the loads below clobber it
-                        g.stage_acc(b + 2);
-                        g.stage_reg(target, b);
-                        match key_reg {
-                            Some(k) => g.stage_reg(k, b + 1),
-                            None => g.stage_constant(name_idx.unwrap(), b + 1),
-                        }
-                        g.stage_smi(PropertyFlags::DontEnum.bits(), b + 3);
-                    });
+                    let key = match key_reg {
+                        Some(k) => RtArg::Reg(k),
+                        None => RtArg::Const(name_idx.unwrap()),
+                    };
+                    self.b.call_runtime_staged(RuntimeFn::DefineOwnProperty, &[RtArg::Reg(target), key, RtArg::Acc, RtArg::Smi(PropertyFlags::DontEnum.bits())]);
                 }
                 MemberKind::Get | MemberKind::Set => {
                     // one accessor half; merges with an existing pair:
@@ -2873,20 +2448,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     if kind == MemberKind::Get {
                         flags |= 1;
                     }
-                    self.emit_runtime_call(bytecode::RuntimeFn::InstallAccessor, 4, |g, b| {
-                        g.stage_acc(b + 2);
-                        g.stage_reg(target, b);
-                        match key_reg {
-                            Some(k) => g.stage_reg(k, b + 1),
-                            None => g.stage_constant(name_idx.unwrap(), b + 1),
-                        }
-                        g.stage_smi(flags, b + 3);
-                    });
+                    let key = match key_reg {
+                        Some(k) => RtArg::Reg(k),
+                        None => RtArg::Const(name_idx.unwrap()),
+                    };
+                    self.b.call_runtime_staged(RuntimeFn::InstallAccessor, &[RtArg::Reg(target), key, RtArg::Acc, RtArg::Smi(flags)]);
                 }
                 MemberKind::Field => unreachable!("fields handled above"),
             }
             if key_reg.is_some() {
-                self.pop_value();
+                self.b.drop_temp();
             }
         }
 
@@ -2897,66 +2468,59 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 (c.home_slot.unwrap(), c.static_home_slot.unwrap())
             };
             // the class context is pushed here: zero hops
-            emit(&mut self.code, Opcode::Load, &[proto]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[home_slot, 0]);
-            emit(&mut self.code, Opcode::Load, &[ctor]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[static_home_slot, 0]);
+            self.b.load(proto);
+            self.b.store_context_slot(home_slot, 0);
+            self.b.load(ctor);
+            self.b.store_context_slot(static_home_slot, 0);
         }
         if let Some(slot) = name_slot {
-            emit(&mut self.code, Opcode::Load, &[ctor]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            self.b.load(ctor);
+            self.b.store_context_slot(slot, 0);
         }
 
         // static fields: each initializer runs with the constructor as
         // `this` and its result is [[DefineOwnProperty]]'d on it, in
         // declaration order (ES 15.7.14 step 33)
         for (closure, key_reg, name_idx) in &static_fields {
-            emit(&mut self.code, Opcode::Load, &[*closure]);
-            emit(&mut self.code, Opcode::CallNoFeedback, &[*closure, ctor, 1]);
+            self.b.load(*closure);
+            self.b.call_no_feedback(*closure, RegList::new(ctor, 1));
             // runtime(obj = ctor, key, value = acc, flags 0)
-            self.emit_runtime_call(bytecode::RuntimeFn::DefineOwnProperty, 4, |g, b| {
-                g.stage_acc(b + 2);
-                g.stage_reg(ctor, b);
-                match (key_reg, name_idx) {
-                    (Some(k), _) => g.stage_reg(*k, b + 1),
-                    (None, Some(name_idx)) => g.stage_constant(*name_idx, b + 1),
-                    (None, None) => unreachable!("static field keys are reg or const"),
-                }
-                g.stage_smi(0, b + 3);
-            });
+            let key = match (key_reg, name_idx) {
+                (Some(k), _) => RtArg::Reg(*k),
+                (None, Some(name_idx)) => RtArg::Const(*name_idx),
+                (None, None) => unreachable!("static field keys are reg or const"),
+            };
+            self.b.call_runtime_staged(RuntimeFn::DefineOwnProperty, &[RtArg::Reg(ctor), key, RtArg::Acc, RtArg::Smi(0)]);
         }
         // LIFO pops for the static field registers (key under closure)
         for (_closure, key_reg, _) in static_fields.iter().rev() {
-            self.pop_value(); // closure
+            self.b.drop_temp(); // closure
             if key_reg.is_some() {
-                self.pop_value(); // key
+                self.b.drop_temp(); // key
             }
         }
 
         // attach the instance field list to the constructor
         if let Some(arr) = fields_arr {
-            emit(&mut self.code, Opcode::Load, &[ctor]);
-            let ctor_reg = self.push_value();
-            emit(&mut self.code, Opcode::Load, &[arr]);
-            self.push_value();
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::SetClassFields as u32, ctor_reg, 2],
-            );
-            self.pop_value(); // arr copy
-            self.pop_value(); // ctor_reg
-            self.pop_value(); // the fields array itself
+            self.b.load(ctor);
+            let ctor_reg = self.b.stage_acc();
+            self.b.load(arr);
+            self.b.stage_acc();
+            self.b
+                .call_runtime(RuntimeFn::SetClassFields, RegList::new(ctor_reg, 2));
+            self.b.drop_temp(); // arr copy
+            self.b.drop_temp(); // ctor_reg
+            self.b.drop_temp(); // the fields array itself
         }
 
         // pop the class context; member closures already captured it
         if let Some(save) = ctx_save {
-            emit(&mut self.code, Opcode::PopContext, &[save]);
-            self.next_temp -= 1; // save
+            self.b.pop_context(save);
+            self.b.drop_temp(); // save
         }
 
         // outer binding for declarations (the class value in acc)
-        emit(&mut self.code, Opcode::Load, &[ctor]);
+        self.b.load(ctor);
         if is_decl
             && let Some((sym, name)) = decl_symbol
         {
@@ -2964,22 +2528,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
 
         // LIFO: ctor, proto, cp, pp, superclass
-        self.pop_value(); // ctor
-        self.pop_value(); // proto
-        self.pop_value(); // cp
-        self.pop_value(); // pp
+        self.b.drop_temp(); // ctor
+        self.b.drop_temp(); // proto
+        self.b.drop_temp(); // cp
+        self.b.drop_temp(); // pp
         if sup.is_some() {
-            self.pop_value();
+            self.b.drop_temp();
         }
-        emit(&mut self.code, Opcode::Load, &[ctor]);
+        self.b.load(ctor);
         Ok(())
     }
 
     // -- literals -----------------------------------------------------------------
 
     fn emit_array_literal(&mut self, a: &ArrayExpression<'_>) -> Result<(), CompileError> {
-        emit(&mut self.code, Opcode::CreateEmptyArrayLiteral, &[]);
-        let arr = self.push_value();
+        self.b.create_empty_array_literal();
+        let arr = self.b.stage_acc();
         let mut i = 0u32;
         for el in &a.elements {
             match el {
@@ -2989,22 +2553,18 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 }
                 other => {
                     let x = other.as_expression().expect("elision/spread handled");
-                    emit(&mut self.code, Opcode::LoadSmi, &[i]);
-                    let idx = self.push_value();
+                    self.b.load_smi(i as i32);
+                    let idx = self.b.stage_acc();
                     self.expr(x)?;
-                    let feedback = self.feedback_slot();
-                    emit(
-                        &mut self.code,
-                        Opcode::StoreKeyedPropertyNoShadow,
-                        &[arr, idx, feedback],
-                    );
-                    self.pop_value();
+                    let feedback = self.b.new_feedback();
+                    self.b.store_keyed_property_no_shadow(arr, idx, feedback);
+                    self.b.drop_temp();
                     i += 1;
                 }
             }
         }
-        emit(&mut self.code, Opcode::Load, &[arr]);
-        self.pop_value();
+        self.b.load(arr);
+        self.b.drop_temp();
         Ok(())
     }
 
@@ -3014,32 +2574,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let node = o.node_id.get();
         let needs_home = self.c.facts.obj_lit_home.contains(&node);
         let ctx_save = if needs_home {
-            emit(&mut self.code, Opcode::CreateBlockContext, &[1]);
-            let save = self.reserve_temp();
-            emit(&mut self.code, Opcode::PushContext, &[save]);
+            self.b.create_block_context(1);
+            let save = self.b.temp();
+            self.b.push_context(save);
             Some(save)
         } else {
             None
         };
 
-        emit(&mut self.code, Opcode::CreateEmptyObjectLiteral, &[]);
-        let obj = self.push_value();
+        self.b.create_empty_object_literal();
+        let obj = self.b.stage_acc();
         for p in &o.properties {
             let ObjectPropertyKind::ObjectProperty(p) = p else {
                 return self.err(o.span, "spread in object literals");
             };
-            let key_reg = if p.computed {
-                if let Some(e) = p.key.as_expression() {
-                    self.expr(e)?;
-                }
-                Some(self.push_value())
-            } else if matches!(p.key, PropertyKey::NumericLiteral(_)) {
-                // numeric literal keys ({ 1: x }) use the keyed path
-                self.emit_number_key(&p.key);
-                Some(self.push_value())
-            } else {
-                None
-            };
+            // numeric literal keys ({ 1: x }) use the keyed path
+            let key_reg = self.stage_key(&p.key, p.computed)?;
             let is_method = p.method || matches!(p.value, Expression::FunctionExpression(_));
             match p.kind {
                 PropertyKind::Init if !is_method => {
@@ -3051,23 +2601,15 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                             if self.is_anon_function(&p.value) {
                                 self.emit_set_name_by_const(name_idx);
                             }
-                            let feedback = self.feedback_slot();
-                            emit(
-                                &mut self.code,
-                                Opcode::StoreNamedProperty,
-                                &[obj, name_idx, feedback],
-                            );
+                            let feedback = self.b.new_feedback();
+                            self.b.store_named_property(obj, name_idx, feedback);
                         }
                         Some(k) => {
                             if self.is_anon_function(&p.value) {
                                 self.emit_set_name_by_reg(k, 0);
                             }
-                            let feedback = self.feedback_slot();
-                            emit(
-                                &mut self.code,
-                                Opcode::StoreKeyedProperty,
-                                &[obj, k, feedback],
-                            );
+                            let feedback = self.b.new_feedback();
+                            self.b.store_keyed_property(obj, k, feedback);
                         }
                     }
                 }
@@ -3079,20 +2621,12 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         self.emit_set_name_by_reg(k, 0);
                     }
                     if let Some(k) = key_reg {
-                        let feedback = self.feedback_slot();
-                        emit(
-                            &mut self.code,
-                            Opcode::StoreKeyedProperty,
-                            &[obj, k, feedback],
-                        );
+                        let feedback = self.b.new_feedback();
+                        self.b.store_keyed_property(obj, k, feedback);
                     } else {
                         let name_idx = self.name_constant(&p.key)?;
-                        let feedback = self.feedback_slot();
-                        emit(
-                            &mut self.code,
-                            Opcode::StoreNamedProperty,
-                            &[obj, name_idx, feedback],
-                        );
+                        let feedback = self.b.new_feedback();
+                        self.b.store_named_property(obj, name_idx, feedback);
                     }
                 }
                 PropertyKind::Get | PropertyKind::Set => {
@@ -3114,34 +2648,29 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         Some(_) => None,
                         None => Some(self.name_constant(&p.key)?),
                     };
-                    self.emit_runtime_call(bytecode::RuntimeFn::InstallAccessor, 4, |g, b| {
-                        // the closure is in the accumulator: stage it first
-                        g.stage_acc(b + 2);
-                        g.stage_reg(obj, b);
-                        match key_reg {
-                            Some(k) => g.stage_reg(k, b + 1),
-                            None => g.stage_constant(name_idx.unwrap(), b + 1),
-                        }
-                        g.stage_smi(flags, b + 3);
-                    });
+                    let key = match key_reg {
+                        Some(k) => RtArg::Reg(k),
+                        None => RtArg::Const(name_idx.unwrap()),
+                    };
+                    self.b.call_runtime_staged(RuntimeFn::InstallAccessor, &[RtArg::Reg(obj), key, RtArg::Acc, RtArg::Smi(flags)]);
                 }
             }
             if key_reg.is_some() {
-                self.pop_value();
+                self.b.drop_temp();
             }
         }
         // the home object is the literal itself; methods already captured
         // the context, so the store is visible to them
         if needs_home {
-            emit(&mut self.code, Opcode::Load, &[obj]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[0, 0]);
+            self.b.load(obj);
+            self.b.store_context_slot(0, 0);
         }
         if let Some(save) = ctx_save {
-            emit(&mut self.code, Opcode::PopContext, &[save]);
-            self.next_temp -= 1;
+            self.b.pop_context(save);
+            self.b.drop_temp();
         }
-        emit(&mut self.code, Opcode::Load, &[obj]);
-        self.pop_value();
+        self.b.load(obj);
+        self.b.drop_temp();
         Ok(())
     }
 }
@@ -3182,7 +2711,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 // a script-level value-producing statement records the
                 // completion value (non-value statements leave it)
                 if let Some(completion) = self.completion {
-                    emit(&mut self.code, Opcode::Store, &[completion]);
+                    self.b.store(completion);
                 }
                 Ok(())
             }
@@ -3195,22 +2724,19 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             Statement::IfStatement(s) => {
                 self.expr(&s.test)?;
-                let mut else_l = Label::new();
-                emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut else_l);
+                let else_l = self.b.new_label();
+                self.b.jump_if_falsy(else_l);
                 self.stmt(&s.consequent)?;
                 match &s.alternate {
                     Some(e) => {
-                        let mut end = Label::new();
-                        emit_jump(&mut self.code, Opcode::Jump, &mut end);
-                        else_l.bind(&self.code);
-                        else_l.patch_all(&mut self.code);
+                        let end = self.b.new_label();
+                        self.b.jump(end);
+                        self.b.bind(else_l);
                         self.stmt(e)?;
-                        end.bind(&self.code);
-                        end.patch_all(&mut self.code);
+                        self.b.bind(end);
                     }
                     None => {
-                        else_l.bind(&self.code);
-                        else_l.patch_all(&mut self.code);
+                        self.b.bind(else_l);
                     }
                 }
                 Ok(())
@@ -3232,15 +2758,15 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 }
                 match &s.argument {
                     Some(v) => self.expr(v)?,
-                    None => self.emit_load_undefined(),
+                    None => self.b.load_undefined(),
                 }
-                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-                emit(&mut self.code, Opcode::Return, &[]);
+                self.b.pop_context(self.ctx_save);
+                self.b.ret();
                 Ok(())
             }
             Statement::ThrowStatement(s) => {
                 self.expr(&s.argument)?;
-                emit(&mut self.code, Opcode::Throw, &[]);
+                self.b.throw();
                 Ok(())
             }
             Statement::TryStatement(s) => self.emit_try_catch(s),
@@ -3260,8 +2786,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     .is_some_and(|v| v.iter().any(|(s, _)| *s == sym));
                 if !hoisted {
                     let fid = self.c.facts.fn_of_node[&f.node_id.get()];
-                    let idx = self.add_constant(Constant::Callable(IrFunctionId(fid.0)));
-                    emit(&mut self.code, Opcode::CreateClosure, &[idx]);
+                    let idx = self.b.constant(Constant::Callable(FunctionId(fid.0)));
+                    self.b.create_closure(idx);
                     self.store_symbol(sym, id.name.as_ref())?;
                 }
                 Ok(())
@@ -3308,16 +2834,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 r
             }
             _ => {
+                let breaks = self.b.new_label();
                 self.breakables.push(Breakable {
                     labels: vec![label],
-                    breaks: Label::new(),
+                    breaks,
                     continues: None,
                     unwind_ctx: None,
                 });
                 let result = self.stmt(&s.body);
-                let (mut breaks, _) = self.end_breakable();
-                breaks.bind(&self.code);
-                breaks.patch_all(&mut self.code);
+                let (breaks, _) = self.end_breakable();
+                self.b.bind(breaks);
                 result
             }
         }
@@ -3332,9 +2858,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                             .err(decl.span, "destructuring declaration needs an initializer");
                     };
                     self.expr(init)?;
-                    let value = self.push_value();
+                    let value = self.b.stage_acc();
                     self.emit_binding_pattern(&decl.id, value)?;
-                    self.pop_value();
+                    self.b.drop_temp();
                 }
                 BindingPattern::BindingIdentifier(b) => {
                     let Some(sym) = b.symbol_id.get() else {
@@ -3371,13 +2897,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // lexical heads (`for (let/const k in …)`) own a block
             // context; captured heads get a fresh copy per iteration so
             // closures in the body capture per-iteration bindings
-            let mut loop_ctx: Option<u32> = None;
+            let mut loop_ctx: Option<Reg> = None;
             let ctx_save = if slots > 0 {
-                emit(&mut g.code, Opcode::CreateBlockContext, &[slots]);
-                let save = g.reserve_temp();
-                let lc = g.reserve_temp();
-                emit(&mut g.code, Opcode::Store, &[lc]);
-                emit(&mut g.code, Opcode::PushContext, &[save]);
+                g.b.create_block_context(slots);
+                let save = g.b.temp();
+                let lc = g.b.temp();
+                g.b.store(lc);
+                g.b.push_context(save);
                 loop_ctx = Some(lc);
                 Some(save)
             } else {
@@ -3386,77 +2912,65 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // head: subject → enumerator (undefined for nullish subjects;
             // ForInNext(undefined) is immediately done)
             g.expr(&s.right)?;
-            let subject = g.push_value();
-            emit(
-                &mut g.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::ForInEnumerate as u32, subject, 1],
-            );
-            g.pop_value(); // the call consumed the subject; acc = enumerator
-            let enumerator = g.push_value();
+            let subject = g.b.stage_acc();
+            g.b
+                .call_runtime(RuntimeFn::ForInEnumerate, RegList::new(subject, 1));
+            g.b.drop_temp(); // the call consumed the subject; acc = enumerator
+            let enumerator = g.b.stage_acc();
 
             // loop: next key or undefined
-            let head = g.code.len();
+            let back = g.b.new_label();
+            g.b.bind(back); // loop head
+            let breaks = g.b.new_label();
+            let continues = g.b.new_label();
             g.breakables.push(Breakable {
                 labels,
-                breaks: Label::new(),
-                continues: Some(Label::new()),
+                breaks,
+                continues: Some(continues),
                 unwind_ctx: ctx_save,
             });
-            emit(
-                &mut g.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::ForInNext as u32, enumerator, 1],
-            );
-            let mut have_key = Label::new();
-            emit_jump(&mut g.code, Opcode::JumpIfNotUndefined, &mut have_key);
-            emit_jump(
-                &mut g.code,
-                Opcode::Jump,
-                &mut g.breakables.last_mut().unwrap().breaks,
-            );
-            have_key.bind(&g.code);
-            have_key.patch_all(&mut g.code);
-            let key = g.push_value();
+            g.b.call_runtime(RuntimeFn::ForInNext, RegList::new(enumerator, 1));
+            let have_key = g.b.new_label();
+            g.b.jump_if_not_undefined(have_key);
+            g.b.jump(breaks);
+            g.b.bind(have_key);
+            let key = g.b.stage_acc();
 
             // per iteration with a lexical head: replace the context with
             // a fresh sibling (same outer) and initialize the binding
             // there — a fresh binding per iteration
             if per_iteration {
                 let save = ctx_save.expect("per-iteration loops own a context");
-                emit(&mut g.code, Opcode::PopContext, &[save]);
-                emit(&mut g.code, Opcode::CreateBlockContext, &[slots]);
-                emit(&mut g.code, Opcode::PushContext, &[save]);
+                g.b.pop_context(save);
+                g.b.create_block_context(slots);
+                g.b.push_context(save);
             }
 
             // assign the key to the target (per iteration), then the body
             g.emit_for_in_assign(&s.left, key)?;
             g.stmt(&s.body)?;
 
-            g.breakables
-                .last_mut()
-                .unwrap()
-                .continues
-                .as_mut()
-                .unwrap()
-                .bind(&g.code);
+            let continues = g.breakables.last().unwrap().continues.unwrap();
+            g.b.bind(continues);
             // absolute restore: a labelled continue may arrive from a
             // nested construct still holding its context (per-iteration
             // heads self-heal at the top of the next iteration)
-            if !per_iteration && let Some(lc) = loop_ctx {
-                emit(&mut g.code, Opcode::PopContext, &[lc]);
+            if !per_iteration
+                && let Some(lc) = loop_ctx
+            {
+                g.b.pop_context(lc);
             }
-            let mut back = Label::new();
-            emit_jump(&mut g.code, Opcode::JumpLoop, &mut back);
-            g.bind_loop_end(back, head);
+            g.b.jump_loop(back);
             // absolute restore: break may arrive from arbitrary context
             // depth (labelled jumps past nested loop pops)
+            let (breaks, _) = g.end_breakable();
+            g.b.bind(breaks);
             if let Some(save) = ctx_save {
-                emit(&mut g.code, Opcode::PopContext, &[save]);
+                g.b.pop_context(save);
             }
 
-            g.pop_value(); // key
-            g.pop_value(); // enumerator
+            g.b.drop_temp(); // key
+            g.b.drop_temp(); // enumerator
             Ok(())
         })
     }
@@ -3468,7 +2982,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     fn emit_for_in_assign(
         &mut self,
         left: &ForStatementLeft<'_>,
-        key: u32,
+        key: Reg,
     ) -> Result<(), CompileError> {
         match left {
             ForStatementLeft::VariableDeclaration(d) => {
@@ -3477,7 +2991,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 };
                 match &declarator.id {
                     BindingPattern::BindingIdentifier(b) => {
-                        emit(&mut self.code, Opcode::Load, &[key]);
+                        self.b.load(key);
                         let Some(sym) = b.symbol_id.get() else {
                             return self.err(b.span, "for-in binding");
                         };
@@ -3490,7 +3004,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 }
             }
             ForStatementLeft::AssignmentTargetIdentifier(i) => {
-                emit(&mut self.code, Opcode::Load, &[key]);
+                self.b.load(key);
                 self.store_name(i)
             }
             t if assign_member_ref_for_left(t).is_some() => {
@@ -3500,22 +3014,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 } else {
                     self.prepare_property_store(m)?
                 };
-                emit(&mut self.code, Opcode::Load, &[key]);
+                self.b.load(key);
                 self.emit_property_store(&store);
                 self.release_store(&store);
                 Ok(())
             }
             _ => self.err(left.span(), "for-in assignment target"),
         }
-    }
-
-    fn bind_loop_end(&mut self, mut back: Label, head: usize) {
-        let (mut breaks, continues) = self.end_breakable();
-        breaks.bind(&self.code);
-        breaks.patch_all(&mut self.code);
-        continues.unwrap().patch_all(&mut self.code);
-        back.bind_at(head);
-        back.patch_all(&mut self.code);
     }
 
     fn emit_while(
@@ -3525,30 +3030,24 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         labels: Vec<String>,
     ) -> Result<(), CompileError> {
         // head: cond; JumpIfFalsy breaks; body; continues; back-edge
-        let head = self.code.len();
+        let back = self.b.new_label();
+        self.b.bind(back); // loop head
         self.expr(test)?;
+        let breaks = self.b.new_label();
+        let continues = self.b.new_label();
         self.breakables.push(Breakable {
             labels,
-            breaks: Label::new(),
-            continues: Some(Label::new()),
+            breaks,
+            continues: Some(continues),
             unwind_ctx: None,
         });
-        emit_jump(
-            &mut self.code,
-            Opcode::JumpIfFalsy,
-            &mut self.breakables.last_mut().unwrap().breaks,
-        );
+        self.b.jump_if_falsy(breaks);
         self.stmt(body)?;
-        self.breakables
-            .last_mut()
-            .unwrap()
-            .continues
-            .as_mut()
-            .unwrap()
-            .bind(&self.code);
-        let mut back = Label::new();
-        emit_jump(&mut self.code, Opcode::JumpLoop, &mut back);
-        self.bind_loop_end(back, head);
+        let continues = self.breakables.last().unwrap().continues.unwrap();
+        self.b.bind(continues);
+        self.b.jump_loop(back);
+        let (breaks, _) = self.end_breakable();
+        self.b.bind(breaks);
         Ok(())
     }
 
@@ -3561,13 +3060,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let slots = self.c.facts.for_slots.get(&node).copied().unwrap_or(0);
         let labels = self.take_labels();
         self.with_temps(|g| {
-            let mut loop_ctx: Option<u32> = None;
+            let mut loop_ctx: Option<Reg> = None;
             let ctx_save = if slots > 0 {
-                emit(&mut g.code, Opcode::CreateBlockContext, &[slots]);
-                let save = g.reserve_temp();
-                let lc = g.reserve_temp();
-                emit(&mut g.code, Opcode::Store, &[lc]);
-                emit(&mut g.code, Opcode::PushContext, &[save]);
+                g.b.create_block_context(slots);
+                let save = g.b.temp();
+                let lc = g.b.temp();
+                g.b.store(lc);
+                g.b.push_context(save);
                 loop_ctx = Some(lc);
                 Some(save)
             } else {
@@ -3584,11 +3083,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // and the current iteration's context (merge points restore
             // absolutely — a labelled continue may bypass the pops of
             // nested loops still holding contexts)
-            let copies: Vec<u32>;
-            let mut iter_ctx: Option<u32> = None;
+            let copies: Vec<Reg>;
+            let mut iter_ctx: Option<Reg> = None;
             if per_iteration {
-                copies = (0..slots).map(|_| g.reserve_temp()).collect();
-                let iter_ctx_reg = g.reserve_temp();
+                copies = (0..slots).map(|_| g.b.temp()).collect();
+                let iter_ctx_reg = g.b.temp();
                 // the first iteration starts from a copy of the head
                 // context: values copied out, fresh sibling pushed
                 g.emit_iteration_context_copy(Some(iter_ctx_reg), slots, &copies, ctx_save);
@@ -3597,48 +3096,42 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 copies = Vec::new();
             }
             // head: cond?; JumpIfFalsy breaks; body; continues; update; back-edge
-            let head = g.code.len();
+            let back = g.b.new_label();
+            g.b.bind(back); // loop head
+            let breaks = g.b.new_label();
+            let continues = g.b.new_label();
             g.breakables.push(Breakable {
                 labels,
-                breaks: Label::new(),
-                continues: Some(Label::new()),
+                breaks,
+                continues: Some(continues),
                 unwind_ctx: ctx_save,
             });
             if let Some(cond) = &s.test {
                 g.expr(cond)?;
-                emit_jump(
-                    &mut g.code,
-                    Opcode::JumpIfFalsy,
-                    &mut g.breakables.last_mut().unwrap().breaks,
-                );
+                g.b.jump_if_falsy(breaks);
             }
             g.stmt(&s.body)?;
-            g.breakables
-                .last_mut()
-                .unwrap()
-                .continues
-                .as_mut()
-                .unwrap()
-                .bind(&g.code);
+            let continues = g.breakables.last().unwrap().continues.unwrap();
+            g.b.bind(continues);
             if let Some(iter_ctx) = iter_ctx {
                 // absolute restore to this iteration's context, then copy
                 // its values into a fresh sibling for the next iteration
                 // (ES 14.7.5.4: the copy precedes the update)
-                emit(&mut g.code, Opcode::PopContext, &[iter_ctx]);
+                g.b.pop_context(iter_ctx);
                 g.emit_iteration_context_copy(Some(iter_ctx), slots, &copies, ctx_save);
             } else if let Some(lc) = loop_ctx {
-                emit(&mut g.code, Opcode::PopContext, &[lc]);
+                g.b.pop_context(lc);
             }
             if let Some(next) = &s.update {
                 g.expr(next)?;
             }
-            let mut back = Label::new();
-            emit_jump(&mut g.code, Opcode::JumpLoop, &mut back);
-            g.bind_loop_end(back, head);
+            g.b.jump_loop(back);
             // absolute restore: break may arrive from arbitrary context
             // depth (labelled jumps past nested loop pops)
+            let (breaks, _) = g.end_breakable();
+            g.b.bind(breaks);
             if let Some(save) = ctx_save {
-                emit(&mut g.code, Opcode::PopContext, &[save]);
+                g.b.pop_context(save);
             }
             Ok(())
         })
@@ -3649,25 +3142,25 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     /// a fresh context (holes) and write the values back in.
     fn emit_iteration_context_copy(
         &mut self,
-        iter_ctx: Option<u32>,
+        iter_ctx: Option<Reg>,
         count: u32,
-        copies: &[u32],
-        ctx_save: Option<u32>,
+        copies: &[Reg],
+        ctx_save: Option<Reg>,
     ) {
         for slot in 0..count {
-            emit(&mut self.code, Opcode::LoadContextSlot, &[slot, 0]);
-            emit(&mut self.code, Opcode::Store, &[copies[slot as usize]]);
+            self.b.load_context_slot(slot, 0);
+            self.b.store(copies[slot as usize]);
         }
         let save = ctx_save.expect("per-iteration loops own a context");
-        emit(&mut self.code, Opcode::PopContext, &[save]);
-        emit(&mut self.code, Opcode::CreateBlockContext, &[count]);
+        self.b.pop_context(save);
+        self.b.create_block_context(count);
         if let Some(iter_ctx) = iter_ctx {
-            emit(&mut self.code, Opcode::Store, &[iter_ctx]);
+            self.b.store(iter_ctx);
         }
-        emit(&mut self.code, Opcode::PushContext, &[save]);
+        self.b.push_context(save);
         for slot in 0..count {
-            emit(&mut self.code, Opcode::Load, &[copies[slot as usize]]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            self.b.load(copies[slot as usize]);
+            self.b.store_context_slot(slot, 0);
         }
     }
 
@@ -3698,11 +3191,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // popping them innermost-first lands at the target's context
             for b in self.breakables[idx + 1..].iter().rev() {
                 if let Some(reg) = b.unwind_ctx {
-                    emit(&mut self.code, Opcode::PopContext, &[reg]);
+                    self.b.pop_context(reg);
                 }
             }
-            let state = &mut self.breakables[idx];
-            emit_jump(&mut self.code, Opcode::Jump, &mut state.breaks);
+            let target = self.breakables[idx].breaks;
+            self.b.jump(target);
             return Ok(());
         }
         let idx = match label {
@@ -3716,15 +3209,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         };
         for b in self.breakables[idx + 1..].iter().rev() {
             if let Some(reg) = b.unwind_ctx {
-                emit(&mut self.code, Opcode::PopContext, &[reg]);
+                self.b.pop_context(reg);
             }
         }
-        let state = &mut self.breakables[idx];
-        emit_jump(
-            &mut self.code,
-            Opcode::Jump,
-            state.continues.as_mut().unwrap(),
-        );
+        let target = self.breakables[idx].continues.unwrap();
+        self.b.jump(target);
         Ok(())
     }
 
@@ -3732,54 +3221,52 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let labels = self.take_labels();
         // evaluate the discriminant once into a temp
         self.expr(&s.discriminant)?;
-        let d = self.push_value();
+        let d = self.b.stage_acc();
+        let breaks = self.b.new_label();
         self.breakables.push(Breakable {
             labels,
-            breaks: Label::new(),
+            breaks,
             continues: None,
             unwind_ctx: None,
         });
 
         let cases = &s.cases;
-        let mut bodies: Vec<Label> = (0..cases.len()).map(|_| Label::new()).collect();
+        let bodies: Vec<Label> = (0..cases.len()).map(|_| self.b.new_label()).collect();
         let mut default_idx = None;
 
         for (i, case) in cases.iter().enumerate() {
             match &case.test {
                 Some(test) => {
                     self.expr(test)?;
-                    let t = self.push_value();
-                    emit(&mut self.code, Opcode::Load, &[d]);
-                    emit(&mut self.code, Opcode::EqualStrict, &[t]);
-                    self.pop_value();
-                    emit_jump(&mut self.code, Opcode::JumpIfTruthy, &mut bodies[i]);
+                    let t = self.b.stage_acc();
+                    self.b.load(d);
+                    self.b.equal_strict(t);
+                    self.b.drop_temp();
+                    self.b.jump_if_truthy(bodies[i]);
                 }
                 None => default_idx = Some(i),
             }
         }
 
         // no case matched: the default body, or past the switch
-        let mut end = Label::new();
+        let end = self.b.new_label();
         match default_idx {
-            Some(i) => emit_jump(&mut self.code, Opcode::Jump, &mut bodies[i]),
-            None => emit_jump(&mut self.code, Opcode::Jump, &mut end),
+            Some(i) => self.b.jump(bodies[i]),
+            None => self.b.jump(end),
         }
 
         // bodies execute in order; fallthrough is just sequential layout
         for (i, case) in cases.iter().enumerate() {
-            bodies[i].bind(&self.code);
-            bodies[i].patch_all(&mut self.code);
+            self.b.bind(bodies[i]);
             for st in &case.consequent {
                 self.stmt(st)?;
             }
         }
 
-        let (mut breaks, _) = self.end_breakable();
-        breaks.bind(&self.code);
-        breaks.patch_all(&mut self.code);
-        end.bind(&self.code);
-        end.patch_all(&mut self.code);
-        self.pop_value(); // discriminant
+        let (breaks, _) = self.end_breakable();
+        self.b.bind(breaks);
+        self.b.bind(end);
+        self.b.drop_temp(); // discriminant
         Ok(())
     }
 
@@ -3794,28 +3281,28 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // the handler restores absolutely so the catch block's
             // context-slot accesses see the context of the enclosing
             // statement
-            let try_ctx = g.reserve_temp();
-            emit(&mut g.code, Opcode::LoadContext, &[]);
-            emit(&mut g.code, Opcode::Store, &[try_ctx]);
-            let try_start = g.code.len();
+            let try_ctx = g.b.temp();
+            g.b.load_context();
+            g.b.store(try_ctx);
+            let t = g.b.begin_try();
             for st in &s.block.body {
                 g.stmt(st)?;
             }
-            let try_end = g.code.len();
+            g.b.end_try(t);
 
-            let mut end = Label::new();
-            emit_jump(&mut g.code, Opcode::Jump, &mut end);
+            let end = g.b.new_label();
+            g.b.jump(end);
 
             // handler entry: the exception arrives in the accumulator
-            let handler_pc = g.code.len();
-            emit(&mut g.code, Opcode::PopContext, &[try_ctx]);
+            g.b.handler_entry(t);
+            g.b.pop_context(try_ctx);
             if let Some(h) = &s.handler {
                 if let Some(param) = &h.param {
                     match &param.pattern {
                         BindingPattern::ObjectPattern(_) | BindingPattern::ArrayPattern(_) => {
-                            let value = g.push_value();
+                            let value = g.b.stage_acc();
                             g.emit_binding_pattern(&param.pattern, value)?;
-                            g.pop_value();
+                            g.b.drop_temp();
                         }
                         BindingPattern::BindingIdentifier(b) => {
                             let Some(sym) = b.symbol_id.get() else {
@@ -3831,13 +3318,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 }
             }
 
-            g.handlers.push(ir::HandlerEntry {
-                try_start,
-                try_end,
-                handler_pc,
-            });
-            end.bind(&g.code);
-            end.patch_all(&mut g.code);
+            g.b.bind(end);
             Ok(())
         })
     }
@@ -3861,8 +3342,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     /// receiver register.
     fn emit_this_load_own(&mut self) {
         match self.c.layouts[self.fid.0 as usize].this_slot {
-            Some(slot) => emit(&mut self.code, Opcode::LoadContextSlot, &[slot, 0]),
-            None => emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]),
+            Some(slot) => self.b.load_context_slot(slot, 0),
+            None => self.b.load(self.b.this_reg()),
         }
     }
 
@@ -3877,31 +3358,30 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // still pushed: the captured-this slot lives in it)
             self.emit_this_load_own();
             self.emit_this_initialized_check();
-            emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-            emit(&mut self.code, Opcode::Return, &[]);
+            self.b.pop_context(self.ctx_save);
+            self.b.ret();
             return Ok(());
         };
         self.expr(v)?;
-        let t = self.push_value();
+        let t = self.b.stage_acc();
         // acc === undefined → return this
-        self.emit_load_undefined();
-        let u = self.push_value();
-        emit(&mut self.code, Opcode::Load, &[t]);
-        emit(&mut self.code, Opcode::EqualStrict, &[u]);
-        let mut is_obj = Label::new();
-        emit_jump(&mut self.code, Opcode::JumpIfFalsy, &mut is_obj);
+        self.b.load_undefined();
+        let u = self.b.stage_acc();
+        self.b.load(t);
+        self.b.equal_strict(u);
+        let is_obj = self.b.new_label();
+        self.b.jump_if_falsy(is_obj);
         // undefined → return this (context still pushed for the slot read)
         self.emit_this_load_own();
         self.emit_this_initialized_check();
-        emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-        emit(&mut self.code, Opcode::Return, &[]);
-        is_obj.bind(&self.code);
-        is_obj.patch_all(&mut self.code);
-        emit(&mut self.code, Opcode::Load, &[t]);
-        emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-        emit(&mut self.code, Opcode::Return, &[]);
-        self.pop_value(); // u
-        self.pop_value(); // t
+        self.b.pop_context(self.ctx_save);
+        self.b.ret();
+        self.b.bind(is_obj);
+        self.b.load(t);
+        self.b.pop_context(self.ctx_save);
+        self.b.ret();
+        self.b.drop_temp(); // u
+        self.b.drop_temp(); // t
         Ok(())
     }
 
@@ -3913,17 +3393,21 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let layout = &self.c.layouts[self.fid.0 as usize];
         // the script (and each eval compilation) tracks its completion
         // value in a dedicated register between ctx_save and the temps
-        self.completion = (self.fid.0 == 0).then_some(layout.register_count + 1);
-        self.ctx_save = layout.register_count as i32;
-        self.reg_base = layout.register_count + 1 + u32::from(self.completion.is_some());
+        self.completion = (self.fid.0 == 0).then(|| Reg::new(layout.register_count as i32 + 1));
+        self.ctx_save = Reg::new(layout.register_count as i32);
+        self.b.set_temp_base(layout.register_count + 1 + u32::from(self.completion.is_some()));
 
         // prologue: one context per function (uniform chain), pushed onto
-        // the frame context; locals below reg_base are born as the hole.
-        // constants[0] is the context's shared ScopeInfo (slot names)
-        let names = layout.slot_names.clone();
-        self.add_constant(Constant::ContextNames(names));
-        emit(&mut self.code, Opcode::CreateFunctionContext, &[0]);
-        emit(&mut self.code, Opcode::PushContext, &[self.ctx_save as u32]);
+        // the frame context; locals below the temps are born as the hole.
+        // the context's shared ScopeInfo (slot names) is the first constant
+        let names: Vec<Box<[u8]>> = layout
+            .slot_names
+            .iter()
+            .map(|n| n.as_slice().into())
+            .collect();
+        let ctx_info = self.b.constant(Constant::ContextNames(names));
+        self.b.create_function_context(ctx_info);
+        self.b.push_context(self.ctx_save);
 
         // parameters: non-simple lists (any default / pattern / rest)
         // stage the incoming arguments, hole-fill the parameter registers,
@@ -3945,55 +3429,53 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         });
         if non_simple {
             let n = params.len() as u32;
-            let staged_base = self.reserve_temps(n);
+            let staged_base = self.b.reserve_temps(n);
             // stage the incoming arguments (missing ones arrive as
             // undefined through frame padding)
             for i in 0..n {
-                emit(&mut self.code, Opcode::Load, &[(-(i as i32 + 2)) as u32]);
-                emit(&mut self.code, Opcode::Store, &[staged_base + i]);
+                let param = self.b.param(i);
+                self.b.load(param);
+                self.b.store(Reg::new(staged_base.index() + i as i32));
             }
             // rest arrays capture the frame's raw argument list — build
             // them before the registers are hole-filled
             for (i, (_, _, rest)) in params.iter().enumerate() {
                 if *rest {
                     let i = i as u32;
-                    self.emit_runtime_call(
-                        bytecode::RuntimeFn::CreateRestParameter,
-                        1,
-                        |g, b| g.stage_smi(i, b),
-                    );
-                    emit(&mut self.code, Opcode::Store, &[staged_base + i]);
+                    self.b
+                        .call_runtime_staged(RuntimeFn::CreateRestParameter, &[RtArg::Smi(i)]);
+                    self.b.store(Reg::new(staged_base.index() + i as i32));
                 }
             }
             // parameters start in their TDZ
             for i in 0..n {
-                emit(&mut self.code, Opcode::LoadHole, &[]);
-                emit(&mut self.code, Opcode::Store, &[(-(i as i32 + 2)) as u32]);
+                let param = self.b.param(i);
+                self.b.load_hole();
+                self.b.store(param);
             }
             // left-to-right initialization
             for (i, (target, default, _)) in params.iter().enumerate() {
-                let reg = (-(i as i32 + 2)) as u32;
-                let staged = staged_base + i as u32;
+                let reg = self.b.param(i as u32);
+                let staged = Reg::new(staged_base.index() + i as i32);
                 if let Some(default) = default {
-                    emit(&mut self.code, Opcode::Load, &[staged]);
-                    let mut skip = Label::new();
-                    emit_jump(&mut self.code, Opcode::JumpIfNotUndefined, &mut skip);
+                    self.b.load(staged);
+                    let skip = self.b.new_label();
+                    self.b.jump_if_not_undefined(skip);
                     self.expr(default)?;
-                    emit(&mut self.code, Opcode::Store, &[staged]);
-                    skip.bind(&self.code);
-                    skip.patch_all(&mut self.code);
+                    self.b.store(staged);
+                    self.b.bind(skip);
                 }
                 // InitializeBinding: the register (and, when captured, the
                 // context slot) receives the value
-                emit(&mut self.code, Opcode::Load, &[staged]);
-                emit(&mut self.code, Opcode::Store, &[reg]);
+                self.b.load(staged);
+                self.b.store(reg);
                 if let PatTarget::Binding(BindingPattern::BindingIdentifier(b)) = target
                     && let Some(sym) = b.symbol_id.get()
                     && let Some(Slot::Ctx { slot, .. }) = self.c.slots.get(&sym)
                 {
                     let slot = *slot;
-                    emit(&mut self.code, Opcode::Load, &[reg]);
-                    emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+                    self.b.load(reg);
+                    self.b.store_context_slot(slot, 0);
                 }
                 // pattern parameters destructure the bound value
                 if matches!(
@@ -4010,7 +3492,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     )?;
                 }
             }
-            self.next_temp -= n; // staged parameter window
+            self.b.drop_temps(self.b.temp_depth() - n); // staged parameter window
         } else {
             // context-allocated parameters: copy the argument into its
             // slot (captured params and direct-eval scopes force params
@@ -4023,9 +3505,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 if let Some(Slot::Ctx { slot, .. }) = self.c.slots.get(&sym) {
                     let slot = *slot;
                     let index = self.c.facts.param_symbols[&sym];
-                    let reg = (-(index as i32 + 2)) as u32;
-                    emit(&mut self.code, Opcode::Load, &[reg]);
-                    emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+                    let reg = self.b.param(index);
+                    self.b.load(reg);
+                    self.b.store_context_slot(slot, 0);
                 }
             }
         }
@@ -4033,18 +3515,18 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // store the receiver into the hidden this-slot when a nested
         // arrow captures it
         if let Some(slot) = self.c.layouts[self.fid.0 as usize].this_slot {
-            emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            self.b.load(self.b.this_reg());
+            self.b.store_context_slot(slot, 0);
         }
         // expose new.target / the running closure to nested arrows
         // (arrow-delegated super() and arrow new.target reads)
         if let Some(slot) = self.c.layouts[self.fid.0 as usize].new_target_slot {
-            emit(&mut self.code, Opcode::LoadNewTarget, &[]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            self.b.load_new_target();
+            self.b.store_context_slot(slot, 0);
         }
         if let Some(slot) = self.c.layouts[self.fid.0 as usize].this_function_slot {
-            emit(&mut self.code, Opcode::LoadCurrentClosure, &[]);
-            emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+            self.b.load_current_closure();
+            self.b.store_context_slot(slot, 0);
         }
 
         let kind = self.c.facts.functions[self.fid.0 as usize].kind;
@@ -4052,31 +3534,24 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // the synthesized default derived constructor forwards every
         // argument to super() and returns the bound this (ES 15.7.13)
         if kind == FnKind::DefaultDerivedCtor {
-            emit(
-                &mut self.code,
-                Opcode::CallRuntime,
-                &[bytecode::RuntimeFn::ConstructSuperAllArgs as u32, 0, 0],
-            );
-            emit(&mut self.code, Opcode::Store, &[(-1i32) as u32]);
+            self.b
+                .call_runtime(RuntimeFn::ConstructSuperAllArgs, RegList::new(Reg::new(0), 0));
+            self.b.store(self.b.this_reg());
             if self.fn_has_instance_fields(self.fid) {
                 // InitializeInstanceElements on the bound this:
                 // native(ctor, instance)
                 self.with_temps(|g| {
-                    emit(&mut g.code, Opcode::LoadCurrentClosure, &[]);
-                    let ctor = g.push_value();
+                    g.b.load_current_closure();
+                    let ctor = g.b.stage_acc();
                     g.emit_this_load_own();
-                    g.push_value();
-                    emit(
-                        &mut g.code,
-                        Opcode::CallRuntime,
-                        &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
-                    );
+                    g.b.stage_acc();
+                    g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(ctor, 2));
                     Ok(())
                 })?;
             }
-            emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-            emit(&mut self.code, Opcode::Load, &[(-1i32) as u32]);
-            emit(&mut self.code, Opcode::Return, &[]);
+            self.b.pop_context(self.ctx_save);
+            self.b.load(self.b.this_reg());
+            self.b.ret();
             return Ok(());
         }
 
@@ -4084,15 +3559,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // right after the receiver exists (ES 7.3.33, before the body)
         if kind == FnKind::BaseClassCtor && self.fn_has_instance_fields(self.fid) {
             self.with_temps(|g| {
-                emit(&mut g.code, Opcode::LoadCurrentClosure, &[]);
-                let ctor = g.push_value();
+                g.b.load_current_closure();
+                let ctor = g.b.stage_acc();
                 g.emit_this_load_own();
-                g.push_value();
-                emit(
-                    &mut g.code,
-                    Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::InitInstanceFields as u32, ctor, 2],
-                );
+                g.b.stage_acc();
+                g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(ctor, 2));
                 Ok(())
             })?;
         }
@@ -4104,26 +3575,23 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 let name = self.c.scoping.symbol_name(sym).to_string();
                 match self.c.slot_of(sym) {
                     Slot::Global => {
-                        let idx = self.add_constant(Constant::String(name.into_bytes()));
-                        let feedback = self.feedback_slot();
-                        self.emit_load_undefined();
-                        emit(&mut self.code, Opcode::StoreGlobal, &[idx, feedback]);
+                        let idx = self.b.name(name.as_bytes());
+                        let feedback = self.b.new_feedback();
+                        self.b.load_undefined();
+                        self.b.store_global(idx, feedback);
                     }
                     Slot::Param { index, .. } => {
-                        self.emit_load_undefined();
-                        emit(
-                            &mut self.code,
-                            Opcode::Store,
-                            &[(-(index as i32 + 2)) as u32],
-                        );
+                        let reg = self.b.param(index);
+                        self.b.load_undefined();
+                        self.b.store(reg);
                     }
                     Slot::Local { reg, .. } => {
-                        self.emit_load_undefined();
-                        emit(&mut self.code, Opcode::Store, &[reg]);
+                        self.b.load_undefined();
+                        self.b.store(Reg::new(reg as i32));
                     }
                     Slot::Ctx { slot, .. } => {
-                        self.emit_load_undefined();
-                        emit(&mut self.code, Opcode::StoreContextSlot, &[slot, 0]);
+                        self.b.load_undefined();
+                        self.b.store_context_slot(slot, 0);
                     }
                     Slot::CtxAt { .. } => unreachable!("vars never live in class/for contexts"),
                 }
@@ -4132,8 +3600,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         if let Some(fns) = self.c.facts.hoist_fns.get(&self.fid).cloned() {
             for (sym, fid) in fns {
                 let name = self.c.scoping.symbol_name(sym).to_string();
-                let idx = self.add_constant(Constant::Callable(IrFunctionId(fid.0)));
-                emit(&mut self.code, Opcode::CreateClosure, &[idx]);
+                let idx = self.b.constant(Constant::Callable(FunctionId(fid.0)));
+                self.b.create_closure(idx);
                 self.store_symbol(sym, &name)?;
             }
         }
@@ -4141,8 +3609,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // the script's completion value starts as undefined; only
         // value-producing statements overwrite it (see `stmt`)
         if let Some(completion) = self.completion {
-            self.emit_load_undefined();
-            emit(&mut self.code, Opcode::Store, &[completion]);
+            self.b.load_undefined();
+            self.b.store(completion);
         }
 
         // field-initializer functions (`return <init>;`): an anonymous
@@ -4155,14 +3623,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     if self.is_anon_function(e) {
                         self.emit_set_name_for_key_node(field_key.unwrap());
                     }
-                    emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-                    emit(&mut self.code, Opcode::Return, &[]);
+                    self.b.pop_context(self.ctx_save);
+                    self.b.ret();
                     return Ok(());
                 }
                 FnBody::Empty => {
-                    self.emit_load_undefined();
-                    emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-                    emit(&mut self.code, Opcode::Return, &[]);
+                    self.b.load_undefined();
+                    self.b.pop_context(self.ctx_save);
+                    self.b.ret();
                     return Ok(());
                 }
                 _ => {}
@@ -4182,8 +3650,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             FnBody::ArrowExpr(e) => {
                 self.expr(e)?;
-                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-                emit(&mut self.code, Opcode::Return, &[]);
+                self.b.pop_context(self.ctx_save);
+                self.b.ret();
                 return Ok(());
             }
             FnBody::FieldInit(_) | FnBody::Empty => {}
@@ -4194,20 +3662,20 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // (initialization checked — super() must have run)
         match self.completion {
             Some(completion) => {
-                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-                emit(&mut self.code, Opcode::Load, &[completion]);
+                self.b.pop_context(self.ctx_save);
+                self.b.load(completion);
             }
             None if self.is_derived_ctor() => {
                 self.emit_this_load_own();
                 self.emit_this_initialized_check();
-                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
+                self.b.pop_context(self.ctx_save);
             }
             None => {
-                emit(&mut self.code, Opcode::PopContext, &[self.ctx_save as u32]);
-                self.emit_load_undefined();
+                self.b.pop_context(self.ctx_save);
+                self.b.load_undefined();
             }
         }
-        emit(&mut self.code, Opcode::Return, &[]);
+        self.b.ret();
         Ok(())
     }
 }

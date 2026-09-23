@@ -1,12 +1,12 @@
-//! Materialization: `ir::Program` → VM heap objects.
+//! Materialization: `bytecode::Program` → VM heap objects.
 //!
 //! Each compiled function becomes a `CallableInfoObject` (bytecode +
 //! constants + handler table); closures reference them from the constants
 //! table. Constants are converted to heap values: interned strings,
 //! `Float`s, oddball singletons, and child callable infos.
 //!
-//! The materializer is frontend-agnostic: it consumes the shared [`ir`]
-//! program pools and knows nothing about the language that produced them.
+//! The materializer is frontend-agnostic: it consumes the compiled program
+//! function table and knows nothing about the language that produced it.
 
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
@@ -14,7 +14,7 @@ use crate::{
     ScopeInfoInit, Tagged, Value, VmError, decode_wtf8, new_feedback_vector,
 };
 
-use ir::{CallableKind, Constant, FunctionId, Program};
+use bytecode::{CallableKind, Constant, FunctionId, Program};
 
 use crate::DenseString;
 use crate::Smi;
@@ -57,6 +57,7 @@ impl Materialize {
         program: &Program,
         context: Handle<'s, Context>,
     ) -> Result<Handle<'s, Object>, VmError> {
+        let _span = trace::info_span!("vm::materialize").entered();
         let mut infos: Vec<Option<Handle<'s, CallableInfoObject>>> =
             (0..program.len()).map(|_| None).collect();
         let info = materialize_function(
@@ -91,6 +92,7 @@ fn materialize_function<'s>(
     if let Some(info) = infos[fid.index()] {
         return Ok(info);
     }
+    let _span = trace::debug_span!("vm::materialize_function", fid = fid.0).entered();
     let function = program.function(fid);
 
     let constants = program.constants(function);

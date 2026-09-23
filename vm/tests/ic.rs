@@ -577,7 +577,7 @@ fn object_create_builds_proto_chain() {
 
 // -- Kette multi-parent chains (constant parents, cached like JS) ---------
 
-use ir::SourceMode;
+use bytecode::SourceMode;
 
 fn run_kette_smi(src: &str) -> i64 {
     let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();

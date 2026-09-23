@@ -2,7 +2,7 @@
 //! the IR, and materialization into a hole-filled `FeedbackVector`.
 
 use bytecode::{Opcode, decode};
-use ir::{FunctionId, Program, SourceMode};
+use bytecode::{FunctionId, Program, SourceMode};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::VM;
 

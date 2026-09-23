@@ -4,6 +4,52 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use crate::program::{Constant, Function, HandlerEntry};
 use crate::{CallableKind, Opcode, Operand, emit};
 
+/// One staged argument of a runtime call: where the value for a window
+/// slot comes from. [`RtArg::Acc`] captures the accumulator's current
+/// value — always before any loads run, so later `Reg`/`Const`/`Smi`
+/// entries may clobber the accumulator freely.
+#[derive(Debug, Clone, Copy)]
+pub enum RtArg {
+    Acc,
+    Reg(Reg),
+    Const(ConstIdx),
+    Smi(u32),
+}
+
+impl FnBuilder {
+    /// Emit a `CallRuntime` with its argument window staged from a
+    /// declarative list: `&[RtArg::Acc, RtArg::Reg(obj), RtArg::Const(k)]`
+    /// stages the accumulator into slot 0, `obj` into slot 1, and the
+    /// pooled constant into slot 2, then calls.
+    pub fn call_runtime_staged(&mut self, f: crate::RuntimeFn, args: &[RtArg]) {
+        let mark = self.temp_depth();
+        let base = self.reserve_temps(args.len() as u32);
+        if let Some(i) = args.iter().position(|a| matches!(a, RtArg::Acc)) {
+            self.store(Reg::new(base.index() + i as i32));
+        }
+        for (i, arg) in args.iter().enumerate() {
+            let dst = Reg::new(base.index() + i as i32);
+            match arg {
+                RtArg::Acc => {}
+                RtArg::Reg(r) => {
+                    self.load(*r);
+                    self.store(dst);
+                }
+                RtArg::Const(c) => {
+                    self.load_constant(*c);
+                    self.store(dst);
+                }
+                RtArg::Smi(v) => {
+                    self.load_smi(*v as i32);
+                    self.store(dst);
+                }
+            }
+        }
+        self.call_runtime(f, RegList::new(base, args.len() as u32));
+        self.drop_temps(mark);
+    }
+}
+
 /// Emits an operand-less opcode that writes the accumulator.
 macro_rules! acc_void {
     ($name:ident, $opcode:ident) => {
@@ -57,7 +103,8 @@ impl Reg {
         self.0
     }
 
-    fn operand(self) -> u32 {
+    /// The operand encoding of this register (two's complement).
+    pub const fn operand(self) -> u32 {
         self.0 as u32
     }
 }
@@ -329,6 +376,17 @@ impl FnBuilder {
         r
     }
 
+    /// Allocate `n` consecutive temporary registers and return the first
+    /// (`base + 1` ... follow from its index) — the shape call argument
+    /// windows need.
+    pub fn reserve_temps(&mut self, n: u32) -> Reg {
+        let base = self.temp();
+        for _ in 1..n {
+            self.temp();
+        }
+        base
+    }
+
     /// Store the accumulator into a fresh temporary and return its register.
     pub fn stage_acc(&mut self) -> Reg {
         let t = self.temp();
@@ -350,6 +408,14 @@ impl FnBuilder {
 
     pub fn temp_depth(&self) -> u32 {
         self.temp_depth
+    }
+
+    /// Whether the fall-through path is still reachable: false after
+    /// `Return`/`Throw`/an unconditional jump, until the next `bind`.
+    /// Frontends use this to stop emitting unreachable statements (whose
+    /// accumulator reads would be meaningless).
+    pub fn is_live(&self) -> bool {
+        self.acc != Acc::Dead
     }
 
     // -- labels and handlers --------------------------------------------------
