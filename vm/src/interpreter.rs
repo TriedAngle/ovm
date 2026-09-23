@@ -6,7 +6,7 @@ use crate::{
     CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
     DenseString, Errors, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint, Key, LoadOutcome,
     Lookup, Object, PropertyDescriptor, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi,
-    Stack, StackCache, StoreOutcome, StoreSemantics, Tagged, VM, Value, VmError,
+    Stack, StackCache, StoreOutcome, StoreSemantics, Tagged, Termination, VM, Value, VmError,
 };
 
 enum Called<'a> {
@@ -213,22 +213,29 @@ fn exception_dispatch<'a>(
 ) -> Unwind<'a> {
     let stack = &state.stack;
     let cache = &state.cache;
+    // A termination is not an exception: no handler (catch or finally in
+    // any frame) may observe or intercept it — unwind straight out.
+    let terminated = state.termination().is_some();
     loop {
-        let handled = 'handled: {
-            let Some(obj) = stack
-                .callable_slot(&cache.frame_meta())
-                .get(heap)
-                .as_heap_object()
-            else {
-                break 'handled None;
-            };
-            let Some(info) = obj.as_ref().callable_info(heap) else {
-                break 'handled None;
-            };
-            let Some(handlers) = info.handlers.get(heap) else {
-                break 'handled None;
-            };
-            handlers.as_ref().lookup(pc)
+        let handled = if terminated {
+            None
+        } else {
+            'handled: {
+                let Some(obj) = stack
+                    .callable_slot(&cache.frame_meta())
+                    .get(heap)
+                    .as_heap_object()
+                else {
+                    break 'handled None;
+                };
+                let Some(info) = obj.as_ref().callable_info(heap) else {
+                    break 'handled None;
+                };
+                let Some(handlers) = info.handlers.get(heap) else {
+                    break 'handled None;
+                };
+                handlers.as_ref().lookup(pc)
+            }
         };
         if let Some(handler_pc) = handled {
             let ex = state
@@ -263,6 +270,13 @@ fn raise<'a>(
         Errors::from_vm_error(vm, heap, state, err).expect("error materialization must not fail");
     state.set_pending_exception(ex);
     exception_dispatch(heap, state, base_depth, pc)
+}
+
+fn begin_termination(heap: &Heap, state: &ContextState) -> Step<'static> {
+    state.set_termination(Termination::Shutdown);
+    let undefined = heap.known().undefined.as_tagged(heap);
+    state.set_pending_exception(undefined);
+    Step::PendingThrow
 }
 
 macro_rules! step_try {
@@ -1507,7 +1521,9 @@ fn step<'a>(
             Step::Next
         }
         Opcode::JumpLoop => {
-            heap.safepoint_poll();
+            if heap.safepoint_poll() {
+                return begin_termination(heap, state);
+            }
             cache.set_pc(jump_target(pc, ops.imm(0)));
             Step::Next
         }

@@ -32,8 +32,8 @@ use function::{
 };
 use global::{eval_runtime, is_nan};
 use helpers::{
-    define_data, define_method_prop, define_non_enumerable, install_constructor, install_method,
-    make_runtime_function, make_runtime_plain_function, run_prelude,
+    install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
+    run_prelude,
 };
 use number::{number_constructor, number_to_string, number_value_of};
 use object::{
@@ -190,7 +190,13 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             let n = thread.intern(&scope, name);
             // Safety: fresh interned word, rooted below before the define.
             let n = scope.handle(n.as_tagged(&*thread.heap()));
-            define_data(thread.heap(), &scope, number_fn, n, value.erase())?;
+            Object::define_own_property(
+                thread.heap(),
+                &scope,
+                number_fn,
+                n,
+                PropertyDescriptor::data(value.erase()),
+            )?;
         }
         let mut known = *thread.heap().known();
         known.number_wrapper_map = roots.create_handle(
@@ -265,19 +271,19 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             install_constructor(thread, &scope, idx.error, "Error", object_prototype)?;
         let known = thread.heap().known();
         let error_name = thread.intern(&scope, "Error");
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             error_proto,
             known.strings.name,
-            error_name.erase(),
+            PropertyDescriptor::data(error_name.erase()),
         )?;
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             error_proto,
             known.strings.message,
-            known.strings.empty.erase(),
+            PropertyDescriptor::data(known.strings.empty.erase()),
         )?;
         install_method(thread, &scope, error_proto, "toString", idx.error_to_string)?;
 
@@ -295,19 +301,19 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let (_, type_error_proto) =
             install_constructor(thread, &scope, idx.type_error, "TypeError", error_proto)?;
         let type_error_name = thread.intern(&scope, "TypeError");
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             type_error_proto,
             wks.name,
-            type_error_name.erase(),
+            PropertyDescriptor::data(type_error_name.erase()),
         )?;
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             type_error_proto,
             wks.message,
-            wks.empty.erase(),
+            PropertyDescriptor::data(wks.empty.erase()),
         )?;
         let mut known = *thread.heap().known();
         known.type_error_map = roots.create_handle(thread.heap().allocate::<Map>(MapInit {
@@ -326,19 +332,19 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             error_proto,
         )?;
         let reference_error_name = thread.intern(&scope, "ReferenceError");
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             reference_error_proto,
             wks.name,
-            reference_error_name.erase(),
+            PropertyDescriptor::data(reference_error_name.erase()),
         )?;
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             reference_error_proto,
             wks.message,
-            wks.empty.erase(),
+            PropertyDescriptor::data(wks.empty.erase()),
         )?;
         let mut known = *thread.heap().known();
         known.reference_error_map = roots.create_handle(thread.heap().allocate::<Map>(MapInit {
@@ -352,30 +358,30 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // ---- Function (constructor: dynamic bodies via eval, ES 20.2.1) --------
         let function_prototype = thread.heap().known().function_prototype;
         let function_fn = make_runtime_function(thread, &scope, idx.function_constructor)?;
-        define_method_prop(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             function_prototype,
             wks.constructor,
-            function_fn.erase(),
+            PropertyDescriptor::method(function_fn.erase()),
         )?;
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             function_fn,
             wks.prototype,
-            function_prototype.erase(),
+            PropertyDescriptor::data(function_prototype.erase()),
         )?;
         let function_name = thread.intern(&scope, "Function");
         // Safety: fresh interned word, rooted below before the define.
         let function_name = scope.handle(function_name.as_tagged(&*thread.heap()));
         let global_object = thread.heap().known().global_object;
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             global_object,
             function_name,
-            function_fn.erase(),
+            PropertyDescriptor::data(function_fn.erase()),
         )?;
 
         // ---- Function.prototype toString/call/apply/bind ------------------------
@@ -419,7 +425,13 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let eval_name = thread.intern(&scope, "eval");
         // Safety: fresh interned word, rooted below before the define.
         let eval_name = scope.handle(eval_name.as_tagged(&*thread.heap()));
-        define_data(thread.heap(), &scope, global, eval_name, eval_fn.erase())?;
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            global,
+            eval_name,
+            PropertyDescriptor::data(eval_fn.erase()),
+        )?;
 
         // ---- Object.prototype.toString/hasOwnProperty/propertyIsEnumerable ------
         let object_prototype = thread.heap().known().object_prototype;
@@ -450,29 +462,29 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // constructor to it (like Array below)
         let object_prototype = thread.heap().known().object_prototype;
         let object_fn = make_runtime_function(thread, &scope, idx.object)?;
-        define_method_prop(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             object_prototype,
             wks.constructor,
-            object_fn.erase(),
+            PropertyDescriptor::method(object_fn.erase()),
         )?;
-        define_method_prop(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             object_fn,
             wks.prototype,
-            object_prototype.erase(),
+            PropertyDescriptor::method(object_prototype.erase()),
         )?;
         let object_name = thread.intern(&scope, "Object");
         // Safety: fresh interned word, rooted below before the define.
         let object_name = scope.handle(object_name.as_tagged(&*thread.heap()));
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             global,
             object_name,
-            object_fn.erase(),
+            PropertyDescriptor::data(object_fn.erase()),
         )?;
         install_method(thread, &scope, object_fn, "create", idx.object_create)?;
         install_method(
@@ -516,36 +528,42 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // whose prototype is %Object.prototype%); just link the constructor
         let array_fn = make_runtime_function(thread, &scope, idx.array)?;
         let array_prototype = thread.heap().known().array_prototype;
-        define_method_prop(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             array_prototype,
             wks.constructor,
-            array_fn.erase(),
+            PropertyDescriptor::method(array_fn.erase()),
         )?;
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             array_fn,
             wks.prototype,
-            array_prototype.erase(),
+            PropertyDescriptor::data(array_prototype.erase()),
         )?;
         let array_name = thread.intern(&scope, "Array");
         // Safety: fresh interned word, rooted below before the define.
         let array_name = scope.handle(array_name.as_tagged(&*thread.heap()));
-        define_data(thread.heap(), &scope, global, array_name, array_fn.erase())?;
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            global,
+            array_name,
+            PropertyDescriptor::data(array_fn.erase()),
+        )?;
 
         // Array.isArray
         let is_array_fn = make_runtime_function(thread, &scope, idx.array_is_array)?;
         let is_array_name = thread.intern(&scope, "isArray");
         // Safety: fresh interned word, rooted below before the define.
         let is_array_name = scope.handle(is_array_name.as_tagged(&*thread.heap()));
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             array_fn,
             is_array_name,
-            is_array_fn.erase(),
+            PropertyDescriptor::data(is_array_fn.erase()),
         )?;
 
         // ---- Array iteration (the iterator protocol minimum) ---------------------
@@ -574,12 +592,12 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let iterator_symbol = thread.heap().known().iterator_symbol;
         // Safety: fresh root-slot word, rooted below before the defines.
         let iterator_name = scope.handle(iterator_symbol.as_tagged(&*thread.heap()));
-        define_method_prop(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             array_iterator_prototype,
             iterator_name,
-            sym_iterator_iter.erase(),
+            PropertyDescriptor::method(sym_iterator_iter.erase()),
         )?;
 
         // Array.prototype.values === Array.prototype[Symbol.iterator]: a
@@ -588,19 +606,19 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let values_name = thread.intern(&scope, "values");
         // Safety: fresh interned word, rooted below before the defines.
         let values_name = scope.handle(values_name.as_tagged(&*thread.heap()));
-        define_method_prop(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             array_prototype,
             values_name,
-            values_fn.erase(),
+            PropertyDescriptor::method(values_fn.erase()),
         )?;
-        define_method_prop(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             array_prototype,
             iterator_name,
-            values_fn.erase(),
+            PropertyDescriptor::method(values_fn.erase()),
         )?;
 
         // array-iterator map: slots [iterated array, next index], prototype
@@ -667,12 +685,12 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let is_nan_name = thread.intern(&scope, "isNaN");
         // Safety: fresh interned word, rooted below before the define.
         let is_nan_name = scope.handle(is_nan_name.as_tagged(&*thread.heap()));
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             global,
             is_nan_name,
-            is_nan_fn.erase(),
+            PropertyDescriptor::data(is_nan_fn.erase()),
         )?;
 
         // ---- Symbol (minimal: constructor + Symbol.iterator) ---------------
@@ -682,23 +700,23 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         let symbol_name = thread.intern(&scope, "Symbol");
         // Safety: fresh interned word, rooted below before the define.
         let symbol_name = scope.handle(symbol_name.as_tagged(&*thread.heap()));
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             global,
             symbol_name,
-            symbol_fn.erase(),
+            PropertyDescriptor::data(symbol_fn.erase()),
         )?;
         let iterator_symbol = thread.heap().known().iterator_symbol;
         let iter_name = thread.intern(&scope, "iterator");
         // Safety: fresh interned word, rooted below before the define.
         let iter_name = scope.handle(iter_name.as_tagged(&*thread.heap()));
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             symbol_fn,
             iter_name,
-            iterator_symbol.erase(),
+            PropertyDescriptor::data(iterator_symbol.erase()),
         )?;
 
         // ---- Proxy ------------------------------------------------------------
@@ -707,51 +725,69 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         // undefined"); `install_constructor` cannot be used.
         let proxy_fn = make_runtime_function(thread, &scope, idx.proxy)?;
         let two = scope.handle(Smi::new(2));
-        define_non_enumerable(thread.heap(), &scope, proxy_fn, wks.length, two)?;
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            proxy_fn,
+            wks.length,
+            PropertyDescriptor::non_enumerable(two),
+        )?;
         let proxy_name = thread.intern(&scope, "Proxy");
-        define_non_enumerable(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             proxy_fn,
             wks.name,
-            proxy_name.erase(),
+            PropertyDescriptor::non_enumerable(proxy_name.erase()),
         )?;
         // Safety: fresh interned word, rooted below before the define.
         let proxy_name = scope.handle(proxy_name.as_tagged(&*thread.heap()));
-        define_data(thread.heap(), &scope, global, proxy_name, proxy_fn.erase())?;
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            global,
+            proxy_name,
+            PropertyDescriptor::data(proxy_fn.erase()),
+        )?;
         // Proxy.revocable: a non-constructor function returning
         // { proxy, revoke }; the revoke closure is the JS template
         // installed by REVOKE_PRELUDE (runtimes cannot carry state).
         let revocable_fn = make_runtime_plain_function(thread, &scope, idx.proxy_revocable)?;
-        define_non_enumerable(thread.heap(), &scope, revocable_fn, wks.length, two)?;
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            revocable_fn,
+            wks.length,
+            PropertyDescriptor::non_enumerable(two),
+        )?;
         let revocable_name = thread.intern(&scope, "revocable");
-        define_non_enumerable(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             revocable_fn,
             wks.name,
-            revocable_name.erase(),
+            PropertyDescriptor::non_enumerable(revocable_name.erase()),
         )?;
         // Safety: fresh interned word, rooted below before the define.
         let revocable_name = scope.handle(revocable_name.as_tagged(&*thread.heap()));
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             proxy_fn,
             revocable_name,
-            revocable_fn.erase(),
+            PropertyDescriptor::data(revocable_fn.erase()),
         )?;
         // hidden revoke runtime used by the REVOKE_PRELUDE closure
         let revoke_fn = make_runtime_plain_function(thread, &scope, idx.proxy_revoke)?;
         let revoke_name = thread.intern(&scope, "__revokeProxy");
         // Safety: fresh interned word, rooted below before the define.
         let revoke_name = scope.handle(revoke_name.as_tagged(&*thread.heap()));
-        define_data(
+        Object::define_own_property(
             thread.heap(),
             &scope,
             global,
             revoke_name,
-            revoke_fn.erase(),
+            PropertyDescriptor::data(revoke_fn.erase()),
         )?;
 
         // ---- Object extensibility statics --------------------------------------

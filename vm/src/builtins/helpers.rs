@@ -13,7 +13,14 @@ pub fn make_runtime_function<'s>(
     scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
 ) -> Result<Handle<'s, Object>, VmError> {
-    let heap = thread.heap();
+    make_runtime_function_in(thread.heap(), scope, index)
+}
+
+pub fn make_runtime_function_in<'s>(
+    heap: &mut Heap,
+    scope: &'s HandleScope<'_>,
+    index: RuntimeIndex,
+) -> Result<Handle<'s, Object>, VmError> {
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
         .union(MapKind::CONSTRUCTOR)
@@ -46,7 +53,14 @@ pub fn make_runtime_plain_function<'s>(
     scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
 ) -> Result<Handle<'s, Object>, VmError> {
-    let heap = thread.heap();
+    make_runtime_plain_function_in(thread.heap(), scope, index)
+}
+
+pub fn make_runtime_plain_function_in<'s>(
+    heap: &mut Heap,
+    scope: &'s HandleScope<'_>,
+    index: RuntimeIndex,
+) -> Result<Handle<'s, Object>, VmError> {
     let kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
         .union(MapKind::RUNTIME)
@@ -137,23 +151,35 @@ pub fn install_constructor<'s>(
     let constructor_str = thread.intern(scope, "constructor");
     // Safety: fresh interned word, rooted below before any allocation.
     let constructor_name = scope.handle(constructor_str.as_tagged(&*thread.heap()));
-    define_method_prop(
+    Object::define_own_property(
         thread.heap(),
         scope,
         proto,
         constructor_name,
-        fn_obj.erase(),
+        PropertyDescriptor::method(fn_obj.erase()),
     )?;
     let prototype_str = thread.intern(scope, "prototype");
     // Safety: fresh interned word, rooted below before any allocation.
     let prototype_name = scope.handle(prototype_str.as_tagged(&*thread.heap()));
-    define_method_prop(thread.heap(), scope, fn_obj, prototype_name, proto.erase())?;
+    Object::define_own_property(
+        thread.heap(),
+        scope,
+        fn_obj,
+        prototype_name,
+        PropertyDescriptor::method(proto.erase()),
+    )?;
 
     // global.Name = fn
     let global = thread.heap().known().global_object;
     // Safety: fresh interned word, rooted below before any allocation.
     let name = scope.handle(name_str.as_tagged(&*thread.heap()));
-    define_data(thread.heap(), scope, global, name, fn_obj.erase())?;
+    Object::define_own_property(
+        thread.heap(),
+        scope,
+        global,
+        name,
+        PropertyDescriptor::data(fn_obj.erase()),
+    )?;
     Ok((fn_obj, proto))
 }
 
@@ -168,67 +194,12 @@ pub fn install_method(
     let name_str = thread.intern(scope, name);
     // Safety: fresh interned word, rooted below before any allocation.
     let method_name = scope.handle(name_str.as_tagged(&*thread.heap()));
-    define_method_prop(thread.heap(), scope, receiver, method_name, method.erase())?;
-    Ok(())
-}
-
-/// A built-in method property: {writable: true, enumerable: false,
-/// configurable: true} (ES 20.1.3-style attributes for prototype
-/// methods). Non-enumerability keeps for-in/`Object.keys` clean.
-#[allow(clippy::too_many_arguments)]
-pub fn define_method_prop(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    object: Handle<'_, Object>,
-    name: Handle<'_, SlotName>,
-    value: Handle<'_, Value>,
-) -> Result<(), VmError> {
     Object::define_own_property(
-        heap,
+        thread.heap(),
         scope,
-        object,
-        name,
-        PropertyDescriptor::Data {
-            value,
-            writable: true,
-            enumerable: false,
-            configurable: true,
-        },
-    )?;
-    Ok(())
-}
-
-pub fn define_data(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    object: Handle<'_, Object>,
-    name: Handle<'_, SlotName>,
-    value: Handle<'_, Value>,
-) -> Result<(), VmError> {
-    Object::define_own_property(heap, scope, object, name, PropertyDescriptor::data(value))?;
-    Ok(())
-}
-
-/// {writable: false, enumerable: false, configurable: true} — the spec
-/// attributes of builtin `length`/`name` properties.
-pub fn define_non_enumerable(
-    heap: &mut Heap,
-    scope: &HandleScope<'_>,
-    object: Handle<'_, Object>,
-    name: Handle<'_, SlotName>,
-    value: Handle<'_, Value>,
-) -> Result<(), VmError> {
-    Object::define_own_property(
-        heap,
-        scope,
-        object,
-        name,
-        PropertyDescriptor::Data {
-            value,
-            writable: false,
-            enumerable: false,
-            configurable: true,
-        },
+        receiver,
+        method_name,
+        PropertyDescriptor::method(method.erase()),
     )?;
     Ok(())
 }

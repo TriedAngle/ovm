@@ -421,17 +421,27 @@ impl Heap {
         self.local.collection_requested()
     }
 
-    pub fn park_for_collection(&self) {
+    pub fn park_for_collection(&self) -> bool {
         self.local.park_for_collection()
+    }
+
+    pub fn take_cancel(&self) -> bool {
+        self.local.take_cancel()
+    }
+
+    pub fn cancel_executions(&mut self, protocol: &dyn Fn()) {
+        self.local.cancel_executions(protocol)
     }
 
     pub fn gc_in_progress(&self) -> bool {
         self.local.gc_in_progress()
     }
 
-    pub fn safepoint_poll(&mut self) {
+    pub fn safepoint_poll(&mut self) -> bool {
         if self.collection_requested() {
-            self.park_for_collection();
+            self.park_for_collection() && self.take_cancel()
+        } else {
+            false
         }
     }
 

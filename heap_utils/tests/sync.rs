@@ -1,5 +1,5 @@
 use heap_utils::{LocalNode, Safepoint};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 fn spin_until(mut f: impl FnMut() -> bool) {
     while !f() {
@@ -188,4 +188,116 @@ fn churn_stress() {
     });
 
     assert_eq!(cycles.load(Ordering::Relaxed), 100);
+}
+
+#[test]
+fn cancel_executions_releases_threads_into_halt() {
+    let sync = Safepoint::new();
+    let requester = LocalNode::detached();
+    sync.attach(&requester);
+
+    let attached = AtomicUsize::new(0);
+    let cancelled = AtomicUsize::new(0);
+
+    std::thread::scope(|s| {
+        for _ in 0..2 {
+            s.spawn(|| {
+                let node = LocalNode::detached();
+                sync.attach(&node);
+                attached.fetch_add(1, Ordering::Relaxed);
+                // a mutator: run until requested, then pause
+                spin_until(|| node.requested());
+                let paused = sync.park_for_collection(&node);
+                // the pause carried the cancel; taking it consumes it
+                let took = node.take_cancel();
+                let took_again = node.take_cancel();
+                cancelled.fetch_add((paused && took && !took_again) as usize, Ordering::Relaxed);
+                // a cancelled node still detaches cleanly
+                sync.detach(&node);
+            });
+        }
+        spin_until(|| attached.load(Ordering::Relaxed) == 2);
+
+        let protocol = AtomicUsize::new(0);
+        sync.cancel_executions(&requester, || {
+            protocol.fetch_add(1, Ordering::Relaxed);
+        });
+
+        assert_eq!(protocol.load(Ordering::Relaxed), 1);
+        assert!(!sync.is_armed());
+        // the requester itself carries no cancel
+        assert!(!requester.pending());
+        // cancelling again is a no-op cycle, not an error
+        sync.cancel_executions(&requester, || {});
+
+        spin_until(|| cancelled.load(Ordering::Relaxed) == 2);
+    });
+}
+
+#[test]
+fn cancel_survives_collection_cycles() {
+    let sync = Safepoint::new();
+    let requester = LocalNode::detached();
+    let node = LocalNode::detached();
+    sync.attach(&requester);
+
+    let cancelled = AtomicUsize::new(0);
+    let attached = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            sync.attach(&node);
+            attached.store(true, Ordering::Relaxed);
+            spin_until(|| node.requested());
+            // first pause: the cancel cycle itself (the cancel is NOT
+            // taken yet — it must survive what comes next)
+            let paused = sync.park_for_collection(&node);
+            cancelled.fetch_add(paused as usize, Ordering::Relaxed);
+            // an ordinary collection cycle arrives: the thread parks for
+            // it, wakes, and the cancel is still observable afterwards
+            spin_until(|| sync.is_armed());
+            let paused_again = sync.park_for_collection(&node);
+            let took = node.take_cancel();
+            cancelled.fetch_add((paused_again && took) as usize, Ordering::Relaxed);
+            sync.detach(&node);
+        });
+        // the cancel protocol completes once the mutator paused once...
+        spin_until(|| attached.load(Ordering::Relaxed));
+        sync.cancel_executions(&requester, || {});
+        spin_until(|| cancelled.load(Ordering::Relaxed) == 1);
+        // ...and an ordinary cycle right after it runs normally (the
+        // pending cancel does not block barrier traffic) while the mutator
+        // is between pauses
+        let cycles = AtomicUsize::new(0);
+        sync.stop_the_world(Some(&requester), || {
+            cycles.fetch_add(1, Ordering::Relaxed);
+        });
+        assert_eq!(cycles.load(Ordering::Relaxed), 1);
+        spin_until(|| cancelled.load(Ordering::Relaxed) == 2);
+    });
+
+    sync.detach(&requester);
+}
+
+#[test]
+fn attach_after_cancel_starts_fresh() {
+    let sync = Safepoint::new();
+    let requester = LocalNode::detached();
+    sync.attach(&requester);
+    sync.cancel_executions(&requester, || {});
+
+    // a fresh node is not cancelled: shutdown only kills executions that
+    // were attached when the protocol ran
+    let paused = AtomicUsize::new(1);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let node = LocalNode::detached();
+            sync.attach(&node);
+            let paused_here = sync.park_for_collection(&node);
+            paused.store(paused_here as usize, Ordering::Relaxed);
+            sync.detach(&node);
+        });
+    });
+
+    assert_eq!(paused.load(Ordering::Relaxed), 0);
+    sync.detach(&requester);
 }

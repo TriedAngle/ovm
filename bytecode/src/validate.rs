@@ -113,10 +113,18 @@ pub fn validate_function(f: &Function, program_len: usize) -> Result<(), Validat
 
         match op {
             Opcode::Jump | Opcode::JumpLoop => {
-                jumps.push(JumpSite { pc, op, offset: ops.imm(0) });
+                jumps.push(JumpSite {
+                    pc,
+                    op,
+                    offset: ops.imm(0),
+                });
             }
             Opcode::JumpIfTruthy | Opcode::JumpIfFalsy | Opcode::JumpIfNotUndefined => {
-                jumps.push(JumpSite { pc, op, offset: ops.imm(0) });
+                jumps.push(JumpSite {
+                    pc,
+                    op,
+                    offset: ops.imm(0),
+                });
             }
             _ => {}
         }
@@ -163,10 +171,7 @@ pub fn validate_function(f: &Function, program_len: usize) -> Result<(), Validat
             if let Constant::Callable(id) = constant
                 && id.index() >= program_len
             {
-                return Err(ValidationError::CallableOutOfRange {
-                    function,
-                    id: id.0,
-                });
+                return Err(ValidationError::CallableOutOfRange { function, id: id.0 });
             }
         }
     }

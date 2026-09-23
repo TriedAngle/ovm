@@ -16,25 +16,23 @@ pub mod codegen;
 pub use codegen::CompileError;
 
 use oxc_allocator::Allocator;
-use oxc_span::SourceType;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_semantic::SemanticBuilder;
+use oxc_span::SourceType;
 
 pub use bytecode::{FrontendError, Program, SourceMode};
 /// Parse + analyze + lower `source` in the given mode.
 pub fn compile_js(source: &str, mode: SourceMode) -> Result<Program, FrontendError> {
     let allocator = Allocator::default();
     let _pipeline = trace::info_span!("js::compile");
-    let parser = Parser::new(&allocator, source, SourceType::script()).with_options(
-        ParseOptions {
-            // the old parser dropped parens; also keeps NamedEvaluation
-            // semantics uniform
-            preserve_parens: false,
-            // scripts and REPL entries may `return` at the top level
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        },
-    );
+    let parser = Parser::new(&allocator, source, SourceType::script()).with_options(ParseOptions {
+        // the old parser dropped parens; also keeps NamedEvaluation
+        // semantics uniform
+        preserve_parens: false,
+        // scripts and REPL entries may `return` at the top level
+        allow_return_outside_function: true,
+        ..ParseOptions::default()
+    });
     let ret = {
         let _span = trace::info_span!("js::parse").entered();
         parser.parse()

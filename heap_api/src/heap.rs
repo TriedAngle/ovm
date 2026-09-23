@@ -91,7 +91,9 @@ pub trait LocalHeap: Send {
     fn allocate_raw(&self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
     fn write_barrier(&self, host: Word, slot: &RawCell, value: Word);
     fn collection_requested(&self) -> bool;
-    fn park_for_collection(&self);
+    fn park_for_collection(&self) -> bool;
+    fn take_cancel(&self) -> bool;
+    fn cancel_executions(&self, protocol: &dyn Fn());
     fn force_collect(&self);
     fn collect_minor(&self);
     fn gc_in_progress(&self) -> bool;
@@ -103,8 +105,6 @@ pub trait SharedHeap: Send + Sync {
     fn iterate_roots(&self, roots: &mut dyn Visitor);
     fn should_collect(&self) -> bool;
     fn gc_in_progress(&self) -> bool;
-    /// Run one full collection cycle synchronously; returns when complete.
-    /// Must not be called from a thread that owns a local heap.
     fn force_collect(&self);
     fn contains(&self, addr: Word) -> bool;
     fn is_young(&self, value: Word) -> bool;

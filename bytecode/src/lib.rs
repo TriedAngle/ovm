@@ -8,7 +8,7 @@ pub use builder::{
 };
 pub use opcodes::Opcode;
 pub use program::{
-    CallableKind, CompileFn, Constant, Function, FunctionId, FrontendError, FrontendErrorKind,
+    CallableKind, CompileFn, Constant, FrontendError, FrontendErrorKind, Function, FunctionId,
     HandlerEntry, Program, SourceMode,
 };
 pub use validate::{ValidationError, validate, validate_function};
@@ -162,13 +162,25 @@ pub enum RuntimeFn {
     /// (home, recv, key, value, semantics) -> value — super.x store (ES
     /// 15.4.4); semantics is SUPER_STORE_WRITE_THROUGH or 0 (shadow), a Smi
     SuperSetProperty,
+    /// () -> undefined — `KetteTools.forceMinorGC()`: force a nursery
+    /// collection on the calling thread's heap
+    ForceMinorGc,
+    /// () -> undefined — `KetteTools.forceMajorGC()`: force a full
+    /// collection cycle (nursery evacuation included) on the calling
+    /// thread's heap
+    ForceMajorGc,
+    /// () -> never returns a value — `KetteTools.shutdown()`: pause every
+    /// other thread at a safepoint (running the shutdown protocol at the
+    /// world-stopped point), cancel their executions, and terminate the
+    /// calling thread's execution through the uncatchable channel
+    ShutdownVm,
 }
 
 impl RuntimeFn {
     /// All variants in discriminant order. The array length is the
     /// variant count (type-checked), and the VM registers its table in
     /// this order so registry indices equal discriminants.
-    pub const ALL: [Self; 35] = [
+    pub const ALL: [Self; 38] = [
         Self::GetIterator,
         Self::IteratorNext,
         Self::IteratorDone,
@@ -204,6 +216,9 @@ impl RuntimeFn {
         Self::CreateRestParameter,
         Self::SuperGetProperty,
         Self::SuperSetProperty,
+        Self::ForceMinorGc,
+        Self::ForceMajorGc,
+        Self::ShutdownVm,
     ];
 
     pub const COUNT: u16 = Self::ALL.len() as u16;

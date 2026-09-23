@@ -124,7 +124,17 @@ impl LocalHeap for DummyLocalHeap {
         false
     }
 
-    fn park_for_collection(&self) {}
+    fn park_for_collection(&self) -> bool {
+        false
+    }
+
+    fn take_cancel(&self) -> bool {
+        false
+    }
+
+    /// The dummy heap has no safepoint barrier: shutdown only terminates
+    /// the calling thread's execution itself.
+    fn cancel_executions(&self, _protocol: &dyn Fn()) {}
 
     fn force_collect(&self) {}
 
