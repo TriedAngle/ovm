@@ -1,5 +1,3 @@
-use std::sync::{Arc, Mutex, MutexGuard};
-
 use core::alloc::Layout;
 
 use crate::{
@@ -7,34 +5,6 @@ use crate::{
     Lookup, Map, MapInit, MaybeWeak, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
     WeakFixedArray, WeakFixedArrayInit,
 };
-
-/// Serializes map-transition tree mutations across threads. VM-internal:
-/// to the heap, transition arrays are ordinary traced objects.
-#[derive(Clone)]
-pub struct TransitionLock(Arc<Mutex<()>>);
-
-impl Default for TransitionLock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl TransitionLock {
-    pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(())))
-    }
-
-    pub fn acquire(&self) -> TransitionGuard<'_> {
-        TransitionGuard {
-            _guard: self.0.lock().unwrap(),
-        }
-    }
-}
-
-/// Proof that the heap's transition lock is held.
-pub struct TransitionGuard<'a> {
-    _guard: MutexGuard<'a, ()>,
-}
 
 /// Store semantics:
 /// - Self-style writes through to an inherited writable slot
@@ -200,115 +170,128 @@ impl Transition {
         change: Change,
     ) -> Handle<'s, Map> {
         debug_assert_eq!(flags.is_accessor(), pair.is_some());
-        let lock = heap.transition_lock();
-        let guard = lock.acquire();
-
-        // shared child map: reuse it instead of growing the tree
-        if let Some(target) = {
+        loop {
             let pair_values = pair.map(|(get, set)| (get.as_tagged(heap), set.as_tagged(heap)));
-            parent(heap)
-                .find_transition_locked(heap, name.as_tagged(heap), flags, pair_values, &guard)
-                .map(|m| m.as_handle(scope))
-        } {
-            return target;
-        }
+            if let Some(target) =
+                parent(heap).find_transition(heap, name.as_tagged(heap), flags, pair_values)
+            {
+                return target.as_handle(scope);
+            }
 
-        let (kind, descriptor_count, value_slot_count, pairs_len, prototype, old_row) = {
             let parent_ref = parent(heap);
             let old_row = match change {
                 Change::Append => None,
                 Change::Replace { index } => {
                     let d = &parent_ref.descriptors()[index];
-                    // accessor rows embed the pair, not a slot offset
                     let offset = (!d.flags().is_accessor())
                         .then(|| Smi::decode(d.value.get(heap).raw()).expect("data row offset"));
                     Some((d.flags(), offset))
                 }
             };
-            (
-                parent_ref.kind(),
-                parent_ref.descriptor_count(),
-                parent_ref.value_slot_count(),
-                parent_ref.transitions.get(heap).map_or(0, |a| a.len()),
-                scope.handle(parent_ref.prototype.get(heap)),
-                old_row,
-            )
-        };
+            let kind = parent_ref.kind();
+            let descriptor_count = parent_ref.descriptor_count();
+            let value_slot_count = parent_ref.value_slot_count();
+            let prototype = scope.handle(parent_ref.prototype.get(heap));
+            let pairs_len = parent_ref
+                .transitions
+                .load(heap)
+                .map_or(0, |a| a.len());
 
-        let grow = !flags.is_accessor()
-            && match change {
-                Change::Append => true,
-                Change::Replace { .. } => old_row.expect("replace row").0.is_accessor(),
+            let grow = !flags.is_accessor()
+                && match change {
+                    Change::Append => true,
+                    Change::Replace { .. } => old_row.expect("replace row").0.is_accessor(),
+                };
+            let row_offset = match change {
+                Change::Replace { .. } if !grow && !flags.is_accessor() => old_row
+                    .expect("replace row")
+                    .1
+                    .expect("data row offset")
+                    .value()
+                    as usize,
+                _ => value_slot_count,
             };
-        let row_offset = match change {
-            Change::Replace { .. } if !grow && !flags.is_accessor() => old_row
-                .expect("replace row")
-                .1
-                .expect("data row offset")
-                .value()
-                as usize,
-            _ => value_slot_count,
-        };
-        let appends = usize::from(matches!(change, Change::Append));
+            let appends = usize::from(matches!(change, Change::Append));
 
-        let map_layout = Map::layout_for(descriptor_count + appends);
-        let pairs_layout = WeakFixedArray::<Value>::layout_for(pairs_len + 2);
-        let total = match pair.is_some() {
-            true => {
-                AllocToken::total_for(&[Layout::new::<AccessorPair>(), map_layout, pairs_layout])
-            }
-            false => AllocToken::total_for(&[map_layout, pairs_layout]),
-        };
+            let map_layout = Map::layout_for(descriptor_count + appends);
+            let pairs_layout = WeakFixedArray::<Value>::layout_for(pairs_len + 2);
+            let total = match pair.is_some() {
+                true => AllocToken::total_for(&[
+                    Layout::new::<AccessorPair>(),
+                    map_layout,
+                    pairs_layout,
+                ]),
+                false => AllocToken::total_for(&[map_layout, pairs_layout]),
+            };
 
-        heap.allocate_token_enter_heap(total, |token, heap| {
-            let parent_ref = parent(heap);
-            let name_word = name.as_tagged(heap);
-            let row_value = match pair {
-                Some((get, set)) => {
-                    scope.handle(token.allocate::<AccessorPair>((get, set)).erase())
+            let attempt = heap.allocate_token_enter_heap(total, |token, heap| {
+                let parent_ref = parent(heap);
+                let word = parent_ref.transitions.load_word(heap);
+                let old = parent_ref.transitions.decode(heap, word);
+                if old.map_or(0, |a| a.len()) != pairs_len {
+                    token.discard_remaining();
+                    return None;
                 }
-                None => scope.handle(Smi::new(row_offset as i64)),
-            };
 
-            let mut descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
-                parent_ref
-                    .descriptors()
-                    .iter()
-                    .map(|d| {
-                        (
-                            scope.handle(d.name(heap)),
-                            d.flags(),
-                            scope.handle(d.value.get(heap)),
-                        )
-                    })
-                    .collect();
-            let name_handle = scope.handle(name_word);
-            match change {
-                Change::Append => descriptors.push((name_handle, flags, row_value)),
-                Change::Replace { index } => descriptors[index] = (name_handle, flags, row_value),
-            }
-            let child = token.allocate::<Map>(MapInit {
-                kind,
-                value_slot_count: value_slot_count + usize::from(grow),
-                descriptors: &descriptors,
-                prototype,
+                let name_word = name.as_tagged(heap);
+                let row_value = match pair {
+                    Some((get, set)) => {
+                        scope.handle(token.allocate::<AccessorPair>((get, set)).erase())
+                    }
+                    None => scope.handle(Smi::new(row_offset as i64)),
+                };
+
+                let mut descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
+                    parent_ref
+                        .descriptors()
+                        .iter()
+                        .map(|d| {
+                            (
+                                scope.handle(d.name(heap)),
+                                d.flags(),
+                                scope.handle(d.value.get(heap)),
+                            )
+                        })
+                        .collect();
+                let name_handle = scope.handle(name_word);
+                match change {
+                    Change::Append => descriptors.push((name_handle, flags, row_value)),
+                    Change::Replace { index } => {
+                        descriptors[index] = (name_handle, flags, row_value)
+                    }
+                }
+                let child = token.allocate::<Map>(MapInit {
+                    kind,
+                    value_slot_count: value_slot_count + usize::from(grow),
+                    descriptors: &descriptors,
+                    prototype,
+                });
+                child.pred.set(heap, child.erase(), parent_ref);
+
+                let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> =
+                    Vec::with_capacity(pairs_len + 2);
+                if let Some(old) = old {
+                    for entry in old.as_slice().as_chunks::<2>().0 {
+                        pairs.push(entry[0].get(heap));
+                        pairs.push(entry[1].get(heap));
+                    }
+                }
+                pairs.push(name_word.erase().as_maybe_weak());
+                pairs.push(child.erase().as_weak());
+                let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
+
+                match parent_ref
+                    .transitions
+                    .publish(heap, parent_ref.erase(), word, pairs)
+                {
+                    Ok(()) => Some(child.as_handle(scope)),
+                    Err(_) => None,
+                }
             });
-            child.pred.set(heap, child.erase(), parent_ref);
-
-            let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
-            if let Some(old) = parent_ref.transitions.get(heap) {
-                for entry in old.as_slice().as_chunks::<2>().0 {
-                    pairs.push(entry[0].get(heap));
-                    pairs.push(entry[1].get(heap));
-                }
+            if let Some(child) = attempt {
+                return child;
             }
-            pairs.push(name_word.erase().as_maybe_weak());
-            pairs.push(child.erase().as_weak());
-            let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
-            parent_ref.transitions.set(heap, parent_ref.erase(), pairs);
-
-            child.as_handle(scope)
-        })
+        }
     }
 
     fn grow_slots_and_swap(
@@ -398,10 +381,7 @@ impl Transition {
         receiver: Handle<Object>,
         name: Handle<SlotName>,
     ) {
-        let lock = heap.transition_lock();
-        let guard = lock.acquire();
-
-        let (existing, kind, prototype, surviving, values, pairs_len) = {
+        let (kind, prototype, surviving, values) = {
             let name_word = name.as_tagged(heap);
             let obj = receiver.as_tagged(heap);
             let parent = obj.map_ref(heap);
@@ -419,11 +399,8 @@ impl Transition {
                 .map(|d| d.offset())
                 .min()
                 .unwrap_or(parent.value_slot_count());
-            let existing = parent
-                .find_remove_transition_locked(heap, name_word, &guard)
-                .map(|m| m.as_handle(scope));
             // names are rooted here and re-anchored in the allocating
-            // closure: a Tagged cannot escape this non-allocating region
+            // closures: a Tagged cannot escape this non-allocating region
             let mut surviving: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
                 Vec::with_capacity(descriptors.len() - 1);
             let mut values: Vec<Handle<'_, Value>> = obj.slots.get(heap).as_slice()[..base]
@@ -452,73 +429,111 @@ impl Transition {
                     ));
                 }
             }
-            let pairs_len = parent.transitions.get(heap).map_or(0, |a| a.len());
             (
-                existing,
                 parent.kind(),
                 scope.handle(parent.prototype.get(heap)),
                 surviving,
                 values,
-                pairs_len,
             )
         };
 
-        if let Some(existing) = existing {
-            // shared child map: only this receiver's slots need compacting
+        // the parent map is immutable except its transitions slot, so the
+        // descriptor/value snapshot stays valid across every retry below
+        loop {
+            // shared child map: reuse it instead of growing the tree (the
+            // initial check, and the loser's convergence point after a
+            // lost publication race)
+            let existing = receiver
+                .as_tagged(heap)
+                .map_ref(heap)
+                .find_remove_transition(heap, name.as_tagged(heap))
+                .map(|m| m.as_handle(scope));
+            if let Some(existing) = existing {
+                // only this receiver's slots need compacting
+                let values = {
+                    let anchored: Vec<Tagged<'_, Value>> =
+                        values.iter().map(|h| h.as_tagged(heap)).collect();
+                    scope.stage(&anchored)
+                };
+                heap.allocate_token_enter_heap(
+                    FixedArray::<Value>::layout_for(values.len()),
+                    |token, heap| {
+                        let obj = receiver.as_tagged(heap);
+                        let slots = token.allocate::<FixedArray>(values);
+                        let host = receiver.as_tagged(heap).erase();
+                        obj.slots.set(heap, host, slots);
+                        obj.header.map.set(heap, host, existing.as_tagged(heap));
+                    },
+                );
+                return;
+            }
+
+            let pairs_len = receiver
+                .as_tagged(heap)
+                .map_ref(heap)
+                .transitions
+                .load(heap)
+                .map_or(0, |a| a.len());
+
+            let map_layout = Map::layout_for(surviving.len());
+            let pairs_layout = WeakFixedArray::<Value>::layout_for(pairs_len + 2);
+            let slots_layout = FixedArray::<Value>::layout_for(values.len());
+            let total = AllocToken::total_for(&[map_layout, pairs_layout, slots_layout]);
             let values = {
                 let anchored: Vec<Tagged<'_, Value>> =
                     values.iter().map(|h| h.as_tagged(heap)).collect();
                 scope.stage(&anchored)
             };
-            heap.allocate_token_enter_heap(
-                FixedArray::<Value>::layout_for(values.len()),
-                |token, heap| {
-                    let obj = receiver.as_tagged(heap);
-                    let slots = token.allocate::<FixedArray>(values);
-                    let host = receiver.as_tagged(heap).erase();
-                    obj.slots.set(heap, host, slots);
-                    obj.header.map.set(heap, host, existing.as_tagged(heap));
-                },
-            );
-            return;
-        }
-
-        let map_layout = Map::layout_for(surviving.len());
-        let pairs_layout = WeakFixedArray::<Value>::layout_for(pairs_len + 2);
-        let slots_layout = FixedArray::<Value>::layout_for(values.len());
-        let total = AllocToken::total_for(&[map_layout, pairs_layout, slots_layout]);
-        let values = {
-            let anchored: Vec<Tagged<'_, Value>> =
-                values.iter().map(|h| h.as_tagged(heap)).collect();
-            scope.stage(&anchored)
-        };
-        heap.allocate_token_enter_heap(total, |token, heap| {
-            let obj = receiver.as_tagged(heap);
-            let parent = obj.map_ref(heap);
-            let child = token.allocate::<Map>(MapInit {
-                kind,
-                value_slot_count: values.len(),
-                descriptors: &surviving,
-                prototype,
-            });
-            child.pred.set(heap, child.erase(), parent);
-            let name_word = name.as_tagged(heap);
-            let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> = Vec::with_capacity(pairs_len + 2);
-            if let Some(old) = parent.transitions.get(heap) {
-                for entry in old.as_slice().as_chunks::<2>().0 {
-                    pairs.push(entry[0].get(heap));
-                    pairs.push(entry[1].get(heap));
+            let published = heap.allocate_token_enter_heap(total, |token, heap| {
+                let obj = receiver.as_tagged(heap);
+                let parent = obj.map_ref(heap);
+                // re-derive the publication after the reservation; see
+                // Transition::target for the same-length invariant
+                let word = parent.transitions.load_word(heap);
+                let old = parent.transitions.decode(heap, word);
+                if old.map_or(0, |a| a.len()) != pairs_len {
+                    token.discard_remaining();
+                    return None;
                 }
+                let child = token.allocate::<Map>(MapInit {
+                    kind,
+                    value_slot_count: values.len(),
+                    descriptors: &surviving,
+                    prototype,
+                });
+                child.pred.set(heap, child.erase(), parent);
+                let name_word = name.as_tagged(heap);
+                let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> =
+                    Vec::with_capacity(pairs_len + 2);
+                if let Some(old) = old {
+                    for entry in old.as_slice().as_chunks::<2>().0 {
+                        pairs.push(entry[0].get(heap));
+                        pairs.push(entry[1].get(heap));
+                    }
+                }
+                pairs.push(name_word.erase().as_maybe_weak());
+                pairs.push(child.erase().as_weak());
+                let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
+                let slots = token.allocate::<FixedArray>(values);
+                match parent
+                    .transitions
+                    .publish(heap, parent.erase(), word, pairs)
+                {
+                    Ok(()) => {
+                        let host = receiver.as_tagged(heap).erase();
+                        obj.slots.set(heap, host, slots);
+                        obj.header.map.set(heap, host, child);
+                        Some(())
+                    }
+                    Err(_) => None,
+                }
+            });
+            if published.is_some() {
+                return;
             }
-            pairs.push(name_word.erase().as_maybe_weak());
-            pairs.push(child.erase().as_weak());
-            let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
-            parent.transitions.set(heap, parent.erase(), pairs);
-            let slots = token.allocate::<FixedArray>(values);
-            let host = receiver.as_tagged(heap).erase();
-            obj.slots.set(heap, host, slots);
-            obj.header.map.set(heap, host, child);
-        });
+            // lost a race: retry — the find above converges on the
+            // winner's shared child map, or re-extends the longer array
+        }
     }
 
     fn define(

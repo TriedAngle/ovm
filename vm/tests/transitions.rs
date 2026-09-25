@@ -74,7 +74,7 @@ fn transition_target<'a>(
     map: Tagged<'a, Map>,
     name: Tagged<'a, SlotName>,
 ) -> Option<Tagged<'a, Value>> {
-    let array = map.transitions.get(heap)?;
+    let array = map.transitions.load(heap)?;
     for entry in array.as_slice().as_chunks::<2>().0 {
         if entry[0].get(heap).ptr_eq(name.erase()) {
             return entry[1].get_strong(heap);

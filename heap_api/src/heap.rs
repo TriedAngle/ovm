@@ -1,4 +1,9 @@
-use core::{alloc::Layout, cell::UnsafeCell, ptr::NonNull};
+use core::{
+    alloc::Layout,
+    cell::UnsafeCell,
+    ptr::NonNull,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::Word;
 
@@ -44,8 +49,22 @@ impl RawCell {
         unsafe { *self.raw.get() = w };
     }
 
-    /// The raw word pointer, for transparent wrappers that layer a typed
-    /// view over the cell (e.g. a register exposed as `&mut Value`).
+    pub fn load_atomic(&self, order: Ordering) -> Word {
+        unsafe { (*self.raw.get().cast::<AtomicU64>()).load(order) }
+    }
+
+    pub fn compare_exchange(
+        &self,
+        current: Word,
+        new: Word,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<Word, Word> {
+        unsafe {
+            (*self.raw.get().cast::<AtomicU64>()).compare_exchange(current, new, success, failure)
+        }
+    }
+
     pub fn as_ptr(&self) -> *mut Word {
         self.raw.get()
     }
@@ -69,10 +88,6 @@ pub struct HeapStats {
 }
 
 /// VM services a collector needs, registered once via [`SharedHeap::set_host`].
-///
-/// Callable from any thread: `visit_roots` runs once per cycle on the
-/// initiating thread while all mutators are stopped; `visit_object` may run
-/// concurrently on several marker threads and must only read.
 #[derive(Clone, Copy)]
 pub struct GcHost {
     pub ctx: *const (),

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use bytecode::{CompileFn, SourceMode};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{DenseString, Float, Smi, Value};
+use vm::{DenseString, Float, Heap, LoadOutcome, Lookup, SlotName, Smi, Tagged, Value};
 use vm::{Thread, VM};
 
 fn main() {
@@ -133,6 +133,34 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
         if let Some(s) = unsafe { v.assume_valid(heap) }.get_as::<DenseString>() {
             return s.to_rust_string(heap);
         }
+        if let Some(text) = error_text(heap, v) {
+            return text;
+        }
         format!("{v:?}")
+    }
+}
+
+fn error_text(heap: &Heap, v: Value) -> Option<String> {
+    let tagged = unsafe { v.assume_valid(heap) };
+    tagged.as_heap_object()?;
+    let known = heap.known();
+    let name = error_property(heap, tagged, known.strings.name.as_tagged(heap));
+    let message = error_property(heap, tagged, known.strings.message.as_tagged(heap));
+    match (name, message) {
+        (Some(n), Some(m)) if !m.is_empty() => Some(format!("{n}: {m}")),
+        (Some(n), _) => Some(n),
+        (None, Some(m)) if !m.is_empty() => Some(m),
+        _ => None,
+    }
+}
+
+fn error_property<'a>(
+    heap: &'a Heap,
+    v: Tagged<'a, Value>,
+    name: Tagged<'a, SlotName>,
+) -> Option<String> {
+    match Lookup::load_outcome_on(heap, v, name) {
+        Ok(LoadOutcome::Value(x)) => x.get_as::<DenseString>().map(|s| s.to_rust_string(heap)),
+        _ => None,
     }
 }

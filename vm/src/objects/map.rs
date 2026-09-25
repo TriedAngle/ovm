@@ -1,8 +1,8 @@
 use core::alloc::Layout;
 
 use crate::{
-    Compare, DenseString, EdgeVisitable, GcSlot, Handle, Header, Heap, HeapObject, ObjectKind,
-    OptionGcSlot, Smi, Symbol, Tagged, TransitionGuard, Value, Visitor, WeakFixedArray,
+    AtomicOptionGcSlot, Compare, DenseString, EdgeVisitable, GcSlot, Handle, Header, Heap,
+    HeapObject, ObjectKind, OptionGcSlot, Smi, Symbol, Tagged, Value, Visitor, WeakFixedArray,
 };
 
 #[repr(C)]
@@ -18,7 +18,10 @@ pub struct Map {
     /// - the hole: no parents (null-proto root)
     pub prototype: GcSlot,
     pub pred: OptionGcSlot<Map>,
-    pub transitions: OptionGcSlot<WeakFixedArray>,
+    /// Shared transition-tree edges: `[name, target]` pairs. Published
+    /// RCU-style (see [`AtomicOptionGcSlot`]): arrays are immutable after
+    /// publication, inserts race-publish a grown copy with a CAS.
+    pub transitions: AtomicOptionGcSlot<WeakFixedArray>,
     pub descriptors: [SlotDescriptor; 0],
 }
 
@@ -76,20 +79,7 @@ impl Map {
         flags: SlotFlags,
         pair: Option<(Tagged<'a, Value>, Tagged<'a, Value>)>,
     ) -> Option<Tagged<'a, Map>> {
-        let lock = heap.transition_lock();
-        let guard = lock.acquire();
-        self.find_transition_locked(heap, name, flags, pair, &guard)
-    }
-
-    pub fn find_transition_locked<'a>(
-        &self,
-        heap: &'a Heap,
-        name: Tagged<'a, SlotName>,
-        flags: SlotFlags,
-        pair: Option<(Tagged<'a, Value>, Tagged<'a, Value>)>,
-        _guard: &TransitionGuard<'_>,
-    ) -> Option<Tagged<'a, Map>> {
-        let array = self.transitions.get(heap)?;
+        let array = self.transitions.load(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
             pairs.len() % 2 == 0,
@@ -106,10 +96,6 @@ impl Map {
                 continue;
             };
 
-            // adds append the property (last descriptor), redefines keep
-            // its index: either way the descriptor row for `name` must
-            // carry the requested flags. This lets adds and redefines
-            // share one transition tree — identical shapes, identical maps.
             let Some(row) = target
                 .descriptors()
                 .iter()
@@ -118,9 +104,6 @@ impl Map {
                 continue;
             };
 
-            // accessor rows embed the AccessorPair: the cached map is only
-            // reusable when the pair is identical (same-name accessors with
-            // different pairs get separate tree entries)
             if let Some((get, set)) = pair {
                 let matches = row
                     .value
@@ -139,18 +122,12 @@ impl Map {
         None
     }
 
-    /// Find the recorded remove-transition for `name`: a child map that
-    /// lacks the descriptor and holds exactly one fewer. Add and redefine
-    /// transitions key their pair by the target's own descriptor row for
-    /// `name`; a removal target has no such row, so the two pair
-    /// populations sharing one name never collide.
-    pub fn find_remove_transition_locked<'a>(
+    pub fn find_remove_transition<'a>(
         &self,
         heap: &'a Heap,
         name: Tagged<'a, SlotName>,
-        _guard: &TransitionGuard<'_>,
     ) -> Option<Tagged<'a, Map>> {
-        let array = self.transitions.get(heap)?;
+        let array = self.transitions.load(heap)?;
         let pairs = array.as_slice();
         debug_assert!(
             pairs.len() % 2 == 0,
