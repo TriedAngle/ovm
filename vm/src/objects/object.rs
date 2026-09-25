@@ -205,13 +205,18 @@ impl Object {
         Ok(())
     }
 
+    /// Write an existing element slot in place: never allocates, never
+    /// grows, no handle scope required — takes anchored `Tagged` words
+    /// under a single shared heap borrow (safe for fast paths).
     pub fn store_array_element_in_place(
-        heap: &mut Heap,
-        receiver: &Handle<'_, Object>,
+        heap: &Heap,
+        receiver: Tagged<'_, Value>,
         i: usize,
-        value: &Handle<'_, Value>,
+        value: Tagged<'_, Value>,
     ) -> Result<(), VmError> {
-        let obj = receiver.as_tagged(heap);
+        let Some(obj) = receiver.as_heap_object() else {
+            return Err(VmError::Type);
+        };
         if !obj.as_ref().is_array(heap) {
             return Err(VmError::Type);
         }
@@ -219,7 +224,7 @@ impl Object {
             return Err(VmError::OutOfBounds);
         }
         let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
-        elements.set(heap, i, value.as_tagged(heap));
+        elements.set(heap, i, value);
         Ok(())
     }
 }

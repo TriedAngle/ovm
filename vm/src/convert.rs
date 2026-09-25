@@ -5,6 +5,15 @@ use crate::{
 pub struct Convert;
 
 impl Convert {
+    /// The numeric value of a value that already IS a number
+    #[inline]
+    pub fn as_number(v: Tagged<'_, Value>) -> Option<f64> {
+        if let Some(smi) = Smi::decode(v.raw()) {
+            return Some(smi.value() as f64);
+        }
+        v.get_as::<Float>().map(|f| f.value.get())
+    }
+
     /// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN,
     /// everything else is truthy.
     pub fn is_truthy(heap: &Heap, v: Tagged<'_, Value>) -> bool {
