@@ -443,6 +443,10 @@ pub trait EdgeVisitable {
     fn visit_edges(&self, visitor: &mut dyn Visitor);
 }
 
+impl EdgeVisitable for () {
+    fn visit_edges(&self, _visitor: &mut dyn Visitor) {}
+}
+
 /// Type-erased per-thread heap.
 pub struct Heap {
     local: Box<dyn LocalHeap>,
@@ -652,11 +656,14 @@ impl GlobalHeap {
     }
 
     /// Arm the `stress-minor-gc` knob: bootstrap runs un-stressed; from
-    /// here on every allocation triggers a minor collection first.
-    #[cfg(feature = "stress-minor-gc")]
+    /// here on every allocation triggers a minor collection first. No-op
+    /// unless compiled with the `stress-minor-gc` feature.
     pub fn arm_gc_stress(&self) {
+        #[cfg(feature = "stress-minor-gc")]
         self.stress_armed
             .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(not(feature = "stress-minor-gc"))]
+        {}
     }
 
     pub fn new_local(&self, known: &KnownCell) -> Heap {

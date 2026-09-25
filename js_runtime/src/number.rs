@@ -1,9 +1,9 @@
 //! ES 21.1: the Number constructor and prototype methods.
 
-use super::helpers::wrapper_value;
-use crate::Object;
-use crate::RuntimeContext;
-use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
+use vm_core::Object;
+use vm_core::RuntimeContext;
+use vm_core::runtime_api::wrapper_value;
+use vm_core::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
 
 pub fn number_constructor<'a>(
     nctx: RuntimeContext<'a>,

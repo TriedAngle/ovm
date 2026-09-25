@@ -133,7 +133,7 @@ where
         let vm2 = vm.clone();
         workers.push(std::thread::spawn(move || {
             let mut thread = vm2.attach();
-            let result = thread.run_script(script);
+            let result = thread.eval::<vm::JavascriptCompiler>(script);
             result.map(|v| v.to_i64().expect("smi result"))
         }));
     }

@@ -1,15 +1,19 @@
 use std::io::Write;
-use std::path::Path;
 
-use bytecode::{CompileFn, SourceMode};
+use kette_compiler::KetteCompiler;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{DenseString, Float, Heap, LoadOutcome, Lookup, SlotName, Smi, Tagged, Value};
-use vm::{Thread, VM};
+use vm::{Compiler, JSRuntime, Thread, ThreadedInterpreter, VM};
+use vm::{
+    DenseString, Float, Heap, JavascriptCompiler, LoadOutcome, Lookup, SlotName, Smi, Tagged, Value,
+};
 
 fn main() {
     trace::init();
-    let vm =
-        VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).expect("failed to create heap");
+    let vm = VM::new::<MarkSweep, ThreadedInterpreter>(MarkSweepConfig::default())
+        .expect("failed to create heap")
+        .add::<JSRuntime>()
+        .expect("failed to install js runtime");
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
 
     let mut files = Vec::new();
@@ -32,6 +36,7 @@ fn main() {
     }
 }
 
+// the frontend is chosen at the call site; the VM stays language-agnostic
 fn run_file(thread: &mut Thread, path: &str) {
     let src = match std::fs::read_to_string(path) {
         Ok(src) => src,
@@ -40,18 +45,26 @@ fn run_file(thread: &mut Thread, path: &str) {
             std::process::exit(1);
         }
     };
-    // the frontend is chosen at the call site; the VM stays language-agnostic
-    let compile: CompileFn = match Path::new(path).extension().and_then(|e| e.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("js") => js_compiler::compile_js,
-        Some(ext) if ext.eq_ignore_ascii_case("ktt") => kette_compiler::compile_kette,
+    match std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("js") => run_with::<JavascriptCompiler>(thread, &src, path),
+        Some("ktt") => run_with::<KetteCompiler>(thread, &src, path),
         _ => {
             eprintln!("ovm: cannot tell the language of {path} (expected .js or .ktt)");
             std::process::exit(1);
         }
-    };
-    match thread.run_source(&src, compile, SourceMode::Script) {
+    }
+}
+
+fn run_with<C: Compiler>(thread: &mut Thread, src: &str, path: &str) {
+    match thread.eval::<C>(src) {
         Ok(_) => {
             if report_uncaught(thread) {
+                eprintln!("{path}: uncaught exception");
                 std::process::exit(1);
             }
         }
@@ -86,7 +99,7 @@ fn repl(thread: &mut Thread) {
         if line == ".exit" {
             break;
         }
-        match thread.run_script_repl(line) {
+        match thread.eval_repl::<JavascriptCompiler>(line) {
             Ok(v) => {
                 if report_uncaught(thread) {
                     continue;

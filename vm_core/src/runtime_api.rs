@@ -86,18 +86,19 @@ pub fn make_runtime_plain_function_in<'s>(
     Ok(scope.handle(obj))
 }
 
-/// Compile and run a JS prelude once at install time (BIND_PRELUDE,
+/// Compile and run a prelude once at install time (BIND_PRELUDE,
 /// REVOKE_PRELUDE): its top-level assignments install hidden helpers.
 pub fn run_prelude(
     thread: &mut Thread,
     scope: &HandleScope<'_>,
     src: &str,
     name: &str,
+    compile: bytecode::CompileFn,
 ) -> Result<(), VmError> {
     let (vm, heap, state) = thread.split();
     let empty = heap.known().empty_context;
     let closure = {
-        let program = js_compiler::compile_js(src, bytecode::SourceMode::Script).map_err(|e| {
+        let program = compile(src, bytecode::SourceMode::Script).map_err(|e| {
             eprintln!("{name} prelude compile error: {e}");
             VmError::Type
         })?;

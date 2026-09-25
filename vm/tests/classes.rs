@@ -6,12 +6,16 @@
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{DenseString, Smi, Value};
-use vm::{ScriptError, Thread, VM};
+use vm::{ScriptError, Thread};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script(src)
+    thread.eval::<vm::JavascriptCompiler>(src)
 }
 
 fn run_smi(src: &str) -> i64 {
@@ -19,9 +23,13 @@ fn run_smi(src: &str) -> i64 {
 }
 
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     (result, thread)
 }
 

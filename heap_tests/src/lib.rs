@@ -1,11 +1,16 @@
-use vm::{HeapBackend, VM};
+use vm::{HeapBackend, JSRuntime, ThreadedInterpreter, VM};
 
 pub fn vm<B: HeapBackend>(config: B::Config) -> VM {
-    VM::new::<B>(config).expect("failed to create heap")
+    VM::new::<B, ThreadedInterpreter>(config).expect("failed to create heap")
 }
 
 pub fn vm_with_builtins<B: HeapBackend>(config: B::Config) -> VM {
-    VM::with_builtins::<B>(config).expect("failed to create heap")
+    let vm = VM::new::<B, ThreadedInterpreter>(config)
+        .expect("failed to create heap")
+        .add::<JSRuntime>()
+        .expect("failed to create heap");
+    vm.arm_gc_stress();
+    vm
 }
 
 /// Instantiates each generic test function once per backend.

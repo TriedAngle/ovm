@@ -2,12 +2,16 @@
 //! instance and static, plus the private-name semantics of ES 7.3.26–33.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{DenseString, Smi, VM, Value};
+use vm::{DenseString, Smi, Value};
 
 fn run(src: &str) -> Result<Value, vm::ScriptError> {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script(src)
+    thread.eval::<vm::JavascriptCompiler>(src)
 }
 
 fn run_smi(src: &str) -> i64 {
@@ -15,9 +19,13 @@ fn run_smi(src: &str) -> i64 {
 }
 
 fn run_str(src: &str) -> String {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let v = thread.run_script(src).unwrap();
+    let v = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     {
         let heap = &*thread.heap();
         let s = unsafe { v.assume_valid(heap) }
@@ -28,17 +36,25 @@ fn run_str(src: &str) -> String {
 }
 
 fn run_bool(src: &str) -> bool {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let v = thread.run_script(src).unwrap();
+    let v = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     let heap = thread.heap();
     v == heap.known().true_object.as_tagged(heap).raw()
 }
 
 fn throws(src: &str) -> bool {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    match thread.run_script(src) {
+    match thread.eval::<vm::JavascriptCompiler>(src) {
         Ok(v) => {
             let heap = thread.heap();
             v == heap.known().exception.as_tagged(heap).raw()

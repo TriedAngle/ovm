@@ -5,18 +5,23 @@ use vm::VM;
 use vm::Value;
 
 fn vm() -> VM {
-    VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap()
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
+    vm
 }
 
 fn run_smi(vm: &VM, src: &str) -> i64 {
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     result.to_i64().unwrap()
 }
 
 fn run_str(vm: &VM, src: &str) -> String {
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     {
         let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
@@ -28,7 +33,7 @@ fn run_str(vm: &VM, src: &str) -> String {
 
 fn run_bool(vm: &VM, src: &str) -> bool {
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     let heap = thread.heap();
     if result == heap.known().true_object.as_tagged(heap).raw() {
         true
@@ -41,7 +46,7 @@ fn run_bool(vm: &VM, src: &str) -> bool {
 
 fn run_value(vm: &VM, src: &str) -> (Value, vm::Thread) {
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     (result, thread)
 }
 

@@ -31,7 +31,7 @@ fn smi_add<'a>(
 
 #[test]
 fn registered_runtime_invokes_and_checks_types() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let r = thread
@@ -73,7 +73,7 @@ fn runtime_result_is_boxed_when_not_smi() {
         Ok(heap.new_number(sum))
     }
 
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let fa = float(&mut thread, 1.5);
@@ -98,7 +98,7 @@ fn runtime_result_is_boxed_when_not_smi() {
 /*
 #[test]
 fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
-    let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let idx = vm.register_runtime(smi_add);
     let mut thread = vm.attach();
     let args = [smi(0), smi(1)]; // arity error for smi_add
@@ -159,7 +159,7 @@ fn register_runtime_appends_after_well_known() {
         Ok(Tagged::from(Smi::new(v.value() * 2)))
     }
 
-    let mut vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let idx = vm.register_runtime(double as vm::RuntimeCall);
     // the registry starts with the fixed RuntimeFn table; dynamic
     // registrations append after it

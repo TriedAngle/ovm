@@ -21,6 +21,14 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::SourceType;
 
 pub use bytecode::{FrontendError, Program, SourceMode};
+
+pub struct JavascriptCompiler;
+
+impl vm_core::Compiler for JavascriptCompiler {
+    fn compile(source: &str, mode: SourceMode) -> Result<Program, FrontendError> {
+        compile_js(source, mode)
+    }
+}
 /// Parse + analyze + lower `source` in the given mode.
 pub fn compile_js(source: &str, mode: SourceMode) -> Result<Program, FrontendError> {
     let allocator = Allocator::default();

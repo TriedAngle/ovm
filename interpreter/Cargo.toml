@@ -1,0 +1,8 @@
+[package]
+name = "interpreter"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+vm_core = { path = "../vm_core" }
+bytecode = { path = "../bytecode" }

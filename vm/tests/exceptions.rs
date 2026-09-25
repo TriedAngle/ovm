@@ -64,7 +64,7 @@ fn callable(
 
 #[test]
 fn throw_is_caught_in_same_function() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // 0: LoadSmi 99 | 2: Throw | 3: Return | 4: Store r0 | 6: Load r0 | 8: Return
@@ -99,7 +99,7 @@ fn throw_is_caught_in_same_function() {
 
 #[test]
 fn throw_any_value_escapes_as_sentinel() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // throw 42: arbitrary values are throwable (ES §14.18), no handlers
@@ -131,7 +131,7 @@ fn throw_any_value_escapes_as_sentinel() {
 
 #[test]
 fn innermost_handler_wins() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // 0: LoadSmi 1 | 2: LoadSmi 2 | 4: Throw | 5: Return
@@ -165,7 +165,7 @@ fn innermost_handler_wins() {
 
 #[test]
 fn exception_unwinds_to_caller() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -209,7 +209,7 @@ fn exception_unwinds_to_caller() {
 
 #[test]
 fn rethrow_from_finally_escapes_past_its_own_handler() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // 0: LoadSmi 3 | 2: Throw | 3: Return | 4: ReThrow (finally handler)
@@ -248,7 +248,7 @@ fn rethrow_from_finally_escapes_past_its_own_handler() {
 
 #[test]
 fn stack_overflow_during_call_is_throwable() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // self-recursive call with no handler: each Call pushes a frame until

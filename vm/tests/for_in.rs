@@ -3,12 +3,16 @@
 //! assignment target.
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{DenseString, ScriptError, Smi, VM, Value};
+use vm::{DenseString, ScriptError, Smi, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script(src)
+    thread.eval::<vm::JavascriptCompiler>(src)
 }
 
 fn run_smi(src: &str) -> i64 {
@@ -17,10 +21,14 @@ fn run_smi(src: &str) -> i64 {
 
 fn run_str(src: &str) -> String {
     run(src).unwrap();
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     // re-run under a live heap to read the string back
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     {
         let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }

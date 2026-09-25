@@ -24,7 +24,7 @@ fn handle_scope(data: &HandleData) -> HandleScope<'_> {
 /// A heap anchor: reading a handle back as a word requires a live
 /// `&Heap` borrow (`Handle::as_tagged`).
 fn anchor() -> (vm::VM, vm::Thread) {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let thread = vm.attach();
     (vm, thread)
 }

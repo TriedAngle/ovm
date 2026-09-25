@@ -5,9 +5,13 @@ use vm::{DenseString, Float, FunctionKind, Lookup, Smi, Value};
 use vm::{ScriptError, Thread, VM};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script(src)
+    thread.eval::<vm::JavascriptCompiler>(src)
 }
 
 fn smi(v: i64) -> Value {
@@ -20,9 +24,13 @@ fn run_smi(src: &str) -> i64 {
 
 /// Run and read back the result as a Rust value.
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     (result, thread)
 }
 
@@ -339,16 +347,24 @@ fn function_metadata_and_public_properties_survive_materialization() {
 
 #[test]
 fn arrows_and_methods_are_not_constructible() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let result = thread
-        .run_script("var arrow = () => 1; var method = ({ m() { return 2; } }).m; new arrow();")
+        .eval::<vm::JavascriptCompiler>(
+            "var arrow = () => 1; var method = ({ m() { return 2; } }).m; new arrow();",
+        )
         .unwrap();
     assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
     let _ = thread.take_pending_exception();
 
-    let result = thread.run_script("new ({ m() {} }).m();").unwrap();
+    let result = thread
+        .eval::<vm::JavascriptCompiler>("new ({ m() {} }).m();")
+        .unwrap();
     assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
 }
@@ -357,9 +373,9 @@ fn arrows_and_methods_are_not_constructible() {
 fn tdz_throws_on_let_before_init() {
     // uncaught exceptions escape as the exception sentinel + pending
     // exception holding a ReferenceError
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
-    let result = thread.run_script("let x = x;").unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>("let x = x;").unwrap();
     assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
     let ex = thread.take_pending_exception().expect("pending exception");
@@ -381,16 +397,16 @@ fn tdz_throws_on_let_before_init() {
     });
 
     // the hole survives frame reuse: run twice in a row
-    let result = thread.run_script("let x = x;").unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>("let x = x;").unwrap();
     assert_eq!(result, exception_word(&mut thread));
     thread.take_pending_exception();
 }
 
 #[test]
 fn uncaught_throw_escapes_as_exception() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
-    let result = thread.run_script("throw 42;").unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>("throw 42;").unwrap();
     assert_eq!(result, exception_word(&mut thread));
     assert!(thread.has_pending_exception());
     thread.take_pending_exception();
@@ -447,62 +463,108 @@ fn update_on_property_refs() {
 #[test]
 fn unused_let_without_init_is_still_tdz() {
     // `y` is never read; `x` reads before its initializer runs
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
-    let result = thread.run_script("let x = 1, y; y = x; x;").unwrap();
+    let result = thread
+        .eval::<vm::JavascriptCompiler>("let x = 1, y; y = x; x;")
+        .unwrap();
     assert_eq!(result.to_i64().unwrap(), 1);
 }
 
 #[test]
 fn repl_mode_persists_top_level_bindings() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script_repl("let x = 10;").unwrap();
-    thread.run_script_repl("var y = 2;").unwrap();
-    thread.run_script_repl("const z = 3;").unwrap();
-    let v = thread.run_script_repl("x * y + z;").unwrap();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("let x = 10;")
+        .unwrap();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("var y = 2;")
+        .unwrap();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("const z = 3;")
+        .unwrap();
+    let v = thread
+        .eval_repl::<vm::JavascriptCompiler>("x * y + z;")
+        .unwrap();
     assert_eq!(v.to_i64().unwrap(), 23);
 }
 
 #[test]
 fn repl_mode_functions_persist_and_read_globals() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
-    let mut thread = vm.attach();
-    thread.run_script_repl("let x = 10;").unwrap();
-    thread
-        .run_script_repl("function get() { return x; }")
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
         .unwrap();
-    thread.run_script_repl("x = 20;").unwrap();
-    let v = thread.run_script_repl("get();").unwrap();
+    vm.arm_gc_stress();
+    let mut thread = vm.attach();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("let x = 10;")
+        .unwrap();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("function get() { return x; }")
+        .unwrap();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("x = 20;")
+        .unwrap();
+    let v = thread
+        .eval_repl::<vm::JavascriptCompiler>("get();")
+        .unwrap();
     assert_eq!(v.to_i64().unwrap(), 20);
 }
 
 #[test]
 fn repl_mode_allows_redeclaration_across_entries() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script_repl("let x = 1;").unwrap();
-    let v = thread.run_script_repl("let x = 2; x;").unwrap();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("let x = 1;")
+        .unwrap();
+    let v = thread
+        .eval_repl::<vm::JavascriptCompiler>("let x = 2; x;")
+        .unwrap();
     assert_eq!(v.to_i64().unwrap(), 2);
 }
 
 #[test]
 fn repl_mode_keeps_nested_scopes_local() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script_repl("{ let inner = 5; }").unwrap();
+    thread
+        .eval_repl::<vm::JavascriptCompiler>("{ let inner = 5; }")
+        .unwrap();
     // `inner` was block-scoped: gone with the block, this throws
-    let result = thread.run_script_repl("inner;").unwrap();
+    let result = thread
+        .eval_repl::<vm::JavascriptCompiler>("inner;")
+        .unwrap();
     assert_eq!(result, exception_word(&mut thread));
     thread.take_pending_exception();
 }
 
 #[test]
 fn script_mode_top_level_bindings_do_not_persist() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script("let x = 10;").unwrap();
-    let result = thread.run_script("x;").unwrap();
+    thread
+        .eval::<vm::JavascriptCompiler>("let x = 10;")
+        .unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>("x;").unwrap();
     assert_eq!(result, exception_word(&mut thread));
     thread.take_pending_exception();
 }
@@ -555,9 +617,13 @@ fn switch_statements() {
 
 #[test]
 fn unresolvable_global_names_the_binding() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.run_script("flurb;").unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>("flurb;").unwrap();
     let exception_word = {
         let heap = thread.heap();
         heap.known().exception.as_tagged(heap).raw()

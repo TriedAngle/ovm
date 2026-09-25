@@ -1,8 +1,8 @@
 //! ES 23.1 + 23.1.5: the Array constructor, Array.isArray,
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
-use crate::RuntimeContext;
-use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
+use vm_core::RuntimeContext;
+use vm_core::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
 
 /// `Array(...)`: call and construct behave the same (ES 23.1.1.1). No
 /// arguments → `[]`; one non-negative Smi → that many holes (negative or

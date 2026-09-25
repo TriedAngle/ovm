@@ -5,7 +5,11 @@ use vm::{
 };
 
 fn thread() -> (VM, Thread) {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let thread = vm.attach();
     (vm, thread)
 }

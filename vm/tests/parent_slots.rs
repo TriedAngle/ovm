@@ -10,7 +10,7 @@ use vm::{
 };
 
 fn thread() -> (VM, Thread) {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let thread = vm.attach();
     (vm, thread)
 }
