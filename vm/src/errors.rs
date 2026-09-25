@@ -21,12 +21,47 @@ impl Errors {
         state: &ContextState,
         err: VmError,
     ) -> Result<Tagged<'a, Value>, VmError> {
+        Self::with_message(vm, heap, state, err.name(), err.message())
+    }
+
+    /// ReferenceError for an unresolvable binding reference (ES 6.2.3.3
+    /// GetValue on a baseless reference): `'<name>' is not defined`.
+    #[cold]
+    #[inline(never)]
+    pub fn not_defined<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        name: &str,
+    ) -> Result<Tagged<'a, Value>, VmError> {
+        Self::with_message(
+            vm,
+            heap,
+            state,
+            "ReferenceError",
+            &format!("'{name}' is not defined"),
+        )
+    }
+
+    /// Materialize an error object of the named class with an arbitrary
+    /// message — the escape hatch for messages that must name a runtime
+    /// value. Classes without a dedicated map fall back to the plain
+    /// Error prototype chain.
+    #[cold]
+    #[inline(never)]
+    pub fn with_message<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        class: &str,
+        message: &str,
+    ) -> Result<Tagged<'a, Value>, VmError> {
         state.handle_scope(|scope| {
-            let name_value = vm.interner().intern_str(heap, &scope, err.name());
-            let message_value = vm.interner().intern_str(heap, &scope, err.message());
+            let name_value = vm.interner().intern_str(heap, &scope, class);
+            let message_value = vm.interner().intern_str(heap, &scope, message);
 
             // per-class maps carry the right prototype chain (.constructor etc.)
-            let map = match err.name() {
+            let map = match class {
                 "TypeError" => heap.known().type_error_map,
                 "ReferenceError" => heap.known().reference_error_map,
                 "RangeError" => heap.known().range_error_map,

@@ -56,10 +56,12 @@ pub struct WellKnown {
     pub reference_error_map: Global<Map>,
     pub range_error_map: Global<Map>,
     /// Wrapper maps for boxed primitives (slots[0] = the primitive value);
-    /// installed by the builtins bootstrap.
     pub number_wrapper_map: Global<Map>,
     pub boolean_wrapper_map: Global<Map>,
     pub string_wrapper_map: Global<Map>,
+    pub number_prototype: Global<Object>,
+    pub boolean_prototype: Global<Object>,
+    pub string_prototype: Global<Object>,
     // prototypes
     /// `%Object.prototype%`: root of the ordinary-object prototype hierarchy.
     pub object_prototype: Global<Object>,
@@ -247,6 +249,9 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         number_wrapper_map: map,
         boolean_wrapper_map: map,
         string_wrapper_map: map,
+        number_prototype: obj,
+        boolean_prototype: obj,
+        string_prototype: obj,
         object_prototype: obj,
         array_prototype: obj,
         error_prototype: obj,

@@ -12,6 +12,7 @@ pub mod function;
 pub mod global;
 pub mod helpers;
 pub mod intrinsics;
+pub mod math;
 pub mod number;
 pub mod object;
 pub mod proxy;
@@ -35,6 +36,7 @@ use helpers::{
     install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
     run_prelude,
 };
+use math::math_sqrt;
 use number::{number_constructor, number_to_string, number_value_of};
 use object::{
     object_constructor, object_create, object_define_property, object_freeze,
@@ -101,6 +103,7 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
         object_is_extensible: vm.register_runtime(object_is_extensible),
         object_seal: vm.register_runtime(object_seal),
         object_freeze: vm.register_runtime(object_freeze),
+        math_sqrt: vm.register_runtime(math_sqrt),
     }
 }
 
@@ -148,6 +151,7 @@ pub struct BuiltinIndices {
     pub object_is_extensible: RuntimeIndex,
     pub object_seal: RuntimeIndex,
     pub object_freeze: RuntimeIndex,
+    pub math_sqrt: RuntimeIndex,
 }
 
 /// Build the builtin objects and install them on the global object.
@@ -198,7 +202,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
                 PropertyDescriptor::data(value.erase()),
             )?;
         }
+        let number_prototype = roots.create_handle(number_proto.as_tagged(&*thread.heap()));
         let mut known = *thread.heap().known();
+        known.number_prototype = number_prototype;
         known.number_wrapper_map = roots.create_handle(
             thread.heap().allocate::<Map>(MapInit {
                 kind: MapKind::OBJECT
@@ -229,7 +235,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             "toString",
             idx.boolean_to_string,
         )?;
+        let boolean_prototype = roots.create_handle(boolean_proto.as_tagged(&*thread.heap()));
         let mut known = *thread.heap().known();
+        known.boolean_prototype = boolean_prototype;
         known.boolean_wrapper_map = roots.create_handle(
             thread.heap().allocate::<Map>(MapInit {
                 kind: MapKind::OBJECT
@@ -253,7 +261,9 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             "toString",
             idx.string_to_string,
         )?;
+        let string_prototype = roots.create_handle(string_proto.as_tagged(&*thread.heap()));
         let mut known = *thread.heap().known();
+        known.string_prototype = string_prototype;
         known.string_wrapper_map = roots.create_handle(
             thread.heap().allocate::<Map>(MapInit {
                 kind: MapKind::OBJECT
@@ -680,6 +690,37 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         }));
         known.for_in_enumerator_map = for_in_enumerator_map;
         thread.heap().set_known(known);
+
+        // ---- Math (namespace object; not callable, not a constructor) --------
+        let math_object = {
+            let map = thread.heap().allocate_handle::<Map>(
+                MapInit {
+                    kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                    value_slot_count: 0,
+                    descriptors: &[],
+                    prototype: object_prototype.erase(),
+                },
+                &scope,
+            );
+            roots.create_handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY))
+        };
+        install_method(
+            thread,
+            &scope,
+            math_object,
+            "sqrt",
+            idx.math_sqrt,
+        )?;
+        let math_name = thread.intern(&scope, "Math");
+        // Safety: fresh interned word, rooted below before the define.
+        let math_name = scope.handle(math_name.as_tagged(&*thread.heap()));
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            global,
+            math_name,
+            PropertyDescriptor::data(math_object.erase()),
+        )?;
 
         let is_nan_fn = make_runtime_function(thread, &scope, idx.is_nan)?;
         let is_nan_name = thread.intern(&scope, "isNaN");

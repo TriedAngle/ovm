@@ -1,8 +1,8 @@
 use crate::Thread;
 use crate::materialize::Materialize;
 use crate::{
-    Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor, Smi,
-    Tagged, Value, VmError,
+    DenseString, Float, Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object,
+    PropertyDescriptor, Smi, Tagged, Value, VmError,
 };
 use crate::{RuntimeContext, RuntimeIndex};
 
@@ -204,11 +204,25 @@ pub fn install_method(
     Ok(())
 }
 
-/// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver.
+/// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver — or the receiver
+/// itself when it is an unboxed primitive: builtin `this`-values are
+/// never auto-boxed (ES 5.2.3), so `Number.prototype.toString` and
+/// friends must accept raw Smi/Float/string/boolean receivers.
 pub fn wrapper_value<'a>(
     heap: &'a Heap,
-    receiver: Tagged<'_, Value>,
+    receiver: Tagged<'a, Value>,
 ) -> Result<Tagged<'a, Value>, VmError> {
+    {
+        let known = heap.known();
+        let is_primitive = receiver.as_heap_object().is_none()
+            || receiver.get_as::<Float>().is_some()
+            || receiver.get_as::<DenseString>().is_some()
+            || receiver == known.true_object.as_tagged(heap)
+            || receiver == known.false_object.as_tagged(heap);
+        if is_primitive {
+            return Ok(receiver);
+        }
+    }
     let Some(obj) = receiver.as_heap_object() else {
         return Err(VmError::Type);
     };

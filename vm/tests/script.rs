@@ -552,3 +552,34 @@ fn switch_statements() {
         "default before cases still works"
     );
 }
+
+#[test]
+fn unresolvable_global_names_the_binding() {
+    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let mut thread = vm.attach();
+    let result = thread.run_script("flurb;").unwrap();
+    let exception_word = {
+        let heap = thread.heap();
+        heap.known().exception.as_tagged(heap).raw()
+    };
+    assert_eq!(result, exception_word, "the run must end in the sentinel");
+    let ex = thread.take_pending_exception().expect("pending exception");
+    thread.handle_scope(|thread, scope| {
+        let message = thread.intern(&scope, "message");
+        let heap = &*thread.heap();
+        let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
+            panic!("error object expected");
+        };
+        let msg = match o.lookup(heap, message.as_tagged(heap).into()) {
+            Lookup::Data { slot, .. } => slot
+                .get(heap)
+                .get_as::<DenseString>()
+                .expect("string message")
+                .to_rust_string(heap),
+            _ => panic!("error object must have a message property"),
+        };
+        assert_eq!(msg, "'flurb' is not defined");
+    });
+    // `typeof` on an unresolved global stays undefined, not a throw
+    assert_eq!(run_str("typeof flurb;"), "undefined");
+}
