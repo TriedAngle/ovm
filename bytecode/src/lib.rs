@@ -269,7 +269,7 @@ pub struct Operands<'c> {
 
 impl<'c> Operands<'c> {
     /// Read operand `i` from the stream.
-    #[inline]
+    #[inline(always)]
     fn read(&self, i: usize) -> u32 {
         let e = self.row[i] as usize;
         debug_assert!(e != 0, "no operand {i}");
@@ -401,16 +401,24 @@ pub fn decode<'c>(code: &'c [u8], pc: usize) -> (Opcode, Operands<'c>, usize) {
         (unsafe { Opcode::from_byte_unchecked(byte) }, pc + 1, false)
     };
     let idx = op as usize;
-    let row = (if wide {
-        opcodes::OPERAND_ROWS_WIDE
-    } else {
-        opcodes::OPERAND_ROWS_NARROW
-    })[idx];
-    let size = (if wide {
-        opcodes::OPERAND_SIZES_WIDE
-    } else {
-        opcodes::OPERAND_SIZES_NARROW
-    })[idx] as usize;
+    // Safety: opcode discriminants are dense over the decode tables
+    let row: &'static [u8; 5] = unsafe {
+        (if wide {
+            opcodes::OPERAND_ROWS_WIDE
+        } else {
+            opcodes::OPERAND_ROWS_NARROW
+        })
+        .get_unchecked(idx)
+    };
+    // Safety: dense discriminant, see above
+    let size = unsafe {
+        *(if wide {
+            opcodes::OPERAND_SIZES_WIDE
+        } else {
+            opcodes::OPERAND_SIZES_NARROW
+        })
+        .get_unchecked(idx)
+    } as usize;
     (
         op,
         Operands {
@@ -434,7 +442,7 @@ pub fn try_decode<'c>(code: &'c [u8], mut pc: usize) -> Option<(Opcode, Operands
     }
     let op = Opcode::from_byte(byte)?;
     let idx = op as usize;
-    let row = (if wide {
+    let row = &(if wide {
         opcodes::OPERAND_ROWS_WIDE
     } else {
         opcodes::OPERAND_ROWS_NARROW

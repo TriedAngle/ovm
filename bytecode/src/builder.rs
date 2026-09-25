@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::program::{Constant, Function, HandlerEntry};
-use crate::{CallableKind, Opcode, Operand, emit};
+use crate::{CallableKind, Opcode, Operand, emit, Scale};
 
 /// One staged argument of a runtime call: where the value for a window
 /// slot comes from. [`RtArg::Acc`] captures the accumulator's current
@@ -223,6 +223,56 @@ struct JumpRec {
     at: usize,
     op: Opcode,
     target: u32,
+    /// Leading (non-offset) operands of a fused jump like
+    /// `CompareJump { reg, kind, offset }`.
+    prefix_len: u8,
+    prefix: [u32; 2],
+}
+
+/// The physically last emitted instruction, when it is fusable into a
+/// superinstruction by the next emission. Anchors (labels, handler
+/// ranges) and any other emission clear it.
+#[derive(Debug, Clone, Copy)]
+enum LastOp {
+    None,
+    /// `LoadSmi imm` at `at`
+    LoadSmi { at: usize, imm: i32 },
+    /// a comparison reading `reg` at `at`
+    Compare { at: usize, op: Opcode, reg: i32 },
+}
+
+/// The comparison index encoded into `CompareJump`'s kind operand.
+fn fused_compare_kind(op: Opcode, jump_if_falsy: bool) -> u32 {
+    let cmp = match op {
+        Opcode::Equal => 0,
+        Opcode::EqualStrict => 1,
+        Opcode::LessThan => 2,
+        Opcode::LessThanOrEqual => 3,
+        Opcode::GreaterThan => 4,
+        Opcode::GreaterThanOrEqual => 5,
+        _ => unreachable!("not a fusable comparison"),
+    };
+    cmp * 2 + u32::from(jump_if_falsy)
+}
+
+/// Write one operand's narrow/wide stream bytes (the shared encoding of
+/// [`crate::emit`], for jump patching in `layout`).
+fn push_operand_bytes(out: &mut Vec<u8>, kind: Operand, v: u32, wide: bool) {
+    let size = kind.size_in_stream(if wide { Scale::Byte2 } else { Scale::Byte1 });
+    if kind.is_signed() {
+        let x = v as i32;
+        match size {
+            1 => out.push(x as i8 as u8),
+            2 => out.extend_from_slice(&(x as i16).to_le_bytes()),
+            _ => unreachable!("signed operands are at most 2 bytes"),
+        }
+    } else {
+        match size {
+            1 => out.push(v as u8),
+            2 => out.extend_from_slice(&(v as u16).to_le_bytes()),
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -270,6 +320,9 @@ pub struct FnBuilder {
     // accumulator analysis
     acc: Acc,
 
+    // superinstruction fusion state
+    last: LastOp,
+
     // register allocation
     temp_base: u32,
     temp_depth: u32,
@@ -293,6 +346,7 @@ impl FnBuilder {
             other_pool: HashMap::new(),
             feedback_slots: 0,
             acc: Acc::Dead,
+            last: LastOp::None,
             temp_base: 0,
             temp_depth: 0,
             max_reg: -1,
@@ -437,6 +491,7 @@ impl FnBuilder {
         debug_assert!(rec.bind.is_none(), "label bound twice");
         rec.bind = Some(self.code.len());
         self.acc = Acc::Unknown;
+        self.last = LastOp::None;
     }
 
     /// Anchor the start of a try region at the next instruction.
@@ -447,6 +502,7 @@ impl FnBuilder {
             try_end: None,
             handler_pc: None,
         });
+        self.last = LastOp::None;
         TryBlock {
             id,
             origin: self.origin,
@@ -460,6 +516,7 @@ impl FnBuilder {
         let rec = &mut self.handlers[t.id as usize];
         debug_assert!(rec.try_end.is_none(), "try range ended twice");
         rec.try_end = Some(self.code.len());
+        self.last = LastOp::None;
     }
 
     /// Anchor the handler entry: control resumes here with the exception
@@ -470,6 +527,7 @@ impl FnBuilder {
         debug_assert!(rec.handler_pc.is_none(), "handler anchored twice");
         rec.handler_pc = Some(self.code.len());
         self.acc = Acc::Unknown;
+        self.last = LastOp::None;
     }
 
     pub fn load(&mut self, r: Reg) {
@@ -529,7 +587,18 @@ impl FnBuilder {
     }
 
     /// Keyed load: the key is in the accumulator, the result replaces it.
+    /// A directly preceding `LoadSmi` with an in-range non-negative value
+    /// fuses into [`Opcode::LoadElementImm`] (the feedback pair the
+    /// caller reserved stays simply unused).
     pub fn load_keyed_property(&mut self, obj: Reg, fb: Feedback) {
+        if let LastOp::LoadSmi { at, imm } = self.last
+            && (0..=u16::MAX as i32).contains(&imm)
+        {
+            self.code.truncate(at);
+            self.last = LastOp::None;
+            self.emit_tracked(Opcode::LoadElementImm, &[obj.operand(), imm as u32]);
+            return;
+        }
         self.emit_tracked(Opcode::LoadKeyedProperty, &[obj.operand(), fb.0]);
     }
 
@@ -648,7 +717,18 @@ impl FnBuilder {
 
     // -- binary arithmetic: acc = acc op reg --------------------------------------
 
-    acc_reg_op!(add, Add);
+    /// `acc = acc + reg`. Fuses with a directly preceding `LoadSmi` into
+    /// [`Opcode::AddImmediate`] (`acc = imm + reg` — addition is
+    /// commutative, and the intermediate smi is otherwise dead).
+    pub fn add(&mut self, r: Reg) {
+        if let LastOp::LoadSmi { at, imm } = self.last {
+            self.code.truncate(at);
+            self.last = LastOp::None;
+            self.emit_tracked(Opcode::AddImmediate, &[r.operand(), imm as u32]);
+            return;
+        }
+        self.emit_tracked(Opcode::Add, &[r.operand()]);
+    }
     acc_reg_op!(sub, Sub);
     acc_reg_op!(mul, Mul);
     acc_reg_op!(div, Div);
@@ -688,11 +768,31 @@ impl FnBuilder {
     }
 
     pub fn jump_if_truthy(&mut self, target: Label) {
-        self.emit_jump_op(Opcode::JumpIfTruthy, target);
+        self.emit_cond_jump(Opcode::JumpIfTruthy, target);
     }
 
     pub fn jump_if_falsy(&mut self, target: Label) {
-        self.emit_jump_op(Opcode::JumpIfFalsy, target);
+        self.emit_cond_jump(Opcode::JumpIfFalsy, target);
+    }
+
+    /// A conditional jump fuses with a directly preceding comparison
+    /// into [`Opcode::CompareJump`].
+    fn emit_cond_jump(&mut self, plain: Opcode, target: Label) {
+        self.check_label(target);
+        if plain.reads_acc() {
+            debug_assert!(
+                self.acc != Acc::Dead,
+                "{plain:?} reads the accumulator, which is not defined here"
+            );
+        }
+        if let LastOp::Compare { at, op, reg } = self.last {
+            let kind = fused_compare_kind(op, plain == Opcode::JumpIfFalsy);
+            self.code.truncate(at);
+            self.last = LastOp::None;
+            self.emit_jump_with_prefix(Opcode::CompareJump, &[reg as u32, kind], target);
+            return;
+        }
+        self.emit_jump_op(plain, target);
     }
 
     pub fn jump_if_not_undefined(&mut self, target: Label) {
@@ -837,7 +937,9 @@ impl FnBuilder {
             for (i, jump) in self.jumps.iter().enumerate() {
                 let offset = label_out[jump.target as usize] as i64 - jump_out[i] as i64;
                 if extra[i] == 0 && !(i8::MIN as i64..=i8::MAX as i64).contains(&offset) {
-                    extra[i] = 2;
+                    // widening scales every operand and adds the Wide
+                    // prefix byte (Opcode::size excludes it)
+                    extra[i] = jump.op.size(Scale::Byte2) + 1 - jump.op.size(Scale::Byte1);
                     changed = true;
                 }
             }
@@ -857,16 +959,23 @@ impl FnBuilder {
             if let Ev::Jump(i) = ev {
                 let jump = &self.jumps[i as usize];
                 let offset = label_out[jump.target as usize] as i64 - out.len() as i64;
-                if extra[i as usize] == 0 {
-                    out.push(jump.op as u8);
-                    out.push(offset as i8 as u8);
-                } else {
-                    let off = i16::try_from(offset).map_err(|_| BuildError::JumpOutOfRange)?;
+                let kinds = jump.op.operands();
+                let wide = extra[i as usize] != 0;
+                if wide {
                     out.push(Opcode::Wide as u8);
-                    out.push(jump.op as u8);
-                    out.extend_from_slice(&off.to_le_bytes());
                 }
-                pos = epos + 2; // skip the narrow placeholder
+                out.push(jump.op as u8);
+                for k in 0..jump.prefix_len as usize {
+                    push_operand_bytes(&mut out, kinds[k], jump.prefix[k], wide);
+                }
+                if wide {
+                    let off =
+                        i16::try_from(offset).map_err(|_| BuildError::JumpOutOfRange)?;
+                    out.extend_from_slice(&off.to_le_bytes());
+                } else {
+                    out.push(offset as i8 as u8);
+                }
+                pos = epos + jump.op.size(Scale::Byte1); // skip the placeholder
             } else {
                 pos = epos;
             }
@@ -915,7 +1024,28 @@ impl FnBuilder {
         if op.writes_acc() {
             self.acc = Acc::Unknown;
         }
+        let at = self.code.len();
         emit(&mut self.code, op, operands);
+        self.last = match (op, operands.first().copied()) {
+            (Opcode::LoadSmi, Some(v)) => LastOp::LoadSmi {
+                at,
+                imm: v as i32,
+            },
+            (
+                Opcode::Equal
+                | Opcode::EqualStrict
+                | Opcode::LessThan
+                | Opcode::LessThanOrEqual
+                | Opcode::GreaterThan
+                | Opcode::GreaterThanOrEqual,
+                Some(r),
+            ) => LastOp::Compare {
+                at,
+                op,
+                reg: r as i32,
+            },
+            _ => LastOp::None,
+        };
     }
 
     /// Bounds-check a register operand and grow the frame window.
@@ -932,6 +1062,13 @@ impl FnBuilder {
     }
 
     fn emit_jump_op(&mut self, op: Opcode, target: Label) {
+        self.emit_jump_with_prefix(op, &[], target);
+    }
+
+    /// Emit a jump whose operands are `prefix..` followed by the final
+    /// offset (a label fixup, widened at finish). The placeholder is the
+    /// narrow encoding with a zero offset.
+    fn emit_jump_with_prefix(&mut self, op: Opcode, prefix: &[u32], target: Label) {
         self.check_label(target);
         if op.reads_acc() {
             debug_assert!(
@@ -939,17 +1076,32 @@ impl FnBuilder {
                 "{op:?} reads the accumulator, which is not defined here"
             );
         }
+        let kinds = op.operands();
+        debug_assert_eq!(
+            kinds.len(),
+            prefix.len() + 1,
+            "jump ops take prefix operands plus the final offset"
+        );
         let at = self.code.len();
         self.code.push(op as u8);
+        for (i, v) in prefix.iter().enumerate() {
+            push_operand_bytes(&mut self.code, kinds[i], *v, false);
+        }
         self.code.push(0); // narrow imm placeholder, patched at finish
         self.jumps.push(JumpRec {
             at,
             op,
             target: target.id,
+            prefix_len: prefix.len() as u8,
+            prefix: [
+                prefix.first().copied().unwrap_or(0),
+                prefix.get(1).copied().unwrap_or(0),
+            ],
         });
         if op == Opcode::Jump || op == Opcode::JumpLoop {
             self.acc = Acc::Dead;
         }
+        self.last = LastOp::None;
     }
 
     fn check_label(&self, label: Label) {

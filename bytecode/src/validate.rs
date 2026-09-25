@@ -126,6 +126,13 @@ pub fn validate_function(f: &Function, program_len: usize) -> Result<(), Validat
                     offset: ops.imm(0),
                 });
             }
+            Opcode::CompareJump => {
+                jumps.push(JumpSite {
+                    pc,
+                    op,
+                    offset: ops.imm(2),
+                });
+            }
             _ => {}
         }
 
