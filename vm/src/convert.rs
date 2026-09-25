@@ -16,6 +16,7 @@ impl Convert {
 
     /// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN,
     /// everything else is truthy.
+    #[inline]
     pub fn is_truthy(heap: &Heap, v: Tagged<'_, Value>) -> bool {
         let known = heap.known();
         if let Some(smi) = Smi::decode(v.raw()) {
@@ -107,6 +108,7 @@ impl Convert {
     }
 
     /// The true/false singleton for a Rust bool.
+    #[inline]
     pub fn boolean<'a>(heap: &'a Heap, b: bool) -> Tagged<'a, Value> {
         let known = heap.known();
         if b {

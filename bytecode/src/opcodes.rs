@@ -145,11 +145,12 @@ macro_rules! define_opcodes {
         }
 
         /// Packed decode rows (see [`pack_row`]), narrow and wide scale,
-        /// indexed by opcode discriminant.
-        pub static OPERAND_ROWS_NARROW: &[&[u8; 5]] =
-            &[$(&pack_row(&[$(Operand::$operand),*], false)),*];
-        pub static OPERAND_ROWS_WIDE: &[&[u8; 5]] =
-            &[$(&pack_row(&[$(Operand::$operand),*], true)),*];
+        /// indexed by opcode discriminant (dense by construction: every
+        /// valid discriminant indexes in range).
+        pub static OPERAND_ROWS_NARROW: &[[u8; 5]] =
+            &[$(pack_row(&[$(Operand::$operand),*], false)),*];
+        pub static OPERAND_ROWS_WIDE: &[[u8; 5]] =
+            &[$(pack_row(&[$(Operand::$operand),*], true)),*];
         /// Total operand bytes per instruction, narrow and wide scale.
         pub static OPERAND_SIZES_NARROW: &[u8] =
             &[$(total_size(&[$(Operand::$operand),*], false)),*];
@@ -298,6 +299,17 @@ define_opcodes! {
     LessThanOrEqual { operands: [Register], acc: reads_writes, indices: [Unchecked] },    // reg; <=
     GreaterThan { operands: [Register], acc: reads_writes, indices: [Unchecked] },        // reg; >
     GreaterThanOrEqual { operands: [Register], acc: reads_writes, indices: [Unchecked] }, // reg; >=
+
+    // -- superinstructions (builder-fused pairs) -----------------------------
+    /// Fused compare + conditional jump: `acc = compare(acc, reg)`, then
+    /// jump when the result's truthiness matches the polarity encoded in
+    /// the kind operand (`cmp * 2 + jump_if_falsy`). cmp: 0 `==`, 1 `===`,
+    /// 2 `<`, 3 `<=`, 4 `>`, 5 `>=`.
+    CompareJump { operands: [Register, UImmediate, Immediate], acc: reads_writes, indices: [Unchecked, Unchecked, Unchecked] },
+    /// Fused load-immediate + add: `acc = imm + reg`.
+    AddImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    /// Fused load-immediate + keyed element read: `acc = reg[idx]`.
+    LoadElementImm { operands: [Register, UImmediate], acc: writes, indices: [Unchecked, Unchecked] },
 
     // exception handling
     Throw { operands: [], acc: reads, indices: [] },   // acc -> pending exception

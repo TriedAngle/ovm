@@ -100,6 +100,18 @@ impl StackCache {
         self.get().pc = pc;
     }
 
+    pub fn base(&self) -> usize {
+        self.get().base
+    }
+
+    pub fn register_count(&self) -> usize {
+        self.get().register_count
+    }
+
+    pub fn code_raw(&self) -> Value {
+        self.get().code.raw()
+    }
+
     pub fn code_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, FixedByteArray> {
         debug_assert!(self.is_active(), "bytecode read from inactive cache");
         self.get()
