@@ -192,10 +192,7 @@ impl Transition {
             let descriptor_count = parent_ref.descriptor_count();
             let value_slot_count = parent_ref.value_slot_count();
             let prototype = scope.handle(parent_ref.prototype.get(heap));
-            let pairs_len = parent_ref
-                .transitions
-                .load(heap)
-                .map_or(0, |a| a.len());
+            let pairs_len = parent_ref.transitions.load(heap).map_or(0, |a| a.len());
 
             let grow = !flags.is_accessor()
                 && match change {

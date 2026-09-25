@@ -704,13 +704,7 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             );
             roots.create_handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY))
         };
-        install_method(
-            thread,
-            &scope,
-            math_object,
-            "sqrt",
-            idx.math_sqrt,
-        )?;
+        install_method(thread, &scope, math_object, "sqrt", idx.math_sqrt)?;
         let math_name = thread.intern(&scope, "Math");
         // Safety: fresh interned word, rooted below before the define.
         let math_name = scope.handle(math_name.as_tagged(&*thread.heap()));
