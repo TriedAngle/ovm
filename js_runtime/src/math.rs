@@ -1,8 +1,8 @@
 //! ES 22.1 (Math): function properties of the Math namespace object.
 
-use crate::Object;
-use crate::RuntimeContext;
-use crate::{HandleSlice, Tagged, Value, VmError};
+use vm_core::Object;
+use vm_core::RuntimeContext;
+use vm_core::{HandleSlice, Tagged, Value, VmError};
 
 /// `Math.sqrt(x)` (ES 22.1.2.29): ToNumber, then the IEEE-754 square root
 /// (NaN/negative input → NaN, ±0 → ±0).

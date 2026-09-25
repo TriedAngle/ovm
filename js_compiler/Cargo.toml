@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 bytecode = { path = "../bytecode" }
+vm_core = { path = "../vm_core" }
 oxc_allocator = "0.151.0"
 oxc_ast = "0.151.0"
 oxc_ast_visit = "0.151.0"

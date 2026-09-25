@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::program::{Constant, Function, HandlerEntry};
-use crate::{CallableKind, Opcode, Operand, emit, Scale};
+use crate::{CallableKind, Opcode, Operand, Scale, emit};
 
 /// One staged argument of a runtime call: where the value for a window
 /// slot comes from. [`RtArg::Acc`] captures the accumulator's current
@@ -236,9 +236,16 @@ struct JumpRec {
 enum LastOp {
     None,
     /// `LoadSmi imm` at `at`
-    LoadSmi { at: usize, imm: i32 },
+    LoadSmi {
+        at: usize,
+        imm: i32,
+    },
     /// a comparison reading `reg` at `at`
-    Compare { at: usize, op: Opcode, reg: i32 },
+    Compare {
+        at: usize,
+        op: Opcode,
+        reg: i32,
+    },
 }
 
 /// The comparison index encoded into `CompareJump`'s kind operand.
@@ -969,8 +976,7 @@ impl FnBuilder {
                     push_operand_bytes(&mut out, kinds[k], jump.prefix[k], wide);
                 }
                 if wide {
-                    let off =
-                        i16::try_from(offset).map_err(|_| BuildError::JumpOutOfRange)?;
+                    let off = i16::try_from(offset).map_err(|_| BuildError::JumpOutOfRange)?;
                     out.extend_from_slice(&off.to_le_bytes());
                 } else {
                     out.push(offset as i8 as u8);
@@ -1027,10 +1033,7 @@ impl FnBuilder {
         let at = self.code.len();
         emit(&mut self.code, op, operands);
         self.last = match (op, operands.first().copied()) {
-            (Opcode::LoadSmi, Some(v)) => LastOp::LoadSmi {
-                at,
-                imm: v as i32,
-            },
+            (Opcode::LoadSmi, Some(v)) => LastOp::LoadSmi { at, imm: v as i32 },
             (
                 Opcode::Equal
                 | Opcode::EqualStrict

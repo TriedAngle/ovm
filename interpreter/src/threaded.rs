@@ -1,8 +1,8 @@
-use crate::proxy::Proxy;
 use bytecode::{Opcode, Operands, decode, jump_target};
+use vm_core::proxy::Proxy;
 
-use crate::ic::{Hit, InlineCache, StoreHit, StoreOutcomeKind};
-use crate::{
+use vm_core::ic::{Hit, InlineCache, StoreHit, StoreOutcomeKind};
+use vm_core::{
     Acc, CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState,
     Convert, DenseString, Errors, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint, Key,
     LoadOutcome, Lookup, Object, PropertyDescriptor, RuntimeContext, RuntimeIndex, ScopeInfo,
@@ -49,8 +49,8 @@ pub fn execute<'a>(
     args: HandleSlice<'_>,
     new_target: Option<Handle<'_, Value>>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let stack = &state.stack;
-    let cache = &state.cache;
+    let stack = &state.stack();
+    let cache = &state.cache();
 
     let saved_top = stack.top();
     let was_active = cache.is_active();
@@ -107,10 +107,10 @@ fn start<'b>(
         None => Err(VmError::Type),
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
-            let (saved_top, fargs) = state.stack.stage_args(heap, args)?;
+            let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
             let result = f(nctx, fargs);
-            state.stack.set_top(saved_top);
+            state.stack().set_top(saved_top);
             result
         }
         Some(CallTarget::Bytecode(target, register_count, kind)) => {
@@ -119,7 +119,7 @@ fn start<'b>(
             }
             // derived constructors receive TheHole as their receiver: `this`
             // stays uninitialized until super() binds it (ES 10.2.2)
-            let stack = &state.stack;
+            let stack = &state.stack();
             // one shared anchor covers every read feeding the frame push;
             // the push itself never allocates, so the anchor may span it
             let frame = {
@@ -148,7 +148,7 @@ fn start<'b>(
                     formal_min,
                 )?
             };
-            state.cache.enter(stack, frame, heap);
+            state.cache().enter(stack, frame, heap);
             dispatch(vm, heap, state, base_depth)
         }
     }
@@ -216,8 +216,8 @@ fn exception_dispatch<'a>(
     base_depth: usize,
     mut pc: usize,
 ) -> Unwind<'a> {
-    let stack = &state.stack;
-    let cache = &state.cache;
+    let stack = &state.stack();
+    let cache = &state.cache();
     // A termination is not an exception: no handler (catch or finally in
     // any frame) may observe or intercept it — unwind straight out.
     let terminated = state.termination().is_some();
@@ -344,7 +344,7 @@ impl Slow {
         reg: i32,
         f: fn(f64, f64) -> f64,
     ) -> Step<'a> {
-        let stack = &state.stack;
+        let stack = &state.stack();
         state.handle_scope(|scope| {
             let a = scope.handle(acc.get(heap));
             let b = scope.handle(stack.reg(heap, &meta, reg));
@@ -369,7 +369,7 @@ impl Slow {
         reg: i32,
         cmp: Cmp,
     ) -> Result<CmpOutcome, VmError> {
-        let stack = &state.stack;
+        let stack = &state.stack();
         state.handle_scope(|scope| {
             let hint = match cmp {
                 Cmp::Eq => Hint::Default,
@@ -389,9 +389,7 @@ impl Slow {
                 Cmp::Eq => Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
                 Cmp::EqStrict => Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap)),
                 Cmp::Lt => Compare::less_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-                Cmp::Le => {
-                    Compare::less_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?
-                }
+                Cmp::Le => Compare::less_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
                 Cmp::Gt => Compare::greater_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
                 Cmp::Ge => {
                     Compare::greater_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?
@@ -669,7 +667,7 @@ impl Slow {
         reg: i32,
         imm: i32,
     ) -> Step<'a> {
-        let stack = &state.stack;
+        let stack = &state.stack();
         state.handle_scope(|scope| {
             let lhs = scope.handle(Smi::new(imm as i64).into_tagged());
             let rhs = scope.handle(stack.reg(heap, &meta, reg));
@@ -677,10 +675,7 @@ impl Slow {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
-            let is_string = rhs
-                .as_tagged(heap)
-                .get_as::<DenseString>()
-                .is_some();
+            let is_string = rhs.as_tagged(heap).get_as::<DenseString>().is_some();
             if is_string {
                 let a = scope.handle(step_try!(Convert::to_string(heap, &scope, lhs)));
                 let b = scope.handle(step_try!(Convert::to_string(heap, &scope, rhs)));
@@ -1021,116 +1016,106 @@ fn store_named<'a>(
         Opcode::StoreNamedPropertyNoShadow
     };
     state.handle_scope(|scope| -> Step<'_> {
-            let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
-            let name = scope.handle(
-                stack
-                    .callable(heap, &meta)
-                    .as_ref()
-                    .constant_slot_name(heap, name_idx),
-            );
-            let vector = cache.feedback_ref(heap).map(|v| scope.handle(v));
-            // the stored value stays in the accumulator (a root); the
-            // IC re-reads it fresh at each use
+        let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
+        let name = scope.handle(
+            stack
+                .callable(heap, &meta)
+                .as_ref()
+                .constant_slot_name(heap, name_idx),
+        );
+        let vector = cache.feedback_ref(heap).map(|v| scope.handle(v));
+        // the stored value stays in the accumulator (a root); the
+        // IC re-reads it fresh at each use
 
-            if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
-                let name = scope.handle(name.as_tagged(heap).erase());
-                let value = scope.handle(acc.get(heap));
-                return match step_try!(Proxy::set(
-                    vm, heap, state, receiver, name, value, receiver
-                )) {
-                    Coercion::Threw => Step::PendingThrow,
-                    Coercion::Value(_) => Step::Next,
-                };
-            }
+        if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
+            let name = scope.handle(name.as_tagged(heap).erase());
+            let value = scope.handle(acc.get(heap));
+            return match step_try!(Proxy::set(vm, heap, state, receiver, name, value, receiver)) {
+                Coercion::Threw => Step::PendingThrow,
+                Coercion::Value(_) => Step::Next,
+            };
+        }
 
-            // inline cache (Shadow semantics only: WriteThrough stores
-            // into parent-pair arrays that no map describes)
-            if op == Opcode::StoreNamedProperty
-                && let Some(hit) = InlineCache::try_store(
-                    heap,
-                    &scope,
-                    vector,
-                    feedback_slot,
-                    receiver,
-                    name,
-                    &acc,
-                )
-            {
-                match hit {
-                    StoreHit::Done => {}
-                    StoreHit::Setter(setter) => {
-                        let setter = scope.handle(setter);
-                        let args =
-                            scope.stage(&[receiver.as_tagged(heap).erase(), acc.get(heap)]);
-                        match step_try!(call_value(
-                            vm, state, heap, stack, cache, meta, pc, setter, args
-                        )) {
-                            Called::Frame => return Step::Reframe,
-                            Called::NotCallable | Called::Immediate(_) => {}
-                            Called::Threw => return Step::PendingThrow,
-                        }
+        // inline cache (Shadow semantics only: WriteThrough stores
+        // into parent-pair arrays that no map describes)
+        if op == Opcode::StoreNamedProperty
+            && let Some(hit) =
+                InlineCache::try_store(heap, &scope, vector, feedback_slot, receiver, name, &acc)
+        {
+            match hit {
+                StoreHit::Done => {}
+                StoreHit::Setter(setter) => {
+                    let setter = scope.handle(setter);
+                    let args = scope.stage(&[receiver.as_tagged(heap).erase(), acc.get(heap)]);
+                    match step_try!(call_value(
+                        vm, state, heap, stack, cache, meta, pc, setter, args
+                    )) {
+                        Called::Frame => return Step::Reframe,
+                        Called::NotCallable | Called::Immediate(_) => {}
+                        Called::Threw => return Step::PendingThrow,
                     }
                 }
-                return Step::Next;
             }
+            return Step::Next;
+        }
 
-            // the receiver's map before the store: the state key when
-            // the outcome transitions it
-            let prev = receiver
-                .as_tagged(heap)
-                .as_heap_object()
-                .map(|o| scope.handle(o.as_ref().map_ref(heap)));
-            let outcome = step_try!(receiver.store_lookup(
+        // the receiver's map before the store: the state key when
+        // the outcome transitions it
+        let prev = receiver
+            .as_tagged(heap)
+            .as_heap_object()
+            .map(|o| scope.handle(o.as_ref().map_ref(heap)));
+        let outcome = step_try!(receiver.store_lookup(
+            heap,
+            &scope,
+            name.as_tagged(heap),
+            acc.get(heap),
+            semantics
+        ));
+        // update the IC before invoking a setter (mirrors loads)
+        let kind = match outcome {
+            StoreOutcome::Done => StoreOutcomeKind::Done,
+            StoreOutcome::Transition { .. } => StoreOutcomeKind::Transition,
+            StoreOutcome::CallSetter { .. } => StoreOutcomeKind::CallSetter,
+        };
+        if op == Opcode::StoreNamedProperty
+            && let Some(prev) = prev
+            && kind != StoreOutcomeKind::Transition
+        {
+            InlineCache::update_store(
                 heap,
                 &scope,
-                name.as_tagged(heap),
-                acc.get(heap),
-                semantics
-            ));
-            // update the IC before invoking a setter (mirrors loads)
-            let kind = match outcome {
-                StoreOutcome::Done => StoreOutcomeKind::Done,
-                StoreOutcome::Transition { .. } => StoreOutcomeKind::Transition,
-                StoreOutcome::CallSetter { .. } => StoreOutcomeKind::CallSetter,
-            };
-            if op == Opcode::StoreNamedProperty
-                && let Some(prev) = prev
-                && kind != StoreOutcomeKind::Transition
-            {
-                InlineCache::update_store(
-                    heap,
-                    &scope,
-                    vector,
-                    feedback_slot,
-                    receiver,
-                    name,
-                    prev,
-                    kind,
-                );
-            }
-            if step_try!(apply_store_outcome(
-                vm, heap, state, stack, cache, meta, pc, receiver, outcome,
-            )) {
-                return Step::Reframe;
-            }
-            // a transitioned store: cache prev -> the produced map
-            if op == Opcode::StoreNamedProperty
-                && let Some(prev) = prev
-                && kind == StoreOutcomeKind::Transition
-            {
-                InlineCache::update_store(
-                    heap,
-                    &scope,
-                    vector,
-                    feedback_slot,
-                    receiver,
-                    name,
-                    prev,
-                    kind,
-                );
-            }
-            Step::Next
-        })
+                vector,
+                feedback_slot,
+                receiver,
+                name,
+                prev,
+                kind,
+            );
+        }
+        if step_try!(apply_store_outcome(
+            vm, heap, state, stack, cache, meta, pc, receiver, outcome,
+        )) {
+            return Step::Reframe;
+        }
+        // a transitioned store: cache prev -> the produced map
+        if op == Opcode::StoreNamedProperty
+            && let Some(prev) = prev
+            && kind == StoreOutcomeKind::Transition
+        {
+            InlineCache::update_store(
+                heap,
+                &scope,
+                vector,
+                feedback_slot,
+                receiver,
+                name,
+                prev,
+                kind,
+            );
+        }
+        Step::Next
+    })
 }
 
 fn dispatch<'a>(
@@ -1139,7 +1124,7 @@ fn dispatch<'a>(
     state: &ContextState,
     base_depth: usize,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let cache = &state.cache;
+    let cache = &state.cache();
     let acc = cache.acc_mut();
 
     // Frame state cached across instructions (the quickjs shape: locals
@@ -1160,16 +1145,7 @@ fn dispatch<'a>(
     loop {
         let (op, ops, next_pc) = decode(code, pc);
         let result = step(
-            vm,
-            heap,
-            state,
-            base_depth,
-            pc,
-            next_pc,
-            frame_base,
-            frame_regs,
-            ops,
-            op,
+            vm, heap, state, base_depth, pc, next_pc, frame_base, frame_regs, ops, op,
         );
         match result {
             Step::Next | Step::Jump(_) => {
@@ -1299,8 +1275,8 @@ fn step<'a>(
     ops: Operands<'_>,
     op: Opcode,
 ) -> Step<'a> {
-    let stack = &state.stack;
-    let cache = &state.cache;
+    let stack = &state.stack();
+    let cache = &state.cache();
     let acc = cache.acc_mut();
 
     let meta = FrameMeta {
@@ -1365,7 +1341,19 @@ fn step<'a>(
                 acc.store(v);
                 return Step::Next;
             }
-            Slow::global_load(vm, heap, state, stack, cache, meta, pc, ops.idx(0), ops.idx(1), &acc, op)
+            Slow::global_load(
+                vm,
+                heap,
+                state,
+                stack,
+                cache,
+                meta,
+                pc,
+                ops.idx(0),
+                ops.idx(1),
+                &acc,
+                op,
+            )
         }
         Opcode::LoadNamedProperty => {
             let receiver = stack.reg(heap, &meta, ops.reg(0));
@@ -1375,7 +1363,19 @@ fn step<'a>(
                 acc.store(v);
                 return Step::Next;
             }
-            Slow::named_load(vm, heap, state, stack, cache, meta, pc, ops.reg(0), ops.idx(1), ops.idx(2), &acc)
+            Slow::named_load(
+                vm,
+                heap,
+                state,
+                stack,
+                cache,
+                meta,
+                pc,
+                ops.reg(0),
+                ops.idx(1),
+                ops.idx(2),
+                &acc,
+            )
         }
         Opcode::LoadKeyedProperty => {
             if let Some(idx) = Smi::decode(acc.get(heap).raw())
@@ -1399,34 +1399,34 @@ fn step<'a>(
         Opcode::StoreGlobal => {
             let name_idx = ops.idx(0);
             state.handle_scope(|scope| -> Step<'_> {
-            let outcome = step_try!({
-                let name = stack
-                    .callable(heap, &meta)
-                    .as_ref()
-                    .constant_slot_name(heap, name_idx);
-                heap.known().global_object.store_lookup(
+                let outcome = step_try!({
+                    let name = stack
+                        .callable(heap, &meta)
+                        .as_ref()
+                        .constant_slot_name(heap, name_idx);
+                    heap.known().global_object.store_lookup(
+                        heap,
+                        &scope,
+                        name,
+                        acc.get(heap),
+                        StoreSemantics::WriteThrough,
+                    )
+                });
+                if step_try!(apply_store_outcome(
+                    vm,
                     heap,
-                    &scope,
-                    name,
-                    acc.get(heap),
-                    StoreSemantics::WriteThrough,
-                )
-            });
-            if step_try!(apply_store_outcome(
-                vm,
-                heap,
-                state,
-                stack,
-                cache,
-                meta,
-                pc,
-                heap.known().global_object.erase(),
-                outcome,
-            )) {
-                return Step::Reframe;
-            }
-            Step::Next
-        })
+                    state,
+                    stack,
+                    cache,
+                    meta,
+                    pc,
+                    heap.known().global_object.erase(),
+                    outcome,
+                )) {
+                    return Step::Reframe;
+                }
+                Step::Next
+            })
         }
         Opcode::StoreNamedProperty | Opcode::StoreNamedPropertyNoShadow => {
             let semantics = match op {
@@ -1453,19 +1453,19 @@ fn step<'a>(
             let recv_reg = ops.reg(0);
             let name_idx = ops.idx(1);
             state.handle_scope(|scope| -> Step<'_> {
-            let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
-            let name = stack
-                .callable(heap, &meta)
-                .as_ref()
-                .constant_slot_name(heap, name_idx);
-            let name = scope.handle(name);
-            let value = scope.handle(acc.get(heap));
-            let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
-                return Step::Error(VmError::Type);
-            };
-            step_try!(Object::add_parent(heap, &scope, receiver, name, value));
-            Step::Next
-        })
+                let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
+                let name = stack
+                    .callable(heap, &meta)
+                    .as_ref()
+                    .constant_slot_name(heap, name_idx);
+                let name = scope.handle(name);
+                let value = scope.handle(acc.get(heap));
+                let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+                    return Step::Error(VmError::Type);
+                };
+                step_try!(Object::add_parent(heap, &scope, receiver, name, value));
+                Step::Next
+            })
         }
         Opcode::StoreKeyedProperty | Opcode::StoreKeyedPropertyNoShadow => {
             let semantics = match op {
@@ -1507,72 +1507,72 @@ fn step<'a>(
             let recv_reg = ops.reg(0);
             let key_reg = ops.reg(1);
             state.handle_scope(|scope| -> Step<'_> {
-            let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
-            let raw = scope.handle(stack.reg(heap, &meta, key_reg));
-            let Some(key) = step_try!(Object::to_property_key(vm, heap, state, raw)) else {
-                return Step::PendingThrow;
-            };
-            let key = scope.handle(key);
+                let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
+                let raw = scope.handle(stack.reg(heap, &meta, key_reg));
+                let Some(key) = step_try!(Object::to_property_key(vm, heap, state, raw)) else {
+                    return Step::PendingThrow;
+                };
+                let key = scope.handle(key);
 
-            if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
-                return match step_try!(Proxy::set(
-                    vm,
+                if Proxy::is_proxy(heap, receiver.as_tagged(heap)) {
+                    return match step_try!(Proxy::set(
+                        vm,
+                        heap,
+                        state,
+                        receiver,
+                        key.erase(),
+                        scope.handle(acc.get(heap)),
+                        receiver,
+                    )) {
+                        Coercion::Threw => Step::PendingThrow,
+                        Coercion::Value(_) => Step::Next,
+                    };
+                }
+
+                let name: Handle<'_, SlotName> =
+                    match step_try!(Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+                        Key::Element(i) => {
+                            let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+                                return Step::Error(VmError::Type);
+                            };
+                            if obj.as_tagged(heap).as_ref().is_array(heap) {
+                                let value = scope.handle(acc.get(heap));
+                                step_try!(Object::store_array_element_in_place(
+                                    heap,
+                                    obj.as_tagged(heap).erase(),
+                                    i,
+                                    value.as_tagged(heap)
+                                ));
+                                return Step::Next;
+                            }
+                            let smi: Handle<'_, Smi> = scope.handle(Smi::new(i as i64));
+                            let name = smi.as_tagged(heap).erase().as_name();
+                            if matches!(
+                                receiver.as_tagged(heap).lookup(heap, name),
+                                Lookup::NotFound
+                            ) {
+                                return Step::Error(VmError::OutOfBounds);
+                            }
+                            scope.handle(name)
+                        }
+                        Key::Name(key) => scope.handle(key),
+                    };
+
+                let outcome = step_try!(receiver.as_tagged(heap).store_lookup(
                     heap,
-                    state,
-                    receiver,
-                    key.erase(),
-                    scope.handle(acc.get(heap)),
-                    receiver,
+                    &scope,
+                    name.as_tagged(heap),
+                    acc.get(heap),
+                    StoreSemantics::WriteThrough,
+                ));
+                let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
+                if step_try!(apply_store_outcome(
+                    vm, heap, state, stack, cache, meta, pc, receiver, outcome,
                 )) {
-                    Coercion::Threw => Step::PendingThrow,
-                    Coercion::Value(_) => Step::Next,
-                };
-            }
-
-            let name: Handle<'_, SlotName> =
-                match step_try!(Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
-                    Key::Element(i) => {
-                        let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
-                            return Step::Error(VmError::Type);
-                        };
-                        if obj.as_tagged(heap).as_ref().is_array(heap) {
-                            let value = scope.handle(acc.get(heap));
-                            step_try!(Object::store_array_element_in_place(
-                                heap,
-                                obj.as_tagged(heap).erase(),
-                                i,
-                                value.as_tagged(heap)
-                            ));
-                            return Step::Next;
-                        }
-                        let smi: Handle<'_, Smi> = scope.handle(Smi::new(i as i64));
-                        let name = smi.as_tagged(heap).erase().as_name();
-                        if matches!(
-                            receiver.as_tagged(heap).lookup(heap, name),
-                            Lookup::NotFound
-                        ) {
-                            return Step::Error(VmError::OutOfBounds);
-                        }
-                        scope.handle(name)
-                    }
-                    Key::Name(key) => scope.handle(key),
-                };
-
-            let outcome = step_try!(receiver.as_tagged(heap).store_lookup(
-                heap,
-                &scope,
-                name.as_tagged(heap),
-                acc.get(heap),
-                StoreSemantics::WriteThrough,
-            ));
-            let receiver = scope.handle(stack.reg(heap, &meta, recv_reg));
-            if step_try!(apply_store_outcome(
-                vm, heap, state, stack, cache, meta, pc, receiver, outcome,
-            )) {
-                return Step::Reframe;
-            }
-            Step::Next
-        })
+                    return Step::Reframe;
+                }
+                Step::Next
+            })
         }
         Opcode::Move => {
             stack.set_reg(&meta, ops.reg(0), stack.reg(heap, &meta, ops.reg(1)));
@@ -1834,18 +1834,18 @@ fn step<'a>(
         Opcode::CreateClosure => {
             let info_idx = ops.idx(0);
             state.handle_scope(|scope| -> Step<'_> {
-            let Some(info) =
-                scope.cast::<CallableInfoObject>(cache.constants_ref(heap).at(heap, info_idx))
-            else {
-                return Step::Error(VmError::Type);
-            };
-            let context = scope
-                .cast::<Context>(stack.context_slot(&meta).get(heap))
-                .expect("frame context slot holds a Context");
-            let obj = step_try!(Object::create_closure(heap, &scope, info, context));
-            acc.store(obj);
-            Step::Next
-        })
+                let Some(info) =
+                    scope.cast::<CallableInfoObject>(cache.constants_ref(heap).at(heap, info_idx))
+                else {
+                    return Step::Error(VmError::Type);
+                };
+                let context = scope
+                    .cast::<Context>(stack.context_slot(&meta).get(heap))
+                    .expect("frame context slot holds a Context");
+                let obj = step_try!(Object::create_closure(heap, &scope, info, context));
+                acc.store(obj);
+                Step::Next
+            })
         }
         Opcode::LoadCurrentClosure => {
             acc.store(stack.callable_slot(&meta).get(heap));
@@ -1948,17 +1948,17 @@ fn step<'a>(
         Opcode::Exp => {
             let reg = ops.reg(0);
             state.handle_scope(|scope| -> Step<'_> {
-            // JS exponentiation is always IEEE double math; the result only
-            // needs a Smi tag when it is an in-range integer.
-            let a = scope.handle(acc.get(heap));
-            let b = scope.handle(stack.reg(heap, &meta, reg));
-            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a.powf(b)));
-            let Some(v) = v else {
-                return Step::PendingThrow;
-            };
-            acc.store(v);
-            Step::Next
-        })
+                // JS exponentiation is always IEEE double math; the result only
+                // needs a Smi tag when it is an in-range integer.
+                let a = scope.handle(acc.get(heap));
+                let b = scope.handle(stack.reg(heap, &meta, reg));
+                let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a.powf(b)));
+                let Some(v) = v else {
+                    return Step::PendingThrow;
+                };
+                acc.store(v);
+                Step::Next
+            })
         }
         Opcode::BitwiseOr => {
             // ToInt32 semantics on the (integer) smi inputs
@@ -2101,15 +2101,15 @@ fn step<'a>(
         Opcode::InstanceOf => {
             let callable_reg = ops.reg(0);
             state.handle_scope(|scope| -> Step<'_> {
-            let object = scope.handle(acc.get(heap));
-            let callable = scope.handle(stack.reg(heap, &meta, callable_reg));
-            let r = step_try!(Object::instance_of(vm, heap, state, object, callable));
-            let Some(r) = r else {
-                return Step::PendingThrow;
-            };
-            acc.store(Convert::boolean(heap, r));
-            Step::Next
-        })
+                let object = scope.handle(acc.get(heap));
+                let callable = scope.handle(stack.reg(heap, &meta, callable_reg));
+                let r = step_try!(Object::instance_of(vm, heap, state, object, callable));
+                let Some(r) = r else {
+                    return Step::PendingThrow;
+                };
+                acc.store(Convert::boolean(heap, r));
+                Step::Next
+            })
         }
         Opcode::EqualStrict => {
             let other = stack.reg(heap, &meta, ops.reg(0));
@@ -2149,10 +2149,9 @@ fn step<'a>(
         }
         Opcode::GreaterThan => {
             let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(acc.get(heap)),
-                Convert::as_number(other),
-            ) {
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
                 acc.store(Convert::boolean(heap, a > b));
                 return Step::Next;
             }
@@ -2160,10 +2159,9 @@ fn step<'a>(
         }
         Opcode::GreaterThanOrEqual => {
             let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(acc.get(heap)),
-                Convert::as_number(other),
-            ) {
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
                 acc.store(Convert::boolean(heap, a >= b));
                 return Step::Next;
             }
@@ -2175,10 +2173,9 @@ fn step<'a>(
             let cmp = Cmp::from_kind(ops.uimm(1) / 2);
             let falsy_jump = ops.uimm(1) % 2 == 1;
             let offset = ops.imm(2);
-            let b = if let (Some(a), Some(b)) = (
-                Convert::as_number(acc.get(heap)),
-                Convert::as_number(other),
-            ) {
+            let b = if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
                 match cmp {
                     Cmp::Eq | Cmp::EqStrict => a == b,
                     Cmp::Lt => a < b,
@@ -2219,7 +2216,18 @@ fn step<'a>(
                 acc.store(v);
                 return Step::Next;
             }
-            Slow::keyed_load_imm(vm, heap, state, stack, cache, meta, pc, ops.reg(0), idx, &acc)
+            Slow::keyed_load_imm(
+                vm,
+                heap,
+                state,
+                stack,
+                cache,
+                meta,
+                pc,
+                ops.reg(0),
+                idx,
+                &acc,
+            )
         }
         Opcode::Throw | Opcode::ReThrow => Step::Throw(acc.get(heap)),
         Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),

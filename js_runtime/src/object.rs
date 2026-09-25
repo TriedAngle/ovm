@@ -1,12 +1,12 @@
 //! ES 20.1: the Object constructor, statics, and prototype methods.
-use crate::Key;
-use crate::Lookup;
-use crate::RuntimeContext;
-use crate::proxy::Flow;
-use crate::proxy::Proxy;
-use crate::runtime::Coercion;
+use vm_core::Key;
+use vm_core::Lookup;
+use vm_core::RuntimeContext;
+use vm_core::proxy::Flow;
+use vm_core::proxy::Proxy;
+use vm_core::runtime::Coercion;
 
-use crate::{
+use vm_core::{
     ContextState, Convert, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor,
     SlotName, Smi, Tagged, VM, Value, VmError,
 };
@@ -558,7 +558,7 @@ pub fn set_integrity_flags(
     obj: Handle<'_, Object>,
     freeze: bool,
 ) {
-    use crate::{Map, MapInit, MapKind, SlotFlags};
+    use vm_core::{Map, MapInit, MapKind, SlotFlags};
     let (kind, descriptor_count, already) = {
         let map = obj.as_tagged(heap).map_ref(heap);
         (

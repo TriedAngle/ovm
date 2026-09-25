@@ -1,10 +1,49 @@
+use core::any::Any;
 use core::ptr::NonNull;
 
-use crate::builtins::intrinsics::runtime_fn;
-use crate::interpreter::execute;
+use crate::intrinsics::runtime_fn;
 use crate::{
-    ContextState, Handle, HandleScope, HandleSlice, Heap, Object, Tagged, VM, Value, VmError,
+    ContextState, EdgeVisitable, Handle, HandleScope, HandleSlice, Heap, Object, Tagged, VM, Value,
+    VmError,
 };
+
+/// The interpreter entry: [[Call]]/[[Construct]] on a bytecode callable.
+/// Stored as a plain fn pointer in `SharedVM` (set once from the
+/// `I: Interpreter` type parameter) so core re-entry points —
+/// `Thread::execute`, `RuntimeContext::call` — pay one indirect call,
+/// never per opcode.
+pub type ExecuteFn = for<'a, 'v, 's, 'c, 'r, 'n> fn(
+    vm: &'v VM,
+    heap: &'a mut Heap,
+    state: &'s ContextState,
+    callable: Handle<'c, Object>,
+    args: HandleSlice<'r>,
+    new_target: Option<Handle<'n, Value>>,
+) -> Result<Tagged<'a, Value>, VmError>;
+
+pub trait Interpreter {
+    const EXECUTE: ExecuteFn;
+}
+
+/// A language runtime contributing native functions and globals to a VM
+/// (registered and installed once by `VM::add`, before any code runs).
+pub trait Runtime: 'static {
+    /// Per-VM runtime state, rooted for the GC; fetched back by native
+    /// functions via `RuntimeContext::runtime_state`.
+    type State: EdgeVisitable + Default + Send + Sync + Any;
+
+    fn setup(vm: &mut VM, state: &mut Self::State) -> Result<(), VmError>;
+}
+
+pub trait ErasedRuntimeState: EdgeVisitable + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: EdgeVisitable + Any + Send + Sync> ErasedRuntimeState for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
 
 /// ToPrimitive hint (ES 7.1.1).
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -59,6 +98,11 @@ impl<'a> RuntimeContext<'a> {
         self.new_target.is_some()
     }
 
+    /// The state runtime `R` stored during `VM::add`.
+    pub fn runtime_state<R: Runtime>(&self) -> &R::State {
+        self.vm.runtime_state::<R>()
+    }
+
     /// Root a handle scope and hand the closure the context parts at their
     /// real (heap) lifetime, so values produced inside are `Tagged<'a>`.
     pub fn handle_scope<R>(
@@ -99,14 +143,14 @@ impl<'a> RuntimeContext<'a> {
                 Some(scope.handle(nt))
             }
         };
-        execute(vm, heap, state, callable, args, new_target)
+        (vm.shared.execute)(vm, heap, state, callable, args, new_target)
     }
 }
 
 pub type RuntimeCall =
     for<'a, 'r> fn(RuntimeContext<'a>, HandleSlice<'r>) -> Result<Tagged<'a, Value>, VmError>;
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RuntimeIndex(pub usize);
 
 impl RuntimeIndex {

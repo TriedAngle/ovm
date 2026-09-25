@@ -64,3 +64,11 @@ pub fn compile_kette(source: &str, mode: SourceMode) -> Result<Program, Frontend
     let mut ast = parser.into_ast();
     compile_ast(&mut ast).map_err(|e| FrontendError::compile(e.to_string()))
 }
+
+pub struct KetteCompiler;
+
+impl vm_core::Compiler for KetteCompiler {
+    fn compile(source: &str, mode: SourceMode) -> Result<Program, FrontendError> {
+        compile_kette(source, mode)
+    }
+}

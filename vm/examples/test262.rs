@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{ScriptError, VM};
+use vm::ScriptError;
 
 const UNSUPPORTED_FEATURES: &[&str] = &[
     "BigInt",
@@ -282,9 +282,13 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
         format!("{harness}\n{includes}\n{src}\n")
     };
     // realm isolation: every test runs in a fresh VM (INTERPRETING.md)
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).expect("vm");
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .expect("vm")
+        .add::<vm::JSRuntime>()
+        .expect("vm");
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    match thread.run_script(&code) {
+    match thread.eval::<vm::JavascriptCompiler>(&code) {
         Ok(v)
             if {
                 {

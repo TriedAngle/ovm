@@ -10,8 +10,6 @@ pub mod boolean;
 pub mod error;
 pub mod function;
 pub mod global;
-pub mod helpers;
-pub mod intrinsics;
 pub mod math;
 pub mod number;
 pub mod object;
@@ -32,10 +30,6 @@ use function::{
     function_to_string,
 };
 use global::{eval_runtime, is_nan};
-use helpers::{
-    install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
-    run_prelude,
-};
 use math::math_sqrt;
 use number::{number_constructor, number_to_string, number_value_of};
 use object::{
@@ -48,14 +42,41 @@ use proxy::{REVOKE_PRELUDE, proxy_constructor, proxy_revocable, proxy_revoke};
 use string::{string_constructor, string_to_string, string_value_of};
 use symbol::symbol_constructor;
 
-use crate::{
-    Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, SlotFlags, SlotName,
-    Smi, Tagged, Value, VmError,
+use vm_core::runtime_api::{
+    install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
+    run_prelude,
+};
+use vm_core::{
+    EdgeVisitable, Float, Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor,
+    Runtime, RuntimeIndex, SlotFlags, SlotName, Smi, Tagged, VM, Value, Visitor, VmError,
 };
 
-use crate::Float;
-use crate::RuntimeIndex;
-use crate::VM;
+pub struct JSRuntime;
+
+impl Runtime for JSRuntime {
+    type State = JSState;
+
+    fn setup(vm: &mut VM, state: &mut Self::State) -> Result<(), VmError> {
+        state.indices = register_builtin_runtimes(vm);
+        install_builtins(vm, &state.indices)
+    }
+}
+
+pub struct JSState {
+    pub indices: BuiltinIndices,
+}
+
+impl Default for JSState {
+    fn default() -> Self {
+        Self {
+            indices: BuiltinIndices::default(),
+        }
+    }
+}
+
+impl EdgeVisitable for JSState {
+    fn visit_edges(&self, _visitor: &mut dyn Visitor) {}
+}
 
 /// Register the builtin runtimes.
 pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
@@ -107,6 +128,7 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
     }
 }
 
+#[derive(Default)]
 pub struct BuiltinIndices {
     pub eval: RuntimeIndex,
     pub string: RuntimeIndex,
@@ -158,7 +180,7 @@ pub struct BuiltinIndices {
 pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError> {
     let mut thread = vm.attach();
     let wks = thread.heap().known().strings;
-    let roots = &vm.shared.roots;
+    let roots = vm.roots();
     thread.handle_scope(|thread, scope| {
         // ---- Number ----------------------------------------------------------
         let object_prototype = thread.heap().known().object_prototype;
@@ -425,9 +447,21 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         )?;
         // bind is a JS closure (see BIND_PRELUDE); compile and run it once
         // here, capturing the empty context
-        run_prelude(thread, &scope, BIND_PRELUDE, "bind prelude")?;
+        run_prelude(
+            thread,
+            &scope,
+            BIND_PRELUDE,
+            "bind prelude",
+            js_compiler::compile_js,
+        )?;
         // likewise the proxy revoke closure (see REVOKE_PRELUDE)
-        run_prelude(thread, &scope, REVOKE_PRELUDE, "revoke prelude")?;
+        run_prelude(
+            thread,
+            &scope,
+            REVOKE_PRELUDE,
+            "revoke prelude",
+            js_compiler::compile_js,
+        )?;
 
         // ---- eval -------------------------------------------------------------
         let eval_fn = make_runtime_function(thread, &scope, idx.eval)?;

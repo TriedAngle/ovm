@@ -1,4 +1,4 @@
-use crate::builtins::helpers::make_runtime_plain_function_in;
+use crate::runtime_api::make_runtime_plain_function_in;
 use crate::{
     HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
     RuntimeContext, RuntimeIndex, StringInterner, Tagged, Value, VmError,

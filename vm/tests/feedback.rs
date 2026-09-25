@@ -4,7 +4,6 @@
 use bytecode::{FunctionId, Program, SourceMode};
 use bytecode::{Opcode, decode};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::VM;
 
 fn compile(src: &str) -> Program {
     js_compiler::compile_js(src, SourceMode::Script).expect("compile")
@@ -65,7 +64,11 @@ fn functions_without_property_access_have_no_feedback() {
 
 #[test]
 fn materialized_vector_is_hole_filled() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     // named load + method-call load + named store sites live in the script
     let program = compile("var o = {x: 1}; function g(p) { return p.x; } o.x = g(o);");
     let mut thread = vm.attach();
@@ -100,10 +103,16 @@ fn materialized_vector_is_hole_filled() {
 
 #[test]
 fn running_a_script_with_feedback_still_works() {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let result = thread
-        .run_script("var o = {x: 1}; function g(p) { return p.x; } o.x = g(o) + o.x;")
+        .eval::<vm::JavascriptCompiler>(
+            "var o = {x: 1}; function g(p) { return p.x; } o.x = g(o) + o.x;",
+        )
         .expect("run");
     let heap = thread.heap();
     let smi = vm::Smi::decode(result).expect("smi result");

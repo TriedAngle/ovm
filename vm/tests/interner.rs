@@ -3,7 +3,7 @@ use vm::{DenseString, VM};
 
 #[test]
 fn interning_deduplicates_and_preserves_content() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut ctx = vm.attach();
 
     ctx.handle_scope(|ctx, scope| {
@@ -47,7 +47,7 @@ fn interning_deduplicates_and_preserves_content() {
 
 #[test]
 fn interning_compresses_utf16_to_latin1() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut ctx = vm.attach();
 
     ctx.handle_scope(|ctx, scope| {
@@ -86,7 +86,7 @@ fn interning_compresses_utf16_to_latin1() {
 
 #[test]
 fn interning_is_thread_safe() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut ctx = vm.attach();
 
     let expected = ctx.handle_scope(|ctx, scope| {

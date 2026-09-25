@@ -7,11 +7,15 @@ members = [
     "heap_api",
     "heap_tests",
     "heap_utils",
+    "interpreter",
     "js_compiler",
     "kette_compiler",
     "kette_parser",
+    "js_runtime",
+    "kette_runtime",
     "trace",
     "vm",
+    "vm_core",
 ]
 
 [workspace.package]

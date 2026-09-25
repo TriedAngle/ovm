@@ -1,7 +1,7 @@
 //! ES 20.4: the Symbol constructor (minimal surface).
 
-use crate::RuntimeContext;
-use crate::{DenseString, HandleSlice, Symbol, Tagged, Value, VmError};
+use vm_core::RuntimeContext;
+use vm_core::{DenseString, HandleSlice, Symbol, Tagged, Value, VmError};
 
 /// `Symbol(desc)`: a fresh Symbol primitive (ES 20.4.1.1). This minimal
 /// surface exists so user code can author iterables

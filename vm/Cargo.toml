@@ -8,6 +8,10 @@ name = "ovm"
 path = "src/main.rs"
 
 [dependencies]
+vm_core = { path = "../vm_core" }
+interpreter = { path = "../interpreter" }
+js_runtime = { path = "../js_runtime" }
+kette_runtime = { path = "../kette_runtime" }
 heap_api = { path = "../heap_api" }
 bytecode = { path = "../bytecode" }
 js_compiler = { path = "../js_compiler" }
@@ -16,4 +20,4 @@ mark_sweep = { path = "../collectors/mark_sweep" }
 trace = { path = "../trace" }
 
 [features]
-stress-minor-gc = []
+stress-minor-gc = ["vm_core/stress-minor-gc"]

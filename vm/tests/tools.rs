@@ -10,16 +10,21 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Smi, Termination, VM};
 
 fn bare_vm() -> VM {
-    VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap()
+    VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap()
 }
 
 fn builtins_vm() -> VM {
-    VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap()
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
+    vm
 }
 
 fn run_bool(vm: &VM, src: &str) -> bool {
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     let heap = thread.heap();
     if result == heap.known().true_object.as_tagged(heap).raw() {
         true
@@ -75,7 +80,9 @@ fn gc_methods_collect_under_allocation() {
 fn shutdown_terminates_script_without_running_rest() {
     let vm = builtins_vm();
     let mut thread = vm.attach();
-    let result = thread.run_script("KetteTools.shutdown(); 99").unwrap();
+    let result = thread
+        .eval::<vm::JavascriptCompiler>("KetteTools.shutdown(); 99")
+        .unwrap();
     let heap = thread.heap();
     assert_eq!(result, heap.known().undefined.as_tagged(heap).raw());
     assert_eq!(thread.state().termination(), Some(Termination::Shutdown));
@@ -89,7 +96,7 @@ fn shutdown_is_uncatchable() {
     let vm = builtins_vm();
     let mut thread = vm.attach();
     let result = thread
-        .run_script("try { KetteTools.shutdown() } catch (e) { 1 } 3")
+        .eval::<vm::JavascriptCompiler>("try { KetteTools.shutdown() } catch (e) { 1 } 3")
         .unwrap();
     let heap = thread.heap();
     assert_eq!(result, heap.known().undefined.as_tagged(heap).raw());
@@ -99,7 +106,7 @@ fn shutdown_is_uncatchable() {
     let vm = builtins_vm();
     let mut thread = vm.attach();
     let result = thread
-        .run_script(
+        .eval::<vm::JavascriptCompiler>(
             "function inner() { KetteTools.shutdown(); return 1 }\
              function outer() { try { return inner() } catch (e) { return 2 } }\
              outer()",
@@ -121,7 +128,9 @@ fn shutdown_cancels_other_threads_at_safepoints() {
     for _ in 0..2 {
         let done_tx = done_tx.clone();
         handles.push(vm.spawn(move |thread| {
-            let result = thread.run_script("while (true) {}").unwrap();
+            let result = thread
+                .eval::<vm::JavascriptCompiler>("while (true) {}")
+                .unwrap();
             // graceful exit: the loop halted at its safepoint and unwound
             let heap = thread.heap();
             assert_eq!(result, heap.known().undefined.as_tagged(heap).raw());
@@ -134,7 +143,8 @@ fn shutdown_cancels_other_threads_at_safepoints() {
     // let the loops spin up, then run the shutdown protocol
     std::thread::sleep(Duration::from_millis(100));
     let mut main = vm.attach();
-    main.run_script("KetteTools.shutdown()").unwrap();
+    main.eval::<vm::JavascriptCompiler>("KetteTools.shutdown()")
+        .unwrap();
     assert!(vm.is_shutdown());
 
     // both mutators halted and their threads ended (joinable, no leak)
@@ -154,7 +164,9 @@ fn vm_stays_usable_after_shutdown() {
 
     // a spinning mutator gets cancelled...
     let handle = vm.spawn(move |thread| {
-        thread.run_script("while (true) {}").unwrap();
+        thread
+            .eval::<vm::JavascriptCompiler>("while (true) {}")
+            .unwrap();
         assert_eq!(thread.state().termination(), Some(Termination::Shutdown));
     });
     std::thread::sleep(Duration::from_millis(50));
@@ -162,7 +174,8 @@ fn vm_stays_usable_after_shutdown() {
     // ...by a shutdown from the main thread...
     {
         let mut main = vm.attach();
-        main.run_script("KetteTools.shutdown()").unwrap();
+        main.eval::<vm::JavascriptCompiler>("KetteTools.shutdown()")
+            .unwrap();
     }
     handle.join().expect("cancelled mutator exited cleanly");
 
@@ -170,14 +183,14 @@ fn vm_stays_usable_after_shutdown() {
     // belonged to the previous executions only
     {
         let mut again = vm.attach();
-        let value = again.run_script("21 * 2").unwrap();
+        let value = again.eval::<vm::JavascriptCompiler>("21 * 2").unwrap();
         assert_eq!(Smi::decode(value).unwrap().value(), 42);
         assert_eq!(again.state().termination(), None);
     }
 
     // a freshly spawned mutator also runs normally after the shutdown
     vm.spawn(move |thread| {
-        let value = thread.run_script("6 * 7").unwrap();
+        let value = thread.eval::<vm::JavascriptCompiler>("6 * 7").unwrap();
         assert_eq!(Smi::decode(value).unwrap().value(), 42);
     })
     .join()
@@ -189,13 +202,15 @@ fn second_shutdown_returns_immediately() {
     let vm = builtins_vm();
     {
         let mut a = vm.attach();
-        a.run_script("KetteTools.shutdown()").unwrap();
+        a.eval::<vm::JavascriptCompiler>("KetteTools.shutdown()")
+            .unwrap();
         assert_eq!(a.state().termination(), Some(Termination::Shutdown));
     } // a detaches: an attached-but-idle thread never parks, and the
     // protocol (like the GC) waits for every attached thread
 
     // a second shutdown on a fresh execution still works
     let mut b = vm.attach();
-    b.run_script("KetteTools.shutdown()").unwrap();
+    b.eval::<vm::JavascriptCompiler>("KetteTools.shutdown()")
+        .unwrap();
     assert_eq!(b.state().termination(), Some(Termination::Shutdown));
 }

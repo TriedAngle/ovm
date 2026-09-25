@@ -2,12 +2,16 @@
 
 use bytecode::{Opcode, decode};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{FeedbackVector, Smi, Tagged, Thread, VM, Value, WeakFixedArray};
+use vm::{FeedbackVector, Smi, Tagged, Thread, Value, WeakFixedArray};
 
 fn run(src: &str) -> Result<Value, vm::ScriptError> {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script(src)
+    thread.eval::<vm::JavascriptCompiler>(src)
 }
 
 fn run_smi(src: &str) -> i64 {
@@ -15,9 +19,13 @@ fn run_smi(src: &str) -> i64 {
 }
 
 fn run_bool(src: &str) -> bool {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     let heap = thread.heap();
     result == heap.known().true_object.as_tagged(heap).raw()
 }
@@ -193,9 +201,13 @@ fn typeof_undeclared_global_before_and_after_assignment() {
 // inspected directly.
 
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     (result, thread)
 }
 
@@ -323,10 +335,16 @@ fn prototype_hit_installs_chain_handler() {
 fn try_load_hits_directly() {
     // end-to-end probe of the hit path: same-shape receiver, populated
     // vector, `try_load` must resolve without the lookup
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let r = thread
-        .run_script("function f(o){ return o.x; } const o = {x: 1}; f(o); f(o); [f, o];")
+        .eval::<vm::JavascriptCompiler>(
+            "function f(o){ return o.x; } const o = {x: 1}; f(o); f(o); [f, o];",
+        )
         .unwrap();
     let heap = &*thread.heap();
     let arr = unsafe { Tagged::<vm::Object>::from_value_unchecked(r) };
@@ -564,9 +582,13 @@ fn object_create_builds_proto_chain() {
          o instanceof Object === false;"
     ));
     // throws on a primitive prototype argument (uncaught → sentinel)
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let r = thread.run_script("Object.create(1);");
+    let r = thread.eval::<vm::JavascriptCompiler>("Object.create(1);");
     let heap = thread.heap();
     assert_eq!(
         r.unwrap(),
@@ -580,7 +602,11 @@ fn object_create_builds_proto_chain() {
 use bytecode::SourceMode;
 
 fn run_kette_smi(src: &str) -> i64 {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let value = thread
         .run_source(src, kette_compiler::compile_kette, SourceMode::Script)
@@ -696,7 +722,11 @@ fn kette_object_literal_stores_cache() {
 fn kette_chain_handler_records_parent_hop() {
     // white-box: the cached handler's chain entry must carry the parent's
     // element index inside the receiver's pair array
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let result = thread
         .run_source(

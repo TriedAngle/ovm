@@ -3,10 +3,10 @@
 
 use bytecode::SourceMode;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{Smi, VM};
+use vm::{Smi, ThreadedInterpreter, VM};
 
 fn run(source: &str) -> i64 {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let value = thread
         .run_source(source, kette_compiler::compile_kette, SourceMode::Script)
@@ -34,7 +34,7 @@ fn element_literal_and_store() {
 
 #[test]
 fn element_write_never_grows() {
-    let vm = VM::new::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.run_source(
         "let a = [10, 20]\na[2] = 5",

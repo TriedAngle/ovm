@@ -1,12 +1,12 @@
 //! ES 20.2: the Function constructor, Function.prototype
 //! toString/call/apply/bind, and the bind-closure prelude.
 
-use crate::Lookup;
-use crate::Object;
-use crate::RuntimeContext;
-use crate::materialize::Materialize;
-use crate::runtime::Coercion;
-use crate::{Context, Convert, DenseString, Errors, HandleSlice, Smi, Tagged, Value, VmError};
+use vm_core::Lookup;
+use vm_core::Object;
+use vm_core::RuntimeContext;
+use vm_core::materialize::Materialize;
+use vm_core::runtime::Coercion;
+use vm_core::{Context, Convert, DenseString, Errors, HandleSlice, Smi, Tagged, Value, VmError};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).

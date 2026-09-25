@@ -1,8 +1,8 @@
-use crate::Lookup;
-use crate::RuntimeContext;
-use crate::runtime::Coercion;
+use vm_core::Lookup;
+use vm_core::RuntimeContext;
+use vm_core::runtime::Coercion;
 
-use crate::{
+use vm_core::{
     Convert, DenseString, HandleSlice, Object, PropertyDescriptor, Tagged, Value, VmError,
 };
 

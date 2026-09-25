@@ -1,13 +1,13 @@
 //! ES 28.2: the Proxy constructor, Proxy.revocable, and the
 //! revoke-closure prelude.
 
-use crate::Lookup;
-use crate::Object;
-use crate::PropertyDescriptor;
-use crate::RuntimeContext;
-use crate::proxy::Proxy;
-use crate::runtime::Coercion;
-use crate::{HandleSlice, Tagged, Value, VmError};
+use vm_core::Lookup;
+use vm_core::Object;
+use vm_core::PropertyDescriptor;
+use vm_core::RuntimeContext;
+use vm_core::proxy::Proxy;
+use vm_core::runtime::Coercion;
+use vm_core::{HandleSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is

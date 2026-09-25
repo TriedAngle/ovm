@@ -5,12 +5,16 @@
 //! [[IsExtensible]], [[PreventExtensions]]).
 
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{ScriptError, Smi, VM};
+use vm::{ScriptError, Smi};
 
 fn run(src: &str) -> Result<vm::Value, ScriptError> {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    thread.run_script(src)
+    thread.eval::<vm::JavascriptCompiler>(src)
 }
 
 fn run_smi(src: &str) -> i64 {
@@ -33,18 +37,28 @@ fn run_bool(src: &str) -> bool {
 
 #[allow(dead_code)]
 fn run_value(src: &str) -> (vm::Value, vm::Thread) {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.run_script(src).unwrap();
+    let result = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     (result, thread)
 }
 
 /// The script must complete with an uncaught error whose `name` is
 /// "TypeError".
 fn assert_type_error(src: &str) {
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.run_script(src).expect("script must complete");
+    let result = thread
+        .eval::<vm::JavascriptCompiler>(src)
+        .expect("script must complete");
     {
         let heap = thread.heap();
         assert_eq!(
@@ -99,9 +113,13 @@ fn constructor_validates_target_and_handler() {
 fn constructor_has_no_prototype_and_metadata() {
     assert_eq!(run_smi("Proxy.prototype === undefined ? 1 : 0"), 1);
     assert_eq!(run_smi("Proxy.length"), 2);
-    let vm = VM::with_builtins::<MarkSweep>(MarkSweepConfig::default()).unwrap();
+    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let name = thread.run_script("Proxy.name").unwrap();
+    let name = thread.eval::<vm::JavascriptCompiler>("Proxy.name").unwrap();
     {
         let heap = &*thread.heap();
         let s = unsafe { name.assume_valid(heap) }

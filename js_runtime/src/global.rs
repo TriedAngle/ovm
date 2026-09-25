@@ -1,9 +1,9 @@
 //! ES 19: function properties of the global object (eval, isNaN).
 
-use crate::Object;
-use crate::RuntimeContext;
-use crate::materialize::Materialize;
-use crate::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
+use vm_core::Object;
+use vm_core::RuntimeContext;
+use vm_core::materialize::Materialize;
+use vm_core::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
 
 pub fn eval_runtime<'a>(
     nctx: RuntimeContext<'a>,
