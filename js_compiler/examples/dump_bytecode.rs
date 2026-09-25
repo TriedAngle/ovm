@@ -28,7 +28,7 @@ fn main() {
         while pc < code.len() {
             let (op, ops, next) = decode(code, pc);
             print!("  {pc:4}: {op:?}");
-            for (i, kind) in ops.kinds().iter().enumerate() {
+            for (i, kind) in op.operands().iter().enumerate() {
                 use bytecode::Operand;
                 match *kind {
                     Operand::RegisterCount => print!(" {}", ops.reg_count(i)),

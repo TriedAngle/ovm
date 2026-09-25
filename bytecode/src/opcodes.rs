@@ -14,6 +14,37 @@ pub enum IndexKind {
     Unchecked,
 }
 
+/// Packed per-operand metadata for the interpreter's decode tables:
+/// `0` = no such operand, otherwise low 4 bits = byte offset from the
+/// first operand byte PLUS ONE (so `0` stays the "absent" marker),
+/// bit 4 = two-byte operand, bit 5 = signed.
+const fn pack_row(kinds: &[Operand], wide: bool) -> [u8; 5] {
+    let mut row = [0u8; 5];
+    let mut off = 0usize;
+    let mut i = 0;
+    while i < kinds.len() {
+        let k = kinds[i];
+        let size = k.size_in_stream(if wide { Scale::Byte2 } else { Scale::Byte1 });
+        row[i] = (off + 1) as u8
+            | if size == 2 { 0x10 } else { 0 }
+            | if k.is_signed() { 0x20 } else { 0 };
+        off += size;
+        i += 1;
+    }
+    row
+}
+
+/// Total operand bytes after the (already peeled) opcode byte.
+const fn total_size(kinds: &[Operand], wide: bool) -> u8 {
+    let mut n = 0usize;
+    let mut i = 0;
+    while i < kinds.len() {
+        n += kinds[i].size_in_stream(if wide { Scale::Byte2 } else { Scale::Byte1 });
+        i += 1;
+    }
+    n as u8
+}
+
 macro_rules! define_opcodes {
     // -- per-entry expansion helpers ---------------------------------------
     (@reads) => { false };
@@ -103,7 +134,27 @@ macro_rules! define_opcodes {
                 }
                 size
             }
+
+            /// # Safety
+            /// `byte` must be a valid opcode discriminant — the
+            /// interpreter only walks streams that passed `validate`.
+            pub const unsafe fn from_byte_unchecked(byte: u8) -> Self {
+                debug_assert!(Self::from_byte(byte).is_some());
+                unsafe { core::mem::transmute::<u8, Self>(byte) }
+            }
         }
+
+        /// Packed decode rows (see [`pack_row`]), narrow and wide scale,
+        /// indexed by opcode discriminant.
+        pub static OPERAND_ROWS_NARROW: &[&[u8; 5]] =
+            &[$(&pack_row(&[$(Operand::$operand),*], false)),*];
+        pub static OPERAND_ROWS_WIDE: &[&[u8; 5]] =
+            &[$(&pack_row(&[$(Operand::$operand),*], true)),*];
+        /// Total operand bytes per instruction, narrow and wide scale.
+        pub static OPERAND_SIZES_NARROW: &[u8] =
+            &[$(total_size(&[$(Operand::$operand),*], false)),*];
+        pub static OPERAND_SIZES_WIDE: &[u8] =
+            &[$(total_size(&[$(Operand::$operand),*], true)),*];
 
         // `indices` must stay parallel to `operands`.
         const _: () = {

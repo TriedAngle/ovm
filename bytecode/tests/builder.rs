@@ -22,8 +22,8 @@ fn decoded(code: &[u8]) -> Vec<Instr> {
     let mut pc = 0;
     while pc < code.len() {
         let (op, operands, next) = try_decode(code, pc).expect("stream decodes");
-        let ops = operands
-            .kinds()
+        let ops = op
+            .operands()
             .iter()
             .enumerate()
             .map(|(i, kind)| match kind {
