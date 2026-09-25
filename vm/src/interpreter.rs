@@ -272,6 +272,15 @@ fn raise<'a>(
     exception_dispatch(heap, state, base_depth, pc)
 }
 
+/// The text of an interned `SlotName` (empty for non-string names).
+fn slot_name_text(heap: &Heap, name: Handle<'_, SlotName>) -> String {
+    name.as_tagged(heap)
+        .erase()
+        .get_as::<DenseString>()
+        .map(|s| s.to_rust_string(heap))
+        .unwrap_or_default()
+}
+
 fn begin_termination(heap: &Heap, state: &ContextState) -> Step<'static> {
     state.set_termination(Termination::Shutdown);
     let undefined = heap.known().undefined.as_tagged(heap);
@@ -296,22 +305,9 @@ fn dispatch<'a>(
 ) -> Result<Tagged<'a, Value>, VmError> {
     let cache = &state.cache;
     let acc = cache.acc_mut();
-    let mut trace = 0;
     loop {
         let pc = cache.pc();
         let (op, ops, next_pc) = decode(cache.code_ref(heap).as_slice(), pc);
-        if std::env::var("OVM_TRACE").is_ok() {
-            trace += 1;
-            if trace > 200000 {
-                panic!("trace limit");
-            }
-            eprintln!(
-                "pc={pc} base={} rc={} op={op:?} acc={:?}",
-                cache.frame_meta().base,
-                cache.frame_meta().register_count,
-                *acc,
-            );
-        }
         cache.set_pc(next_pc);
         let meta = cache.frame_meta();
 
@@ -473,7 +469,13 @@ fn step<'a>(
                         // absent globals are uncached (transient: hoisting)
                         Hit::NotFound => {
                             if op == Opcode::LoadGlobal {
-                                return Step::Error(VmError::Reference);
+                                // unresolvable reference: GetValue throws
+                                // a ReferenceError naming the binding
+                                let text = slot_name_text(heap, name);
+                                let ex = Errors::not_defined(vm, heap, state, &text)
+                                    .expect("error materialization must not fail");
+                                state.set_pending_exception(ex);
+                                return Step::PendingThrow;
                             }
                             acc.store(heap.known().undefined.as_tagged(heap));
                         }
@@ -523,8 +525,13 @@ fn step<'a>(
                     }
                     Lookup::NotFound => {
                         if op == Opcode::LoadGlobal {
-                            // unresolvable reference: GetValue throws ReferenceError
-                            return Step::Error(VmError::Reference);
+                            // unresolvable reference: GetValue throws a
+                            // ReferenceError naming the binding
+                            let text = slot_name_text(heap, name);
+                            let ex = Errors::not_defined(vm, heap, state, &text)
+                                .expect("error materialization must not fail");
+                            state.set_pending_exception(ex);
+                            return Step::PendingThrow;
                         }
                         acc.store(heap.known().undefined.as_tagged(heap));
                     }

@@ -1,9 +1,9 @@
 use crate::proxy::Proxy;
 use crate::{
-    AccessorPair, Coercion, ContextState, Convert, DenseString, FixedArray, FrameMeta, GcSlot,
-    Handle, HandleScope, Heap, HeapObject, Map, Object, PartialDescriptor, PropertyDescriptor,
-    RuntimeContext, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, VM, Value,
-    VmError,
+    AccessorPair, Coercion, ContextState, Convert, DenseString, FixedArray, Float, FrameMeta,
+    GcSlot, Handle, HandleScope, Heap, HeapObject, Map, Object, PartialDescriptor,
+    PropertyDescriptor, RuntimeContext, SlotFlags, SlotName, Smi, Stack, StringData, Symbol,
+    Tagged, VM, Value, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -119,6 +119,22 @@ impl Lookup<'_> {
             let len = s.len() as i64;
             return Ok(LoadOutcome::Value(Smi::new(len).into_tagged()));
         }
+        // unboxed primitive receivers: property lookup continues on the
+        // primitive's prototype (ES 7.3.8 GetV). Own exotic properties
+        // (string `length` above) have already been handled. The prototype
+        // objects are the identity-stable entry points — never their maps —
+        // so later prototype mutations are always visible here.
+        let holder = if Smi::decode(holder.raw()).is_some() || holder.get_as::<Float>().is_some() {
+            known.number_prototype.as_tagged(heap).erase()
+        } else if holder.get_as::<DenseString>().is_some() {
+            known.string_prototype.as_tagged(heap).erase()
+        } else if holder == known.true_object.as_tagged(heap)
+            || holder == known.false_object.as_tagged(heap)
+        {
+            known.boolean_prototype.as_tagged(heap).erase()
+        } else {
+            holder
+        };
         match holder.lookup(heap, name) {
             Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.get(heap))),
             Lookup::Accessor { pair, .. } => {
