@@ -249,55 +249,87 @@ impl Operand {
     }
 }
 
+/// A lazy cursor over one instruction's operands: values are read
+/// straight from the code stream on access — positional, idempotent,
+/// never materialized. Per-operand offset, size and signedness come
+/// from packed per-opcode tables (see the `OPERAND_*` statics).
+///
+/// The `code` view is anchored to a heap borrow and therefore valid
+/// only until the next safepoint (any allocation): fast paths read
+/// their operands immediately after [`decode`]; across a safepoint,
+/// re-derive the view from the rooted code register (the position
+/// words — `pc`, `base` — are plain integers and always safe).
 #[derive(Clone, Copy)]
-pub struct Operands {
-    raw: [u32; 5],
-    kinds: &'static [Operand],
+pub struct Operands<'c> {
+    code: &'c [u8],
+    /// Byte offset of the first operand.
+    base: u32,
+    row: &'static [u8; 5],
 }
 
-impl Operands {
-    pub const fn new(raw: [u32; 5], kinds: &'static [Operand]) -> Self {
-        Self { raw, kinds }
-    }
-
-    pub fn kinds(&self) -> &'static [Operand] {
-        self.kinds
-    }
-
+impl<'c> Operands<'c> {
+    /// Read operand `i` from the stream.
     #[inline]
-    fn at(&self, i: usize, kind: Operand) -> u32 {
-        debug_assert_eq!(self.kinds[i], kind);
-        self.raw[i]
+    fn read(&self, i: usize) -> u32 {
+        let e = self.row[i] as usize;
+        debug_assert!(e != 0, "no operand {i}");
+        let off = self.base as usize + (e & 0x0f) - 1;
+        debug_assert!(
+            off + if e & 0x10 != 0 { 2 } else { 1 } <= self.code.len(),
+            "operand read past the end of the code stream"
+        );
+        // Safety: the stream was validated at materialization, and the
+        // row encodes this operand's exact offset and size.
+        unsafe {
+            if e & 0x10 != 0 {
+                let w = u16::from_le_bytes([
+                    *self.code.get_unchecked(off),
+                    *self.code.get_unchecked(off + 1),
+                ]) as u32;
+                if e & 0x20 != 0 {
+                    (w as i16) as i32 as u32
+                } else {
+                    w
+                }
+            } else {
+                let b = *self.code.get_unchecked(off) as u32;
+                if e & 0x20 != 0 {
+                    (b as i8) as i32 as u32
+                } else {
+                    b
+                }
+            }
+        }
     }
 
     #[inline]
     pub fn reg(&self, i: usize) -> i32 {
-        self.at(i, Operand::Register) as i32
+        self.read(i) as i32
     }
 
     #[inline]
     pub fn reg_list(&self, i: usize) -> i32 {
-        self.at(i, Operand::RegisterListStart) as i32
+        self.read(i) as i32
     }
 
     #[inline]
     pub fn reg_count(&self, i: usize) -> usize {
-        self.at(i, Operand::RegisterCount) as usize
+        self.read(i) as usize
     }
 
     #[inline]
     pub fn imm(&self, i: usize) -> i32 {
-        self.at(i, Operand::Immediate) as i32
+        self.read(i) as i32
     }
 
     #[inline]
     pub fn uimm(&self, i: usize) -> u32 {
-        self.at(i, Operand::UImmediate)
+        self.read(i)
     }
 
     #[inline]
     pub fn idx(&self, i: usize) -> usize {
-        self.at(i, Operand::Index) as usize
+        self.read(i) as usize
     }
 }
 
@@ -345,43 +377,85 @@ pub fn emit(code: &mut Vec<u8>, op: Opcode, operands: &[u32]) {
     }
 }
 
-// TODO: get rid of this much branching and .expect(), use `debug_assert!` instead
-pub fn decode(code: &[u8], pc: usize) -> (Opcode, Operands, usize) {
-    match try_decode(code, pc) {
-        Some(decoded) => decoded,
-        None => panic!("invalid or truncated instruction at pc {pc}"),
-    }
+/// Decode the instruction at `pc` into a lazy operand cursor. The stream
+/// is trusted — programs are validated at materialization (`validate`) —
+/// so release builds read unchecked; debug builds re-verify via
+/// [`try_decode`]. The returned view is anchored to `code`'s borrow and
+/// valid only until the next safepoint (see [`Operands`]).
+pub fn decode<'c>(code: &'c [u8], pc: usize) -> (Opcode, Operands<'c>, usize) {
+    debug_assert!(
+        try_decode(code, pc).is_some(),
+        "invalid or truncated instruction at pc {pc}"
+    );
+    // Safety: validated stream (see above).
+    let byte = unsafe { *code.get_unchecked(pc) };
+    let (op, base, wide) = if byte == Opcode::Wide as u8 {
+        (
+            // Safety: validated stream.
+            unsafe { Opcode::from_byte_unchecked(*code.get_unchecked(pc + 1)) },
+            pc + 2,
+            true,
+        )
+    } else {
+        // Safety: validated stream.
+        (unsafe { Opcode::from_byte_unchecked(byte) }, pc + 1, false)
+    };
+    let idx = op as usize;
+    let row = (if wide {
+        opcodes::OPERAND_ROWS_WIDE
+    } else {
+        opcodes::OPERAND_ROWS_NARROW
+    })[idx];
+    let size = (if wide {
+        opcodes::OPERAND_SIZES_WIDE
+    } else {
+        opcodes::OPERAND_SIZES_NARROW
+    })[idx] as usize;
+    (
+        op,
+        Operands {
+            code,
+            base: base as u32,
+            row,
+        },
+        base + size,
+    )
 }
 
 /// Fallible [`decode`]: `None` on an unknown opcode byte or a stream that
-/// ends inside an instruction.
-pub fn try_decode(code: &[u8], mut pc: usize) -> Option<(Opcode, Operands, usize)> {
-    let mut op = Opcode::from_byte(*code.get(pc)?)?;
+/// ends inside an instruction. The validator's checked twin.
+pub fn try_decode<'c>(code: &'c [u8], mut pc: usize) -> Option<(Opcode, Operands<'c>, usize)> {
+    let mut byte = *code.get(pc)?;
     pc += 1;
-    let mut scale = Scale::Byte1;
-    if op == Opcode::Wide {
-        scale = Scale::Byte2;
-        op = Opcode::from_byte(*code.get(pc)?)?;
+    let wide = byte == Opcode::Wide as u8;
+    if wide {
+        byte = *code.get(pc)?;
         pc += 1;
     }
-
-    let mut raw = [0u32; 5];
-    for (i, kind) in op.operands().iter().enumerate() {
-        let size = kind.size_in_stream(scale);
-        let bytes = code.get(pc..pc + size)?;
-        let mut buf = [0u8; 4];
-        buf[..size].copy_from_slice(bytes);
-        let value = u32::from_le_bytes(buf);
-        raw[i] = if kind.is_signed() {
-            // sign-extend
-            let shift = 32 - size * 8;
-            ((value << shift) as i32 >> shift) as u32
-        } else {
-            value
-        };
-        pc += size;
+    let op = Opcode::from_byte(byte)?;
+    let idx = op as usize;
+    let row = (if wide {
+        opcodes::OPERAND_ROWS_WIDE
+    } else {
+        opcodes::OPERAND_ROWS_NARROW
+    })[idx];
+    let size = (if wide {
+        opcodes::OPERAND_SIZES_WIDE
+    } else {
+        opcodes::OPERAND_SIZES_NARROW
+    })[idx] as usize;
+    if pc + size > code.len() {
+        return None;
     }
-    Some((op, Operands::new(raw, op.operands()), pc))
+    Some((
+        op,
+        Operands {
+            code,
+            base: pc as u32,
+            row,
+        },
+        pc + size,
+    ))
 }
 
 pub fn jump_target(pc: usize, offset: i32) -> usize {
