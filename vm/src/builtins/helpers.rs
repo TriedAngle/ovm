@@ -1,8 +1,8 @@
 use crate::Thread;
 use crate::materialize::Materialize;
 use crate::{
-    Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
-    SlotName, Smi, Tagged, Value, VmError,
+    Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor, Smi,
+    Tagged, Value, VmError,
 };
 use crate::{RuntimeContext, RuntimeIndex};
 

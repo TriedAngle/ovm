@@ -3,8 +3,7 @@ use std::sync::Arc;
 use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
     HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MaybeWeak, Object, ObjectInit,
-    ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, TransitionLock, Value, Visitor,
-    Word,
+    ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, Value, Visitor, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -53,6 +52,13 @@ impl<'heap> AllocToken<'heap> {
 
     pub fn remaining(&self) -> usize {
         self.end as usize - self.next.get() as usize
+    }
+
+    /// Abandon the rest of the reservation: the drop check then sees zero
+    /// remaining. For optimistic paths that reserve up front and bail
+    /// before carving everything — e.g. a publication that lost a race.
+    pub fn discard_remaining(&self) {
+        self.next.set(self.end);
     }
 
     pub fn heap(&self) -> &Heap {
@@ -335,6 +341,70 @@ impl<T> OptionGcSlot<T> {
 }
 
 #[repr(transparent)]
+pub struct AtomicOptionGcSlot<T = Value> {
+    slot: OptionGcSlot<T>,
+}
+
+unsafe impl<T> Send for AtomicOptionGcSlot<T> {}
+unsafe impl<T> Sync for AtomicOptionGcSlot<T> {}
+
+impl<T> AtomicOptionGcSlot<T> {
+    pub fn clear(&self, heap: &Heap) {
+        self.slot.clear(heap);
+    }
+
+    pub fn load_word(&self, _heap: &Heap) -> Word {
+        self.slot
+            .slot
+            .as_raw()
+            .load_atomic(core::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn load<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, T>> {
+        self.decode(heap, self.load_word(heap))
+    }
+
+    pub fn decode<'a>(&self, heap: &'a Heap, word: Word) -> Option<Tagged<'a, T>> {
+        if Value::from_bits(word) == heap.known().the_hole.raw() {
+            return None;
+        }
+        Some(unsafe { Tagged::from_value_unchecked(Value::from_bits(word)) })
+    }
+
+    pub fn publish<'h, 'x>(
+        &self,
+        heap: &Heap,
+        host: Tagged<'h, Value>,
+        expected: Word,
+        value: Tagged<'x, T>,
+    ) -> Result<(), Word>
+    where
+        T: 'x,
+    {
+        let v = value.raw();
+        debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
+        match self.slot.slot.as_raw().compare_exchange(
+            expected,
+            v.to_bits(),
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                if v.is_ptr() {
+                    heap.write_barrier(host, self.slot.as_raw(), value.erase());
+                }
+                Ok(())
+            }
+            Err(current) => Err(current),
+        }
+    }
+
+    pub fn as_raw(&self) -> &RawCell {
+        self.slot.as_raw()
+    }
+}
+
+#[repr(transparent)]
 pub struct Register(RawCell);
 
 impl Register {
@@ -342,30 +412,19 @@ impl Register {
         Self(unsafe { RawCell::from_word(v.to_bits()) })
     }
 
-    /// Re-read the register under a heap borrow. Registers live in rooted
-    /// memory that the GC updates in place, so the word is current; the
-    /// anchor proves no GC runs before its use.
     pub fn get<'a>(&self, _heap: &'a Heap) -> Tagged<'a, Value> {
-        // Safety: see method docs.
         unsafe { Tagged::from_value_unchecked(Value::from_bits(self.0.load())) }
     }
 
-    /// Registers holding Smis (frame headers) can be read without an
-    /// anchor: Smis never dangle.
     pub fn read_smi(&self) -> Smi {
         Smi::decode(Value::from_bits(self.0.load())).expect("register holds a Smi")
     }
 
-    /// The current word without an anchor. It may be moved by a later
-    /// collection; only safe to use as an opaque `Value`.
     pub fn raw(&self) -> Value {
         Value::from_bits(self.0.load())
     }
 
-    /// The raw word as a reference into the register cell. The anchor
-    /// proves no GC (and no `store`) runs for `'a`.
     pub fn as_ref<'a>(&self, _heap: &'a Heap) -> &'a Value {
-        // Safety: rooted cell the GC updates in place; no mutation during `'a`.
         unsafe { &*self.0.as_ptr().cast::<Value>() }
     }
 
@@ -387,7 +446,6 @@ pub trait EdgeVisitable {
 /// Type-erased per-thread heap.
 pub struct Heap {
     local: Box<dyn LocalHeap>,
-    transition_lock: TransitionLock,
     known: *const KnownCell,
     #[cfg(feature = "stress-minor-gc")]
     stress_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -406,10 +464,6 @@ impl Heap {
 
     pub fn set_known(&self, known: WellKnown) {
         unsafe { (*self.known).set(known) }
-    }
-
-    pub fn transition_lock(&self) -> TransitionLock {
-        self.transition_lock.clone()
     }
 
     pub fn write_barrier(&self, host: Tagged<'_, Value>, slot: &RawCell, value: Tagged<'_, Value>) {
@@ -579,7 +633,6 @@ impl core::fmt::Debug for Heap {
 
 pub struct GlobalHeap {
     shared: Arc<dyn SharedHeap>,
-    transition_lock: TransitionLock,
     #[cfg(feature = "stress-minor-gc")]
     stress_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -588,7 +641,6 @@ impl GlobalHeap {
     pub fn new(shared: Arc<dyn SharedHeap>) -> Self {
         Self {
             shared,
-            transition_lock: TransitionLock::new(),
             #[cfg(feature = "stress-minor-gc")]
             stress_armed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -610,7 +662,6 @@ impl GlobalHeap {
     pub fn new_local(&self, known: &KnownCell) -> Heap {
         Heap {
             local: self.shared.new_local(),
-            transition_lock: self.transition_lock.clone(),
             known: known as *const KnownCell,
             #[cfg(feature = "stress-minor-gc")]
             stress_armed: std::sync::Arc::clone(&self.stress_armed),

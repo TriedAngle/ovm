@@ -41,8 +41,8 @@ pub use handle::{
     EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, HandleSlice, RootHandles,
 };
 pub use heap::{
-    AllocToken, EdgeVisitable, GcSlot, GlobalHeap, Heap, MaybeWeakGcSlot, OptionGcSlot, Register,
-    WordType,
+    AllocToken, AtomicOptionGcSlot, EdgeVisitable, GcSlot, GlobalHeap, Heap, MaybeWeakGcSlot,
+    OptionGcSlot, Register, WordType,
 };
 pub use interner::StringInterner;
 pub use lookup::{Key, LoadOutcome, Lookup};
@@ -60,7 +60,6 @@ pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use tools::{KetteTools, Termination};
 pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
-    TransitionGuard, TransitionLock,
 };
 pub use value::{
     HeapPtr, MaybeWeak, PTR_BIT, STRONG_PTR, Smi, TAG_MASK, TAG_SMI, Tagged, Value, WEAK_BIT,
