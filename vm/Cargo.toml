@@ -17,3 +17,6 @@ trace = { path = "../trace" }
 
 [features]
 stress-minor-gc = []
+# IC diagnostics: slow-path entry counts and transition-state traces
+# (OVM_ICSTAT env var gates the printing at runtime)
+ic-stats = []

@@ -48,6 +48,43 @@ pub fn eval_runtime<'a>(
     })
 }
 
+/// `print(x)`: ToString(x) to stdout followed by a newline (a shell
+/// convenience, not an ES builtin; the Octane runner reports through it).
+pub fn print<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
+    state.handle_scope(|scope| {
+        if let Some(arg) = args.get(1) {
+            let s = Convert::to_string(heap, &scope, arg)?;
+            let s = s.raw();
+            let text = // Safety: fresh string word, no allocation since the read.
+                unsafe { s.assume_valid(heap) }
+                    .get_as::<DenseString>()
+                    .map(|s| s.to_rust_string(heap))
+                    .unwrap_or_default();
+            println!("{text}");
+        } else {
+            println!();
+        }
+        Ok(heap.known().undefined.as_tagged(heap).erase())
+    })
+}
+
+/// `performance.now()`: fractional milliseconds since the Unix epoch
+/// (shell timing convenience mirroring the browser API).
+pub fn performance_now<'a>(
+    nctx: RuntimeContext<'a>,
+    _args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    Ok(nctx.heap.new_number(ms))
+}
+
 /// `isNaN(x)`: ToNumber(x) is NaN.
 pub fn is_nan<'a>(
     nctx: RuntimeContext<'a>,

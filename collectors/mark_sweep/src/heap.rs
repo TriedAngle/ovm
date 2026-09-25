@@ -305,6 +305,13 @@ impl MarkSweepState {
             self.update_young_limit(survivors, chunk_size);
         }
         self.minor_cycles.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "gc-stats")]
+        {
+            static GCSTAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *GCSTAT.get_or_init(|| std::env::var_os("OVM_GCSTAT").is_some()) {
+                eprintln!("minor GC #{}", self.minor_cycles.load(Ordering::Relaxed));
+            }
+        }
     }
 
     fn finish_sweeping(&self, host: &GcHost) {

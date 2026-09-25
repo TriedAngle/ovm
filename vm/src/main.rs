@@ -21,14 +21,53 @@ fn main() {
             files.push(arg);
         }
     }
-    for path in &files {
-        run_file(&mut thread, path);
-        if thread.vm().is_shutdown() {
-            return;
+    let all_js = !files.is_empty()
+        && files.iter().all(|f| {
+            Path::new(f)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("js"))
+        });
+    if all_js {
+        run_js_group(&mut thread, &files);
+    } else {
+        for path in &files {
+            run_file(&mut thread, path);
+            if thread.vm().is_shutdown() {
+                return;
+            }
         }
     }
-    if files.is_empty() || then_repl {
+    if (files.is_empty() || then_repl) && !thread.vm().is_shutdown() {
         repl(&mut thread);
+    }
+}
+
+/// Multiple `.js` files share one top-level scope (browser `<script>`
+/// semantics: top-level `var`s and function declarations are visible to
+/// the later files), so they are concatenated into a single script run.
+fn run_js_group(thread: &mut Thread, paths: &[String]) {
+    let mut parts = Vec::with_capacity(paths.len());
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(src) => parts.push(src),
+            Err(e) => {
+                eprintln!("ovm: cannot read {path}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let joined = parts.join("\n");
+    match thread.run_source(&joined, js_compiler::compile_js, SourceMode::Script) {
+        Ok(_) => {
+            if report_uncaught(thread) {
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            eprintln!("{e} (in {})", paths.join(", "));
+            std::process::exit(1);
+        }
     }
 }
 

@@ -709,6 +709,9 @@ fn apply_transition(
     true
 }
 
+#[cfg(feature = "ic-stats")]
+static UPDATE_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn update_site(
     heap: &mut Heap,
     scope: &HandleScope<'_>,
@@ -717,6 +720,16 @@ fn update_site(
     map: &Handle<'_, Map>,
     handler: &Handler<'_>,
 ) {
+    #[cfg(feature = "ic-stats")]
+    {
+        static ICSTAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ICSTAT.get_or_init(|| std::env::var_os("OVM_ICSTAT").is_some()) {
+            let n = UPDATE_LOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 100_000 == 0 {
+                eprintln!("update_site calls: {n}");
+            }
+        }
+    }
     let vec_t = vector.as_tagged(heap);
     let Some((state, _)) = vec_t.site(slot) else {
         return;
@@ -746,6 +759,13 @@ fn update_site(
     } else if let Some(strong) = state.as_strong() {
         if strong.ptr_eq(heap.known().megamorphic_symbol.as_tagged(heap).erase()) {
             return;
+        }
+        #[cfg(feature = "ic-stats")]
+        {
+            static ICSTAT2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ICSTAT2.get_or_init(|| std::env::var_os("OVM_ICSTAT").is_some()) {
+                eprintln!("non-mono state at slot {slot}: {:?}", state.raw());
+            }
         }
         if let Some(pairs) = strong.get_as::<WeakFixedArray>() {
             let pairs = scope.handle(pairs);

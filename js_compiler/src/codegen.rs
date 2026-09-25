@@ -2888,7 +2888,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 let labels = self.take_labels();
                 self.emit_while(&s.test, &s.body, labels)
             }
-            Statement::DoWhileStatement(s) => self.err(s.span, "do-while loops"),
+            Statement::DoWhileStatement(s) => {
+                let labels = self.take_labels();
+                self.emit_do_while(s, labels)
+            }
             Statement::ForStatement(s) => self.emit_for(s),
             Statement::ForInStatement(s) => self.emit_for_in(s),
             Statement::ForOfStatement(s) => self.err(s.span, "for-of loops"),
@@ -3186,6 +3189,33 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let continues = self.breakables.last().unwrap().continues.unwrap();
         self.b.bind(continues);
         self.b.jump_loop(back);
+        let (breaks, _) = self.end_breakable();
+        self.b.bind(breaks);
+        Ok(())
+    }
+
+    /// `do body; while (test)`: body first, then the test gates the
+    /// back-edge; `continue` jumps to the test, `break` past it.
+    fn emit_do_while(
+        &mut self,
+        s: &DoWhileStatement<'_>,
+        labels: Vec<String>,
+    ) -> Result<(), CompileError> {
+        let back = self.b.new_label();
+        let breaks = self.b.new_label();
+        let continues = self.b.new_label();
+        self.b.bind(back); // loop head = body start
+        self.breakables.push(Breakable {
+            labels,
+            breaks,
+            continues: Some(continues),
+            unwind_ctx: None,
+        });
+        self.stmt(&s.body)?;
+        let continues = self.breakables.last().unwrap().continues.unwrap();
+        self.b.bind(continues);
+        self.expr(&s.test)?;
+        self.b.jump_if_truthy(back);
         let (breaks, _) = self.end_breakable();
         self.b.bind(breaks);
         Ok(())

@@ -291,6 +291,91 @@ impl Transition {
         }
     }
 
+    /// The shared target of a prototype change on `parent`: looked up
+    /// through the transition tree (keyed by the private sentinel
+    /// symbol, matched by the child's prototype), created and published
+    /// on first use. Same descriptors, kind and slot count as the
+    /// parent — only the prototype differs.
+    pub fn prototype_target<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        parent: impl for<'a> Fn(&'a Heap) -> Tagged<'a, Map>,
+        proto: Handle<'_, Value>,
+    ) -> Handle<'s, Map> {
+        loop {
+            if let Some(target) =
+                parent(heap).find_prototype_transition(heap, proto.as_tagged(heap))
+            {
+                return target.as_handle(scope);
+            }
+
+            let parent_ref = parent(heap);
+            let kind = parent_ref.kind();
+            let descriptor_count = parent_ref.descriptor_count();
+            let value_slot_count = parent_ref.value_slot_count();
+            let pairs_len = parent_ref.transitions.load(heap).map_or(0, |a| a.len());
+
+            let map_layout = Map::layout_for(descriptor_count);
+            let pairs_layout = WeakFixedArray::<Value>::layout_for(pairs_len + 2);
+            let total = AllocToken::total_for(&[map_layout, pairs_layout]);
+
+            let attempt = heap.allocate_token_enter_heap(total, |token, heap| {
+                let parent_ref = parent(heap);
+                let word = parent_ref.transitions.load_word(heap);
+                let old = parent_ref.transitions.decode(heap, word);
+                if old.map_or(0, |a| a.len()) != pairs_len {
+                    token.discard_remaining();
+                    return None;
+                }
+
+                let descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
+                    parent_ref
+                        .descriptors()
+                        .iter()
+                        .map(|d| {
+                            (
+                                scope.handle(d.name(heap)),
+                                d.flags(),
+                                scope.handle(d.value.get(heap)),
+                            )
+                        })
+                        .collect();
+                let child = token.allocate::<Map>(MapInit {
+                    kind,
+                    value_slot_count,
+                    descriptors: &descriptors,
+                    prototype: proto,
+                });
+                child.pred.set(heap, child.erase(), parent_ref);
+
+                let sentinel = heap.known().prototype_transition_symbol.as_tagged(heap);
+                let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> =
+                    Vec::with_capacity(pairs_len + 2);
+                if let Some(old) = old {
+                    for entry in old.as_slice().as_chunks::<2>().0 {
+                        pairs.push(entry[0].get(heap));
+                        pairs.push(entry[1].get(heap));
+                    }
+                }
+                pairs.push(sentinel.erase().as_maybe_weak());
+                pairs.push(child.erase().as_weak());
+                let pairs = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &pairs });
+
+                match parent_ref
+                    .transitions
+                    .publish(heap, parent_ref.erase(), word, pairs)
+                {
+                    Ok(()) => Some(child.as_handle(scope)),
+                    Err(_) => None,
+                }
+            });
+            if let Some(child) = attempt {
+                return child;
+            }
+            // another thread published first: retry the lookup
+        }
+    }
+
     fn grow_slots_and_swap(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
@@ -1064,34 +1149,22 @@ impl Object {
             Ok(())
         }?;
 
-        let descriptor_count = receiver.as_tagged(heap).map_ref(heap).descriptor_count();
-
-        heap.allocate_token_enter_heap(Map::layout_for(descriptor_count), |token, heap| {
-            let obj = receiver.as_tagged(heap);
-            let map = obj.map_ref(heap);
-            let kind = map.kind();
-            let value_slot_count = map.value_slot_count();
-            let descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> = map
-                .descriptors()
-                .iter()
-                .map(|d| {
-                    (
-                        scope.handle(d.name(heap)),
-                        d.flags(),
-                        scope.handle(d.value.get(heap)),
-                    )
-                })
-                .collect();
-            let new_map = token.allocate::<Map>(MapInit {
-                kind,
-                value_slot_count,
-                descriptors: &descriptors,
-                prototype: proto,
-            });
-            let host = receiver.as_tagged(heap).erase();
-            obj.header.map.set(heap, host, new_map);
-            Ok(())
-        })
+        // the shared map for (current map, proto) — one transition edge
+        // per distinct prototype instead of a fresh map per call, so
+        // ICs see stable receiver maps across constructions
+        let target = Transition::prototype_target(
+            heap,
+            scope,
+            |heap| receiver.as_tagged(heap).map_ref(heap),
+            proto,
+        );
+        let host = receiver.as_tagged(heap).erase();
+        receiver
+            .as_tagged(heap)
+            .header
+            .map
+            .set(heap, host, target.as_tagged(heap));
+        Ok(())
     }
 }
 

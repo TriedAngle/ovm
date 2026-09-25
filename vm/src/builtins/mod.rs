@@ -7,6 +7,7 @@
 
 pub mod array;
 pub mod boolean;
+pub mod date;
 pub mod error;
 pub mod function;
 pub mod global;
@@ -21,9 +22,10 @@ pub mod symbol;
 
 use array::{
     array_constructor, array_is_array, array_iterator_next, array_iterator_symbol_iterator,
-    array_values,
+    array_pop, array_push, array_values,
 };
 use boolean::{boolean_constructor, boolean_to_string, boolean_value_of};
+use date::{date_constructor, date_now, date_to_string, date_value_of};
 use error::{
     error_constructor, error_to_string, reference_error_constructor, type_error_constructor,
 };
@@ -31,13 +33,15 @@ use function::{
     BIND_PRELUDE, function_apply, function_bind, function_call, function_constructor,
     function_to_string,
 };
-use global::{eval_runtime, is_nan};
+use global::{eval_runtime, is_nan, performance_now, print};
 use helpers::{
     install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
     run_prelude,
 };
-use math::math_sqrt;
-use number::{number_constructor, number_to_string, number_value_of};
+use math::{math_log, math_pow, math_sqrt};
+use number::{
+    number_constructor, number_to_fixed, number_to_precision, number_to_string, number_value_of,
+};
 use object::{
     object_constructor, object_create, object_define_property, object_freeze,
     object_get_own_property_descriptor, object_get_own_property_names, object_get_prototype_of,
@@ -104,6 +108,18 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
         object_seal: vm.register_runtime(object_seal),
         object_freeze: vm.register_runtime(object_freeze),
         math_sqrt: vm.register_runtime(math_sqrt),
+        array_push: vm.register_runtime(array_push),
+        array_pop: vm.register_runtime(array_pop),
+        math_log: vm.register_runtime(math_log),
+        math_pow: vm.register_runtime(math_pow),
+        number_to_fixed: vm.register_runtime(number_to_fixed),
+        number_to_precision: vm.register_runtime(number_to_precision),
+        date: vm.register_runtime(date_constructor),
+        date_now: vm.register_runtime(date_now),
+        date_value_of: vm.register_runtime(date_value_of),
+        date_to_string: vm.register_runtime(date_to_string),
+        print: vm.register_runtime(print),
+        performance_now: vm.register_runtime(performance_now),
     }
 }
 
@@ -152,6 +168,18 @@ pub struct BuiltinIndices {
     pub object_seal: RuntimeIndex,
     pub object_freeze: RuntimeIndex,
     pub math_sqrt: RuntimeIndex,
+    pub array_push: RuntimeIndex,
+    pub array_pop: RuntimeIndex,
+    pub math_log: RuntimeIndex,
+    pub math_pow: RuntimeIndex,
+    pub number_to_fixed: RuntimeIndex,
+    pub number_to_precision: RuntimeIndex,
+    pub date: RuntimeIndex,
+    pub date_now: RuntimeIndex,
+    pub date_value_of: RuntimeIndex,
+    pub date_to_string: RuntimeIndex,
+    pub print: RuntimeIndex,
+    pub performance_now: RuntimeIndex,
 }
 
 /// Build the builtin objects and install them on the global object.
@@ -171,6 +199,20 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             number_proto,
             "toString",
             idx.number_to_string,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            number_proto,
+            "toFixed",
+            idx.number_to_fixed,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            number_proto,
+            "toPrecision",
+            idx.number_to_precision,
         )?;
         // static data properties on the Number constructor
         let pos_inf = thread
@@ -576,6 +618,36 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             PropertyDescriptor::data(is_array_fn.erase()),
         )?;
 
+        // ---- Date -----------------------------------------------------------------
+        let (date_fn, date_proto) =
+            install_constructor(thread, &scope, idx.date, "Date", object_prototype)?;
+        install_method(thread, &scope, date_proto, "valueOf", idx.date_value_of)?;
+        install_method(thread, &scope, date_proto, "toString", idx.date_to_string)?;
+        let date_now_fn = make_runtime_plain_function(thread, &scope, idx.date_now)?;
+        let date_now_name = thread.intern(&scope, "now");
+        // Safety: fresh interned word, rooted below before the define.
+        let date_now_name = scope.handle(date_now_name.as_tagged(&*thread.heap()));
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            date_fn,
+            date_now_name,
+            PropertyDescriptor::data(date_now_fn.erase()),
+        )?;
+        let date_proto = roots.create_handle(date_proto.as_tagged(&*thread.heap()));
+        let date_instance_map = roots.create_handle(
+            thread.heap().allocate::<Map>(MapInit {
+                kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                value_slot_count: 1,
+                descriptors: &[],
+                prototype: date_proto.erase(),
+            }),
+        );
+        let mut known = *thread.heap().known();
+        known.date_instance_map = date_instance_map;
+        known.date_prototype = date_proto;
+        thread.heap().set_known(known);
+
         // ---- Array iteration (the iterator protocol minimum) ---------------------
         // %ArrayIteratorPrototype%: next + @@iterator (returns the receiver)
         let array_iterator_prototype = {
@@ -705,6 +777,31 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             roots.create_handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY))
         };
         install_method(thread, &scope, math_object, "sqrt", idx.math_sqrt)?;
+        install_method(thread, &scope, math_object, "log", idx.math_log)?;
+        install_method(thread, &scope, math_object, "pow", idx.math_pow)?;
+        // static data properties (ES 22.1.1)
+        for (name, value) in [
+            ("E", std::f64::consts::E),
+            ("LN10", std::f64::consts::LN_10),
+            ("LN2", std::f64::consts::LN_2),
+            ("LOG2E", std::f64::consts::LOG2_E),
+            ("LOG10E", std::f64::consts::LOG10_E),
+            ("PI", std::f64::consts::PI),
+            ("SQRT1_2", std::f64::consts::FRAC_1_SQRT_2),
+            ("SQRT2", std::f64::consts::SQRT_2),
+        ] {
+            let v = thread.heap().allocate_handle::<Float>(value, &scope);
+            let n = thread.intern(&scope, name);
+            // Safety: fresh interned word, rooted below before the define.
+            let n = scope.handle(n.as_tagged(&*thread.heap()));
+            Object::define_own_property(
+                thread.heap(),
+                &scope,
+                math_object,
+                n,
+                PropertyDescriptor::data(v.erase()),
+            )?;
+        }
         let math_name = thread.intern(&scope, "Math");
         // Safety: fresh interned word, rooted below before the define.
         let math_name = scope.handle(math_name.as_tagged(&*thread.heap()));
@@ -727,6 +824,60 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             is_nan_name,
             PropertyDescriptor::data(is_nan_fn.erase()),
         )?;
+
+        // ---- print / performance (shell conveniences; not ES) --------------------
+        let print_fn = make_runtime_plain_function(thread, &scope, idx.print)?;
+        let print_name = thread.intern(&scope, "print");
+        // Safety: fresh interned word, rooted below before the define.
+        let print_name = scope.handle(print_name.as_tagged(&*thread.heap()));
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            global,
+            print_name,
+            PropertyDescriptor::data(print_fn.erase()),
+        )?;
+
+        let performance_object = {
+            let map = thread.heap().allocate_handle::<Map>(
+                MapInit {
+                    kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                    value_slot_count: 0,
+                    descriptors: &[],
+                    prototype: object_prototype.erase(),
+                },
+                &scope,
+            );
+            roots.create_handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY))
+        };
+        install_method(
+            thread,
+            &scope,
+            performance_object,
+            "now",
+            idx.performance_now,
+        )?;
+        let performance_name = thread.intern(&scope, "performance");
+        // Safety: fresh interned word, rooted below before the define.
+        let performance_name = scope.handle(performance_name.as_tagged(&*thread.heap()));
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            global,
+            performance_name,
+            PropertyDescriptor::data(performance_object.erase()),
+        )?;
+
+        // ---- Array.prototype.push/pop --------------------------------------------
+        let array_prototype = thread.heap().known().array_prototype;
+        install_method(
+            thread,
+            &scope,
+            array_prototype,
+            "push",
+            idx.array_push,
+        )?;
+        install_method(thread, &scope, array_prototype, "pop", idx.array_pop)?;
 
         // ---- Symbol (minimal: constructor + Symbol.iterator) ---------------
         // enough to author custom iterables; the full Symbol surface stays

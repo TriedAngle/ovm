@@ -1,8 +1,32 @@
-use crate::{Convert, DenseString, Float, Heap, Smi, Tagged, Value, VmError};
+use crate::{Convert, DenseString, Float, Heap, Smi, Symbol, Tagged, Value, VmError};
 
 pub struct Compare;
 
 impl Compare {
+    /// Whether `v` is an ECMAScript *Object* operand — the side the `==`
+    /// table coerces. Heap-resident primitives (strings, symbols, Floats)
+    /// and the boolean/nullish singletons are not.
+    pub fn is_object_operand<'a>(heap: &Heap, v: Tagged<'a, Value>) -> bool {
+        if v.is_smi() {
+            return false;
+        }
+        let known = heap.known();
+        if v == known.null.as_tagged(heap)
+            || v == known.undefined.as_tagged(heap)
+            || v == known.true_object.as_tagged(heap)
+            || v == known.false_object.as_tagged(heap)
+        {
+            return false;
+        }
+        if v.get_as::<DenseString>().is_some()
+            || v.get_as::<Float>().is_some()
+            || v.get_as::<Symbol>().is_some()
+        {
+            return false;
+        }
+        v.as_heap_object().is_some()
+    }
+
     pub fn strict_equal<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {
         let x_num = x.is_smi() || x.get_as::<Float>().is_some();
         let y_num = y.is_smi() || y.get_as::<Float>().is_some();
@@ -84,7 +108,9 @@ impl Compare {
             !v.is_smi() && !is_bool(v) && !nullish(v) && !is_string(v) && !is_number(v)
         };
         if is_object(x) || is_object(y) {
-            return Err(VmError::Type);
+            // callers pre-coerce object operands (compare_bool); any that
+            // remain — symbols — are simply never equal to a primitive
+            return Ok(false);
         }
         Ok(false)
     }

@@ -1,6 +1,7 @@
 //! ES 23.1 + 23.1.5: the Array constructor, Array.isArray,
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
+use crate::Object;
 use crate::RuntimeContext;
 use crate::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
 
@@ -37,6 +38,70 @@ pub fn array_constructor<'a>(
         let staged = scope.stage(&values);
         Ok(heap.new_array(&scope, staged).erase())
     })
+}
+
+/// `Array.prototype.push(...items)` (ES 23.1.3.32): append each argument
+/// and answer the new length. Array exotic objects only.
+pub fn array_push<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
+    state.handle_scope(|scope| {
+        let receiver = args
+            .get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?;
+        let receiver = scope
+            .cast::<Object>(receiver)
+            .ok_or(VmError::Type)?;
+        let mut len = {
+            let obj = receiver.as_tagged(heap);
+            if !obj.as_ref().is_array(heap) {
+                return Err(VmError::Type);
+            }
+            obj.as_ref().length()
+        };
+        for arg in args.iter().skip(1) {
+            let value = scope.handle(arg.as_tagged(heap));
+            Object::store_array_element(heap, &scope, &receiver, len, &value)?;
+            len += 1;
+        }
+        Ok(Smi::new(len as i64).into_tagged())
+    })
+}
+
+/// `Array.prototype.pop()` (ES 23.1.3.28): remove and answer the last
+/// element (`undefined` for an empty array).
+pub fn array_pop<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, .. } = nctx;
+    let receiver = args
+        .get(0)
+        .map(|h| h.as_tagged(heap))
+        .ok_or(VmError::Arity)?;
+    let Some(obj) = receiver.as_heap_object() else {
+        return Err(VmError::Type);
+    };
+    if !obj.as_ref().is_array(heap) {
+        return Err(VmError::Type);
+    }
+    let len = obj.as_ref().length();
+    if len == 0 {
+        return Ok(heap.known().undefined.as_tagged(heap).erase());
+    }
+    let hole = heap.known().the_hole.as_tagged(heap).erase();
+    // element reads see holes as undefined
+    let value = obj
+        .as_ref()
+        .element_value(heap, len - 1)
+        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+    let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+    elements.set(heap, len - 1, hole);
+    obj.length.set(heap, obj.erase(), Smi::new(len as i64 - 1));
+    Ok(value)
 }
 
 /// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):

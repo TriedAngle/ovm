@@ -122,6 +122,31 @@ impl Map {
         None
     }
 
+    pub fn find_prototype_transition<'a>(
+        &self,
+        heap: &'a Heap,
+        proto: Tagged<'a, Value>,
+    ) -> Option<Tagged<'a, Map>> {
+        let sentinel = heap.known().prototype_transition_symbol.as_tagged(heap);
+        let array = self.transitions.load(heap)?;
+        let pairs = array.as_slice();
+        for entry in pairs.as_chunks::<2>().0 {
+            if !entry[0].get(heap).ptr_eq(sentinel.erase()) {
+                continue;
+            }
+            let Some(target) = entry[1].get_strong(heap) else {
+                continue;
+            };
+            let Some(target) = target.get_as::<Map>() else {
+                continue;
+            };
+            if target.prototype.get(heap).ptr_eq(proto) {
+                return Some(target);
+            }
+        }
+        None
+    }
+
     pub fn find_remove_transition<'a>(
         &self,
         heap: &'a Heap,

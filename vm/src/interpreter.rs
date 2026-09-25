@@ -357,9 +357,11 @@ impl Slow {
         })
     }
 
-    /// Shared cold body of the loose compares: to_primitive, then the
-    /// full `Compare` implementation. `Threw` means a coercion threw (the
-    /// pending exception is set).
+    /// Shared cold body of the compares. `===` never coerces; `==` is
+    /// identity when both operands are objects and otherwise coerces
+    /// only the object side (ES 7.2.14); the relationals ToPrimitive
+    /// both operands with hint number (ES 7.2.13). `Threw` means a
+    /// coercion threw (the pending exception is set).
     fn compare_bool(
         vm: &VM,
         heap: &mut Heap,
@@ -371,23 +373,54 @@ impl Slow {
     ) -> Result<CmpOutcome, VmError> {
         let stack = &state.stack;
         state.handle_scope(|scope| {
-            let hint = match cmp {
-                Cmp::Eq => Hint::Default,
-                Cmp::EqStrict | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge => Hint::Number,
-            };
             let x = scope.handle(acc.get(heap));
-            let x = match Object::to_primitive(vm, heap, state, x, hint)? {
+            let y = scope.handle(stack.reg(heap, &meta, reg));
+            match cmp {
+                Cmp::EqStrict => {
+                    // IsStrictEqual (ES 7.2.15): no coercion, ever
+                    let b = Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
+                    return Ok(CmpOutcome::Bool(b));
+                }
+                Cmp::Eq => {
+                    // IsLooselyEqual: object ↔ object compares by
+                    // identity; object ↔ primitive coerces the object
+                    let x_obj = Compare::is_object_operand(heap, x.as_tagged(heap));
+                    let y_obj = Compare::is_object_operand(heap, y.as_tagged(heap));
+                    if x_obj && y_obj {
+                        let b =
+                            Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
+                        return Ok(CmpOutcome::Bool(b));
+                    }
+                    let x = if x_obj {
+                        match Object::to_primitive(vm, heap, state, x, Hint::Default)? {
+                            Coercion::Threw => return Ok(CmpOutcome::Threw),
+                            Coercion::Value(v) => scope.handle(v),
+                        }
+                    } else {
+                        x
+                    };
+                    let y = if y_obj {
+                        match Object::to_primitive(vm, heap, state, y, Hint::Default)? {
+                            Coercion::Threw => return Ok(CmpOutcome::Threw),
+                            Coercion::Value(v) => scope.handle(v),
+                        }
+                    } else {
+                        y
+                    };
+                    let b = Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?;
+                    return Ok(CmpOutcome::Bool(b));
+                }
+                _ => {}
+            }
+            let x = match Object::to_primitive(vm, heap, state, x, Hint::Number)? {
                 Coercion::Threw => return Ok(CmpOutcome::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let y = scope.handle(stack.reg(heap, &meta, reg));
-            let y = match Object::to_primitive(vm, heap, state, y, hint)? {
+            let y = match Object::to_primitive(vm, heap, state, y, Hint::Number)? {
                 Coercion::Threw => return Ok(CmpOutcome::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
             let b = match cmp {
-                Cmp::Eq => Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-                Cmp::EqStrict => Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap)),
                 Cmp::Lt => Compare::less_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
                 Cmp::Le => {
                     Compare::less_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?
@@ -396,6 +429,7 @@ impl Slow {
                 Cmp::Ge => {
                     Compare::greater_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?
                 }
+                Cmp::Eq | Cmp::EqStrict => unreachable!("handled above"),
             };
             Ok(CmpOutcome::Bool(b))
         })
@@ -558,6 +592,45 @@ impl Slow {
         acc: &Acc<'_>,
     ) -> Step<'a> {
         state.handle_scope(|scope| -> Step<'_> {
+
+            #[cfg(feature = "ic-stats")]
+            {
+                static NAMED_SLOWS: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                static ICSTAT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *ICSTAT.get_or_init(|| std::env::var_os("OVM_ICSTAT").is_some()) {
+                    let n = NAMED_SLOWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n < 8 || n % 200_000 == 0 {
+                        let nm = stack
+                            .callable(heap, &meta)
+                            .as_ref()
+                            .constant_slot_name(heap, name_idx);
+                        let text = nm
+                            .erase()
+                            .get_as::<DenseString>()
+                            .map(|s| s.to_rust_string(heap))
+                            .unwrap_or_default();
+                        let recv = stack.reg(heap, &meta, reg);
+                        let map = recv
+                            .as_heap_object()
+                            .map(|o| {
+                                let m = o.as_ref().map_ref(heap);
+                                format!("{:016x}", m.raw().raw_addr())
+                            })
+                            .unwrap_or_else(|| "non-obj".into());
+                        let state = cache
+                            .feedback_ref(heap)
+                            .map(|v| {
+                                let w = v.as_ref().slot(feedback_slot).raw();
+                                let mega =
+                                    w == heap.known().megamorphic_symbol.as_tagged(heap).raw();
+                                format!("{w:?} mega={mega}")
+                            })
+                            .unwrap_or_else(|| "no-fb".into());
+                        eprintln!("named_load slow #{n}: name={text:?} map={map} state={state}");
+                    }
+                }
+            }
             let receiver = scope.handle(stack.reg(heap, &meta, reg));
             let name = scope.handle(
                 stack
