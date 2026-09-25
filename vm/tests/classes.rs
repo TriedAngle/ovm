@@ -9,7 +9,7 @@ use vm::{DenseString, Smi, Value};
 use vm::{ScriptError, Thread};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -23,7 +23,7 @@ fn run_smi(src: &str) -> i64 {
 }
 
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

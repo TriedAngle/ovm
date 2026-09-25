@@ -5,3 +5,8 @@ edition.workspace = true
 
 [dependencies]
 vm_core = { path = "../vm_core" }
+
+[dev-dependencies]
+interpreter_match_loop = { path = "../interpreter_match_loop" }
+kette_compiler = { path = "../kette_compiler" }
+mark_sweep = { path = "../collectors/mark_sweep" }

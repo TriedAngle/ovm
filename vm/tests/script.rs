@@ -5,7 +5,7 @@ use vm::{DenseString, Float, FunctionKind, Lookup, Smi, Value};
 use vm::{ScriptError, Thread, VM};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -24,7 +24,7 @@ fn run_smi(src: &str) -> i64 {
 
 /// Run and read back the result as a Rust value.
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -347,7 +347,7 @@ fn function_metadata_and_public_properties_survive_materialization() {
 
 #[test]
 fn arrows_and_methods_are_not_constructible() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -373,7 +373,7 @@ fn arrows_and_methods_are_not_constructible() {
 fn tdz_throws_on_let_before_init() {
     // uncaught exceptions escape as the exception sentinel + pending
     // exception holding a ReferenceError
-    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.eval::<vm::JavascriptCompiler>("let x = x;").unwrap();
     assert_eq!(result, exception_word(&mut thread));
@@ -404,7 +404,7 @@ fn tdz_throws_on_let_before_init() {
 
 #[test]
 fn uncaught_throw_escapes_as_exception() {
-    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread.eval::<vm::JavascriptCompiler>("throw 42;").unwrap();
     assert_eq!(result, exception_word(&mut thread));
@@ -463,7 +463,7 @@ fn update_on_property_refs() {
 #[test]
 fn unused_let_without_init_is_still_tdz() {
     // `y` is never read; `x` reads before its initializer runs
-    let vm = VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
     let result = thread
         .eval::<vm::JavascriptCompiler>("let x = 1, y; y = x; x;")
@@ -473,7 +473,7 @@ fn unused_let_without_init_is_still_tdz() {
 
 #[test]
 fn repl_mode_persists_top_level_bindings() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -496,7 +496,7 @@ fn repl_mode_persists_top_level_bindings() {
 
 #[test]
 fn repl_mode_functions_persist_and_read_globals() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -519,7 +519,7 @@ fn repl_mode_functions_persist_and_read_globals() {
 
 #[test]
 fn repl_mode_allows_redeclaration_across_entries() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -536,7 +536,7 @@ fn repl_mode_allows_redeclaration_across_entries() {
 
 #[test]
 fn repl_mode_keeps_nested_scopes_local() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -555,7 +555,7 @@ fn repl_mode_keeps_nested_scopes_local() {
 
 #[test]
 fn script_mode_top_level_bindings_do_not_persist() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -617,7 +617,7 @@ fn switch_statements() {
 
 #[test]
 fn unresolvable_global_names_the_binding() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

@@ -522,27 +522,19 @@ pub fn object_is_extensible<'a>(
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let target = args
-            .get(1)
-            .map(|h| h.as_tagged(heap).raw())
-            .ok_or(VmError::Arity)?;
-        if !Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) }) {
+        let target = args.get(1).ok_or(VmError::Arity)?;
+        if !Proxy::is_js_receiver(heap, target.as_tagged(heap)) {
             return Ok(Convert::boolean(heap, false));
         }
-        let raw = match Proxy::is_extensible(
-            vm,
-            heap,
-            state,
-            // Safety: fresh argument word, consumed by the call.
-            unsafe { Tagged::<Value>::from_value_unchecked(target) },
-        )? {
+        // Safety: rooted argument word, consumed by the call.
+        let target = unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) };
+        let extensible = match Proxy::is_extensible(vm, heap, state, target)? {
             Coercion::Threw => None,
-            Coercion::Value(v) => Some(v.raw()),
+            Coercion::Value(v) => Some(scope.handle(v)),
         };
-        let Some(raw) = raw else {
+        let Some(v) = extensible else {
             return Ok(heap.known().exception.as_tagged(heap).erase());
         };
-        let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw) });
         Ok(v.as_tagged(heap).erase())
     })
 }

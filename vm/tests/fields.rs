@@ -5,7 +5,7 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{DenseString, Smi, Value};
 
 fn run(src: &str) -> Result<Value, vm::ScriptError> {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -19,7 +19,7 @@ fn run_smi(src: &str) -> i64 {
 }
 
 fn run_str(src: &str) -> String {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -36,7 +36,7 @@ fn run_str(src: &str) -> String {
 }
 
 fn run_bool(src: &str) -> bool {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -48,7 +48,7 @@ fn run_bool(src: &str) -> bool {
 }
 
 fn throws(src: &str) -> bool {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

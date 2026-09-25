@@ -1,5 +1,6 @@
 use core::alloc::Layout;
 
+use crate::proxy::Proxy;
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, Key,
     Lookup, Map, MapInit, MaybeWeak, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
@@ -104,6 +105,55 @@ impl<'s, T> Handle<'s, T> {
         self.as_tagged(heap)
             .erase()
             .store_lookup(heap, scope, name, value, semantics)
+    }
+}
+
+impl<'a> Tagged<'a, Value> {
+    pub fn store_lookup_existing(
+        self,
+        heap: &'a Heap,
+        name: Tagged<'a, SlotName>,
+        value: Tagged<'a, Value>,
+        semantics: StoreSemantics,
+    ) -> Result<bool, VmError> {
+        if self.ptr_eq(heap.known().null.as_tagged(heap).erase())
+            || self.ptr_eq(heap.known().undefined.as_tagged(heap).erase())
+        {
+            return Err(VmError::Type);
+        }
+        debug_assert!(
+            !Proxy::is_proxy(heap, self.erase()),
+            "fast store on a proxy receiver"
+        );
+        if !self
+            .as_heap_object()
+            .is_some_and(|obj| Object::matches_kind(obj.map_ref(heap).kind().kind()))
+        {
+            return Ok(true);
+        }
+        match self.lookup(heap, name) {
+            Lookup::Data {
+                slot,
+                holder,
+                flags,
+                ..
+            } => {
+                if !flags.is_writable() {
+                    return Err(VmError::Type);
+                }
+                let host = holder.erase();
+                if semantics == StoreSemantics::Shadow && host != self {
+                    return Ok(false);
+                }
+                slot.set(heap, host, value);
+                Ok(true)
+            }
+            Lookup::NotFound => Ok(false),
+            Lookup::Accessor { .. } => {
+                debug_assert!(false, "fast store on an accessor property");
+                Ok(true)
+            }
+        }
     }
 }
 

@@ -278,9 +278,8 @@ fn raise<'a>(
 }
 
 /// The text of an interned `SlotName` (empty for non-string names).
-fn slot_name_text(heap: &Heap, name: Handle<'_, SlotName>) -> String {
-    name.as_tagged(heap)
-        .erase()
+fn slot_name_text(heap: &Heap, name: Tagged<'_, SlotName>) -> String {
+    name.erase()
         .get_as::<DenseString>()
         .map(|s| s.to_rust_string(heap))
         .unwrap_or_default()
@@ -470,7 +469,7 @@ impl Slow {
                         if op == Opcode::LoadGlobal {
                             // unresolvable reference: GetValue throws
                             // a ReferenceError naming the binding
-                            let text = slot_name_text(heap, name);
+                            let text = slot_name_text(heap, name.as_tagged(heap));
                             let ex = Errors::not_defined(vm, heap, state, &text)
                                 .expect("error materialization must not fail");
                             state.set_pending_exception(ex);
@@ -526,7 +525,7 @@ impl Slow {
                     if op == Opcode::LoadGlobal {
                         // unresolvable reference: GetValue throws a
                         // ReferenceError naming the binding
-                        let text = slot_name_text(heap, name);
+                        let text = slot_name_text(heap, name.as_tagged(heap));
                         let ex = Errors::not_defined(vm, heap, state, &text)
                             .expect("error materialization must not fail");
                         state.set_pending_exception(ex);
@@ -1127,18 +1126,10 @@ fn dispatch<'a>(
     let cache = &state.cache();
     let acc = cache.acc_mut();
 
-    // Frame state cached across instructions (the quickjs shape: locals
-    // in registers, not re-materialized per op). Two words detect every
-    // invalidation: the code register (the GC rewrites it when the code
-    // object moves; frame transitions reload it) and the frame base
-    // (push/pop/unwind). Refreshed only on change — never per step.
     let mut frame_base = cache.base();
     let mut frame_regs = cache.register_count();
     let mut code_word = cache.code_raw();
-    // Safety: the slice is re-derived on every code-register change, and
-    // the GC only runs inside steps — between refreshes no read can see
-    // a moved code object. Reads themselves happen only before an arm's
-    // first allocation (the operand-cursor safepoint discipline).
+
     let mut code = code_bytes(cache, heap);
     let mut pc = cache.pc();
 
@@ -1202,10 +1193,6 @@ fn dispatch<'a>(
                 Unwind::Escaped => return Ok(heap.known().exception.as_tagged(heap).erase()),
             },
         }
-        // the code-register word doubles as the GC epoch: a collection
-        // rewrites it in place when the code object moves, and nested
-        // executions restore it — both flip the word, triggering one
-        // cheap re-derivation of the raw slice
         if cache.code_raw() != code_word {
             code_word = cache.code_raw();
             code = code_bytes(cache, heap);
@@ -1572,6 +1559,267 @@ fn step<'a>(
                     return Step::Reframe;
                 }
                 Step::Next
+            })
+        }
+        Opcode::LoadGlobalFast => {
+            let global = heap.known().global_object.as_tagged(heap).erase();
+            if let Some(Hit::Value(v)) =
+                InlineCache::try_load(heap, cache.feedback_ref(heap), ops.idx(1), global)
+            {
+                acc.store(v);
+                return Step::Next;
+            }
+            state.handle_scope(|scope| -> Step<'_> {
+                let global = heap.known().global_object;
+                let name = scope.handle(
+                    stack
+                        .callable(heap, &meta)
+                        .as_ref()
+                        .constant_slot_name(heap, ops.idx(0)),
+                );
+                match global.lookup(heap, name.as_tagged(heap)) {
+                    Lookup::Data { slot, .. } => {
+                        acc.store(slot.get(heap));
+                        InlineCache::update_load(
+                            heap,
+                            &scope,
+                            cache.feedback_ref(heap).map(|v| scope.handle(v)),
+                            ops.idx(1),
+                            Some(scope.handle(global.as_tagged(heap))),
+                            name,
+                            false,
+                        );
+                        Step::Next
+                    }
+                    Lookup::Accessor { .. } => {
+                        debug_assert!(false, "fast load on an accessor property");
+                        acc.store(heap.known().undefined.as_tagged(heap));
+                        Step::Next
+                    }
+                    Lookup::NotFound => {
+                        let text = slot_name_text(heap, name.as_tagged(heap));
+                        let ex = Errors::not_defined(vm, heap, state, &text)
+                            .expect("error materialization must not fail");
+                        state.set_pending_exception(ex);
+                        Step::PendingThrow
+                    }
+                }
+            })
+        }
+        Opcode::StoreGlobalFast => {
+            let name = stack
+                .callable(heap, &meta)
+                .as_ref()
+                .constant_slot_name(heap, ops.idx(0));
+            match step_try!(
+                heap.known()
+                    .global_object
+                    .as_tagged(heap)
+                    .erase()
+                    .store_lookup_existing(heap, name, acc.get(heap), StoreSemantics::WriteThrough)
+            ) {
+                true => Step::Next,
+                false => Step::Error(VmError::OutOfBounds),
+            }
+        }
+        Opcode::LoadNamedPropertyFast => {
+            let receiver = stack.reg(heap, &meta, ops.reg(0));
+            if let Some(Hit::Value(v)) =
+                InlineCache::try_load(heap, cache.feedback_ref(heap), ops.idx(2), receiver)
+            {
+                acc.store(v);
+                return Step::Next;
+            }
+            debug_assert!(
+                !Proxy::is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))),
+                "fast load on a proxy receiver"
+            );
+            state.handle_scope(|scope| -> Step<'_> {
+                let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+                let name = scope.handle(
+                    stack
+                        .callable(heap, &meta)
+                        .as_ref()
+                        .constant_slot_name(heap, ops.idx(1)),
+                );
+                match step_try!(Lookup::load_outcome(
+                    heap,
+                    receiver.as_tagged(heap),
+                    name.as_tagged(heap)
+                )) {
+                    LoadOutcome::Value(v) => {
+                        acc.store(v);
+                        InlineCache::update_load(
+                            heap,
+                            &scope,
+                            cache.feedback_ref(heap).map(|v| scope.handle(v)),
+                            ops.idx(2),
+                            receiver
+                                .as_tagged(heap)
+                                .as_heap_object()
+                                .map(|o| scope.handle(o)),
+                            name,
+                            true,
+                        );
+                        Step::Next
+                    }
+                    LoadOutcome::Getter(_) => {
+                        debug_assert!(false, "fast load on an accessor property");
+                        acc.store(heap.known().undefined.as_tagged(heap));
+                        Step::Next
+                    }
+                }
+            })
+        }
+        Opcode::LoadKeyedPropertyFast => {
+            if let Some(idx) = Smi::decode(acc.get(heap).raw())
+                && idx.value() >= 0
+                && let Some(recv) = stack.reg(heap, &meta, ops.reg(0)).as_heap_object()
+                && let Some(v) = recv.as_ref().element_value(heap, idx.value() as usize)
+            {
+                acc.store(v);
+                return Step::Next;
+            }
+            debug_assert!(
+                !Proxy::is_proxy(heap, stack.reg(heap, &meta, ops.reg(0))),
+                "fast load on a proxy receiver"
+            );
+            let receiver = stack.reg(heap, &meta, ops.reg(0));
+            let key = acc.get(heap).as_name();
+            match step_try!(Lookup::load_outcome_keyed(heap, receiver, key)) {
+                LoadOutcome::Value(v) => acc.store(v),
+                LoadOutcome::Getter(_) => {
+                    debug_assert!(false, "fast load on an accessor property");
+                    acc.store(heap.known().undefined.as_tagged(heap));
+                }
+            }
+            Step::Next
+        }
+        Opcode::StoreNamedPropertyFast | Opcode::StoreNamedPropertyNoShadowFast => {
+            let semantics = match op {
+                Opcode::StoreNamedPropertyNoShadowFast => StoreSemantics::WriteThrough,
+                _ => StoreSemantics::Shadow,
+            };
+            state.handle_scope(|scope| -> Step<'_> {
+                let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+                let name = scope.handle(
+                    stack
+                        .callable(heap, &meta)
+                        .as_ref()
+                        .constant_slot_name(heap, ops.idx(1)),
+                );
+                let vector = cache.feedback_ref(heap).map(|v| scope.handle(v));
+
+                // store IC (Shadow semantics only: WriteThrough stores
+                // into parent-pair arrays that no map describes)
+                if op == Opcode::StoreNamedPropertyFast
+                    && let Some(hit) = InlineCache::try_store(
+                        heap,
+                        &scope,
+                        vector,
+                        ops.idx(2),
+                        receiver,
+                        name,
+                        &acc,
+                    )
+                {
+                    debug_assert!(
+                        !matches!(hit, StoreHit::Setter(_)),
+                        "fast store on a setter"
+                    );
+                    return Step::Next;
+                }
+
+                let prev = receiver.as_tagged(heap).as_heap_object().map(|o| {
+                    let map = o.as_ref().map_ref(heap);
+                    scope.handle(map)
+                });
+                let written = step_try!(receiver.as_tagged(heap).erase().store_lookup_existing(
+                    heap,
+                    name.as_tagged(heap),
+                    acc.get(heap),
+                    semantics,
+                ));
+                if !written {
+                    return Step::Error(VmError::OutOfBounds);
+                }
+                if op == Opcode::StoreNamedPropertyFast
+                    && let Some(prev) = prev
+                {
+                    InlineCache::update_store(
+                        heap,
+                        &scope,
+                        vector,
+                        ops.idx(2),
+                        receiver,
+                        name,
+                        prev,
+                        StoreOutcomeKind::Done,
+                    );
+                }
+                Step::Next
+            })
+        }
+        Opcode::StoreKeyedPropertyFast => {
+            if let Some(idx) = Smi::decode(stack.reg(heap, &meta, ops.reg(1)).raw())
+                && idx.value() >= 0
+                && let Some(recv) = stack.reg(heap, &meta, ops.reg(0)).as_heap_object()
+                && recv
+                    .as_ref()
+                    .element_value(heap, idx.value() as usize)
+                    .is_some()
+                && Object::store_array_element_in_place(
+                    heap,
+                    stack.reg(heap, &meta, ops.reg(0)),
+                    idx.value() as usize,
+                    acc.get(heap),
+                )
+                .is_ok()
+            {
+                return Step::Next;
+            }
+            state.handle_scope(|scope| -> Step<'_> {
+                let receiver = scope.handle(stack.reg(heap, &meta, ops.reg(0)));
+                let key = scope.handle(stack.reg(heap, &meta, ops.reg(1)));
+                match step_try!(Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+                    Key::Element(i) => {
+                        if receiver
+                            .as_tagged(heap)
+                            .as_heap_object()
+                            .is_some_and(|obj| obj.as_ref().is_array(heap))
+                        {
+                            let receiver = scope
+                                .cast::<Object>(receiver.as_tagged(heap))
+                                .expect("array receiver is an object");
+                            let value = scope.handle(acc.get(heap));
+                            step_try!(Object::store_array_element(
+                                heap, &scope, &receiver, i, &value
+                            ));
+                            return Step::Next;
+                        }
+                        let name = Tagged::from(Smi::new(i as i64));
+                        match step_try!(receiver.as_tagged(heap).erase().store_lookup_existing(
+                            heap,
+                            name,
+                            acc.get(heap),
+                            StoreSemantics::Shadow,
+                        )) {
+                            true => Step::Next,
+                            false => Step::Error(VmError::OutOfBounds),
+                        }
+                    }
+                    Key::Name(name) => {
+                        match step_try!(receiver.as_tagged(heap).erase().store_lookup_existing(
+                            heap,
+                            name,
+                            acc.get(heap),
+                            StoreSemantics::Shadow,
+                        )) {
+                            true => Step::Next,
+                            false => Step::Error(VmError::OutOfBounds),
+                        }
+                    }
+                }
             })
         }
         Opcode::Move => {
@@ -2232,4 +2480,12 @@ fn step<'a>(
         Opcode::Throw | Opcode::ReThrow => Step::Throw(acc.get(heap)),
         Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),
     }
+}
+
+pub use vm_core::{ExecuteFn, Interpreter};
+
+pub struct MatchLoopInterpreter;
+
+impl Interpreter for MatchLoopInterpreter {
+    const EXECUTE: ExecuteFn = execute;
 }

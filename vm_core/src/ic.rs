@@ -559,6 +559,42 @@ impl InlineCache {
         update_site(heap, scope, vector, slot, &map, &handler);
     }
 
+    /// Scope-free store fast path: a cached bare Field handler for the
+    /// receiver's map writes the value directly. `false` = miss (or a
+    /// transition/setter/chain handler — the slow path decides); never
+    /// allocates, never runs guest code.
+    pub fn try_store_fast(
+        heap: &mut Heap,
+        vector: Option<Tagged<'_, FeedbackVector>>,
+        slot: usize,
+        receiver: Tagged<'_, Value>,
+        value: Tagged<'_, Value>,
+    ) -> bool {
+        let Some(vector) = vector else {
+            return false;
+        };
+        let Some(recv) = ic_receiver(receiver, heap) else {
+            return false;
+        };
+        if vector.as_ref().site(slot).is_none() {
+            return false;
+        }
+        let map = recv.map_ref(heap);
+        let Some(handler) = probe(heap, vector, slot, map) else {
+            return false;
+        };
+        if handler.raw().is_ptr() {
+            return false;
+        }
+        let Some((KIND_FIELD, payload)) = decode_smi(handler) else {
+            return false;
+        };
+        recv.as_ref()
+            .slot(heap, payload as usize)
+            .set(heap, recv.erase(), value);
+        true
+    }
+
     pub fn try_store<'a>(
         heap: &'a mut Heap,
         scope: &HandleScope<'_>,

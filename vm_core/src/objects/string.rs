@@ -226,14 +226,14 @@ impl DenseString {
     pub fn char_at<'s>(
         heap: &mut Heap,
         scope: &'s HandleScope<'_>,
-        receiver: Value,
+        receiver: Handle<'_, Value>,
         i: usize,
     ) -> Option<Handle<'s, DenseString>> {
-        let unit = {
-            // Safety: caller-supplied word, fresh at entry.
-            let s = unsafe { receiver.assume_valid(heap) }.get_as::<DenseString>()?;
-            (i < s.len()).then(|| s.code_unit(heap, i))
-        }?;
+        let unit = receiver
+            .as_tagged(heap)
+            .get_as::<DenseString>()
+            .filter(|s| i < s.len())
+            .map(|s| s.code_unit(heap, i))?;
         Some(Self::from_units(heap, scope, &[unit]))
     }
 

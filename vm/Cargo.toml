@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 vm_core = { path = "../vm_core" }
-interpreter = { path = "../interpreter" }
+interpreter_match_loop = { path = "../interpreter_match_loop" }
 js_runtime = { path = "../js_runtime" }
 kette_runtime = { path = "../kette_runtime" }
 heap_api = { path = "../heap_api" }

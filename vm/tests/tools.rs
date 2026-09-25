@@ -10,11 +10,11 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Smi, Termination, VM};
 
 fn bare_vm() -> VM {
-    VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).unwrap()
+    VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap()
 }
 
 fn builtins_vm() -> VM {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

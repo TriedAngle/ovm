@@ -592,8 +592,6 @@ impl DenseString {
         let Ok(Key::Element(i)) = Lookup::classify_key(heap, key.as_tagged(heap).erase()) else {
             return None;
         };
-        // Safety: fresh rooted-slot word.
-        let receiver = receiver.as_tagged(heap).raw();
         DenseString::char_at(heap, scope, receiver, i).map(|s| s.as_tagged(heap).erase())
     }
 }

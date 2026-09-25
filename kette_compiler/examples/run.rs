@@ -18,7 +18,7 @@ fn main() {
         }
     };
     let vm =
-        VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default()).expect("heap");
+        VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).expect("heap");
     let mut thread = vm.attach();
     match thread.run_source(&source, kette_compiler::compile_kette, SourceMode::Script) {
         Ok(value) => {

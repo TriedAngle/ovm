@@ -21,19 +21,11 @@ pub fn proxy_constructor<'a>(
     }
     let RuntimeContext { heap, state, .. } = nctx;
     let (target, handler) = (
-        args.get(1)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Type)?
-            .raw(),
-        args.get(2)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Type)?
-            .raw(),
+        args.get(1).ok_or(VmError::Type)?,
+        args.get(2).ok_or(VmError::Type)?,
     );
-    let ok = {
-        Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
-            && Proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
-    };
+    let ok = Proxy::is_js_receiver(heap, target.as_tagged(heap))
+        && Proxy::is_js_receiver(heap, handler.as_tagged(heap));
     if !ok {
         return Err(VmError::Message(
             "cannot create proxy with a non-object target or handler",
@@ -43,9 +35,9 @@ pub fn proxy_constructor<'a>(
         Ok(Proxy::allocate(
             heap,
             &scope,
-            // Safety: fresh argument words, consumed by the allocation.
-            unsafe { Tagged::<Value>::from_value_unchecked(target) },
-            unsafe { Tagged::<Value>::from_value_unchecked(handler) },
+            // Safety: rooted argument words, consumed by the allocation.
+            unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) },
+            unsafe { Tagged::<Value>::from_value_unchecked(handler.raw()) },
         ))
     })
 }
@@ -62,19 +54,11 @@ pub fn proxy_revocable<'a>(
         vm, heap, state, ..
     } = nctx;
     let (target, handler) = (
-        args.get(1)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Type)?
-            .raw(),
-        args.get(2)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Type)?
-            .raw(),
+        args.get(1).ok_or(VmError::Type)?,
+        args.get(2).ok_or(VmError::Type)?,
     );
-    let ok = {
-        Proxy::is_js_receiver(heap, unsafe { target.assume_valid(heap) })
-            && Proxy::is_js_receiver(heap, unsafe { handler.assume_valid(heap) })
-    };
+    let ok = Proxy::is_js_receiver(heap, target.as_tagged(heap))
+        && Proxy::is_js_receiver(heap, handler.as_tagged(heap));
     if !ok {
         return Err(VmError::Message(
             "cannot create proxy with a non-object target or handler",
@@ -84,9 +68,9 @@ pub fn proxy_revocable<'a>(
         let proxy = scope.handle(Proxy::allocate(
             heap,
             &scope,
-            // Safety: fresh argument words, consumed by the allocation.
-            unsafe { Tagged::<Value>::from_value_unchecked(target) },
-            unsafe { Tagged::<Value>::from_value_unchecked(handler) },
+            // Safety: rooted argument words, consumed by the allocation.
+            unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) },
+            unsafe { Tagged::<Value>::from_value_unchecked(handler.raw()) },
         ));
         // Function.prototype.__makeRevoke (installed by REVOKE_PRELUDE)
         let make_revoke = {

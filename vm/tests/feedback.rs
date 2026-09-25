@@ -64,7 +64,7 @@ fn functions_without_property_access_have_no_feedback() {
 
 #[test]
 fn materialized_vector_is_hole_filled() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -103,7 +103,7 @@ fn materialized_vector_is_hole_filled() {
 
 #[test]
 fn running_a_script_with_feedback_still_works() {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

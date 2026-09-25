@@ -224,6 +224,20 @@ define_opcodes! {
     /// store. (JS keeps `StoreKeyedProperty*`.)
     StoreKeyedSlot { operands: [Register, Register], acc: reads, indices: [Unchecked, Unchecked] },
 
+    // -- fast property access (Kette): no proxy traps, no accessor
+    // invocation, no user-code key coercion; loads and Shadow stores use
+    // inline caches; stores write existing slots only — a miss is an
+    // error, never a transition
+    LoadGlobalFast { operands: [Index, Index], acc: writes, indices: [ConstantPool, Feedback] }, // idx (constant pool name) idx (feedback) -> acc; ReferenceError on miss
+    StoreGlobalFast { operands: [Index], acc: reads, indices: [ConstantPool] }, // acc -> idx (constant pool name)
+
+    LoadNamedPropertyFast { operands: [Register, Index, Index], acc: writes, indices: [Unchecked, ConstantPool, Feedback] }, // reg (obj) idx (constant pool index string) idx (feedback) -> acc
+    LoadKeyedPropertyFast { operands: [Register], acc: reads_writes, indices: [Unchecked] }, // reg (obj); key in acc -> acc
+
+    StoreNamedPropertyFast { operands: [Register, Index, Index], acc: reads, indices: [Unchecked, ConstantPool, Feedback] }, // acc -> reg (obj) idx (constant pool name) idx (feedback); Shadow semantics
+    StoreNamedPropertyNoShadowFast { operands: [Register, Index, Index], acc: reads, indices: [Unchecked, ConstantPool, Feedback] }, // WriteThrough semantics
+    StoreKeyedPropertyFast { operands: [Register, Register], acc: reads, indices: [Unchecked, Unchecked] }, // acc -> reg (obj) reg (key); Shadow semantics
+
     Move { operands: [Register, Register], writes_reg: 0, indices: [Unchecked, Unchecked] }, // reg (dst) <- reg (src)
 
     // -- contexts ----------------------------------------------------------

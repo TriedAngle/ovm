@@ -78,17 +78,11 @@ pub fn array_iterator_next<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    // Safety: fresh argument word; nothing below allocates before its
-    // final re-reads under heap-borrow anchors.
     let RuntimeContext { heap, state, .. } = nctx;
-    let receiver = args
-        .get(0)
-        .map(|h| h.as_tagged(heap))
-        .ok_or(VmError::Arity)?
-        .raw();
+    let receiver = args.get(0).ok_or(VmError::Arity)?;
     state.handle_scope(|scope| {
         let (array, index) = {
-            let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object() else {
+            let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
                 return Err(VmError::Type);
             };
             let slots = obj.as_ref().slots.get(heap);
@@ -129,7 +123,7 @@ pub fn array_iterator_next<'a>(
         };
         // advance the index slot
         {
-            let Some(obj) = unsafe { receiver.assume_valid(heap) }.as_heap_object() else {
+            let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
                 return Err(VmError::Type);
             };
             let slots = obj.as_ref().slots.get(heap);

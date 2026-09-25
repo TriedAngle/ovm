@@ -282,7 +282,7 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
         format!("{harness}\n{includes}\n{src}\n")
     };
     // realm isolation: every test runs in a fresh VM (INTERPRETING.md)
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .expect("vm")
         .add::<vm::JSRuntime>()
         .expect("vm");

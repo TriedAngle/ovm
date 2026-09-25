@@ -1,6 +1,6 @@
 pub use vm_core::*;
 
-pub use interpreter::{Interpreter, ThreadedInterpreter};
+pub use interpreter_match_loop::{Interpreter, MatchLoopInterpreter};
 pub use js_runtime::JSRuntime;
 pub use kette_runtime::KetteRuntime;
 

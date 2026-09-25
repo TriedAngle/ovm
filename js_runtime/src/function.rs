@@ -150,61 +150,53 @@ pub fn function_apply<'a>(
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let f = args
-        .get(0)
-        .map(|h| h.as_tagged(heap))
-        .ok_or(VmError::Arity)?;
-    if !Object::is_callable(heap, f) {
+    let f = args.get(0).ok_or(VmError::Arity)?;
+    if !Object::is_callable(heap, f.as_tagged(heap)) {
         return Err(VmError::Type);
     }
-    let f = f.raw();
-    // Safety: fresh root-slot word read for the immediate use.
-    let undefined = heap.known().undefined.as_tagged(heap).raw();
-    let this_arg = args
+    let undefined = heap.known().undefined;
+    let this_arg: Value = args
         .get(1)
-        .map(|h| h.as_tagged(heap))
-        .map(|v| v.raw())
-        .unwrap_or(undefined);
-    let array = args
-        .get(2)
-        .map(|h| h.as_tagged(heap))
-        .map(|v| v.raw())
-        .unwrap_or(undefined);
-    let call_args: Vec<Value> = {
-        let nullish = array == heap.known().undefined.as_tagged(heap).raw()
-            || array == heap.known().null.as_tagged(heap).raw();
-        if nullish {
-            vec![this_arg]
-        } else {
-            // array-like: read elements 0..length (holes read as undefined)
-            let len = {
-                unsafe { array.assume_valid(heap) }
-                    .as_heap_object()
-                    .map(|o| {
-                        o.as_ref()
-                            .array_length(heap, heap.known().strings.length.as_tagged(heap))
-                            .and_then(|v| Smi::decode(v.raw()).map(|s| s.value() as usize))
-                            .unwrap_or(0)
-                    })
-                    .unwrap_or(0)
-            };
-            let mut out = Vec::with_capacity(len + 1);
-            out.push(this_arg);
-            for i in 0..len {
-                out.push(
-                    unsafe { array.assume_valid(heap) }
-                        .as_heap_object()
-                        .and_then(|o| o.as_ref().element_value(heap, i))
-                        .map(|v| v.raw())
-                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).raw()),
-                );
-            }
-            out
+        .map(|h| h.as_tagged(heap).raw())
+        .unwrap_or_else(|| undefined.as_tagged(heap).raw());
+    let array = args.get(2);
+    let nullish = match array {
+        Some(a) => {
+            let a = a.as_tagged(heap);
+            a == undefined.as_tagged(heap) || a == heap.known().null.as_tagged(heap)
         }
+        None => true,
+    };
+    let call_args: Vec<Value> = if nullish {
+        vec![this_arg]
+    } else {
+        let array = array.expect("non-nullish array");
+        // array-like: read elements 0..length (holes read as undefined)
+        let len = array
+            .as_tagged(heap)
+            .as_heap_object()
+            .map(|o| {
+                o.as_ref()
+                    .array_length(heap, heap.known().strings.length.as_tagged(heap))
+                    .and_then(|v| Smi::decode(v.raw()).map(|s| s.value() as usize))
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let mut out = Vec::with_capacity(len + 1);
+        out.push(this_arg);
+        for i in 0..len {
+            out.push(
+                array
+                    .as_tagged(heap)
+                    .as_heap_object()
+                    .and_then(|o| o.as_ref().element_value(heap, i))
+                    .map(|v| v.raw())
+                    .unwrap_or_else(|| undefined.as_tagged(heap).raw()),
+            );
+        }
+        out
     };
     state.handle_scope(|scope| {
-        // Safety: fresh argument word (no allocation since the reads).
-        let f = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(f) });
         RuntimeContext::call(
             vm,
             heap,
@@ -247,9 +239,7 @@ pub fn function_constructor<'a>(
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let argv: Vec<Value> = (1..args.len())
-        .filter_map(|i| args.get(i).map(|h| h.as_tagged(heap)).map(|v| v.raw()))
-        .collect();
+    let argv: Vec<_> = (1..args.len()).filter_map(|i| args.get(i)).collect();
     state.handle_scope(|scope| {
         // root the caller context before the allocating ToString loop below
         let context = scope.handle(
@@ -260,18 +250,13 @@ pub fn function_constructor<'a>(
         // ToString all arguments (user toString may run)
         let mut parts: Vec<String> = Vec::with_capacity(argv.len());
         for a in argv {
-            let s = {
-                // Safety: fresh argument word, consumed before any allocation.
-                let a = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(a) });
-                Convert::to_string(heap, &scope, a)?.raw()
-            };
-            parts.push({
-                // Safety: fresh word, no allocation since the read.
-                unsafe { s.assume_valid(heap) }
+            let s = scope.handle(Convert::to_string(heap, &scope, a)?);
+            parts.push(
+                s.as_tagged(heap)
                     .get_as::<DenseString>()
                     .map(|x| x.to_rust_string(heap))
-                    .unwrap_or_default()
-            });
+                    .unwrap_or_default(),
+            );
         }
         let (params, body) = match parts.split_last() {
             Some((body, params)) => (params.join(", "), body.clone()),

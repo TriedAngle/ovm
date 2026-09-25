@@ -8,7 +8,7 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{ScriptError, Smi};
 
 fn run(src: &str) -> Result<vm::Value, ScriptError> {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -37,7 +37,7 @@ fn run_bool(src: &str) -> bool {
 
 #[allow(dead_code)]
 fn run_value(src: &str) -> (vm::Value, vm::Thread) {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -50,7 +50,7 @@ fn run_value(src: &str) -> (vm::Value, vm::Thread) {
 /// The script must complete with an uncaught error whose `name` is
 /// "TypeError".
 fn assert_type_error(src: &str) {
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -113,7 +113,7 @@ fn constructor_validates_target_and_handler() {
 fn constructor_has_no_prototype_and_metadata() {
     assert_eq!(run_smi("Proxy.prototype === undefined ? 1 : 0"), 1);
     assert_eq!(run_smi("Proxy.length"), 2);
-    let vm = vm::VM::new::<MarkSweep, vm::ThreadedInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

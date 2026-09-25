@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["interpreter_become"]
 members = [
     "bytecode",
     "collectors/dummy_heap",
@@ -7,7 +8,7 @@ members = [
     "heap_api",
     "heap_tests",
     "heap_utils",
-    "interpreter",
+    "interpreter_match_loop",
     "js_compiler",
     "kette_compiler",
     "kette_parser",

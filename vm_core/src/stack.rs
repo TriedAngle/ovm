@@ -68,6 +68,12 @@ impl Stack {
         unsafe { &*self.slots.as_ptr().add(index) }
     }
 
+    /// The register backing store (frame bases index into it; the pointer
+    /// is invalidated by frame pushes that grow the store).
+    pub fn slots_ptr(&self) -> *mut Register {
+        self.slots.as_ptr() as *mut Register
+    }
+
     pub fn value_slice(&self, base: usize, count: usize) -> HandleSlice<'_> {
         let slots = &self.slots[base..base + count];
         // Safety: stack slots are GC-visited, so the words stay current for
@@ -125,8 +131,7 @@ impl Stack {
 
     /// Read a register under a heap borrow: rooted memory is updated in
     /// place by the GC, so the word is current and valid for `'a`.
-    pub fn reg<'a>(&self, _heap: &'a Heap, meta: &FrameMeta, i: i32) -> Tagged<'a, Value> {
-        self.slot_unchecked(Self::reg_index(meta, i)).get(_heap)
+    pub fn reg<'a>(&self, _heap: &'a Heap, meta: &FrameMeta, i: i32) -> Tagged<'a, Value> {        self.slot_unchecked(Self::reg_index(meta, i)).get(_heap)
     }
 
     pub fn set_reg<'x, T: 'x>(&self, meta: &FrameMeta, i: i32, v: Tagged<'x, T>) {

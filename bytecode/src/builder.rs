@@ -659,6 +659,57 @@ impl FnBuilder {
         self.emit_tracked(Opcode::StoreKeyedSlot, &[obj.operand(), key.operand()]);
     }
 
+    pub fn load_global_fast(&mut self, name: ConstIdx, fb: Feedback) {
+        self.emit_tracked(Opcode::LoadGlobalFast, &[name.0, fb.0]);
+    }
+
+    pub fn store_global_fast(&mut self, name: ConstIdx) {
+        self.emit_tracked(Opcode::StoreGlobalFast, &[name.0]);
+    }
+
+    pub fn load_named_property_fast(&mut self, obj: Reg, name: ConstIdx, fb: Feedback) {
+        self.emit_tracked(
+            Opcode::LoadNamedPropertyFast,
+            &[obj.operand(), name.0, fb.0],
+        );
+    }
+
+    /// Plain keyed load: the key is in the accumulator, the result
+    /// replaces it. A directly preceding `LoadSmi` with an in-range
+    /// non-negative value fuses into [`Opcode::LoadElementImm`].
+    pub fn load_keyed_property_fast(&mut self, obj: Reg) {
+        if let LastOp::LoadSmi { at, imm } = self.last
+            && (0..=u16::MAX as i32).contains(&imm)
+        {
+            self.code.truncate(at);
+            self.last = LastOp::None;
+            self.emit_tracked(Opcode::LoadElementImm, &[obj.operand(), imm as u32]);
+            return;
+        }
+        self.emit_tracked(Opcode::LoadKeyedPropertyFast, &[obj.operand()]);
+    }
+
+    pub fn store_named_property_fast(&mut self, obj: Reg, name: ConstIdx, fb: Feedback) {
+        self.emit_tracked(
+            Opcode::StoreNamedPropertyFast,
+            &[obj.operand(), name.0, fb.0],
+        );
+    }
+
+    pub fn store_named_property_no_shadow_fast(&mut self, obj: Reg, name: ConstIdx, fb: Feedback) {
+        self.emit_tracked(
+            Opcode::StoreNamedPropertyNoShadowFast,
+            &[obj.operand(), name.0, fb.0],
+        );
+    }
+
+    pub fn store_keyed_property_fast(&mut self, obj: Reg, key: Reg) {
+        self.emit_tracked(
+            Opcode::StoreKeyedPropertyFast,
+            &[obj.operand(), key.operand()],
+        );
+    }
+
     /// `dst <- src` (the `Move` opcode takes the destination first).
     pub fn move_reg(&mut self, dst: Reg, src: Reg) {
         self.emit_tracked(Opcode::Move, &[dst.operand(), src.operand()]);

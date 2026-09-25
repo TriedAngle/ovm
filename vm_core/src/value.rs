@@ -108,12 +108,12 @@ impl Smi {
     pub const fn in_range(val: i64) -> bool {
         Self::MIN <= val && val <= Self::MAX
     }
-
+    #[inline(always)]
     pub const fn new(val: i64) -> Self {
         debug_assert!(Self::in_range(val));
         Self(val)
     }
-
+    #[inline(always)]
     pub const fn value(self) -> i64 {
         self.0
     }
@@ -123,6 +123,7 @@ impl Smi {
     }
 
     // TODO: have unsafe veresion of this with debug check
+    #[inline(always)]
     pub const fn decode(v: Value) -> Option<Smi> {
         if v.is_smi() {
             Some(Self((v.to_bits() as i64) >> 1))

@@ -31,9 +31,13 @@ fn constant_operand(op: Opcode, i: usize) -> bool {
     match op {
         Opcode::LoadConstant | Opcode::CreateClosure => i == 0,
         Opcode::LoadGlobal | Opcode::StoreGlobal => i == 0,
+        Opcode::LoadGlobalFast | Opcode::StoreGlobalFast => i == 0,
         Opcode::LoadNamedProperty
         | Opcode::StoreNamedProperty
         | Opcode::StoreNamedPropertyNoShadow
+        | Opcode::LoadNamedPropertyFast
+        | Opcode::StoreNamedPropertyFast
+        | Opcode::StoreNamedPropertyNoShadowFast
         | Opcode::AddParent => i == 1,
         _ => false,
     }
@@ -86,7 +90,7 @@ fn unused_compile_error_surface() {
 #[test]
 fn add_becomes_an_add_send() {
     let program = compile("1 + 2");
-    assert!(contains(&program, "LoadNamedProperty"));
+    assert!(contains(&program, "LoadNamedPropertyFast"));
     assert!(contains(&program, "#str[\"add\"]"));
     assert!(contains(&program, "CallNoFeedback"));
 }

@@ -279,7 +279,7 @@ impl<'a> FunctionGen<'a> {
                 };
                 let idx = self.name_constant(sym);
                 let feedback = self.b.new_feedback();
-                self.b.load_global(idx, feedback);
+                self.b.load_global_fast(idx, feedback);
             }
         }
     }
@@ -295,8 +295,7 @@ impl<'a> FunctionGen<'a> {
                     unreachable!("identifier nodes carry a symbol");
                 };
                 let idx = self.name_constant(sym);
-                let feedback = self.b.new_feedback();
-                self.b.store_global(idx, feedback);
+                self.b.store_global_fast(idx);
             }
         }
     }
@@ -432,7 +431,7 @@ impl<'a> FunctionGen<'a> {
                 let obj = self.b.stage_acc();
                 let name = self.name_constant(name);
                 let feedback = self.b.new_feedback();
-                self.b.load_named_property(obj, name, feedback);
+                self.b.load_named_property_fast(obj, name, feedback);
                 self.b.drop_temp();
                 Ok(())
             }
@@ -440,8 +439,7 @@ impl<'a> FunctionGen<'a> {
                 self.expr(recv)?;
                 let obj = self.b.stage_acc();
                 self.expr(key)?;
-                let feedback = self.b.new_feedback();
-                self.b.load_keyed_property(obj, feedback);
+                self.b.load_keyed_property_fast(obj);
                 self.b.drop_temp();
                 Ok(())
             }
@@ -485,7 +483,7 @@ impl<'a> FunctionGen<'a> {
         let recv_reg = self.b.stage_acc();
         let name = self.name_constant(name);
         let feedback = self.b.new_feedback();
-        self.b.load_named_property(recv_reg, name, feedback);
+        self.b.load_named_property_fast(recv_reg, name, feedback);
         // argument window [recv, args...] plus the callee slot above it;
         // the method rides the accumulator straight into its slot before
         // argument evaluation clobbers it
@@ -586,7 +584,8 @@ impl<'a> FunctionGen<'a> {
                 let name = self.name_constant(name);
                 self.expr(value)?;
                 let feedback = self.b.new_feedback();
-                self.b.store_named_property_no_shadow(obj, name, feedback);
+                self.b
+                    .store_named_property_no_shadow_fast(obj, name, feedback);
                 self.b.drop_temp();
                 Ok(())
             }
@@ -639,6 +638,9 @@ impl<'a> FunctionGen<'a> {
                     };
                     let name = self.name_constant(sym);
                     self.expr(value)?;
+                    // literal slots are explicit layout: the defining
+                    // store (with transitions); the receiver is a fresh
+                    // bare object
                     let feedback = self.b.new_feedback();
                     self.b.store_named_property(obj, name, feedback);
                 }
@@ -650,8 +652,7 @@ impl<'a> FunctionGen<'a> {
                     self.expr(key)?;
                     let key = self.b.stage_acc();
                     self.expr(value)?;
-                    let feedback = self.b.new_feedback();
-                    self.b.store_keyed_property(obj, key, feedback);
+                    self.b.store_keyed_property_fast(obj, key);
                     self.b.drop_temp();
                 }
                 _ => unreachable!("object slots are Slot nodes"),
@@ -672,8 +673,7 @@ impl<'a> FunctionGen<'a> {
             let index = self.b.stage_acc();
             self.expr(element)?;
             // literal elements are explicit layout: the store may grow
-            let feedback = self.b.new_feedback();
-            self.b.store_keyed_property(array, index, feedback);
+            self.b.store_keyed_property_fast(array, index);
             self.b.drop_temp();
         }
         self.b.load(array);

@@ -1,0 +1,4 @@
+# run builds from this directory: config discovery is CWD-based,
+# so `cargo +nightly test --release` must be invoked from here
+[build]
+rustflags = ["-Zdefault-visibility=hidden"]

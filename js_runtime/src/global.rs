@@ -15,20 +15,13 @@ pub fn eval_runtime<'a>(
     state.handle_scope(|scope| {
         // root the caller context before the allocating ToString below
         let context = scope.handle(state.current_context(heap).ok_or(VmError::Type)?);
-        let src = Ok(args
-            .get(1)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?
-            .raw())?;
-        // Safety: fresh argument word, consumed before any allocation.
-        let src = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(src) });
-        let s = Convert::to_string(heap, &scope, src)?;
-        let s = s.raw();
-        let text = // Safety: fresh word, no allocation since the read.
-            unsafe { s.assume_valid(heap) }
-                .get_as::<DenseString>()
-                .map(|s| s.to_rust_string(heap))
-                .ok_or(VmError::Type)?;
+        let src = args.get(1).ok_or(VmError::Arity)?;
+        let s = scope.handle(Convert::to_string(heap, &scope, src)?);
+        let text = s
+            .as_tagged(heap)
+            .get_as::<DenseString>()
+            .map(|s| s.to_rust_string(heap))
+            .ok_or(VmError::Type)?;
 
         let program = match js_compiler::compile_js(&text, bytecode::SourceMode::Eval) {
             Ok(program) => program,
