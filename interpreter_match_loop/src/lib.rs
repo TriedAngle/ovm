@@ -1461,11 +1461,6 @@ fn step<'a>(
             };
             if let Some(idx) = Smi::decode(stack.reg(heap, &meta, ops.reg(1)).raw())
                 && idx.value() >= 0
-                && let Some(recv) = stack.reg(heap, &meta, ops.reg(0)).as_heap_object()
-                && recv
-                    .as_ref()
-                    .element_value(heap, idx.value() as usize)
-                    .is_some()
                 && Object::store_array_element_in_place(
                     heap,
                     stack.reg(heap, &meta, ops.reg(0)),
@@ -1763,11 +1758,6 @@ fn step<'a>(
         Opcode::StoreKeyedPropertyFast => {
             if let Some(idx) = Smi::decode(stack.reg(heap, &meta, ops.reg(1)).raw())
                 && idx.value() >= 0
-                && let Some(recv) = stack.reg(heap, &meta, ops.reg(0)).as_heap_object()
-                && recv
-                    .as_ref()
-                    .element_value(heap, idx.value() as usize)
-                    .is_some()
                 && Object::store_array_element_in_place(
                     heap,
                     stack.reg(heap, &meta, ops.reg(0)),
@@ -2156,6 +2146,43 @@ fn step<'a>(
                 return Step::Next;
             }
             Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a - b)
+        }
+        Opcode::IncLoc | Opcode::DecLoc => {
+            let reg = ops.reg(0);
+            let delta: i64 = if op == Opcode::IncLoc { 1 } else { -1 };
+            let bits = stack.reg(heap, &meta, reg).smi_bits();
+            if let Some(bits) = bits {
+                let stepped = if delta > 0 {
+                    bits.checked_add(2)
+                } else {
+                    bits.checked_sub(2)
+                };
+                if let Some(new) = stepped {
+                    stack.set_reg(&meta, reg, Tagged::from_smi_bits(new));
+                    // the postfix value is the numeric old value
+                    acc.store(Tagged::from_smi_bits(bits));
+                    return Step::Next;
+                }
+            }
+            state.handle_scope(|scope| -> Step<'_> {
+                let old = scope.handle(stack.reg(heap, &meta, reg));
+                let n = step_try!(Object::to_numeric(vm, heap, state, old));
+                let Some(n) = n else {
+                    return Step::PendingThrow;
+                };
+                let old_num = if n.fract() == 0.0
+                    && Smi::in_range(n as i64)
+                    && !(n == 0.0 && n.is_sign_negative())
+                {
+                    scope.handle(Smi::new(n as i64).into_tagged())
+                } else {
+                    scope.handle(heap.new_number(n))
+                };
+                let new = heap.new_number(n + delta as f64);
+                stack.set_reg(&meta, reg, new);
+                acc.store(old_num.as_tagged(heap));
+                Step::Next
+            })
         }
         Opcode::Mul => {
             let other = stack.reg(heap, &meta, ops.reg(0));

@@ -328,4 +328,9 @@ define_opcodes! {
     // exception handling
     Throw { operands: [], acc: reads, indices: [] },   // acc -> pending exception
     ReThrow { operands: [], acc: reads, indices: [] }, // acc -> pending exception
+
+    /// `regs[r] = ToNumeric(regs[r]) ± 1` in place; acc becomes the numeric
+    /// *old* value (postfix semantics). Prefix forms follow with a `Load`.
+    IncLoc { operands: [Register], acc: writes, writes_reg: 0, indices: [Unchecked] },
+    DecLoc { operands: [Register], acc: writes, writes_reg: 0, indices: [Unchecked] },
 }

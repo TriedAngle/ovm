@@ -217,13 +217,13 @@ impl Object {
         let Some(obj) = receiver.as_heap_object() else {
             return Err(VmError::Type);
         };
-        if !obj.as_ref().is_array(heap) {
-            return Err(VmError::Type);
-        }
-        if obj.as_ref().element_value(heap, i).is_none() {
+        if !obj.as_ref().is_array(heap) || i >= obj.as_ref().length() {
             return Err(VmError::OutOfBounds);
         }
         let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+        if i >= elements.len() || elements.at(heap, i) == heap.known().the_hole.as_tagged(heap) {
+            return Err(VmError::OutOfBounds);
+        }
         elements.set(heap, i, value);
         Ok(())
     }

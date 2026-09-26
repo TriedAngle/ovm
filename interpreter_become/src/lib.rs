@@ -4,9 +4,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unused_macros, unused_unsafe, unused_variables)]
 
+use core::cell::Cell;
 use core::marker::PhantomData;
 
-use bytecode::{Opcode, jump_target};
+use bytecode::{Opcode, Scale, jump_target};
 use vm_core::ic::{Hit, InlineCache, StoreHit, StoreOutcomeKind};
 use vm_core::proxy::Proxy;
 use vm_core::{
@@ -19,11 +20,14 @@ use vm_core::{
 
 pub struct BecomeInterpreter;
 
+const SAFEPOINT_INTERVAL: u32 = 1 << 12;
+
 pub struct Ctx<'a> {
     vm: *const VM,
     heap: *mut Heap,
     state: *const ContextState,
     base_depth: usize,
+    safepoints: Cell<u32>,
     _heap: PhantomData<&'a mut Heap>,
 }
 
@@ -83,6 +87,20 @@ impl<'a> Ctx<'a> {
     #[inline(always)]
     fn is_throw(&self, v: Tagged<'_, Value>) -> bool {
         v == self.exception_word()
+    }
+
+    /// One loop back-edge: `true` every `SAFEPOINT_INTERVAL` ticks or when
+    /// a collection has been requested since the last reset.
+    #[inline(always)]
+    fn safepoint_tick(&self) -> bool {
+        let n = self.safepoints.get();
+        if n == 0 {
+            self.safepoints.set(SAFEPOINT_INTERVAL);
+            true
+        } else {
+            self.safepoints.set(n - 1);
+            false
+        }
     }
 
     /// Materialize a VM error as the pending exception and return the
@@ -167,15 +185,6 @@ macro_rules! helpers {
         }
         macro_rules! bail { ($e:expr) => { return $ctx.raise($e) } }
         macro_rules! threw { () => { return $ctx.threw() } }
-        macro_rules! cold {
-            ($e:expr) => {{
-                let v = $e?;
-                if $ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                v
-            }};
-        }
     };
 }
 
@@ -279,8 +288,29 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(Tagged::from_smi_bits(sum))
         }
-        let v = cold!(add_cold(ctx, acc, other));
-        reenter!(pc, SIZE, v)
+        become cold_add(pc, code, regs, acc, ctx)
+    }
+
+    IncLoc : op_inc_loc_n / op_inc_loc_w (r => signed) {
+        let v = reg!(r);
+        if let Some(bits) = v.smi_bits()
+            && let Some(new) = bits.checked_add(2)
+        {
+            set_reg!(r, Tagged::from_smi_bits(new));
+            next!(v)
+        }
+        become cold_inc_loc(pc, code, regs, acc, ctx)
+    }
+
+    DecLoc : op_dec_loc_n / op_dec_loc_w (r => signed) {
+        let v = reg!(r);
+        if let Some(bits) = v.smi_bits()
+            && let Some(new) = bits.checked_sub(2)
+        {
+            set_reg!(r, Tagged::from_smi_bits(new));
+            next!(v)
+        }
+        become cold_dec_loc(pc, code, regs, acc, ctx)
     }
 
     Sub : op_sub_n / op_sub_w (r => signed) {
@@ -290,8 +320,7 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(Tagged::from_smi_bits(diff))
         }
-        let v = cold!(numeric_cold(ctx, acc, other, |a, b| a - b));
-        reenter!(pc, SIZE, v)
+        become cold_numeric(pc, code, regs, acc, ctx)
     }
 
     Mul : op_mul_n / op_mul_w (r => signed) {
@@ -303,8 +332,7 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(Tagged::from_smi_bits(product))
         }
-        let v = cold!(numeric_cold(ctx, acc, other, |a, b| a * b));
-        reenter!(pc, SIZE, v)
+        become cold_numeric(pc, code, regs, acc, ctx)
     }
 
     Div : op_div_n / op_div_w (r => signed) {
@@ -319,26 +347,17 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(Tagged::from_smi_bits(encoded))
         }
-        let v = cold!(numeric_cold(ctx, acc, other, |a, b| a / b));
-        reenter!(pc, SIZE, v)
+        become cold_numeric(pc, code, regs, acc, ctx)
     }
 
     Equal : op_equal_n / op_equal_w (r => signed) {
         let other = reg!(r);
-        // Smi == Smi is encoded-word equality; only mixed/float pairs need
-        // the numeric conversion
-        let b = match (acc.smi_bits(), other.smi_bits()) {
-            (Some(a), Some(b)) => a == b,
-            _ => match (Convert::as_number(acc), Convert::as_number(other)) {
-                (Some(a), Some(b)) => a == b,
-                _ => match compare_cold(ctx, 0, acc, other) {
-                    Ok(Some(b)) => b,
-                    Ok(None) => threw!(),
-                    Err(err) => bail!(err),
-                },
-            },
-        };
-        next!(Convert::boolean(ctx.heap(), b))
+        // Smi == Smi is encoded-word equality; everything else (mixed,
+        // float, objects that may run user code) is the cold compare
+        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
+            next!(Convert::boolean(ctx.heap(), a == b))
+        }
+        become cold_equal(pc, code, regs, acc, ctx)
     }
 
     ShiftRight : op_shift_right_n / op_shift_right_w (r => signed) {
@@ -354,8 +373,6 @@ handlers!(pc, code, regs, acc, ctx;
         let key_w = reg!(key);
         if let Some(idx) = key_w.to_i64()
             && idx >= 0
-            && let Some(obj) = recv_w.as_heap_object()
-            && obj.as_ref().element_value(ctx.heap(), idx as usize).is_some()
             && Object::store_array_element_in_place(
                 ctx.heap_mut(),
                 recv_w,
@@ -366,62 +383,41 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(acc)
         }
-        let v = cold!(keyed_store_cold(ctx, recv_w, key_w, acc));
-        reenter!(pc, SIZE, v)
+        become cold_keyed_store(pc, code, regs, acc, ctx)
     }
 
     Negate : op_negate_n / op_negate_w () {
-        if let Some(bits) = acc.smi_bits() {
-            if bits == 0 {
-                // preserve -0.0: `-0` must not fold into Smi 0
-                let n = ctx.heap_mut().new_number(-0.0);
-                reenter!(pc, SIZE, n)
-            } else if let Some(neg) = bits.checked_neg() {
-                // encoded negation: i64::MIN (Smi::MIN) overflows to a float
-                next!(Tagged::from_smi_bits(neg))
-            } else {
-                let v = cold!(negate_cold(ctx, acc));
-                reenter!(pc, SIZE, v)
-            }
-        } else {
-            let v = cold!(negate_cold(ctx, acc));
-            reenter!(pc, SIZE, v)
+        if let Some(bits) = acc.smi_bits()
+            && bits != 0
+            && let Some(neg) = bits.checked_neg()
+        {
+            next!(Tagged::from_smi_bits(neg))
         }
+        become cold_negate(pc, code, regs, acc, ctx)
     }
 
     CompareJump : op_compare_jump_n / op_compare_jump_w (r => signed, kind => unsigned, off => signed) {
         let other = reg!(r);
         let cmp = (kind / 2) as u8;
         let falsy_jump = kind % 2 == 1;
-        // encoded Smis compare in the same order as their values
-        let b = match (acc.smi_bits(), other.smi_bits()) {
-            (Some(a), Some(b)) => match cmp {
+        // encoded Smis compare in the same order as their values; anything
+        // else is the cold compare
+        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
+            let b = match cmp {
                 0 | 1 => a == b,
                 2 => a < b,
                 3 => a <= b,
                 4 => a > b,
                 _ => a >= b,
-            },
-            _ => match (Convert::as_number(acc), Convert::as_number(other)) {
-                (Some(a), Some(b)) => match cmp {
-                    0 | 1 => a == b,
-                    2 => a < b,
-                    3 => a <= b,
-                    4 => a > b,
-                    _ => a >= b,
-                },
-                _ => match compare_cold(ctx, cmp, acc, other) {
-                    Ok(Some(b)) => b,
-                    Ok(None) => threw!(),
-                    Err(err) => bail!(err),
-                },
-            },
-        };
-        let boolean = Convert::boolean(ctx.heap(), b);
-        if b != falsy_jump {
-            jump!(off, boolean)
+            };
+            let boolean = Convert::boolean(ctx.heap(), b);
+            if b != falsy_jump {
+                jump!(off, boolean)
+            } else {
+                next!(boolean)
+            }
         }
-        reenter!(pc, SIZE, boolean)
+        become cold_compare_jump(pc, code, regs, acc, ctx)
     }
 
     Jump : op_jump_n / op_jump_w (off => signed) {
@@ -443,18 +439,22 @@ handlers!(pc, code, regs, acc, ctx;
     }
 
     JumpLoop : op_jump_loop_n / op_jump_loop_w (off => signed) {
-        // the acc word must be GC-visible while parked: sync to the cache
-        ctx.cache().acc_mut().store(acc);
-        if ctx.heap_mut().safepoint_poll() {
-            let state = ctx.state();
-            state.set_termination(vm_core::Termination::Shutdown);
-            let undefined = ctx.heap().known().undefined.as_tagged(ctx.heap());
-            state.set_pending_exception(undefined);
-            threw!()
+        if ctx.safepoint_tick() {
+            // the acc word must be GC-visible while parked: sync to the cache
+            ctx.cache().acc_mut().store(acc);
+            if ctx.heap_mut().safepoint_poll() {
+                let state = ctx.state();
+                state.set_termination(vm_core::Termination::Shutdown);
+                let undefined = ctx.heap().known().undefined.as_tagged(ctx.heap());
+                state.set_pending_exception(undefined);
+                threw!()
+            }
+            let target = jump_target(pc, off);
+            let acc = ctx.cache().acc(ctx.heap());
+            reenter!(target, 0, acc)
+        } else {
+            jump!(off, acc)
         }
-        let acc = ctx.cache().acc(ctx.heap());
-        let target = jump_target(pc, off);
-        reenter!(target, 0, acc)
     }
 
     Throw : op_throw_n / op_throw_w () {
@@ -486,8 +486,7 @@ handlers!(pc, code, regs, acc, ctx;
         ) {
             next!(v)
         }
-        let v = cold!(named_load_cold(ctx, recv, name, fb));
-        reenter!(pc, SIZE, v)
+        become cold_named_load(pc, code, regs, acc, ctx)
     }
 
     LoadKeyedProperty : op_load_keyed_n / op_load_keyed_w (r => signed, _fb => unsigned) {
@@ -499,8 +498,7 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(v)
         }
-        let v = cold!(keyed_load_cold(ctx, recv, acc));
-        reenter!(pc, SIZE, v)
+        become cold_keyed_load(pc, code, regs, acc, ctx)
     }
 
     LoadElementImm : op_load_element_imm_n / op_load_element_imm_w (r => signed, idx => unsigned) {
@@ -510,8 +508,7 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(v)
         }
-        let v = cold!(keyed_load_imm_cold(ctx, recv, idx));
-        reenter!(pc, SIZE, v)
+        become cold_keyed_load_imm(pc, code, regs, acc, ctx)
     }
 
     LoadGlobal : op_load_global_n / op_load_global_w (name => unsigned, fb => unsigned) {
@@ -524,14 +521,12 @@ handlers!(pc, code, regs, acc, ctx;
         ) {
             next!(v)
         }
-        let v = cold!(global_load_cold(ctx, name, fb));
-        reenter!(pc, SIZE, v)
+        become cold_global_load(pc, code, regs, acc, ctx)
     }
 
     StoreNamedProperty : op_store_named_n / op_store_named_w (r => signed, name => unsigned, fb => unsigned) {
         let recv = reg!(r);
-        let v = cold!(store_named_cold(ctx, recv, name, fb, acc));
-        reenter!(pc, SIZE, v)
+        become cold_store_named(pc, code, regs, acc, ctx)
     }
 
     LoadContextSlot : op_load_context_slot_n / op_load_context_slot_w (slot => unsigned, depth => unsigned) {
@@ -606,13 +601,11 @@ handlers!(pc, code, regs, acc, ctx;
     }
 
     CreateFunctionContext : op_create_function_context_n / op_create_function_context_w (scope => unsigned) {
-        let v = cold!(create_function_context_cold(ctx, scope));
-        reenter!(pc, SIZE, v)
+        become cold_create_function_context(pc, code, regs, acc, ctx)
     }
 
     CreateClosure : op_create_closure_n / op_create_closure_w (info => unsigned) {
-        let v = cold!(create_closure_cold(ctx, info));
-        reenter!(pc, SIZE, v)
+        become cold_create_closure(pc, code, regs, acc, ctx)
     }
 
     CallRuntime : op_call_runtime_n / op_call_runtime_w (rt => unsigned, base => signed, count => unsigned) {
@@ -635,8 +628,7 @@ handlers!(pc, code, regs, acc, ctx;
     CallNoFeedback : op_call_n / op_call_w (callee => signed, base => signed, count => unsigned) {
         let callee_word = reg!(callee);
         if Proxy::is_proxy(ctx.heap(), callee_word) {
-            let v = cold!(proxy_apply_cold(ctx, callee_word, base, count));
-            reenter!(pc, SIZE, v)
+            become cold_proxy_apply(pc, code, regs, acc, ctx)
         }
         match Object::call_target(ctx.heap(), callee_word) {
             None => bail!(VmError::Type),
@@ -696,8 +688,7 @@ handlers!(pc, code, regs, acc, ctx;
     }
 
     Construct : op_construct_n / op_construct_w (callee => signed, base => signed, count => unsigned) {
-        let v = cold!(construct_cold(ctx, reg!(callee), base, count));
-        reenter!(pc, SIZE, v)
+        become cold_construct(pc, code, regs, acc, ctx)
     }
 );
 
@@ -1371,6 +1362,398 @@ unsafe fn proxy_apply_cold<'a>(
     })
 }
 
+#[inline(always)]
+unsafe fn cold_layout(pc: usize, code: *const u8) -> (usize, usize) {
+    if *code.add(pc) == Opcode::Wide as u8 {
+        (2, 2)
+    } else {
+        (1, 1)
+    }
+}
+
+#[inline(always)]
+unsafe fn cold_next_pc(pc: usize, code: *const u8) -> usize {
+    let wide = *code.add(pc) == Opcode::Wide as u8;
+    let scale = if wide { Scale::Byte2 } else { Scale::Byte1 };
+    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + wide as usize)) };
+    pc + wide as usize + op.size(scale)
+}
+
+/// Dispatch a cold-path result: the pending-exception sentinel is returned
+/// as-is, anything else resumes execution with fresh code/registers.
+#[inline(always)]
+unsafe extern "rust-preserve-none" fn resume<'a>(
+    pc: usize,
+    _code: *const u8,
+    _regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    if ctx.is_throw(acc) {
+        return Ok(acc);
+    }
+    let code = ctx.code_ptr();
+    let regs = ctx.regs_ptr();
+    let op = *code.add(pc) as usize;
+    let h = TABLE_NARROW.0[op];
+    become h(pc, code, regs, acc, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_add<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = add_cold(ctx, acc, other)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_numeric<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
+    let f: fn(f64, f64) -> f64 = match op {
+        Opcode::Sub => |a, b| a - b,
+        Opcode::Mul => |a, b| a * b,
+        _ => |a, b| a / b,
+    };
+    let v = numeric_cold(ctx, acc, other, f)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_negate<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let v = negate_cold(ctx, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+/// The shared non-Smi body of `IncLoc`/`DecLoc`: ToNumeric the old value,
+/// store the stepped result back into its register and leave the numeric
+/// old value in the accumulator.
+#[cold]
+#[inline(never)]
+unsafe fn incdec_cold<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    ctx: &Ctx<'a>,
+    delta: f64,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let r = signed::read(pc, code, base, stride);
+    let old = reg_read(regs, ctx.heap(), r);
+    let heap = ctx.heap_mut();
+    if let Some(bits) = old.smi_bits() {
+        // the Smi fast path already failed: the step left the range
+        let new = heap.new_number((bits >> 1) as f64 + delta);
+        reg_write(regs, r, new);
+        return Ok(old);
+    }
+    let vm = ctx.vm();
+    let state = ctx.state();
+    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let old = scope.handle(old);
+        let Some(n) = Object::to_numeric(vm, heap, state, old)? else {
+            return Ok(ctx.exception_word());
+        };
+        let old_num = if n.fract() == 0.0
+            && Smi::in_range(n as i64)
+            && !(n == 0.0 && n.is_sign_negative())
+        {
+            scope.handle(Smi::new(n as i64).into_tagged())
+        } else {
+            scope.handle(heap.new_number(n))
+        };
+        let new = heap.new_number(n + delta);
+        reg_write(regs, r, new);
+        Ok(old_num.as_tagged(heap))
+    })
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_inc_loc<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let v = incdec_cold(pc, code, regs, ctx, 1.0)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_dec_loc<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let v = incdec_cold(pc, code, regs, ctx, -1.0)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_equal<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
+        (Some(a), Some(b)) => Some(a == b),
+        _ => compare_cold(ctx, 0, acc, other)?,
+    };
+    let Some(b) = b else {
+        return Ok(ctx.exception_word());
+    };
+    let boolean = Convert::boolean(ctx.heap(), b);
+    become resume(next, code, regs, boolean, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_compare_jump<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let r = signed::read(pc, code, base, stride);
+    let kind = unsigned::read(pc, code, base + stride, stride);
+    let off = signed::read(pc, code, base + 2 * stride, stride);
+    let other = reg_read(regs, ctx.heap(), r);
+    let cmp = (kind / 2) as u8;
+    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
+        (Some(a), Some(b)) => Some(match cmp {
+            0 | 1 => a == b,
+            2 => a < b,
+            3 => a <= b,
+            4 => a > b,
+            _ => a >= b,
+        }),
+        _ => compare_cold(ctx, cmp, acc, other)?,
+    };
+    let Some(b) = b else {
+        return Ok(ctx.exception_word());
+    };
+    let boolean = Convert::boolean(ctx.heap(), b);
+    let dest = if b != (kind % 2 == 1) {
+        jump_target(pc, off)
+    } else {
+        next
+    };
+    become resume(dest, code, regs, boolean, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_named_load<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let name_idx = unsigned::read(pc, code, base + stride, stride);
+    let fb_slot = unsigned::read(pc, code, base + 2 * stride, stride);
+    let v = named_load_cold(ctx, recv, name_idx, fb_slot)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_keyed_load<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = keyed_load_cold(ctx, recv, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_keyed_load_imm<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let idx = unsigned::read(pc, code, base + stride, stride);
+    let v = keyed_load_imm_cold(ctx, recv, idx)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_keyed_store<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
+    let v = keyed_store_cold(ctx, recv, key, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_global_load<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let name_idx = unsigned::read(pc, code, base, stride);
+    let fb_slot = unsigned::read(pc, code, base + stride, stride);
+    let v = global_load_cold(ctx, name_idx, fb_slot)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_store_named<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let name_idx = unsigned::read(pc, code, base + stride, stride);
+    let fb_slot = unsigned::read(pc, code, base + 2 * stride, stride);
+    let v = store_named_cold(ctx, recv, name_idx, fb_slot, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_construct<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let callee = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let args_base = signed::read(pc, code, base + stride, stride);
+    let count = unsigned::read(pc, code, base + 2 * stride, stride);
+    let v = construct_cold(ctx, callee, args_base, count)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_create_closure<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let info_idx = unsigned::read(pc, code, base, stride);
+    let v = create_closure_cold(ctx, info_idx)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_create_function_context<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let scope_idx = unsigned::read(pc, code, base, stride);
+    let v = create_function_context_cold(ctx, scope_idx)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_proxy_apply<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let callee = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let args_base = signed::read(pc, code, base + stride, stride);
+    let count = unsigned::read(pc, code, base + 2 * stride, stride);
+    let v = proxy_apply_cold(ctx, callee, args_base, count)?;
+    become resume(next, code, regs, v, ctx)
+}
+
 const fn table_narrow() -> [Handler; 256] {
     let mut t = [op_trap as Handler; 256];
     t[Opcode::Load as usize] = op_load_n as Handler;
@@ -1383,6 +1766,8 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::LoadTrue as usize] = op_load_true_n as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_n as Handler;
     t[Opcode::Add as usize] = op_add_n as Handler;
+    t[Opcode::IncLoc as usize] = op_inc_loc_n as Handler;
+    t[Opcode::DecLoc as usize] = op_dec_loc_n as Handler;
     t[Opcode::Sub as usize] = op_sub_n as Handler;
     t[Opcode::Mul as usize] = op_mul_n as Handler;
     t[Opcode::Div as usize] = op_div_n as Handler;
@@ -1427,6 +1812,8 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::LoadTrue as usize] = op_load_true_w as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_w as Handler;
     t[Opcode::Add as usize] = op_add_w as Handler;
+    t[Opcode::IncLoc as usize] = op_inc_loc_w as Handler;
+    t[Opcode::DecLoc as usize] = op_dec_loc_w as Handler;
     t[Opcode::Sub as usize] = op_sub_w as Handler;
     t[Opcode::Mul as usize] = op_mul_w as Handler;
     t[Opcode::Div as usize] = op_div_w as Handler;
@@ -1542,6 +1929,7 @@ fn enter<'a>(
                 heap: heap as *mut Heap,
                 state: state as *const ContextState,
                 base_depth,
+                safepoints: Cell::new(SAFEPOINT_INTERVAL),
                 _heap: PhantomData,
             };
             let base = ctx.code_ptr();

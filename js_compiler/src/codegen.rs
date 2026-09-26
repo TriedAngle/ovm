@@ -1258,12 +1258,38 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         Ok(())
     }
 
+    /// The register behind a plain local/parameter operand whose read is
+    /// side-effect free (no TDZ check), if `e` is one.
+    fn simple_register(&mut self, e: &Expression<'_>) -> Option<Reg> {
+        let Expression::Identifier(ident) = e else {
+            return None;
+        };
+        self.simple_identifier_register(ident)
+    }
+
+    fn simple_identifier_register(&mut self, ident: &IdentifierReference<'_>) -> Option<Reg> {
+        match self.identifier_resolution(ident).ok()? {
+            IdRes::Slot(Slot::Param { index, hole_check: false }, 0) => Some(self.b.param(index)),
+            IdRes::Slot(Slot::Local { reg, hole_check: false }, 0) => Some(Reg::new(reg as i32)),
+            _ => None,
+        }
+    }
+
     fn binary_arith(
         &mut self,
         lhs: &Expression<'_>,
         rhs: &Expression<'_>,
         op: Opcode,
     ) -> Result<(), CompileError> {
+        // The arithmetic opcodes take their right operand as a register:
+        // when the right side is a plain local there is nothing to stage,
+        // `lhs op reg` computes the whole expression (evaluation order is
+        // preserved because lhs is still evaluated first).
+        if let Some(r) = self.simple_register(rhs) {
+            self.expr(lhs)?;
+            self.b.raw(op, &[r.operand()]);
+            return Ok(());
+        }
         self.expr(lhs)?;
         let a = self.b.stage_acc();
         self.expr(rhs)?;
@@ -1401,6 +1427,19 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let delta = delta.unsigned_abs();
 
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(i) = &u.argument {
+            // a plain local updates in place: `IncLoc`/`DecLoc` do the
+            // ToNumeric + step and leave the numeric old value in acc
+            if let Some(reg) = self.simple_identifier_register(i) {
+                let op = match u.operator {
+                    UpdateOperator::Increment => Opcode::IncLoc,
+                    UpdateOperator::Decrement => Opcode::DecLoc,
+                };
+                self.b.raw(op, &[reg.operand()]);
+                if u.prefix {
+                    self.b.load(reg);
+                }
+                return Ok(());
+            }
             self.emit_identifier(i)?;
             let mark = self.b.temp_depth();
             let orig = self.b.stage_acc();
