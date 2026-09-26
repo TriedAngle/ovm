@@ -1160,6 +1160,7 @@ fn is_extensible_entry_h<'a>(
 
 impl Proxy {
     /// Fast proxy check: one map-kind read.
+    #[inline]
     pub fn is_proxy<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
         // bit test on the already-loaded map kind, no kind decode/match
         v.as_heap_object()
@@ -1168,9 +1169,7 @@ impl Proxy {
 
     /// Whether `v` is a valid ECMAScript receiver ([[ProxyTarget]] /
     /// [[ProxyHandler]] validation, `Reflect.*` / `Object.*` argument
-    /// checks): a pure map-kind check —
-    /// the oddball singletons (`null`, `undefined`, `true`, `false`, …)
-    /// carry `ODDBALL`-kind maps and fall out naturally.
+    /// checks)
     pub fn is_js_receiver<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
         let Some(obj) = v.as_heap_object() else {
             return false;

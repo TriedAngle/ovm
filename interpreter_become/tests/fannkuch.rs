@@ -7,7 +7,10 @@ use vm_core::VM;
 #[test]
 fn fannkuch() {
     let src = [
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../benchmarks/fannkuch/fannkuch.js"),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../benchmarks/fannkuch/fannkuch.js"
+        ),
         "benchmarks/fannkuch/fannkuch.js",
     ]
     .iter()
@@ -18,9 +21,8 @@ fn fannkuch() {
         .add::<JSRuntime>()
         .unwrap();
     let mut thread = vm.attach();
-    thread.eval::<JavascriptCompiler>(&src).expect("fannkuch runs");
-    assert!(
-        thread.take_pending_exception().is_none(),
-        "fannkuch threw"
-    );
+    thread
+        .eval::<JavascriptCompiler>(&src)
+        .expect("fannkuch runs");
+    assert!(thread.take_pending_exception().is_none(), "fannkuch threw");
 }

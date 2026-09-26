@@ -7,15 +7,15 @@
 use core::cell::Cell;
 use core::marker::PhantomData;
 
-use bytecode::{Opcode, Scale, jump_target};
-use vm_core::ic::{ElementHit, Hit, InlineCache, StoreHit, StoreOutcomeKind};
+use bytecode::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode, jump_target};
+use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe, StoreHit, StoreOutcomeKind};
 use vm_core::proxy::Proxy;
 use vm_core::{
-    CallTarget, Coercion, Compare, Context, ContextInit, ContextState, Convert, Key, SlotName,
-    CallableInfoObject, DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, Handle, HandleSlice,
-    Heap, Hint, Interpreter, LoadOutcome, Lookup, Object, PropertyDescriptor,
-    Register, RuntimeContext, RuntimeIndex, ScopeInfo, Smi, Stack, StackCache, StoreOutcome,
-    StoreSemantics, Tagged, VM, Value, VmError,
+    CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
+    DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint,
+    Interpreter, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, Register, RuntimeContext,
+    RuntimeIndex, ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome, StoreSemantics,
+    Tagged, VM, Value, VmError,
 };
 
 pub struct BecomeInterpreter;
@@ -26,7 +26,9 @@ pub struct Ctx<'a> {
     vm: *const VM,
     heap: *mut Heap,
     state: *const ContextState,
-    base_depth: usize,
+    /// Anchor of the frame `execute` entered: a return at this anchor ends
+    /// the execution instead of unwinding into a caller.
+    base_anchor: usize,
     safepoints: Cell<u32>,
     /// numeric result parked between an arithmetic fast path and the
     /// boxing continuation (which must allocate, so it is out of line)
@@ -83,7 +85,7 @@ impl<'a> Ctx<'a> {
 
     #[inline(always)]
     fn code_ptr(&self) -> *const u8 {
-        self.cache().code_ref(self.heap()).as_slice().as_ptr()
+        self.cache().code_ref(self.heap()).as_ref().as_ptr()
     }
 
     #[inline(always)]
@@ -145,20 +147,21 @@ unsafe fn reg_write<'x, T: 'x>(regs: *mut Register, i: i32, v: Tagged<'x, T>) {
     (*regs.offset(i as isize)).store(v);
 }
 
-
-pub type Handler = for<'a> unsafe extern "rust-preserve-none" fn(
-    pc: usize,
-    code: *const u8,
-    regs: *mut Register,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-) -> Result<Tagged<'a, Value>, VmError>;
+pub type Handler =
+    for<'a> unsafe extern "rust-preserve-none" fn(
+        pc: usize,
+        code: *const u8,
+        regs: *mut Register,
+        acc: Tagged<'a, Value>,
+        ctx: &Ctx<'a>,
+    ) -> Result<Tagged<'a, Value>, VmError>;
 
 pub struct HandlerTable([Handler; 256]);
 
 macro_rules! helpers {
-    ($pc:ident, $code:ident, $regs:ident, $acc:ident, $ctx:ident, $stride:literal, $($arg:ident => $kind:ident),* $(,)?) => {
+    ($pc:ident, $code:ident, $regs:ident, $acc:ident, $ctx:ident, $op:ident, $stride:literal, $($arg:ident => $kind:ident),* $(,)?) => {
         const BASE: usize = if $stride == 2 { 2 } else { 1 };
+        const STAR: bool = star_lookahead(Opcode::$op);
         let mut _oi = BASE;
         $( let $arg = unsafe { $kind::read($pc, $code, _oi, $stride) }; _oi += $stride; )*
         #[allow(dead_code)]
@@ -184,10 +187,20 @@ macro_rules! helpers {
                 }
             };
         }
-        macro_rules! next { ($a:expr) => { dispatch!($pc + SIZE, $a, $regs) } }
+        macro_rules! next {
+            ($a:expr) => {{
+                let p = $pc + SIZE;
+                if STAR && unsafe { *$code.add(p) } == Opcode::Store as u8 {
+                    let r = unsafe { *$code.add(p + 1) } as i8 as i32;
+                    unsafe { reg_write($regs, r, $a) };
+                    dispatch!(p + 2, $a, $regs)
+                } else {
+                    dispatch!(p, $a, $regs)
+                }
+            }};
+        }
         macro_rules! jump { ($off:expr, $a:expr) => { dispatch!(jump_target($pc, $off), $a, $regs) } }
-        /// Re-entry after a cold call: the code object may have moved, so
-        /// the pc is re-derived from the (GC-updated) cache.
+
         macro_rules! reenter {
             ($pcrel:expr, $delta:expr, $a:expr) => {{
                 let p = $pcrel + $delta;
@@ -201,6 +214,38 @@ macro_rules! helpers {
     };
 }
 
+const fn star_lookahead(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Load
+            | Opcode::LoadSmi
+            | Opcode::LoadConstant
+            | Opcode::LoadZero
+            | Opcode::LoadUndefined
+            | Opcode::LoadNull
+            | Opcode::LoadTrue
+            | Opcode::LoadFalse
+            | Opcode::LoadHole
+            | Opcode::LoadGlobal
+            | Opcode::LoadNamedProperty
+            | Opcode::LoadKeyedProperty
+            | Opcode::LoadElementImm
+            | Opcode::LoadNewTarget
+            | Opcode::LoadContextSlot
+            | Opcode::AddRight
+            | Opcode::SubRight
+            | Opcode::MulRight
+            | Opcode::DivRight
+            | Opcode::AddLeft
+            | Opcode::SubLeft
+            | Opcode::MulLeft
+            | Opcode::DivLeft
+            | Opcode::AddImmediate
+            | Opcode::AddLoc
+            | Opcode::SubLoc
+    )
+}
+
 macro_rules! handlers {
     ($pc:ident, $code:ident, $regs:ident, $acc:ident, $ctx:ident; $( $op:ident : $n:ident / $w:ident ($($arg:ident => $kind:ident),*) $body:block )*) => {
         $(
@@ -209,7 +254,7 @@ macro_rules! handlers {
             unsafe extern "rust-preserve-none" fn $n<'a>(
                 $pc: usize, $code: *const u8, $regs: *mut Register, $acc: Tagged<'a, Value>, $ctx: &Ctx<'a>,
             ) -> Result<Tagged<'a, Value>, VmError> {
-                helpers!($pc, $code, $regs, $acc, $ctx, 1, $($arg => $kind),*);
+                helpers!($pc, $code, $regs, $acc, $ctx, $op, 1, $($arg => $kind),*);
                 $body
             }
             #[inline(never)]
@@ -217,13 +262,12 @@ macro_rules! handlers {
             unsafe extern "rust-preserve-none" fn $w<'a>(
                 $pc: usize, $code: *const u8, $regs: *mut Register, $acc: Tagged<'a, Value>, $ctx: &Ctx<'a>,
             ) -> Result<Tagged<'a, Value>, VmError> {
-                helpers!($pc, $code, $regs, $acc, $ctx, 2, $($arg => $kind),*);
+                helpers!($pc, $code, $regs, $acc, $ctx, $op, 2, $($arg => $kind),*);
                 $body
             }
         )*
     };
 }
-
 
 #[inline(never)]
 #[rustc_align(32)]
@@ -298,22 +342,20 @@ handlers!(pc, code, regs, acc, ctx;
         next!(ctx.heap().known().false_object.as_tagged(ctx.heap()).erase())
     }
 
-    Add : op_add_n / op_add_w (r => signed) {
+    AddRight : op_add_right_n / op_add_right_w (r => signed) {
         let other = reg!(r);
         if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
             && let Some(sum) = a.checked_add(b)
         {
             next!(Tagged::from_smi_bits(sum))
         }
-        // both operands already numbers: no ToPrimitive, no scopes; only
-        // a non-integral result needs the boxing continuation
         if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
             let sum = a + b;
             if let Some(s) = Smi::from_f64(sum) {
                 next!(s.into_tagged())
             }
             ctx.set_num(sum);
-            become cold_box_number(pc, code, regs, acc, ctx)
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_add(pc, code, regs, acc, ctx)
     }
@@ -358,7 +400,7 @@ handlers!(pc, code, regs, acc, ctx;
                 next!(v)
             }
             ctx.set_num(sum);
-            become cold_box_add_loc(pc, code, regs, acc, ctx)
+            become cold_box_add_loc(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_add_loc(pc, code, regs, acc, ctx)
     }
@@ -381,7 +423,7 @@ handlers!(pc, code, regs, acc, ctx;
                 next!(v)
             }
             ctx.set_num(diff);
-            become cold_box_sub_loc(pc, code, regs, acc, ctx)
+            become cold_box_sub_loc(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_sub_loc(pc, code, regs, acc, ctx)
     }
@@ -410,7 +452,7 @@ handlers!(pc, code, regs, acc, ctx;
         become cold_keyed_load_reg(pc, code, regs, acc, ctx)
     }
 
-    Sub : op_sub_n / op_sub_w (r => signed) {
+    SubRight : op_sub_right_n / op_sub_right_w (r => signed) {
         let other = reg!(r);
         if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
             && let Some(diff) = a.checked_sub(b)
@@ -423,15 +465,13 @@ handlers!(pc, code, regs, acc, ctx;
                 next!(s.into_tagged())
             }
             ctx.set_num(diff);
-            become cold_box_number(pc, code, regs, acc, ctx)
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_numeric(pc, code, regs, acc, ctx)
     }
 
-    Mul : op_mul_n / op_mul_w (r => signed) {
+    MulRight : op_mul_right_n / op_mul_right_w (r => signed) {
         let other = reg!(r);
-        // untag one side only: `a * other` then already is the encoded
-        // product, and checked_mul is the range check
         if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
             && let Some(product) = (a >> 1).checked_mul(b)
         {
@@ -443,12 +483,12 @@ handlers!(pc, code, regs, acc, ctx;
                 next!(s.into_tagged())
             }
             ctx.set_num(product);
-            become cold_box_number(pc, code, regs, acc, ctx)
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_numeric(pc, code, regs, acc, ctx)
     }
 
-    Div : op_div_n / op_div_w (r => signed) {
+    DivRight : op_div_right_n / op_div_right_w (r => signed) {
         let other = reg!(r);
         // the operand shifts cancel in `a / b`; the quotient is untagged
         // and needs a checked re-tag
@@ -466,15 +506,88 @@ handlers!(pc, code, regs, acc, ctx;
                 next!(s.into_tagged())
             }
             ctx.set_num(quotient);
-            become cold_box_number(pc, code, regs, acc, ctx)
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_numeric(pc, code, regs, acc, ctx)
     }
 
+    AddLeft : op_add_left_n / op_add_left_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
+            && let Some(sum) = a.checked_add(b)
+        {
+            next!(Tagged::from_smi_bits(sum))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
+            let sum = a + b;
+            if let Some(s) = Smi::from_f64(sum) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(sum);
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
+        }
+        become cold_add_left(pc, code, regs, acc, ctx)
+    }
+
+    SubLeft : op_sub_left_n / op_sub_left_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
+            && let Some(diff) = a.checked_sub(b)
+        {
+            next!(Tagged::from_smi_bits(diff))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
+            let diff = a - b;
+            if let Some(s) = Smi::from_f64(diff) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(diff);
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
+        }
+        become cold_numeric_left(pc, code, regs, acc, ctx)
+    }
+
+    MulLeft : op_mul_left_n / op_mul_left_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
+            && let Some(product) = (a >> 1).checked_mul(b)
+        {
+            next!(Tagged::from_smi_bits(product))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
+            let product = a * b;
+            if let Some(s) = Smi::from_f64(product) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(product);
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
+        }
+        become cold_numeric_left(pc, code, regs, acc, ctx)
+    }
+
+    DivLeft : op_div_left_n / op_div_left_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
+            && b != 0
+            && a % b == 0
+            && let Some(quotient) = a.checked_div(b)
+            && let Some(encoded) = quotient.checked_mul(2)
+        {
+            next!(Tagged::from_smi_bits(encoded))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
+            let quotient = a / b;
+            if let Some(s) = Smi::from_f64(quotient) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(quotient);
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
+        }
+        become cold_numeric_left(pc, code, regs, acc, ctx)
+    }
+
     Equal : op_equal_n / op_equal_w (r => signed) {
         let other = reg!(r);
-        // Smi == Smi is encoded-word equality; everything else (mixed,
-        // float, objects that may run user code) is the cold compare
         if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
             next!(Convert::boolean(ctx.heap(), a == b))
         }
@@ -566,7 +679,7 @@ handlers!(pc, code, regs, acc, ctx;
                 next!(s.into_tagged())
             }
             ctx.set_num(neg);
-            become cold_box_number(pc, code, regs, acc, ctx)
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_negate(pc, code, regs, acc, ctx)
     }
@@ -575,8 +688,6 @@ handlers!(pc, code, regs, acc, ctx;
         let other = reg!(r);
         let cmp = (kind / 2) as u8;
         let falsy_jump = kind % 2 == 1;
-        // encoded Smis compare in the same order as their values; anything
-        // else is the cold compare
         if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
             let b = match cmp {
                 0 | 1 => a == b,
@@ -638,13 +749,11 @@ handlers!(pc, code, regs, acc, ctx;
     }
 
     Return : op_return_n / op_return_w () {
-        if ctx.stack().frame_depth() == ctx.base_depth {
+        if ctx.cache().base() == ctx.base_anchor {
             return Ok(acc);
         }
-        let low = Stack::frame_low(&ctx.meta(pc));
-        let Some(caller) = ctx.stack().pop_frame(low) else {
-            bail!(VmError::Type);
-        };
+        let meta = ctx.meta(pc);
+        let caller = ctx.stack().pop_frame(&meta);
         ctx.cache().load(ctx.stack(), caller, ctx.heap_mut());
         let rel = ctx.cache().pc();
         let base = ctx.code_ptr();
@@ -653,13 +762,31 @@ handlers!(pc, code, regs, acc, ctx;
 
     LoadNamedProperty : op_load_named_n / op_load_named_w (r => signed, name => unsigned, fb => unsigned) {
         let recv = reg!(r);
-        if let Some(Hit::Value(v)) = InlineCache::try_load(
+        match InlineCache::probe_mono(
             ctx.heap(),
             ctx.cache().feedback_ref(ctx.heap()),
             fb,
             recv,
         ) {
-            next!(v)
+            MonoProbe::Value(v) => next!(v),
+            MonoProbe::Handler(obj, handler) => {
+                if let Some(Hit::Value(v)) = InlineCache::apply_mono(ctx.heap(), obj, handler) {
+                    next!(v)
+                }
+            }
+            MonoProbe::Poly {
+                obj,
+                map,
+                pairs,
+                start,
+            } => {
+                if let Some(Hit::Value(v)) =
+                    InlineCache::try_load_resume(ctx.heap(), obj, map, pairs, start)
+                {
+                    next!(v)
+                }
+            }
+            MonoProbe::Miss | MonoProbe::NotReceiver => {}
         }
         become cold_named_load(pc, code, regs, acc, ctx)
     }
@@ -712,7 +839,6 @@ handlers!(pc, code, regs, acc, ctx;
 
     StoreNamedProperty : op_store_named_n / op_store_named_w (r => signed, name => unsigned, fb => unsigned) {
         let recv = reg!(r);
-        // a cached bare-field handler writes in place: no scope, no lookup
         if InlineCache::try_store_fast(
             ctx.heap_mut(),
             ctx.cache().feedback_ref(ctx.heap()),
@@ -727,6 +853,15 @@ handlers!(pc, code, regs, acc, ctx;
 
     LoadContextSlot : op_load_context_slot_n / op_load_context_slot_w (slot => unsigned, depth => unsigned) {
         let meta = ctx.meta(0);
+        if depth == 0 {
+            let heap = ctx.heap();
+            let context_word = ctx.stack().context_slot(&meta).get(heap);
+            let context = unsafe { context_word.cast::<Context>() };
+            let slots = context.as_ref().slots.get(heap);
+            let slots = unsafe { slots.cast::<FixedArray>() };
+            let v = slots.as_ref().element_slot(slot).get(heap);
+            next!(v)
+        }
         let v = {
             let heap = ctx.heap();
             let Some(mut context) = ctx
@@ -831,11 +966,9 @@ handlers!(pc, code, regs, acc, ctx;
 
     CallNoFeedback : op_call_n / op_call_w (callee => signed, base => signed, count => unsigned) {
         let callee_word = reg!(callee);
-        if Proxy::is_proxy(ctx.heap(), callee_word) {
-            become cold_proxy_apply(pc, code, regs, acc, ctx)
-        }
         match Object::call_target(ctx.heap(), callee_word) {
             None => bail!(VmError::Type),
+            Some(CallTarget::Proxy(_)) => become cold_proxy_apply(pc, code, regs, acc, ctx),
             Some(CallTarget::Runtime(idx)) => {
                 let f = ctx.vm().runtime(RuntimeIndex(idx));
                 let meta = ctx.meta(0);
@@ -852,30 +985,29 @@ handlers!(pc, code, regs, acc, ctx;
                     Err(err) => ctx.raise(err),
                 }
             }
-            Some(CallTarget::Bytecode(target, register_count, kind)) => {
+            Some(CallTarget::Bytecode {
+                target,
+                info,
+                context,
+                register_count,
+                formal_min,
+                kind,
+                ..
+            }) => {
                 if kind.is_class_constructor() {
                     bail!(VmError::Type);
                 }
                 let heap = ctx.heap_mut();
                 let meta = ctx.meta(pc + SIZE);
-                let context = target
-                    .as_ref()
-                    .closure_context(heap)
-                    .expect("callable must have a closure context")
-                    .erase();
-                let formal_min = target
-                    .as_ref()
-                    .callable_info(heap)
-                    .map(|info| info.formal_parameter_count() + 1)
-                    .unwrap_or(1);
                 let undefined = heap.known().undefined.as_tagged(heap).erase();
                 let frame = ctx.stack().push_frame(
                     heap,
                     meta,
                     pc,
                     target.erase(),
+                    info,
                     register_count,
-                    context,
+                    context.erase(),
                     base,
                     count,
                     undefined,
@@ -888,6 +1020,126 @@ handlers!(pc, code, regs, acc, ctx;
                 let undefined = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
                 dispatch!(callee_pc, undefined, r, callee_base)
             }
+        }
+    }
+
+    CallMethod0 : op_call_method0_n / op_call_method0_w (callee => signed, recv => signed) {
+        let callee_word = reg!(callee);
+        match call_method_start(ctx, pc, SIZE, callee_word, &[recv])? {
+            MethodCall::Value(v) => {
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
+                reenter!(pc, SIZE, v)
+            }
+            MethodCall::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
+                dispatch!(p, u, r, b)
+            }
+            MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
+        }
+    }
+
+    CallMethod1 : op_call_method1_n / op_call_method1_w (callee => signed, recv => signed, arg0 => signed) {
+        let callee_word = reg!(callee);
+        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0])? {
+            MethodCall::Value(v) => {
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
+                reenter!(pc, SIZE, v)
+            }
+            MethodCall::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
+                dispatch!(p, u, r, b)
+            }
+            MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
+        }
+    }
+
+    CallMethod2 : op_call_method2_n / op_call_method2_w (callee => signed, recv => signed, arg0 => signed, arg1 => signed) {
+        let callee_word = reg!(callee);
+        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0, arg1])? {
+            MethodCall::Value(v) => {
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
+                reenter!(pc, SIZE, v)
+            }
+            MethodCall::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
+                dispatch!(p, u, r, b)
+            }
+            MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
+        }
+    }
+
+    CallFunction0 : op_call_function0_n / op_call_function0_w (callee => signed) {
+        let callee_word = reg!(callee);
+        match call_function_start(ctx, pc, SIZE, callee_word, &[])? {
+            MethodCall::Value(v) => {
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
+                reenter!(pc, SIZE, v)
+            }
+            MethodCall::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
+                dispatch!(p, u, r, b)
+            }
+            MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
+        }
+    }
+
+    CallFunction1 : op_call_function1_n / op_call_function1_w (callee => signed, arg0 => signed) {
+        let callee_word = reg!(callee);
+        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0])? {
+            MethodCall::Value(v) => {
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
+                reenter!(pc, SIZE, v)
+            }
+            MethodCall::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
+                dispatch!(p, u, r, b)
+            }
+            MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
+        }
+    }
+
+    CallFunction2 : op_call_function2_n / op_call_function2_w (callee => signed, arg0 => signed, arg1 => signed) {
+        let callee_word = reg!(callee);
+        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0, arg1])? {
+            MethodCall::Value(v) => {
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
+                reenter!(pc, SIZE, v)
+            }
+            MethodCall::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
+                dispatch!(p, u, r, b)
+            }
+            MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
         }
     }
 
@@ -970,7 +1222,9 @@ unsafe fn add_cold<'a>(
         if is_string.0 || is_string.1 {
             let a = scope.handle(Convert::to_string(heap, &scope, lhs)?);
             let b = scope.handle(Convert::to_string(heap, &scope, rhs)?);
-            Ok(DenseString::concat(heap, &scope, a, b).as_tagged(heap).erase())
+            Ok(DenseString::concat(heap, &scope, a, b)
+                .as_tagged(heap)
+                .erase())
         } else {
             let a = Convert::to_number(heap, lhs.as_tagged(heap))?;
             let b = Convert::to_number(heap, rhs.as_tagged(heap))?;
@@ -1010,14 +1264,27 @@ unsafe fn numeric_cold<'a>(
 #[inline(never)]
 unsafe extern "rust-preserve-none" fn cold_box_number<'a>(
     pc: usize,
-    code: *const u8,
-    regs: *mut Register,
+    _code: *const u8,
+    _regs: *mut Register,
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
-    let v = ctx.heap_mut().new_number(ctx.num());
-    become resume(next, code, regs, v, ctx)
+    let next = pc + packed_size(acc);
+    let v = ctx.heap_mut().new_float(ctx.num());
+    // the allocation may have moved the code object: re-derive both
+    // pointers from the cache/stack before dispatching
+    let code = ctx.code_ptr();
+    let regs = ctx.regs_ptr();
+    let h = TABLE_NARROW.0[*code.add(next) as usize];
+    become h(next, code, regs, v, ctx)
+}
+
+/// The instruction size a boxing continuation was entered with: the
+/// handlers pack `SIZE` into the (otherwise dead) accumulator argument.
+#[inline(always)]
+fn packed_size(acc: Tagged<'_, Value>) -> usize {
+    debug_assert!(acc.to_i64().is_some(), "boxing continuation lost its size");
+    acc.to_i64().unwrap_or(0) as usize
 }
 
 #[cold]
@@ -1025,16 +1292,19 @@ unsafe extern "rust-preserve-none" fn cold_box_number<'a>(
 unsafe extern "rust-preserve-none" fn cold_box_add_loc<'a>(
     pc: usize,
     code: *const u8,
-    regs: *mut Register,
+    _regs: *mut Register,
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
+    let next = pc + packed_size(acc);
     let dst = signed::read(pc, code, base, stride);
-    let v = ctx.heap_mut().new_number(ctx.num());
+    let v = ctx.heap_mut().new_float(ctx.num());
+    let regs = ctx.regs_ptr();
     reg_write(regs, dst, v);
-    become resume(next, code, regs, v, ctx)
+    let code = ctx.code_ptr();
+    let h = TABLE_NARROW.0[*code.add(next) as usize];
+    become h(next, code, regs, v, ctx)
 }
 
 #[cold]
@@ -1042,16 +1312,19 @@ unsafe extern "rust-preserve-none" fn cold_box_add_loc<'a>(
 unsafe extern "rust-preserve-none" fn cold_box_sub_loc<'a>(
     pc: usize,
     code: *const u8,
-    regs: *mut Register,
+    _regs: *mut Register,
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
+    let next = pc + packed_size(acc);
     let dst = signed::read(pc, code, base, stride);
-    let v = ctx.heap_mut().new_number(ctx.num());
+    let v = ctx.heap_mut().new_float(ctx.num());
+    let regs = ctx.regs_ptr();
     reg_write(regs, dst, v);
-    become resume(next, code, regs, v, ctx)
+    let code = ctx.code_ptr();
+    let h = TABLE_NARROW.0[*code.add(next) as usize];
+    become h(next, code, regs, v, ctx)
 }
 
 #[cold]
@@ -1176,7 +1449,9 @@ unsafe fn named_load_cold<'a>(
                     &scope,
                     ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
                     fb_slot,
-                    recv.as_tagged(heap).as_heap_object().map(|o| scope.handle(o)),
+                    recv.as_tagged(heap)
+                        .as_heap_object()
+                        .map(|o| scope.handle(o)),
                     scope.handle(name.as_tagged(heap).erase().as_name()),
                     true,
                 );
@@ -1292,15 +1567,7 @@ unsafe fn keyed_store_cold<'a>(
         let value = scope.handle(value);
         if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
             let name = scope.handle(raw_key.as_tagged(heap).erase());
-            return match Proxy::set(
-                vm,
-                heap,
-                state,
-                recv,
-                name,
-                value,
-                recv,
-            )? {
+            return match Proxy::set(vm, heap, state, recv, name, value, recv)? {
                 Coercion::Threw => Ok(ctx.exception_word()),
                 Coercion::Value(_) => Ok(value.as_tagged(heap).erase()),
             };
@@ -1309,37 +1576,35 @@ unsafe fn keyed_store_cold<'a>(
             return Ok(ctx.exception_word());
         };
         let key = scope.handle(key);
-        let name: Handle<'_, vm_core::SlotName> = match Lookup::classify_key(
-            heap,
-            key.as_tagged(heap).erase(),
-        )? {
-            Key::Element(i) => {
-                if recv
-                    .as_tagged(heap)
-                    .as_heap_object()
-                    .is_some_and(|obj| obj.as_ref().is_array(heap))
-                {
-                    let obj = scope
-                        .cast::<Object>(recv.as_tagged(heap))
-                        .expect("array receiver is an object");
-                    let grew = i >= obj.as_tagged(heap).as_ref().length();
-                    Object::store_array_element(heap, &scope, &obj, i, &value)?;
-                    if let Some(fb) = fb_slot {
-                        InlineCache::update_store_element(
-                            heap,
-                            &scope,
-                            ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                            fb,
-                            Some(recv),
-                            grew,
-                        );
+        let name: Handle<'_, vm_core::SlotName> =
+            match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
+                Key::Element(i) => {
+                    if recv
+                        .as_tagged(heap)
+                        .as_heap_object()
+                        .is_some_and(|obj| obj.as_ref().is_array(heap))
+                    {
+                        let obj = scope
+                            .cast::<Object>(recv.as_tagged(heap))
+                            .expect("array receiver is an object");
+                        let grew = i >= obj.as_tagged(heap).as_ref().length();
+                        Object::store_array_element(heap, &scope, &obj, i, &value)?;
+                        if let Some(fb) = fb_slot {
+                            InlineCache::update_store_element(
+                                heap,
+                                &scope,
+                                ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                                fb,
+                                Some(recv),
+                                grew,
+                            );
+                        }
+                        return Ok(value.as_tagged(heap).erase());
                     }
-                    return Ok(value.as_tagged(heap).erase());
+                    scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
                 }
-                scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
-            }
-            Key::Name(key) => scope.handle(key),
-        };
+                Key::Name(key) => scope.handle(key),
+            };
         let outcome = recv.as_tagged(heap).erase().store_lookup(
             heap,
             &scope,
@@ -1459,8 +1724,7 @@ unsafe fn store_named_cold<'a>(
                 StoreHit::Done => Ok(value.as_tagged(heap).erase()),
                 StoreHit::Setter(setter) => {
                     let setter = scope.handle(setter);
-                    let args =
-                        scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
+                    let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
                     let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
                     Ok(value.as_tagged(heap).erase())
                 }
@@ -1471,10 +1735,13 @@ unsafe fn store_named_cold<'a>(
             .as_tagged(heap)
             .as_heap_object()
             .map(|o| scope.handle(o.as_ref().map_ref(heap)));
-        let outcome = recv
-            .as_tagged(heap)
-            .erase()
-            .store_lookup(heap, &scope, name.as_tagged(heap), value.as_tagged(heap), StoreSemantics::Shadow)?;
+        let outcome = recv.as_tagged(heap).erase().store_lookup(
+            heap,
+            &scope,
+            name.as_tagged(heap),
+            value.as_tagged(heap),
+            StoreSemantics::Shadow,
+        )?;
         let kind = match outcome {
             StoreOutcome::Done => StoreOutcomeKind::Done,
             StoreOutcome::Transition { .. } => StoreOutcomeKind::Transition,
@@ -1503,8 +1770,7 @@ unsafe fn store_named_cold<'a>(
                 }
             }
             StoreOutcome::CallSetter { setter } => {
-                let args =
-                    scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
+                let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
                 let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
                 if let Some(prev) = prev {
                     InlineCache::update_store(
@@ -1568,13 +1834,12 @@ unsafe fn construct_cold<'a>(
         let callee = scope
             .cast::<Object>(callee.as_tagged(heap))
             .expect("constructible callee is an object");
-        let receiver = match Object::create_construct_receiver_value(
-            vm, heap, state, callee.erase(),
-        ) {
-            Ok(Some(r)) => scope.handle(r),
-            Ok(None) => return Ok(ctx.exception_word()),
-            Err(err) => return Err(err),
-        };
+        let receiver =
+            match Object::create_construct_receiver_value(vm, heap, state, callee.erase()) {
+                Ok(Some(r)) => scope.handle(r),
+                Ok(None) => return Ok(ctx.exception_word()),
+                Err(err) => return Err(err),
+            };
         let mut staged: Vec<Tagged<'_, Value>> = Vec::with_capacity(count + 1);
         staged.push(receiver.as_tagged(heap).erase());
         staged.extend(args.iter().map(|h| h.as_tagged(heap)));
@@ -1609,9 +1874,9 @@ unsafe fn create_closure_cold<'a>(
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let meta = ctx.meta(0);
-        let Some(info) = scope.cast::<CallableInfoObject>(
-            ctx.cache().constants_ref(heap).at(heap, info_idx),
-        ) else {
+        let Some(info) =
+            scope.cast::<CallableInfoObject>(ctx.cache().constants_ref(heap).at(heap, info_idx))
+        else {
             return Err(VmError::Type);
         };
         let context = scope
@@ -1682,6 +1947,30 @@ unsafe fn proxy_apply_cold<'a>(
     })
 }
 
+
+#[cold]
+#[inline(never)]
+unsafe fn proxy_apply_regs_cold<'a>(
+    ctx: &Ctx<'a>,
+    callee: Tagged<'_, Value>,
+    srcs: &[i32],
+) -> Result<Tagged<'a, Value>, VmError> {
+    let vm = ctx.vm();
+    let state = ctx.state();
+    let meta = ctx.meta(0);
+    let heap = ctx.heap_mut();
+    let (saved_top, staged) = ctx.stack().stage_args_regs(heap, &meta, srcs)?;
+    let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let callee = scope.handle(callee);
+        match Proxy::apply(vm, heap, state, callee, staged)? {
+            Coercion::Threw => Ok(ctx.exception_word()),
+            Coercion::Value(v) => Ok(v),
+        }
+    });
+    ctx.stack().set_top(saved_top);
+    result
+}
+
 #[inline(always)]
 unsafe fn cold_layout(pc: usize, code: *const u8) -> (usize, usize) {
     if *code.add(pc) == Opcode::Wide as u8 {
@@ -1694,13 +1983,16 @@ unsafe fn cold_layout(pc: usize, code: *const u8) -> (usize, usize) {
 #[inline(always)]
 unsafe fn cold_next_pc(pc: usize, code: *const u8) -> usize {
     let wide = *code.add(pc) == Opcode::Wide as u8;
-    let scale = if wide { Scale::Byte2 } else { Scale::Byte1 };
-    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + wide as usize)) };
-    pc + wide as usize + op.size(scale)
+    let op = *code.add(pc + wide as usize) as usize;
+    let size = if wide {
+        *OPERAND_SIZES_WIDE.get_unchecked(op)
+    } else {
+        *OPERAND_SIZES_NARROW.get_unchecked(op)
+    } as usize;
+    pc + wide as usize + 1 + size
 }
 
-/// Dispatch a cold-path result: the pending-exception sentinel is returned
-/// as-is, anything else resumes execution with fresh code/registers.
+
 #[inline(always)]
 unsafe extern "rust-preserve-none" fn resume<'a>(
     pc: usize,
@@ -1737,6 +2029,44 @@ unsafe extern "rust-preserve-none" fn cold_add<'a>(
 
 #[cold]
 #[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_add_left<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = add_cold(ctx, other, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_numeric_left<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
+    let f: fn(f64, f64) -> f64 = match op {
+        Opcode::SubLeft => |a, b| a - b,
+        Opcode::MulLeft => |a, b| a * b,
+        _ => |a, b| a / b,
+    };
+    let v = numeric_cold(ctx, other, acc, f)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
 unsafe extern "rust-preserve-none" fn cold_numeric<'a>(
     pc: usize,
     code: *const u8,
@@ -1749,8 +2079,8 @@ unsafe extern "rust-preserve-none" fn cold_numeric<'a>(
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
     let f: fn(f64, f64) -> f64 = match op {
-        Opcode::Sub => |a, b| a - b,
-        Opcode::Mul => |a, b| a * b,
+        Opcode::SubRight => |a, b| a - b,
+        Opcode::MulRight => |a, b| a * b,
         _ => |a, b| a / b,
     };
     let v = numeric_cold(ctx, acc, other, f)?;
@@ -1771,9 +2101,7 @@ unsafe extern "rust-preserve-none" fn cold_negate<'a>(
     become resume(next, code, regs, v, ctx)
 }
 
-/// The shared non-Smi body of `IncLoc`/`DecLoc`: ToNumeric the old value,
-/// store the stepped result back into its register and leave the numeric
-/// old value in the accumulator.
+
 #[cold]
 #[inline(never)]
 unsafe fn incdec_cold<'a>(
@@ -1788,7 +2116,6 @@ unsafe fn incdec_cold<'a>(
     let old = reg_read(regs, ctx.heap(), r);
     let heap = ctx.heap_mut();
     if let Some(bits) = old.smi_bits() {
-        // the Smi fast path already failed: the step left the range
         let new = heap.new_number((bits >> 1) as f64 + delta);
         reg_write(regs, r, new);
         return Ok(old);
@@ -1800,14 +2127,12 @@ unsafe fn incdec_cold<'a>(
         let Some(n) = Object::to_numeric(vm, heap, state, old)? else {
             return Ok(ctx.exception_word());
         };
-        let old_num = if n.fract() == 0.0
-            && Smi::in_range(n as i64)
-            && !(n == 0.0 && n.is_sign_negative())
-        {
-            scope.handle(Smi::new(n as i64).into_tagged())
-        } else {
-            scope.handle(heap.new_number(n))
-        };
+        let old_num =
+            if n.fract() == 0.0 && Smi::in_range(n as i64) && !(n == 0.0 && n.is_sign_negative()) {
+                scope.handle(Smi::new(n as i64).into_tagged())
+            } else {
+                scope.handle(heap.new_number(n))
+            };
         let new = heap.new_number(n + delta);
         reg_write(regs, r, new);
         Ok(old_num.as_tagged(heap))
@@ -1905,14 +2230,17 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
     let (base, stride) = cold_layout(pc, code);
     let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
+    let key = reg_read(
+        regs,
+        ctx.heap(),
+        signed::read(pc, code, base + stride, stride),
+    );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
     let v = keyed_load_cold(ctx, recv, key, Some(fb))?;
     become resume(next, code, regs, v, ctx)
 }
 
-/// Shared cold body of the comparison opcodes: `cmp` uses the
-/// `compare_cold` numbering (0 eq, 2 lt, 3 le, 4 gt, 5 ge).
+
 #[cold]
 #[inline(never)]
 unsafe fn compare_op_cold<'a>(
@@ -2087,7 +2415,11 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store<'a>(
     let (base, stride) = cold_layout(pc, code);
     let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
+    let key = reg_read(
+        regs,
+        ctx.heap(),
+        signed::read(pc, code, base + stride, stride),
+    );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
     let v = keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)?;
     become resume(next, code, regs, v, ctx)
@@ -2105,7 +2437,11 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store_no_shadow<'a>(
     let (base, stride) = cold_layout(pc, code);
     let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
+    let key = reg_read(
+        regs,
+        ctx.heap(),
+        signed::read(pc, code, base + stride, stride),
+    );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
     let v = keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)?;
     become resume(next, code, regs, v, ctx)
@@ -2144,6 +2480,128 @@ unsafe extern "rust-preserve-none" fn cold_store_named<'a>(
     let fb_slot = unsigned::read(pc, code, base + 2 * stride, stride);
     let v = store_named_cold(ctx, recv, name_idx, fb_slot, acc)?;
     become resume(next, code, regs, v, ctx)
+}
+
+enum MethodCall<'a> {
+    /// the call completed (runtime callee): the value or the exception
+    /// sentinel
+    Value(Tagged<'a, Value>),
+    /// a bytecode frame was pushed and the cache switched to it
+    Frame,
+    /// a callable proxy: the caller tail-calls the cold trap dispatch
+    Proxy,
+}
+
+#[inline(always)]
+unsafe fn call_method_start<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    callee_word: Tagged<'_, Value>,
+    srcs: &[i32],
+) -> Result<MethodCall<'a>, VmError> {
+    match Object::call_target(ctx.heap(), callee_word) {
+        None => Ok(MethodCall::Value(ctx.raise(VmError::Type)?)),
+        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
+        Some(CallTarget::Runtime(idx)) => {
+            let f = ctx.vm().runtime(RuntimeIndex(idx));
+            let meta = ctx.meta(0);
+            let (saved_top, args) = ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs)?;
+            let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
+            let result = f(nctx, args);
+            ctx.stack().set_top(saved_top);
+            match result {
+                Ok(v) => Ok(MethodCall::Value(v)),
+                Err(err) => Err(err),
+            }
+        }
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+            ..
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            let heap = ctx.heap_mut();
+            let meta = ctx.meta(pc + size);
+            let undefined = heap.known().undefined.as_tagged(heap).erase();
+            let frame = ctx.stack().push_frame_scattered(
+                heap,
+                meta,
+                pc,
+                target.erase(),
+                info,
+                register_count,
+                context.erase(),
+                srcs,
+                undefined,
+                formal_min,
+            )?;
+            ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
+            Ok(MethodCall::Frame)
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn call_function_start<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    callee_word: Tagged<'_, Value>,
+    args: &[i32],
+) -> Result<MethodCall<'a>, VmError> {
+    match Object::call_target(ctx.heap(), callee_word) {
+        None => Ok(MethodCall::Value(ctx.raise(VmError::Type)?)),
+        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
+        Some(CallTarget::Runtime(idx)) => {
+            let f = ctx.vm().runtime(RuntimeIndex(idx));
+            let meta = ctx.meta(0);
+            let (saved_top, staged) = ctx.stack().stage_function_args(ctx.heap(), &meta, args)?;
+            let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
+            let result = f(nctx, staged);
+            ctx.stack().set_top(saved_top);
+            match result {
+                Ok(v) => Ok(MethodCall::Value(v)),
+                Err(err) => Err(err),
+            }
+        }
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+            ..
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            let heap = ctx.heap_mut();
+            let meta = ctx.meta(pc + size);
+            let undefined = heap.known().undefined.as_tagged(heap).erase();
+            let frame = ctx.stack().push_frame_function(
+                heap,
+                meta,
+                pc,
+                target.erase(),
+                info,
+                register_count,
+                context.erase(),
+                args,
+                undefined,
+                formal_min,
+            )?;
+            ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
+            Ok(MethodCall::Frame)
+        }
+    }
 }
 
 #[cold]
@@ -2252,6 +2710,81 @@ unsafe extern "rust-preserve-none" fn cold_proxy_apply<'a>(
     become resume(next, code, regs, v, ctx)
 }
 
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_call_method_proxy<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let wide = *code.add(pc) == Opcode::Wide as u8;
+    let argc = match Opcode::from_byte_unchecked(*code.add(pc + wide as usize)) {
+        Opcode::CallMethod0 => 0usize,
+        Opcode::CallMethod1 => 1,
+        _ => 2,
+    };
+    let callee = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let mut srcs = [0i32; 3];
+    for (i, src) in srcs.iter_mut().enumerate().take(argc + 1) {
+        *src = signed::read(pc, code, base + (i + 1) * stride, stride);
+    }
+    let v = proxy_apply_regs_cold(ctx, callee, &srcs[..argc + 1])?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn proxy_apply_function_cold<'a>(
+    ctx: &Ctx<'a>,
+    callee: Tagged<'_, Value>,
+    args: &[i32],
+) -> Result<Tagged<'a, Value>, VmError> {
+    let vm = ctx.vm();
+    let state = ctx.state();
+    let meta = ctx.meta(0);
+    let heap = ctx.heap_mut();
+    let (saved_top, staged) = ctx.stack().stage_function_args(heap, &meta, args)?;
+    let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let callee = scope.handle(callee);
+        match Proxy::apply(vm, heap, state, callee, staged)? {
+            Coercion::Threw => Ok(ctx.exception_word()),
+            Coercion::Value(v) => Ok(v),
+        }
+    });
+    ctx.stack().set_top(saved_top);
+    result
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_call_function_proxy<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let wide = *code.add(pc) == Opcode::Wide as u8;
+    let argc = match Opcode::from_byte_unchecked(*code.add(pc + wide as usize)) {
+        Opcode::CallFunction0 => 0usize,
+        Opcode::CallFunction1 => 1,
+        _ => 2,
+    };
+    let callee = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let mut args = [0i32; 2];
+    for (i, arg) in args.iter_mut().enumerate().take(argc) {
+        *arg = signed::read(pc, code, base + (i + 1) * stride, stride);
+    }
+    let v = proxy_apply_function_cold(ctx, callee, &args[..argc])?;
+    become resume(next, code, regs, v, ctx)
+}
+
 const fn table_narrow() -> [Handler; 256] {
     let mut t = [op_trap as Handler; 256];
     t[Opcode::Load as usize] = op_load_n as Handler;
@@ -2264,15 +2797,19 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::LoadNull as usize] = op_load_null_n as Handler;
     t[Opcode::LoadTrue as usize] = op_load_true_n as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_n as Handler;
-    t[Opcode::Add as usize] = op_add_n as Handler;
+    t[Opcode::AddRight as usize] = op_add_right_n as Handler;
     t[Opcode::IncLoc as usize] = op_inc_loc_n as Handler;
     t[Opcode::DecLoc as usize] = op_dec_loc_n as Handler;
     t[Opcode::AddLoc as usize] = op_add_loc_n as Handler;
     t[Opcode::SubLoc as usize] = op_sub_loc_n as Handler;
     t[Opcode::LoadKeyedPropertyReg as usize] = op_load_keyed_reg_n as Handler;
-    t[Opcode::Sub as usize] = op_sub_n as Handler;
-    t[Opcode::Mul as usize] = op_mul_n as Handler;
-    t[Opcode::Div as usize] = op_div_n as Handler;
+    t[Opcode::SubRight as usize] = op_sub_right_n as Handler;
+    t[Opcode::MulRight as usize] = op_mul_right_n as Handler;
+    t[Opcode::DivRight as usize] = op_div_right_n as Handler;
+    t[Opcode::AddLeft as usize] = op_add_left_n as Handler;
+    t[Opcode::SubLeft as usize] = op_sub_left_n as Handler;
+    t[Opcode::MulLeft as usize] = op_mul_left_n as Handler;
+    t[Opcode::DivLeft as usize] = op_div_left_n as Handler;
     t[Opcode::Equal as usize] = op_equal_n as Handler;
     t[Opcode::LessThan as usize] = op_less_than_n as Handler;
     t[Opcode::GreaterThan as usize] = op_greater_than_n as Handler;
@@ -2302,6 +2839,12 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object_n as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime_n as Handler;
     t[Opcode::CallNoFeedback as usize] = op_call_n as Handler;
+    t[Opcode::CallMethod0 as usize] = op_call_method0_n as Handler;
+    t[Opcode::CallFunction0 as usize] = op_call_function0_n as Handler;
+    t[Opcode::CallFunction1 as usize] = op_call_function1_n as Handler;
+    t[Opcode::CallFunction2 as usize] = op_call_function2_n as Handler;
+    t[Opcode::CallMethod1 as usize] = op_call_method1_n as Handler;
+    t[Opcode::CallMethod2 as usize] = op_call_method2_n as Handler;
     t[Opcode::Construct as usize] = op_construct_n as Handler;
     t[Opcode::Wide as usize] = op_wide as Handler;
     t
@@ -2319,15 +2862,19 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::LoadNull as usize] = op_load_null_w as Handler;
     t[Opcode::LoadTrue as usize] = op_load_true_w as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_w as Handler;
-    t[Opcode::Add as usize] = op_add_w as Handler;
+    t[Opcode::AddRight as usize] = op_add_right_w as Handler;
     t[Opcode::IncLoc as usize] = op_inc_loc_w as Handler;
     t[Opcode::DecLoc as usize] = op_dec_loc_w as Handler;
     t[Opcode::AddLoc as usize] = op_add_loc_w as Handler;
     t[Opcode::SubLoc as usize] = op_sub_loc_w as Handler;
     t[Opcode::LoadKeyedPropertyReg as usize] = op_load_keyed_reg_w as Handler;
-    t[Opcode::Sub as usize] = op_sub_w as Handler;
-    t[Opcode::Mul as usize] = op_mul_w as Handler;
-    t[Opcode::Div as usize] = op_div_w as Handler;
+    t[Opcode::SubRight as usize] = op_sub_right_w as Handler;
+    t[Opcode::MulRight as usize] = op_mul_right_w as Handler;
+    t[Opcode::DivRight as usize] = op_div_right_w as Handler;
+    t[Opcode::AddLeft as usize] = op_add_left_w as Handler;
+    t[Opcode::SubLeft as usize] = op_sub_left_w as Handler;
+    t[Opcode::MulLeft as usize] = op_mul_left_w as Handler;
+    t[Opcode::DivLeft as usize] = op_div_left_w as Handler;
     t[Opcode::Equal as usize] = op_equal_w as Handler;
     t[Opcode::LessThan as usize] = op_less_than_w as Handler;
     t[Opcode::GreaterThan as usize] = op_greater_than_w as Handler;
@@ -2357,6 +2904,12 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object_w as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime_w as Handler;
     t[Opcode::CallNoFeedback as usize] = op_call_w as Handler;
+    t[Opcode::CallMethod0 as usize] = op_call_method0_w as Handler;
+    t[Opcode::CallFunction0 as usize] = op_call_function0_w as Handler;
+    t[Opcode::CallFunction1 as usize] = op_call_function1_w as Handler;
+    t[Opcode::CallFunction2 as usize] = op_call_function2_w as Handler;
+    t[Opcode::CallMethod1 as usize] = op_call_method1_w as Handler;
+    t[Opcode::CallMethod2 as usize] = op_call_method2_w as Handler;
     t[Opcode::Construct as usize] = op_construct_w as Handler;
     t
 }
@@ -2364,9 +2917,6 @@ const fn table_wide() -> [Handler; 256] {
 static TABLE_NARROW: HandlerTable = HandlerTable(table_narrow());
 static TABLE_WIDE: HandlerTable = HandlerTable(table_wide());
 
-// ---------------------------------------------------------------------------
-// entry
-// ---------------------------------------------------------------------------
 
 fn enter<'a>(
     vm: &'a VM,
@@ -2375,7 +2925,6 @@ fn enter<'a>(
     callable: Handle<'_, Object>,
     args: HandleSlice<'_>,
     new_target: Option<Handle<'a, Value>>,
-    base_depth: usize,
 ) -> Result<Tagged<'a, Value>, VmError> {
     if Proxy::is_proxy(heap, callable.as_tagged(heap).erase()) {
         return state.handle_scope(|scope| {
@@ -2398,6 +2947,8 @@ fn enter<'a>(
 
     match Object::call_target(heap, callable.as_tagged(heap).erase()) {
         None => Err(VmError::Type),
+        // the proxy dispatch above already intercepted these
+        Some(CallTarget::Proxy(_)) => Err(VmError::Type),
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
@@ -2406,7 +2957,15 @@ fn enter<'a>(
             state.stack().set_top(saved_top);
             result
         }
-        Some(CallTarget::Bytecode(target, register_count, kind)) => {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+            ..
+        }) => {
             if new_target.is_none() && kind.is_class_constructor() {
                 return Err(VmError::Type);
             }
@@ -2414,16 +2973,6 @@ fn enter<'a>(
             let cache = state.cache();
             let frame = {
                 let heap: &Heap = heap;
-                let context = target
-                    .as_ref()
-                    .closure_context(heap)
-                    .expect("callable must have a closure context")
-                    .erase();
-                let formal_min = target
-                    .as_ref()
-                    .callable_info(heap)
-                    .map(|info| info.formal_parameter_count() + 1)
-                    .unwrap_or(1);
                 let new_target_value = match &new_target {
                     Some(nt) => nt.as_tagged(heap).erase(),
                     None => heap.known().undefined.as_tagged(heap).erase(),
@@ -2431,8 +2980,9 @@ fn enter<'a>(
                 stack.push_initial_frame(
                     heap,
                     target.erase(),
+                    info,
                     register_count,
-                    context,
+                    context.erase(),
                     new_target_value,
                     args,
                     formal_min,
@@ -2444,7 +2994,7 @@ fn enter<'a>(
                 vm: vm as *const VM,
                 heap: heap as *mut Heap,
                 state: state as *const ContextState,
-                base_depth,
+                base_anchor: frame.base,
                 safepoints: Cell::new(SAFEPOINT_INTERVAL),
                 num: Cell::new(0.0),
                 _heap: PhantomData,
@@ -2471,21 +3021,16 @@ pub fn execute<'a>(
 
     let saved_top = stack.top();
     let was_active = cache.is_active();
-    if was_active {
-        stack.suspend_frame(cache.frame_meta());
-    }
-    let base_depth = stack.frame_depth();
+    let outer = was_active.then(|| cache.frame_meta());
 
     state.handle_scope(|scope| {
-        let result = enter(vm, heap, state, callable, args, new_target, base_depth)?;
+        let result = enter(vm, heap, state, callable, args, new_target)?;
         let rooted = scope.handle(result);
 
-        stack.truncate_frames(base_depth);
-        if was_active {
-            let outer = stack.pop_frame(saved_top).expect("suspended caller frame");
+        stack.set_top(saved_top);
+        if let Some(outer) = outer {
             cache.load(stack, outer, heap);
         } else {
-            stack.set_top(saved_top);
             cache.deactivate(heap);
         }
         Ok(rooted.as_tagged(heap))

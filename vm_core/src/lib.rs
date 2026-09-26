@@ -230,10 +230,7 @@ impl SharedVM {
         }
         let threads = self.threads.lock().unwrap();
         for state in threads.iter().filter_map(Weak::upgrade) {
-            state.handles.visit_edges(visitor);
-            state.stack.visit_edges(visitor);
-            state.cache.visit_edges(visitor);
-            visitor.visit(state.pending_exception.as_raw());
+            state.visit_edges(visitor);
         }
     }
 
@@ -336,7 +333,6 @@ impl Thread {
         args: &[Value],
     ) -> Result<Value, VmError> {
         debug_assert_eq!(self.state.stack.top(), 0);
-        debug_assert_eq!(self.state.stack.frame_depth(), 0);
         debug_assert!(!self.state.cache.is_active());
 
         // don't leak pending exception if it exists

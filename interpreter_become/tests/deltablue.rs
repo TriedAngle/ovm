@@ -30,9 +30,8 @@ fn deltablue() {
         .add::<JSRuntime>()
         .unwrap();
     let mut thread = vm.attach();
-    thread.eval::<JavascriptCompiler>(&src).expect("deltablue runs");
-    assert!(
-        thread.take_pending_exception().is_none(),
-        "deltablue threw"
-    );
+    thread
+        .eval::<JavascriptCompiler>(&src)
+        .expect("deltablue runs");
+    assert!(thread.take_pending_exception().is_none(), "deltablue threw");
 }

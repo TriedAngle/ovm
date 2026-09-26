@@ -157,6 +157,7 @@ impl<T> GcSlot<T> {
 }
 
 impl GcSlot<Smi> {
+    #[inline]
     pub fn to_smi(&self) -> Smi {
         Smi::decode(self.raw()).expect("GcSlot invariant violated")
     }
@@ -427,6 +428,14 @@ impl Register {
         unsafe { Tagged::from_value_unchecked(Value::from_bits(self.0.load())) }
     }
 
+    #[inline(always)]
+    pub fn read_smi_unchecked(&self) -> Smi {
+        let raw = self.0.load() as i64;
+        debug_assert!(raw & 1 == 0, "register does not hold a Smi");
+        Smi::new(raw >> 1)
+    }
+
+    #[inline]
     pub fn read_smi(&self) -> Smi {
         Smi::decode(Value::from_bits(self.0.load())).expect("register holds a Smi")
     }
@@ -626,6 +635,13 @@ impl Heap {
     /// A number value: a Smi when the double is an in-range integer, a
     /// freshly boxed Float otherwise. `-0.0` always boxes (it must not
     /// collapse into `+0`).
+    /// A heap number known not to be Smi-representable: skips the range
+    /// check (the boxing continuations already know the fast path failed).
+    #[inline]
+    pub fn new_float<'a>(&'a mut self, f: f64) -> Tagged<'a, Value> {
+        self.allocate::<Float>(f).erase()
+    }
+
     pub fn new_number<'a>(&'a mut self, f: f64) -> Tagged<'a, Value> {
         if let Some(s) = Smi::from_f64(f) {
             return s.into_tagged();

@@ -360,7 +360,7 @@ fn reglist_tail_extends_the_frame() {
     f.register_count = 2;
     assert_eq!(
         validate_function(&f, 0).unwrap_err(),
-        ValidationError::RegisterOutOfRange { pc: 0, reg: -7 }
+        ValidationError::RegisterOutOfRange { pc: 0, reg: -14 }
     );
 }
 

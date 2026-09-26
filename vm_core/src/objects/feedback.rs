@@ -32,8 +32,9 @@ impl FeedbackVector {
             .0
     }
 
+    #[inline(always)]
     pub fn len(&self) -> usize {
-        self.length.to_smi().value() as usize
+        self.length.to_smi_unchecked().value() as usize
     }
 
     pub fn is_empty(&self) -> bool {
@@ -95,6 +96,7 @@ impl EdgeVisitable for FeedbackVector {
 
 impl FeedbackVector {
     /// The `[state, handler]` pair of site `slot`, bounds-checked.
+    #[inline]
     pub fn site(&self, slot: usize) -> Option<(&MaybeWeakGcSlot, &MaybeWeakGcSlot)> {
         if slot + 1 >= self.len() {
             return None;

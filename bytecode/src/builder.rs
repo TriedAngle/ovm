@@ -95,8 +95,8 @@ macro_rules! acc_reg_op {
 
 /// The register file's first slot, in anchor-relative offsets: `r0` sits
 /// directly below the frame header (the ABI twin of
-/// `vm_core::stack::HEADER_SLOTS`, which occupies offsets -1..=-4).
-pub const REGISTER_FILE_START: i32 = -5;
+/// `vm_core::stack::HEADER_SLOTS`, which occupies offsets -1..=-11).
+pub const REGISTER_FILE_START: i32 = -12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Reg(i32);
@@ -110,11 +110,6 @@ impl Reg {
         self.0
     }
 
-    /// The operand IS the anchor-relative frame-slot offset : locals encode as `REGISTER_FILE_START - i` (the file
-    /// descends below the header), parameters as `j` (ascending above the
-    /// anchor, receiver = 0). The interpreter adds the operand to the
-    /// frame anchor to address the slot — one addition, no branch, no
-    /// runtime frame size.
     pub const fn operand(self) -> u32 {
         if self.0 >= 0 {
             (REGISTER_FILE_START - self.0) as u32
@@ -776,6 +771,51 @@ impl FnBuilder {
         self.emit_tracked(Opcode::CallNoFeedback, &[callee.operand(), base, count]);
     }
 
+    /// `acc = callee()` with the receiver implicitly `undefined`.
+    pub fn call_function0(&mut self, callee: Reg) {
+        self.emit_tracked(Opcode::CallFunction0, &[callee.operand()]);
+    }
+
+    /// `acc = callee(arg0)` with the receiver implicitly `undefined`.
+    pub fn call_function1(&mut self, callee: Reg, arg0: Reg) {
+        self.emit_tracked(Opcode::CallFunction1, &[callee.operand(), arg0.operand()]);
+    }
+
+    /// `acc = callee(arg0, arg1)` with the receiver implicitly `undefined`.
+    pub fn call_function2(&mut self, callee: Reg, arg0: Reg, arg1: Reg) {
+        self.emit_tracked(
+            Opcode::CallFunction2,
+            &[callee.operand(), arg0.operand(), arg1.operand()],
+        );
+    }
+
+    /// `acc = callee(recv)` with the receiver in its own register: no
+    /// contiguous argument window is built.
+    pub fn call_method0(&mut self, callee: Reg, recv: Reg) {
+        self.emit_tracked(Opcode::CallMethod0, &[callee.operand(), recv.operand()]);
+    }
+
+    /// `acc = callee(recv, arg0)`.
+    pub fn call_method1(&mut self, callee: Reg, recv: Reg, arg0: Reg) {
+        self.emit_tracked(
+            Opcode::CallMethod1,
+            &[callee.operand(), recv.operand(), arg0.operand()],
+        );
+    }
+
+    /// `acc = callee(recv, arg0, arg1)`.
+    pub fn call_method2(&mut self, callee: Reg, recv: Reg, arg0: Reg, arg1: Reg) {
+        self.emit_tracked(
+            Opcode::CallMethod2,
+            &[
+                callee.operand(),
+                recv.operand(),
+                arg0.operand(),
+                arg1.operand(),
+            ],
+        );
+    }
+
     pub fn call_runtime(&mut self, f: crate::RuntimeFn, args: RegList) {
         let [base, count] = args.operands();
         self.emit_tracked(Opcode::CallRuntime, &[f as u32, base, count]);
@@ -809,11 +849,11 @@ impl FnBuilder {
             self.emit_tracked(Opcode::AddImmediate, &[r.operand(), imm as u32]);
             return;
         }
-        self.emit_tracked(Opcode::Add, &[r.operand()]);
+        self.emit_tracked(Opcode::AddRight, &[r.operand()]);
     }
-    acc_reg_op!(sub, Sub);
-    acc_reg_op!(mul, Mul);
-    acc_reg_op!(div, Div);
+    acc_reg_op!(sub, SubRight);
+    acc_reg_op!(mul, MulRight);
+    acc_reg_op!(div, DivRight);
     acc_reg_op!(mod_, Mod);
     acc_reg_op!(exp, Exp);
     acc_reg_op!(bitwise_or, BitwiseOr);
@@ -822,6 +862,12 @@ impl FnBuilder {
     acc_reg_op!(shift_left, ShiftLeft);
     acc_reg_op!(shift_right, ShiftRight);
     acc_reg_op!(shift_right_logical, ShiftRightLogical);
+
+    // reversed forms: acc = reg op acc (deferred left operand)
+    acc_reg_op!(add_left, AddLeft);
+    acc_reg_op!(sub_left, SubLeft);
+    acc_reg_op!(mul_left, MulLeft);
+    acc_reg_op!(div_left, DivLeft);
 
     /// `dst = dst + src` in place; acc = the result.
     pub fn add_loc(&mut self, dst: Reg, src: Reg) {

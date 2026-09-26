@@ -276,10 +276,10 @@ define_opcodes! {
     LoadCurrentClosure { operands: [], acc: writes, indices: [] }, // -> acc
 
     // -- binary arithmetic: acc = acc op reg --------------------------------
-    Add { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    Sub { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    Mul { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    Div { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    AddRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    SubRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    MulRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    DivRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     Mod { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     Exp { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     BitwiseOr { operands: [Register], acc: reads_writes, indices: [Unchecked] },
@@ -340,4 +340,20 @@ define_opcodes! {
     SubLoc { operands: [Register, Register], acc: writes, writes_reg: 0, indices: [Unchecked, Unchecked] },
     /// Keyed read with the key in a register: `acc = regs[recv][regs[key]]`.
     LoadKeyedPropertyReg { operands: [Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },
+
+
+    AddLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    SubLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    MulLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    DivLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+
+
+    CallFunction0 { operands: [Register], acc: writes, indices: [Unchecked] },                              // callee -> acc
+    CallFunction1 { operands: [Register, Register], acc: writes, indices: [Unchecked, Unchecked] },          // callee, arg0 -> acc
+    CallFunction2 { operands: [Register, Register, Register], acc: writes, indices: [Unchecked, Unchecked, Unchecked] }, // callee, arg0, arg1 -> acc
+
+
+    CallMethod0 { operands: [Register, Register], acc: writes, indices: [Unchecked, Unchecked] },                              // callee, receiver -> acc
+    CallMethod1 { operands: [Register, Register, Register], acc: writes, indices: [Unchecked, Unchecked, Unchecked] },          // callee, receiver, arg0 -> acc
+    CallMethod2 { operands: [Register, Register, Register, Register], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Unchecked] }, // callee, receiver, arg0, arg1 -> acc
 }

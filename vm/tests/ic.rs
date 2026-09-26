@@ -323,8 +323,8 @@ fn prototype_hit_installs_one_hop_handler() {
         .get_as::<WeakFixedArray>()
         .expect("one-hop handler array");
     let heap = thread.heap();
-    // [Smi ProtoField|offset, weak holder map, Smi 0]
-    assert_eq!(chain.as_ref().len(), 3);
+    // [Smi ProtoField|offset, weak holder map] (accessors carry a third word)
+    assert_eq!(chain.as_ref().len(), 2);
     let head = decode_handler(chain.as_ref().get(heap, 0).raw()).expect("kind Smi");
     assert_eq!(head.0, 6, "ProtoField kind");
     // after the prototype map changes (delete p.x), behavior stays correct —

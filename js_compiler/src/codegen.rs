@@ -285,13 +285,48 @@ fn is_simple(p: &BindingPattern<'_>) -> bool {
     matches!(p, BindingPattern::BindingIdentifier(_))
 }
 
+/// The deferred-left form of `op`: `acc = reg op acc` (`None` when no
+/// reversed opcode exists, in which case the left operand must be staged).
+fn left_variant(op: Opcode) -> Option<Opcode> {
+    Some(match op {
+        Opcode::AddRight => Opcode::AddLeft,
+        Opcode::SubRight => Opcode::SubLeft,
+        Opcode::MulRight => Opcode::MulLeft,
+        Opcode::DivRight => Opcode::DivLeft,
+        _ => return None,
+    })
+}
+
+/// Whether evaluating `e` can write a non-captured local (and thus whether
+/// a register left operand may be read after it). A call runs in its own
+/// frame and cannot reach our locals, but the callee/argument expressions
+/// can contain assignments: any assignment or update in the subtree makes
+/// this conservative.
+fn rhs_cannot_clobber_locals(e: &Expression<'_>) -> bool {
+    struct Scan {
+        assigns: bool,
+    }
+    impl<'a> oxc_ast_visit::Visit<'a> for Scan {
+        fn visit_assignment_expression(&mut self, _it: &oxc_ast::ast::AssignmentExpression<'a>) {
+            self.assigns = true;
+        }
+        fn visit_update_expression(&mut self, _it: &oxc_ast::ast::UpdateExpression<'a>) {
+            self.assigns = true;
+        }
+    }
+    use oxc_ast_visit::Visit as _;
+    let mut scan = Scan { assigns: false };
+    scan.visit_expression(e);
+    !scan.assigns
+}
+
 fn arith_opcode(op: BinaryOperator) -> Option<Opcode> {
     use BinaryOperator as Op;
     Some(match op {
-        Op::Addition => Opcode::Add,
-        Op::Subtraction => Opcode::Sub,
-        Op::Multiplication => Opcode::Mul,
-        Op::Division => Opcode::Div,
+        Op::Addition => Opcode::AddRight,
+        Op::Subtraction => Opcode::SubRight,
+        Op::Multiplication => Opcode::MulRight,
+        Op::Division => Opcode::DivRight,
         Op::Remainder => Opcode::Mod,
         Op::Exponential => Opcode::Exp,
         Op::ShiftLeft => Opcode::ShiftLeft,
@@ -1241,10 +1276,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             _ => {
                 let op = match b.operator {
-                    Op::Addition => Opcode::Add,
-                    Op::Subtraction => Opcode::Sub,
-                    Op::Multiplication => Opcode::Mul,
-                    Op::Division => Opcode::Div,
+                    Op::Addition => Opcode::AddRight,
+                    Op::Subtraction => Opcode::SubRight,
+                    Op::Multiplication => Opcode::MulRight,
+                    Op::Division => Opcode::DivRight,
                     Op::Remainder => Opcode::Mod,
                     Op::Exponential => Opcode::Exp,
                     Op::BitwiseOR => Opcode::BitwiseOr,
@@ -1333,6 +1368,28 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.expr(lhs)?;
             self.b.raw(op, &[r.operand()]);
             return Ok(());
+        }
+        // Deferred left: evaluate the right side into the accumulator,
+        // then fold the left operand in with the reversed opcode. The
+        // left value must survive the right side untouched: a staged copy
+        // always does, a register only when no direct eval or assignment
+        // in the right side can write it (a call cannot — locals are not
+        // reachable from the callee).
+        if let Some(left_op) = left_variant(op) {
+            if let Some(left) = self.simple_register(lhs) {
+                if rhs_cannot_clobber_locals(rhs) {
+                    self.expr(rhs)?;
+                    self.b.raw(left_op, &[left.operand()]);
+                    return Ok(());
+                }
+            } else {
+                self.expr(lhs)?;
+                let a = self.b.stage_acc();
+                self.expr(rhs)?;
+                self.b.raw(left_op, &[a.operand()]);
+                self.b.drop_temp();
+                return Ok(());
+            }
         }
         self.expr(lhs)?;
         let a = self.b.stage_acc();
@@ -1444,11 +1501,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     self.simple_register(value),
                 ) {
                     match op {
-                        Opcode::Add => {
+                        Opcode::AddRight => {
                             self.b.add_loc(dst, src);
                             return Ok(());
                         }
-                        Opcode::Sub => {
+                        Opcode::SubRight => {
                             self.b.sub_loc(dst, src);
                             return Ok(());
                         }
@@ -1501,7 +1558,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             UpdateOperator::Increment => 1,
             UpdateOperator::Decrement => -1,
         };
-        let arith = if delta > 0 { Opcode::Add } else { Opcode::Sub };
+        let arith = if delta > 0 {
+            Opcode::AddRight
+        } else {
+            Opcode::SubRight
+        };
         let delta = delta.unsigned_abs();
 
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(i) = &u.argument {
@@ -2275,7 +2336,28 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         c: &CallExpression<'_>,
         load_method: impl FnOnce(&mut Self) -> Result<Reg, CompileError>,
     ) -> Result<(), CompileError> {
-        let argc = c.arguments.len() as u32;
+        let argc = c.arguments.len();
+        // zero to two arguments: the call opcode takes callee, receiver and
+        // arguments as independent registers, so no window is built and the
+        // receiver is never copied
+        if argc <= 2 {
+            let mark = self.b.temp_depth();
+            let recv = load_method(self)?;
+            let callee = self.b.stage_acc();
+            let mut args = [Reg::new(0); 2];
+            for (i, arg) in c.arguments.iter().enumerate() {
+                self.call_argument(arg)?;
+                args[i] = self.b.stage_acc();
+            }
+            match argc {
+                0 => self.b.call_method0(callee, recv),
+                1 => self.b.call_method1(callee, recv, args[0]),
+                _ => self.b.call_method2(callee, recv, args[0], args[1]),
+            }
+            self.b.drop_temps(mark);
+            return Ok(());
+        }
+        let argc = argc as u32;
         let mark = self.b.temp_depth();
         let recv = load_method(self)?;
         // the window is [args_base .. args_base+argc]: element 0 (the
@@ -2312,8 +2394,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         if let Expression::StaticMemberExpression(s) = &c.callee {
             let name_idx = self.b.name(s.property.name.as_bytes());
             return self.emit_method_call(c, |g| {
-                g.expr(&s.object)?;
-                let recv = g.b.stage_acc();
+                let recv = match g.simple_register(&s.object) {
+                    Some(r) => r,
+                    None => {
+                        g.expr(&s.object)?;
+                        g.b.stage_acc()
+                    }
+                };
                 let feedback = g.b.new_feedback();
                 g.b.load_named_property(recv, name_idx, feedback);
                 Ok(recv)
@@ -2321,8 +2408,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
         if let Expression::ComputedMemberExpression(cm) = &c.callee {
             return self.emit_method_call(c, |g| {
-                g.expr(&cm.object)?;
-                let recv = g.b.stage_acc();
+                let recv = match g.simple_register(&cm.object) {
+                    Some(r) => r,
+                    None => {
+                        g.expr(&cm.object)?;
+                        g.b.stage_acc()
+                    }
+                };
                 g.expr(&cm.expression)?;
                 let feedback = g.b.new_feedback();
                 g.b.load_keyed_property(recv, feedback);
@@ -2334,7 +2426,25 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
         // plain call: receiver = undefined (slot 0), callee evaluated
         // first, then arguments
-        let argc = c.arguments.len() as u32;
+        let argc = c.arguments.len();
+        if argc <= 2 {
+            let mark = self.b.temp_depth();
+            self.expr(&c.callee)?;
+            let callee = self.b.stage_acc();
+            let mut args = [Reg::new(0); 2];
+            for (i, arg) in c.arguments.iter().enumerate() {
+                self.call_argument(arg)?;
+                args[i] = self.b.stage_acc();
+            }
+            match argc {
+                0 => self.b.call_function0(callee),
+                1 => self.b.call_function1(callee, args[0]),
+                _ => self.b.call_function2(callee, args[0], args[1]),
+            }
+            self.b.drop_temps(mark);
+            return Ok(());
+        }
+        let argc = argc as u32;
         let mark = self.b.temp_depth();
         self.expr(&c.callee)?;
         let args_base = self.b.reserve_temps(argc + 2);

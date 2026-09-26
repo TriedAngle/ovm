@@ -7,7 +7,7 @@ pub use builder::{
     BuildError, ConstIdx, Feedback, FnBuilder, FunctionMeta, Label, REGISTER_FILE_START, Reg,
     RegList, RtArg, TryBlock,
 };
-pub use opcodes::Opcode;
+pub use opcodes::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode};
 pub use program::{
     CallableKind, CompileFn, Constant, FrontendError, FrontendErrorKind, Function, FunctionId,
     HandlerEntry, Program, SourceMode,

@@ -47,6 +47,28 @@ fn decode_smi(word: Tagged<'_, MaybeWeak<Value>>) -> Option<(i64, i64)> {
     Some((v & 0xff, v >> 8))
 }
 
+/// Result of the inlined monomorphic probe (see [`InlineCache::probe_mono`]).
+pub enum MonoProbe<'a> {
+    /// a hot-kind handler (bare field / one-hop prototype field) loaded
+    /// inline
+    Value(Tagged<'a, Value>),
+    /// mono (or first-pair poly) match whose handler needs the out-of-line
+    /// application (accessors, chains, slow)
+    Handler(Tagged<'a, Object>, Tagged<'a, MaybeWeak<Value>>),
+    /// a polymorphic site whose first pair was tried inline: continue the
+    /// search from `start`
+    Poly {
+        obj: Tagged<'a, Object>,
+        map: Tagged<'a, Map>,
+        pairs: Tagged<'a, WeakFixedArray>,
+        start: usize,
+    },
+    /// megamorphic / weak mismatch / unusable state: go cold
+    Miss,
+    /// not a heap receiver (or no feedback): the cold path decides
+    NotReceiver,
+}
+
 /// Result of a load hit.
 pub enum Hit<'a> {
     Value(Tagged<'a, Value>),
@@ -83,6 +105,7 @@ pub enum StoreOutcomeKind {
 
 /// `Some` only for ordinary JSReceiver objects (not proxies): the only
 /// receivers whose lookups the map walk fully describes.
+#[inline(always)]
 fn ic_receiver<'a>(receiver: Tagged<'a, Value>, heap: &'a Heap) -> Option<Tagged<'a, Object>> {
     let obj = receiver.as_heap_object()?;
     let kind = obj.map_ref(heap).kind();
@@ -93,6 +116,7 @@ fn ic_receiver<'a>(receiver: Tagged<'a, Value>, heap: &'a Heap) -> Option<Tagged
 }
 
 /// Handler word for `map`'s monomorphic or polymorphic entry.
+#[inline(always)]
 fn probe<'a>(
     heap: &'a Heap,
     vector: Tagged<'a, FeedbackVector>,
@@ -366,16 +390,21 @@ fn build_proto_array<'s>(
     holder_map: &Handle<'_, Map>,
     pair: Option<&Handle<'_, AccessorPair>>,
 ) -> Handle<'s, WeakFixedArray> {
-    heap.allocate_token_enter_heap(WeakFixedArray::<Value>::layout_for(3), |token, heap| {
-        let words: [Tagged<'_, MaybeWeak<Value>>; 3] = [
+    // a data field needs only [kind|offset, weak holder map]; accessors
+    // carry the weak pair in a third word
+    let len = if pair.is_some() { 3 } else { 2 };
+    heap.allocate_token_enter_heap(WeakFixedArray::<Value>::layout_for(len), |token, heap| {
+        let mut words: [Tagged<'_, MaybeWeak<Value>>; 3] = [
             kind_smi(kind, offset).into_tagged().as_maybe_weak(),
             holder_map.as_tagged(heap).erase().as_weak(),
-            match pair {
-                Some(pair) => pair.as_tagged(heap).erase().as_weak(),
-                None => Smi::new(0).into_tagged().as_maybe_weak(),
-            },
+            Smi::new(0).into_tagged().as_maybe_weak(),
         ];
-        let arr = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &words });
+        if let Some(pair) = pair {
+            words[2] = pair.as_tagged(heap).erase().as_weak();
+        }
+        let arr = token.allocate::<WeakFixedArray>(WeakFixedArrayInit {
+            values: &words[..len],
+        });
         scope.handle(arr)
     })
 }
@@ -512,23 +541,73 @@ fn analyze_load<'s>(
     }
 }
 
-/// Interpreter-facing entry points.
 pub struct InlineCache;
 
-/// Execute one load handler word; dead payloads are a miss.
-fn apply_load_handler<'a>(
+#[inline(always)]
+fn apply_fast<'a>(
     heap: &'a Heap,
     receiver: Tagged<'a, Object>,
     handler: Tagged<'a, MaybeWeak<Value>>,
 ) -> Option<Hit<'a>> {
     if !handler.raw().is_ptr() {
         let (kind, payload) = decode_smi(handler)?;
-        return match kind {
-            KIND_FIELD => Some(Hit::Value(receiver.slot(heap, payload as usize).get(heap))),
-            _ => None,
-        };
+        return (kind == KIND_FIELD)
+            .then(|| Hit::Value(receiver.slot(heap, payload as usize).get(heap)));
     }
-    let chain = handler.as_strong()?.get_as::<WeakFixedArray>()?;
+    // Safety: a non-Smi load handler is always a WeakFixedArray written by
+    // this module (stores use a weak map, loads never do).
+    let chain = unsafe { handler.cast::<WeakFixedArray>() };
+    let chain_ref = chain.as_ref();
+    let (kind, payload) = decode_smi(chain_ref.get(heap, 0))?;
+    if kind != CHAIN_PROTO_FIELD {
+        return None;
+    }
+    let holder = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
+    Some(Hit::Value(holder.slot(heap, payload as usize).get(heap)))
+}
+
+#[inline(always)]
+fn apply_field_only<'a>(
+    heap: &'a Heap,
+    receiver: Tagged<'a, Object>,
+    handler: Tagged<'a, MaybeWeak<Value>>,
+) -> Option<Tagged<'a, Value>> {
+    if handler.raw().is_ptr() {
+        return None;
+    }
+    let (kind, payload) = decode_smi(handler)?;
+    (kind == KIND_FIELD).then(|| receiver.slot(heap, payload as usize).get(heap))
+}
+
+#[inline(always)]
+fn apply_load_handler<'a>(
+    heap: &'a Heap,
+    receiver: Tagged<'a, Object>,
+    handler: Tagged<'a, MaybeWeak<Value>>,
+) -> Option<Hit<'a>> {
+    if let Some(hit) = apply_fast(heap, receiver, handler) {
+        return Some(hit);
+    }
+    if !handler.raw().is_ptr() {
+        return None;
+    }
+    apply_rest(heap, receiver, handler)
+}
+
+#[inline(never)]
+fn apply_rest<'a>(
+    heap: &'a Heap,
+    receiver: Tagged<'a, Object>,
+    handler: Tagged<'a, MaybeWeak<Value>>,
+) -> Option<Hit<'a>> {
+    // Safety: a non-Smi load handler is always a WeakFixedArray written by
+    // this module (stores use a weak map, loads never do).
+    debug_assert!(
+        handler
+            .as_strong()
+            .is_some_and(|h| h.get_as::<WeakFixedArray>().is_some())
+    );
+    let chain = unsafe { handler.as_strong()?.cast::<WeakFixedArray>() };
     let chain_ref = chain.as_ref();
     let head = decode_smi(chain_ref.get(heap, 0))?;
     match head.0 {
@@ -538,10 +617,8 @@ fn apply_load_handler<'a>(
         }
         CHAIN_PROTO_ACCESSOR => {
             proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
-            let pair = chain_ref
-                .get(heap, 2)
-                .as_strong()?
-                .get_as::<AccessorPair>()?;
+            // Safety: proto-accessor chains store the pair weakly at 2.
+            let pair = unsafe { chain_ref.get(heap, 2).as_strong()?.cast::<AccessorPair>() };
             let getter = pair.get.get(heap);
             Some(if getter == heap.known().undefined.as_tagged(heap) {
                 Hit::Value(heap.known().undefined.as_tagged(heap).erase())
@@ -554,10 +631,9 @@ fn apply_load_handler<'a>(
             match head.0 {
                 CHAIN_FIELD => Some(Hit::Value(holder.slot(heap, head.1 as usize).get(heap))),
                 CHAIN_ACCESSOR => {
-                    let pair = chain_ref
-                        .get(heap, 1)
-                        .as_strong()?
-                        .get_as::<AccessorPair>()?;
+                    // Safety: accessor chains store the pair weakly at 1.
+                    let pair =
+                        unsafe { chain_ref.get(heap, 1).as_strong()?.cast::<AccessorPair>() };
                     let getter = pair.get.get(heap);
                     Some(if getter == heap.known().undefined.as_tagged(heap) {
                         Hit::Value(heap.known().undefined.as_tagged(heap).erase())
@@ -580,14 +656,19 @@ fn apply_load_handler<'a>(
     }
 }
 
-/// Resolve a one-hop prototype handler: the recorded holder map must still
-/// describe the receiver's direct prototype.
+#[inline(always)]
 fn proto_holder<'a>(
     heap: &'a Heap,
     receiver: Tagged<'a, Object>,
     expected: Tagged<'a, MaybeWeak<Value>>,
 ) -> Option<Tagged<'a, Object>> {
-    let expected = expected.as_strong()?.get_as::<Map>()?;
+    // Safety: one-hop handlers store the holder map weakly in this slot.
+    debug_assert!(
+        expected
+            .as_strong()
+            .is_some_and(|m| m.get_as::<Map>().is_some())
+    );
+    let expected = unsafe { expected.as_strong()?.cast::<Map>() };
     let proto = receiver.map_ref(heap).prototype.get(heap);
     let holder = proto.as_heap_object()?;
     holder.map_ref(heap).ptr_eq(expected).then_some(holder)
@@ -712,7 +793,6 @@ fn store_handler<'s>(
     }
 }
 
-/// A decoded store handler, rooted for the mutating phase.
 enum StoreAction<'s> {
     Field(usize),
     Transition(Handle<'s, Map>),
@@ -722,6 +802,87 @@ enum StoreAction<'s> {
 }
 
 impl InlineCache {
+    #[inline(always)]
+    pub fn probe_mono<'a>(
+        heap: &'a Heap,
+        vector: Option<Tagged<'a, FeedbackVector>>,
+        slot: usize,
+        receiver: Tagged<'a, Value>,
+    ) -> MonoProbe<'a> {
+        let Some(vector) = vector else {
+            return MonoProbe::NotReceiver;
+        };
+        let Some(obj) = receiver.as_heap_object() else {
+            return MonoProbe::NotReceiver;
+        };
+        let map = obj.map_ref(heap);
+        let Some((state_slot, handler_slot)) = vector.as_ref().site(slot) else {
+            return MonoProbe::NotReceiver;
+        };
+        let state = state_slot.get(heap);
+
+        if state.raw().to_bits() == (map.raw().to_bits() | crate::WEAK_PTR) {
+            let handler = handler_slot.get(heap);
+            return match apply_field_only(heap, obj, handler) {
+                Some(v) => MonoProbe::Value(v),
+                None => MonoProbe::Handler(obj, handler),
+            };
+        }
+        if state.raw().is_weak_ptr() {
+            return MonoProbe::Miss;
+        }
+
+        let Some(pairs) = state.as_strong().and_then(|s| s.get_as::<WeakFixedArray>()) else {
+            return MonoProbe::Miss;
+        };
+        if pairs.as_ref().len() >= 2
+            && let Some(m) = pairs.get(heap, 0).as_strong()
+            && m.ptr_eq(map)
+        {
+            let handler = pairs.as_ref().get(heap, 1);
+            return match apply_field_only(heap, obj, handler) {
+                Some(v) => MonoProbe::Value(v),
+                None => MonoProbe::Handler(obj, handler),
+            };
+        }
+        MonoProbe::Poly {
+            obj,
+            map,
+            pairs,
+            start: 2,
+        }
+    }
+
+    #[inline(never)]
+    pub fn apply_mono<'a>(
+        heap: &'a Heap,
+        obj: Tagged<'a, Object>,
+        handler: Tagged<'a, MaybeWeak<Value>>,
+    ) -> Option<Hit<'a>> {
+        apply_load_handler(heap, obj, handler)
+    }
+
+    #[inline(never)]
+    pub fn try_load_resume<'a>(
+        heap: &'a Heap,
+        obj: Tagged<'a, Object>,
+        map: Tagged<'a, Map>,
+        pairs: Tagged<'a, WeakFixedArray>,
+        start: usize,
+    ) -> Option<Hit<'a>> {
+        let len = pairs.as_ref().len();
+        let mut i = start;
+        while i + 1 < len {
+            if let Some(m) = pairs.get(heap, i).as_strong()
+                && m.ptr_eq(map)
+            {
+                return apply_load_handler(heap, obj, pairs.as_ref().get(heap, i + 1));
+            }
+            i += 2;
+        }
+        None
+    }
+
     pub fn try_load<'a>(
         heap: &'a Heap,
         vector: Option<Tagged<'a, FeedbackVector>>,
@@ -763,8 +924,6 @@ impl InlineCache {
         update_site(heap, scope, vector, slot, &map, &handler);
     }
 
-    /// Keyed element load: dense arrays and indexed strings, keyed on the
-    /// receiver's map. `None` = miss (the slow path decides).
     pub fn try_load_element<'a>(
         heap: &'a Heap,
         vector: Option<Tagged<'a, FeedbackVector>>,
@@ -788,8 +947,6 @@ impl InlineCache {
         }
     }
 
-    /// Keyed element store for dense arrays: in-bounds writes and appends
-    /// within capacity. `None` when the slow path must decide.
     pub fn try_store_element<'a>(
         heap: &'a Heap,
         vector: Option<Tagged<'a, FeedbackVector>>,
@@ -917,10 +1074,6 @@ impl InlineCache {
         update_site(heap, scope, vector, slot, &map, &handler);
     }
 
-    /// Scope-free store fast path: a cached bare Field handler for the
-    /// receiver's map writes the value directly. `false` = miss (or a
-    /// transition/setter/chain handler — the slow path decides); never
-    /// allocates, never runs guest code.
     pub fn try_store_fast(
         heap: &mut Heap,
         vector: Option<Tagged<'_, FeedbackVector>>,

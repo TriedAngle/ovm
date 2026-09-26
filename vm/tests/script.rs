@@ -673,3 +673,40 @@ fn strict_equal_objects_compare_by_identity() {
         "{ var a = { valueOf: function() { return 5; } }; a === 5; }"
     ));
 }
+
+#[test]
+fn deferred_left_arithmetic_keeps_evaluation_order() {
+    // the left operand is read before the right side runs, even though the
+    // reversed opcodes fold it in afterwards
+    assert_eq!(run_smi("{ var x = 1; x + (x = 2); }"), 3);
+    assert_eq!(run_smi("{ var x = 1; x + (x = 2) + x; }"), 5);
+    assert_eq!(
+        run_smi("{ var x = 10; x = x - (function() { return 4; })(); x; }"),
+        6
+    );
+    assert_eq!(
+        run_smi("{ var x = 3; x = x * (function() { return 4; })(); x; }"),
+        12
+    );
+    assert_eq!(
+        run_smi("{ var x = 12; x = x / (function() { return 4; })(); x; }"),
+        3
+    );
+    assert_eq!(
+        run_str("{ var s = 'a'; s = s + (function() { return 'b'; })(); s; }"),
+        "ab"
+    );
+    // a plain call with arguments (CallMethod1/2) keeps left-to-right order
+    assert_eq!(
+        run_smi("function f(a, b) { return a * 10 + b; } var x = 1; f(x, x = 2) + x;"),
+        14
+    );
+    // method calls with arguments
+    assert_eq!(
+        run_smi(
+            "var o = { x: 7, add: function(a) { return this.x + a; }, sub2: function(a, b) { return this.x - a - b; } };
+             o.add(5) + o.sub2(1, 2);"
+        ),
+        16
+    );
+}

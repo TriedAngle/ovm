@@ -127,31 +127,61 @@ impl Object {
     }
 }
 
-/// What kind of callable a value refers to.
+/// What kind of callable a value refers to. The bytecode form carries
+/// everything a frame push needs, gathered from one map-kind check and
+/// one callable-info read.
 pub enum CallTarget<'a> {
-    Bytecode(Tagged<'a, Object>, usize, FunctionKind),
+    Bytecode {
+        target: Tagged<'a, Object>,
+        info: Tagged<'a, CallableInfoObject>,
+        context: Tagged<'a, Context>,
+        register_count: usize,
+        /// formal parameters plus the receiver: the frame pads up to this
+        formal_min: usize,
+        kind: FunctionKind,
+    },
     Runtime(usize),
+    /// A callable proxy: `[[Call]]` dispatches through the `apply` trap.
+    Proxy(Tagged<'a, Object>),
 }
 
 impl Object {
-    /// Classify a value as a callable: a bytecode function (with register
-    /// count and kind) or a runtime (with registry index).
+    #[inline(always)]
     pub fn call_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
         let obj = f.as_heap_object()?;
         let kind = obj.as_ref().header.map.get(heap).kind();
+        if kind.is_proxy() {
+            return Some(CallTarget::Proxy(obj));
+        }
         if !kind.is_callable() {
             return None;
         }
         if kind.is_runtime() {
             return Some(CallTarget::Runtime(obj.as_ref().runtime_index(heap)?));
         }
-        let info = obj.as_ref().callable_info(heap)?;
-        let register_count = info.register_count.to_smi().value() as usize;
-        Some(CallTarget::Bytecode(
-            obj,
+        // every non-runtime callable object is laid out with
+        // `[callable info, context]` in its first two slots
+        let slots = obj.as_ref().slots.get(heap);
+        let info = unsafe { slots.at(heap, 0).cast::<CallableInfoObject>() };
+        let context = unsafe { slots.at(heap, 1).cast::<Context>() };
+        let descriptor = info.descriptor.to_smi_unchecked().value() as u64;
+        let register_count = (descriptor & 0xffff) as usize;
+        let formal_min = ((descriptor >> 16) & 0xffff) as usize;
+        let kind = FunctionKind::decode(((descriptor >> 32) & 0xf) as i64);
+        debug_assert_eq!(
             register_count,
-            info.function_kind(),
-        ))
+            info.register_count.to_smi().value() as usize
+        );
+        debug_assert_eq!(formal_min, info.formal_parameter_count() + 1);
+        debug_assert_eq!(kind, info.function_kind());
+        Some(CallTarget::Bytecode {
+            target: obj,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+        })
     }
 
     /// Store `value` at element index `i` of an array object, growing the

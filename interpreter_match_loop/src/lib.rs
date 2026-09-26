@@ -54,21 +54,16 @@ pub fn execute<'a>(
 
     let saved_top = stack.top();
     let was_active = cache.is_active();
-    if was_active {
-        stack.suspend_frame(cache.frame_meta());
-    }
-    let base_depth = stack.frame_depth();
+    let outer = was_active.then(|| cache.frame_meta());
 
     state.handle_scope(|scope| {
-        let result = start(vm, heap, state, callable, args, new_target, base_depth)?;
+        let result = start(vm, heap, state, callable, args, new_target)?;
         let rooted = scope.handle(result);
 
-        stack.truncate_frames(base_depth);
-        if was_active {
-            let outer = stack.pop_frame(saved_top).expect("suspended caller frame");
+        stack.set_top(saved_top);
+        if let Some(outer) = outer {
             cache.load(stack, outer, heap);
         } else {
-            stack.set_top(saved_top);
             cache.deactivate(heap);
         }
         Ok(rooted.as_tagged(heap))
@@ -82,7 +77,6 @@ fn start<'b>(
     callable: Handle<'_, Object>,
     args: HandleSlice<'_>,
     new_target: Option<Handle<'b, Value>>,
-    base_depth: usize,
 ) -> Result<Tagged<'b, Value>, VmError> {
     if Proxy::is_proxy(heap, callable.as_tagged(heap).erase()) {
         return state.handle_scope(|scope| {
@@ -105,6 +99,8 @@ fn start<'b>(
 
     match Object::call_target(heap, callable.as_tagged(heap).erase()) {
         None => Err(VmError::Type),
+        // the proxy dispatch above already intercepted these
+        Some(CallTarget::Proxy(_)) => Err(VmError::Type),
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
@@ -113,7 +109,15 @@ fn start<'b>(
             state.stack().set_top(saved_top);
             result
         }
-        Some(CallTarget::Bytecode(target, register_count, kind)) => {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+            ..
+        }) => {
             if new_target.is_none() && kind.is_class_constructor() {
                 return Err(VmError::Type);
             }
@@ -124,16 +128,6 @@ fn start<'b>(
             // the push itself never allocates, so the anchor may span it
             let frame = {
                 let heap: &Heap = heap;
-                let context = target
-                    .as_ref()
-                    .closure_context(heap)
-                    .expect("callable must have a closure context")
-                    .erase();
-                let formal_min = target
-                    .as_ref()
-                    .callable_info(heap)
-                    .map(|info| info.formal_parameter_count() + 1)
-                    .unwrap_or(1);
                 let new_target_value = match &new_target {
                     Some(nt) => nt.as_tagged(heap).erase(),
                     None => heap.known().undefined.as_tagged(heap).erase(),
@@ -141,15 +135,16 @@ fn start<'b>(
                 stack.push_initial_frame(
                     heap,
                     target.erase(),
+                    info,
                     register_count,
-                    context,
+                    context.erase(),
                     new_target_value,
                     args,
                     formal_min,
                 )?
             };
             state.cache().enter(stack, frame, heap);
-            dispatch(vm, heap, state, base_depth)
+            dispatch(vm, heap, state, frame.base)
         }
     }
 }
@@ -172,8 +167,15 @@ fn call_value<'a>(
         };
     }
     // TODO: runtime getters/setters invoke in place instead of pushing a frame
-    let Some(CallTarget::Bytecode(target, register_count, kind)) =
-        Object::call_target(heap, f.as_tagged(heap))
+    let Some(CallTarget::Bytecode {
+        target,
+        info,
+        context,
+        register_count,
+        formal_min,
+        kind,
+        ..
+    }) = Object::call_target(heap, f.as_tagged(heap))
     else {
         return Ok(Called::NotCallable);
     };
@@ -181,16 +183,7 @@ fn call_value<'a>(
         return Err(VmError::Type);
     }
 
-    let context = target
-        .as_ref()
-        .closure_context(heap)
-        .expect("callable must have a closure context")
-        .erase();
-    let formal_min = target
-        .as_ref()
-        .callable_info(heap)
-        .map(|info| info.formal_parameter_count() + 1)
-        .unwrap_or(1);
+    let context = context.erase();
     let target = target.erase();
     let undefined = heap.known().undefined.as_tagged(heap).erase();
     let callee = stack.push_frame_with_args(
@@ -198,6 +191,7 @@ fn call_value<'a>(
         meta,
         handler_pc,
         target,
+        info,
         register_count,
         context,
         args,
@@ -213,7 +207,7 @@ fn call_value<'a>(
 fn exception_dispatch<'a>(
     heap: &'a mut Heap,
     state: &ContextState,
-    base_depth: usize,
+    base_anchor: usize,
     mut pc: usize,
 ) -> Unwind<'a> {
     let stack = &state.stack();
@@ -249,13 +243,11 @@ fn exception_dispatch<'a>(
             cache.set_pc(handler_pc);
             return Unwind::Caught(ex);
         }
-        if stack.frame_depth() == base_depth {
+        if cache.base() == base_anchor {
             return Unwind::Escaped;
         }
-        let low = Stack::frame_low(&cache.frame_meta());
-        let caller = stack
-            .pop_frame(low)
-            .expect("suspended frame above base depth");
+        let meta = cache.frame_meta();
+        let caller = stack.pop_frame(&meta);
         cache.load(stack, caller, heap);
         pc = caller.handler_pc;
     }
@@ -267,14 +259,14 @@ fn raise<'a>(
     vm: &VM,
     heap: &'a mut Heap,
     state: &ContextState,
-    base_depth: usize,
+    base_anchor: usize,
     err: VmError,
     pc: usize,
 ) -> Unwind<'a> {
     let ex =
         Errors::from_vm_error(vm, heap, state, err).expect("error materialization must not fail");
     state.set_pending_exception(ex);
-    exception_dispatch(heap, state, base_depth, pc)
+    exception_dispatch(heap, state, base_anchor, pc)
 }
 
 /// The text of an interned `SlotName` (empty for non-string names).
@@ -407,6 +399,77 @@ impl Slow {
             if let Some(dst) = dst {
                 stack.set_reg(&meta, dst, v);
             }
+            acc.store(v);
+            Step::Next
+        })
+    }
+
+    /// `lhs op acc` cold path (`AddLeft`): the register is the left
+    /// operand, the accumulator the right.
+    fn add_left<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        meta: FrameMeta,
+        acc: &Acc<'_>,
+        lhs_reg: i32,
+    ) -> Step<'a> {
+        let stack = &state.stack();
+        state.handle_scope(|scope| {
+            let lhs = scope.handle(stack.reg(heap, &meta, lhs_reg));
+            let lhs = match step_try!(Object::to_primitive(vm, heap, state, lhs, Hint::Default)) {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => scope.handle(v),
+            };
+            let rhs = scope.handle(acc.get(heap));
+            let rhs = match step_try!(Object::to_primitive(vm, heap, state, rhs, Hint::Default)) {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => scope.handle(v),
+            };
+            let is_string = (
+                lhs.as_tagged(heap).get_as::<DenseString>().is_some(),
+                rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
+            );
+            let v = if is_string.0 || is_string.1 {
+                let a = scope.handle(step_try!(Convert::to_string(heap, &scope, lhs)));
+                let b = scope.handle(step_try!(Convert::to_string(heap, &scope, rhs)));
+                DenseString::concat(heap, &scope, a, b)
+                    .as_tagged(heap)
+                    .erase()
+            } else {
+                let a = step_try!(Convert::to_number(heap, lhs.as_tagged(heap)));
+                let b = step_try!(Convert::to_number(heap, rhs.as_tagged(heap)));
+                let r = a + b;
+                let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative() {
+                    -0.0
+                } else {
+                    r
+                };
+                heap.new_number(r)
+            };
+            acc.store(v);
+            Step::Next
+        })
+    }
+
+    /// `reg f acc` cold path (`SubLeft`/`MulLeft`/`DivLeft`).
+    fn numeric_op_left<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        meta: FrameMeta,
+        acc: &Acc<'_>,
+        reg: i32,
+        f: fn(f64, f64) -> f64,
+    ) -> Step<'a> {
+        let stack = &state.stack();
+        state.handle_scope(|scope| {
+            let a = scope.handle(stack.reg(heap, &meta, reg));
+            let b = scope.handle(acc.get(heap));
+            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, f));
+            let Some(v) = v else {
+                return Step::PendingThrow;
+            };
             acc.store(v);
             Step::Next
         })
@@ -1208,7 +1271,7 @@ fn dispatch<'a>(
     vm: &VM,
     heap: &'a mut Heap,
     state: &ContextState,
-    base_depth: usize,
+    base_anchor: usize,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let cache = &state.cache();
     let acc = cache.acc_mut();
@@ -1223,7 +1286,16 @@ fn dispatch<'a>(
     loop {
         let (op, ops, next_pc) = decode(code, pc);
         let result = step(
-            vm, heap, state, base_depth, pc, next_pc, frame_base, frame_regs, ops, op,
+            vm,
+            heap,
+            state,
+            base_anchor,
+            pc,
+            next_pc,
+            frame_base,
+            frame_regs,
+            ops,
+            op,
         );
         match result {
             Step::Next | Step::Jump(_) => {
@@ -1243,7 +1315,7 @@ fn dispatch<'a>(
             Step::Return => return Ok(acc.get(heap)),
             Step::Throw(v) => {
                 state.set_pending_exception(v);
-                match exception_dispatch(heap, state, base_depth, pc) {
+                match exception_dispatch(heap, state, base_anchor, pc) {
                     Unwind::Caught(ex) => {
                         acc.store(ex);
                         frame_base = cache.base();
@@ -1257,7 +1329,7 @@ fn dispatch<'a>(
                     }
                 }
             }
-            Step::PendingThrow => match exception_dispatch(heap, state, base_depth, pc) {
+            Step::PendingThrow => match exception_dispatch(heap, state, base_anchor, pc) {
                 Unwind::Caught(ex) => {
                     acc.store(ex);
                     frame_base = cache.base();
@@ -1268,7 +1340,7 @@ fn dispatch<'a>(
                 }
                 Unwind::Escaped => return Ok(heap.known().exception.as_tagged(heap).erase()),
             },
-            Step::Error(err) => match raise(vm, heap, state, base_depth, err, pc) {
+            Step::Error(err) => match raise(vm, heap, state, base_anchor, err, pc) {
                 Unwind::Caught(ex) => {
                     acc.store(ex);
                     frame_base = cache.base();
@@ -1341,7 +1413,7 @@ fn step<'a>(
     vm: &VM,
     heap: &'a mut Heap,
     state: &ContextState,
-    base_depth: usize,
+    base_anchor: usize,
     pc: usize,
     next_pc: usize,
     frame_base: usize,
@@ -1362,12 +1434,10 @@ fn step<'a>(
 
     match op {
         Opcode::Return => {
-            if stack.frame_depth() == base_depth {
+            if cache.base() == base_anchor {
                 return Step::Return;
             }
-            let caller = stack
-                .pop_frame(Stack::frame_low(&meta))
-                .expect("suspended frame above base depth");
+            let caller = stack.pop_frame(&meta);
             cache.load(stack, caller, heap);
             Step::Reframe
         }
@@ -2063,6 +2133,8 @@ fn step<'a>(
             }
             match Object::call_target(heap, stack.reg(heap, &meta, callee_reg)) {
                 None => Step::Error(VmError::Type),
+                // the proxy dispatch above already intercepted these
+                Some(CallTarget::Proxy(_)) => Step::Error(VmError::Type),
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
@@ -2078,22 +2150,21 @@ fn step<'a>(
                         Err(err) => Step::Error(err),
                     }
                 }
-                Some(CallTarget::Bytecode(callee, register_count, kind)) => {
+                Some(CallTarget::Bytecode {
+                    target: callee,
+                    info,
+                    context,
+                    register_count,
+                    formal_min,
+                    kind,
+                    ..
+                }) => {
                     if kind.is_class_constructor() {
                         return Step::Error(VmError::Type);
                     }
                     // one shared anchor covers every read feeding the push
                     let frame = {
-                        let context = callee
-                            .as_ref()
-                            .closure_context(heap)
-                            .expect("callable must have a closure context")
-                            .erase();
-                        let formal_min = callee
-                            .as_ref()
-                            .callable_info(heap)
-                            .map(|info| info.formal_parameter_count() + 1)
-                            .unwrap_or(1);
+                        let context = context.erase();
                         let callee = callee.erase();
                         let undefined = heap.known().undefined.as_tagged(heap).erase();
                         step_try!(stack.push_frame(
@@ -2101,10 +2172,174 @@ fn step<'a>(
                             meta,
                             pc,
                             callee,
+                            info,
                             register_count,
                             context,
                             args_base,
                             count,
+                            undefined,
+                            formal_min,
+                        ))
+                    };
+                    cache.load(stack, frame, heap);
+                    Step::Reframe
+                }
+            }
+        }
+        Opcode::CallMethod0 | Opcode::CallMethod1 | Opcode::CallMethod2 => {
+            let callee_reg = ops.reg(0);
+            let argc = match op {
+                Opcode::CallMethod0 => 0usize,
+                Opcode::CallMethod1 => 1,
+                _ => 2,
+            };
+            let mut srcs = [0i32; 3];
+            for (i, src) in srcs.iter_mut().enumerate().take(argc + 1) {
+                *src = ops.reg(1 + i);
+            }
+            let srcs = &srcs[..argc + 1];
+            if Proxy::is_proxy(heap, stack.reg(heap, &meta, callee_reg)) {
+                let (saved_top, staged) = step_try!(stack.stage_args_regs(heap, &meta, srcs));
+                let result = state.handle_scope(|scope| {
+                    let callee = scope.handle(stack.reg(heap, &meta, callee_reg));
+                    Proxy::apply(vm, heap, state, callee, staged)
+                });
+                stack.set_top(saved_top);
+                return match result {
+                    Ok(Coercion::Threw) => Step::PendingThrow,
+                    Ok(Coercion::Value(v)) => {
+                        acc.store(v);
+                        Step::Next
+                    }
+                    Err(err) => Step::Error(err),
+                };
+            }
+            match Object::call_target(heap, stack.reg(heap, &meta, callee_reg)) {
+                None => Step::Error(VmError::Type),
+                Some(CallTarget::Proxy(_)) => Step::Error(VmError::Type),
+                Some(CallTarget::Runtime(idx)) => {
+                    let f = vm.runtime(RuntimeIndex(idx));
+                    let exception = heap.known().exception.as_tagged(heap).raw();
+                    let (saved_top, staged) = step_try!(stack.stage_args_regs(heap, &meta, srcs));
+                    let nctx = RuntimeContext::new(vm, heap, state);
+                    let result = f(nctx, staged);
+                    stack.set_top(saved_top);
+                    match result {
+                        Ok(v) if v.raw() == exception => Step::PendingThrow,
+                        Ok(v) => {
+                            acc.store(v);
+                            Step::Next
+                        }
+                        Err(err) => Step::Error(err),
+                    }
+                }
+                Some(CallTarget::Bytecode {
+                    target: callee,
+                    info,
+                    context,
+                    register_count,
+                    formal_min,
+                    kind,
+                    ..
+                }) => {
+                    if kind.is_class_constructor() {
+                        return Step::Error(VmError::Type);
+                    }
+                    let frame = {
+                        let context = context.erase();
+                        let callee = callee.erase();
+                        let undefined = heap.known().undefined.as_tagged(heap).erase();
+                        step_try!(stack.push_frame_scattered(
+                            heap,
+                            meta,
+                            pc,
+                            callee,
+                            info,
+                            register_count,
+                            context,
+                            srcs,
+                            undefined,
+                            formal_min,
+                        ))
+                    };
+                    cache.load(stack, frame, heap);
+                    Step::Reframe
+                }
+            }
+        }
+        Opcode::CallFunction0 | Opcode::CallFunction1 | Opcode::CallFunction2 => {
+            let callee_reg = ops.reg(0);
+            let argc = match op {
+                Opcode::CallFunction0 => 0usize,
+                Opcode::CallFunction1 => 1,
+                _ => 2,
+            };
+            let mut args = [0i32; 2];
+            for (i, arg) in args.iter_mut().enumerate().take(argc) {
+                *arg = ops.reg(1 + i);
+            }
+            let args = &args[..argc];
+            if Proxy::is_proxy(heap, stack.reg(heap, &meta, callee_reg)) {
+                let (saved_top, staged) = step_try!(stack.stage_function_args(heap, &meta, args));
+                let result = state.handle_scope(|scope| {
+                    let callee = scope.handle(stack.reg(heap, &meta, callee_reg));
+                    Proxy::apply(vm, heap, state, callee, staged)
+                });
+                stack.set_top(saved_top);
+                return match result {
+                    Ok(Coercion::Threw) => Step::PendingThrow,
+                    Ok(Coercion::Value(v)) => {
+                        acc.store(v);
+                        Step::Next
+                    }
+                    Err(err) => Step::Error(err),
+                };
+            }
+            match Object::call_target(heap, stack.reg(heap, &meta, callee_reg)) {
+                None => Step::Error(VmError::Type),
+                Some(CallTarget::Proxy(_)) => Step::Error(VmError::Type),
+                Some(CallTarget::Runtime(idx)) => {
+                    let f = vm.runtime(RuntimeIndex(idx));
+                    let exception = heap.known().exception.as_tagged(heap).raw();
+                    let (saved_top, staged) =
+                        step_try!(stack.stage_function_args(heap, &meta, args));
+                    let nctx = RuntimeContext::new(vm, heap, state);
+                    let result = f(nctx, staged);
+                    stack.set_top(saved_top);
+                    match result {
+                        Ok(v) if v.raw() == exception => Step::PendingThrow,
+                        Ok(v) => {
+                            acc.store(v);
+                            Step::Next
+                        }
+                        Err(err) => Step::Error(err),
+                    }
+                }
+                Some(CallTarget::Bytecode {
+                    target: callee,
+                    info,
+                    context,
+                    register_count,
+                    formal_min,
+                    kind,
+                    ..
+                }) => {
+                    if kind.is_class_constructor() {
+                        return Step::Error(VmError::Type);
+                    }
+                    let frame = {
+                        let context = context.erase();
+                        let callee = callee.erase();
+                        let undefined = heap.known().undefined.as_tagged(heap).erase();
+                        step_try!(stack.push_frame_function(
+                            heap,
+                            meta,
+                            pc,
+                            callee,
+                            info,
+                            register_count,
+                            context,
+                            args,
                             undefined,
                             formal_min,
                         ))
@@ -2189,7 +2424,7 @@ fn step<'a>(
             acc.store(stack.callable_slot(&meta).get(heap));
             Step::Next
         }
-        Opcode::Add => {
+        Opcode::AddRight => {
             let other_reg = ops.reg(0);
             let other = stack.reg(heap, &meta, other_reg);
             if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
@@ -2248,7 +2483,7 @@ fn step<'a>(
                 })
             }
         }
-        Opcode::Sub => {
+        Opcode::SubRight => {
             let other = stack.reg(heap, &meta, ops.reg(0));
             if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
                 && let Some(r) = a.checked_sub(b)
@@ -2302,7 +2537,7 @@ fn step<'a>(
                 Step::Next
             })
         }
-        Opcode::Mul => {
+        Opcode::MulRight => {
             let other = stack.reg(heap, &meta, ops.reg(0));
             if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
                 && let Some(r) = a.checked_mul(b)
@@ -2319,7 +2554,7 @@ fn step<'a>(
             }
             Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a * b)
         }
-        Opcode::Div => {
+        Opcode::DivRight => {
             // JS division is IEEE double division: 7/2 = 3.5, x/0 = ±Infinity
             // or NaN, MIN/-1 overflows to a double.
             let other = stack.reg(heap, &meta, ops.reg(0));
@@ -2338,6 +2573,76 @@ fn step<'a>(
                 return Step::Next;
             }
             Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a / b)
+        }
+        Opcode::AddLeft => {
+            let reg = ops.reg(0);
+            let other = stack.reg(heap, &meta, reg);
+            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
+                && let Some(r) = a.checked_add(b)
+                && Smi::in_range(r)
+            {
+                acc.store(Smi::new(r).into_tagged());
+                return Step::Next;
+            }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a + b));
+                return Step::Next;
+            }
+            Slow::add_left(vm, heap, state, meta, &acc, reg)
+        }
+        Opcode::SubLeft => {
+            let other = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
+                && let Some(r) = a.checked_sub(b)
+                && Smi::in_range(r)
+            {
+                acc.store(Smi::new(r).into_tagged());
+                return Step::Next;
+            }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a - b));
+                return Step::Next;
+            }
+            Slow::numeric_op_left(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a - b)
+        }
+        Opcode::MulLeft => {
+            let other = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
+                && let Some(r) = a.checked_mul(b)
+                && Smi::in_range(r)
+            {
+                acc.store(Smi::new(r).into_tagged());
+                return Step::Next;
+            }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a * b));
+                return Step::Next;
+            }
+            Slow::numeric_op_left(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a * b)
+        }
+        Opcode::DivLeft => {
+            let other = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
+                && b != 0
+                && a % b == 0
+                && let Some(r) = a.checked_div(b)
+            {
+                acc.store(Smi::new(r).into_tagged());
+                return Step::Next;
+            }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a / b));
+                return Step::Next;
+            }
+            Slow::numeric_op_left(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a / b)
         }
         Opcode::Mod => {
             // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.

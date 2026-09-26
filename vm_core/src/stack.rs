@@ -1,6 +1,9 @@
-use core::cell::{Cell, RefCell};
+use core::cell::Cell;
 
-use crate::{EdgeVisitable, HandleSlice, Heap, Object, Register, Smi, Tagged, Value, Visitor};
+use crate::{
+    CallableInfoObject, EdgeVisitable, HandleSlice, Heap, Object, Register, Smi, Tagged, Value,
+    Visitor,
+};
 
 use crate::VmError;
 
@@ -8,7 +11,7 @@ use crate::VmError;
 pub const STACK_SLOTS: usize = 16 * 1024;
 
 /// Fixed header slots between the register file and the parameter region
-pub const HEADER_SLOTS: usize = 4;
+pub const HEADER_SLOTS: usize = 11;
 /// Header slots sit directly below the anchor at these (negative) offsets.
 pub const CALLABLE_OFFSET: isize = -1;
 pub const ARGC_OFFSET: isize = -2;
@@ -19,6 +22,21 @@ pub const CONTEXT_OFFSET: isize = -3;
 /// new.target of the active [[Construct]] (ES 9.2.2): the constructor, or
 /// undefined when the function was called. `super()` forwards this value.
 pub const NEW_TARGET_OFFSET: isize = -4;
+/// The frame's own bytecode: dispatch state lives in the frame
+pub const CODE_OFFSET: isize = -5;
+/// The frame's own constant pool.
+pub const CONSTANTS_OFFSET: isize = -6;
+/// The frame's own feedback vector (or the hole when absent).
+pub const FEEDBACK_OFFSET: isize = -7;
+/// The suspended caller's anchor (its frame pointer): returning to a frame
+/// is a header read, not a side-table lookup.
+pub const SAVED_BASE_OFFSET: isize = -8;
+/// The caller's resume pc (the instruction after its call).
+pub const SAVED_PC_OFFSET: isize = -9;
+/// The caller's register-file size (its frame low is derived from it).
+pub const SAVED_REGCOUNT_OFFSET: isize = -10;
+/// The caller's exception handler lookup pc (its call site).
+pub const SAVED_HANDLER_PC_OFFSET: isize = -11;
 
 const _: () = assert!(
     -bytecode::REGISTER_FILE_START as usize == HEADER_SLOTS + 1,
@@ -29,15 +47,16 @@ fn offset_slot(base: usize, offset: isize) -> usize {
     (base as isize + offset) as usize
 }
 
-/// Frame layout — single-anchor layout (anchor = `base`, the analogue
-/// of the frame pointer):
-/// index                    content
-/// base-HEADER-rc .. base-5 register file (r0 at base-5 = directly below
-///                          the header, r_i at base-5-i, descending)
-/// base-4 .. base-1         header: new.target, context, argc, callable
-/// base   + 0               parameter 0 (the receiver)
-/// base   + 1 .. +padded-1  parameters (formal j at base+j), padded to
-///                          formal_min with undefined
+/// Frame layout
+/// index                     content
+/// base-HEADER-rc .. base-12 register file (r0 at base-12 = directly below
+///                           the header, r_i at base-12-i, descending)
+/// base-11 .. base-1         header: new.target, context, argc, callable,
+///                           code, constants, feedback, and the suspended
+///                           caller's base/pc/register count/handler pc
+/// base   + 0                parameter 0 (the receiver)
+/// base   + 1 .. +padded-1   parameters (formal j at base+j), padded to
+///                           formal_min with undefined
 ///
 /// A register operand IS the anchor-relative slot offset: local `i`
 /// encodes as `-(HEADER_SLOTS+1) - i` (descending below the header),
@@ -47,12 +66,12 @@ fn offset_slot(base: usize, offset: isize) -> usize {
 /// address of the window, so `args` slices are element-ordered and frame
 /// pushes are forward memcpys.
 ///
-/// The stack only tracks *suspended* frames: the frame currently being executed
-/// lives in the [`StackCache`](StackCache) and is pushed here when a call suspends it.
+/// Frames are self-describing: the currently executing frame's dispatch
+/// state lives in the [`StackCache`](StackCache), and a call writes the
+/// caller's suspended state into the callee's header
 pub struct Stack {
     slots: Box<[Register]>,
     top: Cell<usize>,
-    frames: RefCell<Vec<FrameMeta>>,
     /// Register files of fresh frames are initialized to this value
     /// (the hole: uninitialized `let`/`const` reads must be TDZ errors).
     fill: Register,
@@ -66,7 +85,6 @@ impl Stack {
                 .map(|_| unsafe { Register::from_value(fill) })
                 .collect(),
             top: Cell::new(0),
-            frames: RefCell::new(Vec::new()),
             fill: unsafe { Register::from_value(fill) },
             undefined: unsafe { Register::from_value(undefined) },
         }
@@ -123,6 +141,11 @@ impl Stack {
         self.context_slot(meta).get(heap)
     }
 
+    #[inline(always)]
+    pub fn header_slot(&self, base: usize, offset: isize) -> &Register {
+        self.slot_unchecked(offset_slot(base, offset))
+    }
+
     pub fn context_slot(&self, meta: &FrameMeta) -> &Register {
         self.slot_unchecked(offset_slot(meta.base, CONTEXT_OFFSET))
     }
@@ -143,8 +166,7 @@ impl Stack {
             .value() as usize
     }
 
-    /// The operand is the anchor-relative slot offset:
-    /// one addition, sign-agnostic.
+    /// The operand is the anchor-relative slot offset 
     fn reg_index(meta: &FrameMeta, operand: i32) -> usize {
         (meta.base as isize + operand as isize) as usize
     }
@@ -169,10 +191,12 @@ impl Stack {
         self.value_slice(Self::reg_index(meta, reg_base - count as i32 + 1), count)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn push_initial_frame(
         &self,
         heap: &Heap,
         callable: Tagged<'_, Value>,
+        info: Tagged<'_, CallableInfoObject>,
         register_count: usize,
         context: Tagged<'_, Value>,
         new_target: Tagged<'_, Value>,
@@ -197,16 +221,33 @@ impl Stack {
                 self.slot_unchecked(anchor + i).store(undefined);
             }
         }
-        Ok(self.init_frame_header(anchor, register_count, callable, context, new_target, argc))
+        Ok(self.init_frame_header(
+            heap,
+            anchor,
+            register_count,
+            callable,
+            info,
+            context,
+            new_target,
+            argc,
+            FrameMeta {
+                base: 0,
+                pc: 0,
+                register_count: 0,
+                handler_pc: 0,
+            },
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     pub fn push_frame(
         &self,
         heap: &Heap,
         caller: FrameMeta,
         handler_pc: usize,
         callable: Tagged<'_, Value>,
+        info: Tagged<'_, CallableInfoObject>,
         register_count: usize,
         context: Tagged<'_, Value>,
         src_reg_base: i32,
@@ -235,12 +276,19 @@ impl Stack {
                 self.slot_unchecked(anchor + i).store(undefined);
             }
         }
-        let callee =
-            self.init_frame_header(anchor, register_count, callable, context, new_target, count);
         let mut caller = caller;
         caller.handler_pc = handler_pc;
-        self.frames.borrow_mut().push(caller);
-        Ok(callee)
+        Ok(self.init_frame_header(
+            heap,
+            anchor,
+            register_count,
+            callable,
+            info,
+            context,
+            new_target,
+            count,
+            caller,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -250,6 +298,7 @@ impl Stack {
         caller: FrameMeta,
         handler_pc: usize,
         callable: Tagged<'_, Value>,
+        info: Tagged<'_, CallableInfoObject>,
         register_count: usize,
         context: Tagged<'_, Value>,
         args: HandleSlice<'_>,
@@ -271,23 +320,21 @@ impl Stack {
                 self.slot_unchecked(anchor + i).store(undefined);
             }
         }
-        let callee = self.init_frame_header(
+        let mut caller = caller;
+        caller.handler_pc = handler_pc;
+        Ok(self.init_frame_header(
+            heap,
             anchor,
             register_count,
             callable,
+            info,
             context,
             new_target,
             args.len(),
-        );
-        let mut caller = caller;
-        caller.handler_pc = handler_pc;
-        self.frames.borrow_mut().push(caller);
-        Ok(callee)
+            caller,
+        ))
     }
 
-    /// Copy `args` into a fresh register region above the current top and
-    /// return a `HandleSlice` over it (GC-visited: reads stay fresh across
-    /// allocations). Rewind the region with `set_top(saved_top)` when done.
     pub fn stage_args(
         &self,
         heap: &Heap,
@@ -320,25 +367,171 @@ impl Stack {
         Ok((saved_top, staged))
     }
 
-    pub fn pop_frame(&self, current_base: usize) -> Option<FrameMeta> {
-        self.set_top(current_base);
-        self.frames.borrow_mut().pop()
+    pub fn stage_args_regs<'s>(
+        &'s self,
+        heap: &Heap,
+        caller: &FrameMeta,
+        srcs: &[i32],
+    ) -> Result<(usize, HandleSlice<'s>), VmError> {
+        let saved_top = self.top();
+        let size = HEADER_SLOTS + srcs.len();
+        if saved_top + size > self.slots.len() {
+            return Err(VmError::StackOverflow);
+        }
+        let base = saved_top;
+        let dst = base + HEADER_SLOTS;
+        let fill = self.fill.get(heap);
+        for i in 0..HEADER_SLOTS {
+            self.slot_unchecked(base + i).store(fill);
+        }
+        self.set_top(base + size);
+        for (i, &operand) in srcs.iter().enumerate() {
+            let src = Self::reg_index(caller, operand);
+            self.slot_unchecked(dst + i)
+                .as_raw()
+                .store_raw(self.slot_unchecked(src).raw().to_bits());
+        }
+        // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
+        let staged = self.value_slice(dst, srcs.len());
+        Ok((saved_top, staged))
     }
 
-    pub fn frame_depth(&self) -> usize {
-        self.frames.borrow().len()
+    pub fn stage_function_args<'s>(
+        &'s self,
+        heap: &Heap,
+        caller: &FrameMeta,
+        srcs: &[i32],
+    ) -> Result<(usize, HandleSlice<'s>), VmError> {
+        let saved_top = self.top();
+        let size = HEADER_SLOTS + 1 + srcs.len();
+        if saved_top + size > self.slots.len() {
+            return Err(VmError::StackOverflow);
+        }
+        let base = saved_top;
+        let dst = base + HEADER_SLOTS;
+        let fill = self.fill.get(heap);
+        for i in 0..HEADER_SLOTS {
+            self.slot_unchecked(base + i).store(fill);
+        }
+        self.set_top(base + size);
+        self.slot_unchecked(dst).store(self.undefined.get(heap));
+        for (i, &operand) in srcs.iter().enumerate() {
+            let src = Self::reg_index(caller, operand);
+            self.slot_unchecked(dst + 1 + i)
+                .as_raw()
+                .store_raw(self.slot_unchecked(src).raw().to_bits());
+        }
+        // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
+        let staged = self.value_slice(dst, 1 + srcs.len());
+        Ok((saved_top, staged))
     }
 
-    pub fn suspend_frame(&self, frame: FrameMeta) {
-        self.frames.borrow_mut().push(frame);
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub fn push_frame_function(
+        &self,
+        heap: &Heap,
+        caller: FrameMeta,
+        handler_pc: usize,
+        callable: Tagged<'_, Value>,
+        info: Tagged<'_, CallableInfoObject>,
+        register_count: usize,
+        context: Tagged<'_, Value>,
+        args: &[i32],
+        new_target: Tagged<'_, Value>,
+        formal_min: usize,
+    ) -> Result<FrameMeta, VmError> {
+        let count = 1 + args.len();
+        let padded = count.max(formal_min);
+        let anchor = self.reserve(heap, register_count, padded)?;
+        self.slot_unchecked(anchor).store(self.undefined.get(heap));
+        for (i, &operand) in args.iter().enumerate() {
+            let src = Self::reg_index(&caller, operand);
+            debug_assert!(!self.slot_unchecked(src).raw().is_weak_ptr());
+            self.slot_unchecked(anchor + 1 + i)
+                .as_raw()
+                .store_raw(self.slot_unchecked(src).raw().to_bits());
+        }
+        let undefined = self.undefined.get(heap);
+        for i in count..padded {
+            self.slot_unchecked(anchor + i).store(undefined);
+        }
+        let mut caller = caller;
+        caller.handler_pc = handler_pc;
+        Ok(self.init_frame_header(
+            heap,
+            anchor,
+            register_count,
+            callable,
+            info,
+            context,
+            new_target,
+            count,
+            caller,
+        ))
     }
 
-    pub fn truncate_frames(&self, depth: usize) {
-        self.frames.borrow_mut().truncate(depth);
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub fn push_frame_scattered(
+        &self,
+        heap: &Heap,
+        caller: FrameMeta,
+        handler_pc: usize,
+        callable: Tagged<'_, Value>,
+        info: Tagged<'_, CallableInfoObject>,
+        register_count: usize,
+        context: Tagged<'_, Value>,
+        srcs: &[i32],
+        new_target: Tagged<'_, Value>,
+        formal_min: usize,
+    ) -> Result<FrameMeta, VmError> {
+        let count = srcs.len();
+        let padded = count.max(formal_min);
+        let anchor = self.reserve(heap, register_count, padded)?;
+        for (i, &operand) in srcs.iter().enumerate() {
+            let src = Self::reg_index(&caller, operand);
+            debug_assert!(!self.slot_unchecked(src).raw().is_weak_ptr());
+            self.slot_unchecked(anchor + i)
+                .as_raw()
+                .store_raw(self.slot_unchecked(src).raw().to_bits());
+        }
+        let undefined = self.undefined.get(heap);
+        for i in count..padded {
+            self.slot_unchecked(anchor + i).store(undefined);
+        }
+        let mut caller = caller;
+        caller.handler_pc = handler_pc;
+        Ok(self.init_frame_header(
+            heap,
+            anchor,
+            register_count,
+            callable,
+            info,
+            context,
+            new_target,
+            count,
+            caller,
+        ))
     }
 
-    /// Allocates a frame block `[registers][header][params]` and returns
-    /// the anchor.
+    #[inline]
+    pub fn pop_frame(&self, frame: &FrameMeta) -> FrameMeta {
+        self.set_top(Self::frame_low(frame));
+        let read = |offset: isize| {
+            self.header_slot(frame.base, offset)
+                .read_smi_unchecked()
+                .value() as usize
+        };
+        FrameMeta {
+            base: read(SAVED_BASE_OFFSET),
+            pc: read(SAVED_PC_OFFSET),
+            register_count: read(SAVED_REGCOUNT_OFFSET),
+            handler_pc: read(SAVED_HANDLER_PC_OFFSET),
+        }
+    }
+
+    #[inline(always)]
     fn reserve(&self, heap: &Heap, register_count: usize, padded: usize) -> Result<usize, VmError> {
         let low = self.top();
         let size = register_count + HEADER_SLOTS + padded;
@@ -354,14 +547,19 @@ impl Stack {
         Ok(anchor)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn init_frame_header(
         &self,
+        heap: &Heap,
         anchor: usize,
         register_count: usize,
         callable: Tagged<'_, Value>,
+        info: Tagged<'_, CallableInfoObject>,
         context: Tagged<'_, Value>,
         new_target: Tagged<'_, Value>,
         argc: usize,
+        caller: FrameMeta,
     ) -> FrameMeta {
         self.slot_unchecked(offset_slot(anchor, CALLABLE_OFFSET))
             .store(callable);
@@ -371,6 +569,26 @@ impl Stack {
             .store(context);
         self.slot_unchecked(offset_slot(anchor, NEW_TARGET_OFFSET))
             .store(new_target);
+        let info = info.as_ref();
+        self.slot_unchecked(offset_slot(anchor, CODE_OFFSET))
+            .store(info.bytecode.get(heap));
+        self.slot_unchecked(offset_slot(anchor, CONSTANTS_OFFSET))
+            .store(info.constants.get(heap));
+        self.slot_unchecked(offset_slot(anchor, FEEDBACK_OFFSET))
+            .store(info.feedback.get(heap).map_or_else(
+                || heap.known().the_hole.as_tagged(heap).erase(),
+                |v| v.erase(),
+            ));
+        let saved = [
+            (SAVED_BASE_OFFSET, caller.base),
+            (SAVED_PC_OFFSET, caller.pc),
+            (SAVED_REGCOUNT_OFFSET, caller.register_count),
+            (SAVED_HANDLER_PC_OFFSET, caller.handler_pc),
+        ];
+        for (offset, value) in saved {
+            self.slot_unchecked(offset_slot(anchor, offset))
+                .store(Smi::new(value as i64).into_tagged());
+        }
         FrameMeta {
             base: anchor,
             pc: 0,

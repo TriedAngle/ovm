@@ -130,7 +130,7 @@ fn hoisted_function_declarations_are_initialized_in_the_prologue() {
     );
     let f = script_fn(&p);
     let first_create = position(&p, f, Opcode::CreateClosure);
-    let first_call = position(&p, f, Opcode::CallNoFeedback);
+    let first_call = position(&p, f, Opcode::CallFunction0);
     assert!(first_create < first_call, "closure created before the call");
 }
 

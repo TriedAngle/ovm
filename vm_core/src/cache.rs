@@ -45,6 +45,7 @@ impl StackCache {
         self.get().active
     }
 
+    #[inline]
     pub fn enter(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
         self.load(stack, frame, heap);
         let cache = self.get();
@@ -53,19 +54,16 @@ impl StackCache {
         cache.acc.store(heap.known().undefined.as_tagged(heap));
     }
 
-    pub fn load(&self, stack: &Stack, frame: FrameMeta, heap: &mut Heap) {
-        let obj = stack.callable(heap, &frame);
-        let info = obj
-            .as_ref()
-            .callable_info(heap)
-            .expect("frame callable must have callable info");
+    #[inline]
+    pub fn load(&self, stack: &Stack, frame: FrameMeta, _heap: &mut Heap) {
         let cache = self.get();
-        cache.code.store(info.bytecode.get(heap));
-        cache.constants.store(info.constants.get(heap));
-        cache.feedback.store(info.feedback.get(heap).map_or_else(
-            || heap.known().the_hole.as_tagged(heap).erase(),
-            |v| v.erase(),
-        ));
+        let copy = |dst: &Register, offset: isize| {
+            dst.as_raw()
+                .store_raw(stack.header_slot(frame.base, offset).raw().to_bits());
+        };
+        copy(&cache.code, crate::stack::CODE_OFFSET);
+        copy(&cache.constants, crate::stack::CONSTANTS_OFFSET);
+        copy(&cache.feedback, crate::stack::FEEDBACK_OFFSET);
         cache.pc = frame.pc;
         cache.base = frame.base;
         cache.register_count = frame.register_count;

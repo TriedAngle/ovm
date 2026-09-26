@@ -11,9 +11,7 @@ fn run(path: &str) {
         .add::<JSRuntime>()
         .unwrap();
     let mut thread = vm.attach();
-    let result = thread
-        .eval::<JavascriptCompiler>(&src)
-        .expect("nbody runs");
+    let result = thread.eval::<JavascriptCompiler>(&src).expect("nbody runs");
     if let Some(ex) = thread.take_pending_exception() {
         let heap = thread.heap();
         let tagged = unsafe { ex.assume_valid(heap) };
@@ -26,9 +24,6 @@ fn run(path: &str) {
 
 #[test]
 fn nbody() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../benchmarks/nbody/nbody.js"
-    );
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../benchmarks/nbody/nbody.js");
     run(path);
 }

@@ -18,6 +18,8 @@ pub struct CallableInfoObject {
     pub feedback: OptionGcSlot<FeedbackVector>,
     pub name: GcSlot,
     pub formal_parameter_count: GcSlot<Smi>,
+    /// `register_count | formal_min << 16 | kind << 32`
+    pub descriptor: GcSlot<Smi>,
     /// JS-visible `length` (differs from `formal_parameter_count` when the
     /// parameter list has defaults / patterns / a rest parameter)
     pub formal_length: GcSlot<Smi>,
@@ -75,7 +77,7 @@ impl FunctionKind {
         matches!(self, Self::Normal)
     }
 
-    fn decode(value: i64) -> Self {
+    pub(crate) fn decode(value: i64) -> Self {
         match value {
             x if x == Self::Normal as i64 => Self::Normal,
             x if x == Self::Generator as i64 => Self::Generator,
@@ -117,6 +119,11 @@ impl HeapObject for CallableInfoObject {
             .set(heap, host, config.constants.as_tagged(heap));
         self.register_count
             .set(heap, host, Smi::new(config.register_count as i64));
+        self.descriptor.set(
+            heap,
+            host,
+            Smi::new(config.register_count as i64 | (1 << 16)),
+        );
         match config.handlers {
             Some(handlers) => self.handlers.set(heap, host, handlers.as_tagged(heap)),
             None => self.handlers.clear(heap),
@@ -148,6 +155,7 @@ impl EdgeVisitable for CallableInfoObject {
         visitor.visit(self.handlers.as_raw());
         visitor.visit(self.feedback.as_raw());
         visitor.visit(self.name.as_raw());
+        visitor.visit(self.descriptor.as_raw());
     }
 }
 
@@ -190,6 +198,10 @@ impl CallableInfoObject {
         self.formal_length
             .set(heap, host, Smi::new(formal_length as i64));
         self.kind.set(heap, host, Smi::new(kind as i64));
+        let register_count = self.register_count.to_smi_unchecked().value() as u64;
+        let descriptor =
+            register_count | ((formal_parameter_count as u64 + 1) << 16) | ((kind as u64) << 32);
+        self.descriptor.set(heap, host, Smi::new(descriptor as i64));
         self.strict.set(heap, host, Smi::new(i64::from(strict)));
     }
 

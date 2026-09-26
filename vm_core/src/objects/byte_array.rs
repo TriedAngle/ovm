@@ -18,6 +18,7 @@ impl FixedByteArray {
             .0
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.size.to_smi().value() as usize
     }
@@ -35,6 +36,12 @@ impl FixedByteArray {
         unsafe { *self.data_ptr().add(i) = b }
     }
 
+    #[inline(always)]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data_ptr()
+    }
+
+    #[inline]
     pub fn as_slice(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.data_ptr(), self.len()) }
     }
