@@ -372,6 +372,31 @@ impl<'a> Tagged<'a, Value> {
         self.raw.to_i64()
     }
 
+    /// The *encoded* Smi word (`value << 1`, tag bit clear), or `None` for
+    /// a heap pointer. Operations that are linear in the value — add, sub,
+    /// negate, ordered compare — can run directly on this word: the shift
+    /// is a factor common to both sides, so it factors out of the result.
+    #[inline(always)]
+    pub fn smi_bits(self) -> Option<i64> {
+        if self.raw.is_smi() {
+            Some(self.raw.to_bits() as i64)
+        } else {
+            None
+        }
+    }
+
+    /// A Smi from an already-encoded word. Any even word is a valid Smi
+    /// (the payload is the upper 63 bits), so this cannot fail and cannot
+    /// dangle; the `'a` anchor is therefore unconstrained.
+    #[inline(always)]
+    pub fn from_smi_bits(bits: i64) -> Tagged<'a, Value> {
+        debug_assert_eq!(bits & 1, 0, "Smi encoding must keep the tag bit clear");
+        Tagged {
+            raw: Value::from_bits(bits as Word),
+            _phantom: PhantomData,
+        }
+    }
+
     pub fn get_as<T: HeapObject>(self) -> Option<Tagged<'a, T>> {
         let ptr = HeapPtr::decode_strong(self.raw)?;
         // Safety: strong pointer; reads only the header's map slot.
