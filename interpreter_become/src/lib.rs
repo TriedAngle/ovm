@@ -111,26 +111,16 @@ unsafe fn tagged(v: Value) -> Tagged<'static, Value> {
     unsafe { Tagged::<Value>::from_value_unchecked(v) }
 }
 
+/// The operand is the anchor-relative slot offset: one addressing mode,
+/// sign-agnostic, no frame-size dependency.
 #[inline(always)]
-unsafe fn reg_read(regs: *mut Register, i: i32, register_count: usize) -> Value {
-    // negative indices address the parameter region above the register
-    // file + header (param 0 = receiver)
-    let slot = if i >= 0 {
-        regs.offset(i as isize)
-    } else {
-        regs.add(register_count + vm_core::stack::HEADER_SLOTS + (-i - 1) as usize)
-    };
-    (*slot).raw()
+unsafe fn reg_read(regs: *mut Register, i: i32) -> Value {
+    (*regs.offset(i as isize)).raw()
 }
 
 #[inline(always)]
-unsafe fn reg_write(regs: *mut Register, i: i32, v: Value, register_count: usize) {
-    let slot = if i >= 0 {
-        regs.offset(i as isize)
-    } else {
-        regs.add(register_count + vm_core::stack::HEADER_SLOTS + (-i - 1) as usize)
-    };
-    (*slot).store(unsafe { Tagged::<Value>::from_value_unchecked(v) });
+unsafe fn reg_write(regs: *mut Register, i: i32, v: Value) {
+    (*regs.offset(i as isize)).store(unsafe { Tagged::<Value>::from_value_unchecked(v) });
 }
 
 // ---------------------------------------------------------------------------
@@ -206,8 +196,8 @@ macro_rules! helpers {
 
         #[allow(unused_variables, unused_macros)]
         let ($code, $regs) = ($code, $regs);
-        macro_rules! reg { ($i:expr) => { unsafe { reg_read($regs, $i, $ctx.cache().register_count()) } } }
-        macro_rules! set_reg { ($i:expr, $v:expr) => { unsafe { reg_write($regs, $i, $v, $ctx.cache().register_count()) } } }
+        macro_rules! reg { ($i:expr) => { unsafe { reg_read($regs, $i) } } }
+        macro_rules! set_reg { ($i:expr, $v:expr) => { unsafe { reg_write($regs, $i, $v) } } }
         macro_rules! dispatch {
             ($p:expr, $a:expr, $r:expr) => {
                 unsafe {
@@ -895,6 +885,11 @@ handlers!(pc, code, regs, acc, ctx;
         next!(reg!(r))
     }
 
+    Move : op_move_n / op_move_w (dst => signed, src => signed) {
+        set_reg!(dst, reg!(src));
+        next!(acc)
+    }
+
     Store : op_store_n / op_store_w (r => signed) {
         set_reg!(r, acc);
         next!(acc)
@@ -1110,8 +1105,8 @@ handlers!(pc, code, regs, acc, ctx;
         if ctx.stack().frame_depth() == ctx.base_depth {
             return Ok(acc);
         }
-        let base = ctx.cache().base();
-        let Some(caller) = ctx.stack().pop_frame(base) else {
+        let low = Stack::frame_low(&ctx.meta(pc));
+        let Some(caller) = ctx.stack().pop_frame(low) else {
             bail!(VmError::Type);
         };
         ctx.cache().load(ctx.stack(), caller, ctx.heap_mut());
@@ -1377,6 +1372,7 @@ unsafe extern "rust-preserve-none" fn op_trap(
 const fn table_narrow() -> [Handler; 256] {
     let mut t = [op_trap as Handler; 256];
     t[Opcode::Load as usize] = op_load_n as Handler;
+    t[Opcode::Move as usize] = op_move_n as Handler;
     t[Opcode::Store as usize] = op_store_n as Handler;
     t[Opcode::LoadSmi as usize] = op_load_smi_n as Handler;
     t[Opcode::LoadConstant as usize] = op_load_constant_n as Handler;
@@ -1420,6 +1416,7 @@ const fn table_narrow() -> [Handler; 256] {
 const fn table_wide() -> [Handler; 256] {
     let mut t = [op_trap as Handler; 256];
     t[Opcode::Load as usize] = op_load_w as Handler;
+    t[Opcode::Move as usize] = op_move_w as Handler;
     t[Opcode::Store as usize] = op_store_w as Handler;
     t[Opcode::LoadSmi as usize] = op_load_smi_w as Handler;
     t[Opcode::LoadConstant as usize] = op_load_constant_w as Handler;

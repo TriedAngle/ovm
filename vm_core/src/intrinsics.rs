@@ -1738,10 +1738,10 @@ fn construct_super_all_args<'a>(
         }
         let meta = state.cache.frame_meta();
         let argc = state.stack.argc(&meta).saturating_sub(1);
-        let slice = state.stack.args(&meta, -2, argc);
-        let arg_words: Vec<Handle<'_, Value>> = slice
-            .iter()
-            .map(|h| scope.handle(h.as_tagged(heap)))
+        // params descend below the frame anchor: read them one by one in
+        // argument order (formal j at operand -(j+1))
+        let arg_words: Vec<Handle<'_, Value>> = (1..=argc)
+            .map(|j| scope.handle(state.stack.reg(heap, &meta, j as i32)))
             .collect();
         construct_super_construct(
             RuntimeContext::new(vm, heap, state),
@@ -1899,7 +1899,7 @@ fn create_rest_parameter<'a>(
         let argc = state.stack.argc(&meta); // receiver included
         let count = argc.saturating_sub(1).saturating_sub(first);
         let values: Vec<Handle<'_, Value>> = (0..count)
-            .map(|i| scope.handle(state.stack.reg(heap, &meta, -((first + i + 2) as i32))))
+            .map(|i| scope.handle(state.stack.reg(heap, &meta, (first + i + 1) as i32)))
             .collect();
         let elements =
             heap.allocate_handle::<FixedArray>(stage_handles(heap, &scope, &values), &scope);

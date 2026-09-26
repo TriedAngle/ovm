@@ -2,7 +2,7 @@
 //! feedback pairs, temp registers, labels with automatic jump widening,
 //! handler ranges, accumulator elision, and validation.
 
-use bytecode::{
+use bytecode::{REGISTER_FILE_START, 
     BuildError, CallableKind, ConstIdx, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode,
     Operand, Program, Reg, RegList, RtArg, RuntimeFn, ValidationError, try_decode, validate,
     validate_function,
@@ -16,6 +16,16 @@ struct Instr {
     at: usize,
 }
 
+/// Decodes an emitted local operand back to its logical index (params are
+/// already their operand).
+fn logical(op: i32) -> i64 {
+    if op <= REGISTER_FILE_START {
+        (REGISTER_FILE_START - op) as i64
+    } else {
+        op as i64
+    }
+}
+
 /// Decode a full instruction stream (panics if it does not decode cleanly).
 fn decoded(code: &[u8]) -> Vec<Instr> {
     let mut out = Vec::new();
@@ -27,8 +37,11 @@ fn decoded(code: &[u8]) -> Vec<Instr> {
             .iter()
             .enumerate()
             .map(|(i, kind)| match kind {
-                Operand::Register => operands.reg(i) as i64,
-                Operand::RegisterListStart => operands.reg_list(i) as i64,
+                // register operands are anchor-relative slots; unbiased
+                // back to logical register space (locals only — params
+                // encode as plain negatives)
+                Operand::Register => logical(operands.reg(i)),
+                Operand::RegisterListStart => logical(operands.reg_list(i)),
                 Operand::RegisterCount => operands.reg_count(i) as i64,
                 Operand::Immediate => operands.imm(i) as i64,
                 Operand::UImmediate => operands.uimm(i) as i64,
@@ -135,7 +148,8 @@ fn staged_runtime_calls_lay_out_the_window_in_order() {
 
     let f = b.finish(meta()).unwrap();
     let instrs = decoded(&f.code);
-    // obj staged at temp 0; the window occupies temps 1..4
+    // obj staged at temp 0; the window occupies temps 1..4 with slot 0
+    // (the accumulator) riding the top — staged into 3, 2, 1
     assert_eq!(
         instrs,
         vec![
@@ -151,7 +165,7 @@ fn staged_runtime_calls_lay_out_the_window_in_order() {
             }, // obj = temp 0
             Instr {
                 op: Opcode::Store,
-                ops: vec![1],
+                ops: vec![3],
                 at: 4
             }, // acc -> window slot 0
             Instr {
@@ -171,7 +185,7 @@ fn staged_runtime_calls_lay_out_the_window_in_order() {
             },
             Instr {
                 op: Opcode::Store,
-                ops: vec![3],
+                ops: vec![1],
                 at: 12
             },
             Instr {
@@ -341,12 +355,12 @@ fn reglist_tail_extends_the_frame() {
     assert_eq!(f.register_count, 3, "args window 0..3 sizes the frame");
     validate_function(&f, 0).unwrap();
 
-    // and the validator checks the window end, not just its base
+    // and the validator checks the window's lowest slot, not just its base
     let mut f = f.clone();
     f.register_count = 2;
     assert_eq!(
         validate_function(&f, 0).unwrap_err(),
-        ValidationError::RegisterOutOfRange { pc: 0, reg: 2 }
+        ValidationError::RegisterOutOfRange { pc: 0, reg: -7 }
     );
 }
 
@@ -380,7 +394,7 @@ fn emitted_param_loads_use_the_vm_convention() {
         vec![
             Instr {
                 op: Opcode::Load,
-                ops: vec![-2],
+                ops: vec![1],
                 at: 0
             },
             Instr {
@@ -395,7 +409,7 @@ fn emitted_param_loads_use_the_vm_convention() {
 
 #[test]
 fn validate_window_covers_receiver_and_all_formals() {
-    // arity 2: receiver -1 and formals -2, -3 are in window; -4 is not
+    // arity 2: receiver operand 0 and formals 1, 2 are in window; 3 is not
     let mut b = FnBuilder::new(2);
     b.load(b.this_reg());
     b.load(b.param(1));
@@ -403,13 +417,13 @@ fn validate_window_covers_receiver_and_all_formals() {
     let f = b.finish(meta()).unwrap();
     validate_function(&f, 0).unwrap();
 
-    // patch the second load's operand byte from -3 to -4
+    // patch the second load's operand byte from 2 to 3
     let mut f = f.clone();
-    assert_eq!(f.code[3], (-3i32) as u8);
-    f.code[3] = (-4i32) as u8;
+    assert_eq!(f.code[3], 2u8);
+    f.code[3] = 3u8;
     assert_eq!(
         validate_function(&f, 0).unwrap_err(),
-        ValidationError::RegisterOutOfRange { pc: 2, reg: -4 }
+        ValidationError::RegisterOutOfRange { pc: 2, reg: 3 }
     );
 }
 
@@ -904,12 +918,17 @@ fn forward_jump_loop_panics() {
     let _ = b.finish(meta()).unwrap();
 }
 
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "below the parameter window")]
 fn register_below_parameter_window_panics() {
-    let mut b = FnBuilder::new(1); // receiver: -1, formal 0: -2
-    b.load(Reg::new(-3));
+    // operand-space: locals live at -5 and below, params at 0..=arity;
+    // a logical -4 encodes as param operand 3, beyond arity 1's window
+    let mut b = FnBuilder::new(1);
+    b.load(Reg::new(-4));
+    let f = b.finish(meta()).unwrap();
+    assert_eq!(
+        validate_function(&f, 0).unwrap_err(),
+        ValidationError::RegisterOutOfRange { pc: 0, reg: 3 }
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1009,10 +1028,10 @@ fn validate_rejects_out_of_range_operands() {
     let mut f = good_function();
     f.register_count = 0; // only the parameter register is used, still legal
     validate_function(&f, 0).unwrap();
-    f.arity = 0; // ...but now Reg(-2) is below the parameter window (receiver only)
+    f.arity = 0; // ...but now operand 1 is above the parameter window (receiver only)
     assert_eq!(
         validate_function(&f, 0).unwrap_err(),
-        ValidationError::RegisterOutOfRange { pc: 0, reg: -2 }
+        ValidationError::RegisterOutOfRange { pc: 0, reg: 1 }
     );
 }
 

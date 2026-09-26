@@ -8,6 +8,16 @@ use vm::{
 };
 use vm::{RuntimeContext, RuntimeIndex, Thread, VM, VmError};
 
+/// Hand-emitted register operands in these tests use logical indices;
+/// the encoding carries the anchor bias for locals (params stay negative).
+fn reg_op(n: i32) -> u32 {
+    if n >= 0 {
+        (bytecode::REGISTER_FILE_START - n) as u32
+    } else {
+        n as u32
+    }
+}
+
 fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
@@ -275,15 +285,15 @@ fn call_runtime_passes_receiver_and_args() {
     let add = vm.register_runtime(add);
     let mut thread = vm.attach();
 
-    // r0 = receiver, r1 = 6, r2 = 7; CallRuntime add, r0, 3
+    // window r0..r2: receiver rides the top (r2), args descend
     let mut program = Vec::new();
     emit(&mut program, Opcode::LoadSmi, &[0]);
-    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[6]);
-    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Store, &[reg_op(1)]);
     emit(&mut program, Opcode::LoadSmi, &[7]);
-    emit(&mut program, Opcode::Store, &[2]);
-    emit(&mut program, Opcode::CallRuntime, &[add.0 as u32, 0, 3]);
+    emit(&mut program, Opcode::Store, &[reg_op(0)]);
+    emit(&mut program, Opcode::CallRuntime, &[add.0 as u32, reg_op(0), 3]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 3, &[]);
@@ -306,10 +316,10 @@ fn failed_run_does_not_leak_frames_into_next_run() {
         word(&*thread.heap(), obj)
     });
     let mut bad = Vec::new();
-    emit(&mut bad, Opcode::Load, &[(-1i32) as u32]);
-    emit(&mut bad, Opcode::Store, &[1]);
-    emit(&mut bad, Opcode::Load, &[(-1i32) as u32]);
-    emit(&mut bad, Opcode::Add, &[1]);
+    emit(&mut bad, Opcode::Load, &[reg_op(0)]);
+    emit(&mut bad, Opcode::Store, &[reg_op(1)]);
+    emit(&mut bad, Opcode::Load, &[reg_op(0)]);
+    emit(&mut bad, Opcode::Add, &[reg_op(1)]);
     emit(&mut bad, Opcode::Return, &[]);
     let result = run_program(&mut thread, bad, 2, &[obj]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -328,7 +338,7 @@ fn parameters_are_readable_via_negative_registers() {
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
-    emit(&mut program, Opcode::Load, &[(-1i32) as u32]); // param 0 (receiver)
+    emit(&mut program, Opcode::Load, &[0]); // param 0 (receiver)
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 2, &[smi(42)]);
@@ -341,10 +351,11 @@ fn wide_parameter_operand_uses_two_bytes() {
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
-    emit(&mut program, Opcode::Load, &[(-201i32) as u32]); // param 200: needs wide
+    // param 200 needs a wide operand; the receiver is param 0
+    emit(&mut program, Opcode::Load, &[200]);
     emit(&mut program, Opcode::Return, &[]);
 
-    // -201 does not fit in a signed byte, so the program must start with Wide
+    // 201 does not fit in a byte, so the program must start with Wide
     assert_eq!(program[0], Opcode::Wide as u8);
 
     let args: Vec<_> = (0..201).map(|i| smi(i * 100)).collect();
@@ -386,8 +397,8 @@ fn call_resolves_callable_object_and_pushes_frames() {
             .allocate_handle::<FixedArray>(stage_values(&scope, &[w3]), &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
         emit(&mut program, Opcode::Return, &[]);
         let bytecode = thread
             .heap()
@@ -417,14 +428,14 @@ fn array_literal_built_with_manual_stores() {
     // r3 = []; r3[0] = 1; r3[1] = 2; r3[2] = 3; return r3
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[3]);
+    emit(&mut program, Opcode::Store, &[reg_op(3)]);
     for (key, value) in [(0i32, 1i32), (1, 2), (2, 3)] {
         emit(&mut program, Opcode::LoadSmi, &[key as u32]);
-        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::Store, &[reg_op(4)]);
         emit(&mut program, Opcode::LoadSmi, &[value as u32]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[3, 4, 0]);
+        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
     }
-    emit(&mut program, Opcode::Load, &[3]);
+    emit(&mut program, Opcode::Load, &[reg_op(3)]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 5, &[]);
@@ -476,14 +487,14 @@ fn array_literal_with_holes_keeps_length() {
     // [1, , 2]: never store index 1; storing index 2 grows length to 3
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[3]);
+    emit(&mut program, Opcode::Store, &[reg_op(3)]);
     for (key, value) in [(0i32, 1i32), (2, 2)] {
         emit(&mut program, Opcode::LoadSmi, &[key as u32]);
-        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::Store, &[reg_op(4)]);
         emit(&mut program, Opcode::LoadSmi, &[value as u32]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[3, 4, 0]);
+        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
     }
-    emit(&mut program, Opcode::Load, &[3]);
+    emit(&mut program, Opcode::Load, &[reg_op(3)]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 5, &[]);
@@ -522,12 +533,12 @@ fn object_literal_built_with_manual_stores() {
             // r0 = {}; r0.x = 7; r0.y = 9; return r0
             let mut program = Vec::new();
             emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-            emit(&mut program, Opcode::Store, &[0]);
+            emit(&mut program, Opcode::Store, &[reg_op(0)]);
             emit(&mut program, Opcode::LoadSmi, &[7]);
-            emit(&mut program, Opcode::StoreNamedProperty, &[0, 0, 0]);
+            emit(&mut program, Opcode::StoreNamedProperty, &[reg_op(0), 0, 0]);
             emit(&mut program, Opcode::LoadSmi, &[9]);
-            emit(&mut program, Opcode::StoreNamedProperty, &[0, 1, 0]);
-            emit(&mut program, Opcode::Load, &[0]);
+            emit(&mut program, Opcode::StoreNamedProperty, &[reg_op(0), 1, 0]);
+            emit(&mut program, Opcode::Load, &[reg_op(0)]);
             emit(&mut program, Opcode::Return, &[]);
 
             let bytecode = thread
@@ -596,26 +607,26 @@ fn define_named_own_property_attributes_and_value() {
                 .heap()
                 .allocate_handle::<FixedArray>(stage_values(&scope, &[m]), &scope);
             let define = |program: &mut Vec<u8>, value: i32| {
-                emit(program, Opcode::Load, &[0]);
-                emit(program, Opcode::Store, &[1]);
+                emit(program, Opcode::Load, &[reg_op(0)]);
+                emit(program, Opcode::Store, &[reg_op(4)]);
                 emit(program, Opcode::LoadConstant, &[0]);
-                emit(program, Opcode::Store, &[2]);
+                emit(program, Opcode::Store, &[reg_op(3)]);
                 emit(program, Opcode::LoadSmi, &[value as u32]);
-                emit(program, Opcode::Store, &[3]);
+                emit(program, Opcode::Store, &[reg_op(2)]);
                 emit(program, Opcode::LoadSmi, &[PropertyFlags::DontEnum.bits()]);
-                emit(program, Opcode::Store, &[4]);
+                emit(program, Opcode::Store, &[reg_op(1)]);
                 emit(
                     program,
                     Opcode::CallRuntime,
-                    &[bytecode::RuntimeFn::DefineOwnProperty as u32, 1, 4],
+                    &[bytecode::RuntimeFn::DefineOwnProperty as u32, reg_op(1), 4],
                 );
             };
             let mut program = Vec::new();
             emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-            emit(&mut program, Opcode::Store, &[0]);
+            emit(&mut program, Opcode::Store, &[reg_op(0)]);
             define(&mut program, 7);
             define(&mut program, 8);
-            emit(&mut program, Opcode::Load, &[0]);
+            emit(&mut program, Opcode::Load, &[reg_op(0)]);
             emit(&mut program, Opcode::Return, &[]);
 
             let bytecode = thread
@@ -677,14 +688,14 @@ fn define_named_own_property_conflicting_redefine_throws() {
     // (runtime(obj, key, value, flags) window: r1..r4)
     let p = thread.handle_scope(|thread, scope| intern_word(thread, &scope, "p"));
     let define = |program: &mut Vec<u8>, value: i32, flags: u32| {
-        emit(program, Opcode::Load, &[0]);
-        emit(program, Opcode::Store, &[1]);
+        emit(program, Opcode::Load, &[reg_op(0)]);
+        emit(program, Opcode::Store, &[reg_op(1)]);
         emit(program, Opcode::LoadConstant, &[0]);
-        emit(program, Opcode::Store, &[2]);
+        emit(program, Opcode::Store, &[reg_op(2)]);
         emit(program, Opcode::LoadSmi, &[value as u32]);
-        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[flags]);
-        emit(program, Opcode::Store, &[4]);
+        emit(program, Opcode::Store, &[reg_op(4)]);
         emit(
             program,
             Opcode::CallRuntime,
@@ -693,7 +704,7 @@ fn define_named_own_property_conflicting_redefine_throws() {
     };
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::Store, &[reg_op(0)]);
     define(
         &mut program,
         1,
@@ -715,31 +726,32 @@ fn define_keyed_own_property_string_and_smi_keys() {
     // r1 = 3 (smi key); define r0[r1] = 6 {e-}; return r0
     // (runtime(obj, key, value, flags) window: r2..r5)
     let x = thread.handle_scope(|thread, scope| intern_word(thread, &scope, "x"));
+    // window r2..r5: element 0 (obj) rides the top slot
     let define = |program: &mut Vec<u8>, value: i32| {
-        emit(program, Opcode::Load, &[0]);
-        emit(program, Opcode::Store, &[2]);
-        emit(program, Opcode::Load, &[1]);
-        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::Load, &[reg_op(0)]);
+        emit(program, Opcode::Store, &[reg_op(5)]);
+        emit(program, Opcode::Load, &[reg_op(1)]);
+        emit(program, Opcode::Store, &[reg_op(4)]);
         emit(program, Opcode::LoadSmi, &[value as u32]);
-        emit(program, Opcode::Store, &[4]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[PropertyFlags::DontEnum.bits()]);
-        emit(program, Opcode::Store, &[5]);
+        emit(program, Opcode::Store, &[reg_op(2)]);
         emit(
             program,
             Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::DefineOwnProperty as u32, 2, 4],
+            &[bytecode::RuntimeFn::DefineOwnProperty as u32, reg_op(2), 4],
         );
     };
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::Store, &[reg_op(0)]);
     emit(&mut program, Opcode::LoadConstant, &[0]);
-    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Store, &[reg_op(1)]);
     define(&mut program, 5);
     emit(&mut program, Opcode::LoadSmi, &[3]);
-    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Store, &[reg_op(1)]);
     define(&mut program, 6);
-    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::Load, &[reg_op(0)]);
     emit(&mut program, Opcode::Return, &[]);
 
     let obj = run_program_consts(&mut thread, program, 6, &[], &[x]).unwrap();
@@ -811,31 +823,32 @@ fn define_own_property_accessor_invokes_getter() {
     let accessor_program = |load: bool| -> Vec<u8> {
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
+        // window r2..r5: element 0 (target) rides the top slot
+        emit(&mut program, Opcode::Load, &[reg_op(0)]);
+        emit(&mut program, Opcode::Store, &[reg_op(5)]);
         emit(&mut program, Opcode::LoadConstant, &[2]);
-        emit(&mut program, Opcode::Store, &[3]);
-        emit(&mut program, Opcode::Load, &[1]);
-        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::Store, &[reg_op(4)]);
+        emit(&mut program, Opcode::Load, &[reg_op(1)]);
+        emit(&mut program, Opcode::Store, &[reg_op(3)]);
         // flags: getter half (bit 0) + non-enumerable
         emit(
             &mut program,
             Opcode::LoadSmi,
             &[(PropertyFlags::DontEnum.bits() | 1)],
         );
-        emit(&mut program, Opcode::Store, &[5]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(
             &mut program,
             Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::InstallAccessor as u32, 2, 4],
+            &[bytecode::RuntimeFn::InstallAccessor as u32, reg_op(2), 4],
         );
         if load {
-            emit(&mut program, Opcode::LoadNamedProperty, &[0, 2, 0]);
+            emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(0), 2, 0]);
         } else {
-            emit(&mut program, Opcode::Load, &[0]);
+            emit(&mut program, Opcode::Load, &[reg_op(0)]);
         }
         emit(&mut program, Opcode::Return, &[]);
         program
@@ -882,15 +895,15 @@ fn keyed_load_reads_array_element() {
     // r3 = []; r3[0..2] = 10, 20, 30; acc = 1; acc = r3[acc]
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[3]);
+    emit(&mut program, Opcode::Store, &[reg_op(3)]);
     for (key, value) in [(0i32, 10i32), (1, 20), (2, 30)] {
         emit(&mut program, Opcode::LoadSmi, &[key as u32]);
-        emit(&mut program, Opcode::Store, &[4]);
+        emit(&mut program, Opcode::Store, &[reg_op(4)]);
         emit(&mut program, Opcode::LoadSmi, &[value as u32]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[3, 4, 0]);
+        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
     }
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::LoadKeyedProperty, &[3, 0]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(3), 0]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 5, &[]);
@@ -905,15 +918,15 @@ fn keyed_store_writes_array_element() {
     // r3 = []; r3[0] = 1; r4 = 0 (key); acc = 99; r3[r4] = acc; acc = r3[0]
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[3]);
+    emit(&mut program, Opcode::Store, &[reg_op(3)]);
     emit(&mut program, Opcode::LoadSmi, &[0]);
-    emit(&mut program, Opcode::Store, &[4]);
+    emit(&mut program, Opcode::Store, &[reg_op(4)]);
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[3, 4, 0]);
+    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
     emit(&mut program, Opcode::LoadSmi, &[99]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[3, 4, 0]);
+    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
     emit(&mut program, Opcode::LoadSmi, &[0]);
-    emit(&mut program, Opcode::LoadKeyedProperty, &[3, 0]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(3), 0]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 5, &[]);
@@ -930,13 +943,13 @@ fn keyed_load_out_of_bounds_yields_undefined() {
     for key in [2u32, (-1i32) as u32] {
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(&mut program, Opcode::LoadSmi, &[1]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[1, 2, 0]);
+        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
         emit(&mut program, Opcode::LoadSmi, &[key]);
-        emit(&mut program, Opcode::LoadKeyedProperty, &[1, 0]);
+        emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(1), 0]);
         emit(&mut program, Opcode::Return, &[]);
 
         let result = run_program(&mut thread, program, 3, &[]);
@@ -952,17 +965,17 @@ fn keyed_store_grows_array_and_fills_holes() {
     // r1 = []; r1[0] = 1; r1[3] = 42; acc = r1[3]; then acc = r1[1] (hole -> undefined)
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Store, &[reg_op(1)]);
     emit(&mut program, Opcode::LoadSmi, &[0]);
-    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[1, 2, 0]);
+    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
     emit(&mut program, Opcode::LoadSmi, &[3]);
-    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[1, 2, 0]);
+    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
     emit(&mut program, Opcode::LoadSmi, &[3]);
-    emit(&mut program, Opcode::LoadKeyedProperty, &[1, 0]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(1), 0]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 3, &[]);
@@ -971,17 +984,17 @@ fn keyed_store_grows_array_and_fills_holes() {
     // the grown array must have length 4 with holes at 1..3
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyArrayLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Store, &[reg_op(1)]);
     emit(&mut program, Opcode::LoadSmi, &[0]);
-    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[1, 2, 0]);
+    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
     emit(&mut program, Opcode::LoadSmi, &[3]);
-    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[1, 2, 0]);
+    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::LoadKeyedProperty, &[1, 0]);
+    emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(1), 0]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 3, &[]);
@@ -996,11 +1009,11 @@ fn keyed_store_creates_numeric_property_on_plain_object() {
     // r3 = 0 (key); r2[0] = 42 (numeric property on an object); acc = r2[0]
     let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
         emit(program, Opcode::LoadSmi, &[0]);
-        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[2, 3, 0]);
+        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
         emit(program, Opcode::LoadSmi, &[0]);
-        emit(program, Opcode::LoadKeyedProperty, &[2, 0]);
+        emit(program, Opcode::LoadKeyedProperty, &[reg_op(2), 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
@@ -1017,11 +1030,11 @@ fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Resu
         // r2 = {}; r2.x = 7; r2.y = 9
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(&mut program, Opcode::LoadSmi, &[7]);
-        emit(&mut program, Opcode::StoreNamedProperty, &[2, 0, 0]);
+        emit(&mut program, Opcode::StoreNamedProperty, &[reg_op(2), 0, 0]);
         emit(&mut program, Opcode::LoadSmi, &[9]);
-        emit(&mut program, Opcode::StoreNamedProperty, &[2, 1, 0]);
+        emit(&mut program, Opcode::StoreNamedProperty, &[reg_op(2), 1, 0]);
         build(&mut program);
         emit(&mut program, Opcode::Return, &[]);
 
@@ -1050,7 +1063,7 @@ fn keyed_load_reads_named_property_via_string_key() {
     // acc = "x" (constants[0]); acc = r2[acc]
     let result = object_program(&mut thread, |program| {
         emit(program, Opcode::LoadConstant, &[0]);
-        emit(program, Opcode::LoadKeyedProperty, &[2, 0]);
+        emit(program, Opcode::LoadKeyedProperty, &[reg_op(2), 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
@@ -1063,10 +1076,10 @@ fn keyed_store_writes_named_property_via_string_key() {
     // r3 = "x"; acc = 42; r2[r3] = acc; acc = r2.x
     let result = object_program(&mut thread, |program| {
         emit(program, Opcode::LoadConstant, &[0]);
-        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[2, 3, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 0, 0]);
+        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 0, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
@@ -1117,7 +1130,7 @@ fn transition_object_program(
         // r2 = object
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         build(&mut program);
         emit(&mut program, Opcode::Return, &[]);
 
@@ -1149,12 +1162,12 @@ fn named_store_new_property_transitions() {
     // r2.z = 42 (transition); acc = r2.x + r2.z
     let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[2, 2, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
-        emit(program, Opcode::Store, &[3]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
-        emit(program, Opcode::Store, &[4]);
-        emit(program, Opcode::Add, &[3]);
+        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 2, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
+        emit(program, Opcode::Store, &[reg_op(4)]);
+        emit(program, Opcode::Add, &[reg_op(3)]);
     });
     // existing slot preserved (7) and new slot written (42)
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 49);
@@ -1169,18 +1182,18 @@ fn named_store_chained_transitions() {
     // acc = r2.x + r2.z + r2.w
     let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[2, 2, 0]);
+        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 2, 0]);
         emit(program, Opcode::LoadSmi, &[1]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[2, 3, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
-        emit(program, Opcode::Store, &[3]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
-        emit(program, Opcode::Store, &[4]);
-        emit(program, Opcode::Add, &[3]);
-        emit(program, Opcode::Store, &[3]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 3, 0]);
-        emit(program, Opcode::Store, &[4]);
-        emit(program, Opcode::Add, &[3]);
+        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 3, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
+        emit(program, Opcode::Store, &[reg_op(4)]);
+        emit(program, Opcode::Add, &[reg_op(3)]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 3, 0]);
+        emit(program, Opcode::Store, &[reg_op(4)]);
+        emit(program, Opcode::Add, &[reg_op(3)]);
     });
     // x = 7 (preserved), z = 42, w = 1
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 50);
@@ -1194,10 +1207,10 @@ fn keyed_store_new_property_via_string_key_transitions() {
     // r3 = "z"; acc = 42; r2[r3] = acc (transition); acc = r2.z
     let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
         emit(program, Opcode::LoadConstant, &[2]);
-        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[2, 3, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
@@ -1213,7 +1226,7 @@ fn named_store_new_property_to_non_extensible_is_ignored() {
     let result =
         transition_object_program(&mut thread, MapKind::OBJECT, WRITABLE_VALUE, |program| {
             emit(program, Opcode::LoadSmi, &[42]);
-            emit(program, Opcode::StoreNamedPropertyNoShadow, &[2, 2, 0]);
+            emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 2, 0]);
         });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
@@ -1226,7 +1239,7 @@ fn named_store_to_non_writable_fails() {
     // x is a non-writable value slot
     let result = transition_object_program(&mut thread, EXTENDABLE, SlotFlags::VALUE, |program| {
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[2, 1, 0]);
+        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 1, 0]);
     });
     expect_escaped(&mut thread, result, "TypeError");
 }
@@ -1299,16 +1312,16 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
         // r2 = child; r2.p = 2 (via `store_op`); acc = r2.p + parent.p
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(&mut program, Opcode::LoadSmi, &[2]);
-        emit(&mut program, store_op, &[2, 1, 0]);
-        emit(&mut program, Opcode::LoadNamedProperty, &[2, 1, 0]);
-        emit(&mut program, Opcode::Store, &[3]);
+        emit(&mut program, store_op, &[reg_op(2), 1, 0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
+        emit(&mut program, Opcode::Store, &[reg_op(3)]);
         emit(&mut program, Opcode::LoadConstant, &[2]);
-        emit(&mut program, Opcode::Store, &[4]);
-        emit(&mut program, Opcode::LoadNamedProperty, &[4, 1, 0]);
-        emit(&mut program, Opcode::Store, &[5]);
-        emit(&mut program, Opcode::Add, &[3]);
+        emit(&mut program, Opcode::Store, &[reg_op(4)]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(4), 1, 0]);
+        emit(&mut program, Opcode::Store, &[reg_op(5)]);
+        emit(&mut program, Opcode::Add, &[reg_op(3)]);
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -1386,18 +1399,18 @@ fn jump_loop_counts_down_to_zero() {
     // end: return r0
     let mut program = Vec::new();
     emit(&mut program, Opcode::LoadSmi, &[3]); // 0..2
-    emit(&mut program, Opcode::Store, &[0]); // 2..4
+    emit(&mut program, Opcode::Store, &[reg_op(0)]); // 2..4
     emit(&mut program, Opcode::LoadSmi, &[(-1i32) as u32]); // 4..6
-    emit(&mut program, Opcode::Store, &[1]); // 6..8
+    emit(&mut program, Opcode::Store, &[reg_op(1)]); // 6..8
     // loop @ 8
-    emit(&mut program, Opcode::Load, &[0]); // 8..10
+    emit(&mut program, Opcode::Load, &[reg_op(0)]); // 8..10
     emit(&mut program, Opcode::JumpIfFalsy, &[10]); // 10..12 -> 20
-    emit(&mut program, Opcode::Load, &[0]); // 12..14
-    emit(&mut program, Opcode::Add, &[1]); // 14..16
-    emit(&mut program, Opcode::Store, &[0]); // 16..18
+    emit(&mut program, Opcode::Load, &[reg_op(0)]); // 12..14
+    emit(&mut program, Opcode::Add, &[reg_op(1)]); // 14..16
+    emit(&mut program, Opcode::Store, &[reg_op(0)]); // 16..18
     emit(&mut program, Opcode::JumpLoop, &[(-10i32) as u32]); // 18..20 -> 8
     // end @ 20
-    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::Load, &[reg_op(0)]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 2, &[]).unwrap();
@@ -1411,7 +1424,7 @@ fn jump_if_truthy_follows_toboolean() {
 
     // acc = param0; JumpIfTruthy L; LoadSmi 0; Return; L: LoadSmi 1; Return
     let mut program = Vec::new();
-    emit(&mut program, Opcode::Load, &[(-1i32) as u32]); // 0..2
+    emit(&mut program, Opcode::Load, &[0]); // 0..2 (param 0)
     emit(&mut program, Opcode::JumpIfTruthy, &[5]); // 2..4 -> 7
     emit(&mut program, Opcode::LoadSmi, &[0]); // 4..6
     emit(&mut program, Opcode::Return, &[]); // 6..7
@@ -1506,8 +1519,8 @@ fn test_reference_equal_compares_identity() {
 
     // acc = param0; TestReferenceEqual param1; Return
     let mut program = Vec::new();
-    emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
-    emit(&mut program, Opcode::TestReferenceEqual, &[(-2i32) as u32]);
+    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, Opcode::TestReferenceEqual, &[1]);
     emit(&mut program, Opcode::Return, &[]);
 
     let (true_v, false_v, undefined, null) = {
@@ -1537,8 +1550,8 @@ fn test_reference_equal_compares_identity() {
 /// getter: `return this.y` (receiver is param 0, "y" is constants[0])
 fn getter_program() -> Vec<u8> {
     let mut p = Vec::new();
-    emit(&mut p, Opcode::Load, &[(-1i32) as u32]);
-    emit(&mut p, Opcode::Store, &[0]);
+    // receiver = param 0: this.y
+    emit(&mut p, Opcode::Load, &[0]);
     emit(&mut p, Opcode::LoadNamedProperty, &[0, 0, 0]);
     emit(&mut p, Opcode::Return, &[]);
     p
@@ -1547,9 +1560,8 @@ fn getter_program() -> Vec<u8> {
 /// setter: `this.y = value` (receiver is param 0, value is param 1)
 fn setter_program() -> Vec<u8> {
     let mut p = Vec::new();
-    emit(&mut p, Opcode::Load, &[(-1i32) as u32]);
-    emit(&mut p, Opcode::Store, &[0]);
-    emit(&mut p, Opcode::Load, &[(-2i32) as u32]);
+    // this.y = value: receiver = param 0, value = param 1
+    emit(&mut p, Opcode::Load, &[1]);
     emit(&mut p, Opcode::StoreNamedPropertyNoShadow, &[0, 0, 0]);
     emit(&mut p, Opcode::Return, &[]);
     p
@@ -1642,7 +1654,7 @@ fn accessor_object_program(
         // r2 = object
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         build(&mut program);
         emit(&mut program, Opcode::Return, &[]);
 
@@ -1670,7 +1682,7 @@ fn named_load_calls_getter_with_receiver() {
 
     // acc = r2.x (calls the getter, which reads this.y)
     let result = accessor_object_program(&mut thread, Some(&getter_program()), None, |program| {
-        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
@@ -1683,8 +1695,8 @@ fn named_store_calls_setter_with_receiver_and_value() {
     // r2.x = 21 (calls the setter, which writes this.y); acc = r2.y
     let result = accessor_object_program(&mut thread, None, Some(&setter_program()), |program| {
         emit(program, Opcode::LoadSmi, &[21]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[2, 1, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 1, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 21);
 }
@@ -1696,7 +1708,7 @@ fn named_load_without_getter_is_undefined() {
 
     let undefined = global_word(&mut thread, |k| k.undefined);
     let result = accessor_object_program(&mut thread, None, None, |program| {
-        emit(program, Opcode::LoadNamedProperty, &[2, 1, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
     });
     assert_eq!(result.unwrap(), undefined);
 }
@@ -1709,8 +1721,8 @@ fn named_store_without_setter_is_ignored() {
     // r2.x = 21 is ignored (no setter); y keeps its initial value 7
     let result = accessor_object_program(&mut thread, None, None, |program| {
         emit(program, Opcode::LoadSmi, &[21]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[2, 1, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 1, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
@@ -1723,7 +1735,7 @@ fn keyed_load_calls_getter() {
     // acc = "x"; acc = r2[acc] (calls the getter)
     let result = accessor_object_program(&mut thread, Some(&getter_program()), None, |program| {
         emit(program, Opcode::LoadConstant, &[1]);
-        emit(program, Opcode::LoadKeyedProperty, &[2, 0]);
+        emit(program, Opcode::LoadKeyedProperty, &[reg_op(2), 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
@@ -1736,10 +1748,10 @@ fn keyed_store_calls_setter() {
     // r3 = "x"; r2[r3] = 21 (calls the setter); acc = r2.y
     let result = accessor_object_program(&mut thread, None, Some(&setter_program()), |program| {
         emit(program, Opcode::LoadConstant, &[1]);
-        emit(program, Opcode::Store, &[3]);
+        emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[21]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[2, 3, 0]);
-        emit(program, Opcode::LoadNamedProperty, &[2, 2, 0]);
+        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 21);
 }
@@ -1752,7 +1764,7 @@ fn named_load_missing_property_is_undefined() {
     let undefined = global_word(&mut thread, |k| k.undefined);
     // r2.z does not exist on the map
     let result = accessor_object_program(&mut thread, None, None, |program| {
-        emit(program, Opcode::LoadNamedProperty, &[2, 3, 0]);
+        emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 3, 0]);
     });
     assert_eq!(result.unwrap(), undefined);
 }
@@ -1837,13 +1849,11 @@ fn store_new_accessor_property_defines_own_accessor() {
         )
         .unwrap();
 
-        // program: acc = param0.x
+        // program: acc = param0.x (receiver = param 0)
         let consts = thread
             .heap()
             .allocate_handle::<FixedArray>(stage_values(&scope, &[x_word]), &scope);
         let mut program = Vec::new();
-        emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
-        emit(&mut program, Opcode::Store, &[0]);
         emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
         emit(&mut program, Opcode::Return, &[]);
         let bytecode = thread
@@ -1973,8 +1983,8 @@ fn call_dispatches_to_runtime_function_object() {
         // r0 = runtime fn; Call r0 with r0 as the (single, receiver) arg
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -2008,7 +2018,7 @@ fn run_failing_inner<'a>(
     state.handle_scope(|scope| {
         // callee: Add on a non-smi accumulator -> TypeError throw
         let mut bad = Vec::new();
-        emit(&mut bad, Opcode::Add, &[1]);
+        emit(&mut bad, Opcode::Add, &[reg_op(1)]);
         emit(&mut bad, Opcode::Return, &[]);
         let callee = scope.handle(bytecode_fn(heap, &scope, &bad, &[], 2));
 
@@ -2016,8 +2026,8 @@ fn run_failing_inner<'a>(
         // depth when the exception escapes the nested run
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
         emit(&mut program, Opcode::Return, &[]);
         let caller = scope.handle(bytecode_fn(
             heap,
@@ -2051,8 +2061,8 @@ fn inner_run_error_unwinds_and_runtime_recovers() {
 
     let mut program = Vec::new();
     emit(&mut program, Opcode::LoadSmi, &[0]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::CallRuntime, &[idx.0 as u32, 0, 1]);
+    emit(&mut program, Opcode::Store, &[reg_op(0)]);
+    emit(&mut program, Opcode::CallRuntime, &[idx.0 as u32, reg_op(0), 1]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 1, &[]);
@@ -2069,8 +2079,9 @@ fn inner_run_error_unwinds_and_runtime_recovers() {
 /// acc = param0; acc = acc op param1; return acc
 fn binary_op_program(op: Opcode) -> Vec<u8> {
     let mut program = Vec::new();
-    emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
-    emit(&mut program, op, &[(-2i32) as u32]);
+    // param 0 (receiver = lhs), param 1 (rhs)
+    emit(&mut program, Opcode::Load, &[0]);
+    emit(&mut program, op, &[1]);
     emit(&mut program, Opcode::Return, &[]);
     program
 }
@@ -2151,9 +2162,9 @@ fn arithmetic_overflow_promotes_to_float() {
 fn binary_op_consts_program(op: Opcode) -> Vec<u8> {
     let mut program = Vec::new();
     emit(&mut program, Opcode::LoadConstant, &[1]);
-    emit(&mut program, Opcode::Store, &[0]);
+    emit(&mut program, Opcode::Store, &[reg_op(0)]);
     emit(&mut program, Opcode::LoadConstant, &[0]);
-    emit(&mut program, op, &[0]);
+    emit(&mut program, op, &[reg_op(0)]);
     emit(&mut program, Opcode::Return, &[]);
     program
 }
@@ -2743,8 +2754,8 @@ fn empty_object_literal_inherits_from_object_prototype() {
         // {}.p reads through the prototype chain
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(0), 0, 0]);
         emit(&mut program, Opcode::Return, &[]);
         let first = run_program_consts(&mut *thread, program, 1, &[], &[p]);
         assert_eq!(Smi::decode(first.unwrap()).unwrap().value(), 1);
@@ -2752,10 +2763,10 @@ fn empty_object_literal_inherits_from_object_prototype() {
         // ({}.p = 2) shadows: own property on the instance...
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[2]);
-        emit(&mut program, Opcode::StoreNamedProperty, &[0, 0, 0]);
-        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::StoreNamedProperty, &[reg_op(0), 0, 0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(0), 0, 0]);
         emit(&mut program, Opcode::Return, &[]);
         let second = run_program_consts(&mut *thread, program, 1, &[], &[p]);
         assert_eq!(Smi::decode(second.unwrap()).unwrap().value(), 2);
@@ -2763,8 +2774,8 @@ fn empty_object_literal_inherits_from_object_prototype() {
         // ...and a fresh {} still sees the prototype value
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(0), 0, 0]);
         emit(&mut program, Opcode::Return, &[]);
         run_program_consts(&mut *thread, program, 1, &[], &[p])
     });
@@ -2802,8 +2813,8 @@ fn create_closure_inherits_current_context_and_is_callable() {
         // caller: r1 = CreateClosure(template); call r1; return
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateClosure, &[1]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::CallNoFeedback, &[1, 1, 1]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
+        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(1), reg_op(1), 1]);
         emit(&mut program, Opcode::Return, &[]);
         let bytecode = thread
             .heap()
@@ -2956,18 +2967,18 @@ fn create_closure_function_kind_controls_call_and_construct() {
     let undefined = global_word(&mut thread, |k| k.undefined);
     let mut call = Vec::new();
     emit(&mut call, Opcode::LoadConstant, &[0]);
-    emit(&mut call, Opcode::Store, &[0]);
+    emit(&mut call, Opcode::Store, &[reg_op(0)]);
     emit(&mut call, Opcode::LoadConstant, &[1]);
-    emit(&mut call, Opcode::Store, &[1]);
-    emit(&mut call, Opcode::CallNoFeedback, &[0, 1, 1]);
+    emit(&mut call, Opcode::Store, &[reg_op(1)]);
+    emit(&mut call, Opcode::CallNoFeedback, &[reg_op(0), reg_op(1), 1]);
     emit(&mut call, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, call, 2, &[], &[method, undefined]).unwrap();
     assert_eq!(result.to_i64().unwrap(), 7);
 
     let mut construct = Vec::new();
     emit(&mut construct, Opcode::LoadConstant, &[0]);
-    emit(&mut construct, Opcode::Store, &[0]);
-    emit(&mut construct, Opcode::Construct, &[0, 0, 0]);
+    emit(&mut construct, Opcode::Store, &[reg_op(0)]);
+    emit(&mut construct, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[method]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -3001,18 +3012,18 @@ fn create_closure_function_kind_controls_call_and_construct() {
 
     let mut call = Vec::new();
     emit(&mut call, Opcode::LoadConstant, &[0]);
-    emit(&mut call, Opcode::Store, &[0]);
+    emit(&mut call, Opcode::Store, &[reg_op(0)]);
     emit(&mut call, Opcode::LoadConstant, &[1]);
-    emit(&mut call, Opcode::Store, &[1]);
-    emit(&mut call, Opcode::CallNoFeedback, &[0, 1, 1]);
+    emit(&mut call, Opcode::Store, &[reg_op(1)]);
+    emit(&mut call, Opcode::CallNoFeedback, &[reg_op(0), reg_op(1), 1]);
     emit(&mut call, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, call, 2, &[], &[class_constructor, undefined]);
     expect_escaped(&mut thread, result, "TypeError");
 
     let mut construct = Vec::new();
     emit(&mut construct, Opcode::LoadConstant, &[0]);
-    emit(&mut construct, Opcode::Store, &[0]);
-    emit(&mut construct, Opcode::Construct, &[0, 0, 0]);
+    emit(&mut construct, Opcode::Store, &[reg_op(0)]);
+    emit(&mut construct, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[class_constructor]).unwrap();
     assert!(
@@ -3029,15 +3040,15 @@ fn function_context_slots_are_readable_and_writable() {
     // CreateFunctionContext (2 slots); PushContext r0; x = 42; y = 43
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateFunctionContext, &[0]);
-    emit(&mut program, Opcode::PushContext, &[0]);
+    emit(&mut program, Opcode::PushContext, &[reg_op(0)]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
     emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
     emit(&mut program, Opcode::LoadSmi, &[43]);
     emit(&mut program, Opcode::StoreContextSlot, &[1, 0]);
     emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
-    emit(&mut program, Opcode::Store, &[1]);
+    emit(&mut program, Opcode::Store, &[reg_op(1)]);
     emit(&mut program, Opcode::LoadContextSlot, &[1, 0]);
-    emit(&mut program, Opcode::Add, &[1]);
+    emit(&mut program, Opcode::Add, &[reg_op(1)]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program_ctx(&mut thread, program, 2, &[], 2);
@@ -3061,11 +3072,11 @@ fn push_context_saves_previous_context_to_register() {
             .allocate_handle::<ScopeInfo>(ScopeInfoInit { names }, &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateFunctionContext, &[0]);
-        emit(&mut program, Opcode::PushContext, &[0]);
-        emit(&mut program, Opcode::Load, &[0]); // r0 = saved old context
-        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::PushContext, &[reg_op(0)]);
+        emit(&mut program, Opcode::Load, &[reg_op(0)]); // r0 = saved old context
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadConstant, &[1]); // acc = empty_context
-        emit(&mut program, Opcode::TestReferenceEqual, &[1]);
+        emit(&mut program, Opcode::TestReferenceEqual, &[reg_op(1)]);
         emit(&mut program, Opcode::Return, &[]);
         let w21 = word(&*thread.heap(), scope_info);
         run_program_consts(&mut *thread, program, 2, &[], &[w21, empty])
@@ -3081,14 +3092,14 @@ fn pop_context_restores_previous_context() {
     // ctxA[0] = 42; push ctxB; ctxB[0] = 99; pop back to ctxA; read ctxA[0]
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateFunctionContext, &[0]);
-    emit(&mut program, Opcode::PushContext, &[0]); // r0 = old; frame = ctxA
+    emit(&mut program, Opcode::PushContext, &[reg_op(0)]); // r0 = old; frame = ctxA
     emit(&mut program, Opcode::LoadSmi, &[42]);
     emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
     emit(&mut program, Opcode::CreateBlockContext, &[1]);
-    emit(&mut program, Opcode::PushContext, &[1]); // r1 = ctxA; frame = ctxB
+    emit(&mut program, Opcode::PushContext, &[reg_op(1)]); // r1 = ctxA; frame = ctxB
     emit(&mut program, Opcode::LoadSmi, &[99]);
     emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // ctxB[0] = 99
-    emit(&mut program, Opcode::PopContext, &[1]); // frame = ctxA
+    emit(&mut program, Opcode::PopContext, &[reg_op(1)]); // frame = ctxA
     emit(&mut program, Opcode::LoadContextSlot, &[0, 0]); // ctxA[0]
     emit(&mut program, Opcode::Return, &[]);
 
@@ -3104,11 +3115,11 @@ fn block_context_reads_outer_scope_via_depth() {
     // ctxA[0] = 7; inside ctxB (outer = ctxA), read slot 0 at depth 1
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateFunctionContext, &[0]);
-    emit(&mut program, Opcode::PushContext, &[0]); // frame = ctxA
+    emit(&mut program, Opcode::PushContext, &[reg_op(0)]); // frame = ctxA
     emit(&mut program, Opcode::LoadSmi, &[7]);
     emit(&mut program, Opcode::StoreContextSlot, &[0, 0]);
     emit(&mut program, Opcode::CreateBlockContext, &[1]);
-    emit(&mut program, Opcode::PushContext, &[1]); // frame = ctxB, outer = ctxA
+    emit(&mut program, Opcode::PushContext, &[reg_op(1)]); // frame = ctxB, outer = ctxA
     emit(&mut program, Opcode::LoadContextSlot, &[0, 1]); // ctxB.outer[0]
     emit(&mut program, Opcode::Return, &[]);
 
@@ -3124,7 +3135,7 @@ fn tdz_hole_read_throws_reference_error() {
     // fresh context slots are the hole; reading one must throw ReferenceError
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateFunctionContext, &[0]);
-    emit(&mut program, Opcode::PushContext, &[0]);
+    emit(&mut program, Opcode::PushContext, &[reg_op(0)]);
     emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
     emit(&mut program, Opcode::ThrowReferenceErrorIfHole, &[]);
     emit(&mut program, Opcode::Return, &[]);
@@ -3163,17 +3174,17 @@ fn closure_captures_function_context_end_to_end() {
         // f's body
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateFunctionContext, &[0]); // ctxA: [x]
-        emit(&mut program, Opcode::PushContext, &[0]); // r0 = old; frame = ctxA
+        emit(&mut program, Opcode::PushContext, &[reg_op(0)]); // r0 = old; frame = ctxA
         emit(&mut program, Opcode::LoadSmi, &[1]);
         emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // x = 1
         emit(&mut program, Opcode::CreateBlockContext, &[1]); // ctxB: [y]
-        emit(&mut program, Opcode::PushContext, &[1]); // r1 = ctxA; frame = ctxB
+        emit(&mut program, Opcode::PushContext, &[reg_op(1)]); // r1 = ctxA; frame = ctxB
         emit(&mut program, Opcode::LoadSmi, &[2]);
         emit(&mut program, Opcode::StoreContextSlot, &[0, 0]); // y = 2
-        emit(&mut program, Opcode::PopContext, &[1]); // frame = ctxA
+        emit(&mut program, Opcode::PopContext, &[reg_op(1)]); // frame = ctxA
         emit(&mut program, Opcode::CreateClosure, &[1]); // closure ctx = ctxA
-        emit(&mut program, Opcode::Store, &[2]);
-        emit(&mut program, Opcode::CallNoFeedback, &[2, 2, 1]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
+        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(2), reg_op(2), 1]);
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -3258,19 +3269,20 @@ fn set_prototype_changes_property_lookup_chain() {
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadConstant, &[1]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
-        emit(&mut program, Opcode::Load, &[1]);
-        emit(&mut program, Opcode::Store, &[3]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
+        // window r2..r3: element 0 (obj) rides the top slot
+        emit(&mut program, Opcode::Load, &[reg_op(0)]);
+        emit(&mut program, Opcode::Store, &[reg_op(3)]);
+        emit(&mut program, Opcode::Load, &[reg_op(1)]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(
             &mut program,
             Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::SetPrototype as u32, 2, 2],
+            &[bytecode::RuntimeFn::SetPrototype as u32, reg_op(2), 2],
         );
-        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(0), 0, 0]);
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -3311,21 +3323,22 @@ fn set_prototype_survives_property_transitions() {
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadConstant, &[1]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
-        emit(&mut program, Opcode::Load, &[1]);
-        emit(&mut program, Opcode::Store, &[3]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
+        // window r2..r3: element 0 (obj) rides the top slot
+        emit(&mut program, Opcode::Load, &[reg_op(0)]);
+        emit(&mut program, Opcode::Store, &[reg_op(3)]);
+        emit(&mut program, Opcode::Load, &[reg_op(1)]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(
             &mut program,
             Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::SetPrototype as u32, 2, 2],
+            &[bytecode::RuntimeFn::SetPrototype as u32, reg_op(2), 2],
         );
         emit(&mut program, Opcode::LoadSmi, &[1]);
-        emit(&mut program, Opcode::StoreNamedProperty, &[0, 2, 0]);
-        emit(&mut program, Opcode::LoadNamedProperty, &[0, 0, 0]);
+        emit(&mut program, Opcode::StoreNamedProperty, &[reg_op(0), 2, 0]);
+        emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(0), 0, 0]);
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -3354,11 +3367,11 @@ fn set_prototype_cycle_throws_type_error() {
     // r0 = {}; r0.[[Prototype]] = r0 (cycle)
     let mut program = Vec::new();
     emit(&mut program, Opcode::CreateEmptyObjectLiteral, &[]);
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::Load, &[0]);
-    emit(&mut program, Opcode::Store, &[1]);
-    emit(&mut program, Opcode::Load, &[0]);
-    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::Store, &[reg_op(0)]);
+    emit(&mut program, Opcode::Load, &[reg_op(0)]);
+    emit(&mut program, Opcode::Store, &[reg_op(1)]);
+    emit(&mut program, Opcode::Load, &[reg_op(0)]);
+    emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(
         &mut program,
         Opcode::CallRuntime,
@@ -3409,17 +3422,18 @@ fn set_prototype_on_non_extensible_throws_type_error() {
             .allocate_handle::<FixedArray>(stage_values(&scope, &[w29, w30]), &scope);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadConstant, &[1]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::Store, &[2]);
-        emit(&mut program, Opcode::Load, &[1]);
-        emit(&mut program, Opcode::Store, &[3]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
+        // window r2..r3: element 0 (obj) rides the top slot
+        emit(&mut program, Opcode::Load, &[reg_op(0)]);
+        emit(&mut program, Opcode::Store, &[reg_op(3)]);
+        emit(&mut program, Opcode::Load, &[reg_op(1)]);
+        emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(
             &mut program,
             Opcode::CallRuntime,
-            &[bytecode::RuntimeFn::SetPrototype as u32, 2, 2],
+            &[bytecode::RuntimeFn::SetPrototype as u32, reg_op(2), 2],
         );
         emit(&mut program, Opcode::Return, &[]);
 
@@ -3526,9 +3540,9 @@ fn program_return_empty_object() -> Vec<u8> {
 fn program_throw_type_error() -> Vec<u8> {
     let mut p = Vec::new();
     emit(&mut p, Opcode::LoadSmi, &[0]);
-    emit(&mut p, Opcode::Store, &[0]);
+    emit(&mut p, Opcode::Store, &[reg_op(0)]);
     emit(&mut p, Opcode::LoadSmi, &[0]);
-    emit(&mut p, Opcode::CallNoFeedback, &[0, 0, 0]);
+    emit(&mut p, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 0]);
     emit(&mut p, Opcode::Return, &[]);
     p
 }
@@ -3848,7 +3862,7 @@ fn value_of_exception_propagates() {
 /// acc = param0; acc = unary op; return acc
 fn unary_program(op: Opcode) -> Vec<u8> {
     let mut program = Vec::new();
-    emit(&mut program, Opcode::Load, &[(-1i32) as u32]);
+    emit(&mut program, Opcode::Load, &[0]);
     emit(&mut program, op, &[]);
     emit(&mut program, Opcode::Return, &[]);
     program
@@ -4068,9 +4082,9 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
 
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[g]).unwrap();
         assert!(r.is_strong_ptr(), "primitive result: receiver must win");
@@ -4078,12 +4092,12 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         // the receiver is `instanceof G`
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
-        emit(&mut program, Opcode::Store, &[1]);
-        emit(&mut program, Opcode::Load, &[1]);
-        emit(&mut program, Opcode::InstanceOf, &[0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
+        emit(&mut program, Opcode::Load, &[reg_op(1)]);
+        emit(&mut program, Opcode::InstanceOf, &[reg_op(0)]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 2, &[], &[g]).unwrap();
         assert_eq!(r, global_word(&mut *thread, |_| known.true_object));
@@ -4092,9 +4106,9 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         let f = make_callable(thread, &scope, &program_return_empty_object(), &[]);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[f]).unwrap();
         assert!(r.is_strong_ptr(), "object result must win");
@@ -4104,9 +4118,9 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         let plain = word(&*thread.heap(), plain_h);
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[plain]);
         expect_escaped(&mut *thread, r, "TypeError");
@@ -4172,10 +4186,10 @@ fn construct_sets_runtime_construct_flag() {
         // the receiver (an object)
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[0, 0, 0]);
-        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 2, &[], &[f, name]).unwrap();
@@ -4184,10 +4198,10 @@ fn construct_sets_runtime_construct_flag() {
         // plain Call: flag is 0
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::Load, &[0]);
-        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
-        emit(&mut program, Opcode::Store, &[1]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::Load, &[reg_op(0)]);
+        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
+        emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 2, &[], &[f, name]).unwrap();
@@ -4272,9 +4286,9 @@ fn shadow_setup<'s>(
 fn shadow_store_program(store_op: Opcode) -> Vec<u8> {
     let mut program = Vec::new();
     emit(&mut program, Opcode::LoadConstant, &[0]);
-    emit(&mut program, Opcode::Store, &[2]);
+    emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[2]);
-    emit(&mut program, store_op, &[2, 1, 0]);
+    emit(&mut program, store_op, &[reg_op(2), 1, 0]);
     emit(&mut program, Opcode::Return, &[]);
     program
 }

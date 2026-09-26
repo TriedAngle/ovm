@@ -180,13 +180,15 @@ fn exception_unwinds_to_caller() {
         //         8: Return | 9: Store r0 | 11: Load r0 | 13: Return
         // the try region covers the call site (pc 4); the handler binds the
         // exception from a suspended frame via the recorded call-site pc
+        // (register operands carry the anchor bias: r0 = REGISTER_BASE)
+        let r0 = (bytecode::REGISTER_FILE_START - 0) as u32;
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
+        emit(&mut program, Opcode::Store, &[r0]);
+        emit(&mut program, Opcode::CallNoFeedback, &[r0, r0, 1]);
         emit(&mut program, Opcode::Return, &[]);
-        emit(&mut program, Opcode::Store, &[0]);
-        emit(&mut program, Opcode::Load, &[0]);
+        emit(&mut program, Opcode::Store, &[r0]);
+        emit(&mut program, Opcode::Load, &[r0]);
         emit(&mut program, Opcode::Return, &[]);
 
         let caller = callable(

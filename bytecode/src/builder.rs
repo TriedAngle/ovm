@@ -19,16 +19,18 @@ pub enum RtArg {
 impl FnBuilder {
     /// Emit a `CallRuntime` with its argument window staged from a
     /// declarative list: `&[RtArg::Acc, RtArg::Reg(obj), RtArg::Const(k)]`
-    /// stages the accumulator into slot 0, `obj` into slot 1, and the
-    /// pooled constant into slot 2, then calls.
+    /// stages the accumulator into window slot 0 (the lowest address,
+    /// `base + len - 1`), `obj` into slot 1, and the pooled constant into
+    /// slot 2, then calls.
     pub fn call_runtime_staged(&mut self, f: crate::RuntimeFn, args: &[RtArg]) {
         let mark = self.temp_depth();
         let base = self.reserve_temps(args.len() as u32);
+        let slot = |i: usize| Reg::new(base.index() + (args.len() - 1 - i) as i32);
         if let Some(i) = args.iter().position(|a| matches!(a, RtArg::Acc)) {
-            self.store(Reg::new(base.index() + i as i32));
+            self.store(slot(i));
         }
         for (i, arg) in args.iter().enumerate() {
-            let dst = Reg::new(base.index() + i as i32);
+            let dst = slot(i);
             match arg {
                 RtArg::Acc => {}
                 RtArg::Reg(r) => {
@@ -91,6 +93,11 @@ macro_rules! acc_reg_op {
     };
 }
 
+/// The register file's first slot, in anchor-relative offsets: `r0` sits
+/// directly below the frame header (the ABI twin of
+/// `vm_core::stack::HEADER_SLOTS`, which occupies offsets -1..=-4).
+pub const REGISTER_FILE_START: i32 = -5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Reg(i32);
 
@@ -103,9 +110,17 @@ impl Reg {
         self.0
     }
 
-    /// The operand encoding of this register (two's complement).
+    /// The operand IS the anchor-relative frame-slot offset : locals encode as `REGISTER_FILE_START - i` (the file
+    /// descends below the header), parameters as `j` (ascending above the
+    /// anchor, receiver = 0). The interpreter adds the operand to the
+    /// frame anchor to address the slot — one addition, no branch, no
+    /// runtime frame size.
     pub const fn operand(self) -> u32 {
-        self.0 as u32
+        if self.0 >= 0 {
+            (REGISTER_FILE_START - self.0) as u32
+        } else {
+            (-self.0 - 1) as u32
+        }
     }
 }
 
@@ -333,7 +348,8 @@ pub struct FnBuilder {
     // register allocation
     temp_base: u32,
     temp_depth: u32,
-    max_reg: i32,
+    /// Most negative register operand emitted (deepest local).
+    min_slot: i32,
 }
 
 impl FnBuilder {
@@ -356,7 +372,7 @@ impl FnBuilder {
             last: LastOp::None,
             temp_base: 0,
             temp_depth: 0,
-            max_reg: -1,
+            min_slot: REGISTER_FILE_START + 1,
         }
     }
 
@@ -538,11 +554,11 @@ impl FnBuilder {
     }
 
     pub fn load(&mut self, r: Reg) {
-        if self.acc == Acc::Reg(r.0) {
+        if self.acc == Acc::Reg(r.operand() as i32) {
             return;
         }
         self.emit_tracked(Opcode::Load, &[r.operand()]);
-        self.acc = Acc::Reg(r.0);
+        self.acc = Acc::Reg(r.operand() as i32);
     }
 
     /// Load a Smi; values beyond the (widened) 16-bit operand range ride
@@ -615,11 +631,11 @@ impl FnBuilder {
 
     /// Store the accumulator into `r`. The store is elided when the accumulator already holds `r`
     pub fn store(&mut self, r: Reg) {
-        if self.acc == Acc::Reg(r.0) {
+        if self.acc == Acc::Reg(r.operand() as i32) {
             return;
         }
         self.emit_tracked(Opcode::Store, &[r.operand()]);
-        self.acc = Acc::Reg(r.0);
+        self.acc = Acc::Reg(r.operand() as i32);
     }
 
     pub fn store_global(&mut self, name: ConstIdx, fb: Feedback) {
@@ -931,7 +947,7 @@ impl FnBuilder {
             constants: self.constants,
             handlers,
             name: meta.name,
-            register_count: (self.max_reg + 1).max(0) as u32,
+            register_count: (REGISTER_FILE_START - self.min_slot + 1).max(0) as u32,
             kind: meta.kind,
             arity: self.arity,
             length: meta.length,
@@ -1042,6 +1058,16 @@ impl FnBuilder {
         Ok((out, label_out, jump_out, handler_out))
     }
 
+    /// Tracks an emitted register operand in slot-offset space: negative
+    /// operands below `REGISTER_FILE_START` are locals and size the frame
+    /// (most negative = deepest register); positive operands are
+    /// parameters and do not.
+    fn track_operand(&mut self, op: i32) {
+        if op <= REGISTER_FILE_START && self.min_slot > op {
+            self.min_slot = op;
+        }
+    }
+
     fn emit_tracked(&mut self, op: Opcode, operands: &[u32]) {
         let kinds = op.operands();
         debug_assert_eq!(
@@ -1058,16 +1084,16 @@ impl FnBuilder {
         }
         for (i, kind) in kinds.iter().enumerate() {
             match kind {
-                Operand::Register => self.track_reg(operands[i] as i32),
+                Operand::Register => self.track_operand(operands[i] as i32),
                 Operand::RegisterListStart => {
                     // the element count follows immediately; the whole
-                    // window base..base+count must fit the frame
+                    // window (base-register operand down count slots) must
+                    // fit the frame
                     debug_assert_eq!(kinds.get(i + 1), Some(&Operand::RegisterCount));
                     let base = operands[i] as i32;
                     let count = operands[i + 1];
-                    self.track_reg(base);
                     if count > 0 {
-                        self.track_reg(base + count as i32 - 1);
+                        self.track_operand(base - count as i32 + 1);
                     }
                 }
                 _ => {}
@@ -1100,19 +1126,6 @@ impl FnBuilder {
             },
             _ => LastOp::None,
         };
-    }
-
-    /// Bounds-check a register operand and grow the frame window.
-    fn track_reg(&mut self, reg: i32) {
-        if reg < 0 {
-            debug_assert!(
-                reg >= -(self.arity as i32) - 1,
-                "register {reg} below the parameter window (receiver plus arity {})",
-                self.arity
-            );
-        } else if reg > self.max_reg {
-            self.max_reg = reg;
-        }
     }
 
     fn emit_jump_op(&mut self, op: Opcode, target: Label) {

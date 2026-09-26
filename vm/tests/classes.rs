@@ -19,7 +19,10 @@ fn run(src: &str) -> Result<Value, ScriptError> {
 }
 
 fn run_smi(src: &str) -> i64 {
-    Smi::decode(run(src).unwrap()).unwrap().value()
+    let v = run(src).unwrap();
+    Smi::decode(v)
+        .unwrap_or_else(|| panic!("not a smi: {v:?}"))
+        .value()
 }
 
 fn run_value(src: &str) -> (Value, Thread) {

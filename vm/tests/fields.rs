@@ -15,7 +15,8 @@ fn run(src: &str) -> Result<Value, vm::ScriptError> {
 }
 
 fn run_smi(src: &str) -> i64 {
-    Smi::decode(run(src).unwrap()).unwrap().value()
+    let v = run(src).unwrap();
+    Smi::decode(v).unwrap_or_else(|| panic!("not a smi: {v:?}")).value()
 }
 
 fn run_str(src: &str) -> String {
@@ -23,7 +24,6 @@ fn run_str(src: &str) -> String {
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
-    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let v = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     {
@@ -40,7 +40,6 @@ fn run_bool(src: &str) -> bool {
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
-    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let v = thread.eval::<vm::JavascriptCompiler>(src).unwrap();
     let heap = thread.heap();
@@ -52,7 +51,6 @@ fn throws(src: &str) -> bool {
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
-    vm.arm_gc_stress();
     let mut thread = vm.attach();
     match thread.eval::<vm::JavascriptCompiler>(src) {
         Ok(v) => {

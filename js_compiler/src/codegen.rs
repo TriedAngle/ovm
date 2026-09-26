@@ -1025,15 +1025,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             Expression::ImportMeta(_) => self.err(e.span(), "import.meta"),
             Expression::PrivateInExpression(p) => {
-                // `#x in obj`: (key, obj) -> bool
+                // `#x in obj`: (key, obj) -> bool — key rides the top slot
+                let mark = self.b.temp_depth();
+                let base = self.b.reserve_temps(2);
                 self.emit_private_key_load(p.left.node_id.get(), p.left.span)?;
-                let base = self.b.stage_acc();
+                self.b.store(Reg::new(base.index() + 1));
                 self.expr(&p.right)?;
-                self.b.stage_acc();
+                self.b.store(base);
                 self.b
                     .call_runtime(RuntimeFn::PrivateIn, RegList::new(base, 2));
-                self.b.drop_temp();
-                self.b.drop_temp();
+                self.b.drop_temps(mark);
                 Ok(())
             }
             Expression::ParenthesizedExpression(_) => {
@@ -1122,7 +1123,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     MemberRef::Private(_) => unreachable!(),
                 };
                 self.expr(object)?;
-                let base = self.b.stage_acc();
+                let mark = self.b.temp_depth();
+                let base = self.b.reserve_temps(2);
+                self.b.store(Reg::new(base.index() + 1));
                 match m {
                     MemberRef::Static(s) => {
                         let idx = self.b.name(s.property.name.as_bytes());
@@ -1133,15 +1136,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     }
                     MemberRef::Private(_) => unreachable!(),
                 }
-                self.b.stage_acc();
+                self.b.store(base);
                 let runtime_fn = if self.c.facts.functions[self.fid.0 as usize].strict {
                     RuntimeFn::DeletePropertyStrict
                 } else {
                     RuntimeFn::DeletePropertySloppy
                 };
                 self.b.call_runtime(runtime_fn, RegList::new(base, 2));
-                self.b.drop_temp();
-                self.b.drop_temp();
+                self.b.drop_temps(mark);
                 Ok(())
             }
             Expression::Identifier(i) => {
@@ -1193,15 +1195,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 Ok(())
             }
             Op::In => {
-                // `key in obj`: (key, obj) -> bool
+                // `key in obj`: (key, obj) -> bool — key rides the top slot
+                let mark = self.b.temp_depth();
+                let base = self.b.reserve_temps(2);
                 self.expr(&b.left)?;
-                let base = self.b.stage_acc();
+                self.b.store(Reg::new(base.index() + 1));
                 self.expr(&b.right)?;
-                self.b.stage_acc();
+                self.b.store(base);
                 self.b
                     .call_runtime(RuntimeFn::HasProperty, RegList::new(base, 2));
-                self.b.drop_temp();
-                self.b.drop_temp();
+                self.b.drop_temps(mark);
                 Ok(())
             }
             _ => {
@@ -1512,17 +1515,30 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     )?;
                 }
                 PatProperty::Rest(target) => {
-                    // native layout: (excluded..., target, source); with no
-                    // earlier keys the window is just [target, source]
+                    // native layout: (excluded..., target, source) — element
+                    // 0 (the first excluded key) rides the top slot
                     self.b.create_empty_object_literal();
                     let rest_obj = self.b.stage_acc();
                     self.b.load(value_reg);
                     self.b.stage_acc();
                     let base = excl_base.unwrap_or(rest_obj);
-                    self.b.call_runtime(
-                        RuntimeFn::CopyDataProperties,
-                        RegList::new(base, excluded + 2),
-                    );
+                    let count = excluded + 2;
+                    // restage the window in element order: excluded keys
+                    // ride the top (excluded[0] highest), then the target,
+                    // the source at the bottom slot
+                    let mark2 = self.b.temp_depth();
+                    let w = self.b.reserve_temps(count);
+                    let top = w.index() + (count - 1) as i32;
+                    for k in 0..excluded {
+                        self.b.load(Reg::new(base.index() + k as i32));
+                        self.b.store(Reg::new(top - k as i32));
+                    }
+                    self.b.load(rest_obj);
+                    self.b.store(Reg::new(w.index() + 1));
+                    self.b.load(Reg::new(base.index() + excluded as i32 + 1));
+                    self.b.store(w);
+                    self.b.call_runtime(RuntimeFn::CopyDataProperties, RegList::new(w, count));
+                    self.b.drop_temps(mark2);
                     self.b.store(rest_obj);
                     self.emit_pattern_leaf(*target, rest_obj, binding)?;
                     self.b.drop_temp(); // source
@@ -1874,11 +1890,19 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.b.store_keyed_property(*obj, *key, feedback);
             }
             StoreTarget::PrivateKeyed { obj, key: _ } => {
-                // (obj, key, value): the value is in the accumulator
+                // (obj, key, value): obj rides the top slot, the key one
+                // above the pre-staged obj was staged by the target
+                // preparation, the value is the accumulator
+                let key = Reg::new(obj.index() + 1);
                 let mark = self.b.temp_depth();
-                self.b.stage_acc();
+                let base = self.b.reserve_temps(3);
+                self.b.store(base);
+                self.b.load(key);
+                self.b.store(Reg::new(base.index() + 1));
+                self.b.load(*obj);
+                self.b.store(Reg::new(base.index() + 2));
                 self.b
-                    .call_runtime(RuntimeFn::PrivateSet, RegList::new(*obj, 3));
+                    .call_runtime(RuntimeFn::PrivateSet, RegList::new(base, 3));
                 self.b.drop_temps(mark);
             }
             // runtime(home, recv, key, value = acc, semantics: shadow)
@@ -1925,9 +1949,18 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.b.load_keyed_property(*obj, feedback);
             }
             StoreTarget::PrivateKeyed { obj, key } => {
+                // (obj, key): obj rides the top slot — restaged into a
+                // fresh window (the prep stages obj below the key, the
+                // old layout's order)
+                let mark = self.b.temp_depth();
+                let base = self.b.reserve_temps(2);
                 self.b.load(*key);
+                self.b.store(base);
+                self.b.load(*obj);
+                self.b.store(Reg::new(base.index() + 1));
                 self.b
-                    .call_runtime(RuntimeFn::PrivateGet, RegList::new(*obj, 2));
+                    .call_runtime(RuntimeFn::PrivateGet, RegList::new(base, 2));
+                self.b.drop_temps(mark);
             }
             // runtime(home, recv, key) -> value
             StoreTarget::SuperNamed {
@@ -2060,14 +2093,15 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         match m {
             MemberRef::Private(p) => {
                 // PrivateGet: `obj.#x` — own private field or TypeError
-                self.expr(&p.object)?;
-                let obj = self.b.stage_acc();
+                let mark = self.b.temp_depth();
+                let base = self.b.reserve_temps(2);
                 self.emit_private_key_load(p.field.node_id.get(), p.field.span)?;
-                self.b.stage_acc();
+                self.b.store(base);
+                self.expr(&p.object)?;
+                self.b.store(Reg::new(base.index() + 1));
                 self.b
-                    .call_runtime(RuntimeFn::PrivateGet, RegList::new(obj, 2));
-                self.b.drop_temp();
-                self.b.drop_temp();
+                    .call_runtime(RuntimeFn::PrivateGet, RegList::new(base, 2));
+                self.b.drop_temps(mark);
                 Ok(())
             }
             MemberRef::Computed(c) => {
@@ -2116,16 +2150,20 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let argc = c.arguments.len() as u32;
         let mark = self.b.temp_depth();
         let recv = load_method(self)?;
-        // reserve args + callee so nested argument temps land above
-        let args_base = self.b.reserve_temps(argc + 1);
-        let callee = Reg::new(args_base.index() + argc as i32);
+        // the window is [args_base .. args_base+argc]: element 0 (the
+        // receiver) rides the top slot, argument i sits argc-1-i slots in,
+        // the callee rides above
+        let args_base = self.b.reserve_temps(argc + 2);
+        let top = args_base.index() + argc as i32;
+        let callee = Reg::new(top + 1);
         self.b.store(callee);
         for (i, arg) in c.arguments.iter().enumerate() {
             self.call_argument(arg)?;
-            self.b.store(Reg::new(args_base.index() + i as i32));
+            self.b.store(Reg::new(top - 1 - i as i32));
         }
+        self.b.move_reg(Reg::new(top), recv);
         self.b
-            .call_no_feedback(callee, RegList::new(recv, argc + 1));
+            .call_no_feedback(callee, RegList::new(args_base, argc + 1));
         self.b.drop_temps(mark);
         Ok(())
     }
@@ -2172,17 +2210,17 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let mark = self.b.temp_depth();
         self.expr(&c.callee)?;
         let args_base = self.b.reserve_temps(argc + 2);
-        let callee = Reg::new(args_base.index() + argc as i32 + 1);
+        let top = args_base.index() + argc as i32;
+        let callee = Reg::new(top + 1);
         self.b.store(callee);
         self.b.load_undefined();
-        let recv = args_base;
-        self.b.store(recv);
+        self.b.store(Reg::new(top));
         for (i, arg) in c.arguments.iter().enumerate() {
             self.call_argument(arg)?;
-            self.b.store(Reg::new(args_base.index() + 1 + i as i32));
+            self.b.store(Reg::new(top - 1 - i as i32));
         }
         self.b
-            .call_no_feedback(callee, RegList::new(recv, argc + 1));
+            .call_no_feedback(callee, RegList::new(args_base, argc + 1));
         self.b.drop_temps(mark);
         Ok(())
     }
@@ -2216,13 +2254,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let argc = n.arguments.len() as u32;
         let mark = self.b.temp_depth();
         self.expr(&n.callee)?;
-        // window [args..., callee]: construct takes no receiver
+        // window [args...] with argument 0 at the top slot, callee above
         let args_base = self.b.reserve_temps(argc + 1);
-        let callee = Reg::new(args_base.index() + argc as i32);
+        let top = args_base.index() + argc as i32 - 1;
+        let callee = Reg::new(top + 1);
         self.b.store(callee);
         for (i, arg) in n.arguments.iter().enumerate() {
             self.call_argument(arg)?;
-            self.b.store(Reg::new(args_base.index() + i as i32));
+            self.b.store(Reg::new(top - i as i32));
         }
         self.b.construct(callee, RegList::new(args_base, argc));
         self.b.drop_temps(mark);
@@ -2253,9 +2292,12 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // the delegated variant) so nested temps land above
         let reserved = argc + 1 + u32::from(!direct) * 2;
         let arg_base = self.b.reserve_temps(reserved);
+        // the delegated window is (args..., closure, new_target): args
+        // ride the top, closure/new.target the two bottom slots
+        let arg_top = arg_base.index() + argc as i32 + i32::from(!direct) * 2 - 1;
         for (i, arg) in c.arguments.iter().enumerate() {
             self.call_argument(arg)?;
-            self.b.store(Reg::new(arg_base.index() + i as i32));
+            self.b.store(Reg::new(arg_top - i as i32));
         }
         if direct {
             self.b
@@ -2272,8 +2314,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         .expect("delegated super() forces the new.target slot"),
                 )
             };
-            let closure_reg = Reg::new(arg_base.index() + argc as i32);
-            let new_target_reg = Reg::new(closure_reg.index() + 1);
+            let new_target_reg = arg_base;
+            let closure_reg = Reg::new(arg_base.index() + 1);
             self.b.load_context_slot(this_function_slot, owner_depth);
             self.b.store(closure_reg);
             self.b.load_context_slot(new_target_slot, owner_depth);
@@ -2318,6 +2360,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // instance (for arrow-delegated super(), the owner is the ctor)
         let field_owner = if direct { self.fid } else { owner };
         if self.fn_has_instance_fields(field_owner) {
+            // (ctor, instance): ctor rides the top slot
+            self.b.load(result);
+            let instance = self.b.stage_acc();
             let ctor = self.b.temp();
             if direct {
                 self.b.load_current_closure();
@@ -2328,12 +2373,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.b.load_context_slot(slot, owner_depth);
             }
             self.b.store(ctor);
-            self.b.load(result);
-            self.b.stage_acc();
             self.b
-                .call_runtime(RuntimeFn::InitInstanceFields, RegList::new(ctor, 2));
-            self.b.drop_temp(); // instance
+                .call_runtime(RuntimeFn::InitInstanceFields, RegList::new(instance, 2));
             self.b.drop_temp(); // ctor
+            self.b.drop_temp(); // instance
         }
         self.b.load(result);
         self.b.drop_temps(mark);
@@ -2644,14 +2687,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
         // attach the instance field list to the constructor
         if let Some(arr) = fields_arr {
-            self.b.load(ctor);
-            let ctor_reg = self.b.stage_acc();
+            // (ctor, fields): ctor rides the top slot
             self.b.load(arr);
-            self.b.stage_acc();
+            let arr_reg = self.b.stage_acc();
+            let ctor_reg = self.b.temp();
+            self.b.load(ctor);
+            self.b.store(ctor_reg);
             self.b
-                .call_runtime(RuntimeFn::SetClassFields, RegList::new(ctor_reg, 2));
+                .call_runtime(RuntimeFn::SetClassFields, RegList::new(arr_reg, 2));
+            self.b.drop_temp(); // ctor copy
             self.b.drop_temp(); // arr copy
-            self.b.drop_temp(); // ctor_reg
             self.b.drop_temp(); // the fields array itself
         }
 
@@ -3685,11 +3730,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 // InitializeInstanceElements on the bound this:
                 // native(ctor, instance)
                 self.with_temps(|g| {
-                    g.b.load_current_closure();
-                    let ctor = g.b.stage_acc();
+                    // (ctor, instance): ctor rides the top slot
                     g.emit_this_load_own();
-                    g.b.stage_acc();
-                    g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(ctor, 2));
+                    let instance = g.b.stage_acc();
+                    g.b.load_current_closure();
+                    let ctor = g.b.temp();
+                    g.b.store(ctor);
+                    g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(instance, 2));
                     Ok(())
                 })?;
             }
@@ -3703,11 +3750,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // right after the receiver exists (ES 7.3.33, before the body)
         if kind == FnKind::BaseClassCtor && self.fn_has_instance_fields(self.fid) {
             self.with_temps(|g| {
-                g.b.load_current_closure();
-                let ctor = g.b.stage_acc();
+                // (ctor, instance): ctor rides the top slot
                 g.emit_this_load_own();
-                g.b.stage_acc();
-                g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(ctor, 2));
+                let instance = g.b.stage_acc();
+                g.b.load_current_closure();
+                let ctor = g.b.temp();
+                g.b.store(ctor);
+                g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(instance, 2));
                 Ok(())
             })?;
         }

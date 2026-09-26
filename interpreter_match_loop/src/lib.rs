@@ -252,9 +252,9 @@ fn exception_dispatch<'a>(
         if stack.frame_depth() == base_depth {
             return Unwind::Escaped;
         }
-        let base = cache.frame_meta().base;
+        let low = Stack::frame_low(&cache.frame_meta());
         let caller = stack
-            .pop_frame(base)
+            .pop_frame(low)
             .expect("suspended frame above base depth");
         cache.load(stack, caller, heap);
         pc = caller.handler_pc;
@@ -1279,7 +1279,7 @@ fn step<'a>(
                 return Step::Return;
             }
             let caller = stack
-                .pop_frame(meta.base)
+                .pop_frame(Stack::frame_low(&meta))
                 .expect("suspended frame above base depth");
             cache.load(stack, caller, heap);
             Step::Reframe

@@ -484,18 +484,20 @@ impl<'a> FunctionGen<'a> {
         let name = self.name_constant(name);
         let feedback = self.b.new_feedback();
         self.b.load_named_property_fast(recv_reg, name, feedback);
-        // argument window [recv, args...] plus the callee slot above it;
-        // the method rides the accumulator straight into its slot before
-        // argument evaluation clobbers it
-        let args_base = self.b.reserve_temps(argc + 1);
-        let callee_reg = Reg::new(args_base.index() + argc as i32);
+        // argument window [args_base .. args_base+argc]: element 0 (the
+        // receiver) rides the top slot, argument i sits argc-1-i in; the
+        // callee rides above
+        let args_base = self.b.reserve_temps(argc + 2);
+        let top = args_base.index() + argc as i32;
+        let callee_reg = Reg::new(top + 1);
         self.b.store(callee_reg);
         for (i, &arg) in args.iter().enumerate() {
             self.expr(arg)?;
-            self.b.store(Reg::new(args_base.index() + i as i32));
+            self.b.store(Reg::new(top - 1 - i as i32));
         }
+        self.b.move_reg(Reg::new(top), recv_reg);
         self.b
-            .call_no_feedback(callee_reg, RegList::new(recv_reg, argc + 1));
+            .call_no_feedback(callee_reg, RegList::new(args_base, argc + 1));
         self.b.drop_temps(mark);
         Ok(())
     }
@@ -507,15 +509,17 @@ impl<'a> FunctionGen<'a> {
         let argc = args.len() as u32;
         let mark = self.b.temp_depth();
         self.expr(callee)?;
-        // window [recv, args...] plus the callee slot above it
+        // window [recv, args...]: element 0 (the undefined receiver)
+        // rides the top slot, argument i sits argc-1-i in; callee above
         let args_base = self.b.reserve_temps(argc + 2);
-        let callee_reg = Reg::new(args_base.index() + argc as i32 + 1);
+        let top = args_base.index() + argc as i32;
+        let callee_reg = Reg::new(top + 1);
         self.b.store(callee_reg);
         self.b.load_undefined();
-        self.b.store(args_base);
+        self.b.store(Reg::new(top));
         for (i, &arg) in args.iter().enumerate() {
             self.expr(arg)?;
-            self.b.store(Reg::new(args_base.index() + 1 + i as i32));
+            self.b.store(Reg::new(top - 1 - i as i32));
         }
         self.b
             .call_no_feedback(callee_reg, RegList::new(args_base, argc + 1));
@@ -554,13 +558,13 @@ impl<'a> FunctionGen<'a> {
         self.b.handler_entry(t);
         let exception = self.b.stage_acc();
         self.b.create_closure(handler_idx);
-        let hwindow = self.b.reserve_temps(3); // [recv, arg0, callee]
+        let hwindow = self.b.reserve_temps(3); // [arg0, recv, callee]
         let hcallee = Reg::new(hwindow.index() + 2);
         self.b.store(hcallee);
         self.b.load_undefined();
-        self.b.store(hwindow);
-        self.b.load(exception);
         self.b.store(Reg::new(hwindow.index() + 1));
+        self.b.load(exception);
+        self.b.store(hwindow);
         self.b.call_no_feedback(hcallee, RegList::new(hwindow, 2));
         self.b.drop_temps(mark);
 

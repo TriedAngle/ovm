@@ -1,6 +1,6 @@
 use crate::opcodes::IndexKind;
 use crate::program::{Constant, Function, Program};
-use crate::{Opcode, Operand, RuntimeFn, jump_target, try_decode};
+use crate::{Opcode, Operand, REGISTER_FILE_START, RuntimeFn, jump_target, try_decode};
 
 /// A compiled function (or program) is malformed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,10 +67,16 @@ pub fn validate_function(f: &Function, program_len: usize) -> Result<(), Validat
         last = Some(op);
 
         for (i, kind) in op.operands().iter().enumerate() {
-            // negative indices address the parameter area: the receiver at
-            // -1 plus `arity` formals down to -(arity + 1)
+            // the operand IS the anchor-relative slot offset: locals live
+            // at REGISTER_FILE_START..=REGISTER_FILE_START-rc+1 (descending
+            // below the header), parameters at 0..=arity-1 (ascending above
+            // the anchor, receiver = 0); the header's -1..=-4 is invalid
             let check_reg = |reg: i32| {
-                if reg < -(f.arity as i32) - 1 || reg >= f.register_count as i32 {
+                let in_frame = (REGISTER_FILE_START - f.register_count as i32 + 1
+                    ..=REGISTER_FILE_START)
+                    .contains(&reg);
+                let in_params = (0..=f.arity as i32).contains(&reg);
+                if !in_frame && !in_params {
                     return Err(ValidationError::RegisterOutOfRange { pc, reg });
                 }
                 Ok(())
@@ -82,7 +88,7 @@ pub fn validate_function(f: &Function, program_len: usize) -> Result<(), Validat
                     check_reg(base)?;
                     let count = ops.reg_count(i + 1);
                     if count > 0 {
-                        check_reg(base + count as i32 - 1)?;
+                        check_reg(base - count as i32 + 1)?;
                     }
                 }
                 Operand::RegisterCount => {}
