@@ -12,7 +12,8 @@ use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe, StoreHit, StoreOutcom
 use vm_core::proxy::Proxy;
 use vm_core::{
     CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
-    DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint,
+    DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap,
+    Hint,
     Interpreter, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, Register, RuntimeContext,
     RuntimeIndex, ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome, StoreSemantics,
     Tagged, VM, Value, VmError,
@@ -104,6 +105,12 @@ impl<'a> Ctx<'a> {
         v == self.exception_word()
     }
 
+    #[inline(always)]
+    fn undefined_word(&self) -> Tagged<'a, Value> {
+        let heap = self.heap();
+        heap.known().undefined.as_tagged(heap).erase()
+    }
+
     /// One loop back-edge: `true` every `SAFEPOINT_INTERVAL` ticks or when
     /// a collection has been requested since the last reset.
     #[inline(always)]
@@ -161,6 +168,7 @@ pub struct HandlerTable([Handler; 256]);
 macro_rules! helpers {
     ($pc:ident, $code:ident, $regs:ident, $acc:ident, $ctx:ident, $op:ident, $stride:literal, $($arg:ident => $kind:ident),* $(,)?) => {
         const BASE: usize = if $stride == 2 { 2 } else { 1 };
+        #[allow(dead_code)]
         const STAR: bool = star_lookahead(Opcode::$op);
         let mut _oi = BASE;
         $( let $arg = unsafe { $kind::read($pc, $code, _oi, $stride) }; _oi += $stride; )*
@@ -200,7 +208,8 @@ macro_rules! helpers {
             }};
         }
         macro_rules! jump { ($off:expr, $a:expr) => { dispatch!(jump_target($pc, $off), $a, $regs) } }
-
+        /// Re-entry after a cold call: the code object may have moved, so
+        /// the pc is re-derived from the (GC-updated) cache.
         macro_rules! reenter {
             ($pcrel:expr, $delta:expr, $a:expr) => {{
                 let p = $pcrel + $delta;
@@ -232,15 +241,30 @@ const fn star_lookahead(op: Opcode) -> bool {
             | Opcode::LoadElementImm
             | Opcode::LoadNewTarget
             | Opcode::LoadContextSlot
-            | Opcode::AddRight
-            | Opcode::SubRight
-            | Opcode::MulRight
-            | Opcode::DivRight
-            | Opcode::AddLeft
-            | Opcode::SubLeft
-            | Opcode::MulLeft
-            | Opcode::DivLeft
+            | Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Mod
+            | Opcode::Exp
+            | Opcode::BitwiseOr
+            | Opcode::BitwiseXor
+            | Opcode::BitwiseAnd
+            | Opcode::ShiftLeft
+            | Opcode::ShiftRight
+            | Opcode::ShiftRightLogical
             | Opcode::AddImmediate
+            | Opcode::SubImmediate
+            | Opcode::MulImmediate
+            | Opcode::DivImmediate
+            | Opcode::ModImmediate
+            | Opcode::ExpImmediate
+            | Opcode::BitwiseOrImmediate
+            | Opcode::BitwiseXorImmediate
+            | Opcode::BitwiseAndImmediate
+            | Opcode::ShiftLeftImmediate
+            | Opcode::ShiftRightImmediate
+            | Opcode::ShiftRightLogicalImmediate
             | Opcode::AddLoc
             | Opcode::SubLoc
     )
@@ -342,14 +366,14 @@ handlers!(pc, code, regs, acc, ctx;
         next!(ctx.heap().known().false_object.as_tagged(ctx.heap()).erase())
     }
 
-    AddRight : op_add_right_n / op_add_right_w (r => signed) {
-        let other = reg!(r);
-        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
+    Add : op_add_n / op_add_w (r => signed) {
+        let lhs = reg!(r);
+        if let (Some(a), Some(b)) = (lhs.smi_bits(), acc.smi_bits())
             && let Some(sum) = a.checked_add(b)
         {
             next!(Tagged::from_smi_bits(sum))
         }
-        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
+        if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
             let sum = a + b;
             if let Some(s) = Smi::from_f64(sum) {
                 next!(s.into_tagged())
@@ -358,6 +382,222 @@ handlers!(pc, code, regs, acc, ctx;
             become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
         }
         become cold_add(pc, code, regs, acc, ctx)
+    }
+
+    Sub : op_sub_n / op_sub_w (r => signed) {
+        let lhs = reg!(r);
+        if let (Some(a), Some(b)) = (lhs.smi_bits(), acc.smi_bits())
+            && let Some(diff) = a.checked_sub(b)
+        {
+            next!(Tagged::from_smi_bits(diff))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
+            let diff = a - b;
+            if let Some(s) = Smi::from_f64(diff) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(diff);
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
+        }
+        become cold_numeric(pc, code, regs, acc, ctx)
+    }
+
+    Mul : op_mul_n / op_mul_w (r => signed) {
+        let lhs = reg!(r);
+        if let (Some(a), Some(b)) = (lhs.smi_bits(), acc.smi_bits())
+            && let Some(product) = (a >> 1).checked_mul(b)
+        {
+            next!(Tagged::from_smi_bits(product))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
+            let product = a * b;
+            if let Some(s) = Smi::from_f64(product) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(product);
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
+        }
+        become cold_numeric(pc, code, regs, acc, ctx)
+    }
+
+    Div : op_div_n / op_div_w (r => signed) {
+        let lhs = reg!(r);
+        if let (Some(a), Some(b)) = (lhs.smi_bits(), acc.smi_bits())
+            && b != 0
+            && a % b == 0
+            && let Some(quotient) = a.checked_div(b)
+            && let Some(encoded) = quotient.checked_mul(2)
+        {
+            next!(Tagged::from_smi_bits(encoded))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
+            let quotient = a / b;
+            if let Some(s) = Smi::from_f64(quotient) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(quotient);
+            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
+        }
+        become cold_numeric(pc, code, regs, acc, ctx)
+    }
+
+    Mod : op_mod_n / op_mod_w (r => signed) {
+        let lhs = reg!(r);
+        if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
+            && b != 0
+        {
+            next!(Smi::new(a % b).into_tagged())
+        }
+        become cold_numeric(pc, code, regs, acc, ctx)
+    }
+
+    Exp : op_exp_n / op_exp_w (r => signed) {
+        become cold_numeric(pc, code, regs, acc, ctx)
+    }
+
+    BitwiseOr : op_bitwise_or_n / op_bitwise_or_w (r => signed) {
+        let (Some(a), Some(b)) = (reg!(r).to_i64(), acc.to_i64()) else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32 | b as i32) as i64).into_tagged())
+    }
+
+    BitwiseXor : op_bitwise_xor_n / op_bitwise_xor_w (r => signed) {
+        let (Some(a), Some(b)) = (reg!(r).to_i64(), acc.to_i64()) else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32 ^ b as i32) as i64).into_tagged())
+    }
+
+    BitwiseAnd : op_bitwise_and_n / op_bitwise_and_w (r => signed) {
+        let (Some(a), Some(b)) = (reg!(r).to_i64(), acc.to_i64()) else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32 & b as i32) as i64).into_tagged())
+    }
+
+    ShiftLeft : op_shift_left_n / op_shift_left_w (r => signed) {
+        let (Some(a), Some(b)) = (reg!(r).to_i64(), acc.to_i64()) else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32).wrapping_shl(b as u32 & 31) as i64).into_tagged())
+    }
+
+    ShiftRight : op_shift_right_n / op_shift_right_w (r => signed) {
+        // ToInt32(lhs) >> (ToUint32(rhs) & 31), sign-extending; Smis only
+        let (Some(a), Some(b)) = (reg!(r).to_i64(), acc.to_i64()) else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32).wrapping_shr(b as u32 & 31) as i64).into_tagged())
+    }
+
+    ShiftRightLogical : op_shift_right_logical_n / op_shift_right_logical_w (r => signed) {
+        let (Some(a), Some(b)) = (reg!(r).to_i64(), acc.to_i64()) else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as u32).wrapping_shr(b as u32 & 31) as i64).into_tagged())
+    }
+
+    AddImmediate : op_add_immediate_n / op_add_immediate_w (r => signed, imm => signed) {
+        let lhs = reg!(r);
+        if let Some(bits) = lhs.smi_bits()
+            && let Some(sum) = bits.checked_add((imm as i64) << 1)
+        {
+            next!(Tagged::from_smi_bits(sum))
+        }
+        become cold_add_immediate(pc, code, regs, acc, ctx)
+    }
+
+    SubImmediate : op_sub_immediate_n / op_sub_immediate_w (r => signed, imm => signed) {
+        let lhs = reg!(r);
+        if let Some(bits) = lhs.smi_bits()
+            && let Some(diff) = bits.checked_sub((imm as i64) << 1)
+        {
+            next!(Tagged::from_smi_bits(diff))
+        }
+        become cold_numeric_immediate(pc, code, regs, acc, ctx)
+    }
+
+    MulImmediate : op_mul_immediate_n / op_mul_immediate_w (r => signed, imm => signed) {
+        let lhs = reg!(r);
+        if let Some(bits) = lhs.smi_bits()
+            && let Some(product) = (bits >> 1).checked_mul(imm as i64)
+            && let Some(encoded) = product.checked_mul(2)
+        {
+            next!(Tagged::from_smi_bits(encoded))
+        }
+        become cold_numeric_immediate(pc, code, regs, acc, ctx)
+    }
+
+    DivImmediate : op_div_immediate_n / op_div_immediate_w (r => signed, imm => signed) {
+        let lhs = reg!(r);
+        if let Some(bits) = lhs.smi_bits() {
+            let value = bits >> 1;
+            if imm != 0
+                && value % imm as i64 == 0
+                && let Some(quotient) = value.checked_div(imm as i64)
+                && let Some(encoded) = quotient.checked_mul(2)
+            {
+                next!(Tagged::from_smi_bits(encoded))
+            }
+        }
+        become cold_numeric_immediate(pc, code, regs, acc, ctx)
+    }
+
+    ModImmediate : op_mod_immediate_n / op_mod_immediate_w (r => signed, imm => signed) {
+        let lhs = reg!(r);
+        if imm != 0
+            && let Some(bits) = lhs.smi_bits()
+        {
+            next!(Tagged::from_smi_bits(((bits >> 1) % imm as i64) << 1))
+        }
+        become cold_numeric_immediate(pc, code, regs, acc, ctx)
+    }
+
+    ExpImmediate : op_exp_immediate_n / op_exp_immediate_w (r => signed, imm => signed) {
+        become cold_numeric_immediate(pc, code, regs, acc, ctx)
+    }
+
+    BitwiseOrImmediate : op_bitwise_or_immediate_n / op_bitwise_or_immediate_w (r => signed, imm => signed) {
+        let Some(a) = reg!(r).to_i64() else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32 | imm) as i64).into_tagged())
+    }
+
+    BitwiseXorImmediate : op_bitwise_xor_immediate_n / op_bitwise_xor_immediate_w (r => signed, imm => signed) {
+        let Some(a) = reg!(r).to_i64() else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32 ^ imm) as i64).into_tagged())
+    }
+
+    BitwiseAndImmediate : op_bitwise_and_immediate_n / op_bitwise_and_immediate_w (r => signed, imm => signed) {
+        let Some(a) = reg!(r).to_i64() else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32 & imm) as i64).into_tagged())
+    }
+
+    ShiftLeftImmediate : op_shift_left_immediate_n / op_shift_left_immediate_w (r => signed, imm => signed) {
+        let Some(a) = reg!(r).to_i64() else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32).wrapping_shl(imm as u32 & 31) as i64).into_tagged())
+    }
+
+    ShiftRightImmediate : op_shift_right_immediate_n / op_shift_right_immediate_w (r => signed, imm => signed) {
+        let Some(a) = reg!(r).to_i64() else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as i32).wrapping_shr(imm as u32 & 31) as i64).into_tagged())
+    }
+
+    ShiftRightLogicalImmediate : op_shift_right_logical_immediate_n / op_shift_right_logical_immediate_w (r => signed, imm => signed) {
+        let Some(a) = reg!(r).to_i64() else {
+            bail!(VmError::Type);
+        };
+        next!(Smi::new((a as u32).wrapping_shr(imm as u32 & 31) as i64).into_tagged())
     }
 
     IncLoc : op_inc_loc_n / op_inc_loc_w (r => signed) {
@@ -452,140 +692,6 @@ handlers!(pc, code, regs, acc, ctx;
         become cold_keyed_load_reg(pc, code, regs, acc, ctx)
     }
 
-    SubRight : op_sub_right_n / op_sub_right_w (r => signed) {
-        let other = reg!(r);
-        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
-            && let Some(diff) = a.checked_sub(b)
-        {
-            next!(Tagged::from_smi_bits(diff))
-        }
-        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
-            let diff = a - b;
-            if let Some(s) = Smi::from_f64(diff) {
-                next!(s.into_tagged())
-            }
-            ctx.set_num(diff);
-            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
-        }
-        become cold_numeric(pc, code, regs, acc, ctx)
-    }
-
-    MulRight : op_mul_right_n / op_mul_right_w (r => signed) {
-        let other = reg!(r);
-        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
-            && let Some(product) = (a >> 1).checked_mul(b)
-        {
-            next!(Tagged::from_smi_bits(product))
-        }
-        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
-            let product = a * b;
-            if let Some(s) = Smi::from_f64(product) {
-                next!(s.into_tagged())
-            }
-            ctx.set_num(product);
-            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
-        }
-        become cold_numeric(pc, code, regs, acc, ctx)
-    }
-
-    DivRight : op_div_right_n / op_div_right_w (r => signed) {
-        let other = reg!(r);
-        // the operand shifts cancel in `a / b`; the quotient is untagged
-        // and needs a checked re-tag
-        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
-            && b != 0
-            && a % b == 0
-            && let Some(quotient) = a.checked_div(b)
-            && let Some(encoded) = quotient.checked_mul(2)
-        {
-            next!(Tagged::from_smi_bits(encoded))
-        }
-        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
-            let quotient = a / b;
-            if let Some(s) = Smi::from_f64(quotient) {
-                next!(s.into_tagged())
-            }
-            ctx.set_num(quotient);
-            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
-        }
-        become cold_numeric(pc, code, regs, acc, ctx)
-    }
-
-    AddLeft : op_add_left_n / op_add_left_w (r => signed) {
-        let other = reg!(r);
-        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
-            && let Some(sum) = a.checked_add(b)
-        {
-            next!(Tagged::from_smi_bits(sum))
-        }
-        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
-            let sum = a + b;
-            if let Some(s) = Smi::from_f64(sum) {
-                next!(s.into_tagged())
-            }
-            ctx.set_num(sum);
-            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
-        }
-        become cold_add_left(pc, code, regs, acc, ctx)
-    }
-
-    SubLeft : op_sub_left_n / op_sub_left_w (r => signed) {
-        let other = reg!(r);
-        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
-            && let Some(diff) = a.checked_sub(b)
-        {
-            next!(Tagged::from_smi_bits(diff))
-        }
-        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
-            let diff = a - b;
-            if let Some(s) = Smi::from_f64(diff) {
-                next!(s.into_tagged())
-            }
-            ctx.set_num(diff);
-            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
-        }
-        become cold_numeric_left(pc, code, regs, acc, ctx)
-    }
-
-    MulLeft : op_mul_left_n / op_mul_left_w (r => signed) {
-        let other = reg!(r);
-        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
-            && let Some(product) = (a >> 1).checked_mul(b)
-        {
-            next!(Tagged::from_smi_bits(product))
-        }
-        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
-            let product = a * b;
-            if let Some(s) = Smi::from_f64(product) {
-                next!(s.into_tagged())
-            }
-            ctx.set_num(product);
-            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
-        }
-        become cold_numeric_left(pc, code, regs, acc, ctx)
-    }
-
-    DivLeft : op_div_left_n / op_div_left_w (r => signed) {
-        let other = reg!(r);
-        if let (Some(a), Some(b)) = (other.smi_bits(), acc.smi_bits())
-            && b != 0
-            && a % b == 0
-            && let Some(quotient) = a.checked_div(b)
-            && let Some(encoded) = quotient.checked_mul(2)
-        {
-            next!(Tagged::from_smi_bits(encoded))
-        }
-        if let (Some(a), Some(b)) = (Convert::as_number(other), Convert::as_number(acc)) {
-            let quotient = a / b;
-            if let Some(s) = Smi::from_f64(quotient) {
-                next!(s.into_tagged())
-            }
-            ctx.set_num(quotient);
-            become cold_box_number(pc, code, regs, Smi::new(SIZE as i64).into_tagged(), ctx)
-        }
-        become cold_numeric_left(pc, code, regs, acc, ctx)
-    }
-
     Equal : op_equal_n / op_equal_w (r => signed) {
         let other = reg!(r);
         if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
@@ -608,14 +714,6 @@ handlers!(pc, code, regs, acc, ctx;
             next!(Convert::boolean(ctx.heap(), a > b))
         }
         become cold_greater_than(pc, code, regs, acc, ctx)
-    }
-
-    ShiftRight : op_shift_right_n / op_shift_right_w (r => signed) {
-        // ToInt32(lhs) >> (ToUint32(rhs) & 31), sign-extending; Smis only
-        let (Some(a), Some(b)) = (acc.to_i64(), reg!(r).to_i64()) else {
-            bail!(VmError::Type);
-        };
-        next!(Smi::new((a as i32).wrapping_shr(b as u32 & 31) as i64).into_tagged())
     }
 
     StoreKeyedProperty : op_store_keyed_n / op_store_keyed_w (recv => signed, key => signed, fb => unsigned) {
@@ -753,6 +851,19 @@ handlers!(pc, code, regs, acc, ctx;
             return Ok(acc);
         }
         let meta = ctx.meta(pc);
+        // ES 9.2.2: an ordinary constructor that returns a primitive yields
+        // the synthesized receiver. `new_target != undefined` marks a
+        // construct frame; `this` sits at operand 0. (Cold-path construct
+        // frames are the `execute` base anchor and never reach here.)
+        let acc = if ctx.stack().new_target_slot(&meta).get(ctx.heap()) != ctx.undefined_word() {
+            if Convert::is_primitive(ctx.heap(), acc) {
+                ctx.stack().reg(ctx.heap(), &meta, 0)
+            } else {
+                acc
+            }
+        } else {
+            acc
+        };
         let caller = ctx.stack().pop_frame(&meta);
         ctx.cache().load(ctx.stack(), caller, ctx.heap_mut());
         let rel = ctx.cache().pc();
@@ -1144,7 +1255,17 @@ handlers!(pc, code, regs, acc, ctx;
     }
 
     Construct : op_construct_n / op_construct_w (callee => signed, base => signed, count => unsigned) {
-        become cold_construct(pc, code, regs, acc, ctx)
+        match construct_start(ctx, pc, SIZE, regs, callee, base, count)? {
+            ConstructStart::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.undefined_word();
+                dispatch!(p, u, r, b)
+            }
+            ConstructStart::Threw(v) => return Ok(v),
+            ConstructStart::Cold => become cold_construct(pc, code, regs, acc, ctx),
+        }
     }
 );
 
@@ -1804,6 +1925,89 @@ unsafe fn store_named_cold<'a>(
     })
 }
 
+/// Outcome of a `Construct` fast-path attempt.
+enum ConstructStart<'a> {
+    /// a constructor frame was pushed; the caller dispatches into it
+    Frame,
+    /// receiver synthesis threw; the pending exception sentinel
+    Threw(Tagged<'a, Value>),
+    /// not an ordinary function constructor: fall back to `cold_construct`
+    Cold,
+}
+
+unsafe fn construct_start<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    regs: *mut Register,
+    callee: i32,
+    base: i32,
+    count: usize,
+) -> Result<ConstructStart<'a>, VmError> {
+    let callee_word = reg_read(regs, ctx.heap(), callee);
+    let Some(CallTarget::Bytecode { kind, .. }) = Object::call_target(ctx.heap(), callee_word) else {
+        return Ok(ConstructStart::Cold);
+    };
+    if kind != FunctionKind::Normal {
+        return Ok(ConstructStart::Cold);
+    }
+    let receiver = match construct_receiver_fast(ctx, callee_word)? {
+        Some(r) => r,
+        None => return Ok(ConstructStart::Threw(ctx.exception_word())),
+    };
+    let callee_word = reg_read(regs, ctx.heap(), callee);
+    let Some(CallTarget::Bytecode {
+        target,
+        info,
+        context,
+        register_count,
+        formal_min,
+        kind,
+        ..
+    }) = Object::call_target(ctx.heap(), callee_word)
+    else {
+        return Ok(ConstructStart::Cold);
+    };
+    if kind != FunctionKind::Normal {
+        return Ok(ConstructStart::Cold);
+    }
+    let heap = ctx.heap_mut();
+    let meta = ctx.meta(pc + size);
+    let frame = ctx.stack().push_construct_frame(
+        heap,
+        meta,
+        pc,
+        target.erase(),
+        info,
+        register_count,
+        context.erase(),
+        base,
+        count,
+        callee_word,
+        receiver,
+        formal_min,
+    )?;
+    ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
+    Ok(ConstructStart::Frame)
+}
+
+
+#[inline(never)]
+unsafe fn construct_receiver_fast<'a>(
+    ctx: &Ctx<'a>,
+    callee: Tagged<'_, Value>,
+) -> Result<Option<Tagged<'a, Value>>, VmError> {
+    let vm = ctx.vm();
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| {
+        let callee = scope
+            .cast::<Object>(callee)
+            .expect("constructible callee is an object");
+        Object::create_construct_receiver_value(vm, heap, state, callee.erase())
+    })
+}
+
 #[cold]
 #[inline(never)]
 unsafe fn construct_cold<'a>(
@@ -2022,46 +2226,8 @@ unsafe extern "rust-preserve-none" fn cold_add<'a>(
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
     let next = cold_next_pc(pc, code);
-    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = add_cold(ctx, acc, other)?;
-    become resume(next, code, regs, v, ctx)
-}
-
-#[cold]
-#[inline(never)]
-unsafe extern "rust-preserve-none" fn cold_add_left<'a>(
-    pc: usize,
-    code: *const u8,
-    regs: *mut Register,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
-    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = add_cold(ctx, other, acc)?;
-    become resume(next, code, regs, v, ctx)
-}
-
-#[cold]
-#[inline(never)]
-unsafe extern "rust-preserve-none" fn cold_numeric_left<'a>(
-    pc: usize,
-    code: *const u8,
-    regs: *mut Register,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
-    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
-    let f: fn(f64, f64) -> f64 = match op {
-        Opcode::SubLeft => |a, b| a - b,
-        Opcode::MulLeft => |a, b| a * b,
-        _ => |a, b| a / b,
-    };
-    let v = numeric_cold(ctx, other, acc, f)?;
+    let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = add_cold(ctx, lhs, acc)?;
     become resume(next, code, regs, v, ctx)
 }
 
@@ -2076,14 +2242,58 @@ unsafe extern "rust-preserve-none" fn cold_numeric<'a>(
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
     let next = cold_next_pc(pc, code);
-    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
     let f: fn(f64, f64) -> f64 = match op {
-        Opcode::SubRight => |a, b| a - b,
-        Opcode::MulRight => |a, b| a * b,
+        Opcode::Sub => |a, b| a - b,
+        Opcode::Mul => |a, b| a * b,
+        Opcode::Mod => |a, b| a % b,
+        Opcode::Exp => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    let v = numeric_cold(ctx, acc, other, f)?;
+    let v = numeric_cold(ctx, lhs, acc, f)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_add_immediate<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let imm = Smi::new(signed::read(pc, code, base + stride, stride) as i64).into_tagged();
+    let v = add_cold(ctx, lhs, imm)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_numeric_immediate<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let imm = Smi::new(signed::read(pc, code, base + stride, stride) as i64).into_tagged();
+    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
+    let f: fn(f64, f64) -> f64 = match op {
+        Opcode::SubImmediate => |a, b| a - b,
+        Opcode::MulImmediate => |a, b| a * b,
+        Opcode::ModImmediate => |a, b| a % b,
+        Opcode::ExpImmediate => |a, b| a.powf(b),
+        _ => |a, b| a / b,
+    };
+    let v = numeric_cold(ctx, lhs, imm, f)?;
     become resume(next, code, regs, v, ctx)
 }
 
@@ -2797,23 +3007,38 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::LoadNull as usize] = op_load_null_n as Handler;
     t[Opcode::LoadTrue as usize] = op_load_true_n as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_n as Handler;
-    t[Opcode::AddRight as usize] = op_add_right_n as Handler;
+    t[Opcode::Add as usize] = op_add_n as Handler;
+    t[Opcode::Sub as usize] = op_sub_n as Handler;
+    t[Opcode::Mul as usize] = op_mul_n as Handler;
+    t[Opcode::Div as usize] = op_div_n as Handler;
+    t[Opcode::Mod as usize] = op_mod_n as Handler;
+    t[Opcode::Exp as usize] = op_exp_n as Handler;
+    t[Opcode::BitwiseOr as usize] = op_bitwise_or_n as Handler;
+    t[Opcode::BitwiseXor as usize] = op_bitwise_xor_n as Handler;
+    t[Opcode::BitwiseAnd as usize] = op_bitwise_and_n as Handler;
+    t[Opcode::ShiftLeft as usize] = op_shift_left_n as Handler;
+    t[Opcode::ShiftRight as usize] = op_shift_right_n as Handler;
+    t[Opcode::ShiftRightLogical as usize] = op_shift_right_logical_n as Handler;
+    t[Opcode::AddImmediate as usize] = op_add_immediate_n as Handler;
+    t[Opcode::SubImmediate as usize] = op_sub_immediate_n as Handler;
+    t[Opcode::MulImmediate as usize] = op_mul_immediate_n as Handler;
+    t[Opcode::DivImmediate as usize] = op_div_immediate_n as Handler;
+    t[Opcode::ModImmediate as usize] = op_mod_immediate_n as Handler;
+    t[Opcode::ExpImmediate as usize] = op_exp_immediate_n as Handler;
+    t[Opcode::BitwiseOrImmediate as usize] = op_bitwise_or_immediate_n as Handler;
+    t[Opcode::BitwiseXorImmediate as usize] = op_bitwise_xor_immediate_n as Handler;
+    t[Opcode::BitwiseAndImmediate as usize] = op_bitwise_and_immediate_n as Handler;
+    t[Opcode::ShiftLeftImmediate as usize] = op_shift_left_immediate_n as Handler;
+    t[Opcode::ShiftRightImmediate as usize] = op_shift_right_immediate_n as Handler;
+    t[Opcode::ShiftRightLogicalImmediate as usize] = op_shift_right_logical_immediate_n as Handler;
     t[Opcode::IncLoc as usize] = op_inc_loc_n as Handler;
     t[Opcode::DecLoc as usize] = op_dec_loc_n as Handler;
     t[Opcode::AddLoc as usize] = op_add_loc_n as Handler;
     t[Opcode::SubLoc as usize] = op_sub_loc_n as Handler;
     t[Opcode::LoadKeyedPropertyReg as usize] = op_load_keyed_reg_n as Handler;
-    t[Opcode::SubRight as usize] = op_sub_right_n as Handler;
-    t[Opcode::MulRight as usize] = op_mul_right_n as Handler;
-    t[Opcode::DivRight as usize] = op_div_right_n as Handler;
-    t[Opcode::AddLeft as usize] = op_add_left_n as Handler;
-    t[Opcode::SubLeft as usize] = op_sub_left_n as Handler;
-    t[Opcode::MulLeft as usize] = op_mul_left_n as Handler;
-    t[Opcode::DivLeft as usize] = op_div_left_n as Handler;
     t[Opcode::Equal as usize] = op_equal_n as Handler;
     t[Opcode::LessThan as usize] = op_less_than_n as Handler;
     t[Opcode::GreaterThan as usize] = op_greater_than_n as Handler;
-    t[Opcode::ShiftRight as usize] = op_shift_right_n as Handler;
     t[Opcode::StoreKeyedProperty as usize] = op_store_keyed_n as Handler;
     t[Opcode::StoreKeyedPropertyNoShadow as usize] = op_store_keyed_no_shadow_n as Handler;
     t[Opcode::Negate as usize] = op_negate_n as Handler;
@@ -2862,23 +3087,38 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::LoadNull as usize] = op_load_null_w as Handler;
     t[Opcode::LoadTrue as usize] = op_load_true_w as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_w as Handler;
-    t[Opcode::AddRight as usize] = op_add_right_w as Handler;
+    t[Opcode::Add as usize] = op_add_w as Handler;
+    t[Opcode::Sub as usize] = op_sub_w as Handler;
+    t[Opcode::Mul as usize] = op_mul_w as Handler;
+    t[Opcode::Div as usize] = op_div_w as Handler;
+    t[Opcode::Mod as usize] = op_mod_w as Handler;
+    t[Opcode::Exp as usize] = op_exp_w as Handler;
+    t[Opcode::BitwiseOr as usize] = op_bitwise_or_w as Handler;
+    t[Opcode::BitwiseXor as usize] = op_bitwise_xor_w as Handler;
+    t[Opcode::BitwiseAnd as usize] = op_bitwise_and_w as Handler;
+    t[Opcode::ShiftLeft as usize] = op_shift_left_w as Handler;
+    t[Opcode::ShiftRight as usize] = op_shift_right_w as Handler;
+    t[Opcode::ShiftRightLogical as usize] = op_shift_right_logical_w as Handler;
+    t[Opcode::AddImmediate as usize] = op_add_immediate_w as Handler;
+    t[Opcode::SubImmediate as usize] = op_sub_immediate_w as Handler;
+    t[Opcode::MulImmediate as usize] = op_mul_immediate_w as Handler;
+    t[Opcode::DivImmediate as usize] = op_div_immediate_w as Handler;
+    t[Opcode::ModImmediate as usize] = op_mod_immediate_w as Handler;
+    t[Opcode::ExpImmediate as usize] = op_exp_immediate_w as Handler;
+    t[Opcode::BitwiseOrImmediate as usize] = op_bitwise_or_immediate_w as Handler;
+    t[Opcode::BitwiseXorImmediate as usize] = op_bitwise_xor_immediate_w as Handler;
+    t[Opcode::BitwiseAndImmediate as usize] = op_bitwise_and_immediate_w as Handler;
+    t[Opcode::ShiftLeftImmediate as usize] = op_shift_left_immediate_w as Handler;
+    t[Opcode::ShiftRightImmediate as usize] = op_shift_right_immediate_w as Handler;
+    t[Opcode::ShiftRightLogicalImmediate as usize] = op_shift_right_logical_immediate_w as Handler;
     t[Opcode::IncLoc as usize] = op_inc_loc_w as Handler;
     t[Opcode::DecLoc as usize] = op_dec_loc_w as Handler;
     t[Opcode::AddLoc as usize] = op_add_loc_w as Handler;
     t[Opcode::SubLoc as usize] = op_sub_loc_w as Handler;
     t[Opcode::LoadKeyedPropertyReg as usize] = op_load_keyed_reg_w as Handler;
-    t[Opcode::SubRight as usize] = op_sub_right_w as Handler;
-    t[Opcode::MulRight as usize] = op_mul_right_w as Handler;
-    t[Opcode::DivRight as usize] = op_div_right_w as Handler;
-    t[Opcode::AddLeft as usize] = op_add_left_w as Handler;
-    t[Opcode::SubLeft as usize] = op_sub_left_w as Handler;
-    t[Opcode::MulLeft as usize] = op_mul_left_w as Handler;
-    t[Opcode::DivLeft as usize] = op_div_left_w as Handler;
     t[Opcode::Equal as usize] = op_equal_w as Handler;
     t[Opcode::LessThan as usize] = op_less_than_w as Handler;
     t[Opcode::GreaterThan as usize] = op_greater_than_w as Handler;
-    t[Opcode::ShiftRight as usize] = op_shift_right_w as Handler;
     t[Opcode::StoreKeyedProperty as usize] = op_store_keyed_w as Handler;
     t[Opcode::StoreKeyedPropertyNoShadow as usize] = op_store_keyed_no_shadow_w as Handler;
     t[Opcode::Negate as usize] = op_negate_w as Handler;

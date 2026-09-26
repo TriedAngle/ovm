@@ -837,23 +837,13 @@ impl FnBuilder {
         self.emit_tracked(Opcode::CreateClosure, &[template.0]);
     }
 
-    // -- binary arithmetic: acc = acc op reg --------------------------------------
-
-    /// `acc = acc + reg`. Fuses with a directly preceding `LoadSmi` into
-    /// [`Opcode::AddImmediate`] (`acc = imm + reg` — addition is
-    /// commutative, and the intermediate smi is otherwise dead).
     pub fn add(&mut self, r: Reg) {
-        if let LastOp::LoadSmi { at, imm } = self.last {
-            self.code.truncate(at);
-            self.last = LastOp::None;
-            self.emit_tracked(Opcode::AddImmediate, &[r.operand(), imm as u32]);
-            return;
-        }
-        self.emit_tracked(Opcode::AddRight, &[r.operand()]);
+        self.emit_tracked(Opcode::Add, &[r.operand()]);
     }
-    acc_reg_op!(sub, SubRight);
-    acc_reg_op!(mul, MulRight);
-    acc_reg_op!(div, DivRight);
+
+    acc_reg_op!(sub, Sub);
+    acc_reg_op!(mul, Mul);
+    acc_reg_op!(div, Div);
     acc_reg_op!(mod_, Mod);
     acc_reg_op!(exp, Exp);
     acc_reg_op!(bitwise_or, BitwiseOr);
@@ -862,12 +852,6 @@ impl FnBuilder {
     acc_reg_op!(shift_left, ShiftLeft);
     acc_reg_op!(shift_right, ShiftRight);
     acc_reg_op!(shift_right_logical, ShiftRightLogical);
-
-    // reversed forms: acc = reg op acc (deferred left operand)
-    acc_reg_op!(add_left, AddLeft);
-    acc_reg_op!(sub_left, SubLeft);
-    acc_reg_op!(mul_left, MulLeft);
-    acc_reg_op!(div_left, DivLeft);
 
     /// `dst = dst + src` in place; acc = the result.
     pub fn add_loc(&mut self, dst: Reg, src: Reg) {

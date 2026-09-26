@@ -275,11 +275,10 @@ define_opcodes! {
     /// the currently executing closure (frame callable)
     LoadCurrentClosure { operands: [], acc: writes, indices: [] }, // -> acc
 
-    // -- binary arithmetic: acc = acc op reg --------------------------------
-    AddRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    SubRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    MulRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    DivRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    Add { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    Sub { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    Mul { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+    Div { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     Mod { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     Exp { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     BitwiseOr { operands: [Register], acc: reads_writes, indices: [Unchecked] },
@@ -288,6 +287,20 @@ define_opcodes! {
     ShiftLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     ShiftRight { operands: [Register], acc: reads_writes, indices: [Unchecked] },
     ShiftRightLogical { operands: [Register], acc: reads_writes, indices: [Unchecked] },
+
+    // -- immediate binary arithmetic: acc = reg op imm ---
+    AddImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    SubImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    MulImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    DivImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    ModImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    ExpImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    BitwiseOrImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    BitwiseXorImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    BitwiseAndImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    ShiftLeftImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    ShiftRightImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
+    ShiftRightLogicalImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
 
     // -- control flow (jumps and branches) ----------------------------------
     Jump { operands: [Immediate], indices: [Unchecked] },     // imm (offset)
@@ -320,8 +333,6 @@ define_opcodes! {
     /// the kind operand (`cmp * 2 + jump_if_falsy`). cmp: 0 `==`, 1 `===`,
     /// 2 `<`, 3 `<=`, 4 `>`, 5 `>=`.
     CompareJump { operands: [Register, UImmediate, Immediate], acc: reads_writes, indices: [Unchecked, Unchecked, Unchecked] },
-    /// Fused load-immediate + add: `acc = imm + reg`.
-    AddImmediate { operands: [Register, Immediate], acc: writes, indices: [Unchecked, Unchecked] },
     /// Fused load-immediate + keyed element read: `acc = reg[idx]`.
     LoadElementImm { operands: [Register, UImmediate], acc: writes, indices: [Unchecked, Unchecked] },
 
@@ -340,13 +351,6 @@ define_opcodes! {
     SubLoc { operands: [Register, Register], acc: writes, writes_reg: 0, indices: [Unchecked, Unchecked] },
     /// Keyed read with the key in a register: `acc = regs[recv][regs[key]]`.
     LoadKeyedPropertyReg { operands: [Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },
-
-
-    AddLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    SubLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    MulLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-    DivLeft { operands: [Register], acc: reads_writes, indices: [Unchecked] },
-
 
     CallFunction0 { operands: [Register], acc: writes, indices: [Unchecked] },                              // callee -> acc
     CallFunction1 { operands: [Register, Register], acc: writes, indices: [Unchecked, Unchecked] },          // callee, arg0 -> acc

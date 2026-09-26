@@ -4,7 +4,7 @@ use core::ptr::NonNull;
 use crate::{
     CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
     Handle, HandleData, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, ObjectInit,
-    RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged, Value,
+    RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged,
 };
 
 #[derive(Clone, Copy)]

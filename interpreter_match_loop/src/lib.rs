@@ -326,28 +326,6 @@ impl Cmp {
 struct Slow;
 
 impl Slow {
-    fn numeric_op<'a>(
-        vm: &VM,
-        heap: &'a mut Heap,
-        state: &ContextState,
-        meta: FrameMeta,
-        acc: &Acc<'_>,
-        reg: i32,
-        f: fn(f64, f64) -> f64,
-    ) -> Step<'a> {
-        let stack = &state.stack();
-        state.handle_scope(|scope| {
-            let a = scope.handle(acc.get(heap));
-            let b = scope.handle(stack.reg(heap, &meta, reg));
-            let v = step_try!(Object::numeric_op(vm, heap, state, a, b, f));
-            let Some(v) = v else {
-                return Step::PendingThrow;
-            };
-            acc.store(v);
-            Step::Next
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn add<'a>(
         vm: &VM,
@@ -416,12 +394,12 @@ impl Slow {
     ) -> Step<'a> {
         let stack = &state.stack();
         state.handle_scope(|scope| {
+            let rhs = scope.handle(acc.get(heap));
             let lhs = scope.handle(stack.reg(heap, &meta, lhs_reg));
             let lhs = match step_try!(Object::to_primitive(vm, heap, state, lhs, Hint::Default)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
             };
-            let rhs = scope.handle(acc.get(heap));
             let rhs = match step_try!(Object::to_primitive(vm, heap, state, rhs, Hint::Default)) {
                 Coercion::Threw => return Step::PendingThrow,
                 Coercion::Value(v) => scope.handle(v),
@@ -449,6 +427,97 @@ impl Slow {
             };
             acc.store(v);
             Step::Next
+        })
+    }
+
+    /// `reg OP imm` cold path (`BinOpImmediate`).
+    fn binop_immediate<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        meta: FrameMeta,
+        acc: &Acc<'_>,
+        op: Opcode,
+        reg: i32,
+        imm: i32,
+    ) -> Step<'a> {
+        let stack = &state.stack();
+        state.handle_scope(|scope| -> Step<'_> {
+            let lhs = scope.handle(stack.reg(heap, &meta, reg));
+            let rhs = scope.handle(Smi::new(imm as i64).into_tagged());
+            match op {
+                Opcode::AddImmediate => {
+                    let l = match step_try!(Object::to_primitive(
+                        vm,
+                        heap,
+                        state,
+                        lhs,
+                        Hint::Default
+                    )) {
+                        Coercion::Threw => return Step::PendingThrow,
+                        Coercion::Value(v) => scope.handle(v),
+                    };
+                    let r = match step_try!(Object::to_primitive(
+                        vm,
+                        heap,
+                        state,
+                        rhs,
+                        Hint::Default
+                    )) {
+                        Coercion::Threw => return Step::PendingThrow,
+                        Coercion::Value(v) => scope.handle(v),
+                    };
+                    let is_string = l.as_tagged(heap).get_as::<DenseString>().is_some()
+                        || r.as_tagged(heap).get_as::<DenseString>().is_some();
+                    let v = if is_string {
+                        let a = scope.handle(step_try!(Convert::to_string(heap, &scope, l)));
+                        let b = scope.handle(step_try!(Convert::to_string(heap, &scope, r)));
+                        DenseString::concat(heap, &scope, a, b)
+                            .as_tagged(heap)
+                            .erase()
+                    } else {
+                        let a = step_try!(Convert::to_number(heap, l.as_tagged(heap)));
+                        let b = step_try!(Convert::to_number(heap, r.as_tagged(heap)));
+                        heap.new_number(a + b)
+                    };
+                    acc.store(v);
+                    Step::Next
+                }
+                Opcode::SubImmediate
+                | Opcode::MulImmediate
+                | Opcode::DivImmediate
+                | Opcode::ModImmediate
+                | Opcode::ExpImmediate => {
+                    let f: fn(f64, f64) -> f64 = match op {
+                        Opcode::SubImmediate => |a, b| a - b,
+                        Opcode::MulImmediate => |a, b| a * b,
+                        Opcode::DivImmediate => |a, b| a / b,
+                        Opcode::ModImmediate => |a, b| a % b,
+                        _ => |a, b| a.powf(b),
+                    };
+                    let v = step_try!(Object::numeric_op(vm, heap, state, lhs, rhs, f));
+                    let Some(v) = v else {
+                        return Step::PendingThrow;
+                    };
+                    acc.store(v);
+                    Step::Next
+                }
+                _ => {
+                    // bitwise/shift: Smi-only (ToInt32/ToUint32)
+                    let a = step_try!(lhs.as_tagged(heap).to_i64().ok_or(VmError::Type)) as i32;
+                    let b = imm as u32;
+                    let r = match op {
+                        Opcode::BitwiseOrImmediate => a | b as i32,
+                        Opcode::BitwiseXorImmediate => a ^ b as i32,
+                        Opcode::BitwiseAndImmediate => a & b as i32,
+                        Opcode::ShiftLeftImmediate => a.wrapping_shl(b & 31),
+                        Opcode::ShiftRightImmediate => a.wrapping_shr(b & 31),
+                        _ => (a as u32).wrapping_shr(b & 31) as i32,
+                    };
+                    acc.store(Smi::new(r as i64).into_tagged());
+                    Step::Next
+                }
+            }
         })
     }
 
@@ -800,47 +869,6 @@ impl Slow {
                         Called::Threw => return Step::PendingThrow,
                     }
                 }
-            }
-            Step::Next
-        })
-    }
-
-    /// `AddImmediate` cold body: the full `Add` semantics with the
-    /// constant as the left operand (string concat included).
-    fn add_imm<'a>(
-        vm: &VM,
-        heap: &'a mut Heap,
-        state: &ContextState,
-        meta: FrameMeta,
-        acc: &Acc<'_>,
-        reg: i32,
-        imm: i32,
-    ) -> Step<'a> {
-        let stack = &state.stack();
-        state.handle_scope(|scope| {
-            let lhs = scope.handle(Smi::new(imm as i64).into_tagged());
-            let rhs = scope.handle(stack.reg(heap, &meta, reg));
-            let rhs = match step_try!(Object::to_primitive(vm, heap, state, rhs, Hint::Default)) {
-                Coercion::Threw => return Step::PendingThrow,
-                Coercion::Value(v) => scope.handle(v),
-            };
-            let is_string = rhs.as_tagged(heap).get_as::<DenseString>().is_some();
-            if is_string {
-                let a = scope.handle(step_try!(Convert::to_string(heap, &scope, lhs)));
-                let b = scope.handle(step_try!(Convert::to_string(heap, &scope, rhs)));
-                let concat = DenseString::concat(heap, &scope, a, b).as_tagged(heap);
-                acc.store(concat);
-            } else {
-                let a = Convert::as_number(lhs.as_tagged(heap)).unwrap_or(f64::NAN);
-                let b = step_try!(Convert::to_number(heap, rhs.as_tagged(heap)));
-                // IEEE `-0 + -0` yields +0; the spec demands -0
-                let r = a + b;
-                let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative() {
-                    -0.0
-                } else {
-                    r
-                };
-                acc.store(heap.new_number(r));
             }
             Step::Next
         })
@@ -2424,23 +2452,21 @@ fn step<'a>(
             acc.store(stack.callable_slot(&meta).get(heap));
             Step::Next
         }
-        Opcode::AddRight => {
-            let other_reg = ops.reg(0);
-            let other = stack.reg(heap, &meta, other_reg);
-            if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
+        Opcode::Add => {
+            let lhs = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
                 && let Some(r) = a.checked_add(b)
                 && Smi::in_range(r)
             {
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
             {
                 acc.store(heap.new_number(a + b));
                 return Step::Next;
             }
-            Slow::add(vm, heap, state, meta, &acc, None, other_reg, None)
+            Slow::add_left(vm, heap, state, meta, &acc, ops.reg(0))
         }
         Opcode::AddLoc | Opcode::SubLoc => {
             let dst = ops.reg(0);
@@ -2483,22 +2509,21 @@ fn step<'a>(
                 })
             }
         }
-        Opcode::SubRight => {
-            let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
+        Opcode::Sub => {
+            let lhs = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
                 && let Some(r) = a.checked_sub(b)
                 && Smi::in_range(r)
             {
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
             {
                 acc.store(heap.new_number(a - b));
                 return Step::Next;
             }
-            Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a - b)
+            Slow::numeric_op_left(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a - b)
         }
         Opcode::IncLoc | Opcode::DecLoc => {
             let reg = ops.reg(0);
@@ -2537,98 +2562,27 @@ fn step<'a>(
                 Step::Next
             })
         }
-        Opcode::MulRight => {
-            let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
+        Opcode::Mul => {
+            let lhs = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
                 && let Some(r) = a.checked_mul(b)
                 && Smi::in_range(r)
             {
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
-                acc.store(heap.new_number(a * b));
-                return Step::Next;
-            }
-            Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a * b)
-        }
-        Opcode::DivRight => {
-            // JS division is IEEE double division: 7/2 = 3.5, x/0 = ±Infinity
-            // or NaN, MIN/-1 overflows to a double.
-            let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
-                && b != 0
-                && a % b == 0
-                && let Some(r) = a.checked_div(b)
-            {
-                acc.store(Smi::new(r).into_tagged());
-                return Step::Next;
-            }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
-                acc.store(heap.new_number(a / b));
-                return Step::Next;
-            }
-            Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a / b)
-        }
-        Opcode::AddLeft => {
-            let reg = ops.reg(0);
-            let other = stack.reg(heap, &meta, reg);
-            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
-                && let Some(r) = a.checked_add(b)
-                && Smi::in_range(r)
-            {
-                acc.store(Smi::new(r).into_tagged());
-                return Step::Next;
-            }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
-            {
-                acc.store(heap.new_number(a + b));
-                return Step::Next;
-            }
-            Slow::add_left(vm, heap, state, meta, &acc, reg)
-        }
-        Opcode::SubLeft => {
-            let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
-                && let Some(r) = a.checked_sub(b)
-                && Smi::in_range(r)
-            {
-                acc.store(Smi::new(r).into_tagged());
-                return Step::Next;
-            }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
-            {
-                acc.store(heap.new_number(a - b));
-                return Step::Next;
-            }
-            Slow::numeric_op_left(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a - b)
-        }
-        Opcode::MulLeft => {
-            let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
-                && let Some(r) = a.checked_mul(b)
-                && Smi::in_range(r)
-            {
-                acc.store(Smi::new(r).into_tagged());
-                return Step::Next;
-            }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
             {
                 acc.store(heap.new_number(a * b));
                 return Step::Next;
             }
             Slow::numeric_op_left(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a * b)
         }
-        Opcode::DivLeft => {
-            let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (other.to_i64(), acc.to_i64())
+        Opcode::Div => {
+            // JS division is IEEE double division: 7/2 = 3.5, x/0 = ±Infinity
+            // or NaN, MIN/-1 overflows to a double.
+            let lhs = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
                 && b != 0
                 && a % b == 0
                 && let Some(r) = a.checked_div(b)
@@ -2636,8 +2590,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(other), Convert::as_number(acc.get(heap)))
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
             {
                 acc.store(heap.new_number(a / b));
                 return Step::Next;
@@ -2646,22 +2599,22 @@ fn step<'a>(
         }
         Opcode::Mod => {
             // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.
-            let other = stack.reg(heap, &meta, ops.reg(0));
-            if let (Some(a), Some(b)) = (acc.to_i64(), other.to_i64())
+            let lhs = stack.reg(heap, &meta, ops.reg(0));
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
                 && b != 0
             {
                 acc.store(Smi::new(a % b).into_tagged());
                 return Step::Next;
             }
-            Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a % b)
+            Slow::numeric_op_left(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a % b)
         }
         Opcode::Exp => {
             let reg = ops.reg(0);
             state.handle_scope(|scope| -> Step<'_> {
                 // JS exponentiation is always IEEE double math; the result only
                 // needs a Smi tag when it is an in-range integer.
-                let a = scope.handle(acc.get(heap));
-                let b = scope.handle(stack.reg(heap, &meta, reg));
+                let a = scope.handle(stack.reg(heap, &meta, reg));
+                let b = scope.handle(acc.get(heap));
                 let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a.powf(b)));
                 let Some(v) = v else {
                     return Step::PendingThrow;
@@ -2672,71 +2625,71 @@ fn step<'a>(
         }
         Opcode::BitwiseOr => {
             // ToInt32 semantics on the (integer) smi inputs
-            let a = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(
+            let a = step_try!(
                 stack
                     .reg(heap, &meta, ops.reg(0))
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
+            let b = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
             acc.store(Smi::new((a | b) as i64).into_tagged());
             Step::Next
         }
         Opcode::BitwiseXor => {
-            let a = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(
+            let a = step_try!(
                 stack
                     .reg(heap, &meta, ops.reg(0))
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
+            let b = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
             acc.store(Smi::new((a ^ b) as i64).into_tagged());
             Step::Next
         }
         Opcode::BitwiseAnd => {
-            let a = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(
+            let a = step_try!(
                 stack
                     .reg(heap, &meta, ops.reg(0))
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
+            let b = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
             acc.store(Smi::new((a & b) as i64).into_tagged());
             Step::Next
         }
         Opcode::ShiftLeft => {
             // ToInt32(lhs) << (ToUint32(rhs) & 31), truncated to int32
-            let a = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(
+            let a = step_try!(
                 stack
                     .reg(heap, &meta, ops.reg(0))
                     .to_i64()
                     .ok_or(VmError::Type)
-            ) as u32;
+            ) as i32;
+            let b = step_try!(acc.to_i64().ok_or(VmError::Type)) as u32;
             acc.store(Smi::new(a.wrapping_shl(b & 31) as i64).into_tagged());
             Step::Next
         }
         Opcode::ShiftRight => {
             // ToInt32(lhs) >> (ToUint32(rhs) & 31), sign-extending
-            let a = step_try!(acc.to_i64().ok_or(VmError::Type)) as i32;
-            let b = step_try!(
+            let a = step_try!(
                 stack
                     .reg(heap, &meta, ops.reg(0))
                     .to_i64()
                     .ok_or(VmError::Type)
-            ) as u32;
+            ) as i32;
+            let b = step_try!(acc.to_i64().ok_or(VmError::Type)) as u32;
             acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
             Step::Next
         }
         Opcode::ShiftRightLogical => {
             // ToUint32(lhs) >>> (ToUint32(rhs) & 31): always non-negative
-            let a = step_try!(acc.to_i64().ok_or(VmError::Type)) as u32;
-            let b = step_try!(
+            let a = step_try!(
                 stack
                     .reg(heap, &meta, ops.reg(0))
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as u32;
+            let b = step_try!(acc.to_i64().ok_or(VmError::Type)) as u32;
             acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
             Step::Next
         }
@@ -2909,17 +2862,52 @@ fn step<'a>(
             }
             Step::Next
         }
-        Opcode::AddImmediate => {
+        Opcode::AddImmediate
+        | Opcode::SubImmediate
+        | Opcode::MulImmediate
+        | Opcode::DivImmediate
+        | Opcode::ModImmediate
+        | Opcode::ExpImmediate
+        | Opcode::BitwiseOrImmediate
+        | Opcode::BitwiseXorImmediate
+        | Opcode::BitwiseAndImmediate
+        | Opcode::ShiftLeftImmediate
+        | Opcode::ShiftRightImmediate
+        | Opcode::ShiftRightLogicalImmediate => {
+            let reg = ops.reg(0);
             let imm = ops.imm(1);
-            let rhs = stack.reg(heap, &meta, ops.reg(0));
-            if let Some(a) = Smi::decode(rhs.raw()).map(|s| s.value())
-                && let Some(r) = a.checked_add(imm as i64)
-                && Smi::in_range(r)
-            {
-                acc.store(Smi::new(r).into_tagged());
-                return Step::Next;
+            let lhs = stack.reg(heap, &meta, reg);
+            if let Some(a) = lhs.to_i64() {
+                let fast: Option<i64> = match op {
+                    Opcode::AddImmediate => a.checked_add(imm as i64),
+                    Opcode::SubImmediate => a.checked_sub(imm as i64),
+                    Opcode::MulImmediate => a.checked_mul(imm as i64),
+                    Opcode::DivImmediate => {
+                        (imm != 0 && a % imm as i64 == 0).then(|| a / imm as i64)
+                    }
+                    Opcode::ModImmediate => (imm != 0).then(|| a % imm as i64),
+                    Opcode::BitwiseOrImmediate => Some((a as i32 | imm) as i64),
+                    Opcode::BitwiseXorImmediate => Some((a as i32 ^ imm) as i64),
+                    Opcode::BitwiseAndImmediate => Some((a as i32 & imm) as i64),
+                    Opcode::ShiftLeftImmediate => {
+                        Some((a as i32).wrapping_shl(imm as u32 & 31) as i64)
+                    }
+                    Opcode::ShiftRightImmediate => {
+                        Some((a as i32).wrapping_shr(imm as u32 & 31) as i64)
+                    }
+                    Opcode::ShiftRightLogicalImmediate => {
+                        Some((a as u32).wrapping_shr(imm as u32 & 31) as i64)
+                    }
+                    _ => None,
+                };
+                if let Some(r) = fast
+                    && Smi::in_range(r)
+                {
+                    acc.store(Smi::new(r).into_tagged());
+                    return Step::Next;
+                }
             }
-            Slow::add_imm(vm, heap, state, meta, &acc, ops.reg(0), imm)
+            Slow::binop_immediate(vm, heap, state, meta, &acc, op, reg, imm)
         }
         Opcode::LoadElementImm => {
             let idx = ops.uimm(1) as usize;

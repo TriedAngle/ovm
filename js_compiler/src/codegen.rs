@@ -51,6 +51,9 @@ enum StoreTarget {
     Named {
         obj: Reg,
         name_idx: ConstIdx,
+        /// whether `obj` was staged as a temp that must be dropped at the
+        /// end (false when `obj` is the frame receiver, operand 0)
+        obj_staged: bool,
     },
     Keyed {
         obj: Reg,
@@ -285,16 +288,31 @@ fn is_simple(p: &BindingPattern<'_>) -> bool {
     matches!(p, BindingPattern::BindingIdentifier(_))
 }
 
-/// The deferred-left form of `op`: `acc = reg op acc` (`None` when no
-/// reversed opcode exists, in which case the left operand must be staged).
-fn left_variant(op: Opcode) -> Option<Opcode> {
+/// The immediate form of a register arithmetic opcode (`Add` -> `AddImmediate`).
+fn immediate_variant(op: Opcode) -> Option<Opcode> {
     Some(match op {
-        Opcode::AddRight => Opcode::AddLeft,
-        Opcode::SubRight => Opcode::SubLeft,
-        Opcode::MulRight => Opcode::MulLeft,
-        Opcode::DivRight => Opcode::DivLeft,
+        Opcode::Add => Opcode::AddImmediate,
+        Opcode::Sub => Opcode::SubImmediate,
+        Opcode::Mul => Opcode::MulImmediate,
+        Opcode::Div => Opcode::DivImmediate,
+        Opcode::Mod => Opcode::ModImmediate,
+        Opcode::Exp => Opcode::ExpImmediate,
+        Opcode::BitwiseOr => Opcode::BitwiseOrImmediate,
+        Opcode::BitwiseXor => Opcode::BitwiseXorImmediate,
+        Opcode::BitwiseAnd => Opcode::BitwiseAndImmediate,
+        Opcode::ShiftLeft => Opcode::ShiftLeftImmediate,
+        Opcode::ShiftRight => Opcode::ShiftRightImmediate,
+        Opcode::ShiftRightLogical => Opcode::ShiftRightLogicalImmediate,
         _ => return None,
     })
+}
+
+/// Whether `op` is commutative (`imm OP x` == `x OP imm`).
+fn is_commutative(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Add | Opcode::Mul | Opcode::BitwiseOr | Opcode::BitwiseXor | Opcode::BitwiseAnd
+    )
 }
 
 /// Whether evaluating `e` can write a non-captured local (and thus whether
@@ -320,13 +338,23 @@ fn rhs_cannot_clobber_locals(e: &Expression<'_>) -> bool {
     !scan.assigns
 }
 
+/// The integer value of a numeric literal that fits a 2-byte immediate
+/// operand, if `e` is one.
+fn int_literal(e: &Expression<'_>) -> Option<i32> {
+    let Expression::NumericLiteral(n) = e else {
+        return None;
+    };
+    let v = n.value;
+    (v.fract() == 0.0 && v >= i16::MIN as f64 && v <= i16::MAX as f64).then_some(v as i32)
+}
+
 fn arith_opcode(op: BinaryOperator) -> Option<Opcode> {
     use BinaryOperator as Op;
     Some(match op {
-        Op::Addition => Opcode::AddRight,
-        Op::Subtraction => Opcode::SubRight,
-        Op::Multiplication => Opcode::MulRight,
-        Op::Division => Opcode::DivRight,
+        Op::Addition => Opcode::Add,
+        Op::Subtraction => Opcode::Sub,
+        Op::Multiplication => Opcode::Mul,
+        Op::Division => Opcode::Div,
         Op::Remainder => Opcode::Mod,
         Op::Exponential => Opcode::Exp,
         Op::ShiftLeft => Opcode::ShiftLeft,
@@ -1130,10 +1158,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 Ok(())
             }
             UnaryOperator::UnaryPlus => {
-                self.b.load_zero();
-                let zero = self.b.stage_acc();
+                // ToNumber(arg) via `arg - 0`
                 self.expr(&u.argument)?;
-                self.b.sub(zero);
+                let arg = self.b.stage_acc();
+                self.b.load_zero();
+                self.b.raw(Opcode::Sub, &[arg.operand()]);
                 self.b.drop_temp();
                 Ok(())
             }
@@ -1276,10 +1305,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             _ => {
                 let op = match b.operator {
-                    Op::Addition => Opcode::AddRight,
-                    Op::Subtraction => Opcode::SubRight,
-                    Op::Multiplication => Opcode::MulRight,
-                    Op::Division => Opcode::DivRight,
+                    Op::Addition => Opcode::Add,
+                    Op::Subtraction => Opcode::Sub,
+                    Op::Multiplication => Opcode::Mul,
+                    Op::Division => Opcode::Div,
                     Op::Remainder => Opcode::Mod,
                     Op::Exponential => Opcode::Exp,
                     Op::BitwiseOR => Opcode::BitwiseOr,
@@ -1334,6 +1363,29 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         self.simple_identifier_register(ident)
     }
 
+    /// The receiver operand of the current frame (`this`, operand 0) when
+    /// `e` is a `this` expression that resolves to this frame's receiver.
+    /// `None` for arrows (lexical `this`), `super`-captured `this`, and
+    /// derived constructors (whose `this` load carries an initialization
+    /// check that must not be elided).
+    fn this_operand_reg(&self, e: &Expression<'_>) -> Option<Reg> {
+        let Expression::ThisExpression(t) = e else {
+            return None;
+        };
+        if let Some(Special::This { owner, .. }) = self.c.facts.special.get(&t.node_id.get())
+            && *owner != self.fid
+        {
+            return None;
+        }
+        if self.c.facts.functions[self.fid.0 as usize]
+            .kind
+            .is_derived_class_constructor()
+        {
+            return None;
+        }
+        Some(self.b.this_reg())
+    }
+
     fn simple_identifier_register(&mut self, ident: &IdentifierReference<'_>) -> Option<Reg> {
         match self.identifier_resolution(ident).ok()? {
             IdRes::Slot(
@@ -1360,36 +1412,55 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         rhs: &Expression<'_>,
         op: Opcode,
     ) -> Result<(), CompileError> {
-        // The arithmetic opcodes take their right operand as a register:
-        // when the right side is a plain local there is nothing to stage,
-        // `lhs op reg` computes the whole expression (evaluation order is
-        // preserved because lhs is still evaluated first).
+        if let Some(imm_op) = immediate_variant(op) {
+            // `reg OP imm`
+            if let Some(l) = self.simple_register(lhs)
+                && let Some(imm) = int_literal(rhs)
+            {
+                self.b.raw(imm_op, &[l.operand(), imm as u32]);
+                return Ok(());
+            }
+            // `lhs` is already a register: keep it as the register operand
+            // and evaluate `rhs` into the accumulator. Evaluation order
+            // (lhs then rhs) is preserved because a simple register has no
+            // side effects.
+            if let Some(l) = self.simple_register(lhs)
+                && rhs_cannot_clobber_locals(rhs)
+            {
+                self.expr(rhs)?;
+                self.b.raw(op, &[l.operand()]);
+                return Ok(());
+            }
+            // `imm OP reg` for a commutative operator == `reg OP imm`
+            if is_commutative(op)
+                && let Some(imm) = int_literal(lhs)
+                && let Some(r) = self.simple_register(rhs)
+            {
+                self.b.raw(imm_op, &[r.operand(), imm as u32]);
+                return Ok(());
+            }
+            // complex `lhs`, immediate `rhs`: stage lhs, then `reg OP imm`
+            if let Some(imm) = int_literal(rhs) {
+                self.expr(lhs)?;
+                let t = self.b.stage_acc();
+                self.b.raw(imm_op, &[t.operand(), imm as u32]);
+                self.b.drop_temp();
+                return Ok(());
+            }
+            // general: `lhs` -> temp register, `rhs` -> accumulator
+            self.expr(lhs)?;
+            let t = self.b.stage_acc();
+            self.expr(rhs)?;
+            self.b.raw(op, &[t.operand()]);
+            self.b.drop_temp();
+            return Ok(());
+        }
+        // non-arithmetic operator (`acc OP reg`): comparisons/tests. When
+        // the right operand is a plain register there is nothing to stage.
         if let Some(r) = self.simple_register(rhs) {
             self.expr(lhs)?;
             self.b.raw(op, &[r.operand()]);
             return Ok(());
-        }
-        // Deferred left: evaluate the right side into the accumulator,
-        // then fold the left operand in with the reversed opcode. The
-        // left value must survive the right side untouched: a staged copy
-        // always does, a register only when no direct eval or assignment
-        // in the right side can write it (a call cannot — locals are not
-        // reachable from the callee).
-        if let Some(left_op) = left_variant(op) {
-            if let Some(left) = self.simple_register(lhs) {
-                if rhs_cannot_clobber_locals(rhs) {
-                    self.expr(rhs)?;
-                    self.b.raw(left_op, &[left.operand()]);
-                    return Ok(());
-                }
-            } else {
-                self.expr(lhs)?;
-                let a = self.b.stage_acc();
-                self.expr(rhs)?;
-                self.b.raw(left_op, &[a.operand()]);
-                self.b.drop_temp();
-                return Ok(());
-            }
         }
         self.expr(lhs)?;
         let a = self.b.stage_acc();
@@ -1501,11 +1572,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     self.simple_register(value),
                 ) {
                     match op {
-                        Opcode::AddRight => {
+                        Opcode::Add => {
                             self.b.add_loc(dst, src);
                             return Ok(());
                         }
-                        Opcode::SubRight => {
+                        Opcode::Sub => {
                             self.b.sub_loc(dst, src);
                             return Ok(());
                         }
@@ -1515,8 +1586,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.expr(value)?;
                 let v = self.b.stage_acc();
                 self.emit_identifier(i)?;
-                self.b.raw(op, &[v.operand()]);
-                self.b.drop_temp();
+                let orig = self.b.stage_acc();
+                self.b.load(v);
+                self.b.raw(op, &[orig.operand()]);
+                self.b.drop_temp(); // orig
+                self.b.drop_temp(); // v
                 self.store_name(i)?;
                 Ok(())
             }
@@ -1530,8 +1604,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.expr(value)?;
                 let v = self.b.stage_acc();
                 self.emit_property_load_of(&store);
-                self.b.raw(op, &[v.operand()]);
-                self.b.drop_temp();
+                let orig = self.b.stage_acc();
+                self.b.load(v);
+                self.b.raw(op, &[orig.operand()]);
+                self.b.drop_temp(); // orig
+                self.b.drop_temp(); // v
                 self.emit_property_store(&store);
                 self.release_store(&store);
                 Ok(())
@@ -1544,12 +1621,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     /// the accumulator with `ToNumber(orig) ± d` (`orig - 0` performs the
     /// ToNumber, ES 13.5.6.2).
     fn emit_add_delta(&mut self, arith: Opcode, orig: Reg, d: Reg) {
-        self.b.load_zero();
-        let zero = self.b.stage_acc();
+        // acc = ToNumber(orig) OP d
         self.b.load(orig);
-        self.b.sub(zero);
-        self.b.drop_temp(); // zero
-        self.b.raw(arith, &[d.operand()]);
+        let t = self.b.stage_acc();
+        self.b.load_zero();
+        self.b.raw(Opcode::Sub, &[t.operand()]);
+        self.b.drop_temp(); // t
+        let lhs = self.b.stage_acc();
+        self.b.load(d);
+        self.b.raw(arith, &[lhs.operand()]);
+        self.b.drop_temp(); // lhs
         self.b.drop_temp(); // d
     }
 
@@ -1558,11 +1639,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             UpdateOperator::Increment => 1,
             UpdateOperator::Decrement => -1,
         };
-        let arith = if delta > 0 {
-            Opcode::AddRight
-        } else {
-            Opcode::SubRight
-        };
+        let arith = if delta > 0 { Opcode::Add } else { Opcode::Sub };
         let delta = delta.unsigned_abs();
 
         if let SimpleAssignmentTarget::AssignmentTargetIdentifier(i) = &u.argument {
@@ -1843,9 +1920,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 .call_runtime(RuntimeFn::IteratorValue, RegList::new(result, 1));
             let feedback = self.b.new_feedback();
             self.b.store_keyed_property_no_shadow(arr, idx, feedback);
-            self.b.load(idx);
-            self.b.load_smi(1);
-            self.b.add(idx);
+            self.b.raw(Opcode::AddImmediate, &[idx.operand(), 1]); // acc = idx + 1
             self.b.store(idx);
             self.b.jump_loop(back);
             self.b.bind(after);
@@ -2060,7 +2135,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
     fn emit_property_store(&mut self, store: &StoreTarget) {
         match store {
-            StoreTarget::Named { obj, name_idx } => {
+            StoreTarget::Named { obj, name_idx, .. } => {
                 let feedback = self.b.new_feedback();
                 self.b.store_named_property(*obj, *name_idx, feedback);
             }
@@ -2118,7 +2193,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
     fn emit_property_load_of(&mut self, store: &StoreTarget) {
         match store {
-            StoreTarget::Named { obj, name_idx } => {
+            StoreTarget::Named { obj, name_idx, .. } => {
                 let feedback = self.b.new_feedback();
                 self.b.load_named_property(*obj, *name_idx, feedback);
             }
@@ -2166,7 +2241,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
     fn release_store(&mut self, store: &StoreTarget) {
         match store {
-            StoreTarget::Named { .. } => self.b.drop_temp(), // obj
+            StoreTarget::Named { obj_staged, .. } => {
+                if *obj_staged {
+                    self.b.drop_temp(); // obj
+                }
+            }
             StoreTarget::Keyed { .. } | StoreTarget::PrivateKeyed { .. } => {
                 self.b.drop_temp(); // key
                 self.b.drop_temp(); // obj
@@ -2193,10 +2272,21 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 Ok(StoreTarget::PrivateKeyed { obj, key: k })
             }
             MemberRef::Static(s) => {
+                let name_idx = self.b.name(s.property.name.as_bytes());
+                if let Some(obj) = self.this_operand_reg(&s.object) {
+                    return Ok(StoreTarget::Named {
+                        obj,
+                        name_idx,
+                        obj_staged: false,
+                    });
+                }
                 self.expr(&s.object)?;
                 let obj = self.b.stage_acc();
-                let name_idx = self.b.name(s.property.name.as_bytes());
-                Ok(StoreTarget::Named { obj, name_idx })
+                Ok(StoreTarget::Named {
+                    obj,
+                    name_idx,
+                    obj_staged: true,
+                })
             }
             MemberRef::Computed(c) => {
                 self.expr(&c.object)?;
@@ -2303,10 +2393,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 Ok(())
             }
             MemberRef::Static(s) => {
-                self.expr(&s.object)?;
-                let obj = self.b.stage_acc();
                 let name_idx = self.b.name(s.property.name.as_bytes());
                 let feedback = self.b.new_feedback();
+                if let Some(obj) = self.this_operand_reg(&s.object) {
+                    self.b.load_named_property(obj, name_idx, feedback);
+                    return Ok(());
+                }
+                self.expr(&s.object)?;
+                let obj = self.b.stage_acc();
                 self.b.load_named_property(obj, name_idx, feedback);
                 self.b.drop_temp();
                 Ok(())
@@ -3843,6 +3937,36 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         Ok(())
     }
 
+    /// Fill this function's register-resident lexical bindings with the hole
+    /// at prologue time. The frame itself is filled with `undefined`, so
+    /// without this a `let`/`const`/class binding read before its
+    /// declaration would yield `undefined` instead of throwing.
+    fn emit_lexical_hole_fills(&mut self) -> Result<(), CompileError> {
+        let scopes = self.c.scopes_by_fid[self.fid.0 as usize].clone();
+        for sid in scopes {
+            for sym in self.c.scoping.iter_bindings_in(sid) {
+                if self.c.facts.param_symbols.contains_key(&sym)
+                    || self.c.facts.pattern_params.contains(&sym)
+                {
+                    continue;
+                }
+                let flags = self.c.scoping.symbol_flags(sym);
+                if !flags.intersects(SymbolFlags::BlockScopedVariable | SymbolFlags::Class) {
+                    continue;
+                }
+                if let Some(&Slot::Local {
+                    reg,
+                    hole_check: true,
+                }) = self.c.slots.get(&sym)
+                {
+                    self.b.load_hole();
+                    self.b.store(Reg::new(reg as i32));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn emit_function_body(&mut self) -> Result<(), CompileError> {
         let layout = &self.c.layouts[self.fid.0 as usize];
         // the script (and each eval compilation) tracks its completion
@@ -4046,14 +4170,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         self.b.load_undefined();
                         self.b.store_global(idx, feedback);
                     }
-                    Slot::Param { index, .. } => {
-                        let reg = self.b.param(index);
-                        self.b.load_undefined();
-                        self.b.store(reg);
+                    Slot::Param { .. } => {
+                        // simple-list params are already undefined when
+                        // omitted (frame padding); a `var` bound to a
+                        // parameter keeps its incoming value
                     }
-                    Slot::Local { reg, .. } => {
-                        self.b.load_undefined();
-                        self.b.store(Reg::new(reg as i32));
+                    Slot::Local { .. } => {
+                        // register locals are pre-filled with undefined by
+                        // the frame (`Stack::reserve`)
                     }
                     Slot::Ctx { slot, .. } => {
                         self.b.load_undefined();
@@ -4071,6 +4195,12 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.store_symbol(sym, &name)?;
             }
         }
+
+        // lexical declarations start in their TDZ: the frame is filled with
+        // `undefined`, so register-resident `let`/`const`/class
+        // bindings get an explicit hole. Context-allocated lexicals are born
+        // the hole when their context is materialized.
+        self.emit_lexical_hole_fills()?;
 
         // the script's completion value starts as undefined; only
         // value-producing statements overwrite it (see `stmt`)

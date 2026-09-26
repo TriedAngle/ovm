@@ -321,10 +321,12 @@ fn failed_run_does_not_leak_frames_into_next_run() {
         word(&*thread.heap(), obj)
     });
     let mut bad = Vec::new();
-    emit(&mut bad, Opcode::Load, &[reg_op(0)]);
+    // operand 0 is the receiver (the object argument); copy it into a local
+    // and add the object to itself to force a TypeError
+    emit(&mut bad, Opcode::Load, &[0]);
     emit(&mut bad, Opcode::Store, &[reg_op(1)]);
-    emit(&mut bad, Opcode::Load, &[reg_op(0)]);
-    emit(&mut bad, Opcode::AddRight, &[reg_op(1)]);
+    emit(&mut bad, Opcode::Load, &[0]);
+    emit(&mut bad, Opcode::Add, &[reg_op(1)]);
     emit(&mut bad, Opcode::Return, &[]);
     let result = run_program(&mut thread, bad, 2, &[obj]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -1229,7 +1231,7 @@ fn named_store_new_property_transitions() {
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
         emit(program, Opcode::Store, &[reg_op(4)]);
-        emit(program, Opcode::AddRight, &[reg_op(3)]);
+        emit(program, Opcode::Add, &[reg_op(3)]);
     });
     // existing slot preserved (7) and new slot written (42)
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 49);
@@ -1259,11 +1261,11 @@ fn named_store_chained_transitions() {
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
         emit(program, Opcode::Store, &[reg_op(4)]);
-        emit(program, Opcode::AddRight, &[reg_op(3)]);
+        emit(program, Opcode::Add, &[reg_op(3)]);
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 3, 0]);
         emit(program, Opcode::Store, &[reg_op(4)]);
-        emit(program, Opcode::AddRight, &[reg_op(3)]);
+        emit(program, Opcode::Add, &[reg_op(3)]);
     });
     // x = 7 (preserved), z = 42, w = 1
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 50);
@@ -1405,7 +1407,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
         emit(&mut program, Opcode::Store, &[reg_op(4)]);
         emit(&mut program, Opcode::LoadNamedProperty, &[reg_op(4), 1, 0]);
         emit(&mut program, Opcode::Store, &[reg_op(5)]);
-        emit(&mut program, Opcode::AddRight, &[reg_op(3)]);
+        emit(&mut program, Opcode::Add, &[reg_op(3)]);
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -1490,7 +1492,7 @@ fn jump_loop_counts_down_to_zero() {
     emit(&mut program, Opcode::Load, &[reg_op(0)]); // 8..10
     emit(&mut program, Opcode::JumpIfFalsy, &[10]); // 10..12 -> 20
     emit(&mut program, Opcode::Load, &[reg_op(0)]); // 12..14
-    emit(&mut program, Opcode::AddRight, &[reg_op(1)]); // 14..16
+    emit(&mut program, Opcode::Add, &[reg_op(1)]); // 14..16
     emit(&mut program, Opcode::Store, &[reg_op(0)]); // 16..18
     emit(&mut program, Opcode::JumpLoop, &[(-10i32) as u32]); // 18..20 -> 8
     // end @ 20
@@ -2123,7 +2125,7 @@ fn run_failing_inner<'a>(
     state.handle_scope(|scope| {
         // callee: Add on a non-smi accumulator -> TypeError throw
         let mut bad = Vec::new();
-        emit(&mut bad, Opcode::AddRight, &[reg_op(1)]);
+        emit(&mut bad, Opcode::Add, &[reg_op(1)]);
         emit(&mut bad, Opcode::Return, &[]);
         let callee = scope.handle(bytecode_fn(heap, &scope, &bad, &[], 2));
 
@@ -2189,12 +2191,34 @@ fn inner_run_error_unwinds_and_runtime_recovers() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 41);
 }
 
-/// acc = param0; acc = acc op param1; return acc
+/// acc = lhs; acc = acc op reg (comparisons) or acc = reg op acc (arithmetic,
+/// register-left); params: 0 = lhs/receiver, 1 = rhs.
 fn binary_op_program(op: Opcode) -> Vec<u8> {
+    let arith = matches!(
+        op,
+        Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Mod
+            | Opcode::Exp
+            | Opcode::BitwiseOr
+            | Opcode::BitwiseXor
+            | Opcode::BitwiseAnd
+            | Opcode::ShiftLeft
+            | Opcode::ShiftRight
+            | Opcode::ShiftRightLogical
+    );
     let mut program = Vec::new();
-    // param 0 (receiver = lhs), param 1 (rhs)
-    emit(&mut program, Opcode::Load, &[0]);
-    emit(&mut program, op, &[1]);
+    if arith {
+        // register = lhs (receiver), accumulator = rhs (param 1)
+        emit(&mut program, Opcode::Load, &[1]);
+        emit(&mut program, op, &[0]);
+    } else {
+        // comparisons: accumulator = lhs, register = rhs
+        emit(&mut program, Opcode::Load, &[0]);
+        emit(&mut program, op, &[1]);
+    }
     emit(&mut program, Opcode::Return, &[]);
     program
 }
@@ -2205,10 +2229,10 @@ fn arithmetic_ops_use_accumulator_convention() {
     let mut thread = vm.attach();
 
     let cases: &[(Opcode, i64, i64, i64)] = &[
-        (Opcode::AddRight, 6, 7, 13),
-        (Opcode::SubRight, 10, 4, 6),
-        (Opcode::MulRight, 6, 7, 42),
-        (Opcode::DivRight, 42, 7, 6),
+        (Opcode::Add, 6, 7, 13),
+        (Opcode::Sub, 10, 4, 6),
+        (Opcode::Mul, 6, 7, 42),
+        (Opcode::Div, 42, 7, 6),
         (Opcode::Mod, 42, 10, 2),
         (Opcode::Exp, 2, 10, 1024),
         (Opcode::BitwiseOr, 0b1010, 0b0110, 0b1110),
@@ -2255,7 +2279,7 @@ fn arithmetic_overflow_promotes_to_float() {
     // Smi::MAX - 1 + 5 no longer fits an smi: the double path rounds it to 2^62
     let result = run_program(
         &mut thread,
-        binary_op_program(Opcode::AddRight),
+        binary_op_program(Opcode::Add),
         0,
         &[smi(Smi::MAX - 1), smi(5)],
     );
@@ -2273,11 +2297,36 @@ fn arithmetic_overflow_promotes_to_float() {
 
 /// acc = constants[0] op constants[1]; return acc
 fn binary_op_consts_program(op: Opcode) -> Vec<u8> {
+    let arith = matches!(
+        op,
+        Opcode::Add
+            | Opcode::Sub
+            | Opcode::Mul
+            | Opcode::Div
+            | Opcode::Mod
+            | Opcode::Exp
+            | Opcode::BitwiseOr
+            | Opcode::BitwiseXor
+            | Opcode::BitwiseAnd
+            | Opcode::ShiftLeft
+            | Opcode::ShiftRight
+            | Opcode::ShiftRightLogical
+    );
     let mut program = Vec::new();
-    emit(&mut program, Opcode::LoadConstant, &[1]);
-    emit(&mut program, Opcode::Store, &[reg_op(0)]);
-    emit(&mut program, Opcode::LoadConstant, &[0]);
-    emit(&mut program, op, &[reg_op(0)]);
+    // constants: [0] = lhs, [1] = rhs
+    if arith {
+        // register = lhs, accumulator = rhs
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::LoadConstant, &[1]);
+        emit(&mut program, op, &[reg_op(0)]);
+    } else {
+        // comparisons: accumulator = lhs, register = rhs
+        emit(&mut program, Opcode::LoadConstant, &[1]);
+        emit(&mut program, Opcode::Store, &[reg_op(0)]);
+        emit(&mut program, Opcode::LoadConstant, &[0]);
+        emit(&mut program, op, &[reg_op(0)]);
+    }
     emit(&mut program, Opcode::Return, &[]);
     program
 }
@@ -2588,7 +2637,7 @@ fn division_and_modulo_follow_ieee() {
     // 7 / 2 = 3.5 (float), 42 / 7 = 6 (smi fast path, covered above)
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::DivRight),
+        binary_op_program(Opcode::Div),
         0,
         &[smi(7), smi(2)],
     );
@@ -2597,21 +2646,21 @@ fn division_and_modulo_follow_ieee() {
     // division by zero: sign-correct infinities and NaN
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::DivRight),
+        binary_op_program(Opcode::Div),
         0,
         &[smi(1), smi(0)],
     );
     assert_eq!(float_value(&mut thread, r.unwrap()), f64::INFINITY);
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::DivRight),
+        binary_op_program(Opcode::Div),
         0,
         &[smi(-1), smi(0)],
     );
     assert_eq!(float_value(&mut thread, r.unwrap()), f64::NEG_INFINITY);
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::DivRight),
+        binary_op_program(Opcode::Div),
         0,
         &[smi(0), smi(0)],
     );
@@ -2698,7 +2747,7 @@ fn arithmetic_coerces_primitives_to_number() {
     // null + 1 = 1
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::AddRight),
+        binary_op_program(Opcode::Add),
         0,
         &[null_word, smi(1)],
     );
@@ -2707,7 +2756,7 @@ fn arithmetic_coerces_primitives_to_number() {
     // undefined + 1 = NaN
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::AddRight),
+        binary_op_program(Opcode::Add),
         0,
         &[undefined_word, smi(1)],
     );
@@ -2716,14 +2765,14 @@ fn arithmetic_coerces_primitives_to_number() {
     // true + 1 = 2, false + 1 = 1
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::AddRight),
+        binary_op_program(Opcode::Add),
         0,
         &[true_word, smi(1)],
     );
     assert_eq!(Smi::decode(r.unwrap()).unwrap().value(), 2);
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::AddRight),
+        binary_op_program(Opcode::Add),
         0,
         &[false_word, smi(1)],
     );
@@ -2732,7 +2781,7 @@ fn arithmetic_coerces_primitives_to_number() {
     // "2" * 3 = 6 (strings parse in numeric contexts)
     let r = thread.handle_scope(|thread, scope| {
         let s2 = intern_word(&mut *thread, &scope, "2");
-        run_binary_consts(thread, Opcode::MulRight, s2, smi(3)).unwrap()
+        run_binary_consts(thread, Opcode::Mul, s2, smi(3)).unwrap()
     });
     assert_eq!(r.to_i64().unwrap(), 6);
 }
@@ -3182,7 +3231,7 @@ fn function_context_slots_are_readable_and_writable() {
     emit(&mut program, Opcode::LoadContextSlot, &[0, 0]);
     emit(&mut program, Opcode::Store, &[reg_op(1)]);
     emit(&mut program, Opcode::LoadContextSlot, &[1, 0]);
-    emit(&mut program, Opcode::AddRight, &[reg_op(1)]);
+    emit(&mut program, Opcode::Add, &[reg_op(1)]);
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program_ctx(&mut thread, program, 2, &[], 2);
@@ -3701,7 +3750,7 @@ fn to_primitive_calls_value_of_in_numeric_contexts() {
         // + and * both coerce the object with hint number → valueOf() = 1
         let r = run_program(
             &mut *thread,
-            binary_op_program(Opcode::AddRight),
+            binary_op_program(Opcode::Add),
             0,
             &[obj, smi(1)],
         )
@@ -3709,7 +3758,7 @@ fn to_primitive_calls_value_of_in_numeric_contexts() {
         assert_eq!(r.to_i64().unwrap(), 2);
         let r = run_program(
             &mut *thread,
-            binary_op_program(Opcode::MulRight),
+            binary_op_program(Opcode::Mul),
             0,
             &[obj, smi(3)],
         )
@@ -3750,7 +3799,7 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
 
         let r = run_program(
             &mut *thread,
-            binary_op_program(Opcode::AddRight),
+            binary_op_program(Opcode::Add),
             0,
             &[obj, smi(1)],
         )
@@ -3780,13 +3829,8 @@ fn add_concatenates_strings() {
             (smi(2), b, "2b"),
             (a, smi(1000), "a1000"),
         ] {
-            let r = run_program(
-                &mut *thread,
-                binary_op_program(Opcode::AddRight),
-                0,
-                &[lhs, rhs],
-            )
-            .unwrap();
+            let r =
+                run_program(&mut *thread, binary_op_program(Opcode::Add), 0, &[lhs, rhs]).unwrap();
             {
                 let heap = &*thread.heap();
                 let s = unsafe { anchored(heap, r) }
@@ -3827,7 +3871,7 @@ fn to_primitive_uses_to_primitive_symbol_first() {
 
         let r = run_program(
             &mut *thread,
-            binary_op_program(Opcode::AddRight),
+            binary_op_program(Opcode::Add),
             0,
             &[obj, smi(1)],
         )
@@ -3857,7 +3901,7 @@ fn to_primitive_symbol_returning_object_throws() {
     });
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::AddRight),
+        binary_op_program(Opcode::Add),
         0,
         &[obj, smi(1)],
     );
@@ -3915,7 +3959,7 @@ fn to_primitive_calls_getter_accessors() {
         let obj_word = word(&*thread.heap(), obj);
         let r = run_program(
             &mut *thread,
-            binary_op_program(Opcode::AddRight),
+            binary_op_program(Opcode::Add),
             0,
             &[obj_word, smi(1)],
         )
@@ -3997,7 +4041,7 @@ fn value_of_exception_propagates() {
     });
     let r = run_program(
         &mut thread,
-        binary_op_program(Opcode::AddRight),
+        binary_op_program(Opcode::Add),
         0,
         &[obj, smi(1)],
     );

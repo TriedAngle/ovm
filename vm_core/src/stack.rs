@@ -68,7 +68,7 @@ fn offset_slot(base: usize, offset: isize) -> usize {
 ///
 /// Frames are self-describing: the currently executing frame's dispatch
 /// state lives in the [`StackCache`](StackCache), and a call writes the
-/// caller's suspended state into the callee's header
+/// caller's suspended state into the callee's header, so no parallel frame list exists.
 pub struct Stack {
     slots: Box<[Register]>,
     top: Cell<usize>,
@@ -166,7 +166,7 @@ impl Stack {
             .value() as usize
     }
 
-    /// The operand is the anchor-relative slot offset 
+    /// The operand is the anchor-relative slot offset
     fn reg_index(meta: &FrameMeta, operand: i32) -> usize {
         (meta.base as isize + operand as isize) as usize
     }
@@ -287,6 +287,65 @@ impl Stack {
             context,
             new_target,
             count,
+            caller,
+        ))
+    }
+
+    /// Push a `[[Construct]]` frame: the receiver is *synthesized* (not in
+    /// the caller's registers), so it is seeded at the anchor and the
+    /// contiguous argument range `base-count+1..=base` follows it.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    pub fn push_construct_frame(
+        &self,
+        heap: &Heap,
+        caller: FrameMeta,
+        handler_pc: usize,
+        callable: Tagged<'_, Value>,
+        info: Tagged<'_, CallableInfoObject>,
+        register_count: usize,
+        context: Tagged<'_, Value>,
+        src_reg_base: i32,
+        count: usize,
+        new_target: Tagged<'_, Value>,
+        receiver: Tagged<'_, Value>,
+        formal_min: usize,
+    ) -> Result<FrameMeta, VmError> {
+        let total = count + 1;
+        let padded = total.max(formal_min);
+        let anchor = self.reserve(heap, register_count, padded)?;
+        self.slot_unchecked(anchor)
+            .as_raw()
+            .store_raw(receiver.raw().to_bits());
+        let src = Self::reg_index(&caller, src_reg_base - count as i32 + 1);
+        debug_assert!(
+            count == 0
+                || self.slots[src..src + count]
+                    .iter()
+                    .all(|r| !r.raw().is_weak_ptr())
+        );
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.slots.as_ptr().add(src) as *const Value,
+                self.slots.as_ptr().add(anchor + 1) as *mut Value,
+                count,
+            );
+        }
+        let undefined = self.undefined.get(heap);
+        for i in total..padded {
+            self.slot_unchecked(anchor + i).store(undefined);
+        }
+        let mut caller = caller;
+        caller.handler_pc = handler_pc;
+        Ok(self.init_frame_header(
+            heap,
+            anchor,
+            register_count,
+            callable,
+            info,
+            context,
+            new_target,
+            total,
             caller,
         ))
     }

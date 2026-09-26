@@ -533,7 +533,7 @@ impl VM {
         let undefined = heap.known().undefined.raw();
         let state = Arc::new(ContextState {
             handles: HandleData::new(the_hole),
-            stack: Stack::new(STACK_SLOTS, the_hole, undefined),
+            stack: Stack::new(STACK_SLOTS, undefined, undefined),
             cache: StackCache::new(the_hole),
             pending_exception: unsafe { Register::from_value(the_hole) },
             has_pending_exception: Cell::new(false),

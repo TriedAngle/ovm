@@ -1,7 +1,6 @@
 use crate::{
     Acc, AccessorPair, DenseString, FeedbackVector, FixedArray, Handle, HandleScope, Heap, Map,
-    MaybeWeak, Object, ObjectKind, SlotName, Smi, Tagged, Value, WeakFixedArray,
-    WeakFixedArrayInit,
+    MaybeWeak, Object, SlotName, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
