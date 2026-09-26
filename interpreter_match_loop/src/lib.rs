@@ -356,6 +356,62 @@ impl Slow {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn add<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        meta: FrameMeta,
+        acc: &Acc<'_>,
+        lhs_reg: Option<i32>,
+        rhs_reg: i32,
+        dst: Option<i32>,
+    ) -> Step<'a> {
+        let stack = &state.stack();
+        state.handle_scope(|scope| {
+            let lhs = scope.handle(match lhs_reg {
+                None => acc.get(heap),
+                Some(r) => stack.reg(heap, &meta, r),
+            });
+            let lhs = match step_try!(Object::to_primitive(vm, heap, state, lhs, Hint::Default)) {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => scope.handle(v),
+            };
+            let rhs = scope.handle(stack.reg(heap, &meta, rhs_reg));
+            let rhs = match step_try!(Object::to_primitive(vm, heap, state, rhs, Hint::Default)) {
+                Coercion::Threw => return Step::PendingThrow,
+                Coercion::Value(v) => scope.handle(v),
+            };
+            let is_string = (
+                lhs.as_tagged(heap).get_as::<DenseString>().is_some(),
+                rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
+            );
+            let v = if is_string.0 || is_string.1 {
+                let a = scope.handle(step_try!(Convert::to_string(heap, &scope, lhs)));
+                let b = scope.handle(step_try!(Convert::to_string(heap, &scope, rhs)));
+                DenseString::concat(heap, &scope, a, b)
+                    .as_tagged(heap)
+                    .erase()
+            } else {
+                let a = step_try!(Convert::to_number(heap, lhs.as_tagged(heap)));
+                let b = step_try!(Convert::to_number(heap, rhs.as_tagged(heap)));
+                // IEEE `-0 + -0` yields +0; the spec demands -0
+                let r = a + b;
+                let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative() {
+                    -0.0
+                } else {
+                    r
+                };
+                heap.new_number(r)
+            };
+            if let Some(dst) = dst {
+                stack.set_reg(&meta, dst, v);
+            }
+            acc.store(v);
+            Step::Next
+        })
+    }
+
     /// Shared cold body of the loose compares: to_primitive, then the
     /// full `Compare` implementation. `Threw` means a coercion threw (the
     /// pending exception is set).
@@ -1375,6 +1431,19 @@ fn step<'a>(
             }
             Slow::keyed_load(vm, heap, state, stack, cache, meta, pc, ops.reg(0), &acc)
         }
+        Opcode::LoadKeyedPropertyReg => {
+            let key_reg = ops.reg(1);
+            if let Some(idx) = Smi::decode(stack.reg(heap, &meta, key_reg).raw())
+                && idx.value() >= 0
+                && let Some(recv) = stack.reg(heap, &meta, ops.reg(0)).as_heap_object()
+                && let Some(v) = recv.as_ref().element_value(heap, idx.value() as usize)
+            {
+                acc.store(v);
+                return Step::Next;
+            }
+            acc.store(stack.reg(heap, &meta, key_reg));
+            Slow::keyed_load(vm, heap, state, stack, cache, meta, pc, ops.reg(0), &acc)
+        }
         Opcode::LoadNewTarget => {
             acc.store(stack.new_target_slot(&meta).get(heap));
             Step::Next
@@ -2099,42 +2168,41 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
-            state.handle_scope(|scope| {
-                let lhs = scope.handle(acc.get(heap));
-                let lhs = match step_try!(Object::to_primitive(vm, heap, state, lhs, Hint::Default))
-                {
-                    Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
-                };
-                let rhs = scope.handle(stack.reg(heap, &meta, other_reg));
-                let rhs = match step_try!(Object::to_primitive(vm, heap, state, rhs, Hint::Default))
-                {
-                    Coercion::Threw => return Step::PendingThrow,
-                    Coercion::Value(v) => scope.handle(v),
-                };
-                let is_string = (
-                    lhs.as_tagged(heap).get_as::<DenseString>().is_some(),
-                    rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
-                );
-                if is_string.0 || is_string.1 {
-                    let a = scope.handle(step_try!(Convert::to_string(heap, &scope, lhs)));
-                    let b = scope.handle(step_try!(Convert::to_string(heap, &scope, rhs)));
-                    let s = DenseString::concat(heap, &scope, a, b).as_tagged(heap);
-                    acc.store(s);
+            Slow::add(vm, heap, state, meta, &acc, None, other_reg, None)
+        }
+        Opcode::AddLoc | Opcode::SubLoc => {
+            let dst = ops.reg(0);
+            let src = ops.reg(1);
+            let lhs = stack.reg(heap, &meta, dst);
+            let rhs = stack.reg(heap, &meta, src);
+            if let (Some(a), Some(b)) = (lhs.smi_bits(), rhs.smi_bits()) {
+                let stepped = if op == Opcode::AddLoc {
+                    a.checked_add(b)
                 } else {
-                    let a = step_try!(Convert::to_number(heap, lhs.as_tagged(heap)));
-                    let b = step_try!(Convert::to_number(heap, rhs.as_tagged(heap)));
-                    // IEEE `-0 + -0` yields +0; the spec demands -0
-                    let r = a + b;
-                    let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative() {
-                        -0.0
-                    } else {
-                        r
-                    };
-                    acc.store(heap.new_number(r));
+                    a.checked_sub(b)
+                };
+                if let Some(r) = stepped {
+                    let v = Tagged::from_smi_bits(r);
+                    stack.set_reg(&meta, dst, v);
+                    acc.store(v);
+                    return Step::Next;
                 }
-                Step::Next
-            })
+            }
+            if op == Opcode::AddLoc {
+                Slow::add(vm, heap, state, meta, &acc, Some(dst), src, Some(dst))
+            } else {
+                state.handle_scope(|scope| -> Step<'_> {
+                    let a = scope.handle(stack.reg(heap, &meta, dst));
+                    let b = scope.handle(stack.reg(heap, &meta, src));
+                    let v = step_try!(Object::numeric_op(vm, heap, state, a, b, |a, b| a - b));
+                    let Some(v) = v else {
+                        return Step::PendingThrow;
+                    };
+                    stack.set_reg(&meta, dst, v);
+                    acc.store(v);
+                    Step::Next
+                })
+            }
         }
         Opcode::Sub => {
             let other = stack.reg(heap, &meta, ops.reg(0));

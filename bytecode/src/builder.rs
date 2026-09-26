@@ -625,6 +625,14 @@ impl FnBuilder {
         self.emit_tracked(Opcode::LoadKeyedProperty, &[obj.operand(), fb.0]);
     }
 
+    /// Keyed read with the key already in a register.
+    pub fn load_keyed_property_reg(&mut self, obj: Reg, key: Reg, fb: Feedback) {
+        self.emit_tracked(
+            Opcode::LoadKeyedPropertyReg,
+            &[obj.operand(), key.operand(), fb.0],
+        );
+    }
+
     acc_void!(load_new_target, LoadNewTarget);
     acc_void!(load_current_closure, LoadCurrentClosure);
     acc_void!(load_context, LoadContext);
@@ -814,6 +822,16 @@ impl FnBuilder {
     acc_reg_op!(shift_left, ShiftLeft);
     acc_reg_op!(shift_right, ShiftRight);
     acc_reg_op!(shift_right_logical, ShiftRightLogical);
+
+    /// `dst = dst + src` in place; acc = the result.
+    pub fn add_loc(&mut self, dst: Reg, src: Reg) {
+        self.emit_tracked(Opcode::AddLoc, &[dst.operand(), src.operand()]);
+    }
+
+    /// `dst = dst - src` in place; acc = the result.
+    pub fn sub_loc(&mut self, dst: Reg, src: Reg) {
+        self.emit_tracked(Opcode::SubLoc, &[dst.operand(), src.operand()]);
+    }
 
     // -- tests and comparisons: acc = acc op reg -----------------------------------
 

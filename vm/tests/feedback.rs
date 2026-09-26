@@ -23,6 +23,7 @@ fn feedback_sites(code: &[u8]) -> Vec<(Opcode, usize)> {
         let slot = match op {
             Opcode::LoadNamedProperty
             | Opcode::LoadKeyedProperty
+            | Opcode::LoadKeyedPropertyReg
             | Opcode::StoreNamedProperty
             | Opcode::StoreNamedPropertyNoShadow
             | Opcode::StoreKeyedProperty

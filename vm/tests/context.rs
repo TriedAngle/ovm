@@ -125,6 +125,7 @@ fn closure_object_carries_typed_context() {
                 context.as_tagged(heap).erase(),
             ])
         };
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let obj = thread
             .heap()
             .allocate_object(
@@ -132,7 +133,7 @@ fn closure_object_carries_typed_context() {
                 ObjectSlotsInit {
                     map,
                     values,
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )

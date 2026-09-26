@@ -348,7 +348,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let the_hole = roots.create_handle(heap.allocate::<Object>(ObjectInit {
         map: the_hole_map,
         slots: unsafe { smi_handle::<FixedArray>(roots) },
-        elements: unsafe { smi_handle::<Value>(roots) },
+        elements: unsafe { smi_handle::<FixedArray>(roots) },
         length: 0,
     }));
 
@@ -361,7 +361,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let null = roots.create_handle(heap.allocate::<Object>(ObjectInit {
         map: null_map,
         slots: unsafe { smi_handle::<FixedArray>(roots) },
-        elements: unsafe { smi_handle::<Value>(roots) },
+        elements: unsafe { smi_handle::<FixedArray>(roots) },
         length: 0,
     }));
 
@@ -640,7 +640,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     o.elements.set(
         heap,
         null.as_tagged(heap).erase(),
-        known.empty_fixed_array.as_tagged(heap).erase(),
+        known.empty_fixed_array.as_tagged(heap),
     );
     // ordinary function objects' [[Prototype]] is %Function.prototype%
     // (ES 19.2.3.1): function_map was created with a null placeholder

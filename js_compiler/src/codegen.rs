@@ -1269,8 +1269,20 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
     fn simple_identifier_register(&mut self, ident: &IdentifierReference<'_>) -> Option<Reg> {
         match self.identifier_resolution(ident).ok()? {
-            IdRes::Slot(Slot::Param { index, hole_check: false }, 0) => Some(self.b.param(index)),
-            IdRes::Slot(Slot::Local { reg, hole_check: false }, 0) => Some(Reg::new(reg as i32)),
+            IdRes::Slot(
+                Slot::Param {
+                    index,
+                    hole_check: false,
+                },
+                0,
+            ) => Some(self.b.param(index)),
+            IdRes::Slot(
+                Slot::Local {
+                    reg,
+                    hole_check: false,
+                },
+                0,
+            ) => Some(Reg::new(reg as i32)),
             _ => None,
         }
     }
@@ -1340,6 +1352,24 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     ) -> Result<(), CompileError> {
         match target {
             AssignmentTarget::AssignmentTargetIdentifier(i) => {
+                if let Some(dst) = self.simple_identifier_register(i)
+                    && let Expression::BinaryExpression(b) = value
+                    && matches!(
+                        b.operator,
+                        BinaryOperator::Addition | BinaryOperator::Subtraction
+                    )
+                    && let Expression::Identifier(lhs) = &b.left
+                    && self.simple_identifier_register(lhs).map(|r| r.operand())
+                        == Some(dst.operand())
+                    && let Some(src) = self.simple_register(&b.right)
+                {
+                    if b.operator == BinaryOperator::Addition {
+                        self.b.add_loc(dst, src);
+                    } else {
+                        self.b.sub_loc(dst, src);
+                    }
+                    return Ok(());
+                }
                 self.expr(value)?;
                 if self.is_anon_function(value) {
                     self.emit_set_name_const(i.name.as_bytes());
@@ -1377,6 +1407,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     ) -> Result<(), CompileError> {
         match target {
             AssignmentTarget::AssignmentTargetIdentifier(i) => {
+                if let (Some(dst), Some(src)) = (
+                    self.simple_identifier_register(i),
+                    self.simple_register(value),
+                ) {
+                    match op {
+                        Opcode::Add => {
+                            self.b.add_loc(dst, src);
+                            return Ok(());
+                        }
+                        Opcode::Sub => {
+                            self.b.sub_loc(dst, src);
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
                 self.expr(value)?;
                 let v = self.b.stage_acc();
                 self.emit_identifier(i)?;
@@ -1576,7 +1622,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     self.b.store(Reg::new(w.index() + 1));
                     self.b.load(Reg::new(base.index() + excluded as i32 + 1));
                     self.b.store(w);
-                    self.b.call_runtime(RuntimeFn::CopyDataProperties, RegList::new(w, count));
+                    self.b
+                        .call_runtime(RuntimeFn::CopyDataProperties, RegList::new(w, count));
                     self.b.drop_temps(mark2);
                     self.b.store(rest_obj);
                     self.emit_pattern_leaf(*target, rest_obj, binding)?;
@@ -1984,8 +2031,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             StoreTarget::Keyed { obj, key } => {
                 let feedback = self.b.new_feedback();
-                self.b.load(*key);
-                self.b.load_keyed_property(*obj, feedback);
+                self.b.load_keyed_property_reg(*obj, *key, feedback);
             }
             StoreTarget::PrivateKeyed { obj, key } => {
                 // (obj, key): obj rides the top slot — restaged into a
@@ -2144,11 +2190,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 Ok(())
             }
             MemberRef::Computed(c) => {
+                let feedback = self.b.new_feedback();
+                if let (Some(obj), Some(key)) = (
+                    self.simple_register(&c.object),
+                    self.simple_register(&c.expression),
+                ) {
+                    self.b.load_keyed_property_reg(obj, key, feedback);
+                    return Ok(());
+                }
                 self.expr(&c.object)?;
                 let obj = self.b.stage_acc();
-                self.expr(&c.expression)?;
-                let feedback = self.b.new_feedback();
-                self.b.load_keyed_property(obj, feedback);
+                if let Some(key) = self.simple_register(&c.expression) {
+                    self.b.load_keyed_property_reg(obj, key, feedback);
+                } else {
+                    self.expr(&c.expression)?;
+                    self.b.load_keyed_property(obj, feedback);
+                }
                 self.b.drop_temp();
                 Ok(())
             }

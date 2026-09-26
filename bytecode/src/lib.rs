@@ -4,8 +4,8 @@ mod program;
 mod validate;
 
 pub use builder::{
-    BuildError, ConstIdx, Feedback, FnBuilder, FunctionMeta, Label, Reg, RegList, REGISTER_FILE_START,
-    RtArg, TryBlock,
+    BuildError, ConstIdx, Feedback, FnBuilder, FunctionMeta, Label, REGISTER_FILE_START, Reg,
+    RegList, RtArg, TryBlock,
 };
 pub use opcodes::Opcode;
 pub use program::{

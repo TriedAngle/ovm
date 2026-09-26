@@ -313,6 +313,45 @@ handlers!(pc, code, regs, acc, ctx;
         become cold_dec_loc(pc, code, regs, acc, ctx)
     }
 
+    AddLoc : op_add_loc_n / op_add_loc_w (dst => signed, src => signed) {
+        let lhs = reg!(dst);
+        let rhs = reg!(src);
+        if let (Some(a), Some(b)) = (lhs.smi_bits(), rhs.smi_bits())
+            && let Some(sum) = a.checked_add(b)
+        {
+            let v = Tagged::from_smi_bits(sum);
+            set_reg!(dst, v);
+            next!(v)
+        }
+        become cold_add_loc(pc, code, regs, acc, ctx)
+    }
+
+    SubLoc : op_sub_loc_n / op_sub_loc_w (dst => signed, src => signed) {
+        let lhs = reg!(dst);
+        let rhs = reg!(src);
+        if let (Some(a), Some(b)) = (lhs.smi_bits(), rhs.smi_bits())
+            && let Some(diff) = a.checked_sub(b)
+        {
+            let v = Tagged::from_smi_bits(diff);
+            set_reg!(dst, v);
+            next!(v)
+        }
+        become cold_sub_loc(pc, code, regs, acc, ctx)
+    }
+
+    LoadKeyedPropertyReg : op_load_keyed_reg_n / op_load_keyed_reg_w (recv => signed, key => signed, _fb => unsigned) {
+        let recv = reg!(recv);
+        let key = reg!(key);
+        if let Some(idx) = key.to_i64()
+            && idx >= 0
+            && let Some(obj) = recv.as_heap_object()
+            && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx as usize)
+        {
+            next!(v)
+        }
+        become cold_keyed_load_reg(pc, code, regs, acc, ctx)
+    }
+
     Sub : op_sub_n / op_sub_w (r => signed) {
         let other = reg!(r);
         if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits())
@@ -1522,6 +1561,74 @@ unsafe extern "rust-preserve-none" fn cold_dec_loc<'a>(
     become resume(next, code, regs, v, ctx)
 }
 
+unsafe fn loc_op_cold<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    ctx: &Ctx<'a>,
+    sub: bool,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let dst = signed::read(pc, code, base, stride);
+    let src = signed::read(pc, code, base + stride, stride);
+    let lhs = reg_read(regs, ctx.heap(), dst);
+    let rhs = reg_read(regs, ctx.heap(), src);
+    let v = if sub {
+        numeric_cold(ctx, lhs, rhs, |a, b| a - b)?
+    } else {
+        add_cold(ctx, lhs, rhs)?
+    };
+    if !ctx.is_throw(v) {
+        reg_write(regs, dst, v);
+    }
+    Ok(v)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_add_loc<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let v = loc_op_cold(pc, code, regs, ctx, false)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_sub_loc<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let v = loc_op_cold(pc, code, regs, ctx, true)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
+    let v = keyed_load_cold(ctx, recv, key)?;
+    become resume(next, code, regs, v, ctx)
+}
+
 #[cold]
 #[inline(never)]
 unsafe extern "rust-preserve-none" fn cold_equal<'a>(
@@ -1768,6 +1875,9 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::Add as usize] = op_add_n as Handler;
     t[Opcode::IncLoc as usize] = op_inc_loc_n as Handler;
     t[Opcode::DecLoc as usize] = op_dec_loc_n as Handler;
+    t[Opcode::AddLoc as usize] = op_add_loc_n as Handler;
+    t[Opcode::SubLoc as usize] = op_sub_loc_n as Handler;
+    t[Opcode::LoadKeyedPropertyReg as usize] = op_load_keyed_reg_n as Handler;
     t[Opcode::Sub as usize] = op_sub_n as Handler;
     t[Opcode::Mul as usize] = op_mul_n as Handler;
     t[Opcode::Div as usize] = op_div_n as Handler;
@@ -1814,6 +1924,9 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::Add as usize] = op_add_w as Handler;
     t[Opcode::IncLoc as usize] = op_inc_loc_w as Handler;
     t[Opcode::DecLoc as usize] = op_dec_loc_w as Handler;
+    t[Opcode::AddLoc as usize] = op_add_loc_w as Handler;
+    t[Opcode::SubLoc as usize] = op_sub_loc_w as Handler;
+    t[Opcode::LoadKeyedPropertyReg as usize] = op_load_keyed_reg_w as Handler;
     t[Opcode::Sub as usize] = op_sub_w as Handler;
     t[Opcode::Mul as usize] = op_mul_w as Handler;
     t[Opcode::Div as usize] = op_div_w as Handler;

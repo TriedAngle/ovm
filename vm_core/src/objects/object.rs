@@ -11,7 +11,7 @@ use crate::{
 pub struct Object {
     pub header: Header,
     pub slots: GcSlot<FixedArray>,
-    pub elements: GcSlot,
+    pub elements: GcSlot<FixedArray>,
     pub length: GcSlot<Smi>,
 }
 
@@ -51,7 +51,7 @@ impl Object {
     }
 
     pub fn is_array<'a>(&'a self, heap: &'a Heap) -> bool {
-        self.header.map.get(heap).kind().kind() == ObjectKind::Array
+        self.header.map.get(heap).kind().is_array()
     }
 
     /// The JSArray `length` internal slot, when `self` is an array named
@@ -91,7 +91,8 @@ impl Object {
     }
 
     pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, FixedArray>> {
-        self.elements.get(heap).get_as::<FixedArray>()
+        let elements = self.elements.get(heap);
+        elements.is_strong_ptr().then_some(elements)
     }
 
     /// Fast element read for array objects: `None` if `self` is not an
@@ -190,7 +191,7 @@ impl Object {
             let elements = heap.allocate_handle::<FixedArray>(staged, scope);
             let obj = receiver.as_tagged(heap);
             obj.elements
-                .set(heap, obj.erase(), elements.as_tagged(heap).erase());
+                .set(heap, obj.erase(), elements.as_tagged(heap));
             obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
         } else {
             let obj = receiver.as_tagged(heap);
@@ -232,14 +233,14 @@ impl Object {
 pub struct ObjectInit<'a> {
     pub map: Handle<'a, Map>,
     pub slots: Handle<'a, FixedArray>,
-    pub elements: Handle<'a, Value>,
+    pub elements: Handle<'a, FixedArray>,
     pub length: usize,
 }
 
 pub struct ObjectSlotsInit<'m, 'v> {
     pub map: Handle<'m, Map>,
     pub values: HandleSlice<'v>,
-    pub elements: Handle<'m, Value>,
+    pub elements: Handle<'m, FixedArray>,
     pub length: usize,
 }
 

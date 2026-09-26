@@ -155,6 +155,7 @@ fn callable_info_carries_handler_table() {
                 empty_context.as_tagged(heap).erase(),
             ])
         };
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let obj = thread
             .heap()
             .allocate_object(
@@ -162,7 +163,7 @@ fn callable_info_carries_handler_table() {
                 ObjectSlotsInit {
                     map,
                     values,
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )

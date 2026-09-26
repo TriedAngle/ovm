@@ -1910,7 +1910,7 @@ fn create_rest_parameter<'a>(
                 ObjectSlotsInit {
                     map,
                     values: HandleSlice::EMPTY,
-                    elements: elements.erase(),
+                    elements,
                     length: values.len(),
                 },
             )

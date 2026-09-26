@@ -151,7 +151,8 @@ impl Stack {
 
     /// Read a register under a heap borrow: rooted memory is updated in
     /// place by the GC, so the word is current and valid for `'a`.
-    pub fn reg<'a>(&self, _heap: &'a Heap, meta: &FrameMeta, i: i32) -> Tagged<'a, Value> {        self.slot_unchecked(Self::reg_index(meta, i)).get(_heap)
+    pub fn reg<'a>(&self, _heap: &'a Heap, meta: &FrameMeta, i: i32) -> Tagged<'a, Value> {
+        self.slot_unchecked(Self::reg_index(meta, i)).get(_heap)
     }
 
     pub fn set_reg<'x, T: 'x>(&self, meta: &FrameMeta, i: i32, v: Tagged<'x, T>) {

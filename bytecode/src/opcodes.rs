@@ -333,4 +333,11 @@ define_opcodes! {
     /// *old* value (postfix semantics). Prefix forms follow with a `Load`.
     IncLoc { operands: [Register], acc: writes, writes_reg: 0, indices: [Unchecked] },
     DecLoc { operands: [Register], acc: writes, writes_reg: 0, indices: [Unchecked] },
+
+    /// `regs[dst] = regs[dst] + regs[src]` in place; acc becomes the result.
+    AddLoc { operands: [Register, Register], acc: writes, writes_reg: 0, indices: [Unchecked, Unchecked] },
+    /// `regs[dst] = regs[dst] - regs[src]` in place; acc becomes the result.
+    SubLoc { operands: [Register, Register], acc: writes, writes_reg: 0, indices: [Unchecked, Unchecked] },
+    /// Keyed read with the key in a register: `acc = regs[recv][regs[key]]`.
+    LoadKeyedPropertyReg { operands: [Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },
 }

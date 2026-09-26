@@ -2,10 +2,10 @@
 //! feedback pairs, temp registers, labels with automatic jump widening,
 //! handler ranges, accumulator elision, and validation.
 
-use bytecode::{REGISTER_FILE_START, 
+use bytecode::{
     BuildError, CallableKind, ConstIdx, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode,
-    Operand, Program, Reg, RegList, RtArg, RuntimeFn, ValidationError, try_decode, validate,
-    validate_function,
+    Operand, Program, REGISTER_FILE_START, Reg, RegList, RtArg, RuntimeFn, ValidationError,
+    try_decode, validate, validate_function,
 };
 
 #[derive(Debug, PartialEq)]

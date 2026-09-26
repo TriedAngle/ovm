@@ -568,7 +568,7 @@ impl Heap {
             ObjectSlotsInit {
                 map,
                 values,
-                elements: self.known().empty_fixed_array.erase(),
+                elements: self.known().empty_fixed_array,
                 length: 0,
             },
         )
@@ -603,7 +603,7 @@ impl Heap {
             ObjectSlotsInit {
                 map: self.known().js_array_map,
                 values: HandleSlice::EMPTY,
-                elements: elements.erase(),
+                elements,
                 length: values.len(),
             },
         )

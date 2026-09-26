@@ -16,7 +16,9 @@ fn run(src: &str) -> Result<Value, vm::ScriptError> {
 
 fn run_smi(src: &str) -> i64 {
     let v = run(src).unwrap();
-    Smi::decode(v).unwrap_or_else(|| panic!("not a smi: {v:?}")).value()
+    Smi::decode(v)
+        .unwrap_or_else(|| panic!("not a smi: {v:?}"))
+        .value()
 }
 
 fn run_str(src: &str) -> String {

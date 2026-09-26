@@ -224,6 +224,7 @@ impl EdgeVisitable for Map {
 /// RUNTIME is only valid together with CALLABLE and means slots[0] of the
 /// object is a Smi runtime registry index instead of a `CallableInfoObject`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct MapKind(u64);
 
 impl MapKind {
@@ -308,6 +309,10 @@ impl MapKind {
 
     pub const fn is_extendable(self) -> bool {
         self.0 & Self::EXTENDABLE.0 != 0
+    }
+
+    pub const fn is_array(self) -> bool {
+        self.0 & Self::KIND_MASK == ObjectKind::Array as u64
     }
 
     pub const fn is_callable(self) -> bool {

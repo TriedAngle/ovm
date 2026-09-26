@@ -48,6 +48,7 @@ fn callable(
             empty_context.as_tagged(heap).erase(),
         ])
     };
+    let empty_fixed_array = thread.heap().known().empty_fixed_array;
     thread
         .heap()
         .allocate_object(
@@ -55,7 +56,7 @@ fn callable(
             ObjectSlotsInit {
                 map,
                 values,
-                elements: the_hole.erase(),
+                elements: empty_fixed_array,
                 length: 0,
             },
         )

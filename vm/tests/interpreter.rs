@@ -113,6 +113,7 @@ fn callable_object<'s>(
             &[word(heap, info), word(heap, empty_context.erase())],
         )
     };
+    let empty_fixed_array = thread.heap().known().empty_fixed_array;
     thread
         .heap()
         .allocate_object(
@@ -120,7 +121,7 @@ fn callable_object<'s>(
             ObjectSlotsInit {
                 map,
                 values,
-                elements: the_hole.erase(),
+                elements: empty_fixed_array,
                 length: 0,
             },
         )
@@ -293,7 +294,11 @@ fn call_runtime_passes_receiver_and_args() {
     emit(&mut program, Opcode::Store, &[reg_op(1)]);
     emit(&mut program, Opcode::LoadSmi, &[7]);
     emit(&mut program, Opcode::Store, &[reg_op(0)]);
-    emit(&mut program, Opcode::CallRuntime, &[add.0 as u32, reg_op(0), 3]);
+    emit(
+        &mut program,
+        Opcode::CallRuntime,
+        &[add.0 as u32, reg_op(0), 3],
+    );
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 3, &[]);
@@ -398,7 +403,11 @@ fn call_resolves_callable_object_and_pushes_frames() {
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
-        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
+        emit(
+            &mut program,
+            Opcode::CallNoFeedback,
+            &[reg_op(0), reg_op(0), 1],
+        );
         emit(&mut program, Opcode::Return, &[]);
         let bytecode = thread
             .heap()
@@ -433,7 +442,11 @@ fn array_literal_built_with_manual_stores() {
         emit(&mut program, Opcode::LoadSmi, &[key as u32]);
         emit(&mut program, Opcode::Store, &[reg_op(4)]);
         emit(&mut program, Opcode::LoadSmi, &[value as u32]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
+        emit(
+            &mut program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(3), reg_op(4), 0],
+        );
     }
     emit(&mut program, Opcode::Load, &[reg_op(3)]);
     emit(&mut program, Opcode::Return, &[]);
@@ -492,7 +505,11 @@ fn array_literal_with_holes_keeps_length() {
         emit(&mut program, Opcode::LoadSmi, &[key as u32]);
         emit(&mut program, Opcode::Store, &[reg_op(4)]);
         emit(&mut program, Opcode::LoadSmi, &[value as u32]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
+        emit(
+            &mut program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(3), reg_op(4), 0],
+        );
     }
     emit(&mut program, Opcode::Load, &[reg_op(3)]);
     emit(&mut program, Opcode::Return, &[]);
@@ -900,7 +917,11 @@ fn keyed_load_reads_array_element() {
         emit(&mut program, Opcode::LoadSmi, &[key as u32]);
         emit(&mut program, Opcode::Store, &[reg_op(4)]);
         emit(&mut program, Opcode::LoadSmi, &[value as u32]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
+        emit(
+            &mut program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(3), reg_op(4), 0],
+        );
     }
     emit(&mut program, Opcode::LoadSmi, &[1]);
     emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(3), 0]);
@@ -922,9 +943,17 @@ fn keyed_store_writes_array_element() {
     emit(&mut program, Opcode::LoadSmi, &[0]);
     emit(&mut program, Opcode::Store, &[reg_op(4)]);
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
+    emit(
+        &mut program,
+        Opcode::StoreKeyedPropertyNoShadow,
+        &[reg_op(3), reg_op(4), 0],
+    );
     emit(&mut program, Opcode::LoadSmi, &[99]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(3), reg_op(4), 0]);
+    emit(
+        &mut program,
+        Opcode::StoreKeyedPropertyNoShadow,
+        &[reg_op(3), reg_op(4), 0],
+    );
     emit(&mut program, Opcode::LoadSmi, &[0]);
     emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(3), 0]);
     emit(&mut program, Opcode::Return, &[]);
@@ -947,7 +976,11 @@ fn keyed_load_out_of_bounds_yields_undefined() {
         emit(&mut program, Opcode::LoadSmi, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(2)]);
         emit(&mut program, Opcode::LoadSmi, &[1]);
-        emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
+        emit(
+            &mut program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(1), reg_op(2), 0],
+        );
         emit(&mut program, Opcode::LoadSmi, &[key]);
         emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(1), 0]);
         emit(&mut program, Opcode::Return, &[]);
@@ -969,11 +1002,19 @@ fn keyed_store_grows_array_and_fills_holes() {
     emit(&mut program, Opcode::LoadSmi, &[0]);
     emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
+    emit(
+        &mut program,
+        Opcode::StoreKeyedPropertyNoShadow,
+        &[reg_op(1), reg_op(2), 0],
+    );
     emit(&mut program, Opcode::LoadSmi, &[3]);
     emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
+    emit(
+        &mut program,
+        Opcode::StoreKeyedPropertyNoShadow,
+        &[reg_op(1), reg_op(2), 0],
+    );
     emit(&mut program, Opcode::LoadSmi, &[3]);
     emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(1), 0]);
     emit(&mut program, Opcode::Return, &[]);
@@ -988,11 +1029,19 @@ fn keyed_store_grows_array_and_fills_holes() {
     emit(&mut program, Opcode::LoadSmi, &[0]);
     emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[1]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
+    emit(
+        &mut program,
+        Opcode::StoreKeyedPropertyNoShadow,
+        &[reg_op(1), reg_op(2), 0],
+    );
     emit(&mut program, Opcode::LoadSmi, &[3]);
     emit(&mut program, Opcode::Store, &[reg_op(2)]);
     emit(&mut program, Opcode::LoadSmi, &[42]);
-    emit(&mut program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(1), reg_op(2), 0]);
+    emit(
+        &mut program,
+        Opcode::StoreKeyedPropertyNoShadow,
+        &[reg_op(1), reg_op(2), 0],
+    );
     emit(&mut program, Opcode::LoadSmi, &[1]);
     emit(&mut program, Opcode::LoadKeyedProperty, &[reg_op(1), 0]);
     emit(&mut program, Opcode::Return, &[]);
@@ -1011,7 +1060,11 @@ fn keyed_store_creates_numeric_property_on_plain_object() {
         emit(program, Opcode::LoadSmi, &[0]);
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
+        emit(
+            program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(2), reg_op(3), 0],
+        );
         emit(program, Opcode::LoadSmi, &[0]);
         emit(program, Opcode::LoadKeyedProperty, &[reg_op(2), 0]);
     });
@@ -1078,7 +1131,11 @@ fn keyed_store_writes_named_property_via_string_key() {
         emit(program, Opcode::LoadConstant, &[0]);
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
+        emit(
+            program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(2), reg_op(3), 0],
+        );
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 0, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
@@ -1110,6 +1167,7 @@ fn transition_object_program(
             },
             &scope,
         );
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let obj = thread
             .heap()
             .allocate_object(
@@ -1117,7 +1175,7 @@ fn transition_object_program(
                 ObjectSlotsInit {
                     map,
                     values: stage_values(&scope, &[smi(7)]),
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )
@@ -1162,7 +1220,11 @@ fn named_store_new_property_transitions() {
     // r2.z = 42 (transition); acc = r2.x + r2.z
     let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 2, 0]);
+        emit(
+            program,
+            Opcode::StoreNamedPropertyNoShadow,
+            &[reg_op(2), 2, 0],
+        );
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
@@ -1182,9 +1244,17 @@ fn named_store_chained_transitions() {
     // acc = r2.x + r2.z + r2.w
     let result = transition_object_program(&mut thread, EXTENDABLE, WRITABLE_VALUE, |program| {
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 2, 0]);
+        emit(
+            program,
+            Opcode::StoreNamedPropertyNoShadow,
+            &[reg_op(2), 2, 0],
+        );
         emit(program, Opcode::LoadSmi, &[1]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 3, 0]);
+        emit(
+            program,
+            Opcode::StoreNamedPropertyNoShadow,
+            &[reg_op(2), 3, 0],
+        );
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 1, 0]);
@@ -1209,7 +1279,11 @@ fn keyed_store_new_property_via_string_key_transitions() {
         emit(program, Opcode::LoadConstant, &[2]);
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
+        emit(
+            program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(2), reg_op(3), 0],
+        );
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
@@ -1226,7 +1300,11 @@ fn named_store_new_property_to_non_extensible_is_ignored() {
     let result =
         transition_object_program(&mut thread, MapKind::OBJECT, WRITABLE_VALUE, |program| {
             emit(program, Opcode::LoadSmi, &[42]);
-            emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 2, 0]);
+            emit(
+                program,
+                Opcode::StoreNamedPropertyNoShadow,
+                &[reg_op(2), 2, 0],
+            );
         });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 42);
 }
@@ -1239,7 +1317,11 @@ fn named_store_to_non_writable_fails() {
     // x is a non-writable value slot
     let result = transition_object_program(&mut thread, EXTENDABLE, SlotFlags::VALUE, |program| {
         emit(program, Opcode::LoadSmi, &[42]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 1, 0]);
+        emit(
+            program,
+            Opcode::StoreNamedPropertyNoShadow,
+            &[reg_op(2), 1, 0],
+        );
     });
     expect_escaped(&mut thread, result, "TypeError");
 }
@@ -1263,6 +1345,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
             },
             &scope,
         );
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let parent = thread
             .heap()
             .allocate_object(
@@ -1270,7 +1353,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 ObjectSlotsInit {
                     map: parent_map,
                     values: stage_values(&scope, &[Smi::new(1).encode()]),
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )
@@ -1291,6 +1374,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
             },
             &scope,
         );
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let child = thread
             .heap()
             .allocate_object(
@@ -1298,7 +1382,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
                 ObjectSlotsInit {
                     map: child_map,
                     values: HandleSlice::EMPTY,
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )
@@ -1472,6 +1556,7 @@ fn jump_if_truthy_follows_toboolean() {
                 },
                 &scope,
             );
+            let empty_fixed_array = thread.heap().known().empty_fixed_array;
             let obj = thread
                 .heap()
                 .allocate_object(
@@ -1479,7 +1564,7 @@ fn jump_if_truthy_follows_toboolean() {
                     ObjectSlotsInit {
                         map,
                         values: HandleSlice::EMPTY,
-                        elements: the_hole.erase(),
+                        elements: empty_fixed_array,
                         length: 0,
                     },
                 )
@@ -1633,6 +1718,7 @@ fn accessor_object_program(
             },
             &scope,
         );
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let obj = thread
             .heap()
             .allocate_object(
@@ -1640,7 +1726,7 @@ fn accessor_object_program(
                 ObjectSlotsInit {
                     map,
                     values: stage_values(&scope, &[smi(7)]),
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )
@@ -1695,7 +1781,11 @@ fn named_store_calls_setter_with_receiver_and_value() {
     // r2.x = 21 (calls the setter, which writes this.y); acc = r2.y
     let result = accessor_object_program(&mut thread, None, Some(&setter_program()), |program| {
         emit(program, Opcode::LoadSmi, &[21]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 1, 0]);
+        emit(
+            program,
+            Opcode::StoreNamedPropertyNoShadow,
+            &[reg_op(2), 1, 0],
+        );
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 21);
@@ -1721,7 +1811,11 @@ fn named_store_without_setter_is_ignored() {
     // r2.x = 21 is ignored (no setter); y keeps its initial value 7
     let result = accessor_object_program(&mut thread, None, None, |program| {
         emit(program, Opcode::LoadSmi, &[21]);
-        emit(program, Opcode::StoreNamedPropertyNoShadow, &[reg_op(2), 1, 0]);
+        emit(
+            program,
+            Opcode::StoreNamedPropertyNoShadow,
+            &[reg_op(2), 1, 0],
+        );
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
@@ -1750,7 +1844,11 @@ fn keyed_store_calls_setter() {
         emit(program, Opcode::LoadConstant, &[1]);
         emit(program, Opcode::Store, &[reg_op(3)]);
         emit(program, Opcode::LoadSmi, &[21]);
-        emit(program, Opcode::StoreKeyedPropertyNoShadow, &[reg_op(2), reg_op(3), 0]);
+        emit(
+            program,
+            Opcode::StoreKeyedPropertyNoShadow,
+            &[reg_op(2), reg_op(3), 0],
+        );
         emit(program, Opcode::LoadNamedProperty, &[reg_op(2), 2, 0]);
     });
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 21);
@@ -1793,6 +1891,7 @@ fn store_new_accessor_property_defines_own_accessor() {
             },
             &scope,
         );
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let obj = thread
             .heap()
             .allocate_object(
@@ -1800,7 +1899,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 ObjectSlotsInit {
                     map,
                     values: stage_values(&scope, &[smi(7)]),
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )
@@ -1896,6 +1995,7 @@ fn runtime_function<'s>(
         },
         scope,
     );
+    let empty_fixed_array = thread.heap().known().empty_fixed_array;
     thread
         .heap()
         .allocate_object(
@@ -1903,7 +2003,7 @@ fn runtime_function<'s>(
             ObjectSlotsInit {
                 map,
                 values: stage_values(scope, &[Smi::new(idx.0 as i64).encode()]),
-                elements: the_hole.erase(),
+                elements: empty_fixed_array,
                 length: 0,
             },
         )
@@ -1936,12 +2036,13 @@ fn bytecode_fn<'a>(
         scope,
         &[word(&*heap, info), word(&*heap, empty_context.erase())],
     );
+    let empty_fixed_array = heap.known().empty_fixed_array;
     heap.allocate_object(
         scope,
         ObjectSlotsInit {
             map,
             values,
-            elements: the_hole.erase(),
+            elements: empty_fixed_array,
             length: 0,
         },
     )
@@ -1984,7 +2085,11 @@ fn call_dispatches_to_runtime_function_object() {
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
-        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
+        emit(
+            &mut program,
+            Opcode::CallNoFeedback,
+            &[reg_op(0), reg_op(0), 1],
+        );
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -2027,7 +2132,11 @@ fn run_failing_inner<'a>(
         let mut program = Vec::new();
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
-        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
+        emit(
+            &mut program,
+            Opcode::CallNoFeedback,
+            &[reg_op(0), reg_op(0), 1],
+        );
         emit(&mut program, Opcode::Return, &[]);
         let caller = scope.handle(bytecode_fn(
             heap,
@@ -2062,7 +2171,11 @@ fn inner_run_error_unwinds_and_runtime_recovers() {
     let mut program = Vec::new();
     emit(&mut program, Opcode::LoadSmi, &[0]);
     emit(&mut program, Opcode::Store, &[reg_op(0)]);
-    emit(&mut program, Opcode::CallRuntime, &[idx.0 as u32, reg_op(0), 1]);
+    emit(
+        &mut program,
+        Opcode::CallRuntime,
+        &[idx.0 as u32, reg_op(0), 1],
+    );
     emit(&mut program, Opcode::Return, &[]);
 
     let result = run_program(&mut thread, program, 1, &[]);
@@ -2814,7 +2927,11 @@ fn create_closure_inherits_current_context_and_is_callable() {
         let mut program = Vec::new();
         emit(&mut program, Opcode::CreateClosure, &[1]);
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
-        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(1), reg_op(1), 1]);
+        emit(
+            &mut program,
+            Opcode::CallNoFeedback,
+            &[reg_op(1), reg_op(1), 1],
+        );
         emit(&mut program, Opcode::Return, &[]);
         let bytecode = thread
             .heap()
@@ -2863,6 +2980,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
                 &[word(heap, caller_info), word(heap, context.erase())],
             )
         };
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let caller = thread
             .heap()
             .allocate_object(
@@ -2870,7 +2988,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
                 ObjectSlotsInit {
                     map,
                     values,
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )
@@ -2970,7 +3088,11 @@ fn create_closure_function_kind_controls_call_and_construct() {
     emit(&mut call, Opcode::Store, &[reg_op(0)]);
     emit(&mut call, Opcode::LoadConstant, &[1]);
     emit(&mut call, Opcode::Store, &[reg_op(1)]);
-    emit(&mut call, Opcode::CallNoFeedback, &[reg_op(0), reg_op(1), 1]);
+    emit(
+        &mut call,
+        Opcode::CallNoFeedback,
+        &[reg_op(0), reg_op(1), 1],
+    );
     emit(&mut call, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, call, 2, &[], &[method, undefined]).unwrap();
     assert_eq!(result.to_i64().unwrap(), 7);
@@ -2978,7 +3100,11 @@ fn create_closure_function_kind_controls_call_and_construct() {
     let mut construct = Vec::new();
     emit(&mut construct, Opcode::LoadConstant, &[0]);
     emit(&mut construct, Opcode::Store, &[reg_op(0)]);
-    emit(&mut construct, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+    emit(
+        &mut construct,
+        Opcode::Construct,
+        &[reg_op(0), reg_op(0), 0],
+    );
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[method]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -3015,7 +3141,11 @@ fn create_closure_function_kind_controls_call_and_construct() {
     emit(&mut call, Opcode::Store, &[reg_op(0)]);
     emit(&mut call, Opcode::LoadConstant, &[1]);
     emit(&mut call, Opcode::Store, &[reg_op(1)]);
-    emit(&mut call, Opcode::CallNoFeedback, &[reg_op(0), reg_op(1), 1]);
+    emit(
+        &mut call,
+        Opcode::CallNoFeedback,
+        &[reg_op(0), reg_op(1), 1],
+    );
     emit(&mut call, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, call, 2, &[], &[class_constructor, undefined]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -3023,7 +3153,11 @@ fn create_closure_function_kind_controls_call_and_construct() {
     let mut construct = Vec::new();
     emit(&mut construct, Opcode::LoadConstant, &[0]);
     emit(&mut construct, Opcode::Store, &[reg_op(0)]);
-    emit(&mut construct, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+    emit(
+        &mut construct,
+        Opcode::Construct,
+        &[reg_op(0), reg_op(0), 0],
+    );
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[class_constructor]).unwrap();
     assert!(
@@ -3184,7 +3318,11 @@ fn closure_captures_function_context_end_to_end() {
         emit(&mut program, Opcode::PopContext, &[reg_op(1)]); // frame = ctxA
         emit(&mut program, Opcode::CreateClosure, &[1]); // closure ctx = ctxA
         emit(&mut program, Opcode::Store, &[reg_op(2)]);
-        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(2), reg_op(2), 1]);
+        emit(
+            &mut program,
+            Opcode::CallNoFeedback,
+            &[reg_op(2), reg_op(2), 1],
+        );
         emit(&mut program, Opcode::Return, &[]);
 
         let bytecode = thread
@@ -3238,6 +3376,7 @@ fn proto_object<'s>(
         },
         scope,
     );
+    let empty_fixed_array = thread.heap().known().empty_fixed_array;
     thread
         .heap()
         .allocate_object(
@@ -3245,7 +3384,7 @@ fn proto_object<'s>(
             ObjectSlotsInit {
                 map,
                 values: stage_values(scope, &[smi(7)]),
-                elements: the_hole.erase(),
+                elements: empty_fixed_array,
                 length: 0,
             },
         )
@@ -3403,6 +3542,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
             },
             &scope,
         );
+        let empty_fixed_array = thread.heap().known().empty_fixed_array;
         let frozen = thread
             .heap()
             .allocate_object(
@@ -3410,7 +3550,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
                 ObjectSlotsInit {
                     map,
                     values: HandleSlice::EMPTY,
-                    elements: the_hole.erase(),
+                    elements: empty_fixed_array,
                     length: 0,
                 },
             )
@@ -4200,7 +4340,11 @@ fn construct_sets_runtime_construct_flag() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::Load, &[reg_op(0)]);
-        emit(&mut program, Opcode::CallNoFeedback, &[reg_op(0), reg_op(0), 1]);
+        emit(
+            &mut program,
+            Opcode::CallNoFeedback,
+            &[reg_op(0), reg_op(0), 1],
+        );
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);
@@ -4232,6 +4376,7 @@ fn shadow_setup<'s>(
         },
         scope,
     );
+    let empty_fixed_array = thread.heap().known().empty_fixed_array;
     let parent = thread
         .heap()
         .allocate_object(
@@ -4239,7 +4384,7 @@ fn shadow_setup<'s>(
             ObjectSlotsInit {
                 map: parent_map,
                 values: stage_values(scope, &[Smi::new(1).encode()]),
-                elements: the_hole.erase(),
+                elements: empty_fixed_array,
                 length: 0,
             },
         )
@@ -4263,6 +4408,7 @@ fn shadow_setup<'s>(
         },
         scope,
     );
+    let empty_fixed_array = thread.heap().known().empty_fixed_array;
     let child = thread
         .heap()
         .allocate_object(
@@ -4270,7 +4416,7 @@ fn shadow_setup<'s>(
             ObjectSlotsInit {
                 map: child_map,
                 values: HandleSlice::EMPTY,
-                elements: the_hole.erase(),
+                elements: empty_fixed_array,
                 length: 0,
             },
         )
