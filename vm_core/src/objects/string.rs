@@ -179,7 +179,7 @@ impl DenseString {
     }
 
     pub fn len(&self) -> usize {
-        self.length.to_smi().value() as usize
+        self.length.to_smi_unchecked().value() as usize
     }
 
     pub fn is_empty(&self) -> bool {

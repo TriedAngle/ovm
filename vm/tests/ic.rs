@@ -305,7 +305,7 @@ fn five_shapes_go_megamorphic() {
 }
 
 #[test]
-fn prototype_hit_installs_chain_handler() {
+fn prototype_hit_installs_one_hop_handler() {
     let (result, mut thread) = run_value(
         "const p = {x: 1}; const o = {}; Object.setPrototypeOf(o, p);
          function f(r){ return r.x; } f(o); f(o); f;",
@@ -321,14 +321,14 @@ fn prototype_hit_installs_chain_handler() {
     let handler = vector.as_ref().slot(slot + 1).raw();
     let chain = unsafe { Tagged::<Value>::from_value_unchecked(handler) }
         .get_as::<WeakFixedArray>()
-        .expect("chain handler array");
+        .expect("one-hop handler array");
     let heap = thread.heap();
-    // [Smi ChainField, payload, Smi hop(-1), Smi owner(-1), weak map]
-    assert_eq!(chain.as_ref().len(), 5);
+    // [Smi ProtoField|offset, weak holder map, Smi 0]
+    assert_eq!(chain.as_ref().len(), 3);
     let head = decode_handler(chain.as_ref().get(heap, 0).raw()).expect("kind Smi");
-    assert_eq!(head.0, 0, "ChainField kind");
-    // after the chain broke (delete p.x), behavior stays correct — covered
-    // by deleted_prototype_property_disappears
+    assert_eq!(head.0, 6, "ProtoField kind");
+    // after the prototype map changes (delete p.x), behavior stays correct —
+    // covered by deleted_prototype_property_disappears
 }
 
 #[test]

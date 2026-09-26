@@ -112,28 +112,29 @@ impl StackCache {
         self.get().code.raw()
     }
 
+    #[inline]
     pub fn code_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, FixedByteArray> {
         debug_assert!(self.is_active(), "bytecode read from inactive cache");
-        self.get()
-            .code
-            .get(heap)
-            .get_as::<FixedByteArray>()
-            .expect("strong cache slot")
+        // Only `load`/`enter` write this slot, always with the frame's
+        // bytecode: the kind re-check is redundant.
+        unsafe { self.get().code.get(heap).cast() }
     }
 
+    #[inline]
     pub fn constants_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, FixedArray> {
         debug_assert!(self.is_active(), "constants read from inactive cache");
-        self.get()
-            .constants
-            .get(heap)
-            .get_as::<FixedArray>()
-            .expect("strong cache slot")
+        // Only `load`/`enter` write this slot, always the constant pool.
+        unsafe { self.get().constants.get(heap).cast() }
     }
 
     /// The current frame's feedback vector, or `None` for functions without
     /// feedback slots (or while inactive).
+    #[inline]
     pub fn feedback_ref<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, FeedbackVector>> {
-        self.get().feedback.get(heap).get_as::<FeedbackVector>()
+        // Only `load`/`enter`/`deactivate` write this slot: it is always a
+        // `FeedbackVector` or the hole, so the kind re-check is redundant.
+        let word = self.get().feedback.get(heap);
+        (word.raw() != heap.known().the_hole.raw()).then(|| unsafe { word.cast() })
     }
 
     pub fn acc<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {

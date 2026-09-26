@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{Header, Heap, HeapObject, Map, Object, VmError};
+use crate::{Header, Heap, HeapObject, Map, MapKind, Object, VmError};
 
 // imports flattened
 use crate::Handle;
@@ -127,6 +127,20 @@ impl Smi {
     pub const fn decode(v: Value) -> Option<Smi> {
         if v.is_smi() {
             Some(Self((v.to_bits() as i64) >> 1))
+        } else {
+            None
+        }
+    }
+
+    /// The `Smi` for an exactly-representable integer `f`, if any: `-0.0`,
+    /// non-integral, out-of-range, NaN and infinite values are `None`.
+    /// The saturating `as i64` plus the round-trip check makes this
+    /// branch-only — no libm `trunc`/`fract`.
+    #[inline(always)]
+    pub fn from_f64(f: f64) -> Option<Smi> {
+        let r = f as i64;
+        if (r as f64) == f && Self::in_range(r) && !(f == 0.0 && f.is_sign_negative()) {
+            Some(Self(r))
         } else {
             None
         }
@@ -403,8 +417,13 @@ impl<'a> Tagged<'a, Value> {
         let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.raw();
         // Safety: raw header read under the anchor.
         let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
-        let kind = map_ref.kind().kind();
-        if !T::matches_kind(kind) {
+        let kind = map_ref.kind();
+        // exact-kind fast path: one mask + compare, no decode match
+        if kind.bits() & MapKind::KIND_MASK == T::KIND as u64 {
+            // Safety: the map-kind check above is the type witness.
+            return Some(unsafe { Tagged::from_value_unchecked(self.raw) });
+        }
+        if !T::matches_kind(kind.kind()) {
             return None;
         }
         // Safety: the map-kind check above is the type witness; the

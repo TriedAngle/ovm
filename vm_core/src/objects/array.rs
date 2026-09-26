@@ -22,7 +22,7 @@ impl<T: 'static> FixedArray<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.size.to_smi().value() as usize
+        self.size.to_smi_unchecked().value() as usize
     }
 
     pub fn is_empty(&self) -> bool {

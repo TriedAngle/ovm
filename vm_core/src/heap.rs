@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
-    HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MaybeWeak, Object, ObjectInit,
-    ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, Value, Visitor, Word,
+    HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MapKind, MaybeWeak, Object,
+    ObjectInit, ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, Value, Visitor,
+    Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -158,6 +159,16 @@ impl<T> GcSlot<T> {
 impl GcSlot<Smi> {
     pub fn to_smi(&self) -> Smi {
         Smi::decode(self.raw()).expect("GcSlot invariant violated")
+    }
+
+    /// The slot's value without the tag check: a `GcSlot<Smi>` is only ever
+    /// written an encoded Smi (debug-asserted), so hot readers can skip
+    /// `to_smi`'s branch and panic path.
+    #[inline(always)]
+    pub fn to_smi_unchecked(&self) -> Smi {
+        let raw = self.raw();
+        debug_assert!(raw.is_smi(), "GcSlot<Smi> invariant violated");
+        Smi::new((raw.to_bits() as i64) >> 1)
     }
 }
 
@@ -451,6 +462,12 @@ impl EdgeVisitable for () {
 pub struct Heap {
     local: Box<dyn LocalHeap>,
     known: *const KnownCell,
+    /// Bumped whenever an array map gains the holey flag: packed element
+    /// inline caches recorded under an older epoch must re-record.
+    holey_epoch: Cell<u32>,
+    /// True while no object owns an integer-named (non-element) property:
+    /// element misses may then return `undefined` without a chain walk.
+    indexed_props: Cell<bool>,
     #[cfg(feature = "stress-minor-gc")]
     stress_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -464,6 +481,38 @@ impl Heap {
 
     pub fn known(&self) -> &'static WellKnown {
         unsafe { (*self.known).get() }
+    }
+
+    /// The current holey-map epoch (see [`Heap::promote_holey`]).
+    pub fn holey_epoch(&self) -> u32 {
+        self.holey_epoch.get()
+    }
+
+    /// Whether no object owns an integer-named property (see
+    /// [`Heap::invalidate_indexed_props`]).
+    pub fn indexed_props_valid(&self) -> bool {
+        self.indexed_props.get()
+    }
+
+    /// An object acquired an integer-named own property, so an element
+    /// miss can no longer assume the prototype chain lacks the index.
+    pub fn invalidate_indexed_props(&self) {
+        self.indexed_props.set(false);
+    }
+
+    /// Mark an array map holey in place. Conservative for every array
+    /// sharing the map; the epoch bump invalidates packed element caches.
+    pub fn promote_holey(&self, map: Tagged<'_, Map>) {
+        let kind = map.as_ref().kind();
+        if kind.contains(MapKind::HOLEY) {
+            return;
+        }
+        map.as_ref().kind.set(
+            self,
+            map.erase(),
+            Smi::new(kind.union(MapKind::HOLEY).bits() as i64),
+        );
+        self.holey_epoch.set(self.holey_epoch.get().wrapping_add(1));
     }
 
     pub fn set_known(&self, known: WellKnown) {
@@ -578,14 +627,8 @@ impl Heap {
     /// freshly boxed Float otherwise. `-0.0` always boxes (it must not
     /// collapse into `+0`).
     pub fn new_number<'a>(&'a mut self, f: f64) -> Tagged<'a, Value> {
-        let r = f as i64; // saturating cast; the round-trip check rejects out-of-range values
-        if f.is_finite()
-            && f.fract() == 0.0
-            && Smi::in_range(r)
-            && (r as f64) == f
-            && !(f == 0.0 && f.is_sign_negative())
-        {
-            return Smi::new(r).into_tagged();
+        if let Some(s) = Smi::from_f64(f) {
+            return s.into_tagged();
         }
         self.allocate::<Float>(f).erase()
     }
@@ -670,6 +713,8 @@ impl GlobalHeap {
         Heap {
             local: self.shared.new_local(),
             known: known as *const KnownCell,
+            holey_epoch: Cell::new(0),
+            indexed_props: Cell::new(true),
             #[cfg(feature = "stress-minor-gc")]
             stress_armed: std::sync::Arc::clone(&self.stress_armed),
         }

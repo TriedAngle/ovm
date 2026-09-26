@@ -1160,8 +1160,10 @@ fn is_extensible_entry_h<'a>(
 
 impl Proxy {
     /// Fast proxy check: one map-kind read.
-    pub fn is_proxy<'a>(_heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
-        v.get_as::<ProxyObject>().is_some()
+    pub fn is_proxy<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
+        // bit test on the already-loaded map kind, no kind decode/match
+        v.as_heap_object()
+            .is_some_and(|obj| obj.as_ref().header.map.get(heap).kind().is_proxy())
     }
 
     /// Whether `v` is a valid ECMAScript receiver ([[ProxyTarget]] /

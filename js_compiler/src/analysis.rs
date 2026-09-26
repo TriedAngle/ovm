@@ -187,6 +187,10 @@ pub struct Facts<'a> {
     pub ref_depth: HashMap<ReferenceId, u32>,
     /// symbols referenced from a function other than their owner
     pub captured: HashSet<SymbolId>,
+    /// functions whose prologue must push a context: any function that
+    /// contains a nested function (a descendant may capture its slots)
+    /// or runs direct `eval`
+    pub creates_context: HashSet<Fid>,
     /// functions whose receiver / new.target a nested arrow captures
     pub captures_this: HashSet<Fid>,
     pub captures_new_target: HashSet<Fid>,
@@ -289,24 +293,31 @@ impl<'a, 'p> Collector<'a, 'p> {
             for_of_scope: &self.for_of_scope,
             fn_scope_to_fid: &self.fn_scope_to_fid,
             captured: HashSet::new(),
+            creates_context: HashSet::new(),
             captures_this: HashSet::new(),
             captures_new_target: HashSet::new(),
             needs_this_function: HashSet::new(),
             obj_lit_home: HashSet::new(),
             special: HashMap::new(),
             ref_depth: HashMap::new(),
+            repl_root: matches!(self.mode, Mode::Repl),
             fid_node: &self.fid_node,
         };
         d.mark_super_uses();
         d.finalize_class_slots();
         d.patch_object_methods();
-        d.scan_special_nodes();
+        // capture sets (and the context predicate they drive) must be
+        // final before any depth is resolved
+        d.scan_special_owners();
         d.scan_captures();
+        d.creates_context = d.compute_creates_context();
+        d.scan_special_nodes();
         d.compute_reference_depths();
         let Deriver {
             special,
             ref_depth,
             captured,
+            creates_context,
             captures_this,
             captures_new_target,
             needs_this_function,
@@ -383,6 +394,7 @@ impl<'a, 'p> Collector<'a, 'p> {
             special,
             ref_depth,
             captured,
+            creates_context,
             captures_this,
             captures_new_target,
             needs_this_function,
@@ -859,12 +871,15 @@ struct Deriver<'a, 'p, 'f> {
     for_of_scope: &'f HashMap<ScopeId, NodeId>,
     fn_scope_to_fid: &'f HashMap<ScopeId, Fid>,
     captured: HashSet<SymbolId>,
+    creates_context: HashSet<Fid>,
     captures_this: HashSet<Fid>,
     captures_new_target: HashSet<Fid>,
     needs_this_function: HashSet<Fid>,
     obj_lit_home: HashSet<NodeId>,
     special: HashMap<NodeId, Special>,
     ref_depth: HashMap<ReferenceId, u32>,
+    /// REPL mode: root-level bindings are global properties, not slots
+    repl_root: bool,
     /// fid → its AST node (program, function, property definition)
     fid_node: &'f HashMap<Fid, NodeId>,
 }
@@ -970,6 +985,56 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
 
     /// Resolve this / new.target / super(...) / super.x / private names by
     /// walking parent chains.
+    /// Capture-set discovery ahead of depth resolution: a `this` /
+    /// `new.target` / `super` use inside a nested arrow forces the nearest
+    /// non-arrow function to keep its receiver in a context slot.
+    fn scan_special_owners(&mut self) {
+        for node in self.nodes.iter() {
+            let id = node.id();
+            let owner_node = match node.kind() {
+                AstKind::ThisExpression(_) | AstKind::NewTarget(_) => {
+                    self.nearest_function(id, false)
+                }
+                AstKind::CallExpression(c) if matches!(c.callee, Expression::Super(_)) => {
+                    self.nearest_function(id, false)
+                }
+                AstKind::StaticMemberExpression(e) if matches!(e.object, Expression::Super(_)) => {
+                    self.nearest_function(id, false)
+                }
+                AstKind::ComputedMemberExpression(e)
+                    if matches!(e.object, Expression::Super(_)) =>
+                {
+                    self.nearest_function(id, false)
+                }
+                _ => None,
+            };
+            let Some(owner_node) = owner_node else {
+                continue;
+            };
+            let Some(&fid) = self.fn_of_node.get(&owner_node) else {
+                continue;
+            };
+            // direct uses stay in the register; only arrow-delegated uses
+            // need the owner's context slot
+            if fid == self.current_fn_of(id) {
+                continue;
+            }
+            match node.kind() {
+                AstKind::NewTarget(_) => {
+                    self.captures_new_target.insert(fid);
+                }
+                AstKind::CallExpression(_) => {
+                    self.needs_this_function.insert(fid);
+                    self.captures_new_target.insert(fid);
+                    self.captures_this.insert(fid);
+                }
+                _ => {
+                    self.captures_this.insert(fid);
+                }
+            }
+        }
+    }
+
     fn scan_special_nodes(&mut self) {
         for node in self.nodes.iter() {
             let id = node.id();
@@ -978,7 +1043,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
                     let Some((owner, depth)) = self.fn_owner_and_depth(id) else {
                         continue;
                     };
-                    self.captures_this.insert(owner);
+                    if owner != self.current_fn_of(id) {
+                        self.captures_this.insert(owner);
+                    }
                     self.special
                         .insert(t.node_id.get(), Special::This { owner, depth });
                 }
@@ -1079,6 +1146,12 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         let mut passed_use = false;
         let mut hops = 0u32;
         for anc in self.nodes.ancestors(node) {
+            if anc.id() == target {
+                if self.node_creates_ctx(anc.id()) && passed_use {
+                    hops += 1;
+                }
+                return hops;
+            }
             if !self.node_creates_ctx(anc.id()) {
                 continue;
             }
@@ -1087,19 +1160,60 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
             } else {
                 hops += 1;
             }
-            if anc.id() == target {
-                return hops;
-            }
         }
         unreachable!("target is an ancestor of the use site")
     }
 
+    /// Which functions push a context: those whose bindings/specials
+    /// occupy slots (`captured`, `this`/`new.target`/`this_function`), or
+    /// that run direct `eval`. Must stay in sync with
+    /// `FunctionGen::assign_function_slots`.
+    fn compute_creates_context(&self) -> HashSet<Fid> {
+        let mut out: HashSet<Fid> = self.captures_this.iter().copied().collect();
+        out.extend(self.captures_new_target.iter().copied());
+        out.extend(self.needs_this_function.iter().copied());
+        for (&scope, &fid) in self.fn_scope_to_fid {
+            if self
+                .scoping
+                .scope_flags(scope)
+                .contains(ScopeFlags::DirectEval)
+            {
+                out.insert(fid);
+            }
+        }
+        for &sym in &self.captured {
+            // class / for scopes host their own slots, so ownership stops
+            // there (mirrors `FunctionGen`'s `scopes_by_fid`)
+            let mut cur = self.scoping.symbol_scope_id(sym);
+            let owner = loop {
+                if let Some(&fid) = self.fn_scope_to_fid.get(&cur) {
+                    break Some(fid);
+                }
+                if self.class_of_scope.contains_key(&cur) || self.for_of_scope.contains_key(&cur) {
+                    break None;
+                }
+                match self.scoping.scope_parent_id(cur) {
+                    Some(p) => cur = p,
+                    None => break None,
+                }
+            };
+            if let Some(fid) = owner {
+                if self.repl_root && fid == Fid(0) {
+                    continue;
+                }
+                out.insert(fid);
+            }
+        }
+        out
+    }
+
     /// Whether an AST node creates a runtime context in our model:
-    /// functions (incl. arrows and field initializers), context-owning
-    /// classes, home-owning object literals, lexical `for` heads.
+    /// context-creating functions (incl. arrows and field initializers),
+    /// context-owning classes, home-owning object literals, lexical
+    /// `for` heads.
     fn node_creates_ctx(&self, node: NodeId) -> bool {
-        if self.fn_of_node.contains_key(&node) {
-            return true;
+        if let Some(&fid) = self.fn_of_node.get(&node) {
+            return self.creates_context.contains(&fid);
         }
         match self.nodes.get_node(node).kind() {
             AstKind::Class(c) => {
@@ -1144,7 +1258,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         let Some((this_owner, this_depth)) = self.fn_owner_and_depth(node) else {
             return;
         };
-        self.captures_this.insert(this_owner);
+        if this_owner != self.current_fn_of(node) {
+            self.captures_this.insert(this_owner);
+        }
         let mut home = None;
         let mut depth = 0u32;
         let mut passed_use = false;
@@ -1327,7 +1443,9 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         let mut cur = decl_scope;
         loop {
             if let Some(&fid) = self.fn_scope_to_fid.get(&cur) {
-                return Some(self.f_node(fid));
+                if self.creates_context.contains(&fid) {
+                    return Some(self.f_node(fid));
+                }
             }
             if let Some(&idx) = self.class_of_scope.get(&cur) {
                 if self.classes[idx.0 as usize].slot_count > 0 {

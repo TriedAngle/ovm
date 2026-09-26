@@ -116,6 +116,10 @@ struct Layout {
     new_target_slot: Option<u32>,
     this_function_slot: Option<u32>,
     slot_names: Vec<Vec<u8>>,
+    /// whether the prologue must create/push a function context: any
+    /// context-allocated binding, or a direct `eval` that may add
+    /// bindings at runtime
+    creates_context: bool,
 }
 
 /// How an identifier reference resolves at its use site.
@@ -416,6 +420,7 @@ pub fn generate<'a>(scoping: &Scoping, facts: &Facts<'a>) -> Result<Program, Com
                 new_target_slot: None,
                 this_function_slot: None,
                 slot_names: Vec::new(),
+                creates_context: true,
             })
             .collect(),
         fid_scope: facts
@@ -425,6 +430,14 @@ pub fn generate<'a>(scoping: &Scoping, facts: &Facts<'a>) -> Result<Program, Com
             .collect(),
         for_counters: HashMap::new(),
     };
+    // Frame layouts decide both register counts and whether a function
+    // pushes a context; context depths are baked into the bytecode, so
+    // they must be settled before any body (including nested depth
+    // calculations) is emitted.
+    for fid in 0..n as u32 {
+        let layout = compiler.assign_function_slots(Fid(fid));
+        compiler.layouts[fid as usize] = layout;
+    }
     let mut program = Program::with_capacity(n);
     for fid in 0..n as u32 {
         let _span = trace::debug_span!("js::function", fid).entered();
@@ -441,8 +454,8 @@ pub fn generate<'a>(scoping: &Scoping, facts: &Facts<'a>) -> Result<Program, Com
 
 impl<'a, 'p> Compiler<'a, 'p> {
     fn scope_creates_ctx(&self, scope: ScopeId) -> bool {
-        if self.facts.fn_scope_to_fid.contains_key(&scope) {
-            return true;
+        if let Some(&fid) = self.facts.fn_scope_to_fid.get(&scope) {
+            return self.layouts[fid.0 as usize].creates_context;
         }
         if let Some(&idx) = self.facts.class_of_scope.get(&scope) {
             return self.facts.classes[idx.0 as usize].slot_count > 0;
@@ -603,11 +616,18 @@ impl<'a, 'p> Compiler<'a, 'p> {
             }
         }
 
+        let creates_context = !slot_names.is_empty() || calls_eval;
+        debug_assert_eq!(
+            creates_context,
+            self.facts.creates_context.contains(&fid),
+            "context predicate desynced from the slot layout"
+        );
         Layout {
             register_count: next_reg,
             this_slot,
             new_target_slot,
             this_function_slot,
+            creates_context,
             slot_names,
         }
     }
@@ -623,6 +643,8 @@ struct FunctionGen<'c, 'a, 'p> {
     b: FnBuilder,
     /// register holding the pushed-over context for prologue/epilogue
     ctx_save: Reg,
+    /// whether the prologue created/pushed a function context
+    frame_context: bool,
     /// script completion-value register (scripts/eval only)
     completion: Option<Reg>,
     breakables: Vec<Breakable>,
@@ -638,6 +660,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             fid,
             b: FnBuilder::new(arity),
             ctx_save: Reg::new(0),
+            frame_context: false,
             completion: None,
             breakables: Vec::new(),
             nested_labels: Vec::new(),
@@ -671,6 +694,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let result = f(self);
         self.b.drop_temps(mark);
         result
+    }
+
+    /// Leave the function-context frame, if the prologue pushed one.
+    fn pop_frame_context(&mut self) {
+        if self.frame_context {
+            self.b.pop_context(self.ctx_save);
+        }
     }
 
     fn emit_this_initialized_check(&mut self) {
@@ -1108,8 +1138,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     return self.err(u.span, "super property");
                 };
                 self.release_store(&store);
-                self.b
-                    .call_runtime(RuntimeFn::DeleteSuperProperty, RegList::new(Reg::new(0), 0));
+                self.b.call_runtime(
+                    RuntimeFn::DeleteSuperProperty,
+                    RegList::new(self.b.this_reg(), 0),
+                );
                 Ok(())
             }
             e if MemberRef::of(e).is_some() => {
@@ -3029,7 +3061,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 let labels = self.take_labels();
                 self.emit_while(&s.test, &s.body, labels)
             }
-            Statement::DoWhileStatement(s) => self.err(s.span, "do-while loops"),
+            Statement::DoWhileStatement(s) => {
+                let labels = self.take_labels();
+                self.emit_do_while(&s.test, &s.body, labels)
+            }
             Statement::ForStatement(s) => self.emit_for(s),
             Statement::ForInStatement(s) => self.emit_for_in(s),
             Statement::ForOfStatement(s) => self.err(s.span, "for-of loops"),
@@ -3044,7 +3079,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     Some(v) => self.expr(v)?,
                     None => self.b.load_undefined(),
                 }
-                self.b.pop_context(self.ctx_save);
+                self.pop_frame_context();
                 self.b.ret();
                 Ok(())
             }
@@ -3108,6 +3143,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let label = s.label.name.to_string();
         match &s.body {
             Statement::WhileStatement(_)
+            | Statement::DoWhileStatement(_)
             | Statement::ForStatement(_)
             | Statement::ForInStatement(_)
             | Statement::SwitchStatement(_)
@@ -3326,6 +3362,36 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         self.stmt(body)?;
         let continues = self.breakables.last().unwrap().continues.unwrap();
         self.b.bind(continues);
+        self.b.jump_loop(back);
+        let (breaks, _) = self.end_breakable();
+        self.b.bind(breaks);
+        Ok(())
+    }
+
+    /// `do body while (test)`: the body runs once before the first test;
+    /// `continue` targets the test, and the back-edge stays a `JumpLoop`
+    /// so a long loop still reaches safepoints.
+    fn emit_do_while(
+        &mut self,
+        test: &Expression<'_>,
+        body: &Statement<'_>,
+        labels: Vec<String>,
+    ) -> Result<(), CompileError> {
+        let back = self.b.new_label();
+        self.b.bind(back); // loop head, entered without a test
+        let breaks = self.b.new_label();
+        let continues = self.b.new_label();
+        self.breakables.push(Breakable {
+            labels,
+            breaks,
+            continues: Some(continues),
+            unwind_ctx: None,
+        });
+        self.stmt(body)?;
+        let continues = self.breakables.last().unwrap().continues.unwrap();
+        self.b.bind(continues);
+        self.expr(test)?;
+        self.b.jump_if_falsy(breaks);
         self.b.jump_loop(back);
         let (breaks, _) = self.end_breakable();
         self.b.bind(breaks);
@@ -3640,7 +3706,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // still pushed: the captured-this slot lives in it)
             self.emit_this_load_own();
             self.emit_this_initialized_check();
-            self.b.pop_context(self.ctx_save);
+            self.pop_frame_context();
             self.b.ret();
             return Ok(());
         };
@@ -3656,11 +3722,11 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // undefined → return this (context still pushed for the slot read)
         self.emit_this_load_own();
         self.emit_this_initialized_check();
-        self.b.pop_context(self.ctx_save);
+        self.pop_frame_context();
         self.b.ret();
         self.b.bind(is_obj);
         self.b.load(t);
-        self.b.pop_context(self.ctx_save);
+        self.pop_frame_context();
         self.b.ret();
         self.b.drop_temp(); // u
         self.b.drop_temp(); // t
@@ -3668,10 +3734,6 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     }
 
     fn emit_function_body(&mut self) -> Result<(), CompileError> {
-        // layout: assign this function's slots before any emission
-        let layout = self.c.assign_function_slots(self.fid);
-        self.c.layouts[self.fid.0 as usize] = layout;
-
         let layout = &self.c.layouts[self.fid.0 as usize];
         // the script (and each eval compilation) tracks its completion
         // value in a dedicated register between ctx_save and the temps
@@ -3680,17 +3742,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         self.b
             .set_temp_base(layout.register_count + 1 + u32::from(self.completion.is_some()));
 
-        // prologue: one context per function (uniform chain), pushed onto
-        // the frame context; locals below the temps are born as the hole.
-        // the context's shared ScopeInfo (slot names) is the first constant
-        let names: Vec<Box<[u8]>> = layout
-            .slot_names
-            .iter()
-            .map(|n| n.as_slice().into())
-            .collect();
-        let ctx_info = self.b.constant(Constant::ContextNames(names));
-        self.b.create_function_context(ctx_info);
-        self.b.push_context(self.ctx_save);
+        // prologue: functions with context-allocated bindings get a fresh
+        // context pushed onto the frame context; locals below the temps are
+        // born as the hole. Functions with none reuse the closure's context
+        // (outer slots resolve through it), and the depth baked into their
+        // nested accesses already skips this frame.
+        self.frame_context = layout.creates_context;
+        if self.frame_context {
+            let names: Vec<Box<[u8]>> = layout
+                .slot_names
+                .iter()
+                .map(|n| n.as_slice().into())
+                .collect();
+            let ctx_info = self.b.constant(Constant::ContextNames(names));
+            self.b.create_function_context(ctx_info);
+            self.b.push_context(self.ctx_save);
+        }
 
         // parameters: non-simple lists (any default / pattern / rest)
         // stage the incoming arguments, hole-fill the parameter registers,
@@ -3819,7 +3886,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         if kind == FnKind::DefaultDerivedCtor {
             self.b.call_runtime(
                 RuntimeFn::ConstructSuperAllArgs,
-                RegList::new(Reg::new(0), 0),
+                RegList::new(self.b.this_reg(), 0),
             );
             self.b.store(self.b.this_reg());
             if self.fn_has_instance_fields(self.fid) {
@@ -3836,7 +3903,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     Ok(())
                 })?;
             }
-            self.b.pop_context(self.ctx_save);
+            self.pop_frame_context();
             self.b.load(self.b.this_reg());
             self.b.ret();
             return Ok(());
@@ -3912,13 +3979,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     if self.is_anon_function(e) {
                         self.emit_set_name_for_key_node(field_key.unwrap());
                     }
-                    self.b.pop_context(self.ctx_save);
+                    self.pop_frame_context();
                     self.b.ret();
                     return Ok(());
                 }
                 FnBody::Empty => {
                     self.b.load_undefined();
-                    self.b.pop_context(self.ctx_save);
+                    self.pop_frame_context();
                     self.b.ret();
                     return Ok(());
                 }
@@ -3939,7 +4006,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             FnBody::ArrowExpr(e) => {
                 self.expr(e)?;
-                self.b.pop_context(self.ctx_save);
+                self.pop_frame_context();
                 self.b.ret();
                 return Ok(());
             }
@@ -3951,16 +4018,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // (initialization checked — super() must have run)
         match self.completion {
             Some(completion) => {
-                self.b.pop_context(self.ctx_save);
+                self.pop_frame_context();
                 self.b.load(completion);
             }
             None if self.is_derived_ctor() => {
                 self.emit_this_load_own();
                 self.emit_this_initialized_check();
-                self.b.pop_context(self.ctx_save);
+                self.pop_frame_context();
             }
             None => {
-                self.b.pop_context(self.ctx_save);
+                self.pop_frame_context();
                 self.b.load_undefined();
             }
         }

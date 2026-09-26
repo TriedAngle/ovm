@@ -426,29 +426,60 @@ impl Slow {
     ) -> Result<CmpOutcome, VmError> {
         let stack = &state.stack();
         state.handle_scope(|scope| {
-            let hint = match cmp {
-                Cmp::Eq => Hint::Default,
-                Cmp::EqStrict | Cmp::Lt | Cmp::Le | Cmp::Gt | Cmp::Ge => Hint::Number,
-            };
             let x = scope.handle(acc.get(heap));
-            let x = match Object::to_primitive(vm, heap, state, x, hint)? {
+            let y = scope.handle(stack.reg(heap, &meta, reg));
+            match cmp {
+                Cmp::EqStrict => {
+                    // IsStrictEqual (ES 7.2.15): no coercion, ever
+                    let b = Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
+                    return Ok(CmpOutcome::Bool(b));
+                }
+                Cmp::Eq => {
+                    // IsLooselyEqual: object ↔ object compares by
+                    // identity; object ↔ primitive coerces the object
+                    let x_obj = Compare::is_object_operand(heap, x.as_tagged(heap));
+                    let y_obj = Compare::is_object_operand(heap, y.as_tagged(heap));
+                    if x_obj && y_obj {
+                        let b = Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
+                        return Ok(CmpOutcome::Bool(b));
+                    }
+                    let x = if x_obj {
+                        match Object::to_primitive(vm, heap, state, x, Hint::Default)? {
+                            Coercion::Threw => return Ok(CmpOutcome::Threw),
+                            Coercion::Value(v) => scope.handle(v),
+                        }
+                    } else {
+                        x
+                    };
+                    let y = if y_obj {
+                        match Object::to_primitive(vm, heap, state, y, Hint::Default)? {
+                            Coercion::Threw => return Ok(CmpOutcome::Threw),
+                            Coercion::Value(v) => scope.handle(v),
+                        }
+                    } else {
+                        y
+                    };
+                    let b = Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?;
+                    return Ok(CmpOutcome::Bool(b));
+                }
+                _ => {}
+            }
+            let x = match Object::to_primitive(vm, heap, state, x, Hint::Number)? {
                 Coercion::Threw => return Ok(CmpOutcome::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let y = scope.handle(stack.reg(heap, &meta, reg));
-            let y = match Object::to_primitive(vm, heap, state, y, hint)? {
+            let y = match Object::to_primitive(vm, heap, state, y, Hint::Number)? {
                 Coercion::Threw => return Ok(CmpOutcome::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
             let b = match cmp {
-                Cmp::Eq => Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-                Cmp::EqStrict => Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap)),
                 Cmp::Lt => Compare::less_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
                 Cmp::Le => Compare::less_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
                 Cmp::Gt => Compare::greater_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
                 Cmp::Ge => {
                     Compare::greater_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?
                 }
+                Cmp::Eq | Cmp::EqStrict => unreachable!("handled above"),
             };
             Ok(CmpOutcome::Bool(b))
         })
@@ -2168,6 +2199,12 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(heap.new_number(a + b));
+                return Step::Next;
+            }
             Slow::add(vm, heap, state, meta, &acc, None, other_reg, None)
         }
         Opcode::AddLoc | Opcode::SubLoc => {
@@ -2187,6 +2224,13 @@ fn step<'a>(
                     acc.store(v);
                     return Step::Next;
                 }
+            }
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(rhs)) {
+                let r = if op == Opcode::AddLoc { a + b } else { a - b };
+                let v = heap.new_number(r);
+                stack.set_reg(&meta, dst, v);
+                acc.store(v);
+                return Step::Next;
             }
             if op == Opcode::AddLoc {
                 Slow::add(vm, heap, state, meta, &acc, Some(dst), src, Some(dst))
@@ -2211,6 +2255,12 @@ fn step<'a>(
                 && Smi::in_range(r)
             {
                 acc.store(Smi::new(r).into_tagged());
+                return Step::Next;
+            }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(heap.new_number(a - b));
                 return Step::Next;
             }
             Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a - b)
@@ -2261,6 +2311,12 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Step::Next;
             }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(heap.new_number(a * b));
+                return Step::Next;
+            }
             Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a * b)
         }
         Opcode::Div => {
@@ -2273,6 +2329,12 @@ fn step<'a>(
                 && let Some(r) = a.checked_div(b)
             {
                 acc.store(Smi::new(r).into_tagged());
+                return Step::Next;
+            }
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(heap.new_number(a / b));
                 return Step::Next;
             }
             Slow::numeric_op(vm, heap, state, meta, &acc, ops.reg(0), |a, b| a / b)
@@ -2417,7 +2479,10 @@ fn step<'a>(
         }
         Opcode::Negate => {
             let acc_word = *acc;
-            if let Some(v) = acc_word.to_i64() {
+            if let Some(n) = Convert::as_number(acc.get(heap)) {
+                // `new_number` keeps -0.0 boxed and folds everything else
+                acc.store(heap.new_number(-n));
+            } else if let Some(v) = acc_word.to_i64() {
                 if v == 0 {
                     // preserve -0.0: `-0` must not fold into Smi 0
                     acc.store(heap.new_number(-0.0));

@@ -318,3 +318,50 @@ fn unused_whole_subtree_is_collected() {
         );
     });
 }
+
+#[test]
+fn constructor_instances_share_a_map() {
+    let (_vm, mut thread) = thread();
+    let result = thread
+        .eval::<vm::JavascriptCompiler>(
+            "function C(x) { this.x = x; }
+             var a = new C(1), b = new C(2), c = new C(3);
+             [a, b, c];",
+        )
+        .unwrap();
+    let heap = &*thread.heap();
+    let arr = unsafe { Tagged::<Object>::from_value_unchecked(result) };
+    let map_of = |i: usize| {
+        let v = arr.as_ref().element_value(heap, i).expect("element");
+        let o = unsafe { Tagged::<Object>::from_value_unchecked(v.raw()) };
+        o.as_ref().map_ref(heap).raw().to_bits()
+    };
+    let (m0, m1, m2) = (map_of(0), map_of(1), map_of(2));
+    assert_eq!(m0, m1, "same constructor must reuse the initial map");
+    assert_eq!(m1, m2, "same constructor must reuse the initial map");
+}
+
+#[test]
+fn equal_prototypes_reuse_one_map() {
+    let (_vm, mut thread) = thread();
+    let result = thread
+        .eval::<vm::JavascriptCompiler>(
+            "var p = {};
+             var a = {}; Object.setPrototypeOf(a, p);
+             var b = {}; Object.setPrototypeOf(b, p);
+             [a, b];",
+        )
+        .unwrap();
+    let heap = &*thread.heap();
+    let arr = unsafe { Tagged::<Object>::from_value_unchecked(result) };
+    let map_of = |i: usize| {
+        let v = arr.as_ref().element_value(heap, i).expect("element");
+        let o = unsafe { Tagged::<Object>::from_value_unchecked(v.raw()) };
+        o.as_ref().map_ref(heap).raw().to_bits()
+    };
+    assert_eq!(
+        map_of(0),
+        map_of(1),
+        "objects sharing a prototype must share the transition target"
+    );
+}

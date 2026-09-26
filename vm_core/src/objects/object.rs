@@ -25,7 +25,8 @@ impl Object {
             return None;
         }
         let info = self.slots.get(heap).at(heap, 0);
-        info.get_as::<CallableInfoObject>()
+        // the callable map's slot 0 is always its CallableInfoObject
+        Some(unsafe { info.cast() })
     }
 
     pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, Context>> {
@@ -87,7 +88,7 @@ impl Object {
     }
 
     pub fn length(&self) -> usize {
-        self.length.to_smi().value() as usize
+        self.length.to_smi_unchecked().value() as usize
     }
 
     pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, FixedArray>> {
@@ -95,20 +96,31 @@ impl Object {
         elements.is_strong_ptr().then_some(elements)
     }
 
+    /// Mark the array's map holey: future element reads must expect holes
+    /// (and future element caches must re-record).
+    pub fn mark_holey(&self, heap: &Heap) {
+        heap.promote_holey(self.header.map.get(heap));
+    }
+
     /// Fast element read for array objects: `None` if `self` is not an
     /// array, the index is past the end, or the slot is a hole — the
-    /// caller must fall back to a named property lookup.
+    /// caller must fall back to a named property lookup. A packed (non
+    /// holey) map skips both the hole compare and the backing-store bound.
     pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
-        if !self.is_array(heap) || i >= self.length() {
+        let kind = self.header.map.get(heap).as_ref().kind();
+        if !kind.is_array() || i >= self.length() {
             return None;
         }
-        let elements = self.elements_array(heap)?;
-        if i >= elements.len() {
+        let elements = self.elements.get(heap);
+        if !elements.is_strong_ptr() {
+            return None;
+        }
+        if i >= elements.as_ref().len() {
             // `length` can exceed the backing store: those indices are holes
             return None;
         }
-        let v = elements.at(heap, i);
-        if v == heap.known().the_hole.as_tagged(heap) {
+        let v = elements.as_ref().at(heap, i);
+        if kind.is_holey() && v == heap.known().the_hole.as_tagged(heap) {
             return None;
         }
         Some(v)
@@ -154,7 +166,7 @@ impl Object {
     ) -> Result<(), VmError> {
         let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
 
-        let grows = {
+        let (grows, old_len) = {
             let obj = receiver.as_tagged(heap);
             if !obj.as_ref().is_array(heap) {
                 return Err(VmError::Type);
@@ -167,8 +179,14 @@ impl Object {
                 .elements_array(heap)
                 .map(|e| e.len())
                 .unwrap_or(0);
-            i >= capacity
+            (i >= capacity, obj.as_ref().length())
         };
+
+        // writing past the end leaves holes behind: the map must stop
+        // promising packed elements
+        if i > old_len {
+            receiver.as_tagged(heap).as_ref().mark_holey(heap);
+        }
 
         if grows {
             let staged = {
@@ -218,11 +236,15 @@ impl Object {
         let Some(obj) = receiver.as_heap_object() else {
             return Err(VmError::Type);
         };
-        if !obj.as_ref().is_array(heap) || i >= obj.as_ref().length() {
+        let kind = obj.as_ref().header.map.get(heap).as_ref().kind();
+        if !kind.is_array() || i >= obj.as_ref().length() {
             return Err(VmError::OutOfBounds);
         }
         let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
-        if i >= elements.len() || elements.at(heap, i) == heap.known().the_hole.as_tagged(heap) {
+        if i >= elements.len() {
+            return Err(VmError::OutOfBounds);
+        }
+        if kind.is_holey() && elements.at(heap, i) == heap.known().the_hole.as_tagged(heap) {
             return Err(VmError::OutOfBounds);
         }
         elements.set(heap, i, value);

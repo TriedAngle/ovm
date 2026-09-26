@@ -67,6 +67,10 @@ pub struct WellKnown {
     pub object_prototype: Global<Object>,
     /// `%Array.prototype%`: an array object, parent of all array instance maps.
     pub array_prototype: Global<Object>,
+    /// Map of Date instances: ordinary extendable objects with one value
+    /// slot holding the epoch-milliseconds Float (prototype %Date.prototype%).
+    pub date_instance_map: Global<Map>,
+    pub date_prototype: Global<Object>,
     /// `%Error.prototype%`: parent of all error instance maps.
     pub error_prototype: Global<Object>,
     /// `%Function.prototype%` (ES 19.2.3): the canonical empty function — a
@@ -97,6 +101,9 @@ pub struct WellKnown {
     /// Inline-cache state sentinel (never user-visible): a feedback slot
     /// holding it permanently takes the slow path
     pub megamorphic_symbol: Global<Symbol>,
+    /// Transition-tree key for prototype changes (never user-visible):
+    /// a `set_prototype` edge, disambiguated by the child's prototype
+    pub prototype_transition_symbol: Global<Symbol>,
     /// Map of array-iterator objects (slots: [iterated array, next index])
     pub array_iterator_map: Global<Map>,
     /// %ArrayIteratorPrototype% (holds `next` and @@iterator)
@@ -254,6 +261,8 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         string_prototype: obj,
         object_prototype: obj,
         array_prototype: obj,
+        date_instance_map: map,
+        date_prototype: obj,
         error_prototype: obj,
         function_prototype: obj,
         global_object: obj,
@@ -265,6 +274,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         to_primitive_symbol: symbol,
         iterator_symbol: symbol,
         megamorphic_symbol: symbol,
+        prototype_transition_symbol: symbol,
         array_iterator_map: map,
         array_iterator_prototype: obj,
         iterator_result_map: map,
@@ -496,6 +506,20 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         array_prototype,
     );
 
+    let date_prototype_map = alloc_parent_map(
+        heap,
+        roots,
+        MapKind::OBJECT.union(MapKind::EXTENDABLE),
+        object_prototype,
+    );
+    let date_prototype = alloc_object(heap, &scope, roots, date_prototype_map);
+    let date_instance_map = alloc_parent_map(
+        heap,
+        roots,
+        MapKind::OBJECT.union(MapKind::EXTENDABLE),
+        date_prototype,
+    );
+
     let error_prototype_map = alloc_parent_map(
         heap,
         roots,
@@ -545,6 +569,9 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     // permanently takes the slow path
     let megamorphic_symbol =
         roots.create_handle(Symbol::new(heap, &scope, b"<megamorphic>").as_tagged(heap));
+    // transition-tree key for prototype changes (never user-visible)
+    let prototype_transition_symbol =
+        roots.create_handle(Symbol::new(heap, &scope, b"<set-prototype>").as_tagged(heap));
 
     let empty_scope_info =
         roots.create_handle(heap.allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots }));
@@ -596,8 +623,11 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.to_primitive_symbol = to_primitive_symbol;
     known.iterator_symbol = iterator_symbol;
     known.megamorphic_symbol = megamorphic_symbol;
+    known.prototype_transition_symbol = prototype_transition_symbol;
     known.object_prototype = object_prototype;
     known.array_prototype = array_prototype;
+    known.date_prototype = date_prototype;
+    known.date_instance_map = date_instance_map;
     known.error_prototype = error_prototype;
     known.function_prototype = function_prototype;
     known.error_map = error_map;

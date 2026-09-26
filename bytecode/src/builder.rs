@@ -1110,9 +1110,14 @@ impl FnBuilder {
                     debug_assert_eq!(kinds.get(i + 1), Some(&Operand::RegisterCount));
                     let base = operands[i] as i32;
                     let count = operands[i + 1];
-                    if count > 0 {
-                        self.track_operand(base - count as i32 + 1);
-                    }
+                    // an empty window still encodes an operand the
+                    // validator checks
+                    let lowest = if count > 0 {
+                        base - count as i32 + 1
+                    } else {
+                        base
+                    };
+                    self.track_operand(lowest);
                 }
                 _ => {}
             }

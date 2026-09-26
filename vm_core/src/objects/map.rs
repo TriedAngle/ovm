@@ -36,11 +36,11 @@ impl Map {
     }
 
     pub fn value_slot_count(&self) -> usize {
-        self.value_slot_count.to_smi().value() as usize
+        self.value_slot_count.to_smi_unchecked().value() as usize
     }
 
     pub fn descriptor_count(&self) -> usize {
-        self.descriptor_count.to_smi().value() as usize
+        self.descriptor_count.to_smi_unchecked().value() as usize
     }
 
     pub fn pred<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Map>> {
@@ -56,7 +56,7 @@ impl Map {
     }
 
     pub fn kind(&self) -> MapKind {
-        MapKind::new(self.kind.to_smi().value() as u64)
+        MapKind::new(self.kind.to_smi_unchecked().value() as u64)
     }
 
     fn data_ptr(&self) -> *mut SlotDescriptor {
@@ -154,8 +154,36 @@ impl Map {
         }
         None
     }
-}
 
+    /// The map produced by changing this map's prototype to `proto`, if a
+    /// previous `set_prototype` published one. Prototype edges share the
+    /// property transition table, keyed by a private sentinel symbol and
+    /// disambiguated by the child's prototype.
+    pub fn find_prototype_transition<'a>(
+        &self,
+        heap: &'a Heap,
+        proto: Tagged<'a, Value>,
+    ) -> Option<Tagged<'a, Map>> {
+        let sentinel = heap.known().prototype_transition_symbol.as_tagged(heap);
+        let array = self.transitions.load(heap)?;
+        let pairs = array.as_slice();
+        for entry in pairs.as_chunks::<2>().0 {
+            if !entry[0].get(heap).ptr_eq(sentinel.erase()) {
+                continue;
+            }
+            let Some(target) = entry[1].get_strong(heap) else {
+                continue;
+            };
+            let Some(target) = target.get_as::<Map>() else {
+                continue;
+            };
+            if target.prototype.get(heap).ptr_eq(proto) {
+                return Some(target);
+            }
+        }
+        None
+    }
+}
 pub struct MapInit<'a> {
     pub kind: MapKind,
     pub value_slot_count: usize,
@@ -189,8 +217,14 @@ impl HeapObject for Map {
         self.pred.clear(heap);
         self.transitions.clear(heap);
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
+            let name_word = name.as_tagged(heap);
+            // integer-named own properties make element misses observable
+            // on the prototype chain
+            if Smi::decode(name_word.raw()).is_some() {
+                heap.invalidate_indexed_props();
+            }
             let d = self.descriptor(i);
-            d.name.set(heap, host, name.as_tagged(heap));
+            d.name.set(heap, host, name_word);
             d.flags.set(heap, host, Smi::new(flags.bits() as i64));
             d.value.set(heap, host, value.as_tagged(heap));
         }
@@ -228,7 +262,7 @@ impl EdgeVisitable for Map {
 pub struct MapKind(u64);
 
 impl MapKind {
-    const KIND_MASK: u64 = 0xff;
+    pub const KIND_MASK: u64 = 0xff;
 
     pub const EXTENDABLE: MapKind = MapKind(1 << 8);
     pub const CALLABLE: MapKind = MapKind(1 << 9);
@@ -241,6 +275,11 @@ impl MapKind {
     /// accurate) on `DENSE_STRING` maps — future string representations
     /// get their own kinds/flags.
     pub const LATIN1: MapKind = MapKind(1 << 14);
+
+    /// Array elements may contain holes or extend past the backing store;
+    /// only meaningful on `ARRAY` maps. Once set it is never cleared (the
+    /// promotion is conservative for every array sharing the map).
+    pub const HOLEY: MapKind = MapKind(1 << 15);
 
     pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
     pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
@@ -313,6 +352,27 @@ impl MapKind {
 
     pub const fn is_array(self) -> bool {
         self.0 & Self::KIND_MASK == ObjectKind::Array as u64
+    }
+
+    /// Whether this map belongs to an ordinary JSReceiver layout
+    /// (Object/Array/ByteArray/String/Oddball), excluding exotic Proxy.
+    pub const fn is_js_receiver(self) -> bool {
+        let k = self.0 & Self::KIND_MASK;
+        k == ObjectKind::Object as u64
+            || k == ObjectKind::Array as u64
+            || k == ObjectKind::ByteArray as u64
+            || k == ObjectKind::String as u64
+            || k == ObjectKind::Oddball as u64
+    }
+
+    /// Whether this map is a Proxy.
+    pub const fn is_proxy(self) -> bool {
+        self.0 & Self::KIND_MASK == ObjectKind::Proxy as u64
+    }
+
+    /// Whether this array map may hold holes (see [`MapKind::HOLEY`]).
+    pub const fn is_holey(self) -> bool {
+        self.0 & Self::HOLEY.0 != 0
     }
 
     pub const fn is_callable(self) -> bool {
@@ -389,7 +449,7 @@ impl SlotDescriptor {
     }
 
     pub fn flags(&self) -> SlotFlags {
-        SlotFlags::new(self.flags.to_smi().value() as u64)
+        SlotFlags::new(self.flags.to_smi_unchecked().value() as u64)
     }
 
     pub fn offset(&self) -> usize {

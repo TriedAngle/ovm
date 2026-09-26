@@ -2,7 +2,7 @@
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
 use vm_core::RuntimeContext;
-use vm_core::{Convert, HandleSlice, Smi, Tagged, Value, VmError};
+use vm_core::{Convert, HandleSlice, Object, Smi, Tagged, Value, VmError};
 
 /// `Array(...)`: call and construct behave the same (ES 23.1.1.1). No
 /// arguments → `[]`; one non-negative Smi → that many holes (negative or
@@ -35,7 +35,75 @@ pub fn array_constructor<'a>(
         };
 
         let staged = scope.stage(&values);
-        Ok(heap.new_array(&scope, staged).erase())
+        let array = heap.new_array(&scope, staged).as_handle(&scope);
+        if single_len.is_some() {
+            // `Array(n)` is a hole-filled array: retire the packed promise
+            let obj = array.as_tagged(heap);
+            obj.as_ref().mark_holey(heap);
+        }
+        Ok(array.as_tagged(heap).erase())
+    })
+}
+
+/// `Array.prototype.push` (ES 23.1.3.21): append the arguments in order,
+/// growing the elements store; returns the new length.
+pub fn array_push<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
+    state.handle_scope(|scope| {
+        let receiver = args.get(0).ok_or(VmError::Arity)?;
+        let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+            return Err(VmError::Type);
+        };
+        if !obj.as_tagged(heap).as_ref().is_array(heap) {
+            return Err(VmError::Type);
+        }
+        let mut len = obj.as_tagged(heap).as_ref().length();
+        for arg in args.iter().skip(1) {
+            Object::store_array_element(heap, &scope, &obj, len, &arg)?;
+            len += 1;
+        }
+        Ok(Smi::new(len as i64).into_tagged())
+    })
+}
+
+/// `Array.prototype.pop` (ES 23.1.3.20): remove the last element, shorten
+/// `length`, and punch a hole so the store releases the value.
+pub fn array_pop<'a>(
+    nctx: RuntimeContext<'a>,
+    args: HandleSlice<'_>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let RuntimeContext { heap, state, .. } = nctx;
+    state.handle_scope(|scope| {
+        let receiver = args.get(0).ok_or(VmError::Arity)?;
+        let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+            return Err(VmError::Type);
+        };
+        let this = obj.as_tagged(heap);
+        if !this.as_ref().is_array(heap) {
+            return Err(VmError::Type);
+        }
+        let len = this.as_ref().length();
+        if len == 0 {
+            return Ok(heap.known().undefined.as_tagged(heap).erase());
+        }
+        let last = len - 1;
+        let value = this
+            .as_ref()
+            .element_value(heap, last)
+            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+        let elements = this.as_ref().elements.get(heap);
+        if elements.is_strong_ptr() && last < elements.as_ref().len() {
+            elements
+                .as_ref()
+                .set(heap, last, heap.known().the_hole.as_tagged(heap).erase());
+        }
+        this.as_ref()
+            .length
+            .set(heap, this.erase(), Smi::new(last as i64));
+        Ok(value)
     })
 }
 

@@ -31,7 +31,7 @@ impl Default for MarkSweepConfig {
 
 const FORWARD_TAG: Word = 0b10;
 
-const MIN_YOUNG_CHUNKS: usize = 2;
+const MIN_YOUNG_CHUNKS: usize = 8;
 const MAX_YOUNG_CHUNKS: usize = 32;
 
 pub struct MarkSweepState {

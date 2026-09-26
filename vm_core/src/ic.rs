@@ -1,6 +1,7 @@
 use crate::{
-    Acc, AccessorPair, FeedbackVector, FixedArray, Handle, HandleScope, Heap, Map, MaybeWeak,
-    Object, ObjectKind, SlotName, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
+    Acc, AccessorPair, DenseString, FeedbackVector, FixedArray, Handle, HandleScope, Heap, Map,
+    MaybeWeak, Object, ObjectKind, SlotName, Smi, Tagged, Value, WeakFixedArray,
+    WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
@@ -9,6 +10,22 @@ pub const MAX_POLYMORPHIC_ENTRIES: usize = 4;
 /// Smi kinds for bare (chain-free) handlers.
 const KIND_FIELD: i64 = 0;
 const KIND_SLOW: i64 = 1;
+/// Dense array element load; payload = flags + (when packed) the holey
+/// epoch the handler was recorded under.
+const KIND_ELEMENT: i64 = 2;
+/// Dense array element store; payload = flags.
+const KIND_ELEMENT_STORE: i64 = 3;
+/// `DenseString` index load; payload = flags.
+const KIND_INDEXED_STRING: i64 = 4;
+
+/// Element-load payload flags.
+const ELEMENT_HOLEY: i64 = 1 << 0;
+const ELEMENT_ALLOW_OOB: i64 = 1 << 1;
+const ELEMENT_EPOCH_SHIFT: i64 = 2;
+
+/// Element-store payload flags.
+const STORE_HOLEY: i64 = 1 << 0;
+const STORE_GROW: i64 = 1 << 1;
 
 /// Smi kinds stored at index 0 of a chain-handler array.
 const CHAIN_FIELD: i64 = 0;
@@ -16,6 +33,9 @@ const CHAIN_ACCESSOR: i64 = 1;
 const CHAIN_SETTER: i64 = 4;
 const CHAIN_NON_EXISTENT: i64 = 3;
 const CHAIN_PARENT_NAME: i64 = 5;
+/// One-hop prototype handlers: `[kind|offset, weak holder map, weak pair]`.
+const CHAIN_PROTO_FIELD: i64 = 6;
+const CHAIN_PROTO_ACCESSOR: i64 = 7;
 
 fn kind_smi(kind: i64, payload: i64) -> Smi {
     Smi::new(kind | (payload << 8))
@@ -33,6 +53,13 @@ pub enum Hit<'a> {
     /// invoke with the receiver as `this`
     Getter(Tagged<'a, Value>),
     NotFound,
+}
+
+/// Result of a keyed element load hit.
+pub enum ElementHit<'a> {
+    Value(Tagged<'a, Value>),
+    /// a single-code-unit string load (`"ab"[1]`); the caller allocates
+    Char(u16),
 }
 
 /// Result of a store hit.
@@ -58,8 +85,8 @@ pub enum StoreOutcomeKind {
 /// receivers whose lookups the map walk fully describes.
 fn ic_receiver<'a>(receiver: Tagged<'a, Value>, heap: &'a Heap) -> Option<Tagged<'a, Object>> {
     let obj = receiver.as_heap_object()?;
-    let kind = obj.map_ref(heap).kind().kind();
-    if !kind.is_js_receiver() || kind == ObjectKind::Proxy {
+    let kind = obj.map_ref(heap).kind();
+    if !kind.is_js_receiver() || kind.is_proxy() {
         return None;
     }
     Some(obj)
@@ -100,6 +127,10 @@ enum Handler<'s> {
     /// a chain handler array (field through the chain, accessor/setter,
     /// parent name, non-existent)
     Chain(Handle<'s, WeakFixedArray>),
+    /// a one-hop prototype data field: holder map + slot offset
+    ProtoField(Handle<'s, WeakFixedArray>),
+    /// a one-hop prototype accessor: holder map + weak getter pair
+    ProtoAccessor(Handle<'s, WeakFixedArray>),
     /// a store transition: migrate the receiver to this map
     WeakMap(Handle<'s, Map>),
 }
@@ -108,7 +139,9 @@ impl Handler<'_> {
     fn word<'a>(&self, heap: &'a Heap) -> Tagged<'a, MaybeWeak<Value>> {
         match self {
             Self::Smi(s) => s.into_tagged().as_maybe_weak(),
-            Self::Chain(arr) => arr.as_tagged(heap).erase().as_maybe_weak(),
+            Self::Chain(arr) | Self::ProtoField(arr) | Self::ProtoAccessor(arr) => {
+                arr.as_tagged(heap).erase().as_maybe_weak()
+            }
             Self::WeakMap(m) => m.as_tagged(heap).erase().as_weak(),
         }
     }
@@ -236,6 +269,28 @@ fn verify_chain<'a>(
         return None;
     }
     let count = (chain_ref.len() - 2) / 3;
+    const SMALL: usize = 8;
+    if count <= SMALL {
+        // no allocation on the hot path: chains are almost always < 8
+        let mut resolved: [Tagged<'a, Object>; SMALL] = [receiver; SMALL];
+        for e in 0..count {
+            let base = 2 + e * 3;
+            let hop = Smi::decode(chain_ref.get(heap, base).raw())?.value();
+            let owner_idx = Smi::decode(chain_ref.get(heap, base + 1).raw())?.value();
+            let expected = chain_ref.get(heap, base + 2).as_strong()?;
+            let owner = if owner_idx < 0 {
+                receiver
+            } else {
+                *resolved.get(owner_idx as usize)?
+            };
+            resolved[e] = chain_step(heap, owner, hop, expected)?;
+        }
+        return Some(if count == 0 {
+            receiver
+        } else {
+            resolved[count - 1]
+        });
+    }
     let mut resolved: Vec<Tagged<'a, Object>> = Vec::with_capacity(count);
     for e in 0..count {
         let base = 2 + e * 3;
@@ -247,21 +302,30 @@ fn verify_chain<'a>(
         } else {
             *resolved.get(owner_idx as usize)?
         };
-        let proto = owner.as_ref().map_ref(heap).prototype.get(heap);
-        let next = if hop < 0 {
-            proto.as_heap_object()?
-        } else {
-            proto
-                .get_as::<FixedArray>()?
-                .at(heap, hop as usize)
-                .as_heap_object()?
-        };
-        if !next.map_ref(heap).ptr_eq(expected) {
-            return None;
-        }
+        let next = chain_step(heap, owner, hop, expected)?;
         resolved.push(next);
     }
     resolved.last().copied().or(Some(receiver))
+}
+
+/// One chain hop: the owner's prototype (or its parent-pair entry) must
+/// still carry `expected`'s map.
+fn chain_step<'a>(
+    heap: &'a Heap,
+    owner: Tagged<'a, Object>,
+    hop: i64,
+    expected: Tagged<'a, Value>,
+) -> Option<Tagged<'a, Object>> {
+    let proto = owner.as_ref().map_ref(heap).prototype.get(heap);
+    let next = if hop < 0 {
+        proto.as_heap_object()?
+    } else {
+        proto
+            .get_as::<FixedArray>()?
+            .at(heap, hop as usize)
+            .as_heap_object()?
+    };
+    next.map_ref(heap).ptr_eq(expected).then_some(next)
 }
 
 /// Allocate `[kind, payload, (hop, owner, map) × n]`.
@@ -292,6 +356,30 @@ fn build_chain_array<'s>(
     })
 }
 
+/// Allocate `[kind|offset, weak holder map, weak pair-or-zero]`: a one-hop
+/// prototype handler whose single map check replaces the chain walk.
+fn build_proto_array<'s>(
+    heap: &mut Heap,
+    scope: &'s HandleScope<'_>,
+    kind: i64,
+    offset: i64,
+    holder_map: &Handle<'_, Map>,
+    pair: Option<&Handle<'_, AccessorPair>>,
+) -> Handle<'s, WeakFixedArray> {
+    heap.allocate_token_enter_heap(WeakFixedArray::<Value>::layout_for(3), |token, heap| {
+        let words: [Tagged<'_, MaybeWeak<Value>>; 3] = [
+            kind_smi(kind, offset).into_tagged().as_maybe_weak(),
+            holder_map.as_tagged(heap).erase().as_weak(),
+            match pair {
+                Some(pair) => pair.as_tagged(heap).erase().as_weak(),
+                None => Smi::new(0).into_tagged().as_maybe_weak(),
+            },
+        ];
+        let arr = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &words });
+        scope.handle(arr)
+    })
+}
+
 /// What the load analysis found, rooted so it survives handler
 /// construction.
 struct Plan<'s> {
@@ -317,10 +405,22 @@ impl Plan<'_> {
     }
 
     fn into_handler<'s>(self, heap: &mut Heap, scope: &'s HandleScope<'_>) -> Handler<'s> {
+        // a property found on the direct prototype can be cached as a
+        // one-hop handler whose holder map check replaces the chain walk
+        let one_hop =
+            self.entries.len() == 1 && self.entries[0].hop < 0 && self.entries[0].owner < 0;
         match self.kind {
             PlanKind::Field if self.entries.is_empty() => {
                 Handler::Smi(kind_smi(KIND_FIELD, self.offset as i64))
             }
+            PlanKind::Field if one_hop => Handler::ProtoField(build_proto_array(
+                heap,
+                scope,
+                CHAIN_PROTO_FIELD,
+                self.offset as i64,
+                &self.entries[0].map,
+                None,
+            )),
             PlanKind::Field => Handler::Chain(build_chain_array(
                 heap,
                 scope,
@@ -330,6 +430,14 @@ impl Plan<'_> {
                 &self.entries,
             )),
             PlanKind::Slow => Handler::Smi(kind_smi(KIND_SLOW, 0)),
+            PlanKind::Accessor if one_hop => Handler::ProtoAccessor(build_proto_array(
+                heap,
+                scope,
+                CHAIN_PROTO_ACCESSOR,
+                0,
+                &self.entries[0].map,
+                self.pair.as_ref(),
+            )),
             PlanKind::Accessor => Handler::Chain(build_chain_array(
                 heap,
                 scope,
@@ -423,12 +531,15 @@ fn apply_load_handler<'a>(
     let chain = handler.as_strong()?.get_as::<WeakFixedArray>()?;
     let chain_ref = chain.as_ref();
     let head = decode_smi(chain_ref.get(heap, 0))?;
-    let holder = verify_chain(heap, receiver, chain)?;
     match head.0 {
-        CHAIN_FIELD => Some(Hit::Value(holder.slot(heap, head.1 as usize).get(heap))),
-        CHAIN_ACCESSOR => {
+        CHAIN_PROTO_FIELD => {
+            let holder = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
+            Some(Hit::Value(holder.slot(heap, head.1 as usize).get(heap)))
+        }
+        CHAIN_PROTO_ACCESSOR => {
+            proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
             let pair = chain_ref
-                .get(heap, 1)
+                .get(heap, 2)
                 .as_strong()?
                 .get_as::<AccessorPair>()?;
             let getter = pair.get.get(heap);
@@ -438,17 +549,110 @@ fn apply_load_handler<'a>(
                 Hit::Getter(getter)
             })
         }
-        CHAIN_PARENT_NAME => {
-            let pairs = holder
-                .map_ref(heap)
-                .prototype
-                .get(heap)
-                .get_as::<FixedArray>()?;
-            Some(Hit::Value(pairs.at(heap, head.1 as usize)))
+        _ => {
+            let holder = verify_chain(heap, receiver, chain)?;
+            match head.0 {
+                CHAIN_FIELD => Some(Hit::Value(holder.slot(heap, head.1 as usize).get(heap))),
+                CHAIN_ACCESSOR => {
+                    let pair = chain_ref
+                        .get(heap, 1)
+                        .as_strong()?
+                        .get_as::<AccessorPair>()?;
+                    let getter = pair.get.get(heap);
+                    Some(if getter == heap.known().undefined.as_tagged(heap) {
+                        Hit::Value(heap.known().undefined.as_tagged(heap).erase())
+                    } else {
+                        Hit::Getter(getter)
+                    })
+                }
+                CHAIN_PARENT_NAME => {
+                    let pairs = holder
+                        .map_ref(heap)
+                        .prototype
+                        .get(heap)
+                        .get_as::<FixedArray>()?;
+                    Some(Hit::Value(pairs.at(heap, head.1 as usize)))
+                }
+                CHAIN_NON_EXISTENT => Some(Hit::NotFound),
+                _ => None,
+            }
         }
-        CHAIN_NON_EXISTENT => Some(Hit::NotFound),
-        _ => None,
     }
+}
+
+/// Resolve a one-hop prototype handler: the recorded holder map must still
+/// describe the receiver's direct prototype.
+fn proto_holder<'a>(
+    heap: &'a Heap,
+    receiver: Tagged<'a, Object>,
+    expected: Tagged<'a, MaybeWeak<Value>>,
+) -> Option<Tagged<'a, Object>> {
+    let expected = expected.as_strong()?.get_as::<Map>()?;
+    let proto = receiver.map_ref(heap).prototype.get(heap);
+    let holder = proto.as_heap_object()?;
+    holder.map_ref(heap).ptr_eq(expected).then_some(holder)
+}
+
+/// The `undefined` singleton as a value.
+fn undefined<'a>(heap: &'a Heap) -> Tagged<'a, Value> {
+    heap.known().undefined.as_tagged(heap).erase()
+}
+
+/// Execute a dense-array element load handler.
+fn apply_element_load<'a>(
+    heap: &'a Heap,
+    obj: Tagged<'a, Object>,
+    index: usize,
+    payload: i64,
+) -> Option<ElementHit<'a>> {
+    let holey = payload & ELEMENT_HOLEY != 0;
+    let allow_oob = payload & ELEMENT_ALLOW_OOB != 0;
+    let oob = |heap: &'a Heap| {
+        (allow_oob && heap.indexed_props_valid()).then(|| ElementHit::Value(undefined(heap)))
+    };
+    let len = obj.as_ref().length();
+    if index >= len {
+        return oob(heap);
+    }
+    let elements = obj.as_ref().elements.get(heap);
+    if !elements.is_strong_ptr() {
+        return None;
+    }
+    if index >= elements.as_ref().len() {
+        // `length` past the backing store: the index is a hole
+        return oob(heap);
+    }
+    let v = elements.as_ref().at(heap, index);
+    if holey {
+        if v == heap.known().the_hole.as_tagged(heap) {
+            return oob(heap);
+        }
+        return Some(ElementHit::Value(v));
+    }
+    // packed promise: only valid while no array promoted its map since
+    // this handler was recorded
+    let epoch = (payload >> ELEMENT_EPOCH_SHIFT) as u32;
+    if epoch != heap.holey_epoch() {
+        return None;
+    }
+    Some(ElementHit::Value(v))
+}
+
+/// Execute an indexed-string load handler.
+fn apply_indexed_string<'a>(
+    heap: &'a Heap,
+    receiver: Tagged<'a, Value>,
+    index: usize,
+    payload: i64,
+) -> Option<ElementHit<'a>> {
+    let s = receiver.get_as::<DenseString>()?;
+    if index >= s.as_ref().len() {
+        if payload & ELEMENT_ALLOW_OOB != 0 && heap.indexed_props_valid() {
+            return Some(ElementHit::Value(undefined(heap)));
+        }
+        return None;
+    }
+    Some(ElementHit::Char(s.as_ref().code_unit(heap, index)))
 }
 
 struct StorePlan<'s> {
@@ -556,6 +760,160 @@ impl InlineCache {
         }
         let map = scope.handle(recv.map_ref(heap));
         let handler = plan.into_handler(heap, scope);
+        update_site(heap, scope, vector, slot, &map, &handler);
+    }
+
+    /// Keyed element load: dense arrays and indexed strings, keyed on the
+    /// receiver's map. `None` = miss (the slow path decides).
+    pub fn try_load_element<'a>(
+        heap: &'a Heap,
+        vector: Option<Tagged<'a, FeedbackVector>>,
+        slot: usize,
+        receiver: Tagged<'a, Value>,
+        index: usize,
+    ) -> Option<ElementHit<'a>> {
+        let vector = vector?;
+        let obj = receiver.as_heap_object()?;
+        vector.as_ref().site(slot)?;
+        let map = obj.map_ref(heap);
+        let handler = probe(heap, vector, slot, map)?;
+        if handler.raw().is_ptr() {
+            return None;
+        }
+        let (kind, payload) = decode_smi(handler)?;
+        match kind {
+            KIND_ELEMENT => apply_element_load(heap, obj, index, payload),
+            KIND_INDEXED_STRING => apply_indexed_string(heap, receiver, index, payload),
+            _ => None,
+        }
+    }
+
+    /// Keyed element store for dense arrays: in-bounds writes and appends
+    /// within capacity. `None` when the slow path must decide.
+    pub fn try_store_element<'a>(
+        heap: &'a Heap,
+        vector: Option<Tagged<'a, FeedbackVector>>,
+        slot: usize,
+        receiver: Tagged<'a, Value>,
+        index: usize,
+        value: Tagged<'a, Value>,
+    ) -> Option<Tagged<'a, Value>> {
+        let vector = vector?;
+        let obj = receiver.as_heap_object()?;
+        vector.as_ref().site(slot)?;
+        let map = obj.map_ref(heap);
+        let handler = probe(heap, vector, slot, map)?;
+        if handler.raw().is_ptr() {
+            return None;
+        }
+        let (kind, payload) = decode_smi(handler)?;
+        if kind != KIND_ELEMENT_STORE {
+            return None;
+        }
+        let len = obj.as_ref().length();
+        if index > len || (index == len && payload & STORE_GROW == 0) {
+            return None;
+        }
+        let elements = obj.as_ref().elements.get(heap);
+        if !elements.is_strong_ptr() || index >= elements.as_ref().len() {
+            return None;
+        }
+        if index < len
+            && payload & STORE_HOLEY != 0
+            && elements.as_ref().at(heap, index) == heap.known().the_hole.as_tagged(heap)
+        {
+            return None;
+        }
+        elements.as_ref().set(heap, index, value);
+        if index == len {
+            obj.as_ref()
+                .length
+                .set(heap, obj.erase(), Smi::new((index + 1) as i64));
+        }
+        Some(value)
+    }
+
+    /// Re-record the keyed-load site's element handler from a slow-path
+    /// observation.
+    pub fn update_load_element(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        vector: Option<Handle<'_, FeedbackVector>>,
+        slot: usize,
+        receiver: Option<Handle<'_, Value>>,
+        index: usize,
+    ) {
+        let Some(vector) = vector else { return };
+        let Some(receiver) = receiver else { return };
+        if vector.as_tagged(heap).site(slot).is_none() {
+            return;
+        }
+        let recv = receiver.as_tagged(heap);
+        let Some(obj) = recv.as_heap_object() else {
+            return;
+        };
+        let map = scope.handle(obj.map_ref(heap));
+        let handler = if let Some(s) = recv.get_as::<DenseString>() {
+            let s = s.as_ref();
+            if index < s.len() && s.code_unit(heap, index) > 0xFF {
+                return;
+            }
+            if index >= s.len() && !heap.indexed_props_valid() {
+                return;
+            }
+            let mut payload = 0;
+            if heap.indexed_props_valid() {
+                payload |= ELEMENT_ALLOW_OOB;
+            }
+            Handler::Smi(kind_smi(KIND_INDEXED_STRING, payload))
+        } else if obj.as_ref().is_array(heap) {
+            let mut payload = 0;
+            if map.as_tagged(heap).kind().is_holey() {
+                payload |= ELEMENT_HOLEY;
+            }
+            if heap.indexed_props_valid() {
+                payload |= ELEMENT_ALLOW_OOB;
+            }
+            if payload & ELEMENT_HOLEY == 0 {
+                payload |= (heap.holey_epoch() as i64) << ELEMENT_EPOCH_SHIFT;
+            }
+            Handler::Smi(kind_smi(KIND_ELEMENT, payload))
+        } else {
+            return;
+        };
+        update_site(heap, scope, vector, slot, &map, &handler);
+    }
+
+    /// Re-record the keyed-store site's element handler.
+    pub fn update_store_element(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        vector: Option<Handle<'_, FeedbackVector>>,
+        slot: usize,
+        receiver: Option<Handle<'_, Value>>,
+        grew: bool,
+    ) {
+        let Some(vector) = vector else { return };
+        let Some(receiver) = receiver else { return };
+        if vector.as_tagged(heap).site(slot).is_none() {
+            return;
+        }
+        let recv = receiver.as_tagged(heap);
+        let Some(obj) = recv.as_heap_object() else {
+            return;
+        };
+        if !obj.as_ref().is_array(heap) {
+            return;
+        }
+        let map = scope.handle(obj.map_ref(heap));
+        let mut payload = 0;
+        if map.as_tagged(heap).kind().is_holey() {
+            payload |= STORE_HOLEY;
+        }
+        if grew {
+            payload |= STORE_GROW;
+        }
+        let handler = Handler::Smi(kind_smi(KIND_ELEMENT_STORE, payload));
         update_site(heap, scope, vector, slot, &map, &handler);
     }
 

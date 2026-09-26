@@ -8,7 +8,7 @@ use core::cell::Cell;
 use core::marker::PhantomData;
 
 use bytecode::{Opcode, Scale, jump_target};
-use vm_core::ic::{Hit, InlineCache, StoreHit, StoreOutcomeKind};
+use vm_core::ic::{ElementHit, Hit, InlineCache, StoreHit, StoreOutcomeKind};
 use vm_core::proxy::Proxy;
 use vm_core::{
     CallTarget, Coercion, Compare, Context, ContextInit, ContextState, Convert, Key, SlotName,
@@ -28,6 +28,9 @@ pub struct Ctx<'a> {
     state: *const ContextState,
     base_depth: usize,
     safepoints: Cell<u32>,
+    /// numeric result parked between an arithmetic fast path and the
+    /// boxing continuation (which must allocate, so it is out of line)
+    num: Cell<f64>,
     _heap: PhantomData<&'a mut Heap>,
 }
 
@@ -44,6 +47,16 @@ impl<'a> Ctx<'a> {
     unsafe fn heap_mut(&self) -> &'a mut Heap {
         unsafe { &mut *self.heap }
     }
+    #[inline(always)]
+    fn set_num(&self, f: f64) {
+        self.num.set(f);
+    }
+
+    #[inline(always)]
+    fn num(&self) -> f64 {
+        self.num.get()
+    }
+
     #[inline(always)]
     fn state(&self) -> &'a ContextState {
         unsafe { &*self.state }
@@ -273,6 +286,10 @@ handlers!(pc, code, regs, acc, ctx;
         next!(ctx.heap().known().undefined.as_tagged(ctx.heap()).erase())
     }
 
+    LoadNull : op_load_null_n / op_load_null_w () {
+        next!(ctx.heap().known().null.as_tagged(ctx.heap()).erase())
+    }
+
     LoadTrue : op_load_true_n / op_load_true_w () {
         next!(ctx.heap().known().true_object.as_tagged(ctx.heap()).erase())
     }
@@ -287,6 +304,16 @@ handlers!(pc, code, regs, acc, ctx;
             && let Some(sum) = a.checked_add(b)
         {
             next!(Tagged::from_smi_bits(sum))
+        }
+        // both operands already numbers: no ToPrimitive, no scopes; only
+        // a non-integral result needs the boxing continuation
+        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
+            let sum = a + b;
+            if let Some(s) = Smi::from_f64(sum) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(sum);
+            become cold_box_number(pc, code, regs, acc, ctx)
         }
         become cold_add(pc, code, regs, acc, ctx)
     }
@@ -323,6 +350,16 @@ handlers!(pc, code, regs, acc, ctx;
             set_reg!(dst, v);
             next!(v)
         }
+        if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(rhs)) {
+            let sum = a + b;
+            if let Some(s) = Smi::from_f64(sum) {
+                let v = s.into_tagged();
+                set_reg!(dst, v);
+                next!(v)
+            }
+            ctx.set_num(sum);
+            become cold_box_add_loc(pc, code, regs, acc, ctx)
+        }
         become cold_add_loc(pc, code, regs, acc, ctx)
     }
 
@@ -336,18 +373,39 @@ handlers!(pc, code, regs, acc, ctx;
             set_reg!(dst, v);
             next!(v)
         }
+        if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(rhs)) {
+            let diff = a - b;
+            if let Some(s) = Smi::from_f64(diff) {
+                let v = s.into_tagged();
+                set_reg!(dst, v);
+                next!(v)
+            }
+            ctx.set_num(diff);
+            become cold_box_sub_loc(pc, code, regs, acc, ctx)
+        }
         become cold_sub_loc(pc, code, regs, acc, ctx)
     }
 
-    LoadKeyedPropertyReg : op_load_keyed_reg_n / op_load_keyed_reg_w (recv => signed, key => signed, _fb => unsigned) {
+    LoadKeyedPropertyReg : op_load_keyed_reg_n / op_load_keyed_reg_w (recv => signed, key => signed, fb => unsigned) {
         let recv = reg!(recv);
         let key = reg!(key);
         if let Some(idx) = key.to_i64()
             && idx >= 0
-            && let Some(obj) = recv.as_heap_object()
-            && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx as usize)
         {
-            next!(v)
+            if let Some(obj) = recv.as_heap_object()
+                && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx as usize)
+            {
+                next!(v)
+            }
+            if let Some(ElementHit::Value(v)) = InlineCache::try_load_element(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                recv,
+                idx as usize,
+            ) {
+                next!(v)
+            }
         }
         become cold_keyed_load_reg(pc, code, regs, acc, ctx)
     }
@@ -358,6 +416,14 @@ handlers!(pc, code, regs, acc, ctx;
             && let Some(diff) = a.checked_sub(b)
         {
             next!(Tagged::from_smi_bits(diff))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
+            let diff = a - b;
+            if let Some(s) = Smi::from_f64(diff) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(diff);
+            become cold_box_number(pc, code, regs, acc, ctx)
         }
         become cold_numeric(pc, code, regs, acc, ctx)
     }
@@ -370,6 +436,14 @@ handlers!(pc, code, regs, acc, ctx;
             && let Some(product) = (a >> 1).checked_mul(b)
         {
             next!(Tagged::from_smi_bits(product))
+        }
+        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
+            let product = a * b;
+            if let Some(s) = Smi::from_f64(product) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(product);
+            become cold_box_number(pc, code, regs, acc, ctx)
         }
         become cold_numeric(pc, code, regs, acc, ctx)
     }
@@ -386,6 +460,14 @@ handlers!(pc, code, regs, acc, ctx;
         {
             next!(Tagged::from_smi_bits(encoded))
         }
+        if let (Some(a), Some(b)) = (Convert::as_number(acc), Convert::as_number(other)) {
+            let quotient = a / b;
+            if let Some(s) = Smi::from_f64(quotient) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(quotient);
+            become cold_box_number(pc, code, regs, acc, ctx)
+        }
         become cold_numeric(pc, code, regs, acc, ctx)
     }
 
@@ -397,6 +479,22 @@ handlers!(pc, code, regs, acc, ctx;
             next!(Convert::boolean(ctx.heap(), a == b))
         }
         become cold_equal(pc, code, regs, acc, ctx)
+    }
+
+    LessThan : op_less_than_n / op_less_than_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
+            next!(Convert::boolean(ctx.heap(), a < b))
+        }
+        become cold_less_than(pc, code, regs, acc, ctx)
+    }
+
+    GreaterThan : op_greater_than_n / op_greater_than_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
+            next!(Convert::boolean(ctx.heap(), a > b))
+        }
+        become cold_greater_than(pc, code, regs, acc, ctx)
     }
 
     ShiftRight : op_shift_right_n / op_shift_right_w (r => signed) {
@@ -412,17 +510,47 @@ handlers!(pc, code, regs, acc, ctx;
         let key_w = reg!(key);
         if let Some(idx) = key_w.to_i64()
             && idx >= 0
-            && Object::store_array_element_in_place(
-                ctx.heap_mut(),
+        {
+            if Object::store_array_element_in_place(ctx.heap(), recv_w, idx as usize, acc).is_ok()
+            {
+                next!(acc)
+            }
+            if let Some(v) = InlineCache::try_store_element(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
                 recv_w,
                 idx as usize,
                 acc,
-            )
-            .is_ok()
-        {
-            next!(acc)
+            ) {
+                next!(v)
+            }
         }
         become cold_keyed_store(pc, code, regs, acc, ctx)
+    }
+
+    StoreKeyedPropertyNoShadow : op_store_keyed_no_shadow_n / op_store_keyed_no_shadow_w (recv => signed, key => signed, fb => unsigned) {
+        let recv_w = reg!(recv);
+        let key_w = reg!(key);
+        if let Some(idx) = key_w.to_i64()
+            && idx >= 0
+        {
+            if Object::store_array_element_in_place(ctx.heap(), recv_w, idx as usize, acc).is_ok()
+            {
+                next!(acc)
+            }
+            if let Some(v) = InlineCache::try_store_element(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                recv_w,
+                idx as usize,
+                acc,
+            ) {
+                next!(v)
+            }
+        }
+        become cold_keyed_store_no_shadow(pc, code, regs, acc, ctx)
     }
 
     Negate : op_negate_n / op_negate_w () {
@@ -431,6 +559,14 @@ handlers!(pc, code, regs, acc, ctx;
             && let Some(neg) = bits.checked_neg()
         {
             next!(Tagged::from_smi_bits(neg))
+        }
+        if let Some(a) = Convert::as_number(acc) {
+            let neg = -a;
+            if let Some(s) = Smi::from_f64(neg) {
+                next!(s.into_tagged())
+            }
+            ctx.set_num(neg);
+            become cold_box_number(pc, code, regs, acc, ctx)
         }
         become cold_negate(pc, code, regs, acc, ctx)
     }
@@ -528,14 +664,25 @@ handlers!(pc, code, regs, acc, ctx;
         become cold_named_load(pc, code, regs, acc, ctx)
     }
 
-    LoadKeyedProperty : op_load_keyed_n / op_load_keyed_w (r => signed, _fb => unsigned) {
+    LoadKeyedProperty : op_load_keyed_n / op_load_keyed_w (r => signed, fb => unsigned) {
         let recv = reg!(r);
         if let Some(idx) = acc.to_i64()
             && idx >= 0
-            && let Some(obj) = recv.as_heap_object()
-            && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx as usize)
         {
-            next!(v)
+            if let Some(obj) = recv.as_heap_object()
+                && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx as usize)
+            {
+                next!(v)
+            }
+            if let Some(ElementHit::Value(v)) = InlineCache::try_load_element(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                recv,
+                idx as usize,
+            ) {
+                next!(v)
+            }
         }
         become cold_keyed_load(pc, code, regs, acc, ctx)
     }
@@ -565,6 +712,16 @@ handlers!(pc, code, regs, acc, ctx;
 
     StoreNamedProperty : op_store_named_n / op_store_named_w (r => signed, name => unsigned, fb => unsigned) {
         let recv = reg!(r);
+        // a cached bare-field handler writes in place: no scope, no lookup
+        if InlineCache::try_store_fast(
+            ctx.heap_mut(),
+            ctx.cache().feedback_ref(ctx.heap()),
+            fb,
+            recv,
+            acc,
+        ) {
+            next!(acc)
+        }
         become cold_store_named(pc, code, regs, acc, ctx)
     }
 
@@ -645,6 +802,14 @@ handlers!(pc, code, regs, acc, ctx;
 
     CreateClosure : op_create_closure_n / op_create_closure_w (info => unsigned) {
         become cold_create_closure(pc, code, regs, acc, ctx)
+    }
+
+    CreateEmptyArrayLiteral : op_create_empty_array_n / op_create_empty_array_w () {
+        become cold_create_empty_array(pc, code, regs, acc, ctx)
+    }
+
+    CreateEmptyObjectLiteral : op_create_empty_object_n / op_create_empty_object_w () {
+        become cold_create_empty_object(pc, code, regs, acc, ctx)
     }
 
     CallRuntime : op_call_runtime_n / op_call_runtime_w (rt => unsigned, base => signed, count => unsigned) {
@@ -843,6 +1008,54 @@ unsafe fn numeric_cold<'a>(
 
 #[cold]
 #[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_box_number<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let v = ctx.heap_mut().new_number(ctx.num());
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_box_add_loc<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let dst = signed::read(pc, code, base, stride);
+    let v = ctx.heap_mut().new_number(ctx.num());
+    reg_write(regs, dst, v);
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_box_sub_loc<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let dst = signed::read(pc, code, base, stride);
+    let v = ctx.heap_mut().new_number(ctx.num());
+    reg_write(regs, dst, v);
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
 unsafe fn negate_cold<'a>(
     ctx: &Ctx<'a>,
     v: Tagged<'_, Value>,
@@ -872,29 +1085,57 @@ unsafe fn compare_cold<'a>(
     let heap = ctx.heap_mut();
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Option<bool>, VmError> {
-        let hint = match cmp {
-            0 => Hint::Default,
-            _ => Hint::Number,
-        };
         let x = scope.handle(lhs);
-        let x = match Object::to_primitive(vm, heap, state, x, hint)? {
+        let y = scope.handle(rhs);
+        match cmp {
+            1 => {
+                // IsStrictEqual (ES 7.2.15): no coercion, ever
+                let b = Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
+                return Ok(Some(b));
+            }
+            0 => {
+                // IsLooselyEqual: object ↔ object compares by identity;
+                // object ↔ primitive coerces the object
+                let x_obj = Compare::is_object_operand(heap, x.as_tagged(heap));
+                let y_obj = Compare::is_object_operand(heap, y.as_tagged(heap));
+                if x_obj && y_obj {
+                    let b = Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
+                    return Ok(Some(b));
+                }
+                let x = if x_obj {
+                    match Object::to_primitive(vm, heap, state, x, Hint::Default)? {
+                        Coercion::Threw => return Ok(None),
+                        Coercion::Value(v) => scope.handle(v),
+                    }
+                } else {
+                    x
+                };
+                let y = if y_obj {
+                    match Object::to_primitive(vm, heap, state, y, Hint::Default)? {
+                        Coercion::Threw => return Ok(None),
+                        Coercion::Value(v) => scope.handle(v),
+                    }
+                } else {
+                    y
+                };
+                let b = Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?;
+                return Ok(Some(b));
+            }
+            _ => {}
+        }
+        let x = match Object::to_primitive(vm, heap, state, x, Hint::Number)? {
             Coercion::Threw => return Ok(None),
             Coercion::Value(v) => scope.handle(v),
         };
-        let y = scope.handle(rhs);
-        let y = match Object::to_primitive(vm, heap, state, y, hint)? {
+        let y = match Object::to_primitive(vm, heap, state, y, Hint::Number)? {
             Coercion::Threw => return Ok(None),
             Coercion::Value(v) => scope.handle(v),
         };
         let b = match cmp {
-            0 => Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-            1 => Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap)),
             2 => Compare::less_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
             3 => Compare::less_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
             4 => Compare::greater_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-            _ => {
-                Compare::greater_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?
-            }
+            _ => Compare::greater_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
         };
         Ok(Some(b))
     })
@@ -955,6 +1196,7 @@ unsafe fn keyed_load_cold<'a>(
     ctx: &Ctx<'a>,
     recv: Tagged<'_, Value>,
     key: Tagged<'_, Value>,
+    fb_slot: Option<usize>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let vm = ctx.vm();
     let heap = ctx.heap_mut();
@@ -973,6 +1215,25 @@ unsafe fn keyed_load_cold<'a>(
             return Ok(ctx.exception_word());
         };
         let key = scope.handle(key);
+        let element_index = match Lookup::classify_key(heap, key.as_tagged(heap).erase()) {
+            Ok(Key::Element(i)) => Some(i),
+            _ => None,
+        };
+        if let Some(i) = element_index {
+            if let Some(fb) = fb_slot {
+                InlineCache::update_load_element(
+                    heap,
+                    &scope,
+                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                    fb,
+                    Some(recv),
+                    i,
+                );
+            }
+            if let Some(unit) = DenseString::index_element(heap, &scope, recv, key) {
+                return Ok(unit);
+            }
+        }
         match Lookup::load_outcome_keyed(heap, recv.as_tagged(heap), key.as_tagged(heap))? {
             LoadOutcome::Value(v) => Ok(v),
             LoadOutcome::Getter(getter) => {
@@ -996,8 +1257,12 @@ unsafe fn keyed_load_imm_cold<'a>(
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let recv = scope.handle(recv);
-        let key = scope.handle(Smi::new(idx as i64).into_tagged());
-        match Lookup::load_outcome_keyed(heap, recv.as_tagged(heap), key.as_tagged(heap).as_name())? {
+        let smi = Smi::new(idx as i64).into_tagged();
+        let key: Handle<'_, SlotName> = scope.handle(smi.as_name());
+        if let Some(unit) = DenseString::index_element(heap, &scope, recv, key) {
+            return Ok(unit);
+        }
+        match Lookup::load_outcome_keyed(heap, recv.as_tagged(heap), key.as_tagged(heap))? {
             LoadOutcome::Value(v) => Ok(v),
             LoadOutcome::Getter(getter) => {
                 let getter = scope.handle(getter);
@@ -1015,6 +1280,8 @@ unsafe fn keyed_store_cold<'a>(
     recv: Tagged<'_, Value>,
     key: Tagged<'_, Value>,
     value: Tagged<'_, Value>,
+    fb_slot: Option<usize>,
+    semantics: StoreSemantics,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let vm = ctx.vm();
     let heap = ctx.heap_mut();
@@ -1052,10 +1319,21 @@ unsafe fn keyed_store_cold<'a>(
                     .as_heap_object()
                     .is_some_and(|obj| obj.as_ref().is_array(heap))
                 {
-                    let recv = scope
+                    let obj = scope
                         .cast::<Object>(recv.as_tagged(heap))
                         .expect("array receiver is an object");
-                    Object::store_array_element(heap, &scope, &recv, i, &value)?;
+                    let grew = i >= obj.as_tagged(heap).as_ref().length();
+                    Object::store_array_element(heap, &scope, &obj, i, &value)?;
+                    if let Some(fb) = fb_slot {
+                        InlineCache::update_store_element(
+                            heap,
+                            &scope,
+                            ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                            fb,
+                            Some(recv),
+                            grew,
+                        );
+                    }
                     return Ok(value.as_tagged(heap).erase());
                 }
                 scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
@@ -1067,7 +1345,7 @@ unsafe fn keyed_store_cold<'a>(
             &scope,
             name.as_tagged(heap),
             value.as_tagged(heap),
-            StoreSemantics::Shadow,
+            semantics,
         )?;
         match outcome {
             StoreOutcome::Transition { receiver, name } => {
@@ -1364,12 +1642,15 @@ unsafe fn create_function_context_cold<'a>(
             .get_as::<ScopeInfo>()
             .map(|r| r.as_ref().names.get(heap).len())
             .ok_or(VmError::Type)?;
-        let values =
-            scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
         let scope_info = scope
             .cast::<ScopeInfo>(ctx.cache().constants_ref(heap).at(heap, scope_idx))
             .expect("constants slot holds a ScopeInfo");
-        let slots = heap.allocate_handle::<FixedArray>(values, &scope);
+        let slots = if count == 0 {
+            heap.known().empty_fixed_array
+        } else {
+            let values = scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
+            heap.allocate_handle::<FixedArray>(values, &scope)
+        };
         let ctx_obj = heap.allocate::<Context>(ContextInit {
             outer: Some(outer),
             slots,
@@ -1625,8 +1906,35 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
     let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
-    let v = keyed_load_cold(ctx, recv, key)?;
+    let fb = unsigned::read(pc, code, base + 2 * stride, stride);
+    let v = keyed_load_cold(ctx, recv, key, Some(fb))?;
     become resume(next, code, regs, v, ctx)
+}
+
+/// Shared cold body of the comparison opcodes: `cmp` uses the
+/// `compare_cold` numbering (0 eq, 2 lt, 3 le, 4 gt, 5 ge).
+#[cold]
+#[inline(never)]
+unsafe fn compare_op_cold<'a>(
+    ctx: &Ctx<'a>,
+    cmp: u8,
+    acc: Tagged<'_, Value>,
+    other: Tagged<'_, Value>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
+        (Some(a), Some(b)) => Some(match cmp {
+            0 => a == b,
+            2 => a < b,
+            3 => a <= b,
+            4 => a > b,
+            _ => a >= b,
+        }),
+        _ => compare_cold(ctx, cmp, acc, other)?,
+    };
+    let Some(b) = b else {
+        return Ok(ctx.exception_word());
+    };
+    Ok(Convert::boolean(ctx.heap(), b))
 }
 
 #[cold]
@@ -1641,15 +1949,40 @@ unsafe extern "rust-preserve-none" fn cold_equal<'a>(
     let (base, stride) = cold_layout(pc, code);
     let next = cold_next_pc(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
-        (Some(a), Some(b)) => Some(a == b),
-        _ => compare_cold(ctx, 0, acc, other)?,
-    };
-    let Some(b) = b else {
-        return Ok(ctx.exception_word());
-    };
-    let boolean = Convert::boolean(ctx.heap(), b);
-    become resume(next, code, regs, boolean, ctx)
+    let v = compare_op_cold(ctx, 0, acc, other)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_less_than<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = compare_op_cold(ctx, 2, acc, other)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_greater_than<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = compare_op_cold(ctx, 4, acc, other)?;
+    become resume(next, code, regs, v, ctx)
 }
 
 #[cold]
@@ -1720,7 +2053,8 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load<'a>(
     let (base, stride) = cold_layout(pc, code);
     let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = keyed_load_cold(ctx, recv, acc)?;
+    let fb = unsigned::read(pc, code, base + stride, stride);
+    let v = keyed_load_cold(ctx, recv, acc, Some(fb))?;
     become resume(next, code, regs, v, ctx)
 }
 
@@ -1754,7 +2088,26 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store<'a>(
     let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
-    let v = keyed_store_cold(ctx, recv, key, acc)?;
+    let fb = unsigned::read(pc, code, base + 2 * stride, stride);
+    let v = keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_keyed_store_no_shadow<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let key = reg_read(regs, ctx.heap(), signed::read(pc, code, base + stride, stride));
+    let fb = unsigned::read(pc, code, base + 2 * stride, stride);
+    let v = keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)?;
     become resume(next, code, regs, v, ctx)
 }
 
@@ -1829,6 +2182,44 @@ unsafe extern "rust-preserve-none" fn cold_create_closure<'a>(
 
 #[cold]
 #[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_create_empty_array<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    let obj = state.handle_scope(|scope| {
+        let map = heap.known().js_array_map;
+        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
+    });
+    become resume(next, code, regs, obj, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_create_empty_object<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    let obj = state.handle_scope(|scope| {
+        let map = heap.known().object_initial_map;
+        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
+    });
+    become resume(next, code, regs, obj, ctx)
+}
+
+#[cold]
+#[inline(never)]
 unsafe extern "rust-preserve-none" fn cold_create_function_context<'a>(
     pc: usize,
     code: *const u8,
@@ -1870,6 +2261,7 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::LoadConstant as usize] = op_load_constant_n as Handler;
     t[Opcode::LoadZero as usize] = op_load_zero_n as Handler;
     t[Opcode::LoadUndefined as usize] = op_load_undefined_n as Handler;
+    t[Opcode::LoadNull as usize] = op_load_null_n as Handler;
     t[Opcode::LoadTrue as usize] = op_load_true_n as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_n as Handler;
     t[Opcode::Add as usize] = op_add_n as Handler;
@@ -1882,8 +2274,11 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::Mul as usize] = op_mul_n as Handler;
     t[Opcode::Div as usize] = op_div_n as Handler;
     t[Opcode::Equal as usize] = op_equal_n as Handler;
+    t[Opcode::LessThan as usize] = op_less_than_n as Handler;
+    t[Opcode::GreaterThan as usize] = op_greater_than_n as Handler;
     t[Opcode::ShiftRight as usize] = op_shift_right_n as Handler;
     t[Opcode::StoreKeyedProperty as usize] = op_store_keyed_n as Handler;
+    t[Opcode::StoreKeyedPropertyNoShadow as usize] = op_store_keyed_no_shadow_n as Handler;
     t[Opcode::Negate as usize] = op_negate_n as Handler;
     t[Opcode::CompareJump as usize] = op_compare_jump_n as Handler;
     t[Opcode::Jump as usize] = op_jump_n as Handler;
@@ -1903,6 +2298,8 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::PopContext as usize] = op_pop_context_n as Handler;
     t[Opcode::CreateFunctionContext as usize] = op_create_function_context_n as Handler;
     t[Opcode::CreateClosure as usize] = op_create_closure_n as Handler;
+    t[Opcode::CreateEmptyArrayLiteral as usize] = op_create_empty_array_n as Handler;
+    t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object_n as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime_n as Handler;
     t[Opcode::CallNoFeedback as usize] = op_call_n as Handler;
     t[Opcode::Construct as usize] = op_construct_n as Handler;
@@ -1919,6 +2316,7 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::LoadConstant as usize] = op_load_constant_w as Handler;
     t[Opcode::LoadZero as usize] = op_load_zero_w as Handler;
     t[Opcode::LoadUndefined as usize] = op_load_undefined_w as Handler;
+    t[Opcode::LoadNull as usize] = op_load_null_w as Handler;
     t[Opcode::LoadTrue as usize] = op_load_true_w as Handler;
     t[Opcode::LoadFalse as usize] = op_load_false_w as Handler;
     t[Opcode::Add as usize] = op_add_w as Handler;
@@ -1931,8 +2329,11 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::Mul as usize] = op_mul_w as Handler;
     t[Opcode::Div as usize] = op_div_w as Handler;
     t[Opcode::Equal as usize] = op_equal_w as Handler;
+    t[Opcode::LessThan as usize] = op_less_than_w as Handler;
+    t[Opcode::GreaterThan as usize] = op_greater_than_w as Handler;
     t[Opcode::ShiftRight as usize] = op_shift_right_w as Handler;
     t[Opcode::StoreKeyedProperty as usize] = op_store_keyed_w as Handler;
+    t[Opcode::StoreKeyedPropertyNoShadow as usize] = op_store_keyed_no_shadow_w as Handler;
     t[Opcode::Negate as usize] = op_negate_w as Handler;
     t[Opcode::CompareJump as usize] = op_compare_jump_w as Handler;
     t[Opcode::Jump as usize] = op_jump_w as Handler;
@@ -1952,6 +2353,8 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::PopContext as usize] = op_pop_context_w as Handler;
     t[Opcode::CreateFunctionContext as usize] = op_create_function_context_w as Handler;
     t[Opcode::CreateClosure as usize] = op_create_closure_w as Handler;
+    t[Opcode::CreateEmptyArrayLiteral as usize] = op_create_empty_array_w as Handler;
+    t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object_w as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime_w as Handler;
     t[Opcode::CallNoFeedback as usize] = op_call_w as Handler;
     t[Opcode::Construct as usize] = op_construct_w as Handler;
@@ -2043,6 +2446,7 @@ fn enter<'a>(
                 state: state as *const ContextState,
                 base_depth,
                 safepoints: Cell::new(SAFEPOINT_INTERVAL),
+                num: Cell::new(0.0),
                 _heap: PhantomData,
             };
             let base = ctx.code_ptr();

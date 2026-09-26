@@ -649,3 +649,27 @@ fn unresolvable_global_names_the_binding() {
     // `typeof` on an unresolved global stays undefined, not a throw
     assert_eq!(run_str("typeof flurb;"), "undefined");
 }
+
+#[test]
+fn loose_equal_objects_compare_by_identity() {
+    // Abstract Equality: two objects are `===` — no ToPrimitive
+    assert!(!run_bool("{ var a = {x: 1}; var b = {y: 2}; a == b; }"));
+    assert!(run_bool("{ var a = {x: 1}; a == a; }"));
+    assert!(!run_bool(
+        "{ var f = function() {}; var g = function() {}; f == g; }"
+    ));
+    assert!(run_bool("{ var f = function() {}; f == f; }"));
+    // an object against a primitive still coerces (hint default)
+    assert!(run_bool(
+        "{ var a = { valueOf: function() { return 5; } }; a == 5; }"
+    ));
+}
+
+#[test]
+fn strict_equal_objects_compare_by_identity() {
+    assert!(!run_bool("{ var a = {x: 1}; var b = {y: 2}; a === b; }"));
+    assert!(run_bool("{ var a = {x: 1}; a === a; }"));
+    assert!(!run_bool(
+        "{ var a = { valueOf: function() { return 5; } }; a === 5; }"
+    ));
+}
