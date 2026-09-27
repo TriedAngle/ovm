@@ -492,6 +492,7 @@ impl VM {
         &self.shared.runtimes
     }
 
+    #[inline]
     pub fn runtime(&self, index: RuntimeIndex) -> RuntimeCall {
         self.shared
             .runtimes

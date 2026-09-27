@@ -120,6 +120,7 @@ impl Convert {
 
     /// ES Type check: numbers, strings, symbols, booleans, null, undefined
     /// are primitives; everything else is an object.
+    #[inline]
     pub fn is_primitive(heap: &Heap, v: Tagged<'_, Value>) -> bool {
         let known = heap.known();
         if v.is_smi() {

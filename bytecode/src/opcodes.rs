@@ -352,12 +352,12 @@ define_opcodes! {
     /// Keyed read with the key in a register: `acc = regs[recv][regs[key]]`.
     LoadKeyedPropertyReg { operands: [Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },
 
-    CallFunction0 { operands: [Register], acc: writes, indices: [Unchecked] },                              // callee -> acc
-    CallFunction1 { operands: [Register, Register], acc: writes, indices: [Unchecked, Unchecked] },          // callee, arg0 -> acc
-    CallFunction2 { operands: [Register, Register, Register], acc: writes, indices: [Unchecked, Unchecked, Unchecked] }, // callee, arg0, arg1 -> acc
+    CallFunction0 { operands: [Register, Index], acc: writes, indices: [Unchecked, Feedback] },                              // callee, fb -> acc
+    CallFunction1 { operands: [Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },          // callee, arg0, fb -> acc
+    CallFunction2 { operands: [Register, Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Feedback] }, // callee, arg0, arg1, fb -> acc
 
 
-    CallMethod0 { operands: [Register, Register], acc: writes, indices: [Unchecked, Unchecked] },                              // callee, receiver -> acc
-    CallMethod1 { operands: [Register, Register, Register], acc: writes, indices: [Unchecked, Unchecked, Unchecked] },          // callee, receiver, arg0 -> acc
-    CallMethod2 { operands: [Register, Register, Register, Register], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Unchecked] }, // callee, receiver, arg0, arg1 -> acc
+    CallMethod0 { operands: [Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },                              // callee, receiver, fb -> acc
+    CallMethod1 { operands: [Register, Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Feedback] },          // callee, receiver, arg0, fb -> acc
+    CallMethod2 { operands: [Register, Register, Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Unchecked, Feedback] }, // callee, receiver, arg0, arg1, fb -> acc
 }

@@ -772,39 +772,45 @@ impl FnBuilder {
     }
 
     /// `acc = callee()` with the receiver implicitly `undefined`.
-    pub fn call_function0(&mut self, callee: Reg) {
-        self.emit_tracked(Opcode::CallFunction0, &[callee.operand()]);
+    pub fn call_function0(&mut self, callee: Reg, fb: Feedback) {
+        self.emit_tracked(Opcode::CallFunction0, &[callee.operand(), fb.0]);
     }
 
     /// `acc = callee(arg0)` with the receiver implicitly `undefined`.
-    pub fn call_function1(&mut self, callee: Reg, arg0: Reg) {
-        self.emit_tracked(Opcode::CallFunction1, &[callee.operand(), arg0.operand()]);
+    pub fn call_function1(&mut self, callee: Reg, arg0: Reg, fb: Feedback) {
+        self.emit_tracked(
+            Opcode::CallFunction1,
+            &[callee.operand(), arg0.operand(), fb.0],
+        );
     }
 
     /// `acc = callee(arg0, arg1)` with the receiver implicitly `undefined`.
-    pub fn call_function2(&mut self, callee: Reg, arg0: Reg, arg1: Reg) {
+    pub fn call_function2(&mut self, callee: Reg, arg0: Reg, arg1: Reg, fb: Feedback) {
         self.emit_tracked(
             Opcode::CallFunction2,
-            &[callee.operand(), arg0.operand(), arg1.operand()],
+            &[callee.operand(), arg0.operand(), arg1.operand(), fb.0],
         );
     }
 
     /// `acc = callee(recv)` with the receiver in its own register: no
     /// contiguous argument window is built.
-    pub fn call_method0(&mut self, callee: Reg, recv: Reg) {
-        self.emit_tracked(Opcode::CallMethod0, &[callee.operand(), recv.operand()]);
+    pub fn call_method0(&mut self, callee: Reg, recv: Reg, fb: Feedback) {
+        self.emit_tracked(
+            Opcode::CallMethod0,
+            &[callee.operand(), recv.operand(), fb.0],
+        );
     }
 
     /// `acc = callee(recv, arg0)`.
-    pub fn call_method1(&mut self, callee: Reg, recv: Reg, arg0: Reg) {
+    pub fn call_method1(&mut self, callee: Reg, recv: Reg, arg0: Reg, fb: Feedback) {
         self.emit_tracked(
             Opcode::CallMethod1,
-            &[callee.operand(), recv.operand(), arg0.operand()],
+            &[callee.operand(), recv.operand(), arg0.operand(), fb.0],
         );
     }
 
     /// `acc = callee(recv, arg0, arg1)`.
-    pub fn call_method2(&mut self, callee: Reg, recv: Reg, arg0: Reg, arg1: Reg) {
+    pub fn call_method2(&mut self, callee: Reg, recv: Reg, arg0: Reg, arg1: Reg, fb: Feedback) {
         self.emit_tracked(
             Opcode::CallMethod2,
             &[
@@ -812,6 +818,7 @@ impl FnBuilder {
                 recv.operand(),
                 arg0.operand(),
                 arg1.operand(),
+                fb.0,
             ],
         );
     }

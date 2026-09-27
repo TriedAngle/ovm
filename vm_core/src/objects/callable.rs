@@ -77,6 +77,7 @@ impl FunctionKind {
         matches!(self, Self::Normal)
     }
 
+    #[inline]
     pub(crate) fn decode(value: i64) -> Self {
         match value {
             x if x == Self::Normal as i64 => Self::Normal,

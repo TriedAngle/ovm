@@ -1075,6 +1075,26 @@ handlers!(pc, code, regs, acc, ctx;
         }
     }
 
+    Call : op_call_ic_n / op_call_ic_w (callee => signed, base => signed, count => unsigned, fb => unsigned) {
+        let callee_word = reg!(callee);
+        match call_start(ctx, pc, SIZE, callee_word, base, count, fb)? {
+            MethodCall::Value(v) => {
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
+                reenter!(pc, SIZE, v)
+            }
+            MethodCall::Frame => {
+                let p = ctx.cache().pc();
+                let b = ctx.code_ptr();
+                let r = ctx.regs_ptr();
+                let u = ctx.undefined_word();
+                dispatch!(p, u, r, b)
+            }
+            MethodCall::Proxy => become cold_proxy_apply(pc, code, regs, acc, ctx),
+        }
+    }
+
     CallNoFeedback : op_call_n / op_call_w (callee => signed, base => signed, count => unsigned) {
         let callee_word = reg!(callee);
         match Object::call_target(ctx.heap(), callee_word) {
@@ -1134,9 +1154,9 @@ handlers!(pc, code, regs, acc, ctx;
         }
     }
 
-    CallMethod0 : op_call_method0_n / op_call_method0_w (callee => signed, recv => signed) {
+    CallMethod0 : op_call_method0_n / op_call_method0_w (callee => signed, recv => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_method_start(ctx, pc, SIZE, callee_word, &[recv])? {
+        match call_method_start(ctx, pc, SIZE, callee_word, &[recv], fb)? {
             MethodCall::Value(v) => {
                 if ctx.is_throw(v) {
                     return Ok(v);
@@ -1154,9 +1174,9 @@ handlers!(pc, code, regs, acc, ctx;
         }
     }
 
-    CallMethod1 : op_call_method1_n / op_call_method1_w (callee => signed, recv => signed, arg0 => signed) {
+    CallMethod1 : op_call_method1_n / op_call_method1_w (callee => signed, recv => signed, arg0 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0])? {
+        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0], fb)? {
             MethodCall::Value(v) => {
                 if ctx.is_throw(v) {
                     return Ok(v);
@@ -1174,9 +1194,9 @@ handlers!(pc, code, regs, acc, ctx;
         }
     }
 
-    CallMethod2 : op_call_method2_n / op_call_method2_w (callee => signed, recv => signed, arg0 => signed, arg1 => signed) {
+    CallMethod2 : op_call_method2_n / op_call_method2_w (callee => signed, recv => signed, arg0 => signed, arg1 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0, arg1])? {
+        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0, arg1], fb)? {
             MethodCall::Value(v) => {
                 if ctx.is_throw(v) {
                     return Ok(v);
@@ -1194,9 +1214,9 @@ handlers!(pc, code, regs, acc, ctx;
         }
     }
 
-    CallFunction0 : op_call_function0_n / op_call_function0_w (callee => signed) {
+    CallFunction0 : op_call_function0_n / op_call_function0_w (callee => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_function_start(ctx, pc, SIZE, callee_word, &[])? {
+        match call_function_start(ctx, pc, SIZE, callee_word, &[], fb)? {
             MethodCall::Value(v) => {
                 if ctx.is_throw(v) {
                     return Ok(v);
@@ -1214,9 +1234,9 @@ handlers!(pc, code, regs, acc, ctx;
         }
     }
 
-    CallFunction1 : op_call_function1_n / op_call_function1_w (callee => signed, arg0 => signed) {
+    CallFunction1 : op_call_function1_n / op_call_function1_w (callee => signed, arg0 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0])? {
+        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0], fb)? {
             MethodCall::Value(v) => {
                 if ctx.is_throw(v) {
                     return Ok(v);
@@ -1234,9 +1254,9 @@ handlers!(pc, code, regs, acc, ctx;
         }
     }
 
-    CallFunction2 : op_call_function2_n / op_call_function2_w (callee => signed, arg0 => signed, arg1 => signed) {
+    CallFunction2 : op_call_function2_n / op_call_function2_w (callee => signed, arg0 => signed, arg1 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0, arg1])? {
+        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0, arg1], fb)? {
             MethodCall::Value(v) => {
                 if ctx.is_throw(v) {
                     return Ok(v);
@@ -2702,28 +2722,279 @@ enum MethodCall<'a> {
     Proxy,
 }
 
+const CALL_TAG_BYTECODE: i64 = 0;
+const CALL_TAG_RUNTIME: i64 = 1;
+
+/// Call-IC probe: `Some(target)` when the site's `(state, handler)` pair
+/// caches this exact callee. The state slot holds a weak reference to the
+/// callee (monomorphic) or the megamorphic symbol; the handler slot holds a
+/// [`CALL_TAG_*`] discriminant. `None` means the caller must run the slow
+/// resolution and call [`call_ic_update`].
+#[inline(always)]
+unsafe fn call_ic_probe<'a>(
+    ctx: &Ctx<'a>,
+    fb: usize,
+    callee: Tagged<'a, Value>,
+) -> Option<CallTarget<'a>> {
+    let vector = ctx.cache().feedback_ref(ctx.heap())?;
+    let state = vector.as_ref().slot(fb).get(ctx.heap());
+    if !state.raw().is_weak_ptr() || !state.ptr_eq(callee) {
+        return None;
+    }
+    match Smi::decode(vector.as_ref().slot(fb + 1).get(ctx.heap()).raw())?.value() {
+        CALL_TAG_BYTECODE => Object::bytecode_target(ctx.heap(), callee),
+        CALL_TAG_RUNTIME => {
+            let obj = callee.as_heap_object()?;
+            Some(CallTarget::Runtime(obj.as_ref().runtime_index(ctx.heap())?))
+        }
+        _ => None,
+    }
+}
+
+/// Call-IC update: arm the site monomorphically for `callee` (with `tag`
+/// and, for bytecode callees, the shared `info` used to recognize other
+/// closures of the same code) or transition it to megamorphic when the
+/// callee set at this site varies.
+#[inline(always)]
+unsafe fn call_ic_update<'a>(
+    ctx: &Ctx<'a>,
+    fb: usize,
+    callee: Tagged<'a, Value>,
+    tag: i64,
+    info: Option<Tagged<'a, CallableInfoObject>>,
+) {
+    let heap = ctx.heap();
+    let Some(vector) = ctx.cache().feedback_ref(heap) else {
+        return;
+    };
+    let Some((state_slot, tag_slot)) = vector.as_ref().site(fb) else {
+        return;
+    };
+    let host = vector.erase();
+    if state_slot.is_cleared() {
+        // a collected weak entry leaves the site free to become monomorphic
+        // again
+    } else {
+        let state = state_slot.get(heap);
+        if state.raw().is_strong_ptr() {
+            let hole = heap.known().the_hole.as_tagged(heap).erase();
+            if !state.ptr_eq(hole) {
+                // megamorphic: leave it alone
+                return;
+            }
+        } else if !state.ptr_eq(callee) {
+            let same_code = match (state.as_strong().and_then(|c| c.as_heap_object()), info) {
+                (Some(old), Some(info)) => old
+                    .as_ref()
+                    .callable_info(heap)
+                    .is_some_and(|old_info| old_info.ptr_eq(info)),
+                _ => false,
+            };
+            if !same_code {
+                vector.as_ref().set_megamorphic(heap, fb);
+                return;
+            }
+        }
+    }
+    state_slot.set_weak(heap, host, callee);
+    tag_slot.set(heap, host, Smi::new(tag).into_tagged().as_maybe_weak());
+}
+
+#[inline(always)]
+unsafe fn dispatch_runtime_method<'a>(
+    ctx: &Ctx<'a>,
+    idx: usize,
+    srcs: &[i32],
+) -> Result<Tagged<'a, Value>, VmError> {
+    let f = ctx.vm().runtime(RuntimeIndex(idx));
+    let meta = ctx.meta(0);
+    let (saved_top, args) = ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs)?;
+    let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
+    let result = f(nctx, args);
+    ctx.stack().set_top(saved_top);
+    result
+}
+
+#[inline(always)]
+unsafe fn dispatch_runtime_function<'a>(
+    ctx: &Ctx<'a>,
+    idx: usize,
+    args: &[i32],
+) -> Result<Tagged<'a, Value>, VmError> {
+    let f = ctx.vm().runtime(RuntimeIndex(idx));
+    let meta = ctx.meta(0);
+    let (saved_top, staged) = ctx.stack().stage_function_args(ctx.heap(), &meta, args)?;
+    let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
+    let result = f(nctx, staged);
+    ctx.stack().set_top(saved_top);
+    result
+}
+
+#[inline(always)]
+unsafe fn dispatch_runtime_contiguous<'a>(
+    ctx: &Ctx<'a>,
+    idx: usize,
+    base: i32,
+    count: usize,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let f = ctx.vm().runtime(RuntimeIndex(idx));
+    let meta = ctx.meta(0);
+    let args = ctx.stack().args(&meta, base, count);
+    let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
+    f(nctx, args)
+}
+
+#[inline(always)]
+unsafe fn push_scattered_method_frame<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    target: Tagged<'_, Object>,
+    info: Tagged<'_, CallableInfoObject>,
+    context: Tagged<'_, Context>,
+    register_count: usize,
+    formal_min: usize,
+    srcs: &[i32],
+) -> Result<MethodCall<'a>, VmError> {
+    let heap = ctx.heap_mut();
+    let meta = ctx.meta(pc + size);
+    let undefined = heap.known().undefined.as_tagged(heap).erase();
+    let frame = ctx.stack().push_frame_scattered(
+        heap,
+        meta,
+        pc,
+        target.erase(),
+        info,
+        register_count,
+        context.erase(),
+        srcs,
+        undefined,
+        formal_min,
+    )?;
+    ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
+    Ok(MethodCall::Frame)
+}
+
+#[inline(always)]
+unsafe fn push_function_frame<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    target: Tagged<'_, Object>,
+    info: Tagged<'_, CallableInfoObject>,
+    context: Tagged<'_, Context>,
+    register_count: usize,
+    formal_min: usize,
+    args: &[i32],
+) -> Result<MethodCall<'a>, VmError> {
+    let heap = ctx.heap_mut();
+    let meta = ctx.meta(pc + size);
+    let undefined = heap.known().undefined.as_tagged(heap).erase();
+    let frame = ctx.stack().push_frame_function(
+        heap,
+        meta,
+        pc,
+        target.erase(),
+        info,
+        register_count,
+        context.erase(),
+        args,
+        undefined,
+        formal_min,
+    )?;
+    ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
+    Ok(MethodCall::Frame)
+}
+
+#[inline(always)]
+unsafe fn push_contiguous_frame<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    target: Tagged<'_, Object>,
+    info: Tagged<'_, CallableInfoObject>,
+    context: Tagged<'_, Context>,
+    register_count: usize,
+    formal_min: usize,
+    base: i32,
+    count: usize,
+) -> Result<MethodCall<'a>, VmError> {
+    let heap = ctx.heap_mut();
+    let meta = ctx.meta(pc + size);
+    let undefined = heap.known().undefined.as_tagged(heap).erase();
+    let frame = ctx.stack().push_frame(
+        heap,
+        meta,
+        pc,
+        target.erase(),
+        info,
+        register_count,
+        context.erase(),
+        base,
+        count,
+        undefined,
+        formal_min,
+    )?;
+    ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
+    Ok(MethodCall::Frame)
+}
+
 #[inline(always)]
 unsafe fn call_method_start<'a>(
     ctx: &Ctx<'a>,
     pc: usize,
     size: usize,
-    callee_word: Tagged<'_, Value>,
+    callee_word: Tagged<'a, Value>,
     srcs: &[i32],
+    fb: usize,
+) -> Result<MethodCall<'a>, VmError> {
+    match call_ic_probe(ctx, fb, callee_word) {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            push_scattered_method_frame(
+                ctx,
+                pc,
+                size,
+                target,
+                info,
+                context,
+                register_count,
+                formal_min,
+                srcs,
+            )
+        }
+        Some(CallTarget::Runtime(idx)) => {
+            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)?))
+        }
+        _ => cold_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn cold_call_method_miss<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    callee_word: Tagged<'a, Value>,
+    srcs: &[i32],
+    fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(ctx.raise(VmError::Type)?)),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(idx)) => {
-            let f = ctx.vm().runtime(RuntimeIndex(idx));
-            let meta = ctx.meta(0);
-            let (saved_top, args) = ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs)?;
-            let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
-            let result = f(nctx, args);
-            ctx.stack().set_top(saved_top);
-            match result {
-                Ok(v) => Ok(MethodCall::Value(v)),
-                Err(err) => Err(err),
-            }
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
+            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)?))
         }
         Some(CallTarget::Bytecode {
             target,
@@ -2732,28 +3003,22 @@ unsafe fn call_method_start<'a>(
             register_count,
             formal_min,
             kind,
-            ..
         }) => {
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
             }
-            let heap = ctx.heap_mut();
-            let meta = ctx.meta(pc + size);
-            let undefined = heap.known().undefined.as_tagged(heap).erase();
-            let frame = ctx.stack().push_frame_scattered(
-                heap,
-                meta,
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_BYTECODE, Some(info));
+            push_scattered_method_frame(
+                ctx,
                 pc,
-                target.erase(),
+                size,
+                target,
                 info,
+                context,
                 register_count,
-                context.erase(),
-                srcs,
-                undefined,
                 formal_min,
-            )?;
-            ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
-            Ok(MethodCall::Frame)
+                srcs,
+            )
         }
     }
 }
@@ -2763,23 +3028,57 @@ unsafe fn call_function_start<'a>(
     ctx: &Ctx<'a>,
     pc: usize,
     size: usize,
-    callee_word: Tagged<'_, Value>,
+    callee_word: Tagged<'a, Value>,
     args: &[i32],
+    fb: usize,
+) -> Result<MethodCall<'a>, VmError> {
+    match call_ic_probe(ctx, fb, callee_word) {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            push_function_frame(
+                ctx,
+                pc,
+                size,
+                target,
+                info,
+                context,
+                register_count,
+                formal_min,
+                args,
+            )
+        }
+        Some(CallTarget::Runtime(idx)) => {
+            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)?))
+        }
+        _ => cold_call_function_miss(ctx, pc, size, callee_word, args, fb),
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn cold_call_function_miss<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    callee_word: Tagged<'a, Value>,
+    args: &[i32],
+    fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(ctx.raise(VmError::Type)?)),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(idx)) => {
-            let f = ctx.vm().runtime(RuntimeIndex(idx));
-            let meta = ctx.meta(0);
-            let (saved_top, staged) = ctx.stack().stage_function_args(ctx.heap(), &meta, args)?;
-            let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
-            let result = f(nctx, staged);
-            ctx.stack().set_top(saved_top);
-            match result {
-                Ok(v) => Ok(MethodCall::Value(v)),
-                Err(err) => Err(err),
-            }
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
+            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)?))
         }
         Some(CallTarget::Bytecode {
             target,
@@ -2788,28 +3087,115 @@ unsafe fn call_function_start<'a>(
             register_count,
             formal_min,
             kind,
-            ..
         }) => {
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
             }
-            let heap = ctx.heap_mut();
-            let meta = ctx.meta(pc + size);
-            let undefined = heap.known().undefined.as_tagged(heap).erase();
-            let frame = ctx.stack().push_frame_function(
-                heap,
-                meta,
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_BYTECODE, Some(info));
+            push_function_frame(
+                ctx,
                 pc,
-                target.erase(),
+                size,
+                target,
                 info,
+                context,
                 register_count,
-                context.erase(),
-                args,
-                undefined,
                 formal_min,
-            )?;
-            ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
-            Ok(MethodCall::Frame)
+                args,
+            )
+        }
+    }
+}
+
+/// `Call` (contiguous `[receiver, args...]` window) with the same call IC.
+#[inline(always)]
+unsafe fn call_start<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    callee_word: Tagged<'a, Value>,
+    base: i32,
+    count: usize,
+    fb: usize,
+) -> Result<MethodCall<'a>, VmError> {
+    match call_ic_probe(ctx, fb, callee_word) {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            push_contiguous_frame(
+                ctx,
+                pc,
+                size,
+                target,
+                info,
+                context,
+                register_count,
+                formal_min,
+                base,
+                count,
+            )
+        }
+        Some(CallTarget::Runtime(idx)) => {
+            Ok(MethodCall::Value(dispatch_runtime_contiguous(
+                ctx, idx, base, count,
+            )?))
+        }
+        _ => cold_call_miss(ctx, pc, size, callee_word, base, count, fb),
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn cold_call_miss<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    callee_word: Tagged<'a, Value>,
+    base: i32,
+    count: usize,
+    fb: usize,
+) -> Result<MethodCall<'a>, VmError> {
+    match Object::call_target(ctx.heap(), callee_word) {
+        None => Ok(MethodCall::Value(ctx.raise(VmError::Type)?)),
+        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
+        Some(CallTarget::Runtime(idx)) => {
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
+            Ok(MethodCall::Value(dispatch_runtime_contiguous(
+                ctx, idx, base, count,
+            )?))
+        }
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_BYTECODE, Some(info));
+            push_contiguous_frame(
+                ctx,
+                pc,
+                size,
+                target,
+                info,
+                context,
+                register_count,
+                formal_min,
+                base,
+                count,
+            )
         }
     }
 }
@@ -3063,6 +3449,7 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::CreateEmptyArrayLiteral as usize] = op_create_empty_array_n as Handler;
     t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object_n as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime_n as Handler;
+    t[Opcode::Call as usize] = op_call_ic_n as Handler;
     t[Opcode::CallNoFeedback as usize] = op_call_n as Handler;
     t[Opcode::CallMethod0 as usize] = op_call_method0_n as Handler;
     t[Opcode::CallFunction0 as usize] = op_call_function0_n as Handler;
@@ -3143,6 +3530,7 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::CreateEmptyArrayLiteral as usize] = op_create_empty_array_w as Handler;
     t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object_w as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime_w as Handler;
+    t[Opcode::Call as usize] = op_call_ic_w as Handler;
     t[Opcode::CallNoFeedback as usize] = op_call_w as Handler;
     t[Opcode::CallMethod0 as usize] = op_call_method0_w as Handler;
     t[Opcode::CallFunction0 as usize] = op_call_function0_w as Handler;

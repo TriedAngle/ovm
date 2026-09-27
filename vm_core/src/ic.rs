@@ -16,6 +16,9 @@ const KIND_ELEMENT: i64 = 2;
 const KIND_ELEMENT_STORE: i64 = 3;
 /// `DenseString` index load; payload = flags.
 const KIND_INDEXED_STRING: i64 = 4;
+/// Array `length`: read the receiver's length slot directly (the map check
+/// in the probe already pinned it to an array map). Payload unused.
+const KIND_ARRAY_LENGTH: i64 = 5;
 
 /// Element-load payload flags.
 const ELEMENT_HOLEY: i64 = 1 << 0;
@@ -35,6 +38,9 @@ const CHAIN_PARENT_NAME: i64 = 5;
 /// One-hop prototype handlers: `[kind|offset, weak holder map, weak pair]`.
 const CHAIN_PROTO_FIELD: i64 = 6;
 const CHAIN_PROTO_ACCESSOR: i64 = 7;
+/// Two-hop prototype field: `[kind|offset, weak holder0 map, weak holder1 map]`
+/// (`inheritsFrom`: receiver → subclass prototype → superclass prototype).
+const CHAIN_PROTO_FIELD2: i64 = 8;
 
 fn kind_smi(kind: i64, payload: i64) -> Smi {
     Smi::new(kind | (payload << 8))
@@ -122,21 +128,21 @@ fn probe<'a>(
     slot: usize,
     map: Tagged<'a, Map>,
 ) -> Option<Tagged<'a, MaybeWeak<Value>>> {
-    let state = vector.as_ref().slot(slot).get(heap);
+    let state = unsafe { vector.as_ref_unchecked().slot(slot) }.get(heap);
     if state.raw().is_weak_ptr() {
         if !state.ptr_eq(map) {
             return None;
         }
-        return Some(vector.as_ref().slot(slot + 1).get(heap));
+        return Some(unsafe { vector.as_ref_unchecked().slot(slot + 1) }.get(heap));
     }
     let pairs = state.as_strong()?.get_as::<WeakFixedArray>()?;
-    let len = pairs.as_ref().len();
+    let len = unsafe { pairs.as_ref_unchecked() }.len();
     let mut i = 0;
     while i + 1 < len {
         if let Some(m) = pairs.get(heap, i).as_strong()
             && m.ptr_eq(map)
         {
-            return Some(pairs.as_ref().get(heap, i + 1));
+            return Some(unsafe { pairs.as_ref_unchecked() }.get(heap, i + 1));
         }
         i += 2;
     }
@@ -408,6 +414,28 @@ fn build_proto_array<'s>(
     })
 }
 
+/// Allocate `[kind|offset, weak holder0 map, weak holder1 map]`: a two-hop
+/// prototype field handler verified by two map checks instead of a chain
+/// walk.
+fn build_proto2_array<'s>(
+    heap: &mut Heap,
+    scope: &'s HandleScope<'_>,
+    kind: i64,
+    offset: i64,
+    holder0: &Handle<'_, Map>,
+    holder1: &Handle<'_, Map>,
+) -> Handle<'s, WeakFixedArray> {
+    heap.allocate_token_enter_heap(WeakFixedArray::<Value>::layout_for(3), |token, heap| {
+        let words: [Tagged<'_, MaybeWeak<Value>>; 3] = [
+            kind_smi(kind, offset).into_tagged().as_maybe_weak(),
+            holder0.as_tagged(heap).erase().as_weak(),
+            holder1.as_tagged(heap).erase().as_weak(),
+        ];
+        let arr = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &words });
+        scope.handle(arr)
+    })
+}
+
 /// What the load analysis found, rooted so it survives handler
 /// construction.
 struct Plan<'s> {
@@ -421,6 +449,7 @@ struct Plan<'s> {
 
 enum PlanKind {
     Field,
+    ArrayLength,
     Slow,
     Accessor,
     ParentName,
@@ -437,6 +466,11 @@ impl Plan<'_> {
         // one-hop handler whose holder map check replaces the chain walk
         let one_hop =
             self.entries.len() == 1 && self.entries[0].hop < 0 && self.entries[0].owner < 0;
+        let two_hop = self.entries.len() == 2
+            && self.entries[0].hop < 0
+            && self.entries[0].owner < 0
+            && self.entries[1].hop < 0
+            && self.entries[1].owner == 0;
         match self.kind {
             PlanKind::Field if self.entries.is_empty() => {
                 Handler::Smi(kind_smi(KIND_FIELD, self.offset as i64))
@@ -449,6 +483,15 @@ impl Plan<'_> {
                 &self.entries[0].map,
                 None,
             )),
+            PlanKind::Field if two_hop => Handler::ProtoField(build_proto2_array(
+                heap,
+                scope,
+                CHAIN_PROTO_FIELD2,
+                self.offset as i64,
+                &self.entries[0].map,
+                &self.entries[1].map,
+            )),
+            PlanKind::ArrayLength => Handler::Smi(kind_smi(KIND_ARRAY_LENGTH, 0)),
             PlanKind::Field => Handler::Chain(build_chain_array(
                 heap,
                 scope,
@@ -508,7 +551,12 @@ fn analyze_load<'s>(
         pair: None,
     };
     if receiver.as_ref().array_length(heap, name).is_some() {
-        return slow();
+        return Plan {
+            kind: PlanKind::ArrayLength,
+            offset: 0,
+            entries: Vec::new(),
+            pair: None,
+        };
     }
     let mut entries: Vec<ChainEntry<'s>> = Vec::new();
     match walk(heap, scope, receiver, name, -1, &mut entries) {
@@ -550,32 +598,43 @@ fn apply_fast<'a>(
 ) -> Option<Hit<'a>> {
     if !handler.raw().is_ptr() {
         let (kind, payload) = decode_smi(handler)?;
-        return (kind == KIND_FIELD)
-            .then(|| Hit::Value(receiver.slot(heap, payload as usize).get(heap)));
+        return match kind {
+            KIND_FIELD => Some(Hit::Value(receiver.slot(heap, payload as usize).get(heap))),
+            KIND_ARRAY_LENGTH => Some(Hit::Value(receiver.length.get(heap).erase())),
+            _ => None,
+        };
     }
     // Safety: a non-Smi load handler is always a WeakFixedArray written by
     // this module (stores use a weak map, loads never do).
     let chain = unsafe { handler.cast::<WeakFixedArray>() };
-    let chain_ref = chain.as_ref();
+    let chain_ref = unsafe { chain.as_ref_unchecked() };
     let (kind, payload) = decode_smi(chain_ref.get(heap, 0))?;
-    if kind != CHAIN_PROTO_FIELD {
-        return None;
+    match kind {
+        CHAIN_PROTO_FIELD => {
+            let holder = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
+            Some(Hit::Value(holder.slot(heap, payload as usize).get(heap)))
+        }
+        CHAIN_PROTO_FIELD2 => {
+            let h0 = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
+            let holder = proto_holder(heap, h0, chain_ref.get(heap, 2))?;
+            Some(Hit::Value(holder.slot(heap, payload as usize).get(heap)))
+        }
+        _ => None,
     }
-    let holder = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
-    Some(Hit::Value(holder.slot(heap, payload as usize).get(heap)))
 }
 
+/// The subset of load handlers the interpreter can complete inline: an own
+/// field, or a field on the immediate prototype (one-hop method lookup).
 #[inline(always)]
-fn apply_field_only<'a>(
+fn apply_value_fast<'a>(
     heap: &'a Heap,
     receiver: Tagged<'a, Object>,
     handler: Tagged<'a, MaybeWeak<Value>>,
 ) -> Option<Tagged<'a, Value>> {
-    if handler.raw().is_ptr() {
-        return None;
+    match apply_fast(heap, receiver, handler) {
+        Some(Hit::Value(v)) => Some(v),
+        _ => None,
     }
-    let (kind, payload) = decode_smi(handler)?;
-    (kind == KIND_FIELD).then(|| receiver.slot(heap, payload as usize).get(heap))
 }
 
 #[inline(always)]
@@ -815,14 +874,12 @@ impl InlineCache {
             return MonoProbe::NotReceiver;
         };
         let map = obj.map_ref(heap);
-        let Some((state_slot, handler_slot)) = vector.as_ref().site(slot) else {
-            return MonoProbe::NotReceiver;
-        };
+        let (state_slot, handler_slot) = unsafe { vector.as_ref_unchecked().site_unchecked(slot) };
         let state = state_slot.get(heap);
 
         if state.raw().to_bits() == (map.raw().to_bits() | crate::WEAK_PTR) {
             let handler = handler_slot.get(heap);
-            return match apply_field_only(heap, obj, handler) {
+            return match apply_value_fast(heap, obj, handler) {
                 Some(v) => MonoProbe::Value(v),
                 None => MonoProbe::Handler(obj, handler),
             };
@@ -834,12 +891,23 @@ impl InlineCache {
         let Some(pairs) = state.as_strong().and_then(|s| s.get_as::<WeakFixedArray>()) else {
             return MonoProbe::Miss;
         };
-        if pairs.as_ref().len() >= 2
+        let len = unsafe { pairs.as_ref_unchecked() }.len();
+        if len >= 2
             && let Some(m) = pairs.get(heap, 0).as_strong()
             && m.ptr_eq(map)
         {
-            let handler = pairs.as_ref().get(heap, 1);
-            return match apply_field_only(heap, obj, handler) {
+            let handler = unsafe { pairs.as_ref_unchecked() }.get(heap, 1);
+            return match apply_value_fast(heap, obj, handler) {
+                Some(v) => MonoProbe::Value(v),
+                None => MonoProbe::Handler(obj, handler),
+            };
+        }
+        if len >= 4
+            && let Some(m) = pairs.get(heap, 2).as_strong()
+            && m.ptr_eq(map)
+        {
+            let handler = unsafe { pairs.as_ref_unchecked() }.get(heap, 3);
+            return match apply_value_fast(heap, obj, handler) {
                 Some(v) => MonoProbe::Value(v),
                 None => MonoProbe::Handler(obj, handler),
             };
@@ -848,7 +916,7 @@ impl InlineCache {
             obj,
             map,
             pairs,
-            start: 2,
+            start: if len >= 4 { 4 } else { 2 },
         }
     }
 
@@ -869,13 +937,17 @@ impl InlineCache {
         pairs: Tagged<'a, WeakFixedArray>,
         start: usize,
     ) -> Option<Hit<'a>> {
-        let len = pairs.as_ref().len();
+        let len = unsafe { pairs.as_ref_unchecked() }.len();
         let mut i = start;
         while i + 1 < len {
             if let Some(m) = pairs.get(heap, i).as_strong()
                 && m.ptr_eq(map)
             {
-                return apply_load_handler(heap, obj, pairs.as_ref().get(heap, i + 1));
+                return apply_load_handler(
+                    heap,
+                    obj,
+                    unsafe { pairs.as_ref_unchecked() }.get(heap, i + 1),
+                );
             }
             i += 2;
         }
@@ -923,6 +995,7 @@ impl InlineCache {
         update_site(heap, scope, vector, slot, &map, &handler);
     }
 
+    #[inline]
     pub fn try_load_element<'a>(
         heap: &'a Heap,
         vector: Option<Tagged<'a, FeedbackVector>>,
@@ -946,6 +1019,7 @@ impl InlineCache {
         }
     }
 
+    #[inline]
     pub fn try_store_element<'a>(
         heap: &'a Heap,
         vector: Option<Tagged<'a, FeedbackVector>>,
@@ -1073,6 +1147,7 @@ impl InlineCache {
         update_site(heap, scope, vector, slot, &map, &handler);
     }
 
+    #[inline]
     pub fn try_store_fast(
         heap: &mut Heap,
         vector: Option<Tagged<'_, FeedbackVector>>,

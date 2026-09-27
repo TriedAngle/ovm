@@ -411,6 +411,7 @@ impl<'a> Tagged<'a, Value> {
         }
     }
 
+    #[inline]
     pub fn get_as<T: HeapObject>(self) -> Option<Tagged<'a, T>> {
         let ptr = HeapPtr::decode_strong(self.raw)?;
         // Safety: strong pointer; reads only the header's map slot.
@@ -494,6 +495,17 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
         // Safety: a `Tagged<'a, T: HeapObject>` is always a strong heap
         // pointer valid for `'a` (Smi/weak words have no `HeapObject` type).
         unsafe { self.as_ptr().expect("strong pointer").as_ref() }
+    }
+
+    /// [`as_ref`] without the strong-pointer witness. Hot handlers that
+    /// already proved the anchor is a strong pointer (an unchecked cast from
+    /// a verified slot) use this to skip the redundant tag check.
+    ///
+    /// # Safety
+    /// `self` must hold a strong heap pointer (`raw.is_strong_ptr()`).
+    #[inline(always)]
+    pub unsafe fn as_ref_unchecked(self) -> &'a T {
+        unsafe { &*(self.raw.raw_addr() as *const T) }
     }
 
     /// A rooted copy: the value may now cross GC safepoints.

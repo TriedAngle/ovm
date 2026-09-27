@@ -104,6 +104,15 @@ impl FeedbackVector {
         Some((self.slot(slot), self.slot(slot + 1)))
     }
 
+    /// The `[state, handler]` pair of site `slot`. The caller guarantees
+    /// `slot + 1 < len` — bytecode validation rejects any instruction whose
+    /// feedback index is out of range, so hot handlers skip the check.
+    #[inline(always)]
+    pub fn site_unchecked(&self, slot: usize) -> (&MaybeWeakGcSlot, &MaybeWeakGcSlot) {
+        debug_assert!(slot + 1 < self.len());
+        (self.slot(slot), self.slot(slot + 1))
+    }
+
     /// Go monomorphic: `weak map` in the state slot, `handler` in the
     /// handler slot.
     pub fn set_mono(

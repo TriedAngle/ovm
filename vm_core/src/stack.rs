@@ -184,6 +184,7 @@ impl Stack {
     /// The call-argument window `[reg_base .. reg_base+count)`: element 0
     /// (the receiver) is the base register's window slot at
     /// `reg_base - count + 1`, so the ascending slice is element-ordered.
+    #[inline]
     pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> HandleSlice<'_> {
         if count == 0 {
             return HandleSlice::EMPTY;
@@ -426,6 +427,7 @@ impl Stack {
         Ok((saved_top, staged))
     }
 
+    #[inline]
     pub fn stage_args_regs<'s>(
         &'s self,
         heap: &Heap,
@@ -455,6 +457,7 @@ impl Stack {
         Ok((saved_top, staged))
     }
 
+    #[inline]
     pub fn stage_function_args<'s>(
         &'s self,
         heap: &Heap,

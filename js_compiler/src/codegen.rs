@@ -1386,6 +1386,27 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         Some(self.b.this_reg())
     }
 
+    /// A register whose value is stable while sibling expressions (call
+    /// arguments, an assignment's right-hand side) evaluate: the frame
+    /// receiver, or a local/parameter this function never rebinds.
+    /// Captured bindings and eval-scoped functions live in contexts, so a
+    /// callee can only clobber such a binding through a direct assignment
+    /// in this function — exactly what `symbol_is_mutated` detects.
+    fn stable_register(&mut self, e: &Expression<'_>) -> Option<Reg> {
+        if let Some(reg) = self.this_operand_reg(e) {
+            return Some(reg);
+        }
+        let Expression::Identifier(ident) = e else {
+            return None;
+        };
+        let rid = ident.reference_id.get()?;
+        let sym = self.c.scoping.get_reference(rid).symbol_id()?;
+        if self.c.scoping.symbol_is_mutated(sym) {
+            return None;
+        }
+        self.simple_identifier_register(ident)
+    }
+
     fn simple_identifier_register(&mut self, ident: &IdentifierReference<'_>) -> Option<Reg> {
         match self.identifier_resolution(ident).ok()? {
             IdRes::Slot(
@@ -2399,6 +2420,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     self.b.load_named_property(obj, name_idx, feedback);
                     return Ok(());
                 }
+                if let Some(obj) = self.simple_register(&s.object) {
+                    self.b.load_named_property(obj, name_idx, feedback);
+                    return Ok(());
+                }
                 self.expr(&s.object)?;
                 let obj = self.b.stage_acc();
                 self.b.load_named_property(obj, name_idx, feedback);
@@ -2444,9 +2469,18 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 args[i] = self.b.stage_acc();
             }
             match argc {
-                0 => self.b.call_method0(callee, recv),
-                1 => self.b.call_method1(callee, recv, args[0]),
-                _ => self.b.call_method2(callee, recv, args[0], args[1]),
+                0 => {
+                    let fb = self.b.new_feedback();
+                    self.b.call_method0(callee, recv, fb)
+                }
+                1 => {
+                    let fb = self.b.new_feedback();
+                    self.b.call_method1(callee, recv, args[0], fb)
+                }
+                _ => {
+                    let fb = self.b.new_feedback();
+                    self.b.call_method2(callee, recv, args[0], args[1], fb)
+                }
             }
             self.b.drop_temps(mark);
             return Ok(());
@@ -2466,8 +2500,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.b.store(Reg::new(top - 1 - i as i32));
         }
         self.b.move_reg(Reg::new(top), recv);
-        self.b
-            .call_no_feedback(callee, RegList::new(args_base, argc + 1));
+        let fb = self.b.new_feedback();
+        self.b.call(callee, RegList::new(args_base, argc + 1), fb);
         self.b.drop_temps(mark);
         Ok(())
     }
@@ -2488,7 +2522,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         if let Expression::StaticMemberExpression(s) = &c.callee {
             let name_idx = self.b.name(s.property.name.as_bytes());
             return self.emit_method_call(c, |g| {
-                let recv = match g.simple_register(&s.object) {
+                let recv = match g.stable_register(&s.object) {
                     Some(r) => r,
                     None => {
                         g.expr(&s.object)?;
@@ -2502,7 +2536,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
         if let Expression::ComputedMemberExpression(cm) = &c.callee {
             return self.emit_method_call(c, |g| {
-                let recv = match g.simple_register(&cm.object) {
+                let recv = match g.stable_register(&cm.object) {
                     Some(r) => r,
                     None => {
                         g.expr(&cm.object)?;
@@ -2531,9 +2565,18 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 args[i] = self.b.stage_acc();
             }
             match argc {
-                0 => self.b.call_function0(callee),
-                1 => self.b.call_function1(callee, args[0]),
-                _ => self.b.call_function2(callee, args[0], args[1]),
+                0 => {
+                    let fb = self.b.new_feedback();
+                    self.b.call_function0(callee, fb)
+                }
+                1 => {
+                    let fb = self.b.new_feedback();
+                    self.b.call_function1(callee, args[0], fb)
+                }
+                _ => {
+                    let fb = self.b.new_feedback();
+                    self.b.call_function2(callee, args[0], args[1], fb)
+                }
             }
             self.b.drop_temps(mark);
             return Ok(());
@@ -2551,8 +2594,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.call_argument(arg)?;
             self.b.store(Reg::new(top - 1 - i as i32));
         }
-        self.b
-            .call_no_feedback(callee, RegList::new(args_base, argc + 1));
+        let fb = self.b.new_feedback();
+        self.b.call(callee, RegList::new(args_base, argc + 1), fb);
         self.b.drop_temps(mark);
         Ok(())
     }
@@ -2997,7 +3040,8 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // declaration order (ES 15.7.14 step 33)
         for (closure, key_reg, name_idx) in &static_fields {
             self.b.load(*closure);
-            self.b.call_no_feedback(*closure, RegList::new(ctor, 1));
+            let fb = self.b.new_feedback();
+            self.b.call(*closure, RegList::new(ctor, 1), fb);
             // runtime(obj = ctor, key, value = acc, flags 0)
             let key = match (key_reg, name_idx) {
                 (Some(k), _) => RtArg::Reg(*k),

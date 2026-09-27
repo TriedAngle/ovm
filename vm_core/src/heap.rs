@@ -533,14 +533,17 @@ impl Heap {
             .write_barrier(host.raw().to_bits(), slot, value.raw().to_bits())
     }
 
+    #[inline]
     pub fn collection_requested(&self) -> bool {
         self.local.collection_requested()
     }
 
+    #[inline]
     pub fn park_for_collection(&self) -> bool {
         self.local.park_for_collection()
     }
 
+    #[inline]
     pub fn take_cancel(&self) -> bool {
         self.local.take_cancel()
     }
@@ -553,6 +556,7 @@ impl Heap {
         self.local.gc_in_progress()
     }
 
+    #[inline]
     pub fn safepoint_poll(&mut self) -> bool {
         if self.collection_requested() {
             self.park_for_collection() && self.take_cancel()

@@ -43,6 +43,7 @@ impl Object {
             .constant_slot_name(heap, idx)
     }
 
+    #[inline]
     pub fn runtime_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
         if !self.header.map.get(heap).kind().is_runtime() {
             return None;
@@ -58,6 +59,7 @@ impl Object {
     /// The JSArray `length` internal slot, when `self` is an array named
     /// `name`: it lives outside the map descriptors, so descriptor walks
     /// must consult this first. `None` for any other name or non-array.
+    #[inline]
     pub fn array_length<'a>(
         &'a self,
         heap: &'a Heap,
@@ -73,6 +75,7 @@ impl Object {
     }
 
     /// The object's map (shape).
+    #[inline]
     pub fn map_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, Map> {
         self.header.map.get(heap)
     }
@@ -83,6 +86,7 @@ impl Object {
     }
 
     /// The slot holding the value of the data slot at `offset`.
+    #[inline]
     pub fn slot<'a>(&self, heap: &'a Heap, offset: usize) -> &'a GcSlot {
         self.slots.get(heap).as_ref().element_slot(offset)
     }
@@ -106,6 +110,7 @@ impl Object {
     /// array, the index is past the end, or the slot is a hole — the
     /// caller must fall back to a named property lookup. A packed (non
     /// holey) map skips both the hole compare and the backing-store bound.
+    #[inline]
     pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
         let kind = self.header.map.get(heap).as_ref().kind();
         if !kind.is_array() || i >= self.length() {
@@ -184,6 +189,23 @@ impl Object {
         })
     }
 
+    #[inline]
+    pub fn bytecode_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
+        let obj = f.as_heap_object()?;
+        let slots = obj.as_ref().slots.get(heap);
+        let info = unsafe { slots.at(heap, 0).cast::<CallableInfoObject>() };
+        let context = unsafe { slots.at(heap, 1).cast::<Context>() };
+        let descriptor = info.descriptor.to_smi_unchecked().value() as u64;
+        Some(CallTarget::Bytecode {
+            target: obj,
+            info,
+            context,
+            register_count: (descriptor & 0xffff) as usize,
+            formal_min: ((descriptor >> 16) & 0xffff) as usize,
+            kind: FunctionKind::decode(((descriptor >> 32) & 0xf) as i64),
+        })
+    }
+
     /// Store `value` at element index `i` of an array object, growing the
     /// elements backing store and updating `length` when `i` is past the end.
     /// Both arguments are rooted handles, so the grow path may allocate.
@@ -257,6 +279,7 @@ impl Object {
     /// Write an existing element slot in place: never allocates, never
     /// grows, no handle scope required — takes anchored `Tagged` words
     /// under a single shared heap borrow (safe for fast paths).
+    #[inline]
     pub fn store_array_element_in_place(
         heap: &Heap,
         receiver: Tagged<'_, Value>,

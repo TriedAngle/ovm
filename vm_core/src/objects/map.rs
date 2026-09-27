@@ -317,6 +317,7 @@ impl MapKind {
     }
 
     // TODO: consider transmute with debug assert
+    #[inline]
     pub const fn kind(self) -> ObjectKind {
         match Self(self.0 & Self::KIND_MASK) {
             Self::MAP => ObjectKind::Map,
