@@ -9,6 +9,7 @@ fn run(label: &str, src: &str) {
         .unwrap()
         .add::<JSRuntime>()
         .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     thread.eval::<JavascriptCompiler>(src).expect("runs");
     if let Some(ex) = thread.take_pending_exception() {

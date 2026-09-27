@@ -34,7 +34,7 @@ impl HeapObject for Symbol {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().symbol_map.as_tagged(heap));
+            .init(heap.known().symbol_map.as_tagged(heap));
         self.backing.set(heap, host, config.as_tagged(heap));
     }
 

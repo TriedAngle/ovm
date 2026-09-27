@@ -64,9 +64,7 @@ impl<T: 'static> HeapObject for FixedArray<T> {
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.tagged(heap);
-        self.header
-            .map
-            .set(heap, host, heap.known().array_map.as_tagged(heap));
+        self.header.map.init(heap.known().array_map.as_tagged(heap));
         self.size.set(heap, host, Smi::new(config.len() as i64));
         for (i, v) in config.iter().enumerate() {
             // Safety: the caller stages words of the array's element type.
@@ -170,9 +168,7 @@ impl<T: 'static> HeapObject for WeakFixedArray<T> {
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.tagged(heap);
-        self.header
-            .map
-            .set(heap, host, heap.known().array_map.as_tagged(heap));
+        self.header.map.init(heap.known().array_map.as_tagged(heap));
         self.size
             .set(heap, host, Smi::new(config.values.len() as i64));
         for (i, v) in config.values.iter().enumerate() {

@@ -7,7 +7,7 @@ use vm::Thread;
 use vm::{DenseString, ScriptError, Smi, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -35,7 +35,7 @@ fn run_bool(src: &str) -> bool {
 }
 
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

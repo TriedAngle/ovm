@@ -247,7 +247,7 @@ fn run_program_ctx(
 
 #[test]
 fn load_smi_signed_immediates() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // byte1 range, byte1-via-sign-extension traps (128..=255 used to
@@ -281,8 +281,7 @@ fn call_runtime_passes_receiver_and_args() {
         Ok(Tagged::from(Smi::new(a.value() + b.value())))
     }
 
-    let mut vm =
-        VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let add = vm.register_runtime(add);
     let mut thread = vm.attach();
 
@@ -307,7 +306,7 @@ fn call_runtime_passes_receiver_and_args() {
 
 #[test]
 fn failed_run_does_not_leak_frames_into_next_run() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // Add on an object operand needs ToPrimitive (not implemented yet) and
@@ -341,7 +340,7 @@ fn failed_run_does_not_leak_frames_into_next_run() {
 
 #[test]
 fn parameters_are_readable_via_negative_registers() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -354,7 +353,7 @@ fn parameters_are_readable_via_negative_registers() {
 
 #[test]
 fn wide_parameter_operand_uses_two_bytes() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -372,7 +371,7 @@ fn wide_parameter_operand_uses_two_bytes() {
 
 #[test]
 fn call_resolves_callable_object_and_pushes_frames() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -433,7 +432,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
 
 #[test]
 fn array_literal_built_with_manual_stores() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = []; r3[0] = 1; r3[1] = 2; r3[2] = 3; return r3
@@ -472,7 +471,7 @@ fn array_literal_built_with_manual_stores() {
 
 #[test]
 fn create_empty_array_literal_starts_empty() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -496,7 +495,7 @@ fn create_empty_array_literal_starts_empty() {
 
 #[test]
 fn array_literal_with_holes_keeps_length() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // [1, , 2]: never store index 1; storing index 2 grows length to 3
@@ -538,7 +537,7 @@ fn array_literal_with_holes_keeps_length() {
 
 #[test]
 fn object_literal_built_with_manual_stores() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let build = |thread: &mut Thread| -> Value {
@@ -613,7 +612,7 @@ fn object_literal_built_with_manual_stores() {
 
 #[test]
 fn define_named_own_property_attributes_and_value() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = {}; define m = 7 {writable, non-enum, configurable};
@@ -699,7 +698,7 @@ fn define_named_own_property_attributes_and_value() {
 
 #[test]
 fn define_named_own_property_conflicting_redefine_throws() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = {}; define p = 1 {w-, e-, c-}; re-define p = 2 {w, e-, c}:
@@ -738,7 +737,7 @@ fn define_named_own_property_conflicting_redefine_throws() {
 
 #[test]
 fn define_keyed_own_property_string_and_smi_keys() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = {}; r1 = "x"; define r0[r1] = 5 {e-};
@@ -803,7 +802,7 @@ fn define_keyed_own_property_string_and_smi_keys() {
 
 #[test]
 fn define_own_property_accessor_invokes_getter() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // getter returns 42, setter returns undefined
@@ -908,7 +907,7 @@ fn define_own_property_accessor_invokes_getter() {
 
 #[test]
 fn keyed_load_reads_array_element() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = []; r3[0..2] = 10, 20, 30; acc = 1; acc = r3[acc]
@@ -935,7 +934,7 @@ fn keyed_load_reads_array_element() {
 
 #[test]
 fn keyed_store_writes_array_element() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = []; r3[0] = 1; r4 = 0 (key); acc = 99; r3[r4] = acc; acc = r3[0]
@@ -966,7 +965,7 @@ fn keyed_store_writes_array_element() {
 
 #[test]
 fn keyed_load_out_of_bounds_yields_undefined() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // out-of-range and negative indices are ordinary property lookups and
@@ -994,7 +993,7 @@ fn keyed_load_out_of_bounds_yields_undefined() {
 
 #[test]
 fn keyed_store_grows_array_and_fills_holes() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r1 = []; r1[0] = 1; r1[3] = 42; acc = r1[3]; then acc = r1[1] (hole -> undefined)
@@ -1054,7 +1053,7 @@ fn keyed_store_grows_array_and_fills_holes() {
 
 #[test]
 fn keyed_store_creates_numeric_property_on_plain_object() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = 0 (key); r2[0] = 42 (numeric property on an object); acc = r2[0]
@@ -1112,7 +1111,7 @@ fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Resu
 
 #[test]
 fn keyed_load_reads_named_property_via_string_key() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = "x" (constants[0]); acc = r2[acc]
@@ -1125,7 +1124,7 @@ fn keyed_load_reads_named_property_via_string_key() {
 
 #[test]
 fn keyed_store_writes_named_property_via_string_key() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = "x"; acc = 42; r2[r3] = acc; acc = r2.x
@@ -1216,7 +1215,7 @@ const WRITABLE_VALUE: SlotFlags = SlotFlags::VALUE.union(SlotFlags::WRITABLE);
 
 #[test]
 fn named_store_new_property_transitions() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.z = 42 (transition); acc = r2.x + r2.z
@@ -1239,7 +1238,7 @@ fn named_store_new_property_transitions() {
 
 #[test]
 fn named_store_chained_transitions() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.z = 42 (transition); r2.w = 1 (chained transition);
@@ -1273,7 +1272,7 @@ fn named_store_chained_transitions() {
 
 #[test]
 fn keyed_store_new_property_via_string_key_transitions() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = "z"; acc = 42; r2[r3] = acc (transition); acc = r2.z
@@ -1293,7 +1292,7 @@ fn keyed_store_new_property_via_string_key_transitions() {
 
 #[test]
 fn named_store_new_property_to_non_extensible_is_ignored() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // plain OBJECT map: not extendable. Sloppy-mode [[Set]] on an absent
@@ -1313,7 +1312,7 @@ fn named_store_new_property_to_non_extensible_is_ignored() {
 
 #[test]
 fn named_store_to_non_writable_fails() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // x is a non-writable value slot
@@ -1429,7 +1428,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
 
 #[test]
 fn self_store_writes_through_to_parent_slot() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = parent_object_program(&mut thread, Opcode::StoreNamedPropertyNoShadow);
@@ -1439,7 +1438,7 @@ fn self_store_writes_through_to_parent_slot() {
 
 #[test]
 fn shadow_store_creates_own_slot_and_leaves_parent() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = parent_object_program(&mut thread, Opcode::StoreNamedProperty);
@@ -1449,7 +1448,7 @@ fn shadow_store_creates_own_slot_and_leaves_parent() {
 
 #[test]
 fn fallthrough_return_is_undefined() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut program = Vec::new();
@@ -1461,7 +1460,7 @@ fn fallthrough_return_is_undefined() {
 
 #[test]
 fn jump_skips_instructions() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // LoadSmi 1 (0..2); Jump ->6 (2..4); LoadSmi 2 (4..6); Return (6..7)
@@ -1477,7 +1476,7 @@ fn jump_skips_instructions() {
 
 #[test]
 fn jump_loop_counts_down_to_zero() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = 3; r1 = -1;
@@ -1505,7 +1504,7 @@ fn jump_loop_counts_down_to_zero() {
 
 #[test]
 fn jump_if_truthy_follows_toboolean() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = param0; JumpIfTruthy L; LoadSmi 0; Return; L: LoadSmi 1; Return
@@ -1601,7 +1600,7 @@ fn jump_if_truthy_follows_toboolean() {
 
 #[test]
 fn test_reference_equal_compares_identity() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = param0; TestReferenceEqual param1; Return
@@ -1765,7 +1764,7 @@ fn accessor_object_program(
 
 #[test]
 fn named_load_calls_getter_with_receiver() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = r2.x (calls the getter, which reads this.y)
@@ -1777,7 +1776,7 @@ fn named_load_calls_getter_with_receiver() {
 
 #[test]
 fn named_store_calls_setter_with_receiver_and_value() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.x = 21 (calls the setter, which writes this.y); acc = r2.y
@@ -1795,7 +1794,7 @@ fn named_store_calls_setter_with_receiver_and_value() {
 
 #[test]
 fn named_load_without_getter_is_undefined() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let undefined = global_word(&mut thread, |k| k.undefined);
@@ -1807,7 +1806,7 @@ fn named_load_without_getter_is_undefined() {
 
 #[test]
 fn named_store_without_setter_is_ignored() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r2.x = 21 is ignored (no setter); y keeps its initial value 7
@@ -1825,7 +1824,7 @@ fn named_store_without_setter_is_ignored() {
 
 #[test]
 fn keyed_load_calls_getter() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // acc = "x"; acc = r2[acc] (calls the getter)
@@ -1838,7 +1837,7 @@ fn keyed_load_calls_getter() {
 
 #[test]
 fn keyed_store_calls_setter() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r3 = "x"; r2[r3] = 21 (calls the setter); acc = r2.y
@@ -1858,7 +1857,7 @@ fn keyed_store_calls_setter() {
 
 #[test]
 fn named_load_missing_property_is_undefined() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let undefined = global_word(&mut thread, |k| k.undefined);
@@ -1871,7 +1870,7 @@ fn named_load_missing_property_is_undefined() {
 
 #[test]
 fn store_new_accessor_property_defines_own_accessor() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -2057,8 +2056,7 @@ fn forty_two<'a>(_: RuntimeContext<'a>, _: HandleSlice<'_>) -> Result<Tagged<'a,
 
 #[test]
 fn run_dispatches_runtime_callable_without_frame() {
-    let mut vm =
-        VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let idx = vm.register_runtime(forty_two);
     let mut thread = vm.attach();
 
@@ -2071,8 +2069,7 @@ fn run_dispatches_runtime_callable_without_frame() {
 
 #[test]
 fn call_dispatches_to_runtime_function_object() {
-    let mut vm =
-        VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let idx = vm.register_runtime(forty_two);
     let mut thread = vm.attach();
 
@@ -2165,8 +2162,7 @@ fn run_failing_inner<'a>(
 
 #[test]
 fn inner_run_error_unwinds_and_runtime_recovers() {
-    let mut vm =
-        VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let idx = vm.register_runtime(run_failing_inner);
     let mut thread = vm.attach();
 
@@ -2225,7 +2221,7 @@ fn binary_op_program(op: Opcode) -> Vec<u8> {
 
 #[test]
 fn arithmetic_ops_use_accumulator_convention() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let cases: &[(Opcode, i64, i64, i64)] = &[
@@ -2255,7 +2251,7 @@ fn arithmetic_ops_use_accumulator_convention() {
 
 #[test]
 fn shift_counts_are_masked_to_five_bits() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // JS: the shift count is ToUint32(rhs) & 31, so -1 shifts by 31
@@ -2273,7 +2269,7 @@ fn shift_counts_are_masked_to_five_bits() {
 
 #[test]
 fn arithmetic_overflow_promotes_to_float() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // Smi::MAX - 1 + 5 no longer fits an smi: the double path rounds it to 2^62
@@ -2356,7 +2352,7 @@ fn float_value(thread: &mut Thread, v: Value) -> f64 {
 
 #[test]
 fn equal_strict_compares_numbers_strings_and_objects() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -2450,7 +2446,7 @@ fn equal_strict_compares_numbers_strings_and_objects() {
 
 #[test]
 fn abstract_equality_follows_spec() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let true_v = global_word(&mut thread, |k| k.true_object);
@@ -2548,7 +2544,7 @@ fn abstract_equality_follows_spec() {
 
 #[test]
 fn relational_operators_follow_spec() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let true_v = global_word(&mut thread, |k| k.true_object);
@@ -2631,7 +2627,7 @@ fn relational_operators_follow_spec() {
 
 #[test]
 fn division_and_modulo_follow_ieee() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // 7 / 2 = 3.5 (float), 42 / 7 = 6 (smi fast path, covered above)
@@ -2687,7 +2683,7 @@ fn division_and_modulo_follow_ieee() {
 
 #[test]
 fn exp_produces_floats() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // fractional exponent
@@ -2735,7 +2731,7 @@ fn exp_produces_floats() {
 
 #[test]
 fn arithmetic_coerces_primitives_to_number() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let known = thread.heap().known();
@@ -2817,7 +2813,7 @@ fn run_program_consts(
 
 #[test]
 fn global_store_then_load_roundtrips() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (_, result) = thread.handle_scope(|thread, scope| {
@@ -2850,7 +2846,7 @@ fn global_store_then_load_roundtrips() {
 
 #[test]
 fn load_global_missing_name_throws_reference_error() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // unresolvable references throw ReferenceError (GetValue on an
@@ -2879,7 +2875,7 @@ fn load_global_missing_name_throws_reference_error() {
 
 #[test]
 fn empty_object_literal_inherits_from_object_prototype() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -2946,7 +2942,7 @@ fn empty_object_literal_inherits_from_object_prototype() {
 
 #[test]
 fn create_closure_inherits_current_context_and_is_callable() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -3049,7 +3045,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
 
 #[test]
 fn create_closure_shares_callable_info_template() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let (result, template) = thread.handle_scope(|thread, scope| {
@@ -3102,7 +3098,7 @@ fn create_closure_shares_callable_info_template() {
 
 #[test]
 fn create_closure_function_kind_controls_call_and_construct() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let mut method_body = Vec::new();
@@ -3217,7 +3213,7 @@ fn create_closure_function_kind_controls_call_and_construct() {
 
 #[test]
 fn function_context_slots_are_readable_and_writable() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // CreateFunctionContext (2 slots); PushContext r0; x = 42; y = 43
@@ -3240,7 +3236,7 @@ fn function_context_slots_are_readable_and_writable() {
 
 #[test]
 fn push_context_saves_previous_context_to_register() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // PushContext must save the old frame context (empty_context) into r0
@@ -3269,7 +3265,7 @@ fn push_context_saves_previous_context_to_register() {
 
 #[test]
 fn pop_context_restores_previous_context() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // ctxA[0] = 42; push ctxB; ctxB[0] = 99; pop back to ctxA; read ctxA[0]
@@ -3292,7 +3288,7 @@ fn pop_context_restores_previous_context() {
 
 #[test]
 fn block_context_reads_outer_scope_via_depth() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // ctxA[0] = 7; inside ctxB (outer = ctxA), read slot 0 at depth 1
@@ -3312,7 +3308,7 @@ fn block_context_reads_outer_scope_via_depth() {
 
 #[test]
 fn tdz_hole_read_throws_reference_error() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // fresh context slots are the hole; reading one must throw ReferenceError
@@ -3330,7 +3326,7 @@ fn tdz_hole_read_throws_reference_error() {
 #[test]
 fn closure_captures_function_context_end_to_end() {
     // function f() { let x = 1; { let y = 2; } return () => x; }
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -3442,7 +3438,7 @@ fn proto_object<'s>(
 
 #[test]
 fn set_prototype_changes_property_lookup_chain() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = {}; r0.[[Prototype]] = objB (p = 7); return r0.p
@@ -3493,7 +3489,7 @@ fn set_prototype_changes_property_lookup_chain() {
 
 #[test]
 fn set_prototype_survives_property_transitions() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = {}; r0.[[Prototype]] = objB; r0.x = 1 (transition); return r0.p
@@ -3549,7 +3545,7 @@ fn set_prototype_survives_property_transitions() {
 
 #[test]
 fn set_prototype_cycle_throws_type_error() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // r0 = {}; r0.[[Prototype]] = r0 (cycle)
@@ -3573,7 +3569,7 @@ fn set_prototype_cycle_throws_type_error() {
 
 #[test]
 fn set_prototype_on_non_extensible_throws_type_error() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
@@ -3738,7 +3734,7 @@ fn program_throw_type_error() -> Vec<u8> {
 
 #[test]
 fn to_primitive_calls_value_of_in_numeric_contexts() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -3769,7 +3765,7 @@ fn to_primitive_calls_value_of_in_numeric_contexts() {
 
 #[test]
 fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -3816,7 +3812,7 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
 
 #[test]
 fn add_concatenates_strings() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -3844,7 +3840,7 @@ fn add_concatenates_strings() {
 
 #[test]
 fn to_primitive_uses_to_primitive_symbol_first() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -3882,7 +3878,7 @@ fn to_primitive_uses_to_primitive_symbol_first() {
 
 #[test]
 fn to_primitive_symbol_returning_object_throws() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let obj = thread.handle_scope(|thread, scope| {
@@ -3910,7 +3906,7 @@ fn to_primitive_symbol_returning_object_throws() {
 
 #[test]
 fn to_primitive_calls_getter_accessors() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -3970,7 +3966,7 @@ fn to_primitive_calls_getter_accessors() {
 
 #[test]
 fn relational_and_equality_operators_coerce_objects() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -4022,7 +4018,7 @@ fn relational_and_equality_operators_coerce_objects() {
 
 #[test]
 fn value_of_exception_propagates() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     let obj = thread.handle_scope(|thread, scope| {
@@ -4059,7 +4055,7 @@ fn unary_program(op: Opcode) -> Vec<u8> {
 
 #[test]
 fn typeof_reports_spec_types() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -4100,7 +4096,7 @@ fn typeof_reports_spec_types() {
 
 #[test]
 fn negate_arithmetic_rules() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     // smi fast paths
@@ -4150,7 +4146,7 @@ fn negate_arithmetic_rules() {
 
 #[test]
 fn instance_of_walks_prototype_chain() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -4235,7 +4231,7 @@ fn instance_of_walks_prototype_chain() {
 
 #[test]
 fn construct_uses_prototype_receiver_and_prefers_object_result() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -4361,8 +4357,7 @@ fn construct_probe<'a>(
 
 #[test]
 fn construct_sets_runtime_construct_flag() {
-    let mut vm =
-        VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let mut vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let idx = vm.register_runtime(construct_probe);
     let mut thread = vm.attach();
 
@@ -4490,7 +4485,7 @@ fn shadow_store_program(store_op: Opcode) -> Vec<u8> {
 
 #[test]
 fn shadow_store_to_non_extensible_receiver_is_ignored() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
@@ -4528,7 +4523,7 @@ fn shadow_store_to_non_extensible_receiver_is_ignored() {
 
 #[test]
 fn shadow_store_defines_default_attributes() {
-    let vm = VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default()).unwrap();
+    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {

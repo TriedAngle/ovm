@@ -203,9 +203,7 @@ impl HeapObject for Map {
 
     fn init(&mut self, heap: &Heap, config: &Self::Init<'_>) {
         let host = self.tagged(heap);
-        self.header
-            .map
-            .set(heap, host, heap.known().map_map.as_tagged(heap));
+        self.header.map.init(heap.known().map_map.as_tagged(heap));
         self.value_slot_count
             .set(heap, host, Smi::new(config.value_slot_count as i64));
         self.descriptor_count
@@ -510,7 +508,7 @@ impl HeapObject for AccessorPair {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().accessor_pair_map.as_tagged(heap));
+            .init(heap.known().accessor_pair_map.as_tagged(heap));
         // the config's handles are roots; no allocation runs inside init
         self.get.set(heap, host, config.0.as_tagged(heap));
         self.set.set(heap, host, config.1.as_tagged(heap));

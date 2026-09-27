@@ -6,7 +6,7 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{DenseString, ScriptError, Smi, Value};
 
 fn run(src: &str) -> Result<Value, ScriptError> {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -21,7 +21,7 @@ fn run_smi(src: &str) -> i64 {
 
 fn run_str(src: &str) -> String {
     run(src).unwrap();
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

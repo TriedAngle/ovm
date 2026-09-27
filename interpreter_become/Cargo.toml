@@ -13,3 +13,6 @@ js_runtime = { path = "../js_runtime" }
 mark_sweep = { path = "../collectors/mark_sweep" }
 
 interpreter_match_loop = { path = "../interpreter_match_loop" }
+
+[features]
+stress-minor-gc = ["vm_core/stress-minor-gc"]

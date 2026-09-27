@@ -18,6 +18,10 @@ js_compiler = { path = "../js_compiler" }
 kette_compiler = { path = "../kette_compiler" }
 mark_sweep = { path = "../collectors/mark_sweep" }
 trace = { path = "../trace" }
+interpreter_become = { path = "../interpreter_become", optional = true }
 
 [features]
 stress-minor-gc = ["vm_core/stress-minor-gc"]
+# Select the tail-call ("become") interpreter over the match-loop one.
+# Requires a nightly toolchain (explicit_tail_calls / rust_preserve_none_cc).
+fast = ["dep:interpreter_become"]

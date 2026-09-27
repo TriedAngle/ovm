@@ -151,6 +151,17 @@ impl<T> GcSlot<T> {
         &self.cell
     }
 
+    /// Initialize a slot without the generational barrier. The caller
+    /// guarantees no old→young edge can form: either the host is a fresh
+    /// (young) allocation, or `value` is a known old object (e.g. a
+    /// bootstrap map). Hot object constructors use this for the header map.
+    #[inline]
+    pub fn init<'x, U: 'x>(&self, value: impl Into<Tagged<'x, U>>) {
+        let v = value.into().raw();
+        debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
+        self.cell.store_raw(v.to_bits());
+    }
+
     pub const fn raw_get(this: *const Self) -> *mut T {
         this as *const T as *mut T
     }

@@ -5,7 +5,7 @@ use vm::{
 };
 
 fn thread() -> (VM, Thread) {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

@@ -1,12 +1,11 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
-    JSRuntime, JavascriptCompiler, KetteCompiler, KetteRuntime, MatchLoopInterpreter, Smi, VM,
-    VmEval,
+    DefaultInterpreter, JSRuntime, JavascriptCompiler, KetteCompiler, KetteRuntime, Smi, VM, VmEval,
 };
 
 #[test]
 fn composed_vm_runs_js_and_kette() {
-    let vm = VM::new::<MarkSweep, MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = VM::new::<MarkSweep, DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<JSRuntime>()
         .unwrap()
@@ -24,7 +23,7 @@ fn composed_vm_runs_js_and_kette() {
 
 #[test]
 fn runtime_state_is_retrievable() {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

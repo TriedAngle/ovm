@@ -47,6 +47,10 @@ pub struct MarkSweepState {
     minor_cycles: AtomicUsize,
     young_limit: AtomicUsize,
     gc_threshold: AtomicUsize,
+    /// Bytes carved from the heap (TLABs and direct blocks) since the last
+    /// threshold update. A cheap proxy for the live set used to decide when
+    /// to run a full collection — avoids scanning every chunk.
+    gc_allocated: AtomicUsize,
     sweep_signal: Mutex<SweepSignal>,
     sweep_cond: Condvar,
     sweeper: Mutex<Option<JoinHandle<()>>>,
@@ -77,6 +81,7 @@ impl MarkSweepState {
             minor_cycles: AtomicUsize::new(0),
             young_limit: AtomicUsize::new(MIN_YOUNG_CHUNKS),
             gc_threshold: AtomicUsize::new(MIN_GC_THRESHOLD),
+            gc_allocated: AtomicUsize::new(0),
             sweep_signal: Mutex::new(SweepSignal {
                 epoch: 0,
                 shutdown: false,
@@ -409,6 +414,7 @@ impl MarkSweepState {
         let reserve = self.alloc.lock().unwrap().reserve_size();
         let threshold = (live * 2).max(MIN_GC_THRESHOLD).min(reserve);
         self.gc_threshold.store(threshold, Ordering::Relaxed);
+        self.gc_allocated.store(0, Ordering::Relaxed);
     }
 
     fn collect_terminal(
@@ -445,7 +451,7 @@ impl MarkSweepState {
     }
 
     fn used_exceeds_threshold(&self) -> bool {
-        self.alloc.lock().unwrap().live_bytes() > self.gc_threshold.load(Ordering::Relaxed)
+        self.gc_allocated.load(Ordering::Relaxed) > self.gc_threshold.load(Ordering::Relaxed)
     }
 
     fn alloc_block(&self, layout: Layout, young: bool) -> Option<NonNull<u8>> {
@@ -477,6 +483,8 @@ impl MarkSweepState {
                 }
                 continue;
             };
+            self.gc_allocated
+                .fetch_add(layout.size(), Ordering::Relaxed);
             return Some(ptr);
         }
     }

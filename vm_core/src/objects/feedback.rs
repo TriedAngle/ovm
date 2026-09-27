@@ -68,7 +68,7 @@ impl HeapObject for FeedbackVector {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().feedback_vector_map.as_tagged(heap));
+            .init(heap.known().feedback_vector_map.as_tagged(heap));
         self.length.set(heap, host, Smi::new(config.length as i64));
         let fill = heap.known().the_hole.as_tagged(heap).erase();
         for i in 0..config.length {

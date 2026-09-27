@@ -13,6 +13,7 @@ fn bench<I: Interpreter>(name: &str, src: &str) {
         .unwrap()
         .add::<JSRuntime>()
         .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     let start = std::time::Instant::now();
     thread.eval::<JavascriptCompiler>(src).expect("runs");

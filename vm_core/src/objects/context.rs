@@ -29,7 +29,7 @@ impl HeapObject for ScopeInfo {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().scope_info_map.as_tagged(heap));
+            .init(heap.known().scope_info_map.as_tagged(heap));
         self.names.set(heap, host, config.names.as_tagged(heap));
     }
 
@@ -75,7 +75,7 @@ impl HeapObject for Context {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().context_map.as_tagged(heap));
+            .init(heap.known().context_map.as_tagged(heap));
         match config.outer {
             Some(outer) => self.outer.set(heap, host, outer.as_tagged(heap)),
             None => self.outer.clear(heap),
@@ -194,7 +194,7 @@ impl HeapObject for HandlerTable {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().handler_table_map.as_tagged(heap));
+            .init(heap.known().handler_table_map.as_tagged(heap));
         self.size
             .set(heap, host, Smi::new(config.entries.len() as i64));
         for (i, e) in config.entries.iter().enumerate() {

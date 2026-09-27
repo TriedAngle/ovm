@@ -3,14 +3,14 @@ use std::path::Path;
 
 use kette_compiler::KetteCompiler;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{Compiler, JSRuntime, MatchLoopInterpreter, Thread, VM};
+use vm::{Compiler, DefaultInterpreter, JSRuntime, Thread, VM};
 use vm::{
     DenseString, Float, Heap, JavascriptCompiler, LoadOutcome, Lookup, SlotName, Smi, Tagged, Value,
 };
 
 fn main() {
     trace::init();
-    let vm = VM::new::<MarkSweep, MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = VM::new::<MarkSweep, DefaultInterpreter>(MarkSweepConfig::default())
         .expect("failed to create heap")
         .add::<JSRuntime>()
         .expect("failed to install js runtime");

@@ -63,7 +63,7 @@ impl HeapObject for FixedByteArray {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().byte_array_map.as_tagged(heap));
+            .init(heap.known().byte_array_map.as_tagged(heap));
         self.size.set(heap, host, Smi::new(config.len() as i64));
         for (i, b) in config.iter().enumerate() {
             self.set(i, *b);

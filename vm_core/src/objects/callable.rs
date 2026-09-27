@@ -113,7 +113,7 @@ impl HeapObject for CallableInfoObject {
         let host = self.tagged(heap);
         self.header
             .map
-            .set(heap, host, heap.known().callable_map.as_tagged(heap));
+            .init(heap.known().callable_map.as_tagged(heap));
         self.bytecode
             .set(heap, host, config.bytecode.as_tagged(heap));
         self.constants
@@ -131,7 +131,7 @@ impl HeapObject for CallableInfoObject {
         }
         self.feedback.clear(heap);
         self.name
-            .set(heap, host, heap.known().the_hole.as_tagged(heap).erase());
+            .init(heap.known().the_hole.as_tagged(heap).erase());
         self.formal_parameter_count.set(heap, host, Smi::new(0));
         self.formal_length.set(heap, host, Smi::new(0));
         self.kind

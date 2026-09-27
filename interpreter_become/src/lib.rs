@@ -1287,6 +1287,151 @@ handlers!(pc, code, regs, acc, ctx;
             ConstructStart::Cold => become cold_construct(pc, code, regs, acc, ctx),
         }
     }
+
+    LoadHole : op_load_hole_n / op_load_hole_w () {
+        next!(ctx.heap().known().the_hole.as_tagged(ctx.heap()).erase())
+    }
+
+    LoadNewTarget : op_load_new_target_n / op_load_new_target_w () {
+        next!(ctx.stack().new_target_slot(&ctx.meta(0)).get(ctx.heap()))
+    }
+
+    LoadContext : op_load_context_n / op_load_context_w () {
+        next!(ctx.stack().context_slot(&ctx.meta(0)).get(ctx.heap()))
+    }
+
+    ThrowReferenceErrorIfHole : op_throw_reference_error_if_hole_n / op_throw_reference_error_if_hole_w () {
+        if acc == ctx.heap().known().the_hole.as_tagged(ctx.heap()).erase() {
+            bail!(VmError::Reference)
+        }
+        next!(acc)
+    }
+
+    TestReferenceEqual : op_test_reference_equal_n / op_test_reference_equal_w (r => signed) {
+        let other = reg!(r);
+        next!(Convert::boolean(ctx.heap(), other == acc))
+    }
+
+    TestTypeof : op_test_typeof_n / op_test_typeof_w () {
+        next!(Object::type_of(ctx.heap(), acc))
+    }
+
+    EqualStrict : op_equal_strict_n / op_equal_strict_w (r => signed) {
+        let other = reg!(r);
+        next!(Convert::boolean(ctx.heap(), Compare::strict_equal(ctx.heap(), acc, other)))
+    }
+
+    JumpIfNotUndefined : op_jump_if_not_undefined_n / op_jump_if_not_undefined_w (off => signed) {
+        if acc != ctx.heap().known().undefined.as_tagged(ctx.heap()).erase() {
+            jump!(off, acc)
+        }
+        next!(acc)
+    }
+
+    LessThanOrEqual : op_less_than_or_equal_n / op_less_than_or_equal_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
+            next!(Convert::boolean(ctx.heap(), a <= b))
+        }
+        become cold_less_than_or_equal(pc, code, regs, acc, ctx)
+    }
+
+    CreateBareObjectLiteral : op_create_bare_object_n / op_create_bare_object_w () {
+        become cold_create_bare_object(pc, code, regs, acc, ctx)
+    }
+
+    CreateBlockContext : op_create_block_context_n / op_create_block_context_w (count => unsigned) {
+        become cold_create_block_context(pc, code, regs, acc, ctx)
+    }
+
+    LoadGlobalFast : op_load_global_fast_n / op_load_global_fast_w (name => unsigned, fb => unsigned) {
+        let global = ctx.heap().known().global_object.as_tagged(ctx.heap()).erase();
+        if let Some(Hit::Value(v)) = InlineCache::try_load(
+            ctx.heap(),
+            ctx.cache().feedback_ref(ctx.heap()),
+            fb,
+            global,
+        ) {
+            next!(v)
+        }
+        become cold_global_load(pc, code, regs, acc, ctx)
+    }
+
+    LoadGlobalNoThrow : op_load_global_nothrow_n / op_load_global_nothrow_w (name => unsigned, fb => unsigned) {
+        let global = ctx.heap().known().global_object.as_tagged(ctx.heap()).erase();
+        if let Some(Hit::Value(v)) = InlineCache::try_load(
+            ctx.heap(),
+            ctx.cache().feedback_ref(ctx.heap()),
+            fb,
+            global,
+        ) {
+            next!(v)
+        }
+        become cold_global_load_nothrow(pc, code, regs, acc, ctx)
+    }
+
+    StoreGlobal : op_store_global_n / op_store_global_w (name => unsigned, fb => unsigned) {
+        become cold_store_global(pc, code, regs, acc, ctx)
+    }
+
+    StoreNamedPropertyNoShadow : op_store_named_no_shadow_n / op_store_named_no_shadow_w (r => signed, name => unsigned, fb => unsigned) {
+        become cold_store_named_no_shadow(pc, code, regs, acc, ctx)
+    }
+
+    StoreNamedPropertyNoShadowFast : op_store_named_no_shadow_fast_n / op_store_named_no_shadow_fast_w (r => signed, name => unsigned, fb => unsigned) {
+        become cold_store_named_no_shadow(pc, code, regs, acc, ctx)
+    }
+
+    InstanceOf : op_instance_of_n / op_instance_of_w (r => signed) {
+        become cold_instance_of(pc, code, regs, acc, ctx)
+    }
+
+    LoadCurrentClosure : op_load_current_closure_n / op_load_current_closure_w () {
+        next!(ctx.stack().callable_slot(&ctx.meta(0)).get(ctx.heap()))
+    }
+
+    GreaterThanOrEqual : op_greater_than_or_equal_n / op_greater_than_or_equal_w (r => signed) {
+        let other = reg!(r);
+        if let (Some(a), Some(b)) = (acc.smi_bits(), other.smi_bits()) {
+            next!(Convert::boolean(ctx.heap(), a >= b))
+        }
+        become cold_greater_than_or_equal(pc, code, regs, acc, ctx)
+    }
+
+    AddParent : op_add_parent_n / op_add_parent_w (r => signed, name => unsigned) {
+        become cold_add_parent(pc, code, regs, acc, ctx)
+    }
+
+    LoadNamedPropertyFast : op_load_named_fast_n / op_load_named_fast_w (r => signed, name => unsigned, fb => unsigned) {
+        let recv = reg!(r);
+        match InlineCache::probe_mono(
+            ctx.heap(),
+            ctx.cache().feedback_ref(ctx.heap()),
+            fb,
+            recv,
+        ) {
+            MonoProbe::Value(v) => next!(v),
+            MonoProbe::Handler(obj, handler) => {
+                if let Some(Hit::Value(v)) = InlineCache::apply_mono(ctx.heap(), obj, handler) {
+                    next!(v)
+                }
+            }
+            MonoProbe::Poly {
+                obj,
+                map,
+                pairs,
+                start,
+            } => {
+                if let Some(Hit::Value(v)) =
+                    InlineCache::try_load_resume(ctx.heap(), obj, map, pairs, start)
+                {
+                    next!(v)
+                }
+            }
+            MonoProbe::Miss | MonoProbe::NotReceiver => {}
+        }
+        become cold_named_load(pc, code, regs, acc, ctx)
+    }
 );
 
 #[inline(always)]
@@ -3274,6 +3419,370 @@ unsafe extern "rust-preserve-none" fn cold_create_empty_object<'a>(
 
 #[cold]
 #[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_create_bare_object<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let next = cold_next_pc(pc, code);
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    let obj = state.handle_scope(|scope| {
+        let map = heap.known().plain_object_map;
+        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
+    });
+    become resume(next, code, regs, obj, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn create_block_context_cold<'a>(
+    ctx: &Ctx<'a>,
+    count: usize,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let meta = ctx.meta(0);
+        let outer = scope
+            .cast::<Context>(ctx.stack().context_slot(&meta).get(heap))
+            .expect("frame context slot holds a Context");
+        let slots = if count == 0 {
+            heap.known().empty_fixed_array
+        } else {
+            let values = scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
+            heap.allocate_handle::<FixedArray>(values, &scope)
+        };
+        let ctx_obj = heap.allocate::<Context>(ContextInit {
+            outer: Some(outer),
+            slots,
+            scope_info: heap.known().empty_scope_info,
+        });
+        Ok(ctx_obj.erase())
+    })
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_create_block_context<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let count = unsigned::read(pc, code, base, stride);
+    let v = create_block_context_cold(ctx, count)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_less_than_or_equal<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = compare_op_cold(ctx, 3, acc, other)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn global_load_nothrow_cold<'a>(
+    ctx: &Ctx<'a>,
+    name_idx: usize,
+    fb_slot: usize,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let vm = ctx.vm();
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let global = heap.known().global_object;
+        let name = scope.handle(
+            ctx.cache()
+                .constants_ref(heap)
+                .at(heap, name_idx)
+                .erase()
+                .as_name(),
+        );
+        match global.as_tagged(heap).lookup(heap, name.as_tagged(heap)) {
+            Lookup::Data { slot, .. } => {
+                let v = scope.handle(slot.get(heap));
+                InlineCache::update_load(
+                    heap,
+                    &scope,
+                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                    fb_slot,
+                    Some(scope.handle(global.as_tagged(heap))),
+                    scope.handle(name.as_tagged(heap).erase().as_name()),
+                    false,
+                );
+                Ok(v.as_tagged(heap).erase())
+            }
+            Lookup::Accessor { pair, .. } => {
+                let getter = scope.handle(pair.get.get(heap));
+                let args = scope.stage(&[global.as_tagged(heap).erase()]);
+                RuntimeContext::call(vm, heap, state, getter, args, None)
+            }
+            Lookup::NotFound => Ok(heap.known().undefined.as_tagged(heap).erase()),
+        }
+    })
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_global_load_nothrow<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let name_idx = unsigned::read(pc, code, base, stride);
+    let fb_slot = unsigned::read(pc, code, base + stride, stride);
+    let v = global_load_nothrow_cold(ctx, name_idx, fb_slot)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn store_global_cold<'a>(
+    ctx: &Ctx<'a>,
+    name_idx: usize,
+    value: Tagged<'_, Value>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let vm = ctx.vm();
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let value = scope.handle(value);
+        let name = scope.handle(
+            ctx.cache()
+                .constants_ref(heap)
+                .at(heap, name_idx)
+                .erase()
+                .as_name(),
+        );
+        let global = heap.known().global_object;
+        let outcome = global.as_tagged(heap).erase().store_lookup(
+            heap,
+            &scope,
+            name.as_tagged(heap),
+            value.as_tagged(heap),
+            StoreSemantics::WriteThrough,
+        )?;
+        match outcome {
+            StoreOutcome::Transition { receiver, name } => {
+                Object::add_own_property(
+                    heap,
+                    &scope,
+                    receiver,
+                    name,
+                    PropertyDescriptor::data(scope.handle(value.as_tagged(heap))),
+                )?;
+            }
+            StoreOutcome::CallSetter { setter } => {
+                let args = scope.stage(&[global.as_tagged(heap).erase(), value.as_tagged(heap)]);
+                let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+            }
+            StoreOutcome::Done => {}
+        }
+        Ok(value.as_tagged(heap).erase())
+    })
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_store_global<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let name_idx = unsigned::read(pc, code, base, stride);
+    let v = store_global_cold(ctx, name_idx, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn store_named_no_shadow_cold<'a>(
+    ctx: &Ctx<'a>,
+    recv: Tagged<'_, Value>,
+    name_idx: usize,
+    value: Tagged<'_, Value>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let vm = ctx.vm();
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let recv = scope.handle(recv);
+        let value = scope.handle(value);
+        let name = scope.handle(
+            ctx.cache()
+                .constants_ref(heap)
+                .at(heap, name_idx)
+                .erase()
+                .as_name(),
+        );
+        let outcome = recv.as_tagged(heap).erase().store_lookup(
+            heap,
+            &scope,
+            name.as_tagged(heap),
+            value.as_tagged(heap),
+            StoreSemantics::WriteThrough,
+        )?;
+        match outcome {
+            StoreOutcome::Transition { receiver, name } => {
+                Object::add_own_property(
+                    heap,
+                    &scope,
+                    receiver,
+                    name,
+                    PropertyDescriptor::data(scope.handle(value.as_tagged(heap))),
+                )?;
+            }
+            StoreOutcome::CallSetter { setter } => {
+                let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
+                let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+            }
+            StoreOutcome::Done => {}
+        }
+        Ok(value.as_tagged(heap).erase())
+    })
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_store_named_no_shadow<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let name_idx = unsigned::read(pc, code, base + stride, stride);
+    let v = store_named_no_shadow_cold(ctx, recv, name_idx, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn instance_of_cold<'a>(
+    ctx: &Ctx<'a>,
+    object: Tagged<'_, Value>,
+    callable: Tagged<'_, Value>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let vm = ctx.vm();
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let object = scope.handle(object);
+        let callable = scope.handle(callable);
+        match Object::instance_of(vm, heap, state, object, callable)? {
+            None => Ok(ctx.exception_word()),
+            Some(r) => Ok(Convert::boolean(heap, r)),
+        }
+    })
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_instance_of<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let callable = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = instance_of_cold(ctx, acc, callable)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_greater_than_or_equal<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let v = compare_op_cold(ctx, 5, acc, other)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn add_parent_cold<'a>(
+    ctx: &Ctx<'a>,
+    recv: Tagged<'_, Value>,
+    name_idx: usize,
+    value: Tagged<'_, Value>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+        let receiver = scope.handle(recv);
+        let name = scope.handle(
+            ctx.cache()
+                .constants_ref(heap)
+                .at(heap, name_idx)
+                .erase()
+                .as_name(),
+        );
+        let value = scope.handle(value);
+        let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+            return Err(VmError::Type);
+        };
+        Object::add_parent(heap, &scope, receiver, name, value)?;
+        Ok(value.as_tagged(heap).erase())
+    })
+}
+
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn cold_add_parent<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
+    let name_idx = unsigned::read(pc, code, base + stride, stride);
+    let v = add_parent_cold(ctx, recv, name_idx, acc)?;
+    become resume(next, code, regs, v, ctx)
+}
+
+#[cold]
+#[inline(never)]
 unsafe extern "rust-preserve-none" fn cold_create_function_context<'a>(
     pc: usize,
     code: *const u8,
@@ -3458,6 +3967,27 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::CallMethod1 as usize] = op_call_method1_n as Handler;
     t[Opcode::CallMethod2 as usize] = op_call_method2_n as Handler;
     t[Opcode::Construct as usize] = op_construct_n as Handler;
+    t[Opcode::LoadHole as usize] = op_load_hole_n as Handler;
+    t[Opcode::LoadNewTarget as usize] = op_load_new_target_n as Handler;
+    t[Opcode::LoadContext as usize] = op_load_context_n as Handler;
+    t[Opcode::ThrowReferenceErrorIfHole as usize] = op_throw_reference_error_if_hole_n as Handler;
+    t[Opcode::TestReferenceEqual as usize] = op_test_reference_equal_n as Handler;
+    t[Opcode::TestTypeof as usize] = op_test_typeof_n as Handler;
+    t[Opcode::EqualStrict as usize] = op_equal_strict_n as Handler;
+    t[Opcode::JumpIfNotUndefined as usize] = op_jump_if_not_undefined_n as Handler;
+    t[Opcode::LessThanOrEqual as usize] = op_less_than_or_equal_n as Handler;
+    t[Opcode::CreateBareObjectLiteral as usize] = op_create_bare_object_n as Handler;
+    t[Opcode::CreateBlockContext as usize] = op_create_block_context_n as Handler;
+    t[Opcode::LoadGlobalFast as usize] = op_load_global_fast_n as Handler;
+    t[Opcode::LoadGlobalNoThrow as usize] = op_load_global_nothrow_n as Handler;
+    t[Opcode::StoreGlobal as usize] = op_store_global_n as Handler;
+    t[Opcode::StoreNamedPropertyNoShadow as usize] = op_store_named_no_shadow_n as Handler;
+    t[Opcode::InstanceOf as usize] = op_instance_of_n as Handler;
+    t[Opcode::LoadCurrentClosure as usize] = op_load_current_closure_n as Handler;
+    t[Opcode::GreaterThanOrEqual as usize] = op_greater_than_or_equal_n as Handler;
+    t[Opcode::AddParent as usize] = op_add_parent_n as Handler;
+    t[Opcode::LoadNamedPropertyFast as usize] = op_load_named_fast_n as Handler;
+    t[Opcode::StoreNamedPropertyNoShadowFast as usize] = op_store_named_no_shadow_fast_n as Handler;
     t[Opcode::Wide as usize] = op_wide as Handler;
     t
 }
@@ -3539,6 +4069,27 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::CallMethod1 as usize] = op_call_method1_w as Handler;
     t[Opcode::CallMethod2 as usize] = op_call_method2_w as Handler;
     t[Opcode::Construct as usize] = op_construct_w as Handler;
+    t[Opcode::LoadHole as usize] = op_load_hole_w as Handler;
+    t[Opcode::LoadNewTarget as usize] = op_load_new_target_w as Handler;
+    t[Opcode::LoadContext as usize] = op_load_context_w as Handler;
+    t[Opcode::ThrowReferenceErrorIfHole as usize] = op_throw_reference_error_if_hole_w as Handler;
+    t[Opcode::TestReferenceEqual as usize] = op_test_reference_equal_w as Handler;
+    t[Opcode::TestTypeof as usize] = op_test_typeof_w as Handler;
+    t[Opcode::EqualStrict as usize] = op_equal_strict_w as Handler;
+    t[Opcode::JumpIfNotUndefined as usize] = op_jump_if_not_undefined_w as Handler;
+    t[Opcode::LessThanOrEqual as usize] = op_less_than_or_equal_w as Handler;
+    t[Opcode::CreateBareObjectLiteral as usize] = op_create_bare_object_w as Handler;
+    t[Opcode::CreateBlockContext as usize] = op_create_block_context_w as Handler;
+    t[Opcode::LoadGlobalFast as usize] = op_load_global_fast_w as Handler;
+    t[Opcode::LoadGlobalNoThrow as usize] = op_load_global_nothrow_w as Handler;
+    t[Opcode::StoreGlobal as usize] = op_store_global_w as Handler;
+    t[Opcode::StoreNamedPropertyNoShadow as usize] = op_store_named_no_shadow_w as Handler;
+    t[Opcode::InstanceOf as usize] = op_instance_of_w as Handler;
+    t[Opcode::LoadCurrentClosure as usize] = op_load_current_closure_w as Handler;
+    t[Opcode::GreaterThanOrEqual as usize] = op_greater_than_or_equal_w as Handler;
+    t[Opcode::AddParent as usize] = op_add_parent_w as Handler;
+    t[Opcode::LoadNamedPropertyFast as usize] = op_load_named_fast_w as Handler;
+    t[Opcode::StoreNamedPropertyNoShadowFast as usize] = op_store_named_no_shadow_fast_w as Handler;
     t
 }
 

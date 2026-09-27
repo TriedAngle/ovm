@@ -5,7 +5,7 @@ use vm::VM;
 use vm::Value;
 
 fn vm() -> VM {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

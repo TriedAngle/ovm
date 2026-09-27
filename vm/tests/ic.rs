@@ -5,7 +5,7 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{FeedbackVector, Smi, Tagged, Thread, Value, WeakFixedArray};
 
 fn run(src: &str) -> Result<Value, vm::ScriptError> {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -19,7 +19,7 @@ fn run_smi(src: &str) -> i64 {
 }
 
 fn run_bool(src: &str) -> bool {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -201,7 +201,7 @@ fn typeof_undeclared_global_before_and_after_assignment() {
 // inspected directly.
 
 fn run_value(src: &str) -> (Value, Thread) {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -335,7 +335,7 @@ fn prototype_hit_installs_one_hop_handler() {
 fn try_load_hits_directly() {
     // end-to-end probe of the hit path: same-shape receiver, populated
     // vector, `try_load` must resolve without the lookup
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -582,7 +582,7 @@ fn object_create_builds_proto_chain() {
          o instanceof Object === false;"
     ));
     // throws on a primitive prototype argument (uncaught → sentinel)
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();
@@ -602,7 +602,7 @@ fn object_create_builds_proto_chain() {
 use bytecode::SourceMode;
 
 fn run_kette_smi(src: &str) -> i64 {
-    let vm = vm::VM::new::<MarkSweep, vm::MatchLoopInterpreter>(MarkSweepConfig::default())
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
         .unwrap()
         .add::<vm::JSRuntime>()
         .unwrap();

@@ -29,6 +29,7 @@ fn deltablue() {
         .unwrap()
         .add::<JSRuntime>()
         .unwrap();
+    vm.arm_gc_stress();
     let mut thread = vm.attach();
     thread
         .eval::<JavascriptCompiler>(&src)
