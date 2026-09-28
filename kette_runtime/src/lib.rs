@@ -41,10 +41,7 @@ impl Runtime for KetteRuntime {
     }
 }
 
-fn console_print<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn console_print<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -69,4 +66,3 @@ fn console_print<'a>(
         heap.known().undefined.as_tagged(heap).erase()
     })
 }
-

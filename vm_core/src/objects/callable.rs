@@ -78,7 +78,7 @@ impl FunctionKind {
     }
 
     #[inline]
-    pub(crate) fn decode(value: i64) -> Self {
+    pub fn decode(value: i64) -> Self {
         match value {
             x if x == Self::Normal as i64 => Self::Normal,
             x if x == Self::Generator as i64 => Self::Generator,

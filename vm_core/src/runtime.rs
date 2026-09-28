@@ -199,8 +199,7 @@ impl<'a> RuntimeContext<'a> {
 /// The runtime-call ABI (tier 1): a single tagged word in the first
 /// return register. Errors are the exception sentinel with the pending
 /// exception set — one error channel at the boundary. `Result` survives only above `execute`.
-pub type RuntimeCall =
-    for<'a, 'r> fn(RuntimeContext<'a>, HandleSlice<'r>) -> Tagged<'a, Value>;
+pub type RuntimeCall = for<'a, 'r> fn(RuntimeContext<'a>, HandleSlice<'r>) -> Tagged<'a, Value>;
 
 /// Materialize `err` as the pending exception and return the sentinel:
 /// the single-channel bridge for runtime bodies.
@@ -210,8 +209,8 @@ pub fn raise_runtime<'a>(
     state: &ContextState,
     err: VmError,
 ) -> Tagged<'a, Value> {
-    let ex = Errors::from_vm_error(vm, heap, state, err)
-        .expect("error materialization must not fail");
+    let ex =
+        Errors::from_vm_error(vm, heap, state, err).expect("error materialization must not fail");
     state.set_pending_exception(ex);
     state.set_last_error(err);
     heap.known().exception.as_tagged(heap).erase()

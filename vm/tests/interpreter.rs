@@ -265,11 +265,10 @@ fn load_smi_signed_immediates() {
 
 #[test]
 fn call_runtime_passes_receiver_and_args() {
-    fn add<'a>(
-        nctx: RuntimeContext<'a>,
-        args: HandleSlice<'_>,
-    ) -> Tagged<'a, Value> {
-        let RuntimeContext { vm, heap, state, .. } = nctx;
+    fn add<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+        let RuntimeContext {
+            vm, heap, state, ..
+        } = nctx;
         let (a, b) = match (
             args.get(1).map(|h| h.as_tagged(heap)),
             args.get(2).map(|h| h.as_tagged(heap)),
@@ -2114,10 +2113,7 @@ fn call_dispatches_to_runtime_function_object() {
 
 /// Runtime that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the runtime recovers.
-fn run_failing_inner<'a>(
-    nctx: RuntimeContext<'a>,
-    _args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn run_failing_inner<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -4273,7 +4269,11 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(
+            &mut program,
+            Opcode::Construct,
+            &[reg_op(0), reg_op(0), 0, reg_op(1)],
+        );
         emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[g]).unwrap();
@@ -4284,7 +4284,11 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(
+            &mut program,
+            Opcode::Construct,
+            &[reg_op(0), reg_op(0), 0, reg_op(1)],
+        );
         emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::Load, &[reg_op(1)]);
@@ -4299,7 +4303,11 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(
+            &mut program,
+            Opcode::Construct,
+            &[reg_op(0), reg_op(0), 0, reg_op(1)],
+        );
         emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[f]).unwrap();
@@ -4312,7 +4320,11 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(
+            &mut program,
+            Opcode::Construct,
+            &[reg_op(0), reg_op(0), 0, reg_op(1)],
+        );
         emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[plain]);
@@ -4322,10 +4334,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
 
 /// Runtime constructor probe: reports `nctx.is_construct()` by storing 1/0
 /// into the global property "constructProbe".
-fn construct_probe<'a>(
-    nctx: RuntimeContext<'a>,
-    _args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn construct_probe<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let is_construct = nctx.is_construct();
     let RuntimeContext {
         vm, heap, state, ..
@@ -4380,7 +4389,11 @@ fn construct_sets_runtime_construct_flag() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(
+            &mut program,
+            Opcode::Construct,
+            &[reg_op(0), reg_op(0), 0, reg_op(1)],
+        );
         emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);

@@ -7,21 +7,23 @@ use vm_core::{raise_runtime, rt_try};
 
 /// `Math.sqrt(x)` (ES 22.1.2.29): ToNumber, then the IEEE-754 square root
 /// (NaN/negative input → NaN, ±0 → ±0).
-pub fn math_sqrt<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+pub fn math_sqrt<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let n = rt_try!(vm, heap, state, state.handle_scope(|scope| {
-        let arg = args
-            .get(1)
-            .map(|h| h.as_tagged(heap))
-            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
-        let arg = scope.handle(arg);
-        Object::to_numeric(vm, heap, state, arg)
-    }));
+    let n = rt_try!(
+        vm,
+        heap,
+        state,
+        state.handle_scope(|scope| {
+            let arg = args
+                .get(1)
+                .map(|h| h.as_tagged(heap))
+                .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+            let arg = scope.handle(arg);
+            Object::to_numeric(vm, heap, state, arg)
+        })
+    );
     let Some(n) = n else {
         return heap.known().exception.as_tagged(heap).erase();
     };
@@ -48,10 +50,7 @@ fn numeric_arg(
 }
 
 /// `Math.log(x)` (ES 22.1.2.15): natural logarithm.
-pub fn math_log<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+pub fn math_log<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -62,10 +61,7 @@ pub fn math_log<'a>(
 }
 
 /// `Math.pow(base, exponent)` (ES 22.1.2.20).
-pub fn math_pow<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+pub fn math_pow<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

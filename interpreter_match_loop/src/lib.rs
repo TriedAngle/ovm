@@ -5,9 +5,9 @@ use vm_core::ic::{Hit, InlineCache, StoreHit, StoreOutcomeKind};
 use vm_core::{
     Acc, CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState,
     Convert, DenseString, Errors, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint,
-    Intrinsic, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, RuntimeContext,
-    RuntimeIndex, ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome, StoreSemantics,
-    Tagged, Termination, VM, Value, VmError, spread_apply_args,
+    Intrinsic, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, RuntimeContext, RuntimeIndex,
+    ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome, StoreSemantics, Tagged, Termination,
+    VM, Value, VmError, spread_apply_args,
 };
 
 enum Called<'a> {
@@ -105,8 +105,10 @@ fn start<'b>(
             // Rust-world entry of an intrinsic: unwrap it and re-enter
             state.handle_scope(|scope| match intrinsic {
                 Intrinsic::FunctionCall => {
-                    let f =
-                        args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    let f = args
+                        .get(0)
+                        .map(|h| h.as_tagged(heap))
+                        .ok_or(VmError::Arity)?;
                     if !Object::is_callable(heap, f) {
                         return Err(VmError::Type);
                     }
@@ -114,8 +116,10 @@ fn start<'b>(
                     execute(vm, heap, state, f, args.slice_from(1), None)
                 }
                 Intrinsic::FunctionApply => {
-                    let f =
-                        args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    let f = args
+                        .get(0)
+                        .map(|h| h.as_tagged(heap))
+                        .ok_or(VmError::Arity)?;
                     if !Object::is_callable(heap, f) {
                         return Err(VmError::Type);
                     }
@@ -1121,7 +1125,10 @@ fn intrinsic_step<'a>(
     let result = state.handle_scope(|scope| -> Result<Tagged<'_, Value>, VmError> {
         match intrinsic {
             Intrinsic::FunctionCall => {
-                let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                let f = args
+                    .get(0)
+                    .map(|h| h.as_tagged(heap))
+                    .ok_or(VmError::Arity)?;
                 if !Object::is_callable(heap, f) {
                     return Err(VmError::Type);
                 }
@@ -1133,7 +1140,10 @@ fn intrinsic_step<'a>(
                 execute(vm, heap, state, f, args.slice_from(1), None)
             }
             Intrinsic::FunctionApply => {
-                let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                let f = args
+                    .get(0)
+                    .map(|h| h.as_tagged(heap))
+                    .ok_or(VmError::Arity)?;
                 if !Object::is_callable(heap, f) {
                     return Err(VmError::Type);
                 }
@@ -2337,8 +2347,7 @@ fn step<'a>(
                 None => Step::Error(VmError::Type),
                 Some(CallTarget::Proxy(_)) => Step::Error(VmError::Type),
                 Some(CallTarget::Intrinsic(intrinsic)) => {
-                    let (saved_top, staged) =
-                        step_try!(stack.stage_args_regs(heap, &meta, srcs));
+                    let (saved_top, staged) = step_try!(stack.stage_args_regs(heap, &meta, srcs));
                     let step = intrinsic_step(vm, heap, state, &acc, intrinsic, staged);
                     stack.set_top(saved_top);
                     return step;

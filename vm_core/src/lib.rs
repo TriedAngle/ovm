@@ -144,6 +144,12 @@ pub struct ContextState {
     /// right before the uncatchable unwind; guest code can never observe or
     /// intercept it.
     termination: Cell<Option<Termination>>,
+    /// Construct-receiver cache: a `WeakFixedArray` table mapping closures
+    /// to their synthesized initial map identity-keyed per closure since `.prototype` is per-closure.
+    /// Entries are `[closure(weak), fn_map, proto, proto_slot(Smi),
+    /// initial_map]`; a closure's entry is valid while its map and the
+    /// `.prototype` slot value compare equal. The hole = not yet allocated.
+    construct_cache: Register,
 }
 
 impl ContextState {
@@ -153,6 +159,102 @@ impl ContextState {
 
     pub fn cache(&self) -> &StackCache {
         &self.cache
+    }
+
+    #[inline(always)]
+    pub fn construct_initial_map<'a>(
+        &self,
+        heap: &'a Heap,
+        closure: Tagged<'_, Object>,
+    ) -> Option<Tagged<'a, Map>> {
+        let word = self.construct_cache.get(heap);
+        if word.raw() == heap.known().the_hole.as_tagged(heap).raw() {
+            return None;
+        }
+        // Safety: the slot only ever holds this module's table.
+        let table: Tagged<'a, WeakFixedArray> = unsafe { core::mem::transmute(word.raw()) };
+        let t = table.as_ref();
+        let mask = t.len() / 5 - 1;
+        let mut i = ((closure.raw().to_bits() >> 5) as usize) & mask;
+        for _ in 0..=mask {
+            let base = i * 5;
+            let entry = t.get(heap, base);
+            let slot = t.element_slot(base);
+            if entry.raw().is_weak_ptr() && !slot.is_cleared() {
+                if entry.raw().to_bits() == closure.raw().to_bits() | WEAK_PTR {
+                    // validate: same function map, same `.prototype` slot
+                    let fn_map = t.get(heap, base + 1);
+                    let proto = t.get(heap, base + 2);
+                    let offset = Smi::decode(t.get(heap, base + 3).raw())?.value() as usize;
+                    let map_now = closure.as_ref().header.map.get(heap);
+                    if fn_map.raw() != map_now.raw() {
+                        return None;
+                    }
+                    if closure.as_ref().slot(heap, offset).raw() != proto.raw() {
+                        return None;
+                    }
+                    // Safety: written only by `construct_cache_insert` with
+                    // the synthesized receiver's map.
+                    let initial: Tagged<'a, Map> =
+                        unsafe { core::mem::transmute(t.get(heap, base + 4).raw()) };
+                    return Some(initial);
+                }
+                // dead entry: keep probing
+            } else if entry.raw() == heap.known().the_hole.as_tagged(heap).raw() {
+                return None; // reached an empty slot: absent
+            } else {
+                return None; // strong non-hole: not our layout — bail
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+
+    /// Record `closure -> initial_map` (miss path; `proto_slot` is the
+    /// object-slot offset of the closure's `.prototype` data property).
+    pub fn construct_cache_insert(
+        &self,
+        heap: &mut Heap,
+        closure: Tagged<'_, Object>,
+        proto: Tagged<'_, Value>,
+        proto_slot: usize,
+        initial_map: Tagged<'_, Map>,
+    ) {
+        // the ONLY allocation is the first-use table below: run it
+        // before reading any parameter words so a moving GC cannot
+        // stale them
+        let the_hole = heap.known().the_hole.as_tagged(heap).raw();
+        let word = self.construct_cache.get(heap);
+        if word.raw() == the_hole {
+            let hole_weak =
+                unsafe { Tagged::<Value>::from_value_unchecked(the_hole) }.as_maybe_weak();
+            let vals = vec![hole_weak; 320];
+            let table = heap.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &vals });
+            self.construct_cache.store(table.erase());
+        }
+        // allocation-free from here: raw words are stable
+        let table: Tagged<WeakFixedArray> =
+            unsafe { Tagged::from_value_unchecked(self.construct_cache.get(heap).raw()) };
+        let t = table.as_ref();
+        let mask = t.len() / 5 - 1;
+        let fn_map = closure.as_ref().header.map.get(heap);
+        let mut i = ((closure.raw().to_bits() >> 5) as usize) & mask;
+        for _ in 0..=mask {
+            let base = i * 5;
+            let entry = t.get(heap, base);
+            let slot = t.element_slot(base);
+            let free = entry.raw() == the_hole || (entry.raw().is_weak_ptr() && slot.is_cleared());
+            if free {
+                t.set_weak(heap, base, closure.erase());
+                t.set_strong(heap, base + 1, fn_map.erase());
+                t.set_strong(heap, base + 2, proto);
+                t.set_strong(heap, base + 3, Smi::new(proto_slot as i64).into_tagged());
+                t.set_strong(heap, base + 4, initial_map.erase());
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+        // full: drop inserts (rare — 64 constructor kinds)
     }
 
     pub fn set_last_error(&self, err: VmError) {
@@ -285,6 +387,7 @@ impl EdgeVisitable for ContextState {
         self.stack.visit_edges(visitor);
         self.cache.visit_edges(visitor);
         visitor.visit(self.pending_exception.as_raw());
+        visitor.visit(self.construct_cache.as_raw());
     }
 }
 
@@ -559,6 +662,7 @@ impl VM {
             has_pending_exception: Cell::new(false),
             last_error: Cell::new(VmError::Type),
             termination: Cell::new(None),
+            construct_cache: unsafe { Register::from_value(the_hole) },
         });
         let mut threads = self.shared.threads.lock().unwrap();
         // TODO: should we really call this every attach() ?

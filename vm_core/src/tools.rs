@@ -30,10 +30,7 @@ impl KetteTools {
         heap.known().undefined.as_tagged(heap).erase()
     }
 
-    pub fn shutdown<'a>(
-        ctx: RuntimeContext<'a>,
-        _args: HandleSlice<'_>,
-    ) -> Tagged<'a, Value> {
+    pub fn shutdown<'a>(ctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = ctx;

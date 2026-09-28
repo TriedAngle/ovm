@@ -20,8 +20,7 @@ pub fn function_to_string<'a>(
     } = nctx;
     state.handle_scope(|scope| {
         // fresh interned word, consumed with no allocation delay
-        vm
-            .interner()
+        vm.interner()
             .intern_str(heap, &scope, "function () { [native code] }")
             .as_tagged(heap)
             .erase()
@@ -31,18 +30,15 @@ pub fn function_to_string<'a>(
 /// `Function.prototype.bind(thisArg, ...prepend)` (ES 20.2.3.5): the
 /// bound function is the JS closure template installed by BIND_PRELUDE,
 /// called with (target, thisArg, prepend-array).
-pub fn function_bind<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+pub fn function_bind<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     let raw_f = {
         let Some(f) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let f = f.as_tagged(heap);
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
+        let f = f.as_tagged(heap);
         if !Object::is_callable(heap, f) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
@@ -75,7 +71,12 @@ pub fn function_bind<'a>(
                 .intern_str(heap, &scope, "__makeBound")
                 .erase();
             let proto = heap.known().function_prototype.erase();
-            match rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, proto, proto, name)) {
+            match rt_try!(
+                vm,
+                heap,
+                state,
+                Lookup::get_property_on(vm, heap, state, proto, proto, name)
+            ) {
                 Coercion::Threw => {
                     return heap.known().exception.as_tagged(heap).erase();
                 }
@@ -143,9 +144,9 @@ pub fn function_constructor<'a>(
         let mut parts: Vec<String> = Vec::with_capacity(argv.len());
         for a in argv {
             let s = scope.handle(match Convert::to_string(heap, &scope, a).map(|v| v.raw()) {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    });
+                Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+                Err(err) => return raise_runtime(vm, heap, state, err),
+            });
             parts.push(
                 s.as_tagged(heap)
                     .get_as::<DenseString>()
@@ -161,7 +162,12 @@ pub fn function_constructor<'a>(
         let program = match js_compiler::compile_js(&source, bytecode::SourceMode::Eval) {
             Ok(program) => program,
             Err(_) => {
-                let ex = rt_try!(vm, heap, state, Errors::from_vm_error(vm, heap, state, VmError::Type));
+                let ex = rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    Errors::from_vm_error(vm, heap, state, VmError::Type)
+                );
                 state.set_pending_exception(ex);
                 return heap.known().exception.as_tagged(heap).erase();
             }
@@ -169,8 +175,15 @@ pub fn function_constructor<'a>(
         let Some(context) = scope.cast::<Context>(context.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
-        let closure = rt_try!(vm, heap, state, Materialize::closure_vm(vm, heap, state, &scope, &program, context));
-        match RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None).map(|v| v.raw()) {
+        let closure = rt_try!(
+            vm,
+            heap,
+            state,
+            Materialize::closure_vm(vm, heap, state, &scope, &program, context)
+        );
+        match RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
+            .map(|v| v.raw())
+        {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => return raise_runtime(vm, heap, state, err),
         }

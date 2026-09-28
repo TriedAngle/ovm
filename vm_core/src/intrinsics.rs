@@ -80,7 +80,9 @@ fn require_object_coercible<'a>(
 ) -> Tagged<'a, Value> {
     // internal-runtime convention: the register list IS the argument list
     // (no receiver slot)
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(arg) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -132,7 +134,12 @@ fn delete_property<'a>(
     // computed key runs even when the delete afterwards throws);
     // the coercion allocates, so the base must stay rooted across it
     state.handle_scope(|scope| {
-        let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, raw_key)) else {
+        let Some(key) = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::to_property_key(vm, heap, state, raw_key)
+        ) else {
             return heap.known().exception.as_tagged(heap).erase();
         };
         // root the name: the tagged result anchors the `&mut` borrow
@@ -140,7 +147,12 @@ fn delete_property<'a>(
         // proxies run their `deleteProperty` trap (ES 20.2.5.4); the
         // returned boolean flows through the strict handling below
         let ok = if Proxy::is_proxy(heap, target.as_tagged(heap)) {
-            match rt_try!(vm, heap, state, Proxy::delete(vm, heap, state, target, key.erase())) {
+            match rt_try!(
+                vm,
+                heap,
+                state,
+                Proxy::delete(vm, heap, state, target, key.erase())
+            ) {
                 Coercion::Threw => {
                     return heap.known().exception.as_tagged(heap).erase();
                 }
@@ -150,7 +162,12 @@ fn delete_property<'a>(
                 }
             }
         } else {
-            rt_try!(vm, heap, state, delete_property_core(heap, &scope, target, key.erase()))
+            rt_try!(
+                vm,
+                heap,
+                state,
+                delete_property_core(heap, &scope, target, key.erase())
+            )
         };
         if strict && !ok {
             return raise_runtime(vm, heap, state, VmError::Type);
@@ -214,14 +231,21 @@ fn delete_identifier_sloppy<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(name) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
-    let ok = rt_try!(vm, heap, state, state.handle_scope(|scope| {
-        let global = scope.handle(heap.known().global_object.as_tagged(heap).erase());
-        delete_property_core(heap, &scope, global, name)
-    }));
+    let ok = rt_try!(
+        vm,
+        heap,
+        state,
+        state.handle_scope(|scope| {
+            let global = scope.handle(heap.known().global_object.as_tagged(heap).erase());
+            delete_property_core(heap, &scope, global, name)
+        })
+    );
     Convert::boolean(heap, ok)
 }
 
@@ -233,7 +257,9 @@ fn delete_super_property<'a>(
     nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     raise_runtime(vm, heap, state, VmError::Reference)
 }
 
@@ -270,10 +296,7 @@ fn stage_handles<'s>(
 /// zero iterations; objects and strings snapshot level 0 of the lazy
 /// chain walk. Other primitives' prototypes are not walked yet (their
 /// own properties are none, so they enumerate empty).
-fn for_in_enumerate<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn for_in_enumerate<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -449,10 +472,7 @@ fn for_in_level_keys<'s>(
 /// an earlier level (yielded or non-enumerable) are skipped; enumerable
 /// survivors are yielded at most once. When a level's snapshot runs
 /// dry, the walk advances to the live prototype and snapshots it.
-fn for_in_next<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn for_in_next<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -475,13 +495,22 @@ fn for_in_next<'a>(
                     return raise_runtime(vm, heap, state, VmError::Type);
                 };
                 let slots = obj.as_ref().slots.get(heap);
-                let keys = rt_try!(vm, heap, state, slots
-                    .at(heap, FOR_IN_KEYS)
-                    .get_as::<FixedArray>()
-                    .ok_or(VmError::Type));
-                let index = rt_try!(vm, heap, state, Smi::decode(slots.at(heap, FOR_IN_INDEX).raw())
-                    .ok_or(VmError::Type))
-                    .value() as usize;
+                let keys = rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    slots
+                        .at(heap, FOR_IN_KEYS)
+                        .get_as::<FixedArray>()
+                        .ok_or(VmError::Type)
+                );
+                let index = rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    Smi::decode(slots.at(heap, FOR_IN_INDEX).raw()).ok_or(VmError::Type)
+                )
+                .value() as usize;
                 let Some(key) = (index < keys.len()).then(|| keys.at(heap, index)) else {
                     break 'candidate None;
                 };
@@ -496,7 +525,8 @@ fn for_in_next<'a>(
                     };
                     scope.handle(obj.as_ref().slots.get(heap).at(heap, FOR_IN_LEVEL))
                 };
-                let Some(proto) = rt_try!(vm, heap, state, for_in_next_level(heap, &scope, level)) else {
+                let Some(proto) = rt_try!(vm, heap, state, for_in_next_level(heap, &scope, level))
+                else {
                     return heap.known().undefined.as_tagged(heap).erase();
                 };
                 let keys = rt_try!(vm, heap, state, for_in_level_keys(vm, heap, &scope, proto));
@@ -529,13 +559,17 @@ fn for_in_next<'a>(
                 let Some(obj) = enumerator.as_tagged(heap).as_heap_object() else {
                     return raise_runtime(vm, heap, state, VmError::Type);
                 };
-                let visited = rt_try!(vm, heap, state, obj
-                    .as_ref()
-                    .slots
-                    .get(heap)
-                    .at(heap, FOR_IN_VISITED)
-                    .get_as::<FixedArray>()
-                    .ok_or(VmError::Type));
+                let visited = rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    obj.as_ref()
+                        .slots
+                        .get(heap)
+                        .at(heap, FOR_IN_VISITED)
+                        .get_as::<FixedArray>()
+                        .ok_or(VmError::Type)
+                );
                 let key_word = key.as_tagged(heap);
                 visited
                     .as_slice()
@@ -551,13 +585,17 @@ fn for_in_next<'a>(
                     let Some(obj) = enumerator.as_tagged(heap).as_heap_object() else {
                         return raise_runtime(vm, heap, state, VmError::Type);
                     };
-                    let visited = rt_try!(vm, heap, state, obj
-                        .as_ref()
-                        .slots
-                        .get(heap)
-                        .at(heap, FOR_IN_VISITED)
-                        .get_as::<FixedArray>()
-                        .ok_or(VmError::Type));
+                    let visited = rt_try!(
+                        vm,
+                        heap,
+                        state,
+                        obj.as_ref()
+                            .slots
+                            .get(heap)
+                            .at(heap, FOR_IN_VISITED)
+                            .get_as::<FixedArray>()
+                            .ok_or(VmError::Type)
+                    );
                     let mut words: Vec<Tagged<'_, Value>> =
                         visited.as_slice().iter().map(|s| s.get(heap)).collect();
                     words.push(key.as_tagged(heap));
@@ -676,19 +714,21 @@ fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value
 }
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
-fn get_iterator<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn get_iterator<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         let Some(obj) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
         let symbol = scope.handle(heap.known().iterator_symbol.as_tagged(heap).erase());
-        let method = rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, obj, obj, symbol));
+        let method = rt_try!(
+            vm,
+            heap,
+            state,
+            Lookup::get_property_on(vm, heap, state, obj, obj, symbol)
+        );
         let method = match method {
             Coercion::Threw => {
                 return heap.known().exception.as_tagged(heap).erase();
@@ -711,19 +751,21 @@ fn get_iterator<'a>(
 }
 
 /// IteratorNext (ES 8.5.6): (iterator) -> result object.
-fn iterator_next<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn iterator_next<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         let Some(iter) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
         let next_name = scope.handle(heap.known().strings.next.as_tagged(heap).erase());
-        let next = rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, iter, iter, next_name));
+        let next = rt_try!(
+            vm,
+            heap,
+            state,
+            Lookup::get_property_on(vm, heap, state, iter, iter, next_name)
+        );
         let next = match next {
             Coercion::Threw => {
                 return heap.known().exception.as_tagged(heap).erase();
@@ -751,19 +793,21 @@ fn iterator_next<'a>(
 }
 
 /// IteratorComplete (ES 8.5.7): (result) -> bool.
-fn iterator_done<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn iterator_done<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         let Some(result) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
         let done_name = scope.handle(heap.known().strings.done.as_tagged(heap).erase());
-        let v = match rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, result, result, done_name)) {
+        let v = match rt_try!(
+            vm,
+            heap,
+            state,
+            Lookup::get_property_on(vm, heap, state, result, result, done_name)
+        ) {
             Coercion::Threw => return heap.known().exception.as_tagged(heap).erase(),
             Coercion::Value(v) => scope.handle(v),
         };
@@ -773,19 +817,21 @@ fn iterator_done<'a>(
 }
 
 /// IteratorValue (ES 8.5.8): (result) -> value.
-fn iterator_value<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn iterator_value<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         let Some(result) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
         let value_name = scope.handle(heap.known().strings.value.as_tagged(heap).erase());
-        let v = match rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, result, result, value_name)) {
+        let v = match rt_try!(
+            vm,
+            heap,
+            state,
+            Lookup::get_property_on(vm, heap, state, result, result, value_name)
+        ) {
             Coercion::Threw => return heap.known().exception.as_tagged(heap).erase(),
             Coercion::Value(v) => scope.handle(v),
         };
@@ -795,10 +841,7 @@ fn iterator_value<'a>(
 
 /// The `in` operator (ES 14.11.2): (key, obj) -> bool. Proxy receivers
 /// run their `has` trap (ES 20.2.5.9).
-fn has_property<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn has_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -811,13 +854,23 @@ fn has_property<'a>(
     // the key coercion allocates (wrapper keys run toString/valueOf):
     // the receiver stays rooted in its argument handle across it
     state.handle_scope(|scope| {
-        let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, key)) else {
+        let Some(key) = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::to_property_key(vm, heap, state, key)
+        ) else {
             return heap.known().exception.as_tagged(heap).erase();
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
         if Proxy::is_proxy(heap, obj.as_tagged(heap)) {
-            let has = match rt_try!(vm, heap, state, Proxy::has(vm, heap, state, obj, key.erase())) {
+            let has = match rt_try!(
+                vm,
+                heap,
+                state,
+                Proxy::has(vm, heap, state, obj, key.erase())
+            ) {
                 Coercion::Threw => return heap.known().exception.as_tagged(heap).erase(),
                 Coercion::Value(v) => scope.handle(v),
             };
@@ -831,10 +884,7 @@ fn has_property<'a>(
 
 /// CopyDataProperties (ES 8.5.1) with an exclusion list (object rest):
 /// (excluded..., target, source); `excluded` has count−2 entries.
-fn copy_data_properties<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn copy_data_properties<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -905,7 +955,12 @@ fn copy_data_properties<'a>(
                 continue;
             }
             // full [[Get]] (getters may run)
-            let value = match rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, source, source, key)) {
+            let value = match rt_try!(
+                vm,
+                heap,
+                state,
+                Lookup::get_property_on(vm, heap, state, source, source, key)
+            ) {
                 Coercion::Threw => return heap.known().exception.as_tagged(heap).erase(),
                 Coercion::Value(v) => scope.handle(v),
             };
@@ -921,13 +976,18 @@ fn copy_data_properties<'a>(
                 .cast::<Object>(target.as_tagged(heap))
                 .expect("copy target is an object");
             let key_name = scope.handle(key.as_tagged(heap).as_name());
-            rt_try!(vm, heap, state, Object::add_own_property(
+            rt_try!(
+                vm,
                 heap,
-                &scope,
-                target_obj,
-                key_name,
-                PropertyDescriptor::data(value),
-            ));
+                state,
+                Object::add_own_property(
+                    heap,
+                    &scope,
+                    target_obj,
+                    key_name,
+                    PropertyDescriptor::data(value),
+                )
+            );
         }
         // re-read through the handle: the copy loop allocated (getters,
         // property adds) and may have moved the target
@@ -936,11 +996,10 @@ fn copy_data_properties<'a>(
 }
 
 /// A fresh private name: (description) -> Symbol.
-fn create_private_name<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn create_private_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let text = args
         .get(1)
         .map(|h| h.as_tagged(heap))
@@ -954,11 +1013,10 @@ fn create_private_name<'a>(
 }
 
 /// PrivateGet (ES 7.3.30): (obj, key) -> value, TypeError when absent.
-fn private_get<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn private_get<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(obj) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -972,11 +1030,10 @@ fn private_get<'a>(
 }
 
 /// PrivateSet (ES 7.3.31): (obj, key, value), TypeError when absent.
-fn private_set<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn private_set<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(obj) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -989,9 +1046,11 @@ fn private_set<'a>(
     let value = value.as_tagged(heap).raw();
     let obj_tagged = obj.as_tagged(heap).raw();
     // Safety: fresh rooted words above; `private_find` allocates nothing.
-    match Lookup::private_find(heap, unsafe {
-        Tagged::<Value>::from_value_unchecked(obj_tagged)
-    }, key.as_tagged(heap)) {
+    match Lookup::private_find(
+        heap,
+        unsafe { Tagged::<Value>::from_value_unchecked(obj_tagged) },
+        key.as_tagged(heap),
+    ) {
         Some(slot) => {
             slot.set(
                 heap,
@@ -1006,11 +1065,10 @@ fn private_set<'a>(
 }
 
 /// `#x in obj`: (key, obj) -> bool (own private presence only).
-fn private_in<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn private_in<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(key) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -1023,11 +1081,10 @@ fn private_in<'a>(
 
 /// Attach the instance-field array to the class constructor:
 /// (ctor, fields).
-fn set_class_fields<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn set_class_fields<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(ctor) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -1063,10 +1120,7 @@ fn set_class_fields<'a>(
 /// InitializeInstanceElements (ES 7.3.33): (ctor, instance) -> instance.
 /// Runs each field initializer with the instance as receiver and defines
 /// the result onto it ({w+, e+, c+}).
-fn init_instance_fields<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn init_instance_fields<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1105,7 +1159,12 @@ fn init_instance_fields<'a>(
                 .and_then(|o| o.as_ref().element_value(heap, i))
                 .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
             // computed keys need ToPropertyKey canonicalization
-            let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, scope.handle(raw_key))) else {
+            let Some(key) = rt_try!(
+                vm,
+                heap,
+                state,
+                Object::to_property_key(vm, heap, state, scope.handle(raw_key))
+            ) else {
                 return heap.known().exception.as_tagged(heap).erase();
             };
             let key = scope.handle(key);
@@ -1119,14 +1178,12 @@ fn init_instance_fields<'a>(
                 let inst = instance.as_tagged(heap);
                 scope.stage(&[inst])
             };
-            let value = scope.handle(rt_try!(vm, heap, state, RuntimeContext::call(
+            let value = scope.handle(rt_try!(
                 vm,
                 heap,
                 state,
-                scope.handle(init),
-                call_args,
-                None,
-            )));
+                RuntimeContext::call(vm, heap, state, scope.handle(init), call_args, None,)
+            ));
             if value
                 .as_tagged(heap)
                 .ptr_eq(heap.known().exception.as_tagged(heap))
@@ -1136,18 +1193,23 @@ fn init_instance_fields<'a>(
             let instance_obj = scope
                 .cast::<Object>(instance.as_tagged(heap))
                 .expect("class instance is an object");
-            let defined = rt_try!(vm, heap, state, Object::define_own_property(
+            let defined = rt_try!(
+                vm,
                 heap,
-                &scope,
-                instance_obj,
-                key,
-                PropertyDescriptor::Data {
-                    value,
-                    writable: true,
-                    enumerable: true,
-                    configurable: true,
-                },
-            ));
+                state,
+                Object::define_own_property(
+                    heap,
+                    &scope,
+                    instance_obj,
+                    key,
+                    PropertyDescriptor::Data {
+                        value,
+                        writable: true,
+                        enumerable: true,
+                        configurable: true,
+                    },
+                )
+            );
             if !defined {
                 return raise_runtime(vm, heap, state, VmError::Type);
             }
@@ -1283,11 +1345,16 @@ fn get_property_lenient<'a>(
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let (value, getter) = match rt_try!(vm, heap, state, Lookup::load_outcome(
+        let (value, getter) = match rt_try!(
+            vm,
             heap,
-            receiver.as_tagged(heap),
-            name.as_tagged(heap).as_name(),
-        )) {
+            state,
+            Lookup::load_outcome(
+                heap,
+                receiver.as_tagged(heap),
+                name.as_tagged(heap).as_name(),
+            )
+        ) {
             LoadOutcome::Value(v) => (Some(scope.handle(v)), None),
             LoadOutcome::Getter(g) => (None, Some(scope.handle(g))),
         };
@@ -1322,10 +1389,7 @@ fn get_property_lenient<'a>(
 /// constructor after ClassDefinitionEvaluation set its name — an already
 /// explicitly defined `name` wins (ES 15.7.14: SetFunctionName happens
 /// before element installation).
-fn set_function_name<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn set_function_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1344,12 +1408,22 @@ fn set_function_name<'a>(
     // name construction allocates (interning): the closure stays rooted
     // in its argument handle across it
     state.handle_scope(|scope| {
-        let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, raw_key)) else {
+        let Some(key) = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::to_property_key(vm, heap, state, raw_key)
+        ) else {
             return heap.known().exception.as_tagged(heap).erase();
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key).erase();
-        let text = scope.handle(rt_try!(vm, heap, state, Convert::to_string(heap, &scope, key)));
+        let text = scope.handle(rt_try!(
+            vm,
+            heap,
+            state,
+            Convert::to_string(heap, &scope, key)
+        ));
         let units = {
             let s = text
                 .as_tagged(heap)
@@ -1384,18 +1458,23 @@ fn set_function_name<'a>(
         let defined = if explicit {
             true
         } else {
-            rt_try!(vm, heap, state, Object::define_own_property(
+            rt_try!(
+                vm,
                 heap,
-                &scope,
-                fn_obj,
-                name_key,
-                PropertyDescriptor::Data {
-                    value: name,
-                    writable: false,
-                    enumerable: false,
-                    configurable: true,
-                },
-            ))
+                state,
+                Object::define_own_property(
+                    heap,
+                    &scope,
+                    fn_obj,
+                    name_key,
+                    PropertyDescriptor::Data {
+                        value: name,
+                        writable: false,
+                        enumerable: false,
+                        configurable: true,
+                    },
+                )
+            )
         };
         if !defined {
             return raise_runtime(vm, heap, state, VmError::Type);
@@ -1408,10 +1487,7 @@ fn set_function_name<'a>(
 /// flags). Defines one accessor half, merging with an existing pair under
 /// the same key; flags bit 0 marks the getter half, PropertyFlags bits
 /// carry enumerability.
-fn install_accessor<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn install_accessor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1433,7 +1509,12 @@ fn install_accessor<'a>(
     // the key coercion allocates: target and closure stay rooted in
     // their argument handles across it
     state.handle_scope(|scope| {
-        let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, raw_key)) else {
+        let Some(key) = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::to_property_key(vm, heap, state, raw_key)
+        ) else {
             return heap.known().exception.as_tagged(heap).erase();
         };
         // root the name: the tagged result anchors the `&mut` borrow
@@ -1443,7 +1524,12 @@ fn install_accessor<'a>(
         if target.as_tagged(heap).as_heap_object().is_none() {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
-        let name = match rt_try!(vm, heap, state, Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+        let name = match rt_try!(
+            vm,
+            heap,
+            state,
+            Lookup::classify_key(heap, key.as_tagged(heap).erase())
+        ) {
             Key::Element(i) => Tagged::from(Smi::new(i as i64)),
             Key::Name(name) => name,
         };
@@ -1481,7 +1567,12 @@ fn install_accessor<'a>(
         let target_obj = scope
             .cast::<Object>(target.as_tagged(heap))
             .expect("checked object above");
-        let defined = rt_try!(vm, heap, state, Object::define_own_property(heap, &scope, target_obj, name, desc));
+        let defined = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::define_own_property(heap, &scope, target_obj, name, desc)
+        );
         if !defined {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
@@ -1493,10 +1584,7 @@ fn install_accessor<'a>(
 /// installation): (obj, key, value, flags) -> obj. Define sites are
 /// strict-mode code: a rejected define throws a TypeError. flags are
 /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair).
-fn define_own_property<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn define_own_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1518,7 +1606,12 @@ fn define_own_property<'a>(
     // the key coercion allocates: receiver and value stay rooted in
     // their argument handles across it
     state.handle_scope(|scope| {
-        let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, raw_key)) else {
+        let Some(key) = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::to_property_key(vm, heap, state, raw_key)
+        ) else {
             return heap.known().exception.as_tagged(heap).erase();
         };
         // root the name: the tagged result anchors the `&mut` borrow
@@ -1529,10 +1622,15 @@ fn define_own_property<'a>(
             let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
             let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
             let partial = if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
-                let pair = rt_try!(vm, heap, state, value
-                    .as_tagged(heap)
-                    .get_as::<AccessorPair>()
-                    .ok_or(VmError::Type));
+                let pair = rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    value
+                        .as_tagged(heap)
+                        .get_as::<AccessorPair>()
+                        .ok_or(VmError::Type)
+                );
                 let pair = pair.as_ref();
                 PartialDescriptor {
                     value: None,
@@ -1552,15 +1650,12 @@ fn define_own_property<'a>(
                     configurable: Some(configurable),
                 }
             };
-            return match rt_try!(vm, heap, state, Proxy::define_internal(
+            return match rt_try!(
                 vm,
                 heap,
                 state,
-                &scope,
-                receiver,
-                key.erase(),
-                partial,
-            )) {
+                Proxy::define_internal(vm, heap, state, &scope, receiver, key.erase(), partial,)
+            ) {
                 Flow::Threw => heap.known().exception.as_tagged(heap).erase(),
                 Flow::Value(false) => raise_runtime(vm, heap, state, VmError::Type),
                 Flow::Value(true) => receiver.as_tagged(heap),
@@ -1569,17 +1664,27 @@ fn define_own_property<'a>(
         if receiver.as_tagged(heap).as_heap_object().is_none() {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
-        let name = match rt_try!(vm, heap, state, Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+        let name = match rt_try!(
+            vm,
+            heap,
+            state,
+            Lookup::classify_key(heap, key.as_tagged(heap).erase())
+        ) {
             Key::Element(i) => Tagged::from(Smi::new(i as i64)),
             Key::Name(name) => name,
         };
         let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
         let configurable = flags & bytecode::PropertyFlags::DontDelete.bits() == 0;
         let desc = if flags & bytecode::PropertyFlags::Accessor.bits() != 0 {
-            let pair = rt_try!(vm, heap, state, value
-                .as_tagged(heap)
-                .get_as::<AccessorPair>()
-                .ok_or(VmError::Type));
+            let pair = rt_try!(
+                vm,
+                heap,
+                state,
+                value
+                    .as_tagged(heap)
+                    .get_as::<AccessorPair>()
+                    .ok_or(VmError::Type)
+            );
             let pair = pair.as_ref();
             PropertyDescriptor::Accessor {
                 get: scope.handle(pair.get.get(heap)),
@@ -1599,7 +1704,12 @@ fn define_own_property<'a>(
         let receiver_obj = scope
             .cast::<Object>(receiver.as_tagged(heap))
             .expect("checked object above");
-        let defined = rt_try!(vm, heap, state, Object::define_own_property(heap, &scope, receiver_obj, name, desc));
+        let defined = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::define_own_property(heap, &scope, receiver_obj, name, desc)
+        );
         if !defined {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
@@ -1608,22 +1718,26 @@ fn define_own_property<'a>(
 }
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
-fn set_prototype<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn set_prototype<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     state.handle_scope(|scope| {
         let Some(obj) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
         let Some(proto) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
         let obj_ref = scope
             .cast::<Object>(obj.as_tagged(heap))
             .expect("obj is an object");
-        rt_try!(vm, heap, state, Object::set_prototype(heap, &scope, obj_ref, proto));
+        rt_try!(
+            vm,
+            heap,
+            state,
+            Object::set_prototype(heap, &scope, obj_ref, proto)
+        );
         obj.as_tagged(heap)
     })
 }
@@ -1634,7 +1748,9 @@ fn throw_if_not_constructor_or_null<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(v) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -1658,16 +1774,17 @@ fn throw_if_not_object_or_null<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(v) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
     let raw = v.raw();
     let null = heap.known().null.as_tagged(heap).raw();
     // Safety: rooted-slot word, fresh at both uses below.
-    let ok = raw == null || !Convert::is_primitive(heap, unsafe {
-        Tagged::<Value>::from_value_unchecked(raw)
-    });
+    let ok = raw == null
+        || !Convert::is_primitive(heap, unsafe { Tagged::<Value>::from_value_unchecked(raw) });
     if !ok {
         return raise_runtime(vm, heap, state, VmError::Type);
     }
@@ -1680,7 +1797,9 @@ fn throw_super_not_called_if_hole<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(v) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -1699,7 +1818,9 @@ fn throw_super_already_called_if_not_hole<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(v) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -1765,14 +1886,19 @@ fn construct_super_construct<'a>(
         args_v.push(receiver);
         args_v.extend(args.iter().copied());
         let call_args = stage_handles(heap, &scope, &args_v);
-        let result = scope.handle(rt_try!(vm, heap, state, RuntimeContext::call(
+        let result = scope.handle(rt_try!(
             vm,
             heap,
             state,
-            callee.erase(),
-            call_args,
-            Some(new_target.erase()),
-        )));
+            RuntimeContext::call(
+                vm,
+                heap,
+                state,
+                callee.erase(),
+                call_args,
+                Some(new_target.erase()),
+            )
+        ));
         if result
             .as_tagged(heap)
             .ptr_eq(heap.known().exception.as_tagged(heap))
@@ -1795,10 +1921,7 @@ fn construct_super_construct<'a>(
 
 /// super(...): (args...) -> instance. Resolves the super constructor and
 /// new.target from the executing frame.
-fn construct_super<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn construct_super<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1855,10 +1978,7 @@ fn construct_super_all_args<'a>(
 /// Arrow-delegated super(): (args..., closure, new_target) -> instance.
 /// The constructor closure and its new.target ride the tail of the
 /// argument window (threaded through .this_function).
-fn construct_super_via<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn construct_super_via<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1889,9 +2009,14 @@ fn construct_super_via<'a>(
             }
             scope.handle(proto)
         };
-        let arg_words: Vec<Handle<'_, Value>> = rt_try!(vm, heap, state, (0..n - 2)
-            .map(|i| args.get(i).ok_or(VmError::Arity))
-            .collect::<Result<_, _>>());
+        let arg_words: Vec<Handle<'_, Value>> = rt_try!(
+            vm,
+            heap,
+            state,
+            (0..n - 2)
+                .map(|i| args.get(i).ok_or(VmError::Arity))
+                .collect::<Result<_, _>>()
+        );
         construct_super_construct(
             RuntimeContext::new(vm, heap, state),
             callee,
@@ -1905,10 +2030,7 @@ fn construct_super_via<'a>(
 
 /// Direct-eval name load: (name) -> value. Walks the frame context chain
 /// by name; unresolved names fall back to the global object.
-fn load_dynamic_name<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn load_dynamic_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1916,7 +2038,12 @@ fn load_dynamic_name<'a>(
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
     state.handle_scope(|scope| {
-        let found = rt_try!(vm, heap, state, dynamic_lookup_frame(heap, state, &scope, name));
+        let found = rt_try!(
+            vm,
+            heap,
+            state,
+            dynamic_lookup_frame(heap, state, &scope, name)
+        );
         match found {
             Some(v) if !is_the_hole(heap, v.as_tagged(heap)) => v.as_tagged(heap),
             Some(_) => raise_runtime(vm, heap, state, VmError::Reference),
@@ -1931,10 +2058,7 @@ fn load_dynamic_name<'a>(
 
 /// Direct-eval name store: (value, name) -> value. Writes through to the
 /// context-chain slot; unresolved names store on the global object.
-fn store_dynamic_name<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn store_dynamic_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1945,13 +2069,28 @@ fn store_dynamic_name<'a>(
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
     state.handle_scope(|scope| {
-        let found = rt_try!(vm, heap, state, dynamic_lookup_frame(heap, state, &scope, name));
+        let found = rt_try!(
+            vm,
+            heap,
+            state,
+            dynamic_lookup_frame(heap, state, &scope, name)
+        );
         match found {
             Some(v) if !is_the_hole(heap, v.as_tagged(heap)) => {
                 // write through to the found slot
                 let context = rt_try!(vm, heap, state, frame_context_value(state, heap));
-                let mut context = rt_try!(vm, heap, state, context.get_as::<Context>().ok_or(VmError::Type));
-                let target = rt_try!(vm, heap, state, dynamic_slot(heap, &mut context, name.as_tagged(heap)));
+                let mut context = rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    context.get_as::<Context>().ok_or(VmError::Type)
+                );
+                let target = rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    dynamic_slot(heap, &mut context, name.as_tagged(heap))
+                );
                 let host = context.erase();
                 target.set(heap, host, value.as_tagged(heap));
             }
@@ -1987,11 +2126,10 @@ fn is_the_hole(heap: &Heap, v: Tagged<'_, Value>) -> bool {
 
 /// A fresh array of the frame's arguments from formal index `first`:
 /// (first) -> array.
-fn create_rest_parameter<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn create_rest_parameter<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let first = args
         .get(0)
         .map(|h| h.as_tagged(heap))
@@ -2011,17 +2149,16 @@ fn create_rest_parameter<'a>(
         let elements =
             heap.allocate_handle::<FixedArray>(stage_handles(heap, &scope, &values), &scope);
         let map = heap.known().js_array_map;
-        heap
-            .allocate_object(
-                &scope,
-                ObjectSlotsInit {
-                    map,
-                    values: HandleSlice::EMPTY,
-                    elements,
-                    length: values.len(),
-                },
-            )
-            .erase()
+        heap.allocate_object(
+            &scope,
+            ObjectSlotsInit {
+                map,
+                values: HandleSlice::EMPTY,
+                elements,
+                length: values.len(),
+            },
+        )
+        .erase()
     })
 }
 
@@ -2031,10 +2168,7 @@ fn create_rest_parameter<'a>(
 /// object walked with the split receiver/lookup-start; key coercion runs
 /// after the parent link is resolved (user toString must not change the
 /// chain searched).
-fn super_get_property<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn super_get_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2057,18 +2191,33 @@ fn super_get_property<'a>(
     // the key coercion allocates: home/recv stay rooted in their
     // argument handles across it
     state.handle_scope(|scope| {
-        let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, raw_key)) else {
+        let Some(key) = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::to_property_key(vm, heap, state, raw_key)
+        ) else {
             return heap.known().exception.as_tagged(heap).erase();
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
         let outcome = {
             let proto = Lookup::home_proto(heap, home.as_tagged(heap));
-            let name = match rt_try!(vm, heap, state, Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+            let name = match rt_try!(
+                vm,
+                heap,
+                state,
+                Lookup::classify_key(heap, key.as_tagged(heap).erase())
+            ) {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
-            match rt_try!(vm, heap, state, Lookup::super_lookup_from_proto(heap, proto, name)) {
+            match rt_try!(
+                vm,
+                heap,
+                state,
+                Lookup::super_lookup_from_proto(heap, proto, name)
+            ) {
                 LoadOutcome::Value(v) => (Some(scope.handle(v)), None),
                 LoadOutcome::Getter(g) => (None, Some(scope.handle(g))),
             }
@@ -2100,10 +2249,7 @@ fn super_get_property<'a>(
 /// shadow inherited data properties on `this` unless the write-through
 /// semantics flag is set; the parent link is resolved before any user key
 /// coercion runs.
-fn super_set_property<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+fn super_set_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2134,7 +2280,12 @@ fn super_set_property<'a>(
     // the key coercion allocates: home/recv/value stay rooted in their
     // argument handles across it
     state.handle_scope(|scope| {
-        let Some(key) = rt_try!(vm, heap, state, Object::to_property_key(vm, heap, state, raw_key)) else {
+        let Some(key) = rt_try!(
+            vm,
+            heap,
+            state,
+            Object::to_property_key(vm, heap, state, raw_key)
+        ) else {
             return heap.known().exception.as_tagged(heap).erase();
         };
         // root the name: the tagged result anchors the `&mut` borrow
@@ -2146,7 +2297,12 @@ fn super_set_property<'a>(
         };
         let outcome = {
             let proto = Lookup::home_proto(heap, home.as_tagged(heap));
-            let name = match rt_try!(vm, heap, state, Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+            let name = match rt_try!(
+                vm,
+                heap,
+                state,
+                Lookup::classify_key(heap, key.as_tagged(heap).erase())
+            ) {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
             };
@@ -2161,7 +2317,12 @@ fn super_set_property<'a>(
             )
         };
         let outcome = rt_try!(vm, heap, state, outcome);
-        if rt_try!(vm, heap, state, apply_store_outcome(vm, heap, state, recv, outcome, value)) {
+        if rt_try!(
+            vm,
+            heap,
+            state,
+            apply_store_outcome(vm, heap, state, recv, outcome, value)
+        ) {
             return heap.known().exception.as_tagged(heap).erase();
         }
         value.as_tagged(heap)

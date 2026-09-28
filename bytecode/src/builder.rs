@@ -833,7 +833,10 @@ impl FnBuilder {
     /// with it. The pair is atomic — nothing may jump between the two.
     pub fn construct(&mut self, callee: Reg, args: RegList, out: Reg) {
         let [base, count] = args.operands();
-        self.emit_tracked(Opcode::Construct, &[callee.operand(), base, count, out.operand()]);
+        self.emit_tracked(
+            Opcode::Construct,
+            &[callee.operand(), base, count, out.operand()],
+        );
         self.emit_tracked(Opcode::ConstructCheck, &[out.operand()]);
     }
 

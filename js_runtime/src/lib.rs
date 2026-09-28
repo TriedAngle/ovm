@@ -49,8 +49,8 @@ use vm_core::runtime_api::{
 };
 use vm_core::{
     EdgeVisitable, Float, Handle, HandleSlice, Intrinsic, Map, MapInit, MapKind, Object,
-    PropertyDescriptor, Runtime, RuntimeIndex, SlotFlags, SlotName, Smi, Tagged, VM, Value, Visitor,
-    VmError,
+    PropertyDescriptor, Runtime, RuntimeIndex, SlotFlags, SlotName, Smi, Tagged, VM, Value,
+    Visitor, VmError,
 };
 
 pub struct JSRuntime;

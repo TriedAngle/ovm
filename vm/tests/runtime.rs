@@ -14,11 +14,10 @@ fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
-fn smi_add<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+fn smi_add<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let (a, b) = match (
         args.get(1).map(|h| h.as_tagged(heap)),
         args.get(2).map(|h| h.as_tagged(heap)),
@@ -56,11 +55,10 @@ fn registered_runtime_invokes_and_checks_types() {
 
 #[test]
 fn runtime_result_is_boxed_when_not_smi() {
-    fn fadd<'a>(
-        nctx: RuntimeContext<'a>,
-        args: HandleSlice<'_>,
-    ) -> Tagged<'a, Value> {
-        let RuntimeContext { vm, heap, state, .. } = nctx;
+    fn fadd<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+        let RuntimeContext {
+            vm, heap, state, ..
+        } = nctx;
         let sum = {
             let (a, b) = match (
                 args.get(1).map(|h| h.as_tagged(heap)),
@@ -69,8 +67,12 @@ fn runtime_result_is_boxed_when_not_smi() {
                 (Some(a), Some(b)) => (a, b),
                 _ => return raise_runtime(vm, heap, state, VmError::Arity),
             };
-            let fa = rt_try!(vm, heap, state, a.get_as::<Float>().ok_or(VmError::Type)).value.get();
-            let fb = rt_try!(vm, heap, state, b.get_as::<Float>().ok_or(VmError::Type)).value.get();
+            let fa = rt_try!(vm, heap, state, a.get_as::<Float>().ok_or(VmError::Type))
+                .value
+                .get();
+            let fb = rt_try!(vm, heap, state, b.get_as::<Float>().ok_or(VmError::Type))
+                .value
+                .get();
             fa + fb
         };
         heap.new_number(sum)
@@ -149,11 +151,10 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
 #[test]
 fn register_runtime_appends_after_well_known() {
-    fn double<'a>(
-        nctx: RuntimeContext<'a>,
-        args: HandleSlice<'_>,
-    ) -> Tagged<'a, Value> {
-        let RuntimeContext { vm, heap, state, .. } = nctx;
+    fn double<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+        let RuntimeContext {
+            vm, heap, state, ..
+        } = nctx;
         let Some(v) = args.get(1) else {
             return raise_runtime(vm, heap, state, VmError::Arity);
         };

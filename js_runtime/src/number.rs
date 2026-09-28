@@ -14,13 +14,18 @@ pub fn number_constructor<'a>(
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let n = rt_try!(vm, heap, state, state.handle_scope(|scope| {
-        let arg = match args.get(1).map(|h| h.as_tagged(heap)) {
-            Some(v) => scope.handle(v),
-            None => scope.handle(Smi::new(0).into_tagged()),
-        };
-        Object::to_numeric(vm, heap, state, arg)
-    }));
+    let n = rt_try!(
+        vm,
+        heap,
+        state,
+        state.handle_scope(|scope| {
+            let arg = match args.get(1).map(|h| h.as_tagged(heap)) {
+                Some(v) => scope.handle(v),
+                None => scope.handle(Smi::new(0).into_tagged()),
+            };
+            Object::to_numeric(vm, heap, state, arg)
+        })
+    );
     let Some(n) = n else {
         return heap.known().exception.as_tagged(heap).erase();
     };
@@ -31,17 +36,15 @@ pub fn number_constructor<'a>(
     state.handle_scope(|scope| {
         let map = heap.known().number_wrapper_map;
         let value = scope.handle(heap.new_number(n));
-        heap
-            .new_object(&scope, map, scope.stage(&[value.as_tagged(heap)]))
+        heap.new_object(&scope, map, scope.stage(&[value.as_tagged(heap)]))
             .erase()
     })
 }
 
-pub fn number_value_of<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+pub fn number_value_of<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     let Some(arg) = args.get(0) else {
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
@@ -57,10 +60,7 @@ pub fn number_value_of<'a>(
     }
 }
 
-pub fn number_to_string<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+pub fn number_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -70,36 +70,40 @@ pub fn number_to_string<'a>(
             return raise_runtime(vm, heap, state, VmError::Arity);
         };
         let v = match wrapper_value(
-        heap,
-        // Safety: fresh rooted-slot word, no allocation since the read.
-        unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
-    )
-    .map(|v| v.raw())
-    {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    };
+            heap,
+            // Safety: fresh rooted-slot word, no allocation since the read.
+            unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
+        )
+        .map(|v| v.raw())
+        {
+            Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        };
         let v = scope.handle(v);
         match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    }
+            Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        }
     })
 }
 
 /// The numeric `this` of a Number.prototype method (receiver or wrapper).
 fn number_receiver(heap: &Heap, args: &HandleSlice<'_>) -> Result<f64, VmError> {
-    let v = wrapper_value(heap, args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?)?;
+    let v = wrapper_value(
+        heap,
+        args.get(0)
+            .map(|h| h.as_tagged(heap))
+            .ok_or(VmError::Arity)?,
+    )?;
     Convert::to_number(heap, v)
 }
 
 /// `Number.prototype.toFixed(fractionDigits?)` (ES 21.1.3.3): fixed-point
 /// notation with `fractionDigits` digits after the decimal point.
-pub fn number_to_fixed<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+pub fn number_to_fixed<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     state.handle_scope(|scope| {
         let x = rt_try!(vm, heap, state, number_receiver(heap, &args));
         let digits = match args.get(1).map(|h| h.as_tagged(heap)) {
@@ -132,7 +136,9 @@ pub fn number_to_precision<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     state.handle_scope(|scope| {
         let x = rt_try!(vm, heap, state, number_receiver(heap, &args));
         let arg = args
@@ -142,9 +148,9 @@ pub fn number_to_precision<'a>(
         if arg == heap.known().undefined.as_tagged(heap) {
             let v = scope.handle(heap.new_number(x));
             return match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    };
+                Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+                Err(err) => return raise_runtime(vm, heap, state, err),
+            };
         }
         let p = rt_try!(vm, heap, state, Convert::to_number(heap, arg)) as i64;
         if !(1..=100).contains(&p) {

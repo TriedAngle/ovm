@@ -11,7 +11,9 @@ pub fn symbol_constructor<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext { vm, heap, state, .. } = nctx;
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
     state.handle_scope(|scope| {
         let desc_text = args
             .get(1)

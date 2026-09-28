@@ -7,10 +7,7 @@ use vm_core::{
 };
 use vm_core::{raise_runtime, rt_try};
 
-pub fn error_constructor<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+pub fn error_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     make_error(nctx, args, "Error")
 }
 
@@ -45,9 +42,9 @@ pub fn make_error<'a>(
             Some(v) => {
                 let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
                 scope.handle(match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    })
+                    Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+                    Err(err) => return raise_runtime(vm, heap, state, err),
+                })
             }
             None => scope.handle(
                 vm.interner()
@@ -86,10 +83,7 @@ pub fn make_error<'a>(
     })
 }
 
-pub fn error_to_string<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Tagged<'a, Value> {
+pub fn error_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -97,32 +91,38 @@ pub fn error_to_string<'a>(
         let receiver = rt_try!(vm, heap, state, args.get(0).ok_or(VmError::Arity));
 
         let name_key = vm.interner().intern_str(heap, &scope, "name");
-        let name =
-            match rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, receiver, receiver, name_key.erase())) {
-                Coercion::Value(v) => scope.handle(v),
-                Coercion::Threw => scope.handle(heap.known().exception.as_tagged(heap).erase()),
-            };
-        let message_key = vm.interner().intern_str(heap, &scope, "message");
-        let message = match rt_try!(vm, heap, state, Lookup::get_property_on(
+        let name = match rt_try!(
             vm,
             heap,
             state,
-            receiver,
-            receiver,
-            message_key.erase(),
-        )) {
+            Lookup::get_property_on(vm, heap, state, receiver, receiver, name_key.erase())
+        ) {
+            Coercion::Value(v) => scope.handle(v),
+            Coercion::Threw => scope.handle(heap.known().exception.as_tagged(heap).erase()),
+        };
+        let message_key = vm.interner().intern_str(heap, &scope, "message");
+        let message = match rt_try!(
+            vm,
+            heap,
+            state,
+            Lookup::get_property_on(vm, heap, state, receiver, receiver, message_key.erase(),)
+        ) {
             Coercion::Value(v) => scope.handle(v),
             Coercion::Threw => scope.handle(heap.known().exception.as_tagged(heap).erase()),
         };
 
-        let a = scope.handle(match Convert::to_string(heap, &scope, name).map(|v| v.raw()) {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    });
-        let b = scope.handle(match Convert::to_string(heap, &scope, message).map(|v| v.raw()) {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    });
+        let a = scope.handle(
+            match Convert::to_string(heap, &scope, name).map(|v| v.raw()) {
+                Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+                Err(err) => return raise_runtime(vm, heap, state, err),
+            },
+        );
+        let b = scope.handle(
+            match Convert::to_string(heap, &scope, message).map(|v| v.raw()) {
+                Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+                Err(err) => return raise_runtime(vm, heap, state, err),
+            },
+        );
         let colon = vm.interner().intern_str(heap, &scope, ": ");
         let ab = DenseString::concat(heap, &scope, a, colon.erase());
         let out = DenseString::concat(heap, &scope, ab.erase(), b);

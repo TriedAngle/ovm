@@ -76,10 +76,7 @@ impl VmError {
     /// Name of the ECMAScript error class this VM error materializes as §20.5.3.2
     pub const fn name(self) -> &'static str {
         match self {
-            Self::Arity
-            | Self::Type
-            | Self::NotExtensible
-            | Self::Message(_) => "TypeError",
+            Self::Arity | Self::Type | Self::NotExtensible | Self::Message(_) => "TypeError",
             Self::Overflow | Self::OutOfBounds | Self::StackOverflow => "RangeError",
             Self::Reference => "ReferenceError",
         }
@@ -181,9 +178,7 @@ impl Message {
             Self::ProxyRevokedOwnKeys => {
                 "cannot perform 'ownKeys' on a proxy that has been revoked"
             }
-            Self::ProxyRevokedApply => {
-                "cannot perform 'apply' on a proxy that has been revoked"
-            }
+            Self::ProxyRevokedApply => "cannot perform 'apply' on a proxy that has been revoked",
         }
     }
 }

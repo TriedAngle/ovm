@@ -94,6 +94,12 @@ impl Stack {
         self.top.get()
     }
 
+    /// The undefined word from the stack's own rooted cell — a single
+    /// Register read (GC-updated in place), for interpreter entry paths.
+    pub fn undefined_word<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
+        self.undefined.get(heap)
+    }
+
     pub fn set_top(&self, top: usize) {
         self.top.set(top);
     }
@@ -396,6 +402,41 @@ impl Stack {
         ))
     }
 
+    /// Stage a construct argument window for a runtime constructor:
+    /// `[receiver(=undefined), args...]` — runtime fns index element 0 as
+    /// the receiver, constructs pass none.
+    pub fn stage_construct_args(
+        &self,
+        heap: &Heap,
+        args: HandleSlice<'_>,
+    ) -> Result<(usize, HandleSlice<'_>), VmError> {
+        let saved_top = self.top();
+        let size = HEADER_SLOTS + 1 + args.len();
+        if saved_top + size > self.slots.len() {
+            return Err(VmError::StackOverflow);
+        }
+        let base = saved_top;
+        let dst = base + HEADER_SLOTS;
+        let fill = self.fill.get(heap);
+        for i in 0..HEADER_SLOTS {
+            self.slot_unchecked(base + i).store(fill);
+        }
+        let undefined = self.undefined.get(heap);
+        self.slot_unchecked(dst).store(undefined);
+        if !args.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    args.raw().as_ptr(),
+                    (self.slots.as_ptr() as *mut Value).add(dst + 1),
+                    args.len(),
+                )
+            }
+        }
+        self.set_top(base + size);
+        let staged = self.value_slice(dst, 1 + args.len());
+        Ok((saved_top, staged))
+    }
+
     pub fn stage_args(
         &self,
         heap: &Heap,
@@ -624,33 +665,41 @@ impl Stack {
         argc: usize,
         caller: FrameMeta,
     ) -> FrameMeta {
-        self.slot_unchecked(offset_slot(anchor, CALLABLE_OFFSET))
-            .store(callable);
-        self.slot_unchecked(offset_slot(anchor, ARGC_OFFSET))
-            .store(Smi::new(argc as i64).into_tagged());
-        self.slot_unchecked(offset_slot(anchor, CONTEXT_OFFSET))
-            .store(context);
-        self.slot_unchecked(offset_slot(anchor, NEW_TARGET_OFFSET))
-            .store(new_target);
+        // one held base for the whole header: the fixed header words sit
+        // contiguously below the anchor (offsets -1..-11), so the stores
+        // compile to plain offset writes instead of re-deriving the slot
+        // address through `self` per field
         let info = info.as_ref();
-        self.slot_unchecked(offset_slot(anchor, CODE_OFFSET))
-            .store(info.bytecode.get(heap));
-        self.slot_unchecked(offset_slot(anchor, CONSTANTS_OFFSET))
-            .store(info.constants.get(heap));
-        self.slot_unchecked(offset_slot(anchor, FEEDBACK_OFFSET))
-            .store(info.feedback.get(heap).map_or_else(
-                || heap.known().the_hole.as_tagged(heap).erase(),
-                |v| v.erase(),
-            ));
+        let bytecode = info.bytecode.get(heap).raw();
+        let constants = info.constants.get(heap).raw();
+        let feedback = info
+            .feedback
+            .get(heap)
+            .map_or_else(|| heap.known().the_hole.as_tagged(heap).raw(), |v| v.raw());
         let saved = [
-            (SAVED_BASE_OFFSET, caller.base),
-            (SAVED_PC_OFFSET, caller.pc),
-            (SAVED_REGCOUNT_OFFSET, caller.register_count),
-            (SAVED_HANDLER_PC_OFFSET, caller.handler_pc),
+            (CALLABLE_OFFSET, callable.raw()),
+            (ARGC_OFFSET, Smi::new(argc as i64).encode()),
+            (CONTEXT_OFFSET, context.raw()),
+            (NEW_TARGET_OFFSET, new_target.raw()),
+            (CODE_OFFSET, bytecode),
+            (CONSTANTS_OFFSET, constants),
+            (FEEDBACK_OFFSET, feedback),
+            (SAVED_BASE_OFFSET, Smi::new(caller.base as i64).encode()),
+            (SAVED_PC_OFFSET, Smi::new(caller.pc as i64).encode()),
+            (
+                SAVED_REGCOUNT_OFFSET,
+                Smi::new(caller.register_count as i64).encode(),
+            ),
+            (
+                SAVED_HANDLER_PC_OFFSET,
+                Smi::new(caller.handler_pc as i64).encode(),
+            ),
         ];
-        for (offset, value) in saved {
-            self.slot_unchecked(offset_slot(anchor, offset))
-                .store(Smi::new(value as i64).into_tagged());
+        unsafe {
+            let base = (self.slots.as_ptr() as *mut Value).add(anchor);
+            for (offset, word) in saved {
+                *base.offset(offset) = word;
+            }
         }
         FrameMeta {
             base: anchor,
