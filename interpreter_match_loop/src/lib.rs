@@ -35,6 +35,10 @@ enum Step<'a> {
     Jump(usize),
     /// the current frame changed
     Reframe,
+    /// the current frame changed INTO a fresh callee: the accumulator is
+    /// undefined on entry (the frame-entry convention, matching
+    /// `cache.enter` and the become interpreter's call dispatch)
+    EnterFrame,
     Return,
     Throw(Tagged<'a, Value>),
     PendingThrow,
@@ -708,7 +712,7 @@ impl Slow {
                         match step_try!(call_value(
                             vm, state, heap, stack, cache, meta, pc, getter, args
                         )) {
-                            Called::Frame => return Step::Reframe,
+                            Called::Frame => return Step::EnterFrame,
                             Called::NotCallable => {
                                 acc.store(heap.known().undefined.as_tagged(heap));
                             }
@@ -764,7 +768,7 @@ impl Slow {
                         match step_try!(call_value(
                             vm, state, heap, stack, cache, meta, pc, getter, args
                         )) {
-                            Called::Frame => return Step::Reframe,
+                            Called::Frame => return Step::EnterFrame,
                             Called::NotCallable => {
                                 acc.store(heap.known().undefined.as_tagged(heap));
                             }
@@ -840,7 +844,7 @@ impl Slow {
                         match step_try!(call_value(
                             vm, state, heap, stack, cache, meta, pc, getter, args
                         )) {
-                            Called::Frame => return Step::Reframe,
+                            Called::Frame => return Step::EnterFrame,
                             Called::NotCallable => {
                                 acc.store(heap.known().undefined.as_tagged(heap));
                             }
@@ -894,7 +898,7 @@ impl Slow {
                     match step_try!(call_value(
                         vm, state, heap, stack, cache, meta, pc, getter, args
                     )) {
-                        Called::Frame => return Step::Reframe,
+                        Called::Frame => return Step::EnterFrame,
                         Called::NotCallable => {
                             acc.store(heap.known().undefined.as_tagged(heap));
                         }
@@ -955,7 +959,7 @@ impl Slow {
                     match step_try!(call_value(
                         vm, state, heap, stack, cache, meta, pc, getter, args
                     )) {
-                        Called::Frame => return Step::Reframe,
+                        Called::Frame => return Step::EnterFrame,
                         Called::NotCallable => acc.store(heap.known().undefined.as_tagged(heap)),
                         Called::Immediate(v) => acc.store(v),
                         Called::Threw => return Step::PendingThrow,
@@ -1016,7 +1020,7 @@ impl Slow {
                     match step_try!(call_value(
                         vm, state, heap, stack, cache, meta, pc, getter, args
                     )) {
-                        Called::Frame => return Step::Reframe,
+                        Called::Frame => return Step::EnterFrame,
                         Called::NotCallable => acc.store(heap.known().undefined.as_tagged(heap)),
                         Called::Immediate(v) => acc.store(v),
                         Called::Threw => return Step::PendingThrow,
@@ -1322,7 +1326,7 @@ fn store_named<'a>(
                     match step_try!(call_value(
                         vm, state, heap, stack, cache, meta, pc, setter, args
                     )) {
-                        Called::Frame => return Step::Reframe,
+                        Called::Frame => return Step::EnterFrame,
                         Called::NotCallable | Called::Immediate(_) => {}
                         Called::Threw => return Step::PendingThrow,
                     }
@@ -1434,6 +1438,17 @@ fn dispatch<'a>(
                 code_word = cache.code_raw();
                 code = code_bytes(cache, heap);
                 pc = cache.pc();
+            }
+            Step::EnterFrame => {
+                frame_base = cache.base();
+                frame_regs = cache.register_count();
+                code_word = cache.code_raw();
+                code = code_bytes(cache, heap);
+                pc = cache.pc();
+                // the frame-entry convention: a callee's first
+                // acc-reading op must not observe the caller's leftover
+                // accumulator
+                acc.store(heap.known().undefined.as_tagged(heap));
             }
             Step::Return => return Ok(acc.get(heap)),
             Step::Throw(v) => {
@@ -2311,7 +2326,7 @@ fn step<'a>(
                         ))
                     };
                     cache.load(stack, frame, heap);
-                    Step::Reframe
+                    Step::EnterFrame
                 }
             }
         }
@@ -2396,7 +2411,7 @@ fn step<'a>(
                         ))
                     };
                     cache.load(stack, frame, heap);
-                    Step::Reframe
+                    Step::EnterFrame
                 }
             }
         }
@@ -2483,7 +2498,7 @@ fn step<'a>(
                         ))
                     };
                     cache.load(stack, frame, heap);
-                    Step::Reframe
+                    Step::EnterFrame
                 }
             }
         }

@@ -884,6 +884,13 @@ handlers!(pc, code, regs, acc, ctx;
         threw!()
     }
 
+    ReThrow : op_rethrow_n / op_rethrow_w () {
+        // a finally handler re-emits the in-flight exception: same flow
+        // as Throw (the match-loop treats them identically)
+        ctx.state().set_pending_exception(acc);
+        threw!()
+    }
+
     Return : op_return_n / op_return_w () {
         if ctx.cache().base() == ctx.base_anchor {
             return acc;
@@ -1719,6 +1726,17 @@ unsafe fn named_load_cold<'a>(
                 .as_ref()
                 .constant_slot_name(heap, name_idx),
         );
+        // ES 20.2.5.8: a proxy receiver runs its `get` trap (with the
+        // proxy as `this`) instead of a descriptor walk. No IC update:
+        // traps are dynamic, a proxy map must never be cached as a field
+        // handler.
+        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
+            return match Proxy::get(vm, heap, state, recv, recv, name.erase()) {
+                Ok(Coercion::Threw) => Ok(ctx.exception_word()),
+                Ok(Coercion::Value(v)) => Ok(v),
+                Err(err) => Err(err),
+            };
+        }
         enum Res<'s> {
             Word(Handle<'s, Value>),
             Getter(Handle<'s, Value>),
@@ -1764,14 +1782,6 @@ unsafe fn keyed_load_cold<'a>(
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let recv = scope.handle(recv);
         let raw_key = scope.handle(key);
-        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
-            let staged = scope.stage(&[raw_key.as_tagged(heap).erase()]);
-            return match Proxy::apply(vm, heap, state, recv.erase(), staged) {
-                Ok(Coercion::Threw) => Ok(ctx.exception_word()),
-                Ok(Coercion::Value(v)) => Ok(v),
-                Err(err) => Err(err),
-            };
-        }
         let key = match Object::to_property_key(vm, heap, state, raw_key) {
             Ok(k) => k,
             Err(err) => return Err(err),
@@ -1780,6 +1790,15 @@ unsafe fn keyed_load_cold<'a>(
             return Ok(ctx.exception_word());
         };
         let key = scope.handle(key);
+        // ES 20.2.5.8 (keyed form): the `get` trap with the coerced key.
+        // No IC update: traps are dynamic.
+        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
+            return match Proxy::get(vm, heap, state, recv, recv, key.erase()) {
+                Ok(Coercion::Threw) => Ok(ctx.exception_word()),
+                Ok(Coercion::Value(v)) => Ok(v),
+                Err(err) => Err(err),
+            };
+        }
         let element_index = match Lookup::classify_key(heap, key.as_tagged(heap).erase()) {
             Ok(Key::Element(i)) => Some(i),
             _ => None,
@@ -2004,6 +2023,16 @@ unsafe fn store_named_cold<'a>(
                 .erase()
                 .as_name(),
         );
+
+        // ES 20.2.5.10: a proxy receiver runs its `set` trap; no IC
+        // update (dynamic traps must not be cached), and the probe is
+        // skipped entirely so an armed site never matches a proxy map.
+        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
+            return match Proxy::set(vm, heap, state, recv, name.erase(), value, recv)? {
+                Coercion::Threw => Ok(ctx.exception_word()),
+                Coercion::Value(_) => Ok(value.as_tagged(heap).erase()),
+            };
+        }
 
         if let Some(hit) = InlineCache::try_store(
             heap,
@@ -4651,6 +4680,7 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::JumpIfFalsy as usize] = op_jump_if_falsy_n as Handler;
     t[Opcode::JumpLoop as usize] = op_jump_loop_n as Handler;
     t[Opcode::Throw as usize] = op_throw_n as Handler;
+    t[Opcode::ReThrow as usize] = op_rethrow_n as Handler;
     t[Opcode::Return as usize] = op_return_n as Handler;
     t[Opcode::LoadNamedProperty as usize] = op_load_named_n as Handler;
     t[Opcode::LoadKeyedProperty as usize] = op_load_keyed_n as Handler;
@@ -4754,6 +4784,7 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::JumpIfFalsy as usize] = op_jump_if_falsy_w as Handler;
     t[Opcode::JumpLoop as usize] = op_jump_loop_w as Handler;
     t[Opcode::Throw as usize] = op_throw_w as Handler;
+    t[Opcode::ReThrow as usize] = op_rethrow_w as Handler;
     t[Opcode::Return as usize] = op_return_w as Handler;
     t[Opcode::LoadNamedProperty as usize] = op_load_named_w as Handler;
     t[Opcode::LoadKeyedProperty as usize] = op_load_keyed_w as Handler;

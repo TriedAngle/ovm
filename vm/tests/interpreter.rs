@@ -2118,11 +2118,16 @@ fn run_failing_inner<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Ta
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        // callee: Add on a non-smi accumulator -> TypeError throw
+        // callee: Add on an object accumulator -> TypeError throw
+        // (deterministic: the entry accumulator is `undefined` by the
+        // frame-entry convention, so the object rides a constant)
+        let map = scope.handle(heap.known().object_initial_map.as_tagged(heap));
+        let obj = scope.handle(heap.new_object(&scope, map, HandleSlice::EMPTY));
         let mut bad = Vec::new();
+        emit(&mut bad, Opcode::LoadConstant, &[0]);
         emit(&mut bad, Opcode::Add, &[reg_op(1)]);
         emit(&mut bad, Opcode::Return, &[]);
-        let callee = scope.handle(bytecode_fn(heap, &scope, &bad, &[], 2));
+        let callee = scope.handle(bytecode_fn(heap, &scope, &bad, &[obj.as_tagged(heap).raw()], 2));
 
         // caller: calls callee, so one frame is suspended above the base
         // depth when the exception escapes the nested run
@@ -2144,7 +2149,8 @@ fn run_failing_inner<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Ta
         ));
 
         let exception_word = heap.known().exception.as_tagged(heap).raw();
-        match RuntimeContext::call(vm, &mut *heap, state, caller, HandleSlice::EMPTY, None) {
+        let result = RuntimeContext::call(vm, &mut *heap, state, caller, HandleSlice::EMPTY, None);
+        match result {
             Ok(exc) if exc.raw() == exception_word => {
                 // the exception escapes the nested run as the sentinel with
                 // the pending exception set; the runtime recovers by
