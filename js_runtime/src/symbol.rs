@@ -2,6 +2,7 @@
 
 use vm_core::RuntimeContext;
 use vm_core::{DenseString, HandleSlice, Symbol, Tagged, Value, VmError};
+use vm_core::{raise_runtime, rt_try};
 
 /// `Symbol(desc)`: a fresh Symbol primitive (ES 20.4.1.1). This minimal
 /// surface exists so user code can author iterables
@@ -9,8 +10,8 @@ use vm_core::{DenseString, HandleSlice, Symbol, Tagged, Value, VmError};
 pub fn symbol_constructor<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let RuntimeContext { heap, state, .. } = nctx;
+) -> Tagged<'a, Value> {
+    let RuntimeContext { vm, heap, state, .. } = nctx;
     state.handle_scope(|scope| {
         let desc_text = args
             .get(1)
@@ -23,6 +24,6 @@ pub fn symbol_constructor<'a>(
         }
         text.push(')');
         let sym = Symbol::new(heap, &scope, text.as_bytes());
-        Ok(sym.as_tagged(heap).erase())
+        sym.as_tagged(heap).erase()
     })
 }

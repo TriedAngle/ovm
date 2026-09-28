@@ -3,8 +3,8 @@ use core::alloc::Layout;
 use crate::{
     CallableInfoObject, Coercion, Context, ContextState, Convert, DenseString, EdgeVisitable,
     FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
-    HeapObject, Hint, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext, SlotName, Smi,
-    Symbol, Tagged, VM, Value, Visitor, VmError,
+    HeapObject, Hint, Intrinsic, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext,
+    SlotName, Smi, Symbol, Tagged, VM, Value, Visitor, VmError,
 };
 
 #[repr(C)]
@@ -50,6 +50,23 @@ impl Object {
         }
         let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
         usize::try_from(idx).ok()
+    }
+
+    /// The RUNTIME-kind slot-0 Smi decoded to a call target half: a
+    /// non-negative value is a registry runtime index, a negative value
+    /// is an intrinsic id (see [`Intrinsic::encode_slot`]).
+    /// TODO: make this better
+    #[inline]
+    pub fn runtime_call_target<'a>(&'a self, heap: &'a Heap) -> Option<CallTarget<'a>> {
+        if !self.header.map.get(heap).kind().is_runtime() {
+            return None;
+        }
+        let raw = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
+        Some(if raw < 0 {
+            CallTarget::Intrinsic(Intrinsic::decode_slot(raw)?)
+        } else {
+            CallTarget::Runtime(usize::try_from(raw).ok()?)
+        })
     }
 
     pub fn is_array<'a>(&'a self, heap: &'a Heap) -> bool {
@@ -146,6 +163,9 @@ pub enum CallTarget<'a> {
         kind: FunctionKind,
     },
     Runtime(usize),
+    /// An interpreter-implemented callable (`Function.prototype.call`
+    /// and friends): the interpreter resolves it by intrinsic id.
+    Intrinsic(Intrinsic),
     /// A callable proxy: `[[Call]]` dispatches through the `apply` trap.
     Proxy(Tagged<'a, Object>),
 }
@@ -162,7 +182,7 @@ impl Object {
             return None;
         }
         if kind.is_runtime() {
-            return Some(CallTarget::Runtime(obj.as_ref().runtime_index(heap)?));
+            return obj.as_ref().runtime_call_target(heap);
         }
         // every non-runtime callable object is laid out with
         // `[callable info, context]` in its first two slots

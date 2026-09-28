@@ -15,25 +15,25 @@ impl KetteTools {
     pub fn force_minor_gc<'a>(
         ctx: RuntimeContext<'a>,
         _args: HandleSlice<'_>,
-    ) -> Result<Tagged<'a, Value>, VmError> {
+    ) -> Tagged<'a, Value> {
         let RuntimeContext { heap, .. } = ctx;
         heap.collect_minor();
-        Ok(heap.known().undefined.as_tagged(heap).erase())
+        heap.known().undefined.as_tagged(heap).erase()
     }
 
     pub fn force_major_gc<'a>(
         ctx: RuntimeContext<'a>,
         _args: HandleSlice<'_>,
-    ) -> Result<Tagged<'a, Value>, VmError> {
+    ) -> Tagged<'a, Value> {
         let RuntimeContext { heap, .. } = ctx;
         heap.collect();
-        Ok(heap.known().undefined.as_tagged(heap).erase())
+        heap.known().undefined.as_tagged(heap).erase()
     }
 
     pub fn shutdown<'a>(
         ctx: RuntimeContext<'a>,
         _args: HandleSlice<'_>,
-    ) -> Result<Tagged<'a, Value>, VmError> {
+    ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = ctx;
@@ -41,7 +41,7 @@ impl KetteTools {
         vm.note_shutdown();
         state.set_termination(Termination::Shutdown);
         state.set_pending_exception(heap.known().undefined.as_tagged(heap));
-        Ok(heap.known().exception.as_tagged(heap).erase())
+        heap.known().exception.as_tagged(heap).erase()
     }
 
     pub fn install(

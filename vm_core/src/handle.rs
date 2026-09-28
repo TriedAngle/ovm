@@ -104,6 +104,7 @@ struct HandleDataImpl {
 }
 
 impl HandleDataImpl {
+    #[inline]
     fn allocate_slot(&mut self) -> *mut Value {
         if self.next == self.limit {
             self.extend();
@@ -143,6 +144,7 @@ impl HandleDataImpl {
     /// Reserve `n` contiguous slots in the current block, extending first
     /// when the remainder is too small. Oversized requests get a dedicated
     /// block (block memory is boxed and never moves, so any size works).
+    #[inline]
     fn allocate_block(&mut self, n: usize) -> *mut Value {
         if n > HANDLE_BLOCK_SIZE {
             self.extend_sized(n);
@@ -223,6 +225,7 @@ pub struct HandleScope<'d> {
 }
 
 impl<'d> HandleScope<'d> {
+    #[inline]
     pub unsafe fn from_raw(data: NonNull<HandleData>) -> Self {
         let inner = unsafe { &*data.as_ptr() }.inner();
         inner.level += 1;
@@ -426,6 +429,13 @@ pub struct HandleSlice<'a> {
 impl<'a> HandleSlice<'a> {
     /// The empty argument list.
     pub const EMPTY: HandleSlice<'static> = HandleSlice { raw: &[] };
+
+    /// The same rooted slots minus the first `n` elements.
+    pub fn slice_from(&self, n: usize) -> Self {
+        Self {
+            raw: &self.raw[n.min(self.raw.len())..],
+        }
+    }
 
     /// # Safety
     /// The slice must point at memory the GC visits for as long as it is

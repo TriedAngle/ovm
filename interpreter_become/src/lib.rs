@@ -14,9 +14,9 @@ use vm_core::{
     CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
     DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap,
     Hint,
-    Interpreter, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, Register, RuntimeContext,
-    RuntimeIndex, ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome, StoreSemantics,
-    Tagged, VM, Value, VmError,
+    Interpreter, Intrinsic, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, Register,
+    RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome,
+    StoreSemantics, Tagged, VM, Value, VmError, spread_apply_args,
 };
 
 pub struct BecomeInterpreter;
@@ -138,10 +138,6 @@ impl<'a> Ctx<'a> {
         Ok(self.exception_word())
     }
 
-    #[inline(always)]
-    fn threw(&self) -> Result<Tagged<'a, Value>, VmError> {
-        Ok(self.exception_word())
-    }
 }
 
 #[inline(always)]
@@ -218,8 +214,13 @@ macro_rules! helpers {
                 dispatch!(p, $a, r, c)
             }};
         }
-        macro_rules! bail { ($e:expr) => { return $ctx.raise($e) } }
-        macro_rules! threw { () => { return $ctx.threw() } }
+        macro_rules! bail {
+            ($e:expr) => {{
+                let _ = $ctx.raise($e)?;
+                become throw_dispatch($pc, $code, $regs, $acc, $ctx)
+            }}
+        }
+        macro_rules! threw { () => { become throw_dispatch($pc, $code, $regs, $acc, $ctx) } }
     };
 }
 
@@ -268,6 +269,27 @@ const fn star_lookahead(op: Opcode) -> bool {
             | Opcode::AddLoc
             | Opcode::SubLoc
     )
+}
+
+macro_rules! cold_try {
+    ($ctx:ident, $e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(err) => $ctx.raise(err)?,
+        }
+    };
+}
+
+macro_rules! cold_start {
+    ($pc:ident, $code:ident, $regs:ident, $acc:ident, $ctx:ident, $e:expr) => {
+        match $e {
+            Ok(m) => m,
+            Err(err) => {
+                let _ = $ctx.raise(err)?;
+                become throw_dispatch($pc, $code, $regs, $acc, $ctx)
+            }
+        }
+    };
 }
 
 macro_rules! handlers {
@@ -851,19 +873,9 @@ handlers!(pc, code, regs, acc, ctx;
             return Ok(acc);
         }
         let meta = ctx.meta(pc);
-        // ES 9.2.2: an ordinary constructor that returns a primitive yields
-        // the synthesized receiver. `new_target != undefined` marks a
-        // construct frame; `this` sits at operand 0. (Cold-path construct
-        // frames are the `execute` base anchor and never reach here.)
-        let acc = if ctx.stack().new_target_slot(&meta).get(ctx.heap()) != ctx.undefined_word() {
-            if Convert::is_primitive(ctx.heap(), acc) {
-                ctx.stack().reg(ctx.heap(), &meta, 0)
-            } else {
-                acc
-            }
-        } else {
-            acc
-        };
+        // Construct-result fixups are caller-side (`ConstructCheck`) and
+        // cold paths apply their own, so the callee's return is
+        // unconditional: pop, restore the caller, resume.
         let caller = ctx.stack().pop_frame(&meta);
         ctx.cache().load(ctx.stack(), caller, ctx.heap_mut());
         let rel = ctx.cache().pc();
@@ -1063,26 +1075,16 @@ handlers!(pc, code, regs, acc, ctx;
         let meta = ctx.meta(0);
         let args = ctx.stack().args(&meta, base, count);
         let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
-        let result = f(nctx, args);
-        match result {
-            Ok(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
-            }
-            Err(err) => ctx.raise(err),
-        }
+        let v = f(nctx, args);
+        become resume(pc, code, regs, v, ctx)
     }
 
     Call : op_call_ic_n / op_call_ic_w (callee => signed, base => signed, count => unsigned, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_start(ctx, pc, SIZE, callee_word, base, count, fb)? {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, call_start(ctx, pc, SIZE, callee_word, base, count, fb));
+        match __mc {
             MethodCall::Value(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
+                become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame => {
                 let p = ctx.cache().pc();
@@ -1091,6 +1093,7 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.undefined_word();
                 dispatch!(p, u, r, b)
             }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_proxy_apply(pc, code, regs, acc, ctx),
         }
     }
@@ -1100,21 +1103,16 @@ handlers!(pc, code, regs, acc, ctx;
         match Object::call_target(ctx.heap(), callee_word) {
             None => bail!(VmError::Type),
             Some(CallTarget::Proxy(_)) => become cold_proxy_apply(pc, code, regs, acc, ctx),
+            Some(CallTarget::Intrinsic(i)) => {
+                become INTRINSICS[i.id()](pc, code, regs, acc, ctx)
+            }
             Some(CallTarget::Runtime(idx)) => {
                 let f = ctx.vm().runtime(RuntimeIndex(idx));
                 let meta = ctx.meta(0);
                 let args = ctx.stack().args(&meta, base, count);
                 let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
-                let result = f(nctx, args);
-                match result {
-                    Ok(v) => {
-                        if ctx.is_throw(v) {
-                            return Ok(v);
-                        }
-                        reenter!(pc, SIZE, v)
-                    }
-                    Err(err) => ctx.raise(err),
-                }
+                let v = f(nctx, args);
+                become resume(pc, code, regs, v, ctx)
             }
             Some(CallTarget::Bytecode {
                 target,
@@ -1156,12 +1154,10 @@ handlers!(pc, code, regs, acc, ctx;
 
     CallMethod0 : op_call_method0_n / op_call_method0_w (callee => signed, recv => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_method_start(ctx, pc, SIZE, callee_word, &[recv], fb)? {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, call_method_start(ctx, pc, SIZE, callee_word, &[recv], fb));
+        match __mc {
             MethodCall::Value(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
+                become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame => {
                 let p = ctx.cache().pc();
@@ -1170,18 +1166,17 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
                 dispatch!(p, u, r, b)
             }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
         }
     }
 
     CallMethod1 : op_call_method1_n / op_call_method1_w (callee => signed, recv => signed, arg0 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0], fb)? {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0], fb));
+        match __mc {
             MethodCall::Value(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
+                become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame => {
                 let p = ctx.cache().pc();
@@ -1190,18 +1185,17 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
                 dispatch!(p, u, r, b)
             }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
         }
     }
 
     CallMethod2 : op_call_method2_n / op_call_method2_w (callee => signed, recv => signed, arg0 => signed, arg1 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0, arg1], fb)? {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, call_method_start(ctx, pc, SIZE, callee_word, &[recv, arg0, arg1], fb));
+        match __mc {
             MethodCall::Value(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
+                become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame => {
                 let p = ctx.cache().pc();
@@ -1210,18 +1204,17 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
                 dispatch!(p, u, r, b)
             }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
         }
     }
 
     CallFunction0 : op_call_function0_n / op_call_function0_w (callee => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_function_start(ctx, pc, SIZE, callee_word, &[], fb)? {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, call_function_start(ctx, pc, SIZE, callee_word, &[], fb));
+        match __mc {
             MethodCall::Value(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
+                become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame => {
                 let p = ctx.cache().pc();
@@ -1230,18 +1223,17 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
                 dispatch!(p, u, r, b)
             }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
         }
     }
 
     CallFunction1 : op_call_function1_n / op_call_function1_w (callee => signed, arg0 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0], fb)? {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, call_function_start(ctx, pc, SIZE, callee_word, &[arg0], fb));
+        match __mc {
             MethodCall::Value(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
+                become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame => {
                 let p = ctx.cache().pc();
@@ -1250,18 +1242,17 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
                 dispatch!(p, u, r, b)
             }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
         }
     }
 
     CallFunction2 : op_call_function2_n / op_call_function2_w (callee => signed, arg0 => signed, arg1 => signed, fb => unsigned) {
         let callee_word = reg!(callee);
-        match call_function_start(ctx, pc, SIZE, callee_word, &[arg0, arg1], fb)? {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, call_function_start(ctx, pc, SIZE, callee_word, &[arg0, arg1], fb));
+        match __mc {
             MethodCall::Value(v) => {
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                reenter!(pc, SIZE, v)
+                become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame => {
                 let p = ctx.cache().pc();
@@ -1270,12 +1261,14 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.heap().known().undefined.as_tagged(ctx.heap()).erase();
                 dispatch!(p, u, r, b)
             }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
         }
     }
 
-    Construct : op_construct_n / op_construct_w (callee => signed, base => signed, count => unsigned) {
-        match construct_start(ctx, pc, SIZE, regs, callee, base, count)? {
+    Construct : op_construct_n / op_construct_w (callee => signed, base => signed, count => unsigned, out => signed) {
+        let __mc = cold_start!(pc, code, regs, acc, ctx, construct_start(ctx, pc, SIZE, regs, callee, base, count, out));
+        match __mc {
             ConstructStart::Frame => {
                 let p = ctx.cache().pc();
                 let b = ctx.code_ptr();
@@ -1283,9 +1276,24 @@ handlers!(pc, code, regs, acc, ctx;
                 let u = ctx.undefined_word();
                 dispatch!(p, u, r, b)
             }
-            ConstructStart::Threw(v) => return Ok(v),
-            ConstructStart::Cold => become cold_construct(pc, code, regs, acc, ctx),
+            ConstructStart::Threw(()) => become throw_dispatch(pc, code, regs, acc, ctx),
+            ConstructStart::Cold => {
+                // the cold path applies its own result fixup (or is a
+                // proxy trap); park undefined so the ConstructCheck that
+                // follows never reads an uninitialized slot
+                set_reg!(out, ctx.undefined_word());
+                become cold_construct(pc, code, regs, acc, ctx)
+            }
         }
+    }
+
+    ConstructCheck : op_construct_check_n / op_construct_check_w (out => signed) {
+        let v = if Convert::is_primitive(ctx.heap(), acc) {
+            reg!(out)
+        } else {
+            acc
+        };
+        next!(v)
     }
 
     LoadHole : op_load_hole_n / op_load_hole_w () {
@@ -2091,11 +2099,11 @@ unsafe fn store_named_cold<'a>(
 }
 
 /// Outcome of a `Construct` fast-path attempt.
-enum ConstructStart<'a> {
+enum ConstructStart {
     /// a constructor frame was pushed; the caller dispatches into it
     Frame,
-    /// receiver synthesis threw; the pending exception sentinel
-    Threw(Tagged<'a, Value>),
+    /// receiver synthesis threw; the pending exception is set
+    Threw(()),
     /// not an ordinary function constructor: fall back to `cold_construct`
     Cold,
 }
@@ -2108,7 +2116,8 @@ unsafe fn construct_start<'a>(
     callee: i32,
     base: i32,
     count: usize,
-) -> Result<ConstructStart<'a>, VmError> {
+    out: i32,
+) -> Result<ConstructStart, VmError> {
     let callee_word = reg_read(regs, ctx.heap(), callee);
     let Some(CallTarget::Bytecode { kind, .. }) = Object::call_target(ctx.heap(), callee_word) else {
         return Ok(ConstructStart::Cold);
@@ -2118,8 +2127,13 @@ unsafe fn construct_start<'a>(
     }
     let receiver = match construct_receiver_fast(ctx, callee_word)? {
         Some(r) => r,
-        None => return Ok(ConstructStart::Threw(ctx.exception_word())),
+        None => return Ok(ConstructStart::Threw(())),
     };
+    // park the receiver in the caller's `out` register: it stays
+    // GC-rooted for the whole callee run and the ConstructCheck that
+    // follows the callee's return reads it (register-file slots are a
+    // fixed-capacity arena, so `regs` survives the allocation above)
+    reg_write(regs, out, receiver);
     let callee_word = reg_read(regs, ctx.heap(), callee);
     let Some(CallTarget::Bytecode {
         target,
@@ -2340,6 +2354,421 @@ unsafe fn proxy_apply_regs_cold<'a>(
     result
 }
 
+// -- interpreter intrinsics ----------------------------------------------
+//
+// Handler-shaped builtins (`Function.prototype.call` / `apply` and
+// future trampolines): entered through the call IC exactly like
+// bytecode handlers — via a guaranteed tail call — so a call-through
+// builtin pushes the callee frame and tail-dispatches into it instead
+// of re-entering `execute` through nested Rust frames. The intrinsic
+// re-decodes the invoking call opcode's operands from `pc`/`code`, so
+// it knows the argument shape (scattered or contiguous window) it was
+// invoked with.
+
+/// Continue in the frame the helper just pushed (the cache already
+/// switched to the callee). Become-compatible tail entry.
+#[inline(always)]
+unsafe extern "rust-preserve-none" fn enter_fresh_frame<'a>(
+    _pc: usize,
+    _code: *const u8,
+    _regs: *mut Register,
+    _acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let code = ctx.code_ptr();
+    let regs = ctx.regs_ptr();
+    let acc = ctx.undefined_word();
+    let pc = ctx.cache().pc();
+    let op = *code.add(pc) as usize;
+    let h = TABLE_NARROW.0[op];
+    become h(pc, code, regs, acc, ctx)
+}
+
+/// Resolve the (already reshaped) call and push a frame, dispatch a
+/// runtime callee, or report an intrinsic/proxy for the caller to tail
+/// into. `args[0]` is the receiver of the call being made.
+#[cold]
+#[inline(never)]
+unsafe fn intrinsic_call_scattered<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    f: Tagged<'a, Value>,
+    srcs: &[i32],
+) -> Result<MethodCall<'a>, VmError> {
+    match Object::call_target(ctx.heap(), f) {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+            ..
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            push_scattered_method_frame(
+                ctx, pc, size, target, info, context, register_count, formal_min, srcs,
+            )
+        }
+        Some(CallTarget::Runtime(idx)) => {
+            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
+        }
+        Some(CallTarget::Intrinsic(_)) => {
+            // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
+            // the reshaped window, never against the original operands
+            let meta = ctx.meta(0);
+            let (saved_top, staged) = ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs)?;
+            let out = intrinsic_apply_call(ctx, pc, size, f, staged);
+            ctx.stack().set_top(saved_top);
+            match out? {
+                ApplyOut::Frame => Ok(MethodCall::Frame),
+                ApplyOut::Value(v) => Ok(MethodCall::Value(v)),
+            }
+        }
+        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
+        None => Err(VmError::Type),
+    }
+}
+
+/// `intrinsic_call_scattered` for the contiguous call window.
+#[cold]
+#[inline(never)]
+unsafe fn intrinsic_call_contiguous<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    f: Tagged<'a, Value>,
+    base: i32,
+    count: usize,
+) -> Result<MethodCall<'a>, VmError> {
+    match Object::call_target(ctx.heap(), f) {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+            ..
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(MethodCall::Value(ctx.raise(VmError::Type)?));
+            }
+            push_contiguous_frame(
+                ctx, pc, size, target, info, context, register_count, formal_min, base, count,
+            )
+        }
+        Some(CallTarget::Runtime(idx)) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
+            ctx, idx, base, count,
+        ))),
+        Some(CallTarget::Intrinsic(_)) => {
+            // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
+            // the reshaped window, never against the original operands
+            let meta = ctx.meta(0);
+            let staged = ctx.stack().args(&meta, base, count);
+            match intrinsic_apply_call(ctx, pc, size, f, staged)? {
+                ApplyOut::Frame => Ok(MethodCall::Frame),
+                ApplyOut::Value(v) => Ok(MethodCall::Value(v)),
+            }
+        }
+        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
+        None => Err(VmError::Type),
+    }
+}
+
+/// Shared tail of the intrinsics: run the resolved `MethodCall`.
+/// `MethodCall::Intrinsic` never appears here — nested intrinsics are
+/// unwrapped inside the call helpers against the reshaped window.
+macro_rules! finish_intrinsic {
+    ($pc:ident, $next:ident, $code:ident, $regs:ident, $acc:ident, $ctx:ident, $out:expr, $proxy:expr) => {
+        match $out? {
+            MethodCall::Frame => become enter_fresh_frame($pc, $code, $regs, $acc, $ctx),
+            MethodCall::Value(v) => become resume($pc, $code, $regs, v, $ctx),
+            MethodCall::Proxy => {
+                let v = $proxy?;
+                become resume($pc, $code, $regs, v, $ctx)
+            }
+            MethodCall::Intrinsic(i) => become INTRINSICS[i.id()]($pc, $code, $regs, $acc, $ctx),
+        }
+    };
+}
+
+#[rustc_align(32)]
+unsafe extern "rust-preserve-none" fn intrinsic_function_call<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + base / 2)) };
+    match op {
+        // contiguous window `[f, thisArg, args...]`: element 0 rides the
+        // window bottom, so dropping it is `count - 1` at the same base
+        Opcode::Call | Opcode::CallNoFeedback => {
+            let args_base = signed::read(pc, code, base + stride, stride);
+            let count = unsigned::read(pc, code, base + 2 * stride, stride);
+            if count == 0 {
+                let _ = ctx.raise(VmError::Type)?;
+                become throw_dispatch(pc, code, regs, acc, ctx)
+            }
+            let f = reg_read(regs, ctx.heap(), args_base - count as i32 + 1);
+            let size = next - pc;
+            finish_intrinsic!(
+                pc,
+                next,
+                code,
+                regs,
+                acc,
+                ctx,
+                intrinsic_call_contiguous(ctx, pc, size, f, args_base, count - 1),
+                proxy_apply_cold(ctx, f, args_base, count - 1)
+            )
+        }
+        // scattered: the receiver register holds the real target
+        Opcode::CallMethod0 => {
+            let recv = signed::read(pc, code, base + stride, stride);
+            let f = reg_read(regs, ctx.heap(), recv);
+            let size = next - pc;
+            finish_intrinsic!(
+                pc,
+                next,
+                code,
+                regs,
+                acc,
+                ctx,
+                intrinsic_call_scattered(ctx, pc, size, f, &[]),
+                proxy_apply_regs_cold(ctx, f, &[])
+            )
+        }
+        Opcode::CallMethod1 => {
+            let recv = signed::read(pc, code, base + stride, stride);
+            let arg0 = signed::read(pc, code, base + 2 * stride, stride);
+            let f = reg_read(regs, ctx.heap(), recv);
+            let size = next - pc;
+            finish_intrinsic!(
+                pc,
+                next,
+                code,
+                regs,
+                acc,
+                ctx,
+                intrinsic_call_scattered(ctx, pc, size, f, &[arg0]),
+                proxy_apply_regs_cold(ctx, f, &[arg0])
+            )
+        }
+        Opcode::CallMethod2 => {
+            let recv = signed::read(pc, code, base + stride, stride);
+            let arg0 = signed::read(pc, code, base + 2 * stride, stride);
+            let arg1 = signed::read(pc, code, base + 3 * stride, stride);
+            let f = reg_read(regs, ctx.heap(), recv);
+            let size = next - pc;
+            finish_intrinsic!(
+                pc,
+                next,
+                code,
+                regs,
+                acc,
+                ctx,
+                intrinsic_call_scattered(ctx, pc, size, f, &[arg0, arg1]),
+                proxy_apply_regs_cold(ctx, f, &[arg0, arg1])
+            )
+        }
+        // `call` invoked with an undefined receiver (unbound): `this` is
+        // not callable
+        Opcode::CallFunction0 | Opcode::CallFunction1 | Opcode::CallFunction2 => {
+            let _ = ctx.raise(VmError::Type)?;
+            become throw_dispatch(pc, code, regs, acc, ctx)
+        }
+        _ => {
+            let _ = ctx.raise(VmError::Type)?;
+            become throw_dispatch(pc, code, regs, acc, ctx)
+        }
+    }
+}
+
+/// Outcome of a resolved apply: a pushed frame or a completed value.
+enum ApplyOut<'a> {
+    Frame,
+    Value(Tagged<'a, Value>),
+}
+
+/// Resolve a call on `target` with a staged argument window
+/// (`args[0]` = receiver) and push the callee frame when it is bytecode.
+/// Nested intrinsics (`f.call.apply(...)`) are unwrapped recursively.
+#[cold]
+#[inline(never)]
+unsafe fn intrinsic_apply_call<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    target: Tagged<'a, Value>,
+    args: HandleSlice<'_>,
+) -> Result<ApplyOut<'a>, VmError> {
+    match Object::call_target(ctx.heap(), target) {
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+            ..
+        }) => {
+            if kind.is_class_constructor() {
+                return Ok(ApplyOut::Value(ctx.raise(VmError::Type)?));
+            }
+            let heap = ctx.heap_mut();
+            let meta = ctx.meta(pc + size);
+            let undefined = heap.known().undefined.as_tagged(heap).erase();
+            let frame = ctx.stack().push_frame_with_args(
+                heap,
+                meta,
+                pc,
+                target.erase(),
+                info,
+                register_count,
+                context.erase(),
+                args,
+                undefined,
+                formal_min,
+            )?;
+            ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
+            Ok(ApplyOut::Frame)
+        }
+        Some(CallTarget::Runtime(idx)) => {
+            // the spread is rooted by the caller's scope staging
+            let f = ctx.vm().runtime(RuntimeIndex(idx));
+            let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
+            Ok(ApplyOut::Value(f(nctx, args)))
+        }
+        Some(CallTarget::Intrinsic(intrinsic)) => {
+            // unwrap the nested intrinsic and retry on the reshaped args
+            match intrinsic {
+                Intrinsic::FunctionCall => {
+                    let f = args.get(0).map(|h| h.as_tagged(ctx.heap())).ok_or(VmError::Arity)?;
+                    let rest = args.slice_from(1);
+                    intrinsic_apply_call(ctx, pc, size, f, rest)
+                }
+                Intrinsic::FunctionApply => {
+                    let f = args.get(0).map(|h| h.as_tagged(ctx.heap())).ok_or(VmError::Arity)?;
+                    let this_arg = args
+                        .get(1)
+                        .map(|h| h.as_tagged(ctx.heap()))
+                        .unwrap_or_else(|| ctx.undefined_word());
+                    let array = args.get(2).map(|h| h.as_tagged(ctx.heap()));
+                    ctx.state().handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
+                        // Safety: fresh reads of rooted slots, staged before
+                        // the frame push below can move anything.
+                        let staged =
+                            scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
+                        intrinsic_apply_call(ctx, pc, size, f, staged)
+                    })
+                }
+            }
+        }
+        Some(CallTarget::Proxy(_)) => {
+            let vm = ctx.vm();
+            let heap = ctx.heap_mut();
+            let state = ctx.state();
+            let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
+                let target = scope.handle(target);
+                match Proxy::apply(vm, heap, state, target, args)? {
+                    Coercion::Threw => Ok(ctx.exception_word()),
+                    Coercion::Value(v) => Ok(v),
+                }
+            });
+            Ok(ApplyOut::Value(result?))
+        }
+        None => Err(VmError::Type),
+    }
+}
+
+#[rustc_align(32)]
+unsafe extern "rust-preserve-none" fn intrinsic_function_apply<'a>(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let (base, stride) = cold_layout(pc, code);
+    let next = cold_next_pc(pc, code);
+    let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + base / 2)) };
+    // recover (f, thisArg, argsArray) from the invoking call shape
+    let (f, this_arg, array) = match op {
+        Opcode::Call | Opcode::CallNoFeedback => {
+            let args_base = signed::read(pc, code, base + stride, stride);
+            let count = unsigned::read(pc, code, base + 2 * stride, stride);
+            if count < 2 {
+                // window must at least hold [f, thisArg]
+                let _ = ctx.raise(VmError::Type)?;
+                become throw_dispatch(pc, code, regs, acc, ctx)
+            }
+            let f = reg_read(regs, ctx.heap(), args_base - count as i32 + 1);
+            let this_arg = reg_read(regs, ctx.heap(), args_base - count as i32 + 2);
+            let array = if count >= 3 {
+                Some(reg_read(regs, ctx.heap(), args_base - count as i32 + 3))
+            } else {
+                None
+            };
+            (f, this_arg, array)
+        }
+        Opcode::CallMethod0 => {
+            let recv = signed::read(pc, code, base + stride, stride);
+            let f = reg_read(regs, ctx.heap(), recv);
+            (f, ctx.undefined_word(), None)
+        }
+        Opcode::CallMethod1 => {
+            let recv = signed::read(pc, code, base + stride, stride);
+            let arg0 = signed::read(pc, code, base + 2 * stride, stride);
+            let f = reg_read(regs, ctx.heap(), recv);
+            (f, reg_read(regs, ctx.heap(), arg0), None)
+        }
+        Opcode::CallMethod2 => {
+            let recv = signed::read(pc, code, base + stride, stride);
+            let arg0 = signed::read(pc, code, base + 2 * stride, stride);
+            let arg1 = signed::read(pc, code, base + 3 * stride, stride);
+            let f = reg_read(regs, ctx.heap(), recv);
+            (
+                f,
+                reg_read(regs, ctx.heap(), arg0),
+                Some(reg_read(regs, ctx.heap(), arg1)),
+            )
+        }
+        Opcode::CallFunction0 | Opcode::CallFunction1 | Opcode::CallFunction2 => {
+            let _ = ctx.raise(VmError::Type)?;
+            become throw_dispatch(pc, code, regs, acc, ctx)
+        }
+        _ => {
+            let _ = ctx.raise(VmError::Type)?;
+            become throw_dispatch(pc, code, regs, acc, ctx)
+        }
+    };
+    let size = next - pc;
+    let out = ctx.state().handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
+        // Safety: fresh register reads, staged before the frame push
+        // below can move anything.
+        let staged = scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
+        intrinsic_apply_call(ctx, pc, size, f, staged)
+    });
+    match out? {
+        ApplyOut::Frame => become enter_fresh_frame(pc, code, regs, acc, ctx),
+        ApplyOut::Value(v) => become resume(pc, code, regs, v, ctx),
+    }
+}
+
+/// The intrinsic table: builtins entered like bytecode handlers, by id.
+static INTRINSICS: [Handler; Intrinsic::COUNT] = [
+    intrinsic_function_call as Handler,
+    intrinsic_function_apply as Handler,
+];
+
 #[inline(always)]
 unsafe fn cold_layout(pc: usize, code: *const u8) -> (usize, usize) {
     if *code.add(pc) == Opcode::Wide as u8 {
@@ -2362,22 +2791,80 @@ unsafe fn cold_next_pc(pc: usize, code: *const u8) -> usize {
 }
 
 
+/// Exception dispatch: walk the ovm frames from the faulting one, consulting
+/// each frame's static handler table for a try range covering
+/// `fault_pc`; on a hit, take the pending exception and tail-dispatch
+/// into the handler with it in the accumulator. Pops frames until the
+/// anchor; then the sentinel escapes to the `execute` caller with the
+/// pending exception left set. A termination is uncatchable: no
+/// handler may observe it, so it unwinds straight out.
+#[cold]
+#[inline(never)]
+unsafe extern "rust-preserve-none" fn throw_dispatch<'a>(
+    fault_pc: usize,
+    _code: *const u8,
+    _regs: *mut Register,
+    _acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Result<Tagged<'a, Value>, VmError> {
+    let mut pc = fault_pc;
+    loop {
+        let handled = if ctx.state().termination().is_some() {
+            None
+        } else {
+            let meta = ctx.cache().frame_meta();
+            let callable = ctx.stack().callable_slot(&meta).get(ctx.heap());
+            callable
+                .as_heap_object()
+                .and_then(|obj| obj.as_ref().callable_info(ctx.heap()))
+                .and_then(|info| info.handlers.get(ctx.heap()))
+                .and_then(|handlers| handlers.as_ref().lookup(pc))
+        };
+        if let Some(handler_pc) = handled {
+            let ex = ctx
+                .state()
+                .take_pending_exception_tagged(ctx.heap())
+                .expect("pending exception must be set while unwinding");
+            let code = ctx.code_ptr();
+            let regs = ctx.regs_ptr();
+            let op = unsafe { *code.add(handler_pc) } as usize;
+            let h = TABLE_NARROW.0[op];
+            become h(handler_pc, code, regs, ex, ctx)
+        }
+        if ctx.cache().base() == ctx.base_anchor {
+            return Ok(ctx.exception_word());
+        }
+        let meta = ctx.cache().frame_meta();
+        let caller = ctx.stack().pop_frame(&meta);
+        ctx.cache().load(ctx.stack(), caller, ctx.heap_mut());
+        pc = caller.handler_pc;
+    }
+}
+
+/// Re-entry after a cold call, keyed on the faulting instruction's own
+/// pc (handler ranges are `[try_start, try_end)` over instruction
+/// offsets). 
+/// one sentinel compare, then either the exception dispatch or the
+/// dispatch to the instruction following the faulting one — the code
+/// pointer is re-derived from the (GC-updated) cache, so a moved code
+/// object is handled too.
 #[inline(always)]
 unsafe extern "rust-preserve-none" fn resume<'a>(
-    pc: usize,
+    fault_pc: usize,
     _code: *const u8,
     _regs: *mut Register,
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     if ctx.is_throw(acc) {
-        return Ok(acc);
+        become throw_dispatch(fault_pc, _code, _regs, acc, ctx)
     }
     let code = ctx.code_ptr();
+    let next = unsafe { cold_next_pc(fault_pc, code) };
     let regs = ctx.regs_ptr();
-    let op = *code.add(pc) as usize;
+    let op = unsafe { *code.add(next) } as usize;
     let h = TABLE_NARROW.0[op];
-    become h(pc, code, regs, acc, ctx)
+    become h(next, code, regs, acc, ctx)
 }
 
 #[cold]
@@ -2390,10 +2877,9 @@ unsafe extern "rust-preserve-none" fn cold_add<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = add_cold(ctx, lhs, acc)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, add_cold(ctx, lhs, acc));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2406,7 +2892,6 @@ unsafe extern "rust-preserve-none" fn cold_numeric<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
     let f: fn(f64, f64) -> f64 = match op {
@@ -2416,8 +2901,8 @@ unsafe extern "rust-preserve-none" fn cold_numeric<'a>(
         Opcode::Exp => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    let v = numeric_cold(ctx, lhs, acc, f)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, numeric_cold(ctx, lhs, acc, f));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2430,11 +2915,10 @@ unsafe extern "rust-preserve-none" fn cold_add_immediate<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let imm = Smi::new(signed::read(pc, code, base + stride, stride) as i64).into_tagged();
-    let v = add_cold(ctx, lhs, imm)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, add_cold(ctx, lhs, imm));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2447,7 +2931,6 @@ unsafe extern "rust-preserve-none" fn cold_numeric_immediate<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let imm = Smi::new(signed::read(pc, code, base + stride, stride) as i64).into_tagged();
     let op = unsafe { Opcode::from_byte_unchecked(*code.add(pc + (stride == 2) as usize)) };
@@ -2458,8 +2941,8 @@ unsafe extern "rust-preserve-none" fn cold_numeric_immediate<'a>(
         Opcode::ExpImmediate => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    let v = numeric_cold(ctx, lhs, imm, f)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, numeric_cold(ctx, lhs, imm, f));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2471,9 +2954,8 @@ unsafe extern "rust-preserve-none" fn cold_negate<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
-    let v = negate_cold(ctx, acc)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, negate_cold(ctx, acc));
+    become resume(pc, code, regs, v, ctx)
 }
 
 
@@ -2523,9 +3005,8 @@ unsafe extern "rust-preserve-none" fn cold_inc_loc<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
-    let v = incdec_cold(pc, code, regs, ctx, 1.0)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, incdec_cold(pc, code, regs, ctx, 1.0));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2537,9 +3018,8 @@ unsafe extern "rust-preserve-none" fn cold_dec_loc<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
-    let v = incdec_cold(pc, code, regs, ctx, -1.0)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, incdec_cold(pc, code, regs, ctx, -1.0));
+    become resume(pc, code, regs, v, ctx)
 }
 
 unsafe fn loc_op_cold<'a>(
@@ -2574,9 +3054,8 @@ unsafe extern "rust-preserve-none" fn cold_add_loc<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
-    let v = loc_op_cold(pc, code, regs, ctx, false)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, loc_op_cold(pc, code, regs, ctx, false));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2588,9 +3067,8 @@ unsafe extern "rust-preserve-none" fn cold_sub_loc<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
-    let v = loc_op_cold(pc, code, regs, ctx, true)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, loc_op_cold(pc, code, regs, ctx, true));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2603,7 +3081,6 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let key = reg_read(
         regs,
@@ -2611,8 +3088,8 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = keyed_load_cold(ctx, recv, key, Some(fb))?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, keyed_load_cold(ctx, recv, key, Some(fb)));
+    become resume(pc, code, regs, v, ctx)
 }
 
 
@@ -2650,10 +3127,9 @@ unsafe extern "rust-preserve-none" fn cold_equal<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = compare_op_cold(ctx, 0, acc, other)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, compare_op_cold(ctx, 0, acc, other));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2666,10 +3142,9 @@ unsafe extern "rust-preserve-none" fn cold_less_than<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = compare_op_cold(ctx, 2, acc, other)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, compare_op_cold(ctx, 2, acc, other));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2682,10 +3157,9 @@ unsafe extern "rust-preserve-none" fn cold_greater_than<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = compare_op_cold(ctx, 4, acc, other)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, compare_op_cold(ctx, 4, acc, other));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2715,7 +3189,7 @@ unsafe extern "rust-preserve-none" fn cold_compare_jump<'a>(
         _ => compare_cold(ctx, cmp, acc, other)?,
     };
     let Some(b) = b else {
-        return Ok(ctx.exception_word());
+        become resume(pc, code, regs, ctx.exception_word(), ctx)
     };
     let boolean = Convert::boolean(ctx.heap(), b);
     let dest = if b != (kind % 2 == 1) {
@@ -2723,7 +3197,11 @@ unsafe extern "rust-preserve-none" fn cold_compare_jump<'a>(
     } else {
         next
     };
-    become resume(dest, code, regs, boolean, ctx)
+    let code = ctx.code_ptr();
+    let regs = ctx.regs_ptr();
+    let op = unsafe { *code.add(dest) } as usize;
+    let h = TABLE_NARROW.0[op];
+    become h(dest, code, regs, boolean, ctx)
 }
 
 #[cold]
@@ -2736,12 +3214,11 @@ unsafe extern "rust-preserve-none" fn cold_named_load<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let name_idx = unsigned::read(pc, code, base + stride, stride);
     let fb_slot = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = named_load_cold(ctx, recv, name_idx, fb_slot)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, named_load_cold(ctx, recv, name_idx, fb_slot));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2754,11 +3231,10 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let fb = unsigned::read(pc, code, base + stride, stride);
-    let v = keyed_load_cold(ctx, recv, acc, Some(fb))?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, keyed_load_cold(ctx, recv, acc, Some(fb)));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2771,11 +3247,10 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_imm<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let idx = unsigned::read(pc, code, base + stride, stride);
-    let v = keyed_load_imm_cold(ctx, recv, idx)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, keyed_load_imm_cold(ctx, recv, idx));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2788,7 +3263,6 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let key = reg_read(
         regs,
@@ -2796,8 +3270,8 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2810,7 +3284,6 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store_no_shadow<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let key = reg_read(
         regs,
@@ -2818,8 +3291,8 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store_no_shadow<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2832,11 +3305,10 @@ unsafe extern "rust-preserve-none" fn cold_global_load<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let name_idx = unsigned::read(pc, code, base, stride);
     let fb_slot = unsigned::read(pc, code, base + stride, stride);
-    let v = global_load_cold(ctx, name_idx, fb_slot)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, global_load_cold(ctx, name_idx, fb_slot));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -2849,12 +3321,11 @@ unsafe extern "rust-preserve-none" fn cold_store_named<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let name_idx = unsigned::read(pc, code, base + stride, stride);
     let fb_slot = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = store_named_cold(ctx, recv, name_idx, fb_slot, acc)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, store_named_cold(ctx, recv, name_idx, fb_slot, acc));
+    become resume(pc, code, regs, v, ctx)
 }
 
 enum MethodCall<'a> {
@@ -2865,6 +3336,8 @@ enum MethodCall<'a> {
     Frame,
     /// a callable proxy: the caller tail-calls the cold trap dispatch
     Proxy,
+    /// an interpreter intrinsic: the caller tail-calls it like a handler
+    Intrinsic(vm_core::Intrinsic),
 }
 
 const CALL_TAG_BYTECODE: i64 = 0;
@@ -2890,7 +3363,10 @@ unsafe fn call_ic_probe<'a>(
         CALL_TAG_BYTECODE => Object::bytecode_target(ctx.heap(), callee),
         CALL_TAG_RUNTIME => {
             let obj = callee.as_heap_object()?;
-            Some(CallTarget::Runtime(obj.as_ref().runtime_index(ctx.heap())?))
+            match obj.as_ref().runtime_call_target(ctx.heap())? {
+                t @ (CallTarget::Runtime(_) | CallTarget::Intrinsic(_)) => Some(t),
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -2950,14 +3426,20 @@ unsafe fn dispatch_runtime_method<'a>(
     ctx: &Ctx<'a>,
     idx: usize,
     srcs: &[i32],
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let f = ctx.vm().runtime(RuntimeIndex(idx));
     let meta = ctx.meta(0);
-    let (saved_top, args) = ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs)?;
+    let (saved_top, args) = match ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs) {
+        Ok(staged) => staged,
+        Err(err) => {
+            let _ = ctx.raise(err);
+            return ctx.exception_word();
+        }
+    };
     let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
-    let result = f(nctx, args);
+    let v = f(nctx, args);
     ctx.stack().set_top(saved_top);
-    result
+    v
 }
 
 #[inline(always)]
@@ -2965,14 +3447,20 @@ unsafe fn dispatch_runtime_function<'a>(
     ctx: &Ctx<'a>,
     idx: usize,
     args: &[i32],
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let f = ctx.vm().runtime(RuntimeIndex(idx));
     let meta = ctx.meta(0);
-    let (saved_top, staged) = ctx.stack().stage_function_args(ctx.heap(), &meta, args)?;
+    let (saved_top, staged) = match ctx.stack().stage_function_args(ctx.heap(), &meta, args) {
+        Ok(staged) => staged,
+        Err(err) => {
+            let _ = ctx.raise(err);
+            return ctx.exception_word();
+        }
+    };
     let nctx = RuntimeContext::new(ctx.vm(), ctx.heap_mut(), ctx.state());
-    let result = f(nctx, staged);
+    let v = f(nctx, staged);
     ctx.stack().set_top(saved_top);
-    result
+    v
 }
 
 #[inline(always)]
@@ -2981,7 +3469,7 @@ unsafe fn dispatch_runtime_contiguous<'a>(
     idx: usize,
     base: i32,
     count: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let f = ctx.vm().runtime(RuntimeIndex(idx));
     let meta = ctx.meta(0);
     let args = ctx.stack().args(&meta, base, count);
@@ -3118,8 +3606,9 @@ unsafe fn call_method_start<'a>(
             )
         }
         Some(CallTarget::Runtime(idx)) => {
-            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)?))
+            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
         }
+        Some(CallTarget::Intrinsic(i)) => Ok(MethodCall::Intrinsic(i)),
         _ => cold_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
     }
 }
@@ -3139,7 +3628,11 @@ unsafe fn cold_call_method_miss<'a>(
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(idx)) => {
             call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
-            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)?))
+            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
+        }
+        Some(CallTarget::Intrinsic(i)) => {
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
+            Ok(MethodCall::Intrinsic(i))
         }
         Some(CallTarget::Bytecode {
             target,
@@ -3202,8 +3695,9 @@ unsafe fn call_function_start<'a>(
             )
         }
         Some(CallTarget::Runtime(idx)) => {
-            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)?))
+            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
         }
+        Some(CallTarget::Intrinsic(i)) => Ok(MethodCall::Intrinsic(i)),
         _ => cold_call_function_miss(ctx, pc, size, callee_word, args, fb),
     }
 }
@@ -3223,7 +3717,11 @@ unsafe fn cold_call_function_miss<'a>(
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(idx)) => {
             call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
-            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)?))
+            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
+        }
+        Some(CallTarget::Intrinsic(i)) => {
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
+            Ok(MethodCall::Intrinsic(i))
         }
         Some(CallTarget::Bytecode {
             target,
@@ -3291,8 +3789,9 @@ unsafe fn call_start<'a>(
         Some(CallTarget::Runtime(idx)) => {
             Ok(MethodCall::Value(dispatch_runtime_contiguous(
                 ctx, idx, base, count,
-            )?))
+            )))
         }
+        Some(CallTarget::Intrinsic(i)) => Ok(MethodCall::Intrinsic(i)),
         _ => cold_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
 }
@@ -3315,7 +3814,11 @@ unsafe fn cold_call_miss<'a>(
             call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
             Ok(MethodCall::Value(dispatch_runtime_contiguous(
                 ctx, idx, base, count,
-            )?))
+            )))
+        }
+        Some(CallTarget::Intrinsic(i)) => {
+            call_ic_update(ctx, fb, callee_word, CALL_TAG_RUNTIME, None);
+            Ok(MethodCall::Intrinsic(i))
         }
         Some(CallTarget::Bytecode {
             target,
@@ -3355,12 +3858,11 @@ unsafe extern "rust-preserve-none" fn cold_construct<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let callee = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let args_base = signed::read(pc, code, base + stride, stride);
     let count = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = construct_cold(ctx, callee, args_base, count)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, construct_cold(ctx, callee, args_base, count));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3373,10 +3875,9 @@ unsafe extern "rust-preserve-none" fn cold_create_closure<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let info_idx = unsigned::read(pc, code, base, stride);
-    let v = create_closure_cold(ctx, info_idx)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, create_closure_cold(ctx, info_idx));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3388,14 +3889,13 @@ unsafe extern "rust-preserve-none" fn cold_create_empty_array<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
     let heap = ctx.heap_mut();
     let state = ctx.state();
     let obj = state.handle_scope(|scope| {
         let map = heap.known().js_array_map;
         heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
     });
-    become resume(next, code, regs, obj, ctx)
+    become resume(pc, code, regs, obj, ctx)
 }
 
 #[cold]
@@ -3407,14 +3907,13 @@ unsafe extern "rust-preserve-none" fn cold_create_empty_object<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
     let heap = ctx.heap_mut();
     let state = ctx.state();
     let obj = state.handle_scope(|scope| {
         let map = heap.known().object_initial_map;
         heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
     });
-    become resume(next, code, regs, obj, ctx)
+    become resume(pc, code, regs, obj, ctx)
 }
 
 #[cold]
@@ -3426,14 +3925,13 @@ unsafe extern "rust-preserve-none" fn cold_create_bare_object<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let next = cold_next_pc(pc, code);
     let heap = ctx.heap_mut();
     let state = ctx.state();
     let obj = state.handle_scope(|scope| {
         let map = heap.known().plain_object_map;
         heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
     });
-    become resume(next, code, regs, obj, ctx)
+    become resume(pc, code, regs, obj, ctx)
 }
 
 #[cold]
@@ -3474,10 +3972,9 @@ unsafe extern "rust-preserve-none" fn cold_create_block_context<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let count = unsigned::read(pc, code, base, stride);
-    let v = create_block_context_cold(ctx, count)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, create_block_context_cold(ctx, count));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3490,10 +3987,9 @@ unsafe extern "rust-preserve-none" fn cold_less_than_or_equal<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = compare_op_cold(ctx, 3, acc, other)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, compare_op_cold(ctx, 3, acc, other));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3549,11 +4045,10 @@ unsafe extern "rust-preserve-none" fn cold_global_load_nothrow<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let name_idx = unsigned::read(pc, code, base, stride);
     let fb_slot = unsigned::read(pc, code, base + stride, stride);
-    let v = global_load_nothrow_cold(ctx, name_idx, fb_slot)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, global_load_nothrow_cold(ctx, name_idx, fb_slot));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3613,10 +4108,9 @@ unsafe extern "rust-preserve-none" fn cold_store_global<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let name_idx = unsigned::read(pc, code, base, stride);
     let v = store_global_cold(ctx, name_idx, acc)?;
-    become resume(next, code, regs, v, ctx)
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3677,11 +4171,10 @@ unsafe extern "rust-preserve-none" fn cold_store_named_no_shadow<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let name_idx = unsigned::read(pc, code, base + stride, stride);
-    let v = store_named_no_shadow_cold(ctx, recv, name_idx, acc)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, store_named_no_shadow_cold(ctx, recv, name_idx, acc));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3714,10 +4207,9 @@ unsafe extern "rust-preserve-none" fn cold_instance_of<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let callable = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = instance_of_cold(ctx, acc, callable)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, instance_of_cold(ctx, acc, callable));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3730,10 +4222,9 @@ unsafe extern "rust-preserve-none" fn cold_greater_than_or_equal<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = compare_op_cold(ctx, 5, acc, other)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, compare_op_cold(ctx, 5, acc, other));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3774,11 +4265,10 @@ unsafe extern "rust-preserve-none" fn cold_add_parent<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let name_idx = unsigned::read(pc, code, base + stride, stride);
-    let v = add_parent_cold(ctx, recv, name_idx, acc)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, add_parent_cold(ctx, recv, name_idx, acc));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3791,10 +4281,9 @@ unsafe extern "rust-preserve-none" fn cold_create_function_context<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let scope_idx = unsigned::read(pc, code, base, stride);
-    let v = create_function_context_cold(ctx, scope_idx)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, create_function_context_cold(ctx, scope_idx));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3807,12 +4296,11 @@ unsafe extern "rust-preserve-none" fn cold_proxy_apply<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let callee = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let args_base = signed::read(pc, code, base + stride, stride);
     let count = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = proxy_apply_cold(ctx, callee, args_base, count)?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, proxy_apply_cold(ctx, callee, args_base, count));
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3825,7 +4313,6 @@ unsafe extern "rust-preserve-none" fn cold_call_method_proxy<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let wide = *code.add(pc) == Opcode::Wide as u8;
     let argc = match Opcode::from_byte_unchecked(*code.add(pc + wide as usize)) {
         Opcode::CallMethod0 => 0usize,
@@ -3838,7 +4325,7 @@ unsafe extern "rust-preserve-none" fn cold_call_method_proxy<'a>(
         *src = signed::read(pc, code, base + (i + 1) * stride, stride);
     }
     let v = proxy_apply_regs_cold(ctx, callee, &srcs[..argc + 1])?;
-    become resume(next, code, regs, v, ctx)
+    become resume(pc, code, regs, v, ctx)
 }
 
 #[cold]
@@ -3874,7 +4361,6 @@ unsafe extern "rust-preserve-none" fn cold_call_function_proxy<'a>(
     ctx: &Ctx<'a>,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let (base, stride) = cold_layout(pc, code);
-    let next = cold_next_pc(pc, code);
     let wide = *code.add(pc) == Opcode::Wide as u8;
     let argc = match Opcode::from_byte_unchecked(*code.add(pc + wide as usize)) {
         Opcode::CallFunction0 => 0usize,
@@ -3886,8 +4372,8 @@ unsafe extern "rust-preserve-none" fn cold_call_function_proxy<'a>(
     for (i, arg) in args.iter_mut().enumerate().take(argc) {
         *arg = signed::read(pc, code, base + (i + 1) * stride, stride);
     }
-    let v = proxy_apply_function_cold(ctx, callee, &args[..argc])?;
-    become resume(next, code, regs, v, ctx)
+    let v = cold_try!(ctx, proxy_apply_function_cold(ctx, callee, &args[..argc]));
+    become resume(pc, code, regs, v, ctx)
 }
 
 const fn table_narrow() -> [Handler; 256] {
@@ -3967,6 +4453,7 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::CallMethod1 as usize] = op_call_method1_n as Handler;
     t[Opcode::CallMethod2 as usize] = op_call_method2_n as Handler;
     t[Opcode::Construct as usize] = op_construct_n as Handler;
+    t[Opcode::ConstructCheck as usize] = op_construct_check_n as Handler;
     t[Opcode::LoadHole as usize] = op_load_hole_n as Handler;
     t[Opcode::LoadNewTarget as usize] = op_load_new_target_n as Handler;
     t[Opcode::LoadContext as usize] = op_load_context_n as Handler;
@@ -4069,6 +4556,7 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::CallMethod1 as usize] = op_call_method1_w as Handler;
     t[Opcode::CallMethod2 as usize] = op_call_method2_w as Handler;
     t[Opcode::Construct as usize] = op_construct_w as Handler;
+    t[Opcode::ConstructCheck as usize] = op_construct_check_w as Handler;
     t[Opcode::LoadHole as usize] = op_load_hole_w as Handler;
     t[Opcode::LoadNewTarget as usize] = op_load_new_target_w as Handler;
     t[Opcode::LoadContext as usize] = op_load_context_w as Handler;
@@ -4128,13 +4616,45 @@ fn enter<'a>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
+        Some(CallTarget::Intrinsic(intrinsic)) => {
+            // Rust-world entry of an intrinsic: unwrap it and re-enter.
+            // This is the cold path — bytecode call sites reach intrinsics
+            // through the handler-shaped table instead.
+            state.handle_scope(|scope| match intrinsic {
+                Intrinsic::FunctionCall => {
+                    let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    if !Object::is_callable(heap, f) {
+                        return Err(VmError::Type);
+                    }
+                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
+                    enter(vm, heap, state, f, args.slice_from(1), None)
+                }
+                Intrinsic::FunctionApply => {
+                    let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    if !Object::is_callable(heap, f) {
+                        return Err(VmError::Type);
+                    }
+                    let this_arg = args
+                        .get(1)
+                        .map(|h| h.as_tagged(heap))
+                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+                    let array = args.get(2).map(|h| h.as_tagged(heap));
+                    // Safety: fresh rooted-slot reads, staged before `enter`
+                    // below can allocate.
+                    let staged =
+                        scope.stage(&unsafe { spread_apply_args(heap, this_arg, array) });
+                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
+                    enter(vm, heap, state, f, staged, None)
+                }
+            })
+        }
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
-            let result = f(nctx, fargs);
+            let v = f(nctx, fargs);
             state.stack().set_top(saved_top);
-            result
+            Ok(v)
         }
         Some(CallTarget::Bytecode {
             target,

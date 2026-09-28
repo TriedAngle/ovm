@@ -828,9 +828,13 @@ impl FnBuilder {
         self.emit_tracked(Opcode::CallRuntime, &[f as u32, base, count]);
     }
 
-    pub fn construct(&mut self, callee: Reg, args: RegList) {
+    /// `new callee(args)`: parks the synthesized receiver in `out` and
+    /// emits the `ConstructCheck` fixup that replaces a primitive result
+    /// with it. The pair is atomic — nothing may jump between the two.
+    pub fn construct(&mut self, callee: Reg, args: RegList, out: Reg) {
         let [base, count] = args.operands();
-        self.emit_tracked(Opcode::Construct, &[callee.operand(), base, count]);
+        self.emit_tracked(Opcode::Construct, &[callee.operand(), base, count, out.operand()]);
+        self.emit_tracked(Opcode::ConstructCheck, &[out.operand()]);
     }
 
     acc_void!(create_empty_object_literal, CreateEmptyObjectLiteral);

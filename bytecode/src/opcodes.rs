@@ -261,7 +261,7 @@ define_opcodes! {
     CallNoFeedback { operands: [Register, RegisterListStart, RegisterCount], acc: writes, indices: [Unchecked, Unchecked, Unchecked] },
     CallRuntime { operands: [Index, RegisterListStart, RegisterCount], acc: writes, indices: [RuntimeFn, Unchecked, Unchecked] }, // idx (RuntimeFn discriminant) reglist (base) regcount (count) -> acc
 
-    Construct { operands: [Register, RegisterListStart, RegisterCount], acc: writes, indices: [Unchecked, Unchecked, Unchecked] }, // reg (callee) reglist (base) regcount (count) -> acc
+    Construct { operands: [Register, RegisterListStart, RegisterCount, Register], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Unchecked] }, // reg (callee) reglist (base) regcount (count) reg (receiver parking) -> acc
 
     // -- literals and closures --------------------------------------------
     CreateEmptyObjectLiteral { operands: [], acc: writes, indices: [] }, // -> acc (object_initial_map, no slots)
@@ -360,4 +360,12 @@ define_opcodes! {
     CallMethod0 { operands: [Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },                              // callee, receiver, fb -> acc
     CallMethod1 { operands: [Register, Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Feedback] },          // callee, receiver, arg0, fb -> acc
     CallMethod2 { operands: [Register, Register, Register, Register, Index], acc: writes, indices: [Unchecked, Unchecked, Unchecked, Unchecked, Feedback] }, // callee, receiver, arg0, arg1, fb -> acc
+
+    /// Construct-result fixup, always emitted right after `Construct`:
+    /// a primitive result (an ordinary constructor's `return 1` / fall-off-
+    /// the-end `undefined`) yields the parked receiver from `out`; anything
+    /// else passes through. `Construct` stores the synthesized receiver in
+    /// `out` before invoking the callee, so the callee's `Return` stays
+    /// check-free.
+    ConstructCheck { operands: [Register], acc: reads_writes, indices: [Unchecked] },
 }

@@ -57,8 +57,8 @@ pub use objects::{
     object_layout, string_content_hash, visit_object,
 };
 pub use runtime::{
-    Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Runtime, RuntimeCall,
-    RuntimeContext, RuntimeIndex, RuntimeRegistry,
+    Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Intrinsic, Runtime, RuntimeCall,
+    RuntimeContext, RuntimeIndex, RuntimeRegistry, raise_runtime, spread_apply_args,
 };
 pub use stack::{FrameMeta, STACK_SLOTS, Stack};
 pub use tools::{KetteTools, Termination};
@@ -137,6 +137,9 @@ pub struct ContextState {
     cache: StackCache,
     pending_exception: Register,
     has_pending_exception: Cell<bool>,
+    /// The error code behind the current sentinel-channel raise, for
+    /// edges that surface `Result` again (`Thread::run_runtime`).
+    last_error: Cell<VmError>,
     /// Why this thread's execution terminated, if it did. Set exactly once,
     /// right before the uncatchable unwind; guest code can never observe or
     /// intercept it.
@@ -150,6 +153,14 @@ impl ContextState {
 
     pub fn cache(&self) -> &StackCache {
         &self.cache
+    }
+
+    pub fn set_last_error(&self, err: VmError) {
+        self.last_error.set(err);
+    }
+
+    pub fn last_error(&self) -> VmError {
+        self.last_error.get()
     }
 
     pub fn set_pending_exception<'x, T: 'x>(&self, value: Tagged<'x, T>) {
@@ -362,12 +373,13 @@ impl Thread {
     }
 
     pub fn run_runtime(&mut self, f: RuntimeCall, args: &[Value]) -> Result<Value, VmError> {
+        let exception = self.heap.known().exception.as_tagged(&self.heap).raw();
         let nctx = RuntimeContext::new(&self.vm, &mut self.heap, &self.state);
         // stage a rooted copy: the runtime may keep reading it across its
         // own allocations
         // Safety: caller-owned words staged before any allocation.
         self.state.handle_scope(|scope| {
-            f(
+            let v = f(
                 nctx,
                 scope.stage(
                     &args
@@ -375,8 +387,15 @@ impl Thread {
                         .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
                         .collect::<Vec<_>>(),
                 ),
-            )
-            .map(|v| v.raw())
+            );
+            // single channel at the ABI: the sentinel means the pending
+            // exception is set — surface it as the Err half here (the
+            // edge above `execute` keeps the Result convention)
+            if v.raw() == exception {
+                Err(self.state.last_error())
+            } else {
+                Ok(v.raw())
+            }
         })
     }
 
@@ -538,6 +557,7 @@ impl VM {
             cache: StackCache::new(the_hole),
             pending_exception: unsafe { Register::from_value(the_hole) },
             has_pending_exception: Cell::new(false),
+            last_error: Cell::new(VmError::Type),
             termination: Cell::new(None),
         });
         let mut threads = self.shared.threads.lock().unwrap();

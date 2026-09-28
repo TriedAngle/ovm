@@ -1,5 +1,6 @@
 use bytecode::{Opcode, PropertyFlags, emit};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
+use vm::raise_runtime;
 use vm::{
     AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, DenseString,
     FixedArray, FixedByteArray, Float, FunctionKind, Handle, HandleScope, HandleSlice, Heap,
@@ -267,18 +268,19 @@ fn call_runtime_passes_receiver_and_args() {
     fn add<'a>(
         nctx: RuntimeContext<'a>,
         args: HandleSlice<'_>,
-    ) -> Result<Tagged<'a, Value>, VmError> {
-        let RuntimeContext { heap, .. } = nctx;
+    ) -> Tagged<'a, Value> {
+        let RuntimeContext { vm, heap, state, .. } = nctx;
         let (a, b) = match (
             args.get(1).map(|h| h.as_tagged(heap)),
             args.get(2).map(|h| h.as_tagged(heap)),
         ) {
             (Some(a), Some(b)) => (a.raw(), b.raw()),
-            _ => return Err(VmError::Arity),
+            _ => return raise_runtime(vm, heap, state, VmError::Arity),
         };
-        let a = Smi::decode(a).ok_or(VmError::Type)?;
-        let b = Smi::decode(b).ok_or(VmError::Type)?;
-        Ok(Tagged::from(Smi::new(a.value() + b.value())))
+        let (Some(a), Some(b)) = (Smi::decode(a), Smi::decode(b)) else {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        };
+        Tagged::from(Smi::new(a.value() + b.value()))
     }
 
     let mut vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
@@ -2050,8 +2052,8 @@ fn bytecode_fn<'a>(
     .erase()
 }
 
-fn forty_two<'a>(_: RuntimeContext<'a>, _: HandleSlice<'_>) -> Result<Tagged<'a, Value>, VmError> {
-    Ok(Tagged::from(Smi::new(42)))
+fn forty_two<'a>(_: RuntimeContext<'a>, _: HandleSlice<'_>) -> Tagged<'a, Value> {
+    Tagged::from(Smi::new(42))
 }
 
 #[test]
@@ -2115,7 +2117,7 @@ fn call_dispatches_to_runtime_function_object() {
 fn run_failing_inner<'a>(
     nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2153,7 +2155,7 @@ fn run_failing_inner<'a>(
                 // clearing it
                 let ex = state.take_pending_exception().expect("pending exception");
                 assert!(ex.is_strong_ptr());
-                Ok(Tagged::from(Smi::new(42)))
+                Tagged::from(Smi::new(42))
             }
             other => panic!("expected inner escape, got {other:?}"),
         }
@@ -3148,8 +3150,9 @@ fn create_closure_function_kind_controls_call_and_construct() {
     emit(
         &mut construct,
         Opcode::Construct,
-        &[reg_op(0), reg_op(0), 0],
+        &[reg_op(0), reg_op(0), 0, reg_op(1)],
     );
+    emit(&mut construct, Opcode::ConstructCheck, &[reg_op(1)]);
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[method]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -3201,8 +3204,9 @@ fn create_closure_function_kind_controls_call_and_construct() {
     emit(
         &mut construct,
         Opcode::Construct,
-        &[reg_op(0), reg_op(0), 0],
+        &[reg_op(0), reg_op(0), 0, reg_op(1)],
     );
+    emit(&mut construct, Opcode::ConstructCheck, &[reg_op(1)]);
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[class_constructor]).unwrap();
     assert!(
@@ -4269,7 +4273,8 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[g]).unwrap();
         assert!(r.is_strong_ptr(), "primitive result: receiver must win");
@@ -4279,7 +4284,8 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::Load, &[reg_op(1)]);
         emit(&mut program, Opcode::InstanceOf, &[reg_op(0)]);
@@ -4293,7 +4299,8 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[f]).unwrap();
         assert!(r.is_strong_ptr(), "object result must win");
@@ -4305,7 +4312,8 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[plain]);
         expect_escaped(&mut *thread, r, "TypeError");
@@ -4317,13 +4325,13 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
 fn construct_probe<'a>(
     nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let is_construct = nctx.is_construct();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     let flag = Smi::new(if is_construct { 1 } else { 0 }).into_tagged();
-    state.handle_scope(|scope| -> Result<(), VmError> {
+    let _ = state.handle_scope(|scope| -> Result<(), VmError> {
         let name = vm.interner().intern_str(heap, &scope, "constructProbe");
         let global = scope.handle(heap.known().global_object.as_tagged(heap).erase());
         let outcome = global.store_lookup(
@@ -4347,12 +4355,12 @@ fn construct_probe<'a>(
             }
             StoreOutcome::CallSetter { setter } => {
                 let args = scope.stage(&[global.as_tagged(heap).erase(), flag.erase()]);
-                RuntimeContext::call(vm, &mut *heap, state, setter, args, None)?;
+                let _ = RuntimeContext::call(vm, &mut *heap, state, setter, args, None);
             }
         }
         Ok(())
-    })?;
-    Ok(flag.erase())
+    });
+    flag.erase()
 }
 
 #[test]
@@ -4372,7 +4380,8 @@ fn construct_sets_runtime_construct_flag() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0, reg_op(1)]);
+        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);

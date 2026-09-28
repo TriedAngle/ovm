@@ -1,5 +1,6 @@
 use core::alloc::Layout;
 
+use crate::error::Message;
 use crate::runtime::Coercion;
 use crate::{
     Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
@@ -169,7 +170,7 @@ fn call_trap<'a>(
     args: &[Handle<'_, Value>],
 ) -> Result<Coercion<'a>, VmError> {
     if !Object::is_callable(heap, trap.as_tagged(heap)) {
-        return Err(VmError::Message("proxy trap is not a function"));
+        return Err(VmError::Message(Message::ProxyTrapNotFunction));
     }
     let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
     let staged = scope.stage(&words);
@@ -202,23 +203,19 @@ fn enter_trap<'s>(
 
 fn revoked_error(trap: Trap) -> VmError {
     VmError::Message(match trap {
-        Trap::Get => "cannot perform 'get' on a proxy that has been revoked",
-        Trap::Set => "cannot perform 'set' on a proxy that has been revoked",
-        Trap::Has => "cannot perform 'has' on a proxy that has been revoked",
-        Trap::DeleteProperty => "cannot perform 'deleteProperty' on a proxy that has been revoked",
-        Trap::GetOwnPropertyDescriptor => {
-            "cannot perform 'getOwnPropertyDescriptor' on a proxy that has been revoked"
-        }
-        Trap::DefineProperty => "cannot perform 'defineProperty' on a proxy that has been revoked",
-        Trap::GetPrototypeOf => "cannot perform 'getPrototypeOf' on a proxy that has been revoked",
-        Trap::SetPrototypeOf => "cannot perform 'setPrototypeOf' on a proxy that has been revoked",
-        Trap::IsExtensible => "cannot perform 'isExtensible' on a proxy that has been revoked",
-        Trap::PreventExtensions => {
-            "cannot perform 'preventExtensions' on a proxy that has been revoked"
-        }
-        Trap::OwnKeys => "cannot perform 'ownKeys' on a proxy that has been revoked",
-        Trap::Apply => "cannot perform 'apply' on a proxy that has been revoked",
-        Trap::Construct => "cannot perform 'construct' on a proxy that has been revoked",
+        Trap::Get => Message::ProxyRevokedGet,
+        Trap::Set => Message::ProxyRevokedSet,
+        Trap::Has => Message::ProxyRevokedHas,
+        Trap::DeleteProperty => Message::ProxyRevokedDeleteProperty,
+        Trap::GetOwnPropertyDescriptor => Message::ProxyRevokedGetOwnPropertyDescriptor,
+        Trap::DefineProperty => Message::ProxyRevokedDefineProperty,
+        Trap::GetPrototypeOf => Message::ProxyRevokedGetPrototypeOf,
+        Trap::SetPrototypeOf => Message::ProxyRevokedSetPrototypeOf,
+        Trap::IsExtensible => Message::ProxyRevokedIsExtensible,
+        Trap::PreventExtensions => Message::ProxyRevokedPreventExtensions,
+        Trap::OwnKeys => Message::ProxyRevokedOwnKeys,
+        Trap::Apply => Message::ProxyRevokedApply,
+        Trap::Construct => Message::ProxyRevokedApply,
     })
 }
 
@@ -567,17 +564,13 @@ fn get_h<'a>(
                             d.value.map_or(undefined, |h| h.as_tagged(heap)),
                         )
                     {
-                        return Err(VmError::Message(
-                            "proxy get trap must match a non-writable, non-configurable property",
-                        ));
+                        return Err(VmError::Message(Message::ProxyGetMismatch));
                     }
                     if d.is_accessor_descriptor()
                         && d.get.is_some_and(|g| g.as_tagged(heap).ptr_eq(undefined))
                         && !result.as_tagged(heap).ptr_eq(undefined)
                     {
-                        return Err(VmError::Message(
-                            "proxy get trap must return undefined for an accessor without a getter",
-                        ));
+                        return Err(VmError::Message(Message::ProxyGetAccessorUndefined));
                     }
                     Ok(())
                 }?;
@@ -642,16 +635,12 @@ fn set_h<'a, 's>(
                             d.value.map_or(undefined, |h| h.as_tagged(heap)),
                         )
                     {
-                        return Err(VmError::Message(
-                            "proxy set trap must match a non-writable, non-configurable property",
-                        ));
+                        return Err(VmError::Message(Message::ProxySetMismatch));
                     }
                     if d.is_accessor_descriptor()
                         && d.set.is_some_and(|s| s.as_tagged(heap).ptr_eq(undefined))
                     {
-                        return Err(VmError::Message(
-                            "proxy set trap may not report success for an accessor without a setter",
-                        ));
+                        return Err(VmError::Message(Message::ProxySetAccessorNoSetter));
                     }
                     Ok(())
                 }?;
@@ -703,18 +692,14 @@ fn has_h<'a>(
             };
             if let Some(d) = desc {
                 if d.configurable == Some(false) {
-                    return Err(VmError::Message(
-                        "proxy has trap may not hide a non-configurable property",
-                    ));
+                    return Err(VmError::Message(Message::ProxyHasHiddenConfigurable));
                 }
                 let ext = is_extensible_h(vm, heap, state, scope, &target)?;
                 let Flow::Value(extensible) = ext else {
                     return Ok(Coercion::Threw);
                 };
                 if !extensible {
-                    return Err(VmError::Message(
-                        "proxy has trap may not hide a property of a non-extensible target",
-                    ));
+                    return Err(VmError::Message(Message::ProxyHasHiddenNonExtensible));
                 }
             }
             Ok(Coercion::Value(Convert::boolean(heap, false)))
@@ -763,18 +748,14 @@ fn delete_h<'a>(
             };
             if let Some(d) = desc {
                 if d.configurable == Some(false) {
-                    return Err(VmError::Message(
-                        "proxy deleteProperty trap may not delete a non-configurable property",
-                    ));
+                    return Err(VmError::Message(Message::ProxyDeleteConfigurable));
                 }
                 let ext = is_extensible_h(vm, heap, state, scope, &target)?;
                 let Flow::Value(extensible) = ext else {
                     return Ok(Coercion::Threw);
                 };
                 if !extensible {
-                    return Err(VmError::Message(
-                        "proxy deleteProperty trap may not delete a property of a non-extensible target",
-                    ));
+                    return Err(VmError::Message(Message::ProxyDeleteNonExtensible));
                 }
             }
             Ok(Coercion::Value(Convert::boolean(heap, true)))
@@ -827,14 +808,10 @@ fn proxy_define_h(
             match desc.as_ref() {
                 None => {
                     if !extensible {
-                        return Err(VmError::Message(
-                            "proxy defineProperty trap may not add a property to a non-extensible target",
-                        ));
+                        return Err(VmError::Message(Message::ProxyDefineNonExtensible));
                     }
                     if setting_config_false {
-                        return Err(VmError::Message(
-                            "proxy defineProperty trap may not claim a non-configurable new property",
-                        ));
+                        return Err(VmError::Message(Message::ProxyDefineNewConfigurable));
                     }
                 }
                 Some(d) => {
@@ -843,14 +820,10 @@ fn proxy_define_h(
                         Transition::is_compatible_property_descriptor(heap, extensible, &p, Some(d))
                     };
                     if !compatible {
-                        return Err(VmError::Message(
-                            "proxy defineProperty trap returned an incompatible descriptor",
-                        ));
+                        return Err(VmError::Message(Message::ProxyDefineIncompatible));
                     }
                     if setting_config_false && d.configurable != Some(false) {
-                        return Err(VmError::Message(
-                            "proxy defineProperty trap may not make a configurable property non-configurable",
-                        ));
+                        return Err(VmError::Message(Message::ProxyDefineUnconfigure));
                     }
                     if d.configurable == Some(false)
                         && d.is_data_descriptor()
@@ -858,9 +831,7 @@ fn proxy_define_h(
                         && partial.is_data_descriptor()
                         && partial.writable == Some(false)
                     {
-                        return Err(VmError::Message(
-                            "proxy defineProperty trap may not make a non-configurable property non-writable",
-                        ));
+                        return Err(VmError::Message(Message::ProxyDefineUnwritable));
                     }
                 }
             }
@@ -1014,9 +985,7 @@ fn construct_h<'a>(
             {
                 let cond_19 = Convert::is_primitive(heap, result.as_tagged(heap));
                 if cond_19 {
-                    return Err(VmError::Message(
-                        "proxy construct trap must return an object",
-                    ));
+                    return Err(VmError::Message(Message::ProxyConstructNotObject));
                 }
             }
             Ok(Coercion::Value(result.as_tagged(heap)))
@@ -1103,9 +1072,7 @@ fn prevent_extensions_h<'a>(
                 return Ok(Coercion::Threw);
             };
             if extensible {
-                return Err(VmError::Message(
-                    "proxy preventExtensions trap returned true for an extensible target",
-                ));
+                return Err(VmError::Message(Message::ProxyPreventExtensionsTrue));
             }
             Ok(Coercion::Value(Convert::boolean(heap, true)))
         }
@@ -1149,9 +1116,7 @@ fn is_extensible_entry_h<'a>(
                 return Ok(Coercion::Threw);
             };
             if trap_bool != target_bool {
-                return Err(VmError::Message(
-                    "proxy isExtensible trap must match the target's extensibility",
-                ));
+                return Err(VmError::Message(Message::ProxyExtensibilityMismatch));
             }
             Ok(Coercion::Value(Convert::boolean(heap, trap_bool)))
         }

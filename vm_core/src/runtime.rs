@@ -1,6 +1,7 @@
 use core::any::Any;
 use core::ptr::NonNull;
 
+use crate::errors::Errors;
 use crate::intrinsics::runtime_fn;
 use crate::{
     ContextState, EdgeVisitable, Handle, HandleScope, HandleSlice, Heap, Object, Tagged, VM, Value,
@@ -23,6 +24,54 @@ pub type ExecuteFn = for<'a, 'v, 's, 'c, 'r, 'n> fn(
 
 pub trait Interpreter {
     const EXECUTE: ExecuteFn;
+}
+
+/// A callable implemented natively by the interpreter itself: resolved
+/// by id (never through the runtime registry) and — in the tail-call
+/// interpreter — entered as a bytecode handler, so it can push a frame
+/// and tail-dispatch into the callee instead of re-entering execution.
+///
+/// Intrinsic function objects are RUNTIME-kind objects whose slot-0 Smi
+/// carries the intrinsic id in the negative encoding of
+/// [`Intrinsic::encode_slot`].
+#[repr(i64)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum Intrinsic {
+    /// `Function.prototype.call(thisArg, ...args)`
+    FunctionCall,
+    /// `Function.prototype.apply(thisArg, argsArray)`
+    FunctionApply,
+}
+
+impl Intrinsic {
+    pub const COUNT: usize = 2;
+
+    pub fn from_id(id: usize) -> Option<Self> {
+        Some(match id {
+            0 => Self::FunctionCall,
+            1 => Self::FunctionApply,
+            _ => return None,
+        })
+    }
+
+    pub fn id(self) -> usize {
+        self as usize
+    }
+
+    /// The Smi stored in an intrinsic function object's slot 0: negative
+    /// discriminates intrinsics from registry runtime indices (which are
+    /// always non-negative).
+    pub fn encode_slot(self) -> i64 {
+        -(self.id() as i64) - 1
+    }
+
+    pub fn decode_slot(raw: i64) -> Option<Self> {
+        let id = -raw - 1;
+        if id < 0 {
+            return None;
+        }
+        Self::from_id(id as usize)
+    }
 }
 
 /// A language runtime contributing native functions and globals to a VM
@@ -147,8 +196,76 @@ impl<'a> RuntimeContext<'a> {
     }
 }
 
+/// The runtime-call ABI (tier 1): a single tagged word in the first
+/// return register. Errors are the exception sentinel with the pending
+/// exception set — one error channel at the boundary. `Result` survives only above `execute`.
 pub type RuntimeCall =
-    for<'a, 'r> fn(RuntimeContext<'a>, HandleSlice<'r>) -> Result<Tagged<'a, Value>, VmError>;
+    for<'a, 'r> fn(RuntimeContext<'a>, HandleSlice<'r>) -> Tagged<'a, Value>;
+
+/// Materialize `err` as the pending exception and return the sentinel:
+/// the single-channel bridge for runtime bodies.
+pub fn raise_runtime<'a>(
+    vm: &VM,
+    heap: &'a mut Heap,
+    state: &ContextState,
+    err: VmError,
+) -> Tagged<'a, Value> {
+    let ex = Errors::from_vm_error(vm, heap, state, err)
+        .expect("error materialization must not fail");
+    state.set_pending_exception(ex);
+    state.set_last_error(err);
+    heap.known().exception.as_tagged(heap).erase()
+}
+
+/// `?` for runtime bodies: fold an internal `Result` into the sentinel
+/// channel via [`raise_runtime`].
+#[macro_export]
+macro_rules! rt_try {
+    ($vm:expr, $heap:expr, $state:expr, $e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(err) => return $crate::raise_runtime($vm, $heap, $state, err),
+        }
+    };
+}
+
+/// Spread the `apply` argument window: `[thisArg, elements...]` read
+/// array-like from `array` (holes and out-of-range indices read as
+/// undefined; a missing/nullish array yields just the receiver).
+pub fn spread_apply_args<'a>(
+    heap: &'a Heap,
+    this_arg: Tagged<'a, Value>,
+    array: Option<Tagged<'a, Value>>,
+) -> Vec<Tagged<'a, Value>> {
+    use crate::Smi;
+    let mut out = vec![this_arg];
+    let Some(array) = array else {
+        return out;
+    };
+    let undefined = heap.known().undefined.as_tagged(heap).erase();
+    if array == undefined || array == heap.known().null.as_tagged(heap) {
+        return out;
+    }
+    let len = array
+        .as_heap_object()
+        .map(|o| {
+            o.as_ref()
+                .array_length(heap, heap.known().strings.length.as_tagged(heap))
+                .and_then(|v| Smi::decode(v.raw()).map(|s| s.value() as usize))
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    out.reserve(len);
+    for i in 0..len {
+        out.push(
+            array
+                .as_heap_object()
+                .and_then(|o| o.as_ref().element_value(heap, i))
+                .unwrap_or(undefined),
+        );
+    }
+    out
+}
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RuntimeIndex(pub usize);

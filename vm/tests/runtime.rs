@@ -1,6 +1,8 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 
 use vm::RuntimeContext;
+use vm::raise_runtime;
+use vm::rt_try;
 use vm::{Float, HandleSlice, Smi, Tagged, Value};
 use vm::{Thread, VM, VmError};
 
@@ -15,18 +17,19 @@ fn smi(v: i64) -> Value {
 fn smi_add<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let RuntimeContext { heap, .. } = nctx;
+) -> Tagged<'a, Value> {
+    let RuntimeContext { vm, heap, state, .. } = nctx;
     let (a, b) = match (
         args.get(1).map(|h| h.as_tagged(heap)),
         args.get(2).map(|h| h.as_tagged(heap)),
     ) {
         (Some(a), Some(b)) => (a.raw(), b.raw()),
-        _ => return Err(VmError::Arity),
+        _ => return raise_runtime(vm, heap, state, VmError::Arity),
     };
-    let a = Smi::decode(a).ok_or(VmError::Type)?;
-    let b = Smi::decode(b).ok_or(VmError::Type)?;
-    Ok(Tagged::from(Smi::new(a.value() + b.value())))
+    let (Some(a), Some(b)) = (Smi::decode(a), Smi::decode(b)) else {
+        return raise_runtime(vm, heap, state, VmError::Type);
+    };
+    Tagged::from(Smi::new(a.value() + b.value()))
 }
 
 #[test]
@@ -56,21 +59,21 @@ fn runtime_result_is_boxed_when_not_smi() {
     fn fadd<'a>(
         nctx: RuntimeContext<'a>,
         args: HandleSlice<'_>,
-    ) -> Result<Tagged<'a, Value>, VmError> {
-        let RuntimeContext { heap, .. } = nctx;
+    ) -> Tagged<'a, Value> {
+        let RuntimeContext { vm, heap, state, .. } = nctx;
         let sum = {
             let (a, b) = match (
                 args.get(1).map(|h| h.as_tagged(heap)),
                 args.get(2).map(|h| h.as_tagged(heap)),
             ) {
                 (Some(a), Some(b)) => (a, b),
-                _ => return Err(VmError::Arity),
+                _ => return raise_runtime(vm, heap, state, VmError::Arity),
             };
-            let fa = a.get_as::<Float>().ok_or(VmError::Type)?.value.get();
-            let fb = b.get_as::<Float>().ok_or(VmError::Type)?.value.get();
+            let fa = rt_try!(vm, heap, state, a.get_as::<Float>().ok_or(VmError::Type)).value.get();
+            let fb = rt_try!(vm, heap, state, b.get_as::<Float>().ok_or(VmError::Type)).value.get();
             fa + fb
         };
-        Ok(heap.new_number(sum))
+        heap.new_number(sum)
     }
 
     let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
@@ -149,14 +152,15 @@ fn register_runtime_appends_after_well_known() {
     fn double<'a>(
         nctx: RuntimeContext<'a>,
         args: HandleSlice<'_>,
-    ) -> Result<Tagged<'a, Value>, VmError> {
-        let RuntimeContext { heap, .. } = nctx;
-        let v = args
-            .get(1)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?;
-        let v = Smi::decode(v.raw()).ok_or(VmError::Type)?;
-        Ok(Tagged::from(Smi::new(v.value() * 2)))
+    ) -> Tagged<'a, Value> {
+        let RuntimeContext { vm, heap, state, .. } = nctx;
+        let Some(v) = args.get(1) else {
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
+        let Some(v) = Smi::decode(v.raw()) else {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        };
+        Tagged::from(Smi::new(v.value() * 2))
     }
 
     let mut vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();

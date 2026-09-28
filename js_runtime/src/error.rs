@@ -5,25 +5,26 @@ use vm_core::runtime::Coercion;
 use vm_core::{
     Convert, DenseString, HandleSlice, Object, PropertyDescriptor, Tagged, Value, VmError,
 };
+use vm_core::{raise_runtime, rt_try};
 
 pub fn error_constructor<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     make_error(nctx, args, "Error")
 }
 
 pub fn type_error_constructor<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     make_error(nctx, args, "TypeError")
 }
 
 pub fn reference_error_constructor<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     make_error(nctx, args, "ReferenceError")
 }
 
@@ -31,7 +32,7 @@ pub fn make_error<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
     class: &str,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -43,7 +44,10 @@ pub fn make_error<'a>(
             // Safety: fresh argument word, consumed before any allocation.
             Some(v) => {
                 let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
-                scope.handle(Convert::to_string(heap, &scope, v)?)
+                scope.handle(match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
+        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+        Err(err) => return raise_runtime(vm, heap, state, err),
+    })
             }
             None => scope.handle(
                 vm.interner()
@@ -70,52 +74,58 @@ pub fn make_error<'a>(
             obj,
             name,
             PropertyDescriptor::data(class_value.erase()),
-        )?;
+        );
         Object::define_own_property(
             heap,
             &scope,
             obj,
             message_key,
             PropertyDescriptor::data(message.erase()),
-        )?;
-        Ok(obj.as_tagged(heap).erase())
+        );
+        obj.as_tagged(heap).erase()
     })
 }
 
 pub fn error_to_string<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let receiver = args.get(0).ok_or(VmError::Arity)?;
+        let receiver = rt_try!(vm, heap, state, args.get(0).ok_or(VmError::Arity));
 
         let name_key = vm.interner().intern_str(heap, &scope, "name");
         let name =
-            match Lookup::get_property_on(vm, heap, state, receiver, receiver, name_key.erase())? {
+            match rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, receiver, receiver, name_key.erase())) {
                 Coercion::Value(v) => scope.handle(v),
                 Coercion::Threw => scope.handle(heap.known().exception.as_tagged(heap).erase()),
             };
         let message_key = vm.interner().intern_str(heap, &scope, "message");
-        let message = match Lookup::get_property_on(
+        let message = match rt_try!(vm, heap, state, Lookup::get_property_on(
             vm,
             heap,
             state,
             receiver,
             receiver,
             message_key.erase(),
-        )? {
+        )) {
             Coercion::Value(v) => scope.handle(v),
             Coercion::Threw => scope.handle(heap.known().exception.as_tagged(heap).erase()),
         };
 
-        let a = scope.handle(Convert::to_string(heap, &scope, name)?);
-        let b = scope.handle(Convert::to_string(heap, &scope, message)?);
+        let a = scope.handle(match Convert::to_string(heap, &scope, name).map(|v| v.raw()) {
+        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+        Err(err) => return raise_runtime(vm, heap, state, err),
+    });
+        let b = scope.handle(match Convert::to_string(heap, &scope, message).map(|v| v.raw()) {
+        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+        Err(err) => return raise_runtime(vm, heap, state, err),
+    });
         let colon = vm.interner().intern_str(heap, &scope, ": ");
         let ab = DenseString::concat(heap, &scope, a, colon.erase());
         let out = DenseString::concat(heap, &scope, ab.erase(), b);
-        Ok(out.as_tagged(heap).erase())
+        out.as_tagged(heap).erase()
     })
 }

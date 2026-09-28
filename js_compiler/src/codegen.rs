@@ -2629,16 +2629,18 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let argc = n.arguments.len() as u32;
         let mark = self.b.temp_depth();
         self.expr(&n.callee)?;
-        // window [args...] with argument 0 at the top slot, callee above
-        let args_base = self.b.reserve_temps(argc + 1);
+        // window [args...] with argument 0 at the top slot, callee above,
+        // and the receiver-parking register above the callee
+        let args_base = self.b.reserve_temps(argc + 2);
         let top = args_base.index() + argc as i32 - 1;
         let callee = Reg::new(top + 1);
+        let out = Reg::new(top + 2);
         self.b.store(callee);
         for (i, arg) in n.arguments.iter().enumerate() {
             self.call_argument(arg)?;
             self.b.store(Reg::new(top - i as i32));
         }
-        self.b.construct(callee, RegList::new(args_base, argc));
+        self.b.construct(callee, RegList::new(args_base, argc), out);
         self.b.drop_temps(mark);
         Ok(())
     }

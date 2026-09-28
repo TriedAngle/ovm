@@ -27,10 +27,7 @@ use date::{date_constructor, date_now, date_to_string, date_value_of};
 use error::{
     error_constructor, error_to_string, reference_error_constructor, type_error_constructor,
 };
-use function::{
-    BIND_PRELUDE, function_apply, function_bind, function_call, function_constructor,
-    function_to_string,
-};
+use function::{BIND_PRELUDE, function_bind, function_constructor, function_to_string};
 use global::{eval_runtime, is_nan, performance_now, print};
 use math::{math_log, math_pow, math_sqrt};
 use number::{
@@ -47,12 +44,13 @@ use string::{string_constructor, string_to_string, string_value_of};
 use symbol::symbol_constructor;
 
 use vm_core::runtime_api::{
-    install_constructor, install_method, make_runtime_function, make_runtime_plain_function,
-    run_prelude,
+    install_constructor, install_intrinsic_method, install_method, make_runtime_function,
+    make_runtime_plain_function, run_prelude,
 };
 use vm_core::{
-    EdgeVisitable, Float, Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor,
-    Runtime, RuntimeIndex, SlotFlags, SlotName, Smi, Tagged, VM, Value, Visitor, VmError,
+    EdgeVisitable, Float, Handle, HandleSlice, Intrinsic, Map, MapInit, MapKind, Object,
+    PropertyDescriptor, Runtime, RuntimeIndex, SlotFlags, SlotName, Smi, Tagged, VM, Value, Visitor,
+    VmError,
 };
 
 pub struct JSRuntime;
@@ -128,8 +126,6 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
         object_get_own_property_names: vm.register_runtime(object_get_own_property_names),
         object_get_own_property_descriptor: vm.register_runtime(object_get_own_property_descriptor),
         object_define_property: vm.register_runtime(object_define_property),
-        function_call: vm.register_runtime(function_call),
-        function_apply: vm.register_runtime(function_apply),
         function_bind: vm.register_runtime(function_bind),
         function_constructor: vm.register_runtime(function_constructor),
         array_is_array: vm.register_runtime(array_is_array),
@@ -189,8 +185,6 @@ pub struct BuiltinIndices {
     pub object_get_own_property_names: RuntimeIndex,
     pub object_get_own_property_descriptor: RuntimeIndex,
     pub object_define_property: RuntimeIndex,
-    pub function_call: RuntimeIndex,
-    pub function_apply: RuntimeIndex,
     pub function_bind: RuntimeIndex,
     pub function_constructor: RuntimeIndex,
     pub array_is_array: RuntimeIndex,
@@ -460,19 +454,21 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             "toString",
             idx.function_to_string,
         )?;
-        install_method(
+        // call/apply are interpreter intrinsics: handler-shaped builtins
+        // that push the callee frame and tail-dispatch into it
+        install_intrinsic_method(
             thread,
             &scope,
             function_prototype,
             "call",
-            idx.function_call,
+            Intrinsic::FunctionCall,
         )?;
-        install_method(
+        install_intrinsic_method(
             thread,
             &scope,
             function_prototype,
             "apply",
-            idx.function_apply,
+            Intrinsic::FunctionApply,
         )?;
         install_method(
             thread,

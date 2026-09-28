@@ -4,10 +4,10 @@ use vm_core::proxy::Proxy;
 use vm_core::ic::{Hit, InlineCache, StoreHit, StoreOutcomeKind};
 use vm_core::{
     Acc, CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState,
-    Convert, DenseString, Errors, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint, Key,
-    LoadOutcome, Lookup, Object, PropertyDescriptor, RuntimeContext, RuntimeIndex, ScopeInfo,
-    SlotName, Smi, Stack, StackCache, StoreOutcome, StoreSemantics, Tagged, Termination, VM, Value,
-    VmError,
+    Convert, DenseString, Errors, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Hint,
+    Intrinsic, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, RuntimeContext,
+    RuntimeIndex, ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome, StoreSemantics,
+    Tagged, Termination, VM, Value, VmError, spread_apply_args,
 };
 
 enum Called<'a> {
@@ -101,13 +101,42 @@ fn start<'b>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
+        Some(CallTarget::Intrinsic(intrinsic)) => {
+            // Rust-world entry of an intrinsic: unwrap it and re-enter
+            state.handle_scope(|scope| match intrinsic {
+                Intrinsic::FunctionCall => {
+                    let f =
+                        args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    if !Object::is_callable(heap, f) {
+                        return Err(VmError::Type);
+                    }
+                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
+                    execute(vm, heap, state, f, args.slice_from(1), None)
+                }
+                Intrinsic::FunctionApply => {
+                    let f =
+                        args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    if !Object::is_callable(heap, f) {
+                        return Err(VmError::Type);
+                    }
+                    let this_arg = args
+                        .get(1)
+                        .map(|h| h.as_tagged(heap))
+                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+                    let array = args.get(2).map(|h| h.as_tagged(heap));
+                    let staged = scope.stage(&spread_apply_args(heap, this_arg, array));
+                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
+                    execute(vm, heap, state, f, staged, None)
+                }
+            })
+        }
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
-            let result = f(nctx, fargs);
+            let v = f(nctx, fargs);
             state.stack().set_top(saved_top);
-            result
+            Ok(v)
         }
         Some(CallTarget::Bytecode {
             target,
@@ -1073,6 +1102,62 @@ impl Slow {
         })
     }
 }
+
+/// Resolve an interpreter intrinsic against its invocation arguments
+/// (`args[0]` is the receiver the builtin was invoked with) by
+/// unwrapping it and re-entering `start`. The portable interpreter's
+/// slow stand-in for the tail-call interpreter's handler entry.
+#[cold]
+#[inline(never)]
+fn intrinsic_step<'a>(
+    vm: &VM,
+    heap: &'a mut Heap,
+    state: &ContextState,
+    acc: &Acc<'_>,
+    intrinsic: Intrinsic,
+    args: HandleSlice<'_>,
+) -> Step<'a> {
+    let exception = heap.known().exception.as_tagged(heap).raw();
+    let result = state.handle_scope(|scope| -> Result<Tagged<'_, Value>, VmError> {
+        match intrinsic {
+            Intrinsic::FunctionCall => {
+                let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                if !Object::is_callable(heap, f) {
+                    return Err(VmError::Type);
+                }
+                let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
+                // the register-file window is a fixed-capacity arena: the
+                // slice stays valid (and GC-visited) across the push below.
+                // `execute` (not `start`) so the outer frame cache is
+                // restored before the caller's exception dispatch runs.
+                execute(vm, heap, state, f, args.slice_from(1), None)
+            }
+            Intrinsic::FunctionApply => {
+                let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                if !Object::is_callable(heap, f) {
+                    return Err(VmError::Type);
+                }
+                let this_arg = args
+                    .get(1)
+                    .map(|h| h.as_tagged(heap))
+                    .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+                let array = args.get(2).map(|h| h.as_tagged(heap));
+                let staged = scope.stage(&spread_apply_args(heap, this_arg, array));
+                let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
+                execute(vm, heap, state, f, staged, None)
+            }
+        }
+    });
+    match result {
+        Ok(v) if v.raw() == exception => Step::PendingThrow,
+        Ok(v) => {
+            acc.store(v);
+            Step::Next
+        }
+        Err(err) => Step::Error(err),
+    }
+}
+
 /// `Construct` cold body: [[Construct]] with receiver synthesis,
 /// derived-class handling and proxy traps.
 #[cold]
@@ -2163,19 +2248,25 @@ fn step<'a>(
                 None => Step::Error(VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => Step::Error(VmError::Type),
+                Some(CallTarget::Intrinsic(intrinsic)) => intrinsic_step(
+                    vm,
+                    heap,
+                    state,
+                    &acc,
+                    intrinsic,
+                    stack.args(&meta, args_base, count),
+                ),
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let nctx = RuntimeContext::new(vm, heap, state);
-                    let result = f(nctx, stack.args(&meta, args_base, count));
-                    match result {
-                        // Safety: old-gen singleton word.
-                        Ok(v) if v.raw() == exception => Step::PendingThrow,
-                        Ok(v) => {
-                            acc.store(v);
-                            Step::Next
-                        }
-                        Err(err) => Step::Error(err),
+                    let v = f(nctx, stack.args(&meta, args_base, count));
+                    // Safety: old-gen singleton word.
+                    if v.raw() == exception {
+                        Step::PendingThrow
+                    } else {
+                        acc.store(v);
+                        Step::Next
                     }
                 }
                 Some(CallTarget::Bytecode {
@@ -2245,20 +2336,25 @@ fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, &meta, callee_reg)) {
                 None => Step::Error(VmError::Type),
                 Some(CallTarget::Proxy(_)) => Step::Error(VmError::Type),
+                Some(CallTarget::Intrinsic(intrinsic)) => {
+                    let (saved_top, staged) =
+                        step_try!(stack.stage_args_regs(heap, &meta, srcs));
+                    let step = intrinsic_step(vm, heap, state, &acc, intrinsic, staged);
+                    stack.set_top(saved_top);
+                    return step;
+                }
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let (saved_top, staged) = step_try!(stack.stage_args_regs(heap, &meta, srcs));
                     let nctx = RuntimeContext::new(vm, heap, state);
-                    let result = f(nctx, staged);
+                    let v = f(nctx, staged);
                     stack.set_top(saved_top);
-                    match result {
-                        Ok(v) if v.raw() == exception => Step::PendingThrow,
-                        Ok(v) => {
-                            acc.store(v);
-                            Step::Next
-                        }
-                        Err(err) => Step::Error(err),
+                    if v.raw() == exception {
+                        Step::PendingThrow
+                    } else {
+                        acc.store(v);
+                        Step::Next
                     }
                 }
                 Some(CallTarget::Bytecode {
@@ -2326,21 +2422,26 @@ fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, &meta, callee_reg)) {
                 None => Step::Error(VmError::Type),
                 Some(CallTarget::Proxy(_)) => Step::Error(VmError::Type),
+                Some(CallTarget::Intrinsic(intrinsic)) => {
+                    let (saved_top, staged) =
+                        step_try!(stack.stage_function_args(heap, &meta, args));
+                    let step = intrinsic_step(vm, heap, state, &acc, intrinsic, staged);
+                    stack.set_top(saved_top);
+                    return step;
+                }
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let (saved_top, staged) =
                         step_try!(stack.stage_function_args(heap, &meta, args));
                     let nctx = RuntimeContext::new(vm, heap, state);
-                    let result = f(nctx, staged);
+                    let v = f(nctx, staged);
                     stack.set_top(saved_top);
-                    match result {
-                        Ok(v) if v.raw() == exception => Step::PendingThrow,
-                        Ok(v) => {
-                            acc.store(v);
-                            Step::Next
-                        }
-                        Err(err) => Step::Error(err),
+                    if v.raw() == exception {
+                        Step::PendingThrow
+                    } else {
+                        acc.store(v);
+                        Step::Next
                     }
                 }
                 Some(CallTarget::Bytecode {
@@ -2386,15 +2487,13 @@ fn step<'a>(
             let count = ops.reg_count(2);
             let exception = heap.known().exception.as_tagged(heap).raw();
             let nctx = RuntimeContext::new(vm, heap, state);
-            let result = f(nctx, stack.args(&meta, args_base, count));
-            match result {
-                // Safety: old-gen singleton word.
-                Ok(v) if v.raw() == exception => Step::PendingThrow,
-                Ok(v) => {
-                    acc.store(v);
-                    Step::Next
-                }
-                Err(err) => Step::Error(err),
+            let v = f(nctx, stack.args(&meta, args_base, count));
+            // Safety: old-gen singleton word.
+            if v.raw() == exception {
+                Step::PendingThrow
+            } else {
+                acc.store(v);
+                Step::Next
             }
         }
         Opcode::Construct => construct(
@@ -2408,6 +2507,10 @@ fn step<'a>(
             ops.reg_list(1),
             ops.reg_count(2),
         ),
+        // the fast interpreter parks the synthesized receiver in this
+        // register and re-checks here; the match loop's `construct`
+        // applies the ES 9.2.2 fixup itself, so this is a pass-through
+        Opcode::ConstructCheck => Step::Next,
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
                 let map = heap.known().object_initial_map;

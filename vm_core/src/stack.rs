@@ -114,6 +114,7 @@ impl Stack {
         meta.base - HEADER_SLOTS - meta.register_count
     }
 
+    #[inline]
     pub fn value_slice(&self, base: usize, count: usize) -> HandleSlice<'_> {
         let slots = &self.slots[base..base + count];
         // Safety: stack slots are GC-visited, so the words stay current for

@@ -6,65 +6,25 @@ use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::materialize::Materialize;
 use vm_core::runtime::Coercion;
-use vm_core::{Context, Convert, DenseString, Errors, HandleSlice, Smi, Tagged, Value, VmError};
+use vm_core::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
+use vm_core::{raise_runtime, rt_try};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
 pub fn function_to_string<'a>(
     nctx: RuntimeContext<'a>,
     _args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         // fresh interned word, consumed with no allocation delay
-        Ok(vm
+        vm
             .interner()
             .intern_str(heap, &scope, "function () { [native code] }")
             .as_tagged(heap)
-            .erase())
-    })
-}
-
-/// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.4).
-pub fn function_call<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let RuntimeContext {
-        vm, heap, state, ..
-    } = nctx;
-    let f = args
-        .get(0)
-        .map(|h| h.as_tagged(heap))
-        .ok_or(VmError::Arity)?;
-    if !Object::is_callable(heap, f) {
-        return Err(VmError::Type);
-    }
-    let f = f.raw();
-    let call_args: Vec<Value> = args
-        .iter()
-        .map(|h| h.as_tagged(heap))
-        .skip(1)
-        .map(|v| v.raw())
-        .collect();
-    state.handle_scope(|scope| {
-        // Safety: fresh argument word, still fresh (no allocation since).
-        let f = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(f) });
-        RuntimeContext::call(
-            vm,
-            heap,
-            state,
-            f,
-            scope.stage(
-                &call_args
-                    .iter()
-                    .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
-                    .collect::<Vec<_>>(),
-            ),
-            None,
-        )
+            .erase()
     })
 }
 
@@ -74,17 +34,17 @@ pub fn function_call<'a>(
 pub fn function_bind<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     let raw_f = {
-        let f = args
-            .get(0)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?;
+        let Some(f) = args.get(0) else {
+        return raise_runtime(vm, heap, state, VmError::Arity);
+    };
+    let f = f.as_tagged(heap);
         if !Object::is_callable(heap, f) {
-            return Err(VmError::Type);
+            return raise_runtime(vm, heap, state, VmError::Type);
         }
         f.raw()
     };
@@ -115,9 +75,9 @@ pub fn function_bind<'a>(
                 .intern_str(heap, &scope, "__makeBound")
                 .erase();
             let proto = heap.known().function_prototype.erase();
-            match Lookup::get_property_on(vm, heap, state, proto, proto, name)? {
+            match rt_try!(vm, heap, state, Lookup::get_property_on(vm, heap, state, proto, proto, name)) {
                 Coercion::Threw => {
-                    return Ok(heap.known().exception.as_tagged(heap).erase());
+                    return heap.known().exception.as_tagged(heap).erase();
                 }
                 // Safety: fresh word from the lookup, rooted immediately.
                 Coercion::Value(v) => scope.handle(v),
@@ -138,78 +98,10 @@ pub fn function_bind<'a>(
             this_arg.as_tagged(heap).erase(),
             array.as_tagged(heap).erase(),
         ]);
-        RuntimeContext::call(vm, heap, state, make_bound, staged, None)
-    })
-}
-
-/// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.3).
-pub fn function_apply<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let RuntimeContext {
-        vm, heap, state, ..
-    } = nctx;
-    let f = args.get(0).ok_or(VmError::Arity)?;
-    if !Object::is_callable(heap, f.as_tagged(heap)) {
-        return Err(VmError::Type);
-    }
-    let undefined = heap.known().undefined;
-    let this_arg: Value = args
-        .get(1)
-        .map(|h| h.as_tagged(heap).raw())
-        .unwrap_or_else(|| undefined.as_tagged(heap).raw());
-    let array = args.get(2);
-    let nullish = match array {
-        Some(a) => {
-            let a = a.as_tagged(heap);
-            a == undefined.as_tagged(heap) || a == heap.known().null.as_tagged(heap)
+        match RuntimeContext::call(vm, heap, state, make_bound, staged, None).map(|v| v.raw()) {
+            Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+            Err(err) => return raise_runtime(vm, heap, state, err),
         }
-        None => true,
-    };
-    let call_args: Vec<Value> = if nullish {
-        vec![this_arg]
-    } else {
-        let array = array.expect("non-nullish array");
-        // array-like: read elements 0..length (holes read as undefined)
-        let len = array
-            .as_tagged(heap)
-            .as_heap_object()
-            .map(|o| {
-                o.as_ref()
-                    .array_length(heap, heap.known().strings.length.as_tagged(heap))
-                    .and_then(|v| Smi::decode(v.raw()).map(|s| s.value() as usize))
-                    .unwrap_or(0)
-            })
-            .unwrap_or(0);
-        let mut out = Vec::with_capacity(len + 1);
-        out.push(this_arg);
-        for i in 0..len {
-            out.push(
-                array
-                    .as_tagged(heap)
-                    .as_heap_object()
-                    .and_then(|o| o.as_ref().element_value(heap, i))
-                    .map(|v| v.raw())
-                    .unwrap_or_else(|| undefined.as_tagged(heap).raw()),
-            );
-        }
-        out
-    };
-    state.handle_scope(|scope| {
-        RuntimeContext::call(
-            vm,
-            heap,
-            state,
-            f,
-            scope.stage(
-                &call_args
-                    .iter()
-                    .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
-                    .collect::<Vec<_>>(),
-            ),
-            None,
-        )
     })
 }
 
@@ -235,7 +127,7 @@ Function.prototype.__makeBound = function (f, t, p) {
 pub fn function_constructor<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -250,7 +142,10 @@ pub fn function_constructor<'a>(
         // ToString all arguments (user toString may run)
         let mut parts: Vec<String> = Vec::with_capacity(argv.len());
         for a in argv {
-            let s = scope.handle(Convert::to_string(heap, &scope, a)?);
+            let s = scope.handle(match Convert::to_string(heap, &scope, a).map(|v| v.raw()) {
+        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+        Err(err) => return raise_runtime(vm, heap, state, err),
+    });
             parts.push(
                 s.as_tagged(heap)
                     .get_as::<DenseString>()
@@ -266,15 +161,18 @@ pub fn function_constructor<'a>(
         let program = match js_compiler::compile_js(&source, bytecode::SourceMode::Eval) {
             Ok(program) => program,
             Err(_) => {
-                let ex = Errors::from_vm_error(vm, heap, state, VmError::Type)?;
+                let ex = rt_try!(vm, heap, state, Errors::from_vm_error(vm, heap, state, VmError::Type));
                 state.set_pending_exception(ex);
-                return Ok(heap.known().exception.as_tagged(heap).erase());
+                return heap.known().exception.as_tagged(heap).erase();
             }
         };
-        let context = scope
-            .cast::<Context>(context.as_tagged(heap))
-            .ok_or(VmError::Type)?;
-        let closure = Materialize::closure_vm(vm, heap, state, &scope, &program, context)?;
-        RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
+        let Some(context) = scope.cast::<Context>(context.as_tagged(heap)) else {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        };
+        let closure = rt_try!(vm, heap, state, Materialize::closure_vm(vm, heap, state, &scope, &program, context));
+        match RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None).map(|v| v.raw()) {
+            Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        }
     })
 }

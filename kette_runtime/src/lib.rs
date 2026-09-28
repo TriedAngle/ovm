@@ -1,3 +1,4 @@
+use vm_core::raise_runtime;
 use vm_core::runtime_api::install_method;
 use vm_core::{
     Convert, DenseString, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, Runtime,
@@ -43,23 +44,29 @@ impl Runtime for KetteRuntime {
 fn console_print<'a>(
     nctx: RuntimeContext<'a>,
     args: HandleSlice<'_>,
-) -> Result<Tagged<'a, Value>, VmError> {
+) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm: _, heap, state, ..
+        vm, heap, state, ..
     } = nctx;
-    state.handle_scope(|scope| {
+    state.handle_scope(|scope| -> Tagged<'a, Value> {
         match args.get(1) {
             Some(v) => {
-                let text = scope.handle(Convert::to_string(heap, &scope, v)?);
-                let text = text
-                    .as_tagged(heap)
+                let text = match Convert::to_string(heap, &scope, v).map(|t| t.raw()) {
+                    Ok(t) => t,
+                    Err(err) => return raise_runtime(vm, heap, state, err),
+                };
+                // Safety: fresh anchored word, no allocation since.
+                let text = unsafe { Tagged::<Value>::from_value_unchecked(text) }
                     .get_as::<DenseString>()
-                    .map(|s| s.to_rust_string(heap))
-                    .ok_or(VmError::Type)?;
+                    .map(|s| s.to_rust_string(heap));
+                let Some(text) = text else {
+                    return raise_runtime(vm, heap, state, VmError::Type);
+                };
                 println!("{text}");
             }
             None => println!(),
         }
-        Ok(heap.known().undefined.as_tagged(heap).erase())
+        heap.known().undefined.as_tagged(heap).erase()
     })
 }
+
