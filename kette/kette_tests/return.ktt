@@ -1,0 +1,13 @@
+// `return expr` returns from the enclosing block.
+
+// Run:  cargo run -q -p vm -- kette/kette_tests/return.ktt
+// Check: kette/kette_tests/check.py
+
+let firstOf = { |a, b| return a }
+let secondOf = { |a, b| b }
+
+Test.assert(secondOf(10, 20), 20)
+Test.assert(firstOf(10, 20), 10)
+
+let early = { |x| return x; 99 }
+Test.assert(early(3), 3)

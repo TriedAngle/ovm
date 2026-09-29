@@ -1,0 +1,18 @@
+// Blocks are closures. `{ |params| body }` is a lambda, `{ body }` is a
+// zero-arg block; a block's value is its last expression. Blocks capture
+// the lexicals around them.
+//
+// Run:  cargo run -q -p vm -- kette/kette_tests/blocks.ktt
+// Check: kette/kette_tests/check.py
+
+let pair = { |a, b| { first: a, second: b } }
+let oneTwo = pair(1, 2)
+
+let makeAdder = { |n| { |x| n } }
+let add5 = makeAdder(5)
+
+let greeting = { "hello from a zero-arg block" }
+
+Test.assert(oneTwo.second, 2)
+Test.assert(greeting(), "hello from a zero-arg block")
+Test.assert(add5(0), 5)

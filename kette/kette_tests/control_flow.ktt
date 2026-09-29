@@ -1,0 +1,39 @@
+// `if c { A } else { B }` compiles the branches inline (jumps), and a
+// `let` inside a branch belongs to the enclosing scope. Without `else`
+// the falsy path yields null.
+//
+// `a && b` / `a || b` are short-circuit: the right side only runs when
+// the left did not decide.
+//
+// Run:  cargo run -q -p vm -- kette/kette_tests/control_flow.ktt
+// Check: kette/kette_tests/check.py
+
+let n = 2
+
+let sign = if n < 0 { 0 - 1 } else { 1 }
+Test.assert(sign, 1)
+
+let classified = if n < 1 { 0 } else { if n < 2 { 1 } else { 2 } }
+Test.assert(classified, 2)
+
+let doubled = if true {
+    let t = 21
+    t * 2
+} else {
+    0
+}
+Test.assert(doubled, 42)
+
+// a missing else yields null on the falsy path
+let skipped = if false { 9 }
+Test.assert(skipped == null, true)
+
+let hits = 0
+let mark = { hits = hits + 1; true }
+
+// laziness: the rhs must not run
+let a = false && mark()
+let b = true || mark()
+Test.assert(hits, 0)
+Test.assert(false || 7, 7)
+Test.assert(true && 5, 5)

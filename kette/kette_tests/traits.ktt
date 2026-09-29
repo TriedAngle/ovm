@@ -1,0 +1,38 @@
+// Traits: `parent*:` / `mixin*:` slots form a multi-parent lookup chain in
+// declaration order. Methods get `self` from the send, so `Counter.count`
+// reads the receiver's `n`.
+//
+// Run:  cargo run -q -p vm -- kette/kette_tests/traits.ktt
+// Check: kette/kette_tests/check.py
+
+let Greeter = {
+    greet: { "hello" }
+    describe: { self.name }
+}
+
+let Counter = {
+    count: { self.n }
+}
+
+let Thing = {
+    parent*: Greeter
+    mixin*: Counter
+    name: "thing"
+    n: 41
+}
+
+Test.assert(Thing.greet(), "hello")
+Test.assert(Thing.describe(), "thing")
+Test.assert(Thing.count(), 41)
+
+// a parent slot write writes through to the holder
+let P = { x: 1 }
+let C = { parent*: P }
+C.x = 9
+Test.assert(P.x, 9)
+
+// and parents are consulted in declaration order
+let P1 = { a: 1 }
+let P2 = { b: 2 }
+let D = { parent*: P1; parent*: P2 }
+Test.assert(D.b, 2)

@@ -3,7 +3,7 @@ use std::path::Path;
 
 use kette_compiler::KetteCompiler;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm::{Compiler, DefaultInterpreter, JSRuntime, Thread, VM};
+use vm::{Compiler, DefaultInterpreter, JSRuntime, KetteRuntime, Thread, VM};
 use vm::{
     DenseString, Float, Heap, JavascriptCompiler, LoadOutcome, Lookup, SlotName, Smi, Tagged, Value,
 };
@@ -13,7 +13,9 @@ fn main() {
     let vm = VM::new::<MarkSweep, DefaultInterpreter>(MarkSweepConfig::default())
         .expect("failed to create heap")
         .add::<JSRuntime>()
-        .expect("failed to install js runtime");
+        .expect("failed to install js runtime")
+        .add::<KetteRuntime>()
+        .expect("failed to install kette runtime");
     vm.arm_gc_stress();
     let mut thread = vm.attach();
 

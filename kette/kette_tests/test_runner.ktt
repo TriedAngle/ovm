@@ -1,0 +1,25 @@
+// The test runner, prepended to every example by check.py. Provides
+// `Test.assert(actual, expected)`; check.py appends `Test.summary()`.
+
+let Test = {
+    count: 0
+    failures: 0
+    assert: { |actual, expected|
+        self.count = self.count + 1
+        if !(actual == expected) {
+            self.failures = self.failures + 1
+            print("FAIL")
+            print(actual)
+            print(expected)
+        }
+    }
+    summary: { ||
+        if self.failures == 0 {
+            print("passed")
+        } else {
+            print("failed")
+            print(self.failures)
+        }
+        print(self.count)
+    }
+}

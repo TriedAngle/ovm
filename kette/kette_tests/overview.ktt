@@ -1,0 +1,105 @@
+// The unified object: `{ slots | params | body }`, every part optional.
+//
+//   { x: 1, y: 2 }        slots only      — a plain object
+//   { |x| x + 1 }         params + body   — a function
+//   { stmts }             body only       — a zero-arg block
+//   { count: 0 || stmts } all three       — a callable object
+//   { }                   nothing         — an empty object
+//
+// A `{ }` literal with a `|params|` marker or a non-empty body is
+// callable; slots-only is not. Both are just objects.
+//
+// Run:  cargo run -q -p vm -- kette/kette_tests/overview.ktt
+// Check: kette/kette_tests/check.py
+
+// -- slots only ------------------------------------------------------------
+
+let point = { x: 10, y: 20 }
+point.x = 11
+Test.assert(point.x + point.y, 31)
+
+// -- params + body ----------------------------------------------------------
+
+let inc = { |x| x + 1 }
+Test.assert(inc(41), 42)
+
+// -- body only (zero-arg block) ----------------------------------------------
+
+let greet = { "hi from a block" }
+Test.assert(greet(), "hi from a block")
+
+// -- slots | params | body in one object --------------------------------------
+
+let counter = {
+    count: 0
+    ||
+        self.count = self.count + 1
+        self.count
+}
+
+counter()
+Test.assert(counter(), 2)
+
+// slots and code on a send-style method too; `self` is the receiver
+
+let vec = {
+    x: 1
+    y: 2
+    len: { |other|
+        self.x * self.x + self.y * self.y + other
+    }
+}
+
+Test.assert(vec.len(0), 5)
+
+// -- element slots: object + array in one literal -----------------------------
+
+let tuple = {
+    label: "pair"
+    [0]: 30
+    [1]: 12
+}
+
+Test.assert(tuple.label, "pair")
+Test.assert(tuple[0] + tuple[1], 42)
+Test.assert(tuple.1, 12)
+
+// -- parents ------------------------------------------------------------------
+
+let Traits = {
+    describe: { self.label }
+}
+
+let named = {
+    parent*: Traits
+    label: "a named object"
+}
+
+Test.assert(named.describe(), "a named object")
+
+// -- callable objects as initializers --------------------------------------
+
+// one object, slots + params + code in the classic three-part spelling:
+// the call binds the callee as `self`, so the body initializes the
+// object itself and returns it
+
+let origin = { x: 0, y: 0 | x, y | self.x = x; self.y = y; self }
+
+let p = origin(30, 12)
+Test.assert(p.x + p.y, 42)
+
+// a factory: each call creates a fresh object (origin above is shared —
+// every origin(...) rebinds the same instance)
+
+let make = { || { x: 0, y: 0 | x, y | self.x = x; self.y = y; self } }
+
+let q = make()(7, 8)
+let r = make()(9, 10)
+Test.assert(q.x + q.y + r.x + r.y, 34)
+
+// an empty object is not callable (`empty()` would throw); with the
+// params marker it is
+let empty = { }
+let zero = { || 0 }
+Test.assert(zero(), 0)
+Test.assert({ answer: 42 }.answer, 42)

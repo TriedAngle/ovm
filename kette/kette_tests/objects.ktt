@@ -1,0 +1,23 @@
+// Object literals: named slots and elements live on one object. `=` writes
+// existing slots; `[i] =` writes an existing element in place — it never
+// grows the store (define elements with `[i]:` in a literal).
+//
+// Run:  cargo run -q -p vm -- kette/kette_tests/objects.ktt
+// Check: kette/kette_tests/check.py
+
+let rgb = {
+    label: "red"
+    [0]: 255
+    [1]: 0
+    [2]: 0
+}
+
+rgb.label = "crimson"
+rgb[1] = 32
+
+Test.assert(rgb.label, "crimson")
+Test.assert(rgb[1], 32)
+Test.assert(rgb[0] + rgb[1], 287)
+
+// `[i] =` writes existing elements only: an out-of-bounds write throws
+// (`rgb[3] = 255` would raise; reads of missing elements yield null).
