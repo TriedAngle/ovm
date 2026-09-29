@@ -5,4 +5,4 @@ edition.workspace = true
 
 [dependencies]
 heap_api = { path = "../heap_api" }
-libc = "0.2"
+libc.workspace = true

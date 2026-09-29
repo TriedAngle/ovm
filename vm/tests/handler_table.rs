@@ -128,7 +128,7 @@ fn callable_info_carries_handler_table() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread: &mut Thread, scope| {
-        let the_hole = thread.heap().known().the_hole;
+        let _the_hole = thread.heap().known().the_hole;
         let empty_context = thread.heap().known().empty_context;
         let t = table(thread, &scope, &[HandlerEntryInit::new(2, 8, 33)]);
 

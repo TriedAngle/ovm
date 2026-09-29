@@ -3,9 +3,9 @@
 //! handler ranges, accumulator elision, and validation.
 
 use bytecode::{
-    BuildError, CallableKind, ConstIdx, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode,
-    Operand, Program, REGISTER_FILE_START, Reg, RegList, RtArg, RuntimeFn, ValidationError,
-    try_decode, validate, validate_function,
+    BuildError, CallableKind, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode, Operand,
+    Program, REGISTER_FILE_START, Reg, RegList, RtArg, RuntimeFn, ValidationError, try_decode,
+    validate, validate_function,
 };
 
 #[derive(Debug, PartialEq)]

@@ -89,7 +89,7 @@ fn closure_object_carries_typed_context() {
     let mut thread = vm.attach();
 
     thread.handle_scope(|thread, scope| {
-        let the_hole = thread.heap().known().the_hole;
+        let _the_hole = thread.heap().known().the_hole;
         let scope_info = empty_scope_info(thread);
         let slots = thread
             .heap()

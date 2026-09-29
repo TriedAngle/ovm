@@ -4,15 +4,15 @@ exclude = ["interpreter_become"]
 members = [
     "bytecode",
     "collectors/dummy_heap",
+    "collectors/heap_api",
+    "collectors/heap_tests",
+    "collectors/heap_utils",
     "collectors/mark_sweep",
-    "heap_api",
-    "heap_tests",
-    "heap_utils",
     "interpreter_match_loop",
-    "js_compiler",
+    "js/js_compiler",
     "kette/kette_compiler",
     "kette/kette_parser",
-    "js_runtime",
+    "js/js_runtime",
     "kette/kette_runtime",
     "trace",
     "vm",
@@ -21,4 +21,16 @@ members = [
 
 [workspace.package]
 edition = "2024"
+
+[workspace.dependencies]
+libc = "0.2"
+oxc_allocator = "0.151.0"
+oxc_ast = "0.151.0"
+oxc_ast_visit = "0.151.0"
+oxc_parser = "0.151.0"
+oxc_semantic = "0.151.0"
+oxc_span = "0.151.0"
+oxc_syntax = "0.151.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

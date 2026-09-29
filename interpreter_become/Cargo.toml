@@ -8,8 +8,8 @@ vm_core = { path = "../vm_core" }
 bytecode = { path = "../bytecode" }
 
 [dev-dependencies]
-js_compiler = { path = "../js_compiler" }
-js_runtime = { path = "../js_runtime" }
+js_compiler = { path = "../js/js_compiler" }
+js_runtime = { path = "../js/js_runtime" }
 mark_sweep = { path = "../collectors/mark_sweep" }
 
 interpreter_match_loop = { path = "../interpreter_match_loop" }

@@ -10,11 +10,11 @@ path = "src/main.rs"
 [dependencies]
 vm_core = { path = "../vm_core" }
 interpreter_match_loop = { path = "../interpreter_match_loop" }
-js_runtime = { path = "../js_runtime" }
+js_runtime = { path = "../js/js_runtime" }
 kette_runtime = { path = "../kette/kette_runtime" }
-heap_api = { path = "../heap_api" }
+heap_api = { path = "../collectors/heap_api" }
 bytecode = { path = "../bytecode" }
-js_compiler = { path = "../js_compiler" }
+js_compiler = { path = "../js/js_compiler" }
 kette_compiler = { path = "../kette/kette_compiler" }
 mark_sweep = { path = "../collectors/mark_sweep" }
 dummy_heap = { path = "../collectors/dummy_heap" }

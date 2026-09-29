@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-heap_api = { path = "../heap_api" }
+heap_api = { path = "../collectors/heap_api" }
 bytecode = { path = "../bytecode" }
 trace = { path = "../trace" }
 

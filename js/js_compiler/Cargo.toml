@@ -1,0 +1,16 @@
+[package]
+name = "js_compiler"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bytecode = { path = "../../bytecode" }
+vm_core = { path = "../../vm_core" }
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_ast_visit.workspace = true
+oxc_parser.workspace = true
+oxc_semantic.workspace = true
+oxc_span.workspace = true
+oxc_syntax.workspace = true
+trace = { path = "../../trace" }

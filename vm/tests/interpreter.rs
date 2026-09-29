@@ -104,7 +104,7 @@ fn callable_object<'s>(
     scope: &'s HandleScope<'_>,
     info: Handle<'_, CallableInfoObject>,
 ) -> Handle<'s, Object> {
-    let the_hole = thread.heap().known().the_hole;
+    let _the_hole = thread.heap().known().the_hole;
     let empty_context = thread.heap().known().empty_context;
     let map = thread.heap().known().function_map;
     let values = {
@@ -2020,7 +2020,7 @@ fn bytecode_fn<'a>(
     constants: &[Value],
     register_count: usize,
 ) -> Tagged<'a, Value> {
-    let the_hole = heap.known().the_hole;
+    let _the_hole = heap.known().the_hole;
     let empty_context = heap.known().empty_context;
     let bytecode = heap.allocate_handle::<FixedByteArray>(program, scope);
     let constants = heap.allocate_handle::<FixedArray>(stage_values(scope, constants), scope);
@@ -2956,7 +2956,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
     let mut thread = vm.attach();
 
     let result = thread.handle_scope(|thread, scope| {
-        let the_hole = thread.heap().known().the_hole;
+        let _the_hole = thread.heap().known().the_hole;
 
         // callee info template: return context slot 0
         let mut callee_program = Vec::new();

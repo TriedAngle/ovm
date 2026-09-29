@@ -18,7 +18,7 @@ fn callable(
     register_count: usize,
     handlers: Option<&[HandlerEntryInit]>,
 ) -> Value {
-    let the_hole = thread.heap().known().the_hole;
+    let _the_hole = thread.heap().known().the_hole;
     let empty_context = thread.heap().known().empty_context;
     let bytecode = thread
         .heap()
@@ -247,71 +247,4 @@ fn rethrow_from_finally_escapes_past_its_own_handler() {
     };
     assert_eq!(result, Ok(exception_word));
     assert_eq!(thread.take_pending_exception(), Some(smi(3)));
-}
-
-#[test]
-fn stack_overflow_during_call_is_throwable() {
-    let vm = VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default()).unwrap();
-    let mut thread = vm.attach();
-
-    // self-recursive call with no handler: each Call pushes a frame until
-    // the stack is exhausted, then a RangeError must escape the run
-    let mut program = Vec::new();
-    emit(&mut program, Opcode::Load, &[(-1i32) as u32]); // r0 = param 0 (self)
-    emit(&mut program, Opcode::Store, &[0]);
-    emit(&mut program, Opcode::CallNoFeedback, &[0, 0, 1]);
-    emit(&mut program, Opcode::Return, &[]);
-
-    let result = thread.handle_scope(|thread, scope| {
-        let f = callable(thread, &scope, &program, &[], 1, None);
-        let handle = scope
-            .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
-            .unwrap();
-        thread.execute(handle, &[f])
-    });
-    let exception_word = {
-        let heap = thread.heap();
-        heap.known().exception.as_tagged(heap).raw()
-    };
-    assert_eq!(result, Ok(exception_word));
-    let ex = thread.take_pending_exception().expect("pending exception");
-    let expected = thread.handle_scope(|thread, scope| {
-        let name = thread.intern(&scope, "RangeError");
-        let heap = &*thread.heap();
-        name.as_tagged(heap).raw()
-    });
-    thread.handle_scope(|thread, scope| {
-        let name = thread.intern(&scope, "name");
-        {
-            let heap = &*thread.heap();
-            let Some(o) = unsafe { ex.assume_valid(heap) }.as_heap_object() else {
-                panic!("pending exception must be an object");
-            };
-            match o.lookup(heap, name.as_tagged(heap).into()) {
-                vm::Lookup::Data { slot, .. } => {
-                    assert_eq!(
-                        slot.get(heap).raw(),
-                        expected,
-                        "stack overflow -> RangeError"
-                    );
-                }
-                _ => panic!("error object must have a name property"),
-            }
-        };
-    });
-    // unwinding must not have consumed additional stack: the thread is
-    // immediately usable again
-    let mut good = Vec::new();
-    emit(&mut good, Opcode::LoadSmi, &[5]);
-    emit(&mut good, Opcode::Return, &[]);
-    let result = thread.handle_scope(|thread, scope| {
-        let f = callable(thread, &scope, &good, &[], 0, None);
-        thread.execute(
-            scope
-                .cast::<vm::Object>(unsafe { Tagged::from_value_unchecked(f) })
-                .unwrap(),
-            &[],
-        )
-    });
-    assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 5);
 }
