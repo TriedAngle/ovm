@@ -28,7 +28,11 @@ fn once(name: &str, src: &str) {
     bench::<BecomeInterpreter>(&format!("{name}/become"), src);
 }
 
+// benchmark drivers, not correctness tests: opt in with
+// `cargo test -- --ignored` (they are unbounded under the
+// stress-minor-gc feature — a collection per allocation)
 #[test]
+#[ignore]
 fn bench_all() {
     once("nbody", NBODY);
     once("fannkuch", FANNKUCH);

@@ -223,41 +223,44 @@ impl ContextState {
         proto_slot: usize,
         initial_map: Tagged<'_, Map>,
     ) {
-        // the ONLY allocation is the first-use table below: run it
-        // before reading any parameter words so a moving GC cannot
-        // stale them
-        let the_hole = heap.known().the_hole.as_tagged(heap).raw();
-        let word = self.construct_cache.get(heap);
-        if word.raw() == the_hole {
-            let hole_weak =
-                unsafe { Tagged::<Value>::from_value_unchecked(the_hole) }.as_maybe_weak();
-            let vals = vec![hole_weak; 320];
-            let table = heap.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &vals });
-            self.construct_cache.store(table.erase());
-        }
-        // allocation-free from here: raw words are stable
-        let table: Tagged<WeakFixedArray> =
-            unsafe { Tagged::from_value_unchecked(self.construct_cache.get(heap).raw()) };
-        let t = table.as_ref();
-        let mask = t.len() / 5 - 1;
-        let fn_map = closure.as_ref().header.map.get(heap);
-        let mut i = ((closure.raw().to_bits() >> 5) as usize) & mask;
-        for _ in 0..=mask {
-            let base = i * 5;
-            let entry = t.get(heap, base);
-            let slot = t.element_slot(base);
-            let free = entry.raw() == the_hole || (entry.raw().is_weak_ptr() && slot.is_cleared());
-            if free {
-                t.set_weak(heap, base, closure.erase());
-                t.set_strong(heap, base + 1, fn_map.erase());
-                t.set_strong(heap, base + 2, proto);
-                t.set_strong(heap, base + 3, Smi::new(proto_slot as i64).into_tagged());
-                t.set_strong(heap, base + 4, initial_map.erase());
-                return;
+        self.handle_scope(|scope| {
+            let closure = scope.handle(closure);
+            let proto = scope.handle(proto);
+            let initial_map = scope.handle(initial_map);
+            let the_hole = heap.known().the_hole.as_tagged(heap).raw();
+            let word = self.construct_cache.get(heap);
+            if word.raw() == the_hole {
+                let hole_weak =
+                    unsafe { Tagged::<Value>::from_value_unchecked(the_hole) }.as_maybe_weak();
+                let vals = vec![hole_weak; 320];
+                let table = heap.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &vals });
+                self.construct_cache.store(table.erase());
             }
-            i = (i + 1) & mask;
-        }
-        // full: drop inserts (rare — 64 constructor kinds)
+            // allocation-free from here: every word is read through a root
+            let table: Tagged<WeakFixedArray> =
+                unsafe { Tagged::from_value_unchecked(self.construct_cache.get(heap).raw()) };
+            let t = table.as_ref();
+            let mask = t.len() / 5 - 1;
+            let fn_map = closure.as_tagged(heap).as_ref().header.map.get(heap);
+            let mut i = ((closure.as_tagged(heap).raw().to_bits() >> 5) as usize) & mask;
+            for _ in 0..=mask {
+                let base = i * 5;
+                let entry = t.get(heap, base);
+                let slot = t.element_slot(base);
+                let free =
+                    entry.raw() == the_hole || (entry.raw().is_weak_ptr() && slot.is_cleared());
+                if free {
+                    t.set_weak(heap, base, closure.as_tagged(heap).erase());
+                    t.set_strong(heap, base + 1, fn_map.erase());
+                    t.set_strong(heap, base + 2, proto.as_tagged(heap));
+                    t.set_strong(heap, base + 3, Smi::new(proto_slot as i64).into_tagged());
+                    t.set_strong(heap, base + 4, initial_map.as_tagged(heap).erase());
+                    return;
+                }
+                i = (i + 1) & mask;
+            }
+            // full: drop inserts (rare — 64 constructor kinds)
+        })
     }
 
     pub fn set_last_error(&self, err: VmError) {
