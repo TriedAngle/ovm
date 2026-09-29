@@ -2,8 +2,8 @@
 
 use vm_core::Object;
 use vm_core::RuntimeContext;
+use vm_core::rt_try;
 use vm_core::{ContextState, HandleSlice, Heap, Tagged, VM, Value, VmError};
-use vm_core::{raise_runtime, rt_try};
 
 /// `Math.sqrt(x)` (ES 22.1.2.29): ToNumber, then the IEEE-754 square root
 /// (NaN/negative input → NaN, ±0 → ±0).

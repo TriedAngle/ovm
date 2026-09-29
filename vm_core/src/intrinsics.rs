@@ -998,7 +998,7 @@ fn copy_data_properties<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> 
 /// A fresh private name: (description) -> Symbol.
 fn create_private_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _, heap, state, ..
     } = nctx;
     let text = args
         .get(1)

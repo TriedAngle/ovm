@@ -1,8 +1,7 @@
 //! ES 20.4: the Symbol constructor (minimal surface).
 
 use vm_core::RuntimeContext;
-use vm_core::{DenseString, HandleSlice, Symbol, Tagged, Value, VmError};
-use vm_core::{raise_runtime, rt_try};
+use vm_core::{DenseString, HandleSlice, Symbol, Tagged, Value};
 
 /// `Symbol(desc)`: a fresh Symbol primitive (ES 20.4.1.1). This minimal
 /// surface exists so user code can author iterables
@@ -12,7 +11,7 @@ pub fn symbol_constructor<'a>(
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         let desc_text = args

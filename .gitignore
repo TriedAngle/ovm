@@ -4,3 +4,5 @@ target/
 # Lockfile, at any depth
 Cargo.lock
 tmp/
+# Local benchmark results (regenerated per run)
+benchmarks/BENCHMARKS.md

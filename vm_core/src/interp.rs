@@ -1,0 +1,211 @@
+//! The per-execution interpreter context shared by the interpreter
+//! implementations. Hot accessors are `#[inline(always)]` so they
+//! keep inlining into interpreter crates across the crate boundary;
+//! raise paths stay cold and out of line.
+
+use core::cell::Cell;
+use core::marker::PhantomData;
+
+use crate::cache::StackCache;
+use crate::errors::Errors;
+use crate::heap::{Heap, Register};
+use crate::stack::{FrameMeta, Stack};
+use crate::value::{Tagged, Value};
+use crate::{ContextState, VM, VmError};
+
+/// Loop back-edge ticks between safepoint polls.
+pub const SAFEPOINT_INTERVAL: u32 = 1 << 12;
+
+pub struct Ctx<'a> {
+    vm: *const VM,
+    heap: *mut Heap,
+    state: *const ContextState,
+    /// Anchor of the frame `execute` entered: a return at this anchor ends
+    /// the execution instead of unwinding into a caller.
+    base_anchor: usize,
+    safepoints: Cell<u32>,
+    /// numeric result parked between an arithmetic fast path and the
+    /// boxing continuation (which must allocate, so it is out of line)
+    num: Cell<f64>,
+    /// Machine-stack limit for the call paths (one Rust frame per JS
+    /// call): a call below this raises StackOverflow. Recomputed at
+    /// each `enter` from the current SP — nested enters only deepen it.
+    stack_limit: usize,
+    _heap: PhantomData<&'a mut Heap>,
+}
+
+impl<'a> Ctx<'a> {
+    /// Build a context for a fresh `execute` entry.
+    ///
+    /// Safety: `vm`, `heap` and `state` must stay valid and unaliased
+    /// (mutable heap) for `'a`; `base_anchor` must be the frame the
+    /// entered execution returns at.
+    #[inline(always)]
+    pub unsafe fn new(
+        vm: &'a VM,
+        heap: &'a mut Heap,
+        state: &'a ContextState,
+        base_anchor: usize,
+        stack_limit: usize,
+    ) -> Self {
+        Ctx {
+            vm: vm as *const VM,
+            heap: heap as *mut Heap,
+            state: state as *const ContextState,
+            base_anchor,
+            safepoints: Cell::new(SAFEPOINT_INTERVAL),
+            num: Cell::new(0.0),
+            stack_limit,
+            _heap: PhantomData,
+        }
+    }
+
+    /// A nested context for a callee frame sharing this execution's
+    /// borrows and machine-stack limit (a fresh safepoint/num cell each).
+    ///
+    /// Safety: same borrow validity as `self`; `base_anchor` must be the
+    /// callee's frame.
+    #[inline(always)]
+    pub unsafe fn child(&self, base_anchor: usize) -> Ctx<'a> {
+        Ctx {
+            vm: self.vm,
+            heap: self.heap,
+            state: self.state,
+            base_anchor,
+            safepoints: Cell::new(SAFEPOINT_INTERVAL),
+            num: Cell::new(0.0),
+            stack_limit: self.stack_limit,
+            _heap: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn vm(&self) -> &'a VM {
+        unsafe { &*self.vm }
+    }
+
+    #[inline(always)]
+    pub fn heap(&self) -> &'a Heap {
+        unsafe { &*self.heap }
+    }
+
+    #[inline(always)]
+    pub unsafe fn heap_mut(&self) -> &'a mut Heap {
+        unsafe { &mut *self.heap }
+    }
+
+    #[inline(always)]
+    pub fn set_num(&self, f: f64) {
+        self.num.set(f);
+    }
+
+    #[inline(always)]
+    pub fn num(&self) -> f64 {
+        self.num.get()
+    }
+
+    #[inline(always)]
+    pub fn state(&self) -> &'a ContextState {
+        unsafe { &*self.state }
+    }
+
+    #[inline(always)]
+    pub fn stack(&self) -> &'a Stack {
+        self.state().stack()
+    }
+
+    #[inline(always)]
+    pub fn cache(&self) -> &'a StackCache {
+        self.state().cache()
+    }
+
+    #[inline(always)]
+    pub fn base_anchor(&self) -> usize {
+        self.base_anchor
+    }
+
+    #[inline(always)]
+    pub fn meta(&self, pc: usize) -> FrameMeta {
+        let cache = self.cache();
+        FrameMeta {
+            base: cache.base(),
+            pc,
+            register_count: cache.register_count(),
+            handler_pc: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn code_ptr(&self) -> *const u8 {
+        self.cache().code_ref(self.heap()).as_ref().as_ptr()
+    }
+
+    #[inline(always)]
+    pub fn regs_ptr(&self) -> *mut Register {
+        unsafe { self.stack().slots_ptr().add(self.cache().base()) }
+    }
+
+    #[inline(always)]
+    pub fn exception_word(&self) -> Tagged<'a, Value> {
+        let heap = self.heap();
+        heap.known().exception.as_tagged(heap).erase()
+    }
+
+    #[inline(always)]
+    pub fn is_throw(&self, v: Tagged<'_, Value>) -> bool {
+        v == self.exception_word()
+    }
+
+    #[inline(always)]
+    pub fn undefined_word(&self) -> Tagged<'a, Value> {
+        let heap = self.heap();
+        heap.known().undefined.as_tagged(heap).erase()
+    }
+
+    /// The machine-stack probe for the call paths: `true` when the
+    /// current stack pointer has fallen below this execution's limit.
+    #[inline(always)]
+    pub fn stack_overflowed(&self) -> bool {
+        let probe = 0u8;
+        (&probe as *const u8 as usize) < self.stack_limit
+    }
+
+    /// One loop back-edge: `true` every `SAFEPOINT_INTERVAL` ticks or when
+    /// a collection has been requested since the last reset.
+    #[inline(always)]
+    pub fn safepoint_tick(&self) -> bool {
+        let n = self.safepoints.get();
+        if n == 0 {
+            self.safepoints.set(SAFEPOINT_INTERVAL);
+            true
+        } else {
+            self.safepoints.set(n - 1);
+            false
+        }
+    }
+
+    /// Materialize a VM error as the pending exception and return `Ok`
+    /// with the exception sentinel (the fold for `Result`-returning
+    /// helpers).
+    #[cold]
+    #[inline(never)]
+    pub unsafe fn raise(&self, err: VmError) -> Result<Tagged<'a, Value>, VmError> {
+        unsafe { Ok(self.raise_tag(err)) }
+    }
+
+    /// The single-channel raise for Tagged-returning interpreter fns:
+    /// materialize `err`, set the pending exception, return the sentinel
+    /// word.
+    #[cold]
+    #[inline(never)]
+    pub unsafe fn raise_tag(&self, err: VmError) -> Tagged<'a, Value> {
+        unsafe {
+            let heap = self.heap_mut();
+            let state = self.state();
+            let ex = Errors::from_vm_error(self.vm(), heap, state, err)
+                .expect("error materialization must not fail");
+            state.set_pending_exception(ex);
+            self.exception_word()
+        }
+    }
+}

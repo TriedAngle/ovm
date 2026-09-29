@@ -1,158 +1,22 @@
 #![feature(explicit_tail_calls)]
 #![feature(rust_preserve_none_cc)]
+#![allow(incomplete_features)]
 #![feature(fn_align)]
 #![allow(unsafe_op_in_unsafe_fn)]
 #![allow(unused_macros, unused_unsafe, unused_variables)]
 
-use core::cell::Cell;
-use core::marker::PhantomData;
-
 use bytecode::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode, jump_target};
 use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe, StoreHit, StoreOutcomeKind};
 use vm_core::proxy::Proxy;
-use vm_core::SlotFlags;
 use vm_core::{
     CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
-    DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap,
-    Hint,
-    Interpreter, Intrinsic, Key, LoadOutcome, Lookup, Object, PropertyDescriptor, Register,
-    RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi, Stack, StackCache, StoreOutcome,
-    StoreSemantics, Tagged, VM, Value, VmError, spread_apply_args,
+    Ctx, DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice,
+    Heap, Hint, Interpreter, Intrinsic, Key, LoadOutcome, Lookup, Object, PropertyDescriptor,
+    Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics,
+    Tagged, VM, Value, VmError, spread_apply_args,
 };
 
 pub struct BecomeInterpreter;
-
-const SAFEPOINT_INTERVAL: u32 = 1 << 12;
-
-pub struct Ctx<'a> {
-    vm: *const VM,
-    heap: *mut Heap,
-    state: *const ContextState,
-    /// Anchor of the frame `execute` entered: a return at this anchor ends
-    /// the execution instead of unwinding into a caller.
-    base_anchor: usize,
-    safepoints: Cell<u32>,
-    /// numeric result parked between an arithmetic fast path and the
-    /// boxing continuation (which must allocate, so it is out of line)
-    num: Cell<f64>,
-    /// Machine-stack limit for the call trampolines (one Rust frame per
-    /// JS call): a call below this raises StackOverflow. Recomputed at
-    /// each `enter` from the current SP — nested enters only deepen it.
-    stack_limit: usize,
-    _heap: PhantomData<&'a mut Heap>,
-}
-
-impl<'a> Ctx<'a> {
-    #[inline(always)]
-    fn vm(&self) -> &'a VM {
-        unsafe { &*self.vm }
-    }
-    #[inline(always)]
-    fn heap(&self) -> &'a Heap {
-        unsafe { &*self.heap }
-    }
-    #[inline(always)]
-    unsafe fn heap_mut(&self) -> &'a mut Heap {
-        unsafe { &mut *self.heap }
-    }
-    #[inline(always)]
-    fn set_num(&self, f: f64) {
-        self.num.set(f);
-    }
-
-    #[inline(always)]
-    fn num(&self) -> f64 {
-        self.num.get()
-    }
-
-    #[inline(always)]
-    fn state(&self) -> &'a ContextState {
-        unsafe { &*self.state }
-    }
-    #[inline(always)]
-    fn stack(&self) -> &'a Stack {
-        self.state().stack()
-    }
-    #[inline(always)]
-    fn cache(&self) -> &'a StackCache {
-        self.state().cache()
-    }
-
-    #[inline(always)]
-    fn meta(&self, pc: usize) -> FrameMeta {
-        let cache = self.cache();
-        FrameMeta {
-            base: cache.base(),
-            pc,
-            register_count: cache.register_count(),
-            handler_pc: 0,
-        }
-    }
-
-    #[inline(always)]
-    fn code_ptr(&self) -> *const u8 {
-        self.cache().code_ref(self.heap()).as_ref().as_ptr()
-    }
-
-    #[inline(always)]
-    fn regs_ptr(&self) -> *mut Register {
-        unsafe { self.stack().slots_ptr().add(self.cache().base()) }
-    }
-
-    #[inline(always)]
-    fn exception_word(&self) -> Tagged<'a, Value> {
-        let heap = self.heap();
-        heap.known().exception.as_tagged(heap).erase()
-    }
-
-    #[inline(always)]
-    fn is_throw(&self, v: Tagged<'_, Value>) -> bool {
-        v == self.exception_word()
-    }
-
-    #[inline(always)]
-    fn undefined_word(&self) -> Tagged<'a, Value> {
-        let heap = self.heap();
-        heap.known().undefined.as_tagged(heap).erase()
-    }
-
-
-    /// One loop back-edge: `true` every `SAFEPOINT_INTERVAL` ticks or when
-    /// a collection has been requested since the last reset.
-    #[inline(always)]
-    fn safepoint_tick(&self) -> bool {
-        let n = self.safepoints.get();
-        if n == 0 {
-            self.safepoints.set(SAFEPOINT_INTERVAL);
-            true
-        } else {
-            self.safepoints.set(n - 1);
-            false
-        }
-    }
-
-    /// Materialize a VM error as the pending exception and return the
-    /// exception sentinel (the `execute`-caller convention for throws).
-    #[cold]
-    #[inline(never)]
-    unsafe fn raise(&self, err: VmError) -> Result<Tagged<'a, Value>, VmError> {
-        Ok(self.raise_tag(err))
-    }
-
-    /// The single-channel raise for Tagged-returning become-chain fns:
-    /// materialize `err`, set the pending exception, return the sentinel
-    /// word.
-    #[cold]
-    #[inline(never)]
-    unsafe fn raise_tag(&self, err: VmError) -> Tagged<'a, Value> {
-        let heap = self.heap_mut();
-        let state = self.state();
-        let ex = Errors::from_vm_error(self.vm(), heap, state, err)
-            .expect("error materialization must not fail");
-        state.set_pending_exception(ex);
-        self.exception_word()
-    }
-}
 
 #[inline(always)]
 unsafe fn reg_read<'a>(regs: *mut Register, heap: &'a Heap, i: i32) -> Tagged<'a, Value> {
@@ -164,14 +28,13 @@ unsafe fn reg_write<'x, T: 'x>(regs: *mut Register, i: i32, v: Tagged<'x, T>) {
     (*regs.offset(i as isize)).store(v);
 }
 
-pub type Handler =
-    for<'a> unsafe extern "rust-preserve-none" fn(
-        pc: usize,
-        code: *const u8,
-        regs: *mut Register,
-        acc: Tagged<'a, Value>,
-        ctx: &Ctx<'a>,
-    ) -> Tagged<'a, Value>;
+pub type Handler = for<'a> unsafe extern "rust-preserve-none" fn(
+    pc: usize,
+    code: *const u8,
+    regs: *mut Register,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+) -> Tagged<'a, Value>;
 
 pub struct HandlerTable([Handler; 256]);
 
@@ -892,7 +755,7 @@ handlers!(pc, code, regs, acc, ctx;
     }
 
     Return : op_return_n / op_return_w () {
-        if ctx.cache().base() == ctx.base_anchor {
+        if ctx.cache().base() == ctx.base_anchor() {
             return acc;
         }
         let meta = ctx.meta(pc);
@@ -1110,7 +973,7 @@ handlers!(pc, code, regs, acc, ctx;
                 become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame(frame) => become call_trampoline(pc, code, regs, acc, ctx),
-            
+
             MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_proxy_apply(pc, code, regs, acc, ctx),
         }
@@ -1181,7 +1044,7 @@ handlers!(pc, code, regs, acc, ctx;
                 become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame(frame) => become call_trampoline(pc, code, regs, acc, ctx),
-            
+
             MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
         }
@@ -1195,7 +1058,7 @@ handlers!(pc, code, regs, acc, ctx;
                 become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame(frame) => become call_trampoline(pc, code, regs, acc, ctx),
-            
+
             MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
         }
@@ -1209,7 +1072,7 @@ handlers!(pc, code, regs, acc, ctx;
                 become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame(frame) => become call_trampoline(pc, code, regs, acc, ctx),
-            
+
             MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_method_proxy(pc, code, regs, acc, ctx),
         }
@@ -1223,7 +1086,7 @@ handlers!(pc, code, regs, acc, ctx;
                 become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame(frame) => become call_trampoline(pc, code, regs, acc, ctx),
-            
+
             MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
         }
@@ -1237,7 +1100,7 @@ handlers!(pc, code, regs, acc, ctx;
                 become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame(frame) => become call_trampoline(pc, code, regs, acc, ctx),
-            
+
             MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
         }
@@ -1251,7 +1114,7 @@ handlers!(pc, code, regs, acc, ctx;
                 become resume(pc, code, regs, v, ctx)
             }
             MethodCall::Frame(frame) => become call_trampoline(pc, code, regs, acc, ctx),
-            
+
             MethodCall::Intrinsic(i) => become INTRINSICS[i.id()](pc, code, regs, acc, ctx),
             MethodCall::Proxy => become cold_call_function_proxy(pc, code, regs, acc, ctx),
         }
@@ -1260,7 +1123,7 @@ handlers!(pc, code, regs, acc, ctx;
     Construct : op_construct_n / op_construct_w (callee => signed, base => signed, count => unsigned, out => signed) {
         let __mc = cold_start!(pc, code, regs, acc, ctx, construct_start(ctx, pc, SIZE, regs, callee, base, count, out));
         match __mc {
-            ConstructStart::Frame(_) => become call_trampoline(pc, code, regs, acc, ctx),
+            ConstructStart::Frame => become call_trampoline(pc, code, regs, acc, ctx),
             ConstructStart::Runtime(idx) => {
                 // runtime ctor: tier-1 call with `new_target` = callee
                 set_reg!(out, ctx.undefined_word());
@@ -1937,7 +1800,12 @@ unsafe fn keyed_store_cold<'a>(
             }
             StoreOutcome::CallSetter { setter } => {
                 let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                // a throwing setter routes the sentinel into `resume` ->
+                // `throw_dispatch`; the store never completes
+                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
             }
             StoreOutcome::Done => {}
         }
@@ -1980,6 +1848,10 @@ unsafe fn global_load_cold<'a>(
             }
             Lookup::Accessor { pair, .. } => {
                 let getter = scope.handle(pair.get.get(heap));
+                if getter.as_tagged(heap) == heap.known().undefined.as_tagged(heap) {
+                    // a setter-only accessor: the read yields undefined
+                    return Ok(ctx.undefined_word());
+                }
                 let args = scope.stage(&[global.as_tagged(heap).erase()]);
                 RuntimeContext::call(vm, heap, state, getter, args, None)
             }
@@ -2048,7 +1920,10 @@ unsafe fn store_named_cold<'a>(
                 StoreHit::Setter(setter) => {
                     let setter = scope.handle(setter);
                     let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                    let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                    let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                    if ctx.is_throw(v) {
+                        return Ok(v);
+                    }
                     Ok(value.as_tagged(heap).erase())
                 }
             };
@@ -2094,7 +1969,10 @@ unsafe fn store_named_cold<'a>(
             }
             StoreOutcome::CallSetter { setter } => {
                 let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
                 if let Some(prev) = prev {
                     InlineCache::update_store(
                         heap,
@@ -2129,8 +2007,9 @@ unsafe fn store_named_cold<'a>(
 
 /// Outcome of a `Construct` fast-path attempt.
 enum ConstructStart {
-    /// a constructor frame was pushed; enter it through the trampoline
-    Frame(FrameMeta),
+    /// a constructor frame was pushed (the cache already points at it):
+    /// enter it through the trampoline
+    Frame,
     /// receiver synthesis threw; the pending exception is set
     Threw(()),
     /// a runtime constructor: call it directly with `new_target` set
@@ -2199,10 +2078,7 @@ unsafe fn construct_start<'a>(
         kind,
         FunctionKind::DerivedClassConstructor | FunctionKind::DefaultDerivedConstructor
     );
-    if !derived2
-        && kind != FunctionKind::Normal
-        && kind != FunctionKind::BaseClassConstructor
-    {
+    if !derived2 && kind != FunctionKind::Normal && kind != FunctionKind::BaseClassConstructor {
         return Ok(ConstructStart::Cold);
     }
     let heap = ctx.heap_mut();
@@ -2222,9 +2098,8 @@ unsafe fn construct_start<'a>(
         formal_min,
     )?;
     ctx.cache().load(ctx.stack(), frame, ctx.heap_mut());
-    Ok(ConstructStart::Frame(frame))
+    Ok(ConstructStart::Frame)
 }
-
 
 #[inline(never)]
 unsafe fn construct_receiver_fast<'a>(
@@ -2250,7 +2125,8 @@ unsafe fn construct_receiver_fast<'a>(
         else {
             return Ok(None);
         };
-        let obj: vm_core::Handle<Object> = scope.cast::<Object>(obj).expect("receiver is an object");
+        let obj: vm_core::Handle<Object> =
+            scope.cast::<Object>(obj).expect("receiver is an object");
         construct_cache_record(heap, state, &scope, callee, obj);
         Ok(Some(obj.as_tagged(heap).erase()))
     })
@@ -2271,22 +2147,26 @@ fn construct_cache_record(
 ) {
     // Safety: fresh synthesized-receiver word; the insert's allocation
     // runs before it reads parameters, so the raw word stays stable.
-    let map: Tagged<vm_core::Map> =
-        unsafe { Tagged::from_value_unchecked(obj.as_tagged(heap).as_ref().header.map.get(heap).raw()) };
+    let map: Tagged<vm_core::Map> = unsafe {
+        Tagged::from_value_unchecked(obj.as_tagged(heap).as_ref().header.map.get(heap).raw())
+    };
     // find the closure's `.prototype` data-property slot
     let proto_name = heap.known().strings.prototype.as_tagged(heap);
     let closure_map = callee.as_tagged(heap).as_ref().header.map.get(heap);
     let mut found = None;
     for d in closure_map.as_ref().descriptors() {
-        if d.name(heap).raw() == proto_name.raw()
-            && !d.flags().is_accessor()
-        {
+        if d.name(heap).raw() == proto_name.raw() && !d.flags().is_accessor() {
             found = Some(d.offset());
             break;
         }
     }
     let Some(offset) = found else { return };
-    let proto_word = callee.as_tagged(heap).as_ref().slot(heap, offset).get(heap).raw();
+    let proto_word = callee
+        .as_tagged(heap)
+        .as_ref()
+        .slot(heap, offset)
+        .get(heap)
+        .raw();
     if !proto_word.is_strong_ptr() {
         return; // non-object prototype: ES falls back, stays uncached
     }
@@ -2296,7 +2176,8 @@ fn construct_cache_record(
     let _ = scope;
     // Safety: the insert's only allocation (the first-use table) runs
     // before it reads these words — they stay stable throughout.
-    let callee_obj: Tagged<Object> = unsafe { Tagged::from_value_unchecked(callee.as_tagged(heap).raw()) };
+    let callee_obj: Tagged<Object> =
+        unsafe { Tagged::from_value_unchecked(callee.as_tagged(heap).raw()) };
     state.construct_cache_insert(heap, callee_obj, proto, offset, map);
 }
 
@@ -2443,7 +2324,6 @@ unsafe fn proxy_apply_cold<'a>(
     })
 }
 
-
 #[cold]
 #[inline(never)]
 unsafe fn proxy_apply_regs_cold<'a>(
@@ -2523,7 +2403,15 @@ unsafe fn intrinsic_call_scattered<'a>(
                 return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             push_scattered_method_frame(
-                ctx, pc, size, target, info, context, register_count, formal_min, srcs,
+                ctx,
+                pc,
+                size,
+                target,
+                info,
+                context,
+                register_count,
+                formal_min,
+                srcs,
             )
         }
         Some(CallTarget::Runtime(idx)) => {
@@ -2571,7 +2459,16 @@ unsafe fn intrinsic_call_contiguous<'a>(
                 return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             push_contiguous_frame(
-                ctx, pc, size, target, info, context, register_count, formal_min, base, count,
+                ctx,
+                pc,
+                size,
+                target,
+                info,
+                context,
+                register_count,
+                formal_min,
+                base,
+                count,
             )
         }
         Some(CallTarget::Runtime(idx)) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
@@ -2608,7 +2505,9 @@ macro_rules! finish_intrinsic {
                     };
                     become resume($pc, $code, $regs, v, $ctx)
                 }
-                MethodCall::Intrinsic(i) => become INTRINSICS[i.id()]($pc, $code, $regs, $acc, $ctx),
+                MethodCall::Intrinsic(i) => {
+                    become INTRINSICS[i.id()]($pc, $code, $regs, $acc, $ctx)
+                }
             },
             Err(err) => $ctx.raise_tag(err),
         }
@@ -2770,24 +2669,31 @@ unsafe fn intrinsic_apply_call<'a>(
             // unwrap the nested intrinsic and retry on the reshaped args
             match intrinsic {
                 Intrinsic::FunctionCall => {
-                    let f = args.get(0).map(|h| h.as_tagged(ctx.heap())).ok_or(VmError::Arity)?;
+                    let f = args
+                        .get(0)
+                        .map(|h| h.as_tagged(ctx.heap()))
+                        .ok_or(VmError::Arity)?;
                     let rest = args.slice_from(1);
                     intrinsic_apply_call(ctx, pc, size, f, rest)
                 }
                 Intrinsic::FunctionApply => {
-                    let f = args.get(0).map(|h| h.as_tagged(ctx.heap())).ok_or(VmError::Arity)?;
+                    let f = args
+                        .get(0)
+                        .map(|h| h.as_tagged(ctx.heap()))
+                        .ok_or(VmError::Arity)?;
                     let this_arg = args
                         .get(1)
                         .map(|h| h.as_tagged(ctx.heap()))
                         .unwrap_or_else(|| ctx.undefined_word());
                     let array = args.get(2).map(|h| h.as_tagged(ctx.heap()));
-                    ctx.state().handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
-                        // Safety: fresh reads of rooted slots, staged before
-                        // the frame push below can move anything.
-                        let staged =
-                            scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
-                        intrinsic_apply_call(ctx, pc, size, f, staged)
-                    })
+                    ctx.state()
+                        .handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
+                            // Safety: fresh reads of rooted slots, staged before
+                            // the frame push below can move anything.
+                            let staged =
+                                scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
+                            intrinsic_apply_call(ctx, pc, size, f, staged)
+                        })
                 }
             }
         }
@@ -2870,12 +2776,14 @@ unsafe extern "rust-preserve-none" fn intrinsic_function_apply<'a>(
         }
     };
     let size = next - pc;
-    match ctx.state().handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
-        // Safety: fresh register reads, staged before the frame push
-        // below can move anything.
-        let staged = scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
-        intrinsic_apply_call(ctx, pc, size, f, staged)
-    }) {
+    match ctx
+        .state()
+        .handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
+            // Safety: fresh register reads, staged before the frame push
+            // below can move anything.
+            let staged = scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
+            intrinsic_apply_call(ctx, pc, size, f, staged)
+        }) {
         Ok(ApplyOut::Frame(_)) => become enter_fresh_frame(pc, code, regs, acc, ctx),
         Ok(ApplyOut::Value(v)) => become resume(pc, code, regs, v, ctx),
         Err(err) => ctx.raise_tag(err),
@@ -2908,7 +2816,6 @@ unsafe fn cold_next_pc(pc: usize, code: *const u8) -> usize {
     } as usize;
     pc + wide as usize + 1 + size
 }
-
 
 /// Exception dispatch: walk the ovm frames from the faulting one, consulting
 /// each frame's static handler table for a try range covering
@@ -2950,7 +2857,7 @@ unsafe extern "rust-preserve-none" fn throw_dispatch<'a>(
             let h = TABLE_NARROW.0[op];
             become h(handler_pc, code, regs, ex, ctx)
         }
-        if ctx.cache().base() == ctx.base_anchor {
+        if ctx.cache().base() == ctx.base_anchor() {
             return ctx.exception_word();
         }
         let meta = ctx.cache().frame_meta();
@@ -2971,7 +2878,7 @@ unsafe extern "rust-preserve-none" fn call_trampoline<'a>(
     // the pushed callee frame is the cache's current frame
     let frame = ctx.cache().frame_meta();
     let probe = 0u8;
-    if (&probe as *const u8 as usize) < ctx.stack_limit {
+    if ctx.stack_overflowed() {
         // drop the half-built callee frame and surface the overflow
         // through the sentinel channel
         let caller = ctx.stack().pop_frame(&frame);
@@ -2985,16 +2892,7 @@ unsafe extern "rust-preserve-none" fn call_trampoline<'a>(
     let pc0 = ctx.cache().pc();
     let regs = ctx.regs_ptr();
     let acc0 = ctx.stack().undefined_word(ctx.heap());
-    let callee_ctx = Ctx {
-        vm: ctx.vm,
-        heap: ctx.heap,
-        state: ctx.state,
-        base_anchor: frame.base,
-        safepoints: Cell::new(SAFEPOINT_INTERVAL),
-        num: Cell::new(0.0),
-        stack_limit: ctx.stack_limit,
-        _heap: PhantomData,
-    };
+    let callee_ctx = unsafe { Ctx::child(ctx, frame.base) };
     let op = unsafe { *code.add(pc0) } as usize;
     let acc = unsafe { TABLE_NARROW.0[op](pc0, code, regs, acc0, &callee_ctx) };
     let caller = ctx.stack().pop_frame(&frame);
@@ -3010,7 +2908,6 @@ unsafe extern "rust-preserve-none" fn call_trampoline<'a>(
     become h(next, code, regs, acc, ctx)
 }
 
- 
 #[inline(always)]
 unsafe extern "rust-preserve-none" fn resume<'a>(
     fault_pc: usize,
@@ -3120,7 +3017,6 @@ unsafe extern "rust-preserve-none" fn cold_negate<'a>(
     let v = cold_try!(ctx, negate_cold(ctx, acc));
     become resume(pc, code, regs, v, ctx)
 }
-
 
 #[cold]
 #[inline(never)]
@@ -3254,7 +3150,6 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
     let v = cold_try!(ctx, keyed_load_cold(ctx, recv, key, Some(fb)));
     become resume(pc, code, regs, v, ctx)
 }
-
 
 #[cold]
 #[inline(never)]
@@ -3436,7 +3331,10 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(ctx, keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow));
+    let v = cold_try!(
+        ctx,
+        keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)
+    );
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3457,7 +3355,10 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store_no_shadow<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(ctx, keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough));
+    let v = cold_try!(
+        ctx,
+        keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
+    );
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3520,7 +3421,6 @@ enum CallProbe<'a> {
     Bytecode(CallHit<'a>),
     Runtime(usize),
     Intrinsic(vm_core::Intrinsic),
-    Proxy,
     Miss,
 }
 
@@ -3539,11 +3439,7 @@ fn decode_descriptor(desc: i64) -> (usize, usize, FunctionKind) {
 }
 
 #[inline(always)]
-unsafe fn call_ic_probe<'a>(
-    ctx: &Ctx<'a>,
-    fb: usize,
-    callee: Tagged<'a, Value>,
-) -> CallProbe<'a> {
+unsafe fn call_ic_probe<'a>(ctx: &Ctx<'a>, fb: usize, callee: Tagged<'a, Value>) -> CallProbe<'a> {
     let heap = ctx.heap();
     let Some(vector) = ctx.cache().feedback_ref(heap) else {
         return CallProbe::Miss;
@@ -3859,7 +3755,6 @@ unsafe fn call_method_start<'a>(
         }
         CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs))),
         CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        CallProbe::Proxy => Ok(MethodCall::Proxy),
         CallProbe::Miss => cold_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
     }
 }
@@ -3945,11 +3840,8 @@ unsafe fn call_function_start<'a>(
                 args,
             )
         }
-        CallProbe::Runtime(idx) => {
-            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
-        }
+        CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args))),
         CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        CallProbe::Proxy => Ok(MethodCall::Proxy),
         CallProbe::Miss => cold_call_function_miss(ctx, pc, size, callee_word, args, fb),
     }
 }
@@ -4042,7 +3934,6 @@ unsafe fn call_start<'a>(
             ctx, idx, base, count,
         ))),
         CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        CallProbe::Proxy => Ok(MethodCall::Proxy),
         CallProbe::Miss => cold_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
 }
@@ -4341,7 +4232,10 @@ unsafe fn store_global_cold<'a>(
             }
             StoreOutcome::CallSetter { setter } => {
                 let args = scope.stage(&[global.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
             }
             StoreOutcome::Done => {}
         }
@@ -4404,7 +4298,12 @@ unsafe fn store_named_no_shadow_cold<'a>(
             }
             StoreOutcome::CallSetter { setter } => {
                 let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                let _ = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                // a throwing setter routes the sentinel into `resume` ->
+                // `throw_dispatch`; the store never completes
+                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
+                if ctx.is_throw(v) {
+                    return Ok(v);
+                }
             }
             StoreOutcome::Done => {}
         }
@@ -4837,7 +4736,6 @@ const fn table_wide() -> [Handler; 256] {
 static TABLE_NARROW: HandlerTable = HandlerTable(table_narrow());
 static TABLE_WIDE: HandlerTable = HandlerTable(table_wide());
 
-
 fn enter<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
@@ -4875,7 +4773,10 @@ fn enter<'a>(
             // through the handler-shaped table instead.
             state.handle_scope(|scope| match intrinsic {
                 Intrinsic::FunctionCall => {
-                    let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    let f = args
+                        .get(0)
+                        .map(|h| h.as_tagged(heap))
+                        .ok_or(VmError::Arity)?;
                     if !Object::is_callable(heap, f) {
                         return Err(VmError::Type);
                     }
@@ -4883,7 +4784,10 @@ fn enter<'a>(
                     enter(vm, heap, state, f, args.slice_from(1), None)
                 }
                 Intrinsic::FunctionApply => {
-                    let f = args.get(0).map(|h| h.as_tagged(heap)).ok_or(VmError::Arity)?;
+                    let f = args
+                        .get(0)
+                        .map(|h| h.as_tagged(heap))
+                        .ok_or(VmError::Arity)?;
                     if !Object::is_callable(heap, f) {
                         return Err(VmError::Type);
                     }
@@ -4894,8 +4798,7 @@ fn enter<'a>(
                     let array = args.get(2).map(|h| h.as_tagged(heap));
                     // Safety: fresh rooted-slot reads, staged before `enter`
                     // below can allocate.
-                    let staged =
-                        scope.stage(&unsafe { spread_apply_args(heap, this_arg, array) });
+                    let staged = scope.stage(&unsafe { spread_apply_args(heap, this_arg, array) });
                     let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
                     enter(vm, heap, state, f, staged, None)
                 }
@@ -4944,16 +4847,7 @@ fn enter<'a>(
 
             let probe = 0u8;
             let stack_limit = (&probe as *const u8 as usize).saturating_sub(6 * 1024 * 1024);
-            let ctx: Ctx<'a> = Ctx {
-                vm: vm as *const VM,
-                heap: heap as *mut Heap,
-                state: state as *const ContextState,
-                base_anchor: frame.base,
-                safepoints: Cell::new(SAFEPOINT_INTERVAL),
-                num: Cell::new(0.0),
-                stack_limit,
-                _heap: PhantomData,
-            };
+            let ctx: Ctx<'a> = unsafe { Ctx::new(vm, heap, state, frame.base, stack_limit) };
             let base = ctx.code_ptr();
             let pc = cache.pc();
             let regs = ctx.regs_ptr();

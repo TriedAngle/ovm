@@ -236,7 +236,10 @@ pub fn array_iterator_symbol_iterator<'a>(
 /// `Array.isArray(arg)` (ES 24.1.2.1).
 pub fn array_is_array<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _,
+        heap,
+        state: _,
+        ..
     } = nctx;
     let arg = args
         .get(1)

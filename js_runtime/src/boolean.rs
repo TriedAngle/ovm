@@ -1,9 +1,9 @@
 //! ES 20.3: the Boolean constructor and prototype methods.
 
 use vm_core::RuntimeContext;
+use vm_core::raise_runtime;
 use vm_core::runtime_api::wrapper_value;
 use vm_core::{Convert, HandleSlice, Tagged, Value, VmError};
-use vm_core::{raise_runtime, rt_try};
 
 pub fn boolean_constructor<'a>(
     nctx: RuntimeContext<'a>,
@@ -11,7 +11,7 @@ pub fn boolean_constructor<'a>(
 ) -> Tagged<'a, Value> {
     let is_construct = nctx.is_construct();
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _, heap, state, ..
     } = nctx;
     if !is_construct {
         let arg = args

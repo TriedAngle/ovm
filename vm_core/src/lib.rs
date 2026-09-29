@@ -15,6 +15,7 @@ pub mod handle;
 pub mod heap;
 pub mod ic;
 pub mod interner;
+pub mod interp;
 pub mod intrinsics;
 pub mod lookup;
 pub mod materialize;
@@ -46,6 +47,7 @@ pub use heap::{
     OptionGcSlot, Register, WordType,
 };
 pub use interner::StringInterner;
+pub use interp::{Ctx, SAFEPOINT_INTERVAL};
 pub use lookup::{Key, LoadOutcome, Lookup};
 pub use objects::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,

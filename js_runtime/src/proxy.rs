@@ -120,7 +120,7 @@ pub fn proxy_revocable<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
             .as_handle(&scope);
         let proxy_name = vm.interner().intern_str(heap, &scope, "proxy");
         let proxy_name = scope.handle(proxy_name.as_tagged(heap));
-        Object::define_own_property(
+        let _ = Object::define_own_property(
             heap,
             &scope,
             obj,
@@ -129,7 +129,7 @@ pub fn proxy_revocable<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
         );
         let revoke_name = vm.interner().intern_str(heap, &scope, "revoke");
         let revoke_name = scope.handle(revoke_name.as_tagged(heap));
-        Object::define_own_property(
+        let _ = Object::define_own_property(
             heap,
             &scope,
             obj,

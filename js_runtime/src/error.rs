@@ -65,14 +65,14 @@ pub fn make_error<'a>(
         let name = heap.known().strings.name;
         let message_key = heap.known().strings.message;
         let class_value = vm.interner().intern_str(heap, &scope, class);
-        Object::define_own_property(
+        let _ = Object::define_own_property(
             heap,
             &scope,
             obj,
             name,
             PropertyDescriptor::data(class_value.erase()),
         );
-        Object::define_own_property(
+        let _ = Object::define_own_property(
             heap,
             &scope,
             obj,

@@ -2127,7 +2127,13 @@ fn run_failing_inner<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Ta
         emit(&mut bad, Opcode::LoadConstant, &[0]);
         emit(&mut bad, Opcode::Add, &[reg_op(1)]);
         emit(&mut bad, Opcode::Return, &[]);
-        let callee = scope.handle(bytecode_fn(heap, &scope, &bad, &[obj.as_tagged(heap).raw()], 2));
+        let callee = scope.handle(bytecode_fn(
+            heap,
+            &scope,
+            &bad,
+            &[obj.as_tagged(heap).raw()],
+            2,
+        ));
 
         // caller: calls callee, so one frame is suspended above the base
         // depth when the exception escapes the nested run

@@ -1,9 +1,9 @@
 //! ES 22.1: the String constructor and prototype methods.
 
 use vm_core::RuntimeContext;
+use vm_core::raise_runtime;
 use vm_core::runtime_api::wrapper_value;
 use vm_core::{Convert, HandleSlice, Tagged, Value, VmError};
-use vm_core::{raise_runtime, rt_try};
 
 pub fn string_constructor<'a>(
     nctx: RuntimeContext<'a>,
