@@ -7,6 +7,7 @@ use core::ptr::NonNull;
 
 pub mod bootstrap;
 pub mod cache;
+pub mod cold;
 pub mod compare;
 pub mod convert;
 pub mod error;
@@ -47,7 +48,7 @@ pub use heap::{
     OptionGcSlot, Register, WordType,
 };
 pub use interner::StringInterner;
-pub use interp::{Ctx, SAFEPOINT_INTERVAL};
+pub use interp::{Ctx, Unwind};
 pub use lookup::{Key, LoadOutcome, Lookup};
 pub use objects::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,

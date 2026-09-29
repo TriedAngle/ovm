@@ -6,14 +6,14 @@
 #![allow(unused_macros, unused_unsafe, unused_variables)]
 
 use bytecode::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode, jump_target};
-use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe, StoreHit, StoreOutcomeKind};
+use vm_core::StoreSemantics;
+use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe};
 use vm_core::proxy::Proxy;
 use vm_core::{
     CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
-    Ctx, DenseString, Errors, ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice,
-    Heap, Hint, Interpreter, Intrinsic, Key, LoadOutcome, Lookup, Object, PropertyDescriptor,
-    Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi, StoreOutcome, StoreSemantics,
-    Tagged, VM, Value, VmError, spread_apply_args,
+    Ctx, ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter,
+    Intrinsic, Object, Register, RuntimeContext, RuntimeIndex, ScopeInfo, Smi, Tagged, VM, Value,
+    VmError, spread_apply_args,
 };
 
 pub struct BecomeInterpreter;
@@ -1351,72 +1351,6 @@ mod unsigned {
 
 #[cold]
 #[inline(never)]
-unsafe fn add_cold<'a>(
-    ctx: &Ctx<'a>,
-    lhs: Tagged<'_, Value>,
-    rhs: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let lhs = scope.handle(lhs);
-        let lhs = match Object::to_primitive(vm, heap, state, lhs, Hint::Default)? {
-            Coercion::Threw => return Ok(ctx.exception_word()),
-            Coercion::Value(v) => scope.handle(v),
-        };
-        let rhs = scope.handle(rhs);
-        let rhs = match Object::to_primitive(vm, heap, state, rhs, Hint::Default)? {
-            Coercion::Threw => return Ok(ctx.exception_word()),
-            Coercion::Value(v) => scope.handle(v),
-        };
-        let is_string = (
-            lhs.as_tagged(heap).get_as::<DenseString>().is_some(),
-            rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
-        );
-        if is_string.0 || is_string.1 {
-            let a = scope.handle(Convert::to_string(heap, &scope, lhs)?);
-            let b = scope.handle(Convert::to_string(heap, &scope, rhs)?);
-            Ok(DenseString::concat(heap, &scope, a, b)
-                .as_tagged(heap)
-                .erase())
-        } else {
-            let a = Convert::to_number(heap, lhs.as_tagged(heap))?;
-            let b = Convert::to_number(heap, rhs.as_tagged(heap))?;
-            let r = a + b;
-            let r = if r == 0.0 && a.is_sign_negative() && b.is_sign_negative() {
-                -0.0
-            } else {
-                r
-            };
-            Ok(heap.new_number(r))
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn numeric_cold<'a>(
-    ctx: &Ctx<'a>,
-    lhs: Tagged<'_, Value>,
-    rhs: Tagged<'_, Value>,
-    f: fn(f64, f64) -> f64,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let a = scope.handle(lhs);
-        let b = scope.handle(rhs);
-        match Object::numeric_op(vm, heap, state, a, b, f)? {
-            Some(v) => Ok(v),
-            None => Ok(ctx.exception_word()),
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
 unsafe extern "rust-preserve-none" fn cold_box_number<'a>(
     pc: usize,
     _code: *const u8,
@@ -1480,529 +1414,6 @@ unsafe extern "rust-preserve-none" fn cold_box_sub_loc<'a>(
     let code = ctx.code_ptr();
     let h = TABLE_NARROW.0[*code.add(next) as usize];
     become h(next, code, regs, v, ctx)
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn negate_cold<'a>(
-    ctx: &Ctx<'a>,
-    v: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let v = scope.handle(v);
-        match Object::to_numeric(vm, heap, state, v)? {
-            Some(n) => Ok(heap.new_number(-n)),
-            None => Ok(ctx.exception_word()),
-        }
-    })
-}
-
-/// The loose-compare cold body: `Ok(Some(bool))`, `Ok(None)` = threw.
-#[cold]
-#[inline(never)]
-unsafe fn compare_cold<'a>(
-    ctx: &Ctx<'a>,
-    cmp: u8,
-    lhs: Tagged<'_, Value>,
-    rhs: Tagged<'_, Value>,
-) -> Result<Option<bool>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Option<bool>, VmError> {
-        let x = scope.handle(lhs);
-        let y = scope.handle(rhs);
-        match cmp {
-            1 => {
-                // IsStrictEqual (ES 7.2.15): no coercion, ever
-                let b = Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
-                return Ok(Some(b));
-            }
-            0 => {
-                // IsLooselyEqual: object ↔ object compares by identity;
-                // object ↔ primitive coerces the object
-                let x_obj = Compare::is_object_operand(heap, x.as_tagged(heap));
-                let y_obj = Compare::is_object_operand(heap, y.as_tagged(heap));
-                if x_obj && y_obj {
-                    let b = Compare::strict_equal(heap, x.as_tagged(heap), y.as_tagged(heap));
-                    return Ok(Some(b));
-                }
-                let x = if x_obj {
-                    match Object::to_primitive(vm, heap, state, x, Hint::Default)? {
-                        Coercion::Threw => return Ok(None),
-                        Coercion::Value(v) => scope.handle(v),
-                    }
-                } else {
-                    x
-                };
-                let y = if y_obj {
-                    match Object::to_primitive(vm, heap, state, y, Hint::Default)? {
-                        Coercion::Threw => return Ok(None),
-                        Coercion::Value(v) => scope.handle(v),
-                    }
-                } else {
-                    y
-                };
-                let b = Compare::equal(heap, x.as_tagged(heap), y.as_tagged(heap))?;
-                return Ok(Some(b));
-            }
-            _ => {}
-        }
-        let x = match Object::to_primitive(vm, heap, state, x, Hint::Number)? {
-            Coercion::Threw => return Ok(None),
-            Coercion::Value(v) => scope.handle(v),
-        };
-        let y = match Object::to_primitive(vm, heap, state, y, Hint::Number)? {
-            Coercion::Threw => return Ok(None),
-            Coercion::Value(v) => scope.handle(v),
-        };
-        let b = match cmp {
-            2 => Compare::less_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-            3 => Compare::less_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-            4 => Compare::greater_than(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-            _ => Compare::greater_than_or_equal(heap, x.as_tagged(heap), y.as_tagged(heap))?,
-        };
-        Ok(Some(b))
-    })
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn named_load_cold<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    name_idx: usize,
-    fb_slot: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    let meta = ctx.meta(0);
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let recv = scope.handle(recv);
-        let name = scope.handle(
-            ctx.stack()
-                .callable(heap, &meta)
-                .as_ref()
-                .constant_slot_name(heap, name_idx),
-        );
-        // ES 20.2.5.8: a proxy receiver runs its `get` trap (with the
-        // proxy as `this`) instead of a descriptor walk. No IC update:
-        // traps are dynamic, a proxy map must never be cached as a field
-        // handler.
-        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
-            return match Proxy::get(vm, heap, state, recv, recv, name.erase()) {
-                Ok(Coercion::Threw) => Ok(ctx.exception_word()),
-                Ok(Coercion::Value(v)) => Ok(v),
-                Err(err) => Err(err),
-            };
-        }
-        enum Res<'s> {
-            Word(Handle<'s, Value>),
-            Getter(Handle<'s, Value>),
-        }
-        let res = match Lookup::load_outcome(heap, recv.as_tagged(heap), name.as_tagged(heap))? {
-            LoadOutcome::Value(v) => Res::Word(scope.handle(v)),
-            LoadOutcome::Getter(g) => Res::Getter(scope.handle(g)),
-        };
-        match res {
-            Res::Word(v) => {
-                InlineCache::update_load(
-                    heap,
-                    &scope,
-                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                    fb_slot,
-                    recv.as_tagged(heap)
-                        .as_heap_object()
-                        .map(|o| scope.handle(o)),
-                    scope.handle(name.as_tagged(heap).erase().as_name()),
-                    true,
-                );
-                Ok(v.as_tagged(heap).erase())
-            }
-            Res::Getter(getter) => {
-                let args = scope.stage(&[recv.as_tagged(heap).erase()]);
-                RuntimeContext::call(vm, heap, state, getter, args, None)
-            }
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn keyed_load_cold<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    key: Tagged<'_, Value>,
-    fb_slot: Option<usize>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let recv = scope.handle(recv);
-        let raw_key = scope.handle(key);
-        let key = match Object::to_property_key(vm, heap, state, raw_key) {
-            Ok(k) => k,
-            Err(err) => return Err(err),
-        };
-        let Some(key) = key else {
-            return Ok(ctx.exception_word());
-        };
-        let key = scope.handle(key);
-        // ES 20.2.5.8 (keyed form): the `get` trap with the coerced key.
-        // No IC update: traps are dynamic.
-        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
-            return match Proxy::get(vm, heap, state, recv, recv, key.erase()) {
-                Ok(Coercion::Threw) => Ok(ctx.exception_word()),
-                Ok(Coercion::Value(v)) => Ok(v),
-                Err(err) => Err(err),
-            };
-        }
-        let element_index = match Lookup::classify_key(heap, key.as_tagged(heap).erase()) {
-            Ok(Key::Element(i)) => Some(i),
-            _ => None,
-        };
-        if let Some(i) = element_index {
-            if let Some(fb) = fb_slot {
-                InlineCache::update_load_element(
-                    heap,
-                    &scope,
-                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                    fb,
-                    Some(recv),
-                    i,
-                );
-            }
-            if let Some(unit) = DenseString::index_element(heap, &scope, recv, key) {
-                return Ok(unit);
-            }
-        }
-        match Lookup::load_outcome_keyed(heap, recv.as_tagged(heap), key.as_tagged(heap))? {
-            LoadOutcome::Value(v) => Ok(v),
-            LoadOutcome::Getter(getter) => {
-                let getter = scope.handle(getter);
-                let args = scope.stage(&[recv.as_tagged(heap).erase()]);
-                RuntimeContext::call(vm, heap, state, getter, args, None)
-            }
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn keyed_load_imm_cold<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    idx: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let recv = scope.handle(recv);
-        let smi = Smi::new(idx as i64).into_tagged();
-        let key: Handle<'_, SlotName> = scope.handle(smi.as_name());
-        if let Some(unit) = DenseString::index_element(heap, &scope, recv, key) {
-            return Ok(unit);
-        }
-        match Lookup::load_outcome_keyed(heap, recv.as_tagged(heap), key.as_tagged(heap))? {
-            LoadOutcome::Value(v) => Ok(v),
-            LoadOutcome::Getter(getter) => {
-                let getter = scope.handle(getter);
-                let args = scope.stage(&[recv.as_tagged(heap).erase()]);
-                RuntimeContext::call(vm, heap, state, getter, args, None)
-            }
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn keyed_store_cold<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    key: Tagged<'_, Value>,
-    value: Tagged<'_, Value>,
-    fb_slot: Option<usize>,
-    semantics: StoreSemantics,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let recv = scope.handle(recv);
-        let raw_key = scope.handle(key);
-        let value = scope.handle(value);
-        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
-            let name = scope.handle(raw_key.as_tagged(heap).erase());
-            return match Proxy::set(vm, heap, state, recv, name, value, recv)? {
-                Coercion::Threw => Ok(ctx.exception_word()),
-                Coercion::Value(_) => Ok(value.as_tagged(heap).erase()),
-            };
-        }
-        let key = match Object::to_property_key(vm, heap, state, raw_key) {
-            Ok(k) => k,
-            Err(err) => return Err(err),
-        };
-        let Some(key) = key else {
-            return Ok(ctx.exception_word());
-        };
-        let key = scope.handle(key);
-        let name: Handle<'_, vm_core::SlotName> =
-            match Lookup::classify_key(heap, key.as_tagged(heap).erase())? {
-                Key::Element(i) => {
-                    if recv
-                        .as_tagged(heap)
-                        .as_heap_object()
-                        .is_some_and(|obj| obj.as_ref().is_array(heap))
-                    {
-                        let obj = scope
-                            .cast::<Object>(recv.as_tagged(heap))
-                            .expect("array receiver is an object");
-                        let grew = i >= obj.as_tagged(heap).as_ref().length();
-                        Object::store_array_element(heap, &scope, &obj, i, &value)?;
-                        if let Some(fb) = fb_slot {
-                            InlineCache::update_store_element(
-                                heap,
-                                &scope,
-                                ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                                fb,
-                                Some(recv),
-                                grew,
-                            );
-                        }
-                        return Ok(value.as_tagged(heap).erase());
-                    }
-                    scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
-                }
-                Key::Name(key) => scope.handle(key),
-            };
-        let outcome = recv.as_tagged(heap).erase().store_lookup(
-            heap,
-            &scope,
-            name.as_tagged(heap),
-            value.as_tagged(heap),
-            semantics,
-        )?;
-        match outcome {
-            StoreOutcome::Transition { receiver, name } => {
-                Object::add_own_property(
-                    heap,
-                    &scope,
-                    receiver,
-                    name,
-                    PropertyDescriptor::data(scope.handle(value.as_tagged(heap))),
-                )?;
-            }
-            StoreOutcome::CallSetter { setter } => {
-                let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                // a throwing setter routes the sentinel into `resume` ->
-                // `throw_dispatch`; the store never completes
-                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-            }
-            StoreOutcome::Done => {}
-        }
-        Ok(value.as_tagged(heap).erase())
-    })
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn global_load_cold<'a>(
-    ctx: &Ctx<'a>,
-    name_idx: usize,
-    fb_slot: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let global = heap.known().global_object;
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
-        match global.as_tagged(heap).lookup(heap, name.as_tagged(heap)) {
-            Lookup::Data { slot, .. } => {
-                let v = scope.handle(slot.get(heap));
-                InlineCache::update_load(
-                    heap,
-                    &scope,
-                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                    fb_slot,
-                    Some(scope.handle(global.as_tagged(heap))),
-                    scope.handle(name.as_tagged(heap).erase().as_name()),
-                    false,
-                );
-                Ok(v.as_tagged(heap).erase())
-            }
-            Lookup::Accessor { pair, .. } => {
-                let getter = scope.handle(pair.get.get(heap));
-                if getter.as_tagged(heap) == heap.known().undefined.as_tagged(heap) {
-                    // a setter-only accessor: the read yields undefined
-                    return Ok(ctx.undefined_word());
-                }
-                let args = scope.stage(&[global.as_tagged(heap).erase()]);
-                RuntimeContext::call(vm, heap, state, getter, args, None)
-            }
-            Lookup::NotFound => {
-                let text = name
-                    .as_tagged(heap)
-                    .erase()
-                    .get_as::<DenseString>()
-                    .map(|s| s.to_rust_string(heap))
-                    .unwrap_or_default();
-                let ex = Errors::not_defined(vm, heap, state, &text)
-                    .expect("error materialization must not fail");
-                state.set_pending_exception(ex);
-                Ok(ctx.exception_word())
-            }
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn store_named_cold<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    name_idx: usize,
-    fb_slot: usize,
-    value: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    // the store IC reads the accumulator from the cache slot
-    ctx.cache().acc_mut().store(value);
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let recv = scope.handle(recv);
-        let value = scope.handle(value);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
-
-        // ES 20.2.5.10: a proxy receiver runs its `set` trap; no IC
-        // update (dynamic traps must not be cached), and the probe is
-        // skipped entirely so an armed site never matches a proxy map.
-        if Proxy::is_proxy(heap, recv.as_tagged(heap)) {
-            return match Proxy::set(vm, heap, state, recv, name.erase(), value, recv)? {
-                Coercion::Threw => Ok(ctx.exception_word()),
-                Coercion::Value(_) => Ok(value.as_tagged(heap).erase()),
-            };
-        }
-
-        if let Some(hit) = InlineCache::try_store(
-            heap,
-            &scope,
-            ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-            fb_slot,
-            recv.erase(),
-            name,
-            &ctx.cache().acc_mut(),
-        ) {
-            return match hit {
-                StoreHit::Done => Ok(value.as_tagged(heap).erase()),
-                StoreHit::Setter(setter) => {
-                    let setter = scope.handle(setter);
-                    let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                    let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
-                    if ctx.is_throw(v) {
-                        return Ok(v);
-                    }
-                    Ok(value.as_tagged(heap).erase())
-                }
-            };
-        }
-
-        let prev = recv
-            .as_tagged(heap)
-            .as_heap_object()
-            .map(|o| scope.handle(o.as_ref().map_ref(heap)));
-        let outcome = recv.as_tagged(heap).erase().store_lookup(
-            heap,
-            &scope,
-            name.as_tagged(heap),
-            value.as_tagged(heap),
-            StoreSemantics::Shadow,
-        )?;
-        let kind = match outcome {
-            StoreOutcome::Done => StoreOutcomeKind::Done,
-            StoreOutcome::Transition { .. } => StoreOutcomeKind::Transition,
-            StoreOutcome::CallSetter { .. } => StoreOutcomeKind::CallSetter,
-        };
-        match outcome {
-            StoreOutcome::Transition { receiver, name } => {
-                Object::add_own_property(
-                    heap,
-                    &scope,
-                    receiver,
-                    name,
-                    PropertyDescriptor::data(scope.handle(value.as_tagged(heap))),
-                )?;
-                if let Some(prev) = prev {
-                    InlineCache::update_store(
-                        heap,
-                        &scope,
-                        ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                        fb_slot,
-                        recv.erase(),
-                        name,
-                        prev,
-                        kind,
-                    );
-                }
-            }
-            StoreOutcome::CallSetter { setter } => {
-                let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-                if let Some(prev) = prev {
-                    InlineCache::update_store(
-                        heap,
-                        &scope,
-                        ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                        fb_slot,
-                        recv.erase(),
-                        name,
-                        prev,
-                        kind,
-                    );
-                }
-            }
-            StoreOutcome::Done => {
-                if let Some(prev) = prev {
-                    InlineCache::update_store(
-                        heap,
-                        &scope,
-                        ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                        fb_slot,
-                        recv.erase(),
-                        name,
-                        prev,
-                        kind,
-                    );
-                }
-            }
-        }
-        Ok(value.as_tagged(heap).erase())
-    })
 }
 
 /// Outcome of a `Construct` fast-path attempt.
@@ -2179,66 +1590,6 @@ fn construct_cache_record(
     let callee_obj: Tagged<Object> =
         unsafe { Tagged::from_value_unchecked(callee.as_tagged(heap).raw()) };
     state.construct_cache_insert(heap, callee_obj, proto, offset, map);
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn construct_cold<'a>(
-    ctx: &Ctx<'a>,
-    callee: Tagged<'_, Value>,
-    args_base: i32,
-    count: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let callee = scope.handle(callee);
-        let Some(obj) = callee.as_tagged(heap).as_heap_object() else {
-            return Err(VmError::Type);
-        };
-        if !obj.as_ref().header.map.get(heap).kind().is_constructor() {
-            return Err(VmError::Type);
-        }
-        let meta = ctx.meta(0);
-        let args = ctx.stack().args(&meta, args_base, count);
-        if Proxy::is_proxy(heap, callee.as_tagged(heap)) {
-            return match Proxy::construct(vm, heap, state, callee, args, callee)? {
-                Coercion::Threw => Ok(ctx.exception_word()),
-                Coercion::Value(v) => Ok(v),
-            };
-        }
-        let callee = scope
-            .cast::<Object>(callee.as_tagged(heap))
-            .expect("constructible callee is an object");
-        let receiver =
-            match Object::create_construct_receiver_value(vm, heap, state, callee.erase()) {
-                Ok(Some(r)) => scope.handle(r),
-                Ok(None) => return Ok(ctx.exception_word()),
-                Err(err) => return Err(err),
-            };
-        let mut staged: Vec<Tagged<'_, Value>> = Vec::with_capacity(count + 1);
-        staged.push(receiver.as_tagged(heap).erase());
-        staged.extend(args.iter().map(|h| h.as_tagged(heap)));
-        let staged = scope.stage(&staged);
-        let result = scope.handle(RuntimeContext::call(
-            vm,
-            heap,
-            state,
-            callee.erase(),
-            staged,
-            Some(callee.erase()),
-        )?);
-        if result.as_tagged(heap) == ctx.exception_word() {
-            return Ok(ctx.exception_word());
-        }
-        let result = if Convert::is_primitive(heap, result.as_tagged(heap)) {
-            receiver.as_tagged(heap).erase()
-        } else {
-            result.as_tagged(heap).erase()
-        };
-        Ok(result)
-    })
 }
 
 #[cold]
@@ -2833,37 +2184,19 @@ unsafe extern "rust-preserve-none" fn throw_dispatch<'a>(
     _acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Tagged<'a, Value> {
-    let mut pc = fault_pc;
-    loop {
-        let handled = if ctx.state().termination().is_some() {
-            None
-        } else {
-            let meta = ctx.cache().frame_meta();
-            let callable = ctx.stack().callable_slot(&meta).get(ctx.heap());
-            callable
-                .as_heap_object()
-                .and_then(|obj| obj.as_ref().callable_info(ctx.heap()))
-                .and_then(|info| info.handlers.get(ctx.heap()))
-                .and_then(|handlers| handlers.as_ref().lookup(pc))
-        };
-        if let Some(handler_pc) = handled {
-            let ex = ctx
-                .state()
-                .take_pending_exception_tagged(ctx.heap())
-                .expect("pending exception must be set while unwinding");
+    match vm_core::interp::unwind(ctx, fault_pc) {
+        vm_core::interp::Unwind::Caught(ex) => {
+            // `unwind` parked the handler's entry in the cache pc; the
+            // walk itself never allocates, so the re-derived pointers
+            // are stable
+            let handler_pc = ctx.cache().pc();
             let code = ctx.code_ptr();
             let regs = ctx.regs_ptr();
             let op = unsafe { *code.add(handler_pc) } as usize;
             let h = TABLE_NARROW.0[op];
             become h(handler_pc, code, regs, ex, ctx)
         }
-        if ctx.cache().base() == ctx.base_anchor() {
-            return ctx.exception_word();
-        }
-        let meta = ctx.cache().frame_meta();
-        let caller = ctx.stack().pop_frame(&meta);
-        ctx.cache().load(ctx.stack(), caller, ctx.heap_mut());
-        pc = caller.handler_pc;
+        vm_core::interp::Unwind::Escaped => ctx.exception_word(),
     }
 }
 
@@ -2938,7 +2271,7 @@ unsafe extern "rust-preserve-none" fn cold_add<'a>(
 ) -> Tagged<'a, Value> {
     let (base, stride) = cold_layout(pc, code);
     let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = cold_try!(ctx, add_cold(ctx, lhs, acc));
+    let v = vm_core::cold::add(ctx, lhs, acc);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -2961,7 +2294,7 @@ unsafe extern "rust-preserve-none" fn cold_numeric<'a>(
         Opcode::Exp => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    let v = cold_try!(ctx, numeric_cold(ctx, lhs, acc, f));
+    let v = vm_core::cold::numeric(ctx, lhs, acc, f);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -2977,7 +2310,7 @@ unsafe extern "rust-preserve-none" fn cold_add_immediate<'a>(
     let (base, stride) = cold_layout(pc, code);
     let lhs = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let imm = Smi::new(signed::read(pc, code, base + stride, stride) as i64).into_tagged();
-    let v = cold_try!(ctx, add_cold(ctx, lhs, imm));
+    let v = vm_core::cold::add(ctx, lhs, imm);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3001,7 +2334,7 @@ unsafe extern "rust-preserve-none" fn cold_numeric_immediate<'a>(
         Opcode::ExpImmediate => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    let v = cold_try!(ctx, numeric_cold(ctx, lhs, imm, f));
+    let v = vm_core::cold::numeric(ctx, lhs, imm, f);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3014,7 +2347,7 @@ unsafe extern "rust-preserve-none" fn cold_negate<'a>(
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
 ) -> Tagged<'a, Value> {
-    let v = cold_try!(ctx, negate_cold(ctx, acc));
+    let v = vm_core::cold::negate(ctx, acc);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3094,9 +2427,9 @@ unsafe fn loc_op_cold<'a>(
     let lhs = reg_read(regs, ctx.heap(), dst);
     let rhs = reg_read(regs, ctx.heap(), src);
     let v = if sub {
-        numeric_cold(ctx, lhs, rhs, |a, b| a - b)?
+        vm_core::cold::numeric(ctx, lhs, rhs, |a, b| a - b)
     } else {
-        add_cold(ctx, lhs, rhs)?
+        vm_core::cold::add(ctx, lhs, rhs)
     };
     if !ctx.is_throw(v) {
         reg_write(regs, dst, v);
@@ -3147,32 +2480,8 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(ctx, keyed_load_cold(ctx, recv, key, Some(fb)));
+    let v = vm_core::cold::keyed_load(ctx, recv, key, Some(fb));
     become resume(pc, code, regs, v, ctx)
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn compare_op_cold<'a>(
-    ctx: &Ctx<'a>,
-    cmp: u8,
-    acc: Tagged<'_, Value>,
-    other: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
-        (Some(a), Some(b)) => Some(match cmp {
-            0 => a == b,
-            2 => a < b,
-            3 => a <= b,
-            4 => a > b,
-            _ => a >= b,
-        }),
-        _ => compare_cold(ctx, cmp, acc, other)?,
-    };
-    let Some(b) = b else {
-        return Ok(ctx.exception_word());
-    };
-    Ok(Convert::boolean(ctx.heap(), b))
 }
 
 #[cold]
@@ -3186,7 +2495,7 @@ unsafe extern "rust-preserve-none" fn cold_equal<'a>(
 ) -> Tagged<'a, Value> {
     let (base, stride) = cold_layout(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = cold_try!(ctx, compare_op_cold(ctx, 0, acc, other));
+    let v = vm_core::cold::compare(ctx, 0, acc, other);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3201,7 +2510,7 @@ unsafe extern "rust-preserve-none" fn cold_less_than<'a>(
 ) -> Tagged<'a, Value> {
     let (base, stride) = cold_layout(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = cold_try!(ctx, compare_op_cold(ctx, 2, acc, other));
+    let v = vm_core::cold::compare(ctx, 2, acc, other);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3216,7 +2525,7 @@ unsafe extern "rust-preserve-none" fn cold_greater_than<'a>(
 ) -> Tagged<'a, Value> {
     let (base, stride) = cold_layout(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = cold_try!(ctx, compare_op_cold(ctx, 4, acc, other));
+    let v = vm_core::cold::compare(ctx, 4, acc, other);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3237,20 +2546,20 @@ unsafe extern "rust-preserve-none" fn cold_compare_jump<'a>(
     let other = reg_read(regs, ctx.heap(), r);
     let cmp = (kind / 2) as u8;
     let b = match (Convert::as_number(acc), Convert::as_number(other)) {
-        (Some(a), Some(b)) => Some(match cmp {
+        (Some(a), Some(b)) => match cmp {
             0 | 1 => a == b,
             2 => a < b,
             3 => a <= b,
             4 => a > b,
             _ => a >= b,
-        }),
-        _ => match compare_cold(ctx, cmp, acc, other) {
-            Ok(v) => v,
-            Err(err) => return ctx.raise_tag(err),
         },
-    };
-    let Some(b) = b else {
-        become resume(pc, code, regs, ctx.exception_word(), ctx)
+        _ => {
+            let v = vm_core::cold::compare(ctx, cmp, acc, other);
+            if ctx.is_throw(v) {
+                become resume(pc, code, regs, v, ctx)
+            }
+            Convert::is_truthy(ctx.heap(), v)
+        }
     };
     let boolean = Convert::boolean(ctx.heap(), b);
     let dest = if b != (kind % 2 == 1) {
@@ -3278,7 +2587,7 @@ unsafe extern "rust-preserve-none" fn cold_named_load<'a>(
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let name_idx = unsigned::read(pc, code, base + stride, stride);
     let fb_slot = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(ctx, named_load_cold(ctx, recv, name_idx, fb_slot));
+    let v = vm_core::cold::named_load(ctx, recv, name_idx, fb_slot);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3294,7 +2603,7 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load<'a>(
     let (base, stride) = cold_layout(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let fb = unsigned::read(pc, code, base + stride, stride);
-    let v = cold_try!(ctx, keyed_load_cold(ctx, recv, acc, Some(fb)));
+    let v = vm_core::cold::keyed_load(ctx, recv, acc, Some(fb));
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3310,7 +2619,7 @@ unsafe extern "rust-preserve-none" fn cold_keyed_load_imm<'a>(
     let (base, stride) = cold_layout(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let idx = unsigned::read(pc, code, base + stride, stride);
-    let v = cold_try!(ctx, keyed_load_imm_cold(ctx, recv, idx));
+    let v = vm_core::cold::keyed_load_imm(ctx, recv, idx);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3331,10 +2640,7 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(
-        ctx,
-        keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)
-    );
+    let v = vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3355,10 +2661,7 @@ unsafe extern "rust-preserve-none" fn cold_keyed_store_no_shadow<'a>(
         signed::read(pc, code, base + stride, stride),
     );
     let fb = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(
-        ctx,
-        keyed_store_cold(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
-    );
+    let v = vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3374,7 +2677,7 @@ unsafe extern "rust-preserve-none" fn cold_global_load<'a>(
     let (base, stride) = cold_layout(pc, code);
     let name_idx = unsigned::read(pc, code, base, stride);
     let fb_slot = unsigned::read(pc, code, base + stride, stride);
-    let v = cold_try!(ctx, global_load_cold(ctx, name_idx, fb_slot));
+    let v = vm_core::cold::global_load(ctx, name_idx, fb_slot, true);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -3391,7 +2694,7 @@ unsafe extern "rust-preserve-none" fn cold_store_named<'a>(
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let name_idx = unsigned::read(pc, code, base + stride, stride);
     let fb_slot = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(ctx, store_named_cold(ctx, recv, name_idx, fb_slot, acc));
+    let v = vm_core::cold::store_named(ctx, recv, name_idx, fb_slot, acc);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -4003,7 +3306,7 @@ unsafe extern "rust-preserve-none" fn cold_construct<'a>(
     let callee = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let args_base = signed::read(pc, code, base + stride, stride);
     let count = unsigned::read(pc, code, base + 2 * stride, stride);
-    let v = cold_try!(ctx, construct_cold(ctx, callee, args_base, count));
+    let v = vm_core::cold::construct(ctx, callee, args_base, count);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -4130,51 +3433,8 @@ unsafe extern "rust-preserve-none" fn cold_less_than_or_equal<'a>(
 ) -> Tagged<'a, Value> {
     let (base, stride) = cold_layout(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = cold_try!(ctx, compare_op_cold(ctx, 3, acc, other));
+    let v = vm_core::cold::compare(ctx, 3, acc, other);
     become resume(pc, code, regs, v, ctx)
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn global_load_nothrow_cold<'a>(
-    ctx: &Ctx<'a>,
-    name_idx: usize,
-    fb_slot: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let global = heap.known().global_object;
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
-        match global.as_tagged(heap).lookup(heap, name.as_tagged(heap)) {
-            Lookup::Data { slot, .. } => {
-                let v = scope.handle(slot.get(heap));
-                InlineCache::update_load(
-                    heap,
-                    &scope,
-                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
-                    fb_slot,
-                    Some(scope.handle(global.as_tagged(heap))),
-                    scope.handle(name.as_tagged(heap).erase().as_name()),
-                    false,
-                );
-                Ok(v.as_tagged(heap).erase())
-            }
-            Lookup::Accessor { pair, .. } => {
-                let getter = scope.handle(pair.get.get(heap));
-                let args = scope.stage(&[global.as_tagged(heap).erase()]);
-                RuntimeContext::call(vm, heap, state, getter, args, None)
-            }
-            Lookup::NotFound => Ok(heap.known().undefined.as_tagged(heap).erase()),
-        }
-    })
 }
 
 #[cold]
@@ -4189,58 +3449,8 @@ unsafe extern "rust-preserve-none" fn cold_global_load_nothrow<'a>(
     let (base, stride) = cold_layout(pc, code);
     let name_idx = unsigned::read(pc, code, base, stride);
     let fb_slot = unsigned::read(pc, code, base + stride, stride);
-    let v = cold_try!(ctx, global_load_nothrow_cold(ctx, name_idx, fb_slot));
+    let v = vm_core::cold::global_load(ctx, name_idx, fb_slot, false);
     become resume(pc, code, regs, v, ctx)
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn store_global_cold<'a>(
-    ctx: &Ctx<'a>,
-    name_idx: usize,
-    value: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let value = scope.handle(value);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
-        let global = heap.known().global_object;
-        let outcome = global.as_tagged(heap).erase().store_lookup(
-            heap,
-            &scope,
-            name.as_tagged(heap),
-            value.as_tagged(heap),
-            StoreSemantics::WriteThrough,
-        )?;
-        match outcome {
-            StoreOutcome::Transition { receiver, name } => {
-                Object::add_own_property(
-                    heap,
-                    &scope,
-                    receiver,
-                    name,
-                    PropertyDescriptor::data(scope.handle(value.as_tagged(heap))),
-                )?;
-            }
-            StoreOutcome::CallSetter { setter } => {
-                let args = scope.stage(&[global.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-            }
-            StoreOutcome::Done => {}
-        }
-        Ok(value.as_tagged(heap).erase())
-    })
 }
 
 #[cold]
@@ -4254,61 +3464,8 @@ unsafe extern "rust-preserve-none" fn cold_store_global<'a>(
 ) -> Tagged<'a, Value> {
     let (base, stride) = cold_layout(pc, code);
     let name_idx = unsigned::read(pc, code, base, stride);
-    let v = cold_try!(ctx, store_global_cold(ctx, name_idx, acc));
+    let v = vm_core::cold::store_global(ctx, name_idx, acc);
     become resume(pc, code, regs, v, ctx)
-}
-
-#[cold]
-#[inline(never)]
-unsafe fn store_named_no_shadow_cold<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    name_idx: usize,
-    value: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = ctx.heap_mut();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let recv = scope.handle(recv);
-        let value = scope.handle(value);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
-        let outcome = recv.as_tagged(heap).erase().store_lookup(
-            heap,
-            &scope,
-            name.as_tagged(heap),
-            value.as_tagged(heap),
-            StoreSemantics::WriteThrough,
-        )?;
-        match outcome {
-            StoreOutcome::Transition { receiver, name } => {
-                Object::add_own_property(
-                    heap,
-                    &scope,
-                    receiver,
-                    name,
-                    PropertyDescriptor::data(scope.handle(value.as_tagged(heap))),
-                )?;
-            }
-            StoreOutcome::CallSetter { setter } => {
-                let args = scope.stage(&[recv.as_tagged(heap).erase(), value.as_tagged(heap)]);
-                // a throwing setter routes the sentinel into `resume` ->
-                // `throw_dispatch`; the store never completes
-                let v = RuntimeContext::call(vm, heap, state, setter, args, None)?;
-                if ctx.is_throw(v) {
-                    return Ok(v);
-                }
-            }
-            StoreOutcome::Done => {}
-        }
-        Ok(value.as_tagged(heap).erase())
-    })
 }
 
 #[cold]
@@ -4323,7 +3480,7 @@ unsafe extern "rust-preserve-none" fn cold_store_named_no_shadow<'a>(
     let (base, stride) = cold_layout(pc, code);
     let recv = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
     let name_idx = unsigned::read(pc, code, base + stride, stride);
-    let v = cold_try!(ctx, store_named_no_shadow_cold(ctx, recv, name_idx, acc));
+    let v = vm_core::cold::store_named_no_shadow(ctx, recv, name_idx, acc);
     become resume(pc, code, regs, v, ctx)
 }
 
@@ -4373,7 +3530,7 @@ unsafe extern "rust-preserve-none" fn cold_greater_than_or_equal<'a>(
 ) -> Tagged<'a, Value> {
     let (base, stride) = cold_layout(pc, code);
     let other = reg_read(regs, ctx.heap(), signed::read(pc, code, base, stride));
-    let v = cold_try!(ctx, compare_op_cold(ctx, 5, acc, other));
+    let v = vm_core::cold::compare(ctx, 5, acc, other);
     become resume(pc, code, regs, v, ctx)
 }
 

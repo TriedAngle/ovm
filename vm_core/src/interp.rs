@@ -209,3 +209,52 @@ impl<'a> Ctx<'a> {
         }
     }
 }
+
+/// The exception-dispatch result: a handler was found (the cache's pc
+/// already points at it, the exception rides in `Caught`) or the
+/// exception escaped this execution.
+pub enum Unwind<'a> {
+    Caught(Tagged<'a, Value>),
+    Escaped,
+}
+
+/// Search the handler tables from the faulting frame outward, popping
+/// frames until a catch handler covers `fault_pc` or the execution's
+/// base anchor escapes. On `Caught`, the cache's pc is the
+/// handler's entry and the accumulator must become the exception; the
+/// pending exception is consumed.
+#[cold]
+#[inline(never)]
+pub unsafe fn unwind<'a>(ctx: &Ctx<'a>, fault_pc: usize) -> Unwind<'a> {
+    let mut pc = fault_pc;
+    loop {
+        let handled = if ctx.state().termination().is_some() {
+            // A termination is not an exception: no handler (catch or
+            // finally in any frame) may observe or intercept it.
+            None
+        } else {
+            let meta = ctx.cache().frame_meta();
+            let callable = ctx.stack().callable_slot(&meta).get(ctx.heap());
+            callable
+                .as_heap_object()
+                .and_then(|obj| obj.as_ref().callable_info(ctx.heap()))
+                .and_then(|info| info.handlers.get(ctx.heap()))
+                .and_then(|handlers| handlers.as_ref().lookup(pc))
+        };
+        if let Some(handler_pc) = handled {
+            let ex = ctx
+                .state()
+                .take_pending_exception_tagged(ctx.heap())
+                .expect("pending exception must be set while unwinding");
+            ctx.cache().set_pc(handler_pc);
+            return Unwind::Caught(ex);
+        }
+        if ctx.cache().base() == ctx.base_anchor() {
+            return Unwind::Escaped;
+        }
+        let meta = ctx.cache().frame_meta();
+        let caller = ctx.stack().pop_frame(&meta);
+        unsafe { ctx.cache().load(ctx.stack(), caller, ctx.heap_mut()) };
+        pc = caller.handler_pc;
+    }
+}
