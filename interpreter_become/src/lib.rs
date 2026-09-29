@@ -2711,133 +2711,6 @@ enum MethodCall<'a> {
     Intrinsic(vm_core::Intrinsic),
 }
 
-struct CallHit<'a> {
-    target: Tagged<'a, Object>,
-    info: Tagged<'a, CallableInfoObject>,
-    context: Tagged<'a, Context>,
-    register_count: usize,
-    formal_min: usize,
-    kind: FunctionKind,
-}
-
-enum CallProbe<'a> {
-    Bytecode(CallHit<'a>),
-    Runtime(usize),
-    Intrinsic(vm_core::Intrinsic),
-    Miss,
-}
-
-const CALL_TAG_RUNTIME: i64 = 1;
-
-/// Decode the packed callable descriptor: `register_count | formal_min<<16
-/// | kind<<32` (mirrors `Object::call_target`).
-#[inline(always)]
-fn decode_descriptor(desc: i64) -> (usize, usize, FunctionKind) {
-    let desc = desc as u64;
-    (
-        (desc & 0xffff) as usize,
-        ((desc >> 16) & 0xffff) as usize,
-        FunctionKind::decode(((desc >> 32) & 0xf) as i64),
-    )
-}
-
-#[inline(always)]
-unsafe fn call_ic_probe<'a>(ctx: &Ctx<'a>, fb: usize, callee: Tagged<'a, Value>) -> CallProbe<'a> {
-    let heap = ctx.heap();
-    let Some(vector) = ctx.cache().feedback_ref(heap) else {
-        return CallProbe::Miss;
-    };
-    let state = vector.as_ref().slot(fb).get(heap);
-    if !state.raw().is_weak_ptr() || !state.ptr_eq(callee) {
-        return CallProbe::Miss;
-    }
-    let payload = vector.as_ref().slot(fb + 1).get(heap);
-    let raw = payload.raw();
-    if let Some(tag) = Smi::decode(raw) {
-        // runtime/intrinsic callee: decode the index off the object
-        if tag.value() != CALL_TAG_RUNTIME {
-            return CallProbe::Miss;
-        }
-        let Some(obj) = callee.as_heap_object() else {
-            return CallProbe::Miss;
-        };
-        return match obj.as_ref().runtime_call_target(heap) {
-            Some(CallTarget::Runtime(idx)) => CallProbe::Runtime(idx),
-            Some(CallTarget::Intrinsic(i)) => CallProbe::Intrinsic(i),
-            _ => CallProbe::Miss,
-        };
-    }
-
-    let info: Tagged<'a, CallableInfoObject> = unsafe { core::mem::transmute(raw) };
-    let (register_count, formal_min, kind) =
-        decode_descriptor(info.as_ref().descriptor.to_smi_unchecked().value());
-    // Safety: a bytecode callable's slots are `[info, context]` by layout.
-    let obj: Tagged<'a, Object> = unsafe { core::mem::transmute(callee.raw()) };
-    let context = obj.as_ref().slot(heap, 1).get(heap);
-    let context: Tagged<'a, Context> = unsafe { core::mem::transmute(context.raw()) };
-    CallProbe::Bytecode(CallHit {
-        target: unsafe { core::mem::transmute(callee.raw()) },
-        info,
-        context,
-        register_count,
-        formal_min,
-        kind,
-    })
-}
-
-#[inline(always)]
-unsafe fn call_ic_update<'a>(
-    ctx: &Ctx<'a>,
-    fb: usize,
-    callee: Tagged<'a, Value>,
-    info: Option<Tagged<'a, CallableInfoObject>>,
-) {
-    let heap = ctx.heap();
-    let Some(vector) = ctx.cache().feedback_ref(heap) else {
-        return;
-    };
-    let Some((state_slot, tag_slot)) = vector.as_ref().site(fb) else {
-        return;
-    };
-    let host = vector.erase();
-    if state_slot.is_cleared() {
-        // a collected weak entry leaves the site free to become monomorphic
-        // again
-    } else {
-        let state = state_slot.get(heap);
-        if state.raw().is_strong_ptr() {
-            let hole = heap.known().the_hole.as_tagged(heap).erase();
-            if !state.ptr_eq(hole) {
-                // megamorphic: leave it alone
-                return;
-            }
-        } else if !state.ptr_eq(callee) {
-            let same_code = match (state.as_strong().and_then(|c| c.as_heap_object()), info) {
-                (Some(old), Some(info)) => old
-                    .as_ref()
-                    .callable_info(heap)
-                    .is_some_and(|old_info| old_info.ptr_eq(info)),
-                _ => false,
-            };
-            if !same_code {
-                vector.as_ref().set_megamorphic(heap, fb);
-                return;
-            }
-        }
-    }
-    state_slot.set_weak(heap, host, callee);
-    match info {
-        // bytecode: the payload IS the resolved info
-        Some(info) => tag_slot.set_strong(heap, host, info.erase()),
-        // runtime/intrinsic callee
-        None => tag_slot.set(
-            heap,
-            host,
-            Smi::new(CALL_TAG_RUNTIME).into_tagged().as_maybe_weak(),
-        ),
-    }
-}
-
 #[inline(always)]
 unsafe fn dispatch_runtime_method<'a>(
     ctx: &Ctx<'a>,
@@ -3032,8 +2905,13 @@ unsafe fn call_method_start<'a>(
     srcs: &[i32],
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match call_ic_probe(ctx, fb, callee_word) {
-        CallProbe::Bytecode(CallHit {
+    match vm_core::ic::call_probe(
+        ctx.heap(),
+        ctx.cache().feedback_ref(ctx.heap()),
+        fb,
+        callee_word,
+    ) {
+        vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
             target,
             info,
             context,
@@ -3056,9 +2934,11 @@ unsafe fn call_method_start<'a>(
                 srcs,
             )
         }
-        CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs))),
-        CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        CallProbe::Miss => cold_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
+        vm_core::ic::CallProbe::Runtime(idx) => {
+            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
+        }
+        vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
+        vm_core::ic::CallProbe::Miss => cold_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
     }
 }
 
@@ -3076,11 +2956,23 @@ unsafe fn cold_call_method_miss<'a>(
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(idx)) => {
-            call_ic_update(ctx, fb, callee_word, None);
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                None,
+            );
             Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
         }
         Some(CallTarget::Intrinsic(i)) => {
-            call_ic_update(ctx, fb, callee_word, None);
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                None,
+            );
             Ok(MethodCall::Intrinsic(i))
         }
         Some(CallTarget::Bytecode {
@@ -3094,7 +2986,13 @@ unsafe fn cold_call_method_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
-            call_ic_update(ctx, fb, callee_word, Some(info));
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                Some(info),
+            );
             push_scattered_method_frame(
                 ctx,
                 pc,
@@ -3119,8 +3017,13 @@ unsafe fn call_function_start<'a>(
     args: &[i32],
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match call_ic_probe(ctx, fb, callee_word) {
-        CallProbe::Bytecode(CallHit {
+    match vm_core::ic::call_probe(
+        ctx.heap(),
+        ctx.cache().feedback_ref(ctx.heap()),
+        fb,
+        callee_word,
+    ) {
+        vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
             target,
             info,
             context,
@@ -3143,9 +3046,13 @@ unsafe fn call_function_start<'a>(
                 args,
             )
         }
-        CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args))),
-        CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        CallProbe::Miss => cold_call_function_miss(ctx, pc, size, callee_word, args, fb),
+        vm_core::ic::CallProbe::Runtime(idx) => {
+            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
+        }
+        vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
+        vm_core::ic::CallProbe::Miss => {
+            cold_call_function_miss(ctx, pc, size, callee_word, args, fb)
+        }
     }
 }
 
@@ -3163,11 +3070,23 @@ unsafe fn cold_call_function_miss<'a>(
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(idx)) => {
-            call_ic_update(ctx, fb, callee_word, None);
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                None,
+            );
             Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
         }
         Some(CallTarget::Intrinsic(i)) => {
-            call_ic_update(ctx, fb, callee_word, None);
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                None,
+            );
             Ok(MethodCall::Intrinsic(i))
         }
         Some(CallTarget::Bytecode {
@@ -3181,7 +3100,13 @@ unsafe fn cold_call_function_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
-            call_ic_update(ctx, fb, callee_word, Some(info));
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                Some(info),
+            );
             push_function_frame(
                 ctx,
                 pc,
@@ -3208,8 +3133,13 @@ unsafe fn call_start<'a>(
     count: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match call_ic_probe(ctx, fb, callee_word) {
-        CallProbe::Bytecode(CallHit {
+    match vm_core::ic::call_probe(
+        ctx.heap(),
+        ctx.cache().feedback_ref(ctx.heap()),
+        fb,
+        callee_word,
+    ) {
+        vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
             target,
             info,
             context,
@@ -3233,11 +3163,11 @@ unsafe fn call_start<'a>(
                 count,
             )
         }
-        CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
+        vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
             ctx, idx, base, count,
         ))),
-        CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        CallProbe::Miss => cold_call_miss(ctx, pc, size, callee_word, base, count, fb),
+        vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
+        vm_core::ic::CallProbe::Miss => cold_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
 }
 
@@ -3256,13 +3186,25 @@ unsafe fn cold_call_miss<'a>(
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(idx)) => {
-            call_ic_update(ctx, fb, callee_word, None);
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                None,
+            );
             Ok(MethodCall::Value(dispatch_runtime_contiguous(
                 ctx, idx, base, count,
             )))
         }
         Some(CallTarget::Intrinsic(i)) => {
-            call_ic_update(ctx, fb, callee_word, None);
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                None,
+            );
             Ok(MethodCall::Intrinsic(i))
         }
         Some(CallTarget::Bytecode {
@@ -3276,7 +3218,13 @@ unsafe fn cold_call_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
-            call_ic_update(ctx, fb, callee_word, Some(info));
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.cache().feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                Some(info),
+            );
             push_contiguous_frame(
                 ctx,
                 pc,

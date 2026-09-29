@@ -17,6 +17,7 @@ bytecode = { path = "../bytecode" }
 js_compiler = { path = "../js_compiler" }
 kette_compiler = { path = "../kette_compiler" }
 mark_sweep = { path = "../collectors/mark_sweep" }
+dummy_heap = { path = "../collectors/dummy_heap" }
 trace = { path = "../trace" }
 interpreter_become = { path = "../interpreter_become", optional = true }
 

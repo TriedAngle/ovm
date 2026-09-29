@@ -1,6 +1,7 @@
 use crate::{
-    Acc, AccessorPair, DenseString, FeedbackVector, FixedArray, Handle, HandleScope, Heap, Map,
-    MaybeWeak, Object, SlotName, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
+    Acc, AccessorPair, CallTarget, CallableInfoObject, Context, DenseString, FeedbackVector,
+    FixedArray, FunctionKind, Handle, HandleScope, Heap, Intrinsic, Map, MaybeWeak, Object,
+    SlotName, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
@@ -1465,4 +1466,167 @@ fn update_poly(
     vector
         .as_tagged(heap)
         .set_poly(heap, slot, arr.as_tagged(heap));
+}
+
+// ---------------------------------------------------------------------------
+// Call-site inline cache
+//
+// Each Call* bytecode carries a feedback-vector slot pair: slot N holds a
+// weak reference to the callee, slot N+1 the payload — the callee's
+// resolved `CallableInfoObject` (pre-decoded register count, formal
+// minimum, function kind) for bytecode callees, or the Smi
+// `CALL_TAG_RUNTIME` marking a runtime/intrinsic callee. Sites are
+// monomorphic-or-megamorphic: a second, unrelated callee permanently
+// disables the site.
+// ---------------------------------------------------------------------------
+
+/// The Smi payload marking a runtime/intrinsic callee.
+pub const CALL_TAG_RUNTIME: i64 = 1;
+
+/// A monomorphic bytecode-callee hit: everything a frame push needs,
+/// pre-decoded.
+pub struct CallHit<'a> {
+    pub target: Tagged<'a, Object>,
+    pub info: Tagged<'a, CallableInfoObject>,
+    pub context: Tagged<'a, Context>,
+    pub register_count: usize,
+    pub formal_min: usize,
+    pub kind: FunctionKind,
+}
+
+pub enum CallProbe<'a> {
+    Bytecode(CallHit<'a>),
+    Runtime(usize),
+    Intrinsic(Intrinsic),
+    Miss,
+}
+
+/// Decode the packed callable descriptor: `register_count | formal_min<<16
+/// | kind<<32` (mirrors `Object::call_target`).
+#[inline(always)]
+fn decode_descriptor(desc: i64) -> (usize, usize, FunctionKind) {
+    let desc = desc as u64;
+    (
+        (desc & 0xffff) as usize,
+        ((desc >> 16) & 0xffff) as usize,
+        FunctionKind::decode(((desc >> 32) & 0xf) as i64),
+    )
+}
+
+/// Probe a call site: a weak-callee match returns the pre-decoded hit (or
+/// the runtime/intrinsic index); anything else is a miss for the generic
+/// call path to handle and record.
+///
+/// Safety: `vector`/`callee` must be valid for the `heap` borrow; the
+/// returned borrows are anchored to it. The call never allocates.
+#[inline(always)]
+#[allow(unused_unsafe)]
+pub unsafe fn call_probe<'a>(
+    heap: &Heap,
+    vector: Option<Tagged<'a, FeedbackVector>>,
+    fb: usize,
+    callee: Tagged<'a, Value>,
+) -> CallProbe<'a> {
+    unsafe {
+        let Some(vector) = vector else {
+            return CallProbe::Miss;
+        };
+        let state = vector.as_ref().slot(fb).get(heap);
+        if !state.raw().is_weak_ptr() || !state.ptr_eq(callee) {
+            return CallProbe::Miss;
+        }
+        let payload = vector.as_ref().slot(fb + 1).get(heap);
+        let raw = payload.raw();
+        if let Some(tag) = Smi::decode(raw) {
+            // runtime/intrinsic callee: decode the index off the object
+            if tag.value() != CALL_TAG_RUNTIME {
+                return CallProbe::Miss;
+            }
+            let Some(obj) = callee.as_heap_object() else {
+                return CallProbe::Miss;
+            };
+            return match obj.as_ref().runtime_call_target(heap) {
+                Some(CallTarget::Runtime(idx)) => CallProbe::Runtime(idx),
+                Some(CallTarget::Intrinsic(i)) => CallProbe::Intrinsic(i),
+                _ => CallProbe::Miss,
+            };
+        }
+
+        let info: Tagged<'a, CallableInfoObject> = core::mem::transmute(raw);
+        let (register_count, formal_min, kind) =
+            decode_descriptor(info.as_ref().descriptor.to_smi_unchecked().value());
+        // Safety: a bytecode callable's slots are `[info, context]` by layout.
+        let obj: Tagged<'a, Object> = core::mem::transmute(callee.raw());
+        let context = obj.as_ref().slot(heap, 1).get(heap);
+        let context: Tagged<'a, Context> = core::mem::transmute(context.raw());
+        CallProbe::Bytecode(CallHit {
+            target: core::mem::transmute(callee.raw()),
+            info,
+            context,
+            register_count,
+            formal_min,
+            kind,
+        })
+    }
+}
+
+/// Record a call site's callee after the generic path resolved it: re-arm
+/// a cleared weak entry, flip the site megamorphic on an unrelated second
+/// callee, and keep it monomorphic across closures sharing the same
+/// `CallableInfoObject`.
+///
+/// Safety: `vector`/`callee` must be valid for the `heap` borrow.
+#[allow(unused_unsafe)]
+pub unsafe fn call_update(
+    heap: &Heap,
+    vector: Option<Tagged<FeedbackVector>>,
+    fb: usize,
+    callee: Tagged<'_, Value>,
+    info: Option<Tagged<'_, CallableInfoObject>>,
+) {
+    unsafe {
+        let Some(vector) = vector else {
+            return;
+        };
+        let Some((state_slot, tag_slot)) = vector.as_ref().site(fb) else {
+            return;
+        };
+        let host = vector.erase();
+        if state_slot.is_cleared() {
+            // a collected weak entry leaves the site free to become
+            // monomorphic again
+        } else {
+            let state = state_slot.get(heap);
+            if state.raw().is_strong_ptr() {
+                let hole = heap.known().the_hole.as_tagged(heap).erase();
+                if !state.ptr_eq(hole) {
+                    // megamorphic: leave it alone
+                    return;
+                }
+            } else if !state.ptr_eq(callee) {
+                let same_code = match (state.as_strong().and_then(|c| c.as_heap_object()), info) {
+                    (Some(old), Some(info)) => old
+                        .as_ref()
+                        .callable_info(heap)
+                        .is_some_and(|old_info| old_info.ptr_eq(info)),
+                    _ => false,
+                };
+                if !same_code {
+                    vector.as_ref().set_megamorphic(heap, fb);
+                    return;
+                }
+            }
+        }
+        state_slot.set_weak(heap, host, callee);
+        match info {
+            // bytecode: the payload IS the resolved info
+            Some(info) => tag_slot.set_strong(heap, host, info.erase()),
+            // runtime/intrinsic callee
+            None => tag_slot.set(
+                heap,
+                host,
+                Smi::new(CALL_TAG_RUNTIME).into_tagged().as_maybe_weak(),
+            ),
+        }
+    }
 }
