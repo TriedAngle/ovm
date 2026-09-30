@@ -24,9 +24,6 @@ pub struct Ctx<'a> {
     /// the execution instead of unwinding into a caller.
     base_anchor: usize,
     safepoints: Cell<u32>,
-    /// numeric result parked between an arithmetic fast path and the
-    /// boxing continuation (which must allocate, so it is out of line)
-    num: Cell<f64>,
     /// Machine-stack limit for the call paths (one Rust frame per JS
     /// call): a call below this raises StackOverflow. Recomputed at
     /// each `enter` from the current SP — nested enters only deepen it.
@@ -54,14 +51,13 @@ impl<'a> Ctx<'a> {
             state: state as *const ContextState,
             base_anchor,
             safepoints: Cell::new(SAFEPOINT_INTERVAL),
-            num: Cell::new(0.0),
             stack_limit,
             _heap: PhantomData,
         }
     }
 
     /// A nested context for a callee frame sharing this execution's
-    /// borrows and machine-stack limit (a fresh safepoint/num cell each).
+    /// borrows and machine-stack limit (a fresh safepoint cell each).
     ///
     /// Safety: same borrow validity as `self`; `base_anchor` must be the
     /// callee's frame.
@@ -73,7 +69,6 @@ impl<'a> Ctx<'a> {
             state: self.state,
             base_anchor,
             safepoints: Cell::new(SAFEPOINT_INTERVAL),
-            num: Cell::new(0.0),
             stack_limit: self.stack_limit,
             _heap: PhantomData,
         }
@@ -92,16 +87,6 @@ impl<'a> Ctx<'a> {
     #[inline(always)]
     pub unsafe fn heap_mut(&self) -> &'a mut Heap {
         unsafe { &mut *self.heap }
-    }
-
-    #[inline(always)]
-    pub fn set_num(&self, f: f64) {
-        self.num.set(f);
-    }
-
-    #[inline(always)]
-    pub fn num(&self) -> f64 {
-        self.num.get()
     }
 
     #[inline(always)]
