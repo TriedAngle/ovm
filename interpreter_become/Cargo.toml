@@ -15,4 +15,6 @@ mark_sweep = { path = "../collectors/mark_sweep" }
 interpreter_match_loop = { path = "../interpreter_match_loop" }
 
 [features]
+default = ["star_fusion"]
+star_fusion = []
 stress-minor-gc = ["vm_core/stress-minor-gc"]

@@ -6,3 +6,4 @@ Cargo.lock
 tmp/
 # Local benchmark results (regenerated per run)
 benchmarks/BENCHMARKS.md
+.vscode

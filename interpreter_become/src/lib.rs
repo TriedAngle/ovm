@@ -16,6 +16,8 @@ use vm_core::{
     VmError, spread_apply_args,
 };
 
+mod new;
+
 pub struct BecomeInterpreter;
 
 #[inline(always)]
@@ -71,13 +73,20 @@ macro_rules! helpers {
         macro_rules! next {
             ($a:expr) => {{
                 let p = $pc + SIZE;
-                if STAR && unsafe { *$code.add(p) } == Opcode::Store as u8 {
-                    let r = unsafe { *$code.add(p + 1) } as i8 as i32;
-                    unsafe { reg_write($regs, r, $a) };
-                    dispatch!(p + 2, $a, $regs)
-                } else {
+                #[cfg(feature = "star_fusion")]
+                {{
+                    if STAR && unsafe { *$code.add(p) } == Opcode::Store as u8 {
+                        let r = unsafe { *$code.add(p + 1) } as i8 as i32;
+                        unsafe { reg_write($regs, r, $a) };
+                        dispatch!(p + 2, $a, $regs)
+                    } else {
+                        dispatch!(p, $a, $regs)
+                    }
+                }}
+                #[cfg(not(feature = "star_fusion"))]
+                {{
                     dispatch!(p, $a, $regs)
-                }
+                }}
             }};
         }
         macro_rules! jump { ($off:expr, $a:expr) => { dispatch!(jump_target($pc, $off), $a, $regs) } }
