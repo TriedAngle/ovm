@@ -1,8 +1,8 @@
 use crate::Thread;
 use crate::materialize::Materialize;
 use crate::{
-    DenseString, Float, Handle, HandleScope, HandleSlice, Heap, Intrinsic, Map, MapInit, MapKind,
-    Object, PropertyDescriptor, Smi, Tagged, Value, VmError,
+    DenseString, Float, Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object,
+    PropertyDescriptor, Smi, Tagged, Value, VmError,
 };
 use crate::{RuntimeContext, RuntimeIndex};
 
@@ -80,39 +80,6 @@ pub fn make_runtime_plain_function_in<'s>(
         map,
         scope.stage(&[
             Smi::new(index.0 as i64).into_tagged(),
-            empty_context.as_tagged(heap).erase(),
-        ]),
-    );
-    Ok(scope.handle(obj))
-}
-
-/// An interpreter intrinsic callable (`Function.prototype.call`-style):
-/// RUNTIME-kind with the intrinsic id in the slot-0 Smi's negative
-/// encoding. Never constructible, like the ECMAScript originals.
-pub fn make_intrinsic_function_in<'s>(
-    heap: &mut Heap,
-    scope: &'s HandleScope<'_>,
-    intrinsic: Intrinsic,
-) -> Result<Handle<'s, Object>, VmError> {
-    let kind = MapKind::OBJECT
-        .union(MapKind::CALLABLE)
-        .union(MapKind::RUNTIME)
-        .union(MapKind::EXTENDABLE);
-    let map = heap.allocate_handle::<Map>(
-        MapInit {
-            kind,
-            value_slot_count: 2,
-            descriptors: &[],
-            prototype: heap.known().function_prototype.erase(),
-        },
-        scope,
-    );
-    let empty_context = heap.known().empty_context;
-    let obj = heap.new_object(
-        scope,
-        map,
-        scope.stage(&[
-            Smi::new(intrinsic.encode_slot()).into_tagged(),
             empty_context.as_tagged(heap).erase(),
         ]),
     );
@@ -238,16 +205,16 @@ pub fn install_method(
     Ok(())
 }
 
-/// Install an interpreter intrinsic (`Function.prototype.call`-style) as
-/// an own method of `receiver`.
-pub fn install_intrinsic_method(
+/// Install a non-constructor runtime function (`Function.prototype.call`-
+/// style) as an own method of `receiver`.
+pub fn install_plain_method(
     thread: &mut Thread,
     scope: &HandleScope<'_>,
     receiver: Handle<'_, Object>,
     name: &str,
-    intrinsic: Intrinsic,
+    index: RuntimeIndex,
 ) -> Result<(), VmError> {
-    let method = make_intrinsic_function_in(thread.heap(), scope, intrinsic)?;
+    let method = make_runtime_plain_function(thread, scope, index)?;
     let name_str = thread.intern(scope, name);
     // Safety: fresh interned word, rooted below before any allocation.
     let method_name = scope.handle(name_str.as_tagged(&*thread.heap()));

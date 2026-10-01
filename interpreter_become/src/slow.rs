@@ -10,14 +10,14 @@ use bytecode::Opcode;
 use vm_core::proxy::Proxy;
 use vm_core::{
     CallTarget, CallableInfoObject, Callee, Coercion, Context, ContextInit, ContextState, Convert,
-    Ctx, FixedArray, HandleSlice, Heap, Intrinsic, Object, Params, RuntimeContext, RuntimeIndex,
-    ScopeInfo, Smi, StoreSemantics, Tagged, Value, VmError, spread_apply_args,
+    Ctx, FixedArray, HandleSlice, Heap, Object, Params, ScopeInfo, Smi, StoreSemantics, Tagged,
+    Value, VmError,
 };
 
 use crate::{
-    ApplyOut, FloatReg, MethodCall, Ops, Regs, RootsArg, TableArg, base,
-    dispatch_runtime_contiguous, dispatch_runtime_function, dispatch_runtime_method,
-    push_callee_frame, read_signed, resume, slow_next_pc,
+    FloatReg, MethodCall, Ops, Regs, RootsArg, TableArg, base, dispatch_runtime_contiguous,
+    dispatch_runtime_function, dispatch_runtime_method, push_callee_frame, read_signed, resume,
+    slow_next_pc,
 };
 
 /// Define a become-interpreter slow-path handler (always `pub`). The
@@ -566,221 +566,6 @@ pub fn proxy_apply_regs_slow<'a>(
     result
 }
 
-/// Resolve the (already reshaped) call and push a frame, dispatch a
-/// runtime callee, or report an intrinsic/proxy for the caller to tail
-/// into. `args[0]` is the receiver of the call being made.
-#[cold]
-#[inline(never)]
-pub fn intrinsic_call_scattered<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    f: Tagged<'a, Value>,
-    recv: Option<i32>,
-    args: [i32; 2],
-    argc: usize,
-) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), f) {
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            kind,
-            ..
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            push_callee_frame(
-                ctx,
-                pc,
-                size,
-                Callee {
-                    callable: target.erase(),
-                    info: info,
-                    context: context.erase(),
-                },
-                match recv {
-                    Some(recv) => Params::MethodFast { recv, args, argc },
-                    None => Params::FunctionFast { args, argc },
-                },
-            )
-        }
-        Some(CallTarget::Runtime(idx)) => Ok(MethodCall::Value(match recv {
-            Some(recv) => dispatch_runtime_method(ctx, idx, recv, args, argc),
-            None => dispatch_runtime_function(ctx, idx, args, argc),
-        })),
-        Some(CallTarget::Intrinsic(_)) => {
-            // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
-            // the reshaped window, never against the original operands
-            let base = ctx.frame_base();
-            let (saved_top, staged) = match recv {
-                Some(recv) => ctx
-                    .stack()
-                    .stage_args_regs(ctx.heap(), base, recv, args, argc)?,
-                None => ctx
-                    .stack()
-                    .stage_function_args(ctx.heap(), base, args, argc)?,
-            };
-            let out = intrinsic_apply_call(ctx, pc, size, f, staged);
-            ctx.stack().set_top(saved_top);
-            match out? {
-                ApplyOut::Frame(frame) => Ok(MethodCall::Frame(frame)),
-                ApplyOut::Value(v) => Ok(MethodCall::Value(v)),
-            }
-        }
-        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        None => Err(VmError::Type),
-    }
-}
-
-/// `intrinsic_call_scattered` for the contiguous call window.
-#[cold]
-#[inline(never)]
-pub fn intrinsic_call_contiguous<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    f: Tagged<'a, Value>,
-    base: i32,
-    count: usize,
-) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), f) {
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            kind,
-            ..
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            push_callee_frame(
-                ctx,
-                pc,
-                size,
-                Callee {
-                    callable: target.erase(),
-                    info: info,
-                    context: context.erase(),
-                },
-                Params::Window {
-                    base: base,
-                    count: count,
-                },
-            )
-        }
-        Some(CallTarget::Runtime(idx)) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
-            ctx, idx, base, count,
-        ))),
-        Some(CallTarget::Intrinsic(_)) => {
-            // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
-            // the reshaped window, never against the original operands
-            let staged = ctx.stack().args(ctx.frame_base(), base, count);
-            match intrinsic_apply_call(ctx, pc, size, f, staged)? {
-                ApplyOut::Frame(frame) => Ok(MethodCall::Frame(frame)),
-                ApplyOut::Value(v) => Ok(MethodCall::Value(v)),
-            }
-        }
-        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        None => Err(VmError::Type),
-    }
-}
-
-/// Resolve a call on `target` with a staged argument window
-/// (`args[0]` = receiver) and push the callee frame when it is bytecode.
-/// Nested intrinsics (`f.call.apply(...)`) are unwrapped recursively.
-#[cold]
-#[inline(never)]
-pub fn intrinsic_apply_call<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    target: Tagged<'a, Value>,
-    args: HandleSlice<'_>,
-) -> Result<ApplyOut<'a>, VmError> {
-    match Object::call_target(ctx.heap(), target) {
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            kind,
-            ..
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(ApplyOut::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            let heap = unsafe { ctx.heap_mut() };
-            let frame = ctx.stack().push_frame(
-                heap,
-                ctx.caller_meta(pc + size, pc),
-                Callee {
-                    callable: target.erase(),
-                    info,
-                    context: context.erase(),
-                },
-                heap.known().undefined.as_tagged(heap).erase(),
-                Params::Slice(args.as_tagged()),
-            )?;
-            ctx.set_frame_base(frame.base);
-            Ok(ApplyOut::Frame(frame))
-        }
-        Some(CallTarget::Runtime(idx)) => {
-            // the spread is rooted by the caller's scope staging
-            let f = ctx.vm().runtime(RuntimeIndex(idx));
-            let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-            Ok(ApplyOut::Value(f(nctx, args)))
-        }
-        Some(CallTarget::Intrinsic(intrinsic)) => {
-            // unwrap the nested intrinsic and retry on the reshaped args
-            match intrinsic {
-                Intrinsic::FunctionCall => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(ctx.heap()))
-                        .ok_or(VmError::Arity)?;
-                    let rest = args.slice_from(1);
-                    intrinsic_apply_call(ctx, pc, size, f, rest)
-                }
-                Intrinsic::FunctionApply => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(ctx.heap()))
-                        .ok_or(VmError::Arity)?;
-                    let this_arg = args
-                        .get(1)
-                        .map(|h| h.as_tagged(ctx.heap()))
-                        .unwrap_or_else(|| ctx.undefined_word());
-                    let array = args.get(2).map(|h| h.as_tagged(ctx.heap()));
-                    ctx.state()
-                        .handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
-                            // Safety: fresh reads of rooted slots, staged before
-                            // the frame push below can move anything.
-                            let staged =
-                                scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
-                            intrinsic_apply_call(ctx, pc, size, f, staged)
-                        })
-                }
-            }
-        }
-        Some(CallTarget::Proxy(_)) => {
-            let vm = ctx.vm();
-            let heap = unsafe { ctx.heap_mut() };
-            let state = ctx.state();
-            let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-                let target = scope.handle(target);
-                match Proxy::apply(vm, heap, state, target, args)? {
-                    Coercion::Threw => Ok(ctx.exception_word()),
-                    Coercion::Value(v) => Ok(v),
-                }
-            });
-            Ok(ApplyOut::Value(result?))
-        }
-        None => Err(VmError::Type),
-    }
-}
-
 /// Exception dispatch: walk the ovm frames from the faulting one, consulting
 /// each frame's static handler table for a try range covering
 /// `fault_pc`; on a hit, take the pending exception and tail-dispatch
@@ -902,18 +687,6 @@ pub fn slow_call_method_miss<'a>(
                 ctx, idx, recv, args, argc,
             )))
         }
-        Some(CallTarget::Intrinsic(i)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Intrinsic(i))
-        }
         Some(CallTarget::Bytecode {
             target,
             info,
@@ -975,18 +748,6 @@ pub fn slow_call_function_miss<'a>(
                 ctx, idx, args, argc,
             )))
         }
-        Some(CallTarget::Intrinsic(i)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Intrinsic(i))
-        }
         Some(CallTarget::Bytecode {
             target,
             info,
@@ -1047,18 +808,6 @@ pub fn slow_call_miss<'a>(
             Ok(MethodCall::Value(dispatch_runtime_contiguous(
                 ctx, idx, base, count,
             )))
-        }
-        Some(CallTarget::Intrinsic(i)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Intrinsic(i))
         }
         Some(CallTarget::Bytecode {
             target,

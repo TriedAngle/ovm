@@ -26,54 +26,6 @@ pub trait Interpreter {
     const EXECUTE: ExecuteFn;
 }
 
-/// A callable implemented natively by the interpreter itself: resolved
-/// by id (never through the runtime registry) and — in the tail-call
-/// interpreter — entered as a bytecode handler, so it can push a frame
-/// and tail-dispatch into the callee instead of re-entering execution.
-///
-/// Intrinsic function objects are RUNTIME-kind objects whose slot-0 Smi
-/// carries the intrinsic id in the negative encoding of
-/// [`Intrinsic::encode_slot`].
-#[repr(i64)]
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum Intrinsic {
-    /// `Function.prototype.call(thisArg, ...args)`
-    FunctionCall,
-    /// `Function.prototype.apply(thisArg, argsArray)`
-    FunctionApply,
-}
-
-impl Intrinsic {
-    pub const COUNT: usize = 2;
-
-    pub fn from_id(id: usize) -> Option<Self> {
-        Some(match id {
-            0 => Self::FunctionCall,
-            1 => Self::FunctionApply,
-            _ => return None,
-        })
-    }
-
-    pub fn id(self) -> usize {
-        self as usize
-    }
-
-    /// The Smi stored in an intrinsic function object's slot 0: negative
-    /// discriminates intrinsics from registry runtime indices (which are
-    /// always non-negative).
-    pub fn encode_slot(self) -> i64 {
-        -(self.id() as i64) - 1
-    }
-
-    pub fn decode_slot(raw: i64) -> Option<Self> {
-        let id = -raw - 1;
-        if id < 0 {
-            return None;
-        }
-        Self::from_id(id as usize)
-    }
-}
-
 /// A language runtime contributing native functions and globals to a VM
 /// (registered and installed once by `VM::add`, before any code runs).
 pub trait Runtime: 'static {

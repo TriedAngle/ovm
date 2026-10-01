@@ -58,7 +58,7 @@ pub use objects::{
     object_layout, string_content_hash, visit_object,
 };
 pub use runtime::{
-    Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Intrinsic, Runtime, RuntimeCall,
+    Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Runtime, RuntimeCall,
     RuntimeContext, RuntimeIndex, RuntimeRegistry, raise_runtime, spread_apply_args,
 };
 pub use stack::{Callee, FrameMeta, Params, STACK_SLOTS, Stack};
@@ -139,7 +139,7 @@ pub struct ContextState {
     /// self-describing (see [`Stack`]): this cell is the only shadow
     /// state, written by push/pop/unwind frame switches.
     frame_base: Cell<usize>,
-    /// Whether an interpreted frame is current (intrinsics inspecting
+    /// Whether an interpreted frame is current (runtime calls inspecting
     /// the running frame check this).
     frame_active: Cell<bool>,
     /// The accumulator cell: rooted, the GC updates it in place.

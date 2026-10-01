@@ -1,7 +1,7 @@
 use crate::{
     AccessorPair, CallTarget, CallableInfoObject, Context, DenseString, FeedbackVector, FixedArray,
-    FunctionKind, Handle, HandleScope, Heap, Intrinsic, Map, MaybeWeak, Object, SlotName, Smi,
-    Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
+    FunctionKind, Handle, HandleScope, Heap, Map, MaybeWeak, Object, SlotName, Smi, Tagged, Value,
+    WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
@@ -1476,12 +1476,12 @@ fn update_poly(
 // weak reference to the callee, slot N+1 the payload — the callee's
 // resolved `CallableInfoObject` (pre-decoded register count, formal
 // minimum, function kind) for bytecode callees, or the Smi
-// `CALL_TAG_RUNTIME` marking a runtime/intrinsic callee. Sites are
+// `CALL_TAG_RUNTIME` marking a runtime callee. Sites are
 // monomorphic-or-megamorphic: a second, unrelated callee permanently
 // disables the site.
 // ---------------------------------------------------------------------------
 
-/// The Smi payload marking a runtime/intrinsic callee.
+/// The Smi payload marking a runtime callee.
 pub const CALL_TAG_RUNTIME: i64 = 1;
 
 /// A monomorphic bytecode-callee hit: everything a frame push needs,
@@ -1496,7 +1496,6 @@ pub struct CallHit<'a> {
 pub enum CallProbe<'a> {
     Bytecode(CallHit<'a>),
     Runtime(usize),
-    Intrinsic(Intrinsic),
     Miss,
 }
 
@@ -1513,7 +1512,7 @@ fn decode_descriptor(desc: i64) -> (usize, usize, FunctionKind) {
 }
 
 /// Probe a call site: a weak-callee match returns the pre-decoded hit (or
-/// the runtime/intrinsic index); anything else is a miss for the generic
+/// the runtime index); anything else is a miss for the generic
 /// call path to handle and record.
 ///
 /// Safety: `vector`/`callee` must be valid for the `heap` borrow; the
@@ -1537,7 +1536,7 @@ pub unsafe fn call_probe<'a>(
         let payload = vector.as_ref().slot(fb + 1).get(heap);
         let raw = payload.raw();
         if let Some(tag) = Smi::decode(raw) {
-            // runtime/intrinsic callee: decode the index off the object
+            // runtime callee: decode the index off the object
             if tag.value() != CALL_TAG_RUNTIME {
                 return CallProbe::Miss;
             }
@@ -1546,7 +1545,6 @@ pub unsafe fn call_probe<'a>(
             };
             return match obj.as_ref().runtime_call_target(heap) {
                 Some(CallTarget::Runtime(idx)) => CallProbe::Runtime(idx),
-                Some(CallTarget::Intrinsic(i)) => CallProbe::Intrinsic(i),
                 _ => CallProbe::Miss,
             };
         }
@@ -1617,7 +1615,7 @@ pub unsafe fn call_update(
         match info {
             // bytecode: the payload IS the resolved info
             Some(info) => tag_slot.set_strong(heap, host, info.erase()),
-            // runtime/intrinsic callee
+            // runtime callee
             None => tag_slot.set(
                 heap,
                 host,

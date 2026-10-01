@@ -7,7 +7,7 @@ use vm_core::RuntimeContext;
 use vm_core::materialize::Materialize;
 use vm_core::runtime::Coercion;
 use vm_core::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
-use vm_core::{raise_runtime, rt_try};
+use vm_core::{raise_runtime, rt_try, spread_apply_args};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
@@ -24,6 +24,55 @@ pub fn function_to_string<'a>(
             .intern_str(heap, &scope, "function () { [native code] }")
             .as_tagged(heap)
             .erase()
+    })
+}
+
+/// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.1): invoke the
+/// receiver (args[0], per the receiver-first runtime calling convention)
+/// with `thisArg` as `this`.
+pub fn function_call<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let Some(f) = args.get(0) else {
+        return raise_runtime(vm, heap, state, VmError::Arity);
+    };
+    if !Object::is_callable(heap, f.as_tagged(heap)) {
+        return raise_runtime(vm, heap, state, VmError::Type);
+    }
+    match RuntimeContext::call(vm, heap, state, f, args.slice_from(1), None).map(|v| v.raw()) {
+        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+        Err(err) => raise_runtime(vm, heap, state, err),
+    }
+}
+
+/// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.2): invoke
+/// the receiver with `thisArg` as `this` and the array-like spread as
+/// arguments.
+pub fn function_apply<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let Some(f) = args.get(0) else {
+        return raise_runtime(vm, heap, state, VmError::Arity);
+    };
+    if !Object::is_callable(heap, f.as_tagged(heap)) {
+        return raise_runtime(vm, heap, state, VmError::Type);
+    }
+    // Safety: fresh argument-slot words, re-anchored inside the scope
+    // (the args window is rooted, so they stay valid across it).
+    let this_raw = args.get(1).map(|h| h.as_tagged(heap).raw());
+    let array_raw = args.get(2).map(|h| h.as_tagged(heap).raw());
+    state.handle_scope(|scope| {
+        let this_arg = this_raw
+            .map(|raw| unsafe { Tagged::<Value>::from_value_unchecked(raw) })
+            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+        let array = array_raw.map(|raw| unsafe { Tagged::<Value>::from_value_unchecked(raw) });
+        let staged = scope.stage(&spread_apply_args(heap, this_arg, array));
+        match RuntimeContext::call(vm, heap, state, f, staged, None).map(|v| v.raw()) {
+            Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+            Err(err) => raise_runtime(vm, heap, state, err),
+        }
     })
 }
 

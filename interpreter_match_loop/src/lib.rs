@@ -7,9 +7,9 @@ use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe, StoreHit};
 use vm_core::interp::{Ctx, Unwind};
 use vm_core::{
     CallTarget, CallableInfoObject, Callee, Coercion, Compare, Context, ContextInit, ContextState,
-    Convert, FixedArray, FixedByteArray, FrameMeta, Handle, HandleSlice, Heap, Intrinsic, Key,
-    LoadOutcome, Lookup, Object, Params, Register, RuntimeContext, RuntimeIndex, ScopeInfo,
-    SlotName, Smi, StoreSemantics, Tagged, Termination, VM, Value, VmError, spread_apply_args,
+    Convert, FixedArray, FixedByteArray, FrameMeta, Handle, HandleSlice, Heap, Key, LoadOutcome,
+    Lookup, Object, Params, Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi,
+    StoreSemantics, Tagged, Termination, VM, Value, VmError,
 };
 
 /// The per-instruction control flow of the dispatch loop (the error
@@ -117,39 +117,6 @@ fn start<'b>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
-        Some(CallTarget::Intrinsic(intrinsic)) => {
-            // Rust-world entry of an intrinsic: unwrap it and re-enter
-            state.handle_scope(|scope| match intrinsic {
-                Intrinsic::FunctionCall => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(heap))
-                        .ok_or(VmError::Arity)?;
-                    if !Object::is_callable(heap, f) {
-                        return Err(VmError::Type);
-                    }
-                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
-                    execute(vm, heap, state, f, args.slice_from(1), None)
-                }
-                Intrinsic::FunctionApply => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(heap))
-                        .ok_or(VmError::Arity)?;
-                    if !Object::is_callable(heap, f) {
-                        return Err(VmError::Type);
-                    }
-                    let this_arg = args
-                        .get(1)
-                        .map(|h| h.as_tagged(heap))
-                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
-                    let array = args.get(2).map(|h| h.as_tagged(heap));
-                    let staged = scope.stage(&spread_apply_args(heap, this_arg, array));
-                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
-                    execute(vm, heap, state, f, staged, None)
-                }
-            })
-        }
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
@@ -238,72 +205,6 @@ fn begin_termination(heap: &Heap, state: &ContextState) -> Flow {
     let undefined = heap.known().undefined.as_tagged(heap);
     state.set_pending_exception(undefined);
     Flow::Threw
-}
-
-/// Which loose comparison a compare arm performs.
-/// Resolve an interpreter intrinsic against its invocation arguments
-/// (`args[0]` is the receiver the builtin was invoked with) by
-/// unwrapping it and re-entering `start`. The portable interpreter's
-/// slow stand-in for the tail-call interpreter's handler entry.
-#[cold]
-#[inline(never)]
-fn intrinsic_step<'a>(
-    ctx: &Ctx<'a>,
-    acc: &Register,
-    intrinsic: Intrinsic,
-    args: HandleSlice<'_>,
-) -> Flow {
-    let vm = ctx.vm();
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    let exception = heap.known().exception.as_tagged(heap).raw();
-    let result = state.handle_scope(|scope| -> Result<Tagged<'_, Value>, VmError> {
-        match intrinsic {
-            Intrinsic::FunctionCall => {
-                let f = args
-                    .get(0)
-                    .map(|h| h.as_tagged(heap))
-                    .ok_or(VmError::Arity)?;
-                if !Object::is_callable(heap, f) {
-                    return Err(VmError::Type);
-                }
-                let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
-                // the register-file window is a fixed-capacity arena: the
-                // slice stays valid (and GC-visited) across the push below.
-                // `execute` (not `start`) so the outer current-frame is
-                // restored before the caller's exception dispatch runs.
-                execute(vm, heap, state, f, args.slice_from(1), None)
-            }
-            Intrinsic::FunctionApply => {
-                let f = args
-                    .get(0)
-                    .map(|h| h.as_tagged(heap))
-                    .ok_or(VmError::Arity)?;
-                if !Object::is_callable(heap, f) {
-                    return Err(VmError::Type);
-                }
-                let this_arg = args
-                    .get(1)
-                    .map(|h| h.as_tagged(heap))
-                    .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
-                let array = args.get(2).map(|h| h.as_tagged(heap));
-                let staged = scope.stage(&spread_apply_args(heap, this_arg, array));
-                let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
-                execute(vm, heap, state, f, staged, None)
-            }
-        }
-    });
-    match result {
-        Ok(v) if v.raw() == exception => Flow::Threw,
-        Ok(v) => {
-            acc.store(v);
-            Flow::Sync
-        }
-        Err(err) => {
-            unsafe { ctx.raise_tag(err) };
-            Flow::Threw
-        }
-    }
 }
 
 fn dispatch<'a>(ctx: &Ctx<'a>) -> Result<Tagged<'a, Value>, VmError> {
@@ -1113,14 +1014,6 @@ unsafe fn step<'a>(
                             Flow::Sync
                         };
                     }
-                    vm_core::ic::CallProbe::Intrinsic(intrinsic) => {
-                        return intrinsic_step(
-                            ctx,
-                            acc,
-                            intrinsic,
-                            stack.args(frame_base, args_base, count),
-                        );
-                    }
                     vm_core::ic::CallProbe::Miss => {}
                 }
             }
@@ -1146,23 +1039,6 @@ unsafe fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Intrinsic(intrinsic)) => {
-                    unsafe {
-                        vm_core::ic::call_update(
-                            heap,
-                            ctx.feedback_ref(heap),
-                            fb,
-                            stack.reg(heap, frame_base, callee_reg),
-                            None,
-                        );
-                    }
-                    intrinsic_step(
-                        ctx,
-                        acc,
-                        intrinsic,
-                        stack.args(frame_base, args_base, count),
-                    )
-                }
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
@@ -1266,12 +1142,6 @@ unsafe fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Intrinsic(intrinsic)) => intrinsic_step(
-                    ctx,
-                    acc,
-                    intrinsic,
-                    stack.args(frame_base, args_base, count),
-                ),
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
@@ -1397,15 +1267,6 @@ unsafe fn step<'a>(
                             Flow::Sync
                         };
                     }
-                    vm_core::ic::CallProbe::Intrinsic(intrinsic) => {
-                        let (saved_top, staged) = fold!(
-                            ctx,
-                            stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
-                        );
-                        let step = intrinsic_step(ctx, acc, intrinsic, staged);
-                        stack.set_top(saved_top);
-                        return step;
-                    }
                     vm_core::ic::CallProbe::Miss => {}
                 }
             }
@@ -1432,15 +1293,6 @@ unsafe fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Intrinsic(intrinsic)) => {
-                    let (saved_top, staged) = fold!(
-                        ctx,
-                        stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
-                    );
-                    let step = intrinsic_step(ctx, acc, intrinsic, staged);
-                    stack.set_top(saved_top);
-                    return step;
-                }
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
@@ -1578,15 +1430,6 @@ unsafe fn step<'a>(
                             Flow::Sync
                         };
                     }
-                    vm_core::ic::CallProbe::Intrinsic(intrinsic) => {
-                        let (saved_top, staged) = fold!(
-                            ctx,
-                            stack.stage_function_args(heap, frame_base, args.0, args.1)
-                        );
-                        let step = intrinsic_step(ctx, acc, intrinsic, staged);
-                        stack.set_top(saved_top);
-                        return step;
-                    }
                     vm_core::ic::CallProbe::Miss => {}
                 }
             }
@@ -1613,15 +1456,6 @@ unsafe fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Intrinsic(intrinsic)) => {
-                    let (saved_top, staged) = fold!(
-                        ctx,
-                        stack.stage_function_args(heap, frame_base, args.0, args.1)
-                    );
-                    let step = intrinsic_step(ctx, acc, intrinsic, staged);
-                    stack.set_top(saved_top);
-                    return step;
-                }
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();

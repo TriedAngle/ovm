@@ -9,9 +9,8 @@ use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe};
 use vm_core::proxy::Proxy;
 use vm_core::{
     CallTarget, Callee, Coercion, Compare, Context, ContextState, Convert, Ctx, ExecuteFn,
-    FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter, Intrinsic, Object,
-    Params, Register, RuntimeContext, RuntimeIndex, Smi, Tagged, VM, Value, VmError,
-    spread_apply_args,
+    FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter, Object, Params,
+    Register, RuntimeContext, RuntimeIndex, Smi, Tagged, VM, Value, VmError,
 };
 
 pub struct BecomeInterpreter;
@@ -2650,9 +2649,6 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
             )
         }
 
-        MethodCall::Intrinsic(i) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
-        }
         MethodCall::Proxy => {
             become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
@@ -2711,9 +2707,6 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
             )
         }
 
-        MethodCall::Intrinsic(i) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
-        }
         MethodCall::Proxy => {
             become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
@@ -2773,9 +2766,6 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
             )
         }
 
-        MethodCall::Intrinsic(i) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
-        }
         MethodCall::Proxy => {
             become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
@@ -2832,9 +2822,6 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
             )
         }
 
-        MethodCall::Intrinsic(i) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
-        }
         MethodCall::Proxy => {
             become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
@@ -2892,9 +2879,6 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
             )
         }
 
-        MethodCall::Intrinsic(i) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
-        }
         MethodCall::Proxy => {
             become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
@@ -2953,9 +2937,6 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
             )
         }
 
-        MethodCall::Intrinsic(i) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
-        }
         MethodCall::Proxy => {
             become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
@@ -3014,9 +2995,6 @@ extern "rust-preserve-none" fn op_call_ic<'a, const STRIDE: usize>(
             )
         }
 
-        MethodCall::Intrinsic(i) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
-        }
         MethodCall::Proxy => {
             become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
@@ -3044,9 +3022,6 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
         None => bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type),
         Some(CallTarget::Proxy(_)) => {
             become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
-        }
-        Some(CallTarget::Intrinsic(i)) => {
-            become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
         Some(CallTarget::Runtime(idx)) => {
             let f = ctx.vm().runtime(RuntimeIndex(idx));
@@ -3212,16 +3187,6 @@ fn read_signed(ip: *const u8, off: usize, stride: usize) -> i32 {
     }
 }
 
-fn read_unsigned(ip: *const u8, off: usize, stride: usize) -> usize {
-    unsafe {
-        if stride == 1 {
-            *ip.add(off) as usize
-        } else {
-            u16::from_le_bytes([*ip.add(off), *ip.add(off + 1)]) as usize
-        }
-    }
-}
-
 /// Outcome of a `Construct` fast-path attempt.
 enum ConstructStart {
     /// a constructor frame was pushed (the cache already points at it):
@@ -3347,389 +3312,6 @@ fn construct_receiver_fast<'a>(
     })
 }
 
-// -- interpreter intrinsics ----------------------------------------------
-//
-// Handler-shaped builtins (`Function.prototype.call` / `apply` and
-// future trampolines): entered through the call IC exactly like
-// bytecode handlers — via a guaranteed tail call — so a call-through
-// builtin pushes the callee frame and tail-dispatches into it instead
-// of re-entering `execute` through nested Rust frames. The intrinsic
-// re-decodes the invoking call opcode's operands from `pc`/`code`, so
-// it knows the argument shape (scattered or contiguous window) it was
-// invoked with.
-
-/// Continue in the frame the helper just pushed (the cache already
-/// switched to the callee). Become-compatible tail entry.
-#[inline(always)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn enter_fresh_frame<'a>(
-    _ip: *const u8,
-    _regs: Regs,
-    _acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    let acc = ctx.undefined_word();
-    // the helper just pushed the frame: entry is pc 0
-    let ip = ctx.code_ptr();
-    let h = table.get(unsafe { *ip });
-    become h(ip, regs, acc, ctx, table, roots, float)
-}
-
-/// Shared tail of the intrinsics: run the resolved `MethodCall`.
-/// `MethodCall::Intrinsic` never appears here — nested intrinsics are
-/// unwrapped inside the call helpers against the reshaped window.
-macro_rules! finish_intrinsic {
-    ($ip:ident, $next:ident, $regs:ident, $acc:ident, $ctx:ident, $t:ident, $k:ident, $f:ident, { $out:expr }, { $proxy:expr }) => {
-        match $out {
-            Ok(mc) => match mc {
-                MethodCall::Frame(_) => {
-                    become enter_fresh_frame($ip, $regs, $acc, $ctx, $t, $k, $f)
-                }
-                MethodCall::Value(v) => {
-                    become resume(
-                        unsafe { $ctx.code_ptr().add($next as usize - $ip as usize) },
-                        $regs,
-                        v,
-                        $ctx,
-                        $t,
-                        $k,
-                        $f,
-                    )
-                }
-                MethodCall::Proxy => {
-                    let v = match $proxy {
-                        Ok(v) => v,
-                        Err(err) => unsafe { $ctx.raise_tag(err) },
-                    };
-                    become resume(
-                        unsafe { $ctx.code_ptr().add($next as usize - $ip as usize) },
-                        $regs,
-                        v,
-                        $ctx,
-                        $t,
-                        $k,
-                        $f,
-                    )
-                }
-                MethodCall::Intrinsic(i) => {
-                    become INTRINSICS[i.id()]($ip, $regs, $acc, $ctx, $t, $k, $f)
-                }
-            },
-            Err(err) => unsafe { $ctx.raise_tag(err) },
-        }
-    };
-}
-
-#[rustc_align(32)]
-extern "rust-preserve-none" fn intrinsic_function_call<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let code = ctx.code_ptr();
-    let (base, stride) = slow_layout(ip);
-    let next = slow_next_pc(ip);
-    let op = unsafe { Opcode::from_byte_unchecked(*ip.add(base / 2)) };
-    match op {
-        // contiguous window `[f, thisArg, args...]`: element 0 rides the
-        // window bottom, so dropping it is `count - 1` at the same base
-        Opcode::Call | Opcode::CallNoFeedback => {
-            let args_base = read_signed(ip, base + stride, stride);
-            let count = read_unsigned(ip, base + 2 * stride, stride);
-            if count == 0 {
-                let _ = unsafe { ctx.raise_tag(VmError::Type) };
-                let pc = ip as usize - code as usize;
-                become throw_dispatch(
-                    unsafe { ctx.code_ptr().add(pc) },
-                    regs,
-                    acc,
-                    ctx,
-                    table,
-                    roots,
-                    float,
-                )
-            }
-            let f = regs.read(args_base - count as i32 + 1, ctx);
-            let size = next as usize - ip as usize;
-            finish_intrinsic!(
-                ip,
-                next,
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-                {
-                    intrinsic_call_contiguous(
-                        ctx,
-                        ip as usize - code as usize,
-                        size,
-                        f,
-                        args_base,
-                        count - 1,
-                    )
-                },
-                { proxy_apply_slow(ctx, f, args_base, count - 1) }
-            )
-        }
-        // scattered: the receiver register holds the real target
-        Opcode::CallMethod0 => {
-            let recv = read_signed(ip, base + stride, stride);
-            let f = regs.read(recv, ctx);
-            let size = next as usize - ip as usize;
-            finish_intrinsic!(
-                ip,
-                next,
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-                {
-                    intrinsic_call_scattered(
-                        ctx,
-                        ip as usize - code as usize,
-                        size,
-                        f,
-                        None,
-                        [0, 0],
-                        0,
-                    )
-                },
-                { proxy_apply_function_slow(ctx, f, [0, 0], 0) }
-            )
-        }
-        Opcode::CallMethod1 => {
-            let recv = read_signed(ip, base + stride, stride);
-            let arg0 = read_signed(ip, base + 2 * stride, stride);
-            let f = regs.read(recv, ctx);
-            let size = next as usize - ip as usize;
-            finish_intrinsic!(
-                ip,
-                next,
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-                {
-                    intrinsic_call_scattered(
-                        ctx,
-                        ip as usize - code as usize,
-                        size,
-                        f,
-                        Some(arg0),
-                        [0, 0],
-                        0,
-                    )
-                },
-                { proxy_apply_regs_slow(ctx, f, arg0, [0, 0], 0) }
-            )
-        }
-        Opcode::CallMethod2 => {
-            let recv = read_signed(ip, base + stride, stride);
-            let arg0 = read_signed(ip, base + 2 * stride, stride);
-            let arg1 = read_signed(ip, base + 3 * stride, stride);
-            let f = regs.read(recv, ctx);
-            let size = next as usize - ip as usize;
-            finish_intrinsic!(
-                ip,
-                next,
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-                {
-                    intrinsic_call_scattered(
-                        ctx,
-                        ip as usize - code as usize,
-                        size,
-                        f,
-                        Some(arg0),
-                        [arg1, 0],
-                        1,
-                    )
-                },
-                { proxy_apply_regs_slow(ctx, f, arg0, [arg1, 0], 1) }
-            )
-        }
-        // `call` invoked with an undefined receiver (unbound): `this` is
-        // not callable
-        Opcode::CallFunction0 | Opcode::CallFunction1 | Opcode::CallFunction2 => {
-            let _ = unsafe { ctx.raise_tag(VmError::Type) };
-            let pc = ip as usize - code as usize;
-            become throw_dispatch(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
-        _ => {
-            let _ = unsafe { ctx.raise_tag(VmError::Type) };
-            let pc = ip as usize - code as usize;
-            become throw_dispatch(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
-    }
-}
-
-/// Outcome of a resolved apply: a pushed frame or a completed value.
-enum ApplyOut<'a> {
-    Frame(FrameMeta),
-    Value(Tagged<'a, Value>),
-}
-
-#[rustc_align(32)]
-extern "rust-preserve-none" fn intrinsic_function_apply<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let code = ctx.code_ptr();
-    let (base, stride) = slow_layout(ip);
-    let next = slow_next_pc(ip);
-    let op = unsafe { Opcode::from_byte_unchecked(*ip.add(base / 2)) };
-    // recover (f, thisArg, argsArray) from the invoking call shape
-    let (f, this_arg, array) = match op {
-        Opcode::Call | Opcode::CallNoFeedback => {
-            let args_base = read_signed(ip, base + stride, stride);
-            let count = read_unsigned(ip, base + 2 * stride, stride);
-            if count < 2 {
-                // window must at least hold [f, thisArg]
-                let _ = unsafe { ctx.raise_tag(VmError::Type) };
-                let pc = ip as usize - code as usize;
-                become throw_dispatch(
-                    unsafe { ctx.code_ptr().add(pc) },
-                    regs,
-                    acc,
-                    ctx,
-                    table,
-                    roots,
-                    float,
-                )
-            }
-            let f = regs.read(args_base - count as i32 + 1, ctx);
-            let this_arg = regs.read(args_base - count as i32 + 2, ctx);
-            let array = if count >= 3 {
-                Some(regs.read(args_base - count as i32 + 3, ctx))
-            } else {
-                None
-            };
-            (f, this_arg, array)
-        }
-        Opcode::CallMethod0 => {
-            let recv = read_signed(ip, base + stride, stride);
-            let f = regs.read(recv, ctx);
-            (f, ctx.undefined_word(), None)
-        }
-        Opcode::CallMethod1 => {
-            let recv = read_signed(ip, base + stride, stride);
-            let arg0 = read_signed(ip, base + 2 * stride, stride);
-            let f = regs.read(recv, ctx);
-            (f, regs.read(arg0, ctx), None)
-        }
-        Opcode::CallMethod2 => {
-            let recv = read_signed(ip, base + stride, stride);
-            let arg0 = read_signed(ip, base + 2 * stride, stride);
-            let arg1 = read_signed(ip, base + 3 * stride, stride);
-            let f = regs.read(recv, ctx);
-            (f, regs.read(arg0, ctx), Some(regs.read(arg1, ctx)))
-        }
-        Opcode::CallFunction0 | Opcode::CallFunction1 | Opcode::CallFunction2 => {
-            let _ = unsafe { ctx.raise_tag(VmError::Type) };
-            let pc = ip as usize - code as usize;
-            become throw_dispatch(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
-        _ => {
-            let _ = unsafe { ctx.raise_tag(VmError::Type) };
-            let pc = ip as usize - code as usize;
-            become throw_dispatch(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
-    };
-    let size = next as usize - ip as usize;
-    match ctx
-        .state()
-        .handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
-            // Safety: fresh register reads, staged before the frame push
-            // below can move anything.
-            let staged = scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
-            intrinsic_apply_call(ctx, ip as usize - code as usize, size, f, staged)
-        }) {
-        Ok(ApplyOut::Frame(_)) => become enter_fresh_frame(ip, regs, acc, ctx, table, roots, float),
-        Ok(ApplyOut::Value(v)) => {
-            become resume(
-                unsafe { ctx.code_ptr().add(ip as usize - code as usize) },
-                regs,
-                v,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
-        Err(err) => unsafe { ctx.raise_tag(err) },
-    }
-}
-
-/// The intrinsic table: builtins entered like bytecode handlers, by id.
-static INTRINSICS: [Handler; Intrinsic::COUNT] = [
-    intrinsic_function_call as Handler,
-    intrinsic_function_apply as Handler,
-];
-
-#[inline(always)]
-fn slow_layout(ip: *const u8) -> (usize, usize) {
-    if unsafe { *ip } == Opcode::Wide as u8 {
-        (2, 2)
-    } else {
-        (1, 1)
-    }
-}
-
 #[inline(always)]
 fn slow_next_pc(ip: *const u8) -> *const u8 {
     let wide = unsafe { *ip } == Opcode::Wide as u8;
@@ -3834,8 +3416,6 @@ enum MethodCall<'a> {
     Frame(FrameMeta),
     /// a callable proxy: the caller tail-calls the slow trap dispatch
     Proxy,
-    /// an interpreter intrinsic: the caller tail-calls it like a handler
-    Intrinsic(vm_core::Intrinsic),
 }
 
 #[inline(always)]
@@ -3997,7 +3577,6 @@ fn call_method_start<'a>(
         vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_method(
             ctx, idx, recv, args, argc,
         ))),
-        vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
         vm_core::ic::CallProbe::Miss => {
             slow_call_method_miss(ctx, pc, size, callee_word, recv, args, argc, fb)
         }
@@ -4041,7 +3620,6 @@ fn call_function_start<'a>(
         vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_function(
             ctx, idx, args, argc,
         ))),
-        vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
         vm_core::ic::CallProbe::Miss => {
             slow_call_function_miss(ctx, pc, size, callee_word, args, argc, fb)
         }
@@ -4086,7 +3664,6 @@ fn call_start<'a>(
         vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
             ctx, idx, base, count,
         ))),
-        vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
         vm_core::ic::CallProbe::Miss => slow_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
 }
@@ -4338,43 +3915,6 @@ fn enter<'a>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
-        Some(CallTarget::Intrinsic(intrinsic)) => {
-            // Rust-world entry of an intrinsic: unwrap it and re-enter.
-            // This is the slow path — bytecode call sites reach intrinsics
-            // through the handler-shaped table instead.
-            state.handle_scope(|scope| match intrinsic {
-                Intrinsic::FunctionCall => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(heap))
-                        .ok_or(VmError::Arity)?;
-                    if !Object::is_callable(heap, f) {
-                        return Err(VmError::Type);
-                    }
-                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
-                    enter(vm, heap, state, f, args.slice_from(1), None)
-                }
-                Intrinsic::FunctionApply => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(heap))
-                        .ok_or(VmError::Arity)?;
-                    if !Object::is_callable(heap, f) {
-                        return Err(VmError::Type);
-                    }
-                    let this_arg = args
-                        .get(1)
-                        .map(|h| h.as_tagged(heap))
-                        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
-                    let array = args.get(2).map(|h| h.as_tagged(heap));
-                    // Safety: fresh rooted-slot reads, staged before `enter`
-                    // below can allocate.
-                    let staged = scope.stage(&unsafe { spread_apply_args(heap, this_arg, array) });
-                    let f = scope.cast::<Object>(f).ok_or(VmError::Type)?;
-                    enter(vm, heap, state, f, staged, None)
-                }
-            })
-        }
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
             let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
