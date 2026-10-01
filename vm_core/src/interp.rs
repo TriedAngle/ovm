@@ -6,12 +6,11 @@
 use core::cell::Cell;
 use core::marker::PhantomData;
 
-use crate::cache::StackCache;
 use crate::errors::Errors;
 use crate::heap::{Heap, Register};
-use crate::stack::{FrameMeta, Stack};
+use crate::stack::{CODE_OFFSET, CONSTANTS_OFFSET, FEEDBACK_OFFSET, FrameMeta, Stack};
 use crate::value::{Tagged, Value};
-use crate::{ContextState, VM, VmError};
+use crate::{ContextState, FeedbackVector, FixedArray, FixedByteArray, VM, VmError};
 
 /// Loop back-edge ticks between safepoint polls.
 pub const SAFEPOINT_INTERVAL: u32 = 1 << 12;
@@ -100,34 +99,91 @@ impl<'a> Ctx<'a> {
     }
 
     #[inline(always)]
-    pub fn cache(&self) -> &'a StackCache {
-        self.state().cache()
-    }
-
-    #[inline(always)]
     pub fn base_anchor(&self) -> usize {
         self.base_anchor
     }
 
+    /// The current frame's anchor (the frame-pointer analogue). Frame
+    /// switches are a single store: the frame header carries every
+    /// other dispatch fact.
     #[inline(always)]
-    pub fn meta(&self, pc: usize) -> FrameMeta {
-        let cache = self.cache();
+    pub fn frame_base(&self) -> usize {
+        self.state().frame_base()
+    }
+
+    /// Switch the current frame (after a push, pop, or unwind).
+    #[inline(always)]
+    pub fn set_frame_base(&self, base: usize) {
+        self.state().set_frame_base(base);
+    }
+
+    /// The caller descriptor for pushing a frame from the current one:
+    /// `pc` is the caller's resume point, `handler_pc` its exception
+    /// lookup pc.
+    #[inline(always)]
+    pub fn caller_meta(&self, pc: usize, handler_pc: usize) -> FrameMeta {
+        let base = self.frame_base();
         FrameMeta {
-            base: cache.base(),
+            base,
             pc,
-            register_count: cache.register_count(),
-            handler_pc: 0,
+            register_count: self.stack().regcount(base),
+            handler_pc,
         }
     }
 
     #[inline(always)]
     pub fn code_ptr(&self) -> *const u8 {
-        self.cache().code_ref(self.heap()).as_ref().as_ptr()
+        // Safety: only `init_frame_header` writes this slot, always the
+        // frame's bytecode: the kind re-check is redundant.
+        let arr = unsafe {
+            self.stack()
+                .header_slot(self.frame_base(), CODE_OFFSET)
+                .get(self.heap())
+                .cast::<FixedByteArray>()
+        };
+        arr.as_ref().as_ptr()
+    }
+
+    #[inline(always)]
+    pub fn constants_ref<'h>(&self, heap: &'h Heap) -> Tagged<'h, FixedArray> {
+        debug_assert!(
+            self.state().is_frame_active(),
+            "constants read without a frame"
+        );
+        // Safety: only `init_frame_header` writes this slot, always the
+        // constant pool.
+        unsafe {
+            self.stack()
+                .header_slot(self.frame_base(), CONSTANTS_OFFSET)
+                .get(heap)
+                .cast()
+        }
+    }
+
+    /// The current frame's feedback vector, or `None` for functions
+    /// without feedback slots.
+    #[inline(always)]
+    pub fn feedback_ref<'h>(&self, heap: &'h Heap) -> Option<Tagged<'h, FeedbackVector>> {
+        // Safety: only `init_frame_header` writes this slot: it is always
+        // a `FeedbackVector` or the hole.
+        let word = self
+            .stack()
+            .header_slot(self.frame_base(), FEEDBACK_OFFSET)
+            .get(heap);
+        (word.raw() != heap.known().the_hole.raw()).then(|| unsafe { word.cast() })
+    }
+
+    /// The accumulator parking cell: the one rooted home for the value
+    /// in flight across a safepoint poll. Park/poll/reload never nests,
+    /// so a single per-thread cell serves every frame.
+    #[inline(always)]
+    pub fn acc_slot(&self) -> &Register {
+        self.state().acc_slot()
     }
 
     #[inline(always)]
     pub fn regs_ptr(&self) -> *mut Register {
-        unsafe { self.stack().slots_ptr().add(self.cache().base()) }
+        unsafe { self.stack().slots_ptr().add(self.frame_base()) }
     }
 
     #[inline(always)]
@@ -195,31 +251,30 @@ impl<'a> Ctx<'a> {
     }
 }
 
-/// The exception-dispatch result: a handler was found (the cache's pc
-/// already points at it, the exception rides in `Caught`) or the
-/// exception escaped this execution.
+/// The exception-dispatch result: a handler was found (its entry pc
+/// rides in `Caught` along with the exception, the current frame is the
+/// handler's) or the exception escaped this execution.
 pub enum Unwind<'a> {
-    Caught(Tagged<'a, Value>),
+    Caught { pc: usize, ex: Tagged<'a, Value> },
     Escaped,
 }
 
 /// Search the handler tables from the faulting frame outward, popping
 /// frames until a catch handler covers `fault_pc` or the execution's
-/// base anchor escapes. On `Caught`, the cache's pc is the
-/// handler's entry and the accumulator must become the exception; the
-/// pending exception is consumed.
+/// base anchor escapes. On `Caught` the pending exception is consumed
+/// and the current frame is the handler's.
 #[cold]
 #[inline(never)]
 pub unsafe fn unwind<'a>(ctx: &Ctx<'a>, fault_pc: usize) -> Unwind<'a> {
     let mut pc = fault_pc;
     loop {
+        let base = ctx.frame_base();
         let handled = if ctx.state().termination().is_some() {
             // A termination is not an exception: no handler (catch or
             // finally in any frame) may observe or intercept it.
             None
         } else {
-            let meta = ctx.cache().frame_meta();
-            let callable = ctx.stack().callable_slot(&meta).get(ctx.heap());
+            let callable = ctx.stack().callable_slot(base).get(ctx.heap());
             callable
                 .as_heap_object()
                 .and_then(|obj| obj.as_ref().callable_info(ctx.heap()))
@@ -231,15 +286,13 @@ pub unsafe fn unwind<'a>(ctx: &Ctx<'a>, fault_pc: usize) -> Unwind<'a> {
                 .state()
                 .take_pending_exception_tagged(ctx.heap())
                 .expect("pending exception must be set while unwinding");
-            ctx.cache().set_pc(handler_pc);
-            return Unwind::Caught(ex);
+            return Unwind::Caught { pc: handler_pc, ex };
         }
-        if ctx.cache().base() == ctx.base_anchor() {
+        if base == ctx.base_anchor() {
             return Unwind::Escaped;
         }
-        let meta = ctx.cache().frame_meta();
-        let caller = ctx.stack().pop_frame(&meta);
-        unsafe { ctx.cache().load(ctx.stack(), caller, ctx.heap_mut()) };
+        let caller = ctx.stack().pop_frame(base);
+        ctx.set_frame_base(caller.base);
         pc = caller.handler_pc;
     }
 }

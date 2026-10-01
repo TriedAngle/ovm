@@ -1,9 +1,9 @@
 use crate::proxy::Proxy;
 use crate::{
-    AccessorPair, Coercion, ContextState, Convert, DenseString, FixedArray, Float, FrameMeta,
-    GcSlot, Handle, HandleScope, Heap, HeapObject, Map, Object, PartialDescriptor,
-    PropertyDescriptor, RuntimeContext, SlotFlags, SlotName, Smi, Stack, StringData, Symbol,
-    Tagged, VM, Value, VmError,
+    AccessorPair, Coercion, ContextState, Convert, DenseString, FixedArray, Float, GcSlot, Handle,
+    HandleScope, Heap, HeapObject, Map, Object, PartialDescriptor, PropertyDescriptor,
+    RuntimeContext, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, VM, Value,
+    VmError,
 };
 
 pub enum Lookup<'a> {
@@ -369,9 +369,9 @@ impl Lookup<'_> {
     pub fn super_constructor<'a>(
         heap: &'a Heap,
         stack: &Stack,
-        meta: &FrameMeta,
+        base: usize,
     ) -> Option<Tagged<'a, Value>> {
-        let callable = stack.callable_slot(meta).get(heap);
+        let callable = stack.callable_slot(base).get(heap);
         let obj = callable.as_heap_object()?;
         let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
         // must be a real constructor

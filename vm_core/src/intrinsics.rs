@@ -1227,10 +1227,10 @@ fn frame_context_value<'a>(
     state: &ContextState,
     heap: &'a Heap,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    if !state.cache.is_active() {
+    if !state.is_frame_active() {
         return Err(VmError::Type);
     }
-    Ok(state.stack.context(heap, &state.cache.frame_meta()))
+    Ok(state.stack.context(heap, state.frame_base()))
 }
 
 /// Find the slot named `name` in `context`'s chain (direct eval). Returns
@@ -1284,14 +1284,14 @@ fn frame_super_parts<'a>(
     heap: &'a Heap,
     state: &ContextState,
 ) -> Result<(Tagged<'a, Value>, Tagged<'a, Value>), VmError> {
-    if !state.cache.is_active() {
+    if !state.is_frame_active() {
         return Err(VmError::Type);
     }
-    let meta = state.cache.frame_meta();
-    let Some(callee) = Lookup::super_constructor(heap, &state.stack, &meta) else {
+    let base = state.frame_base();
+    let Some(callee) = Lookup::super_constructor(heap, &state.stack, base) else {
         return Err(VmError::Type);
     };
-    Ok((callee, state.stack.new_target_slot(&meta).get(heap)))
+    Ok((callee, state.stack.new_target_slot(base).get(heap)))
 }
 
 // ---- store outcomes ---------------------------------------------------------
@@ -1956,15 +1956,15 @@ fn construct_super_all_args<'a>(
         let (callee, new_target) = rt_try!(vm, heap, state, frame_super_parts(heap, state));
         let callee = scope.handle(callee);
         let new_target = scope.handle(new_target);
-        if !state.cache.is_active() {
+        if !state.is_frame_active() {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
-        let meta = state.cache.frame_meta();
-        let argc = state.stack.argc(&meta).saturating_sub(1);
+        let base = state.frame_base();
+        let argc = state.stack.argc(base).saturating_sub(1);
         // params descend below the frame anchor: read them one by one in
         // argument order (formal j at operand -(j+1))
         let arg_words: Vec<Handle<'_, Value>> = (1..=argc)
-            .map(|j| scope.handle(state.stack.reg(heap, &meta, j as i32)))
+            .map(|j| scope.handle(state.stack.reg(heap, base, j as i32)))
             .collect();
         construct_super_construct(
             RuntimeContext::new(vm, heap, state),
@@ -2137,14 +2137,14 @@ fn create_rest_parameter<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) ->
         .map(|s| s.value() as usize)
         .unwrap_or(0);
     state.handle_scope(|scope| {
-        if !state.cache.is_active() {
+        if !state.is_frame_active() {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
-        let meta = state.cache.frame_meta();
-        let argc = state.stack.argc(&meta); // receiver included
+        let base = state.frame_base();
+        let argc = state.stack.argc(base); // receiver included
         let count = argc.saturating_sub(1).saturating_sub(first);
         let values: Vec<Handle<'_, Value>> = (0..count)
-            .map(|i| scope.handle(state.stack.reg(heap, &meta, (first + i + 1) as i32)))
+            .map(|i| scope.handle(state.stack.reg(heap, base, (first + i + 1) as i32)))
             .collect();
         let elements =
             heap.allocate_handle::<FixedArray>(stage_handles(heap, &scope, &values), &scope);

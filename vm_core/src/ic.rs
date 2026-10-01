@@ -1,7 +1,7 @@
 use crate::{
-    Acc, AccessorPair, CallTarget, CallableInfoObject, Context, DenseString, FeedbackVector,
-    FixedArray, FunctionKind, Handle, HandleScope, Heap, Intrinsic, Map, MaybeWeak, Object,
-    SlotName, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
+    AccessorPair, CallTarget, CallableInfoObject, Context, DenseString, FeedbackVector, FixedArray,
+    FunctionKind, Handle, HandleScope, Heap, Intrinsic, Map, MaybeWeak, Object, SlotName, Smi,
+    Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
@@ -1188,7 +1188,7 @@ impl InlineCache {
         slot: usize,
         receiver: Handle<'_, Value>,
         name: Handle<'_, SlotName>,
-        acc: &Acc<'_>,
+        value: Handle<'_, Value>,
     ) -> Option<StoreHit<'a>> {
         let vector = vector?;
         let recv = ic_receiver(receiver.as_tagged(heap).erase(), heap)?;
@@ -1230,11 +1230,11 @@ impl InlineCache {
                 let host = recv.erase();
                 recv.as_ref()
                     .slot(heap, offset)
-                    .set(heap, host, acc.get(heap));
+                    .set(heap, host, value.as_tagged(heap));
                 Some(StoreHit::Done)
             }
             StoreAction::Transition(target) => {
-                apply_transition(heap, scope, receiver, name, acc, &target)
+                apply_transition(heap, scope, receiver, name, value, &target)
                     .then_some(StoreHit::Done)
             }
             StoreAction::Setter(setter) => Some(StoreHit::Setter(setter.as_tagged(heap))),
@@ -1275,7 +1275,7 @@ fn apply_transition(
     scope: &HandleScope<'_>,
     receiver: Handle<'_, Value>,
     name: Handle<'_, SlotName>,
-    acc: &Acc<'_>,
+    value: Handle<'_, Value>,
     target: &Handle<'_, Map>,
 ) -> bool {
     let recv = receiver
@@ -1299,7 +1299,8 @@ fn apply_transition(
 
     if new_len == old_len && offset < old_len {
         let host = recv.erase();
-        recv.slot(heap, offset).set(heap, host, acc.get(heap));
+        recv.slot(heap, offset)
+            .set(heap, host, value.as_tagged(heap));
         recv.as_ref()
             .header
             .map
@@ -1322,7 +1323,7 @@ fn apply_transition(
             .iter()
             .map(|slot| slot.get(heap))
             .collect();
-        values.push(acc.get(heap));
+        values.push(value.as_tagged(heap));
         let slots = token.allocate::<FixedArray>(scope.stage(&values));
         let host = recv.erase();
         recv.slots.set(heap, host, slots);

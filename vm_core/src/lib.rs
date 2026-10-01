@@ -6,7 +6,6 @@ use core::cell::Cell;
 use core::ptr::NonNull;
 
 pub mod bootstrap;
-pub mod cache;
 pub mod cold;
 pub mod compare;
 pub mod convert;
@@ -35,7 +34,6 @@ pub use bootstrap::{
     KnownCell, WellKnown, WellKnownStrings, bootstrap_basics, bootstrap_well_known,
     intern_well_known_strings,
 };
-pub use cache::{Acc, StackCache};
 pub use compare::Compare;
 pub use convert::Convert;
 pub use error::VmError;
@@ -63,7 +61,7 @@ pub use runtime::{
     Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Intrinsic, Runtime, RuntimeCall,
     RuntimeContext, RuntimeIndex, RuntimeRegistry, raise_runtime, spread_apply_args,
 };
-pub use stack::{FrameMeta, STACK_SLOTS, Stack};
+pub use stack::{Callee, FrameMeta, Params, STACK_SLOTS, Stack};
 pub use tools::{KetteTools, Termination};
 pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
@@ -137,7 +135,17 @@ pub struct VM {
 pub struct ContextState {
     handles: HandleData,
     stack: Stack,
-    cache: StackCache,
+    /// The current (innermost) interpreter frame's anchor. Frames are
+    /// self-describing (see [`Stack`]): this cell is the only shadow
+    /// state, written by push/pop/unwind frame switches.
+    frame_base: Cell<usize>,
+    /// Whether an interpreted frame is current (intrinsics inspecting
+    /// the running frame check this).
+    frame_active: Cell<bool>,
+    /// The accumulator parking cell: interpreters park the value in
+    /// flight here across safepoint polls (park/poll/reload never
+    /// nests, so one cell serves every frame).
+    acc: Register,
     pending_exception: Register,
     has_pending_exception: Cell<bool>,
     /// The error code behind the current sentinel-channel raise, for
@@ -160,8 +168,29 @@ impl ContextState {
         &self.stack
     }
 
-    pub fn cache(&self) -> &StackCache {
-        &self.cache
+    #[inline(always)]
+    pub fn frame_base(&self) -> usize {
+        self.frame_base.get()
+    }
+
+    #[inline(always)]
+    pub fn set_frame_base(&self, base: usize) {
+        self.frame_base.set(base);
+    }
+
+    #[inline(always)]
+    pub fn is_frame_active(&self) -> bool {
+        self.frame_active.get()
+    }
+
+    #[inline(always)]
+    pub fn set_frame_active(&self, active: bool) {
+        self.frame_active.set(active);
+    }
+
+    /// The accumulator parking cell (see the field docs).
+    pub fn acc_slot(&self) -> &Register {
+        &self.acc
     }
 
     #[inline(always)]
@@ -318,10 +347,10 @@ impl ContextState {
     /// The current frame's context (the chain `LoadContextSlot` walks),
     /// for direct eval. `None` when no frame is executing.
     pub fn current_context<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
-        if !self.cache.is_active() {
+        if !self.is_frame_active() {
             return None;
         }
-        Some(self.stack.context(heap, &self.cache.frame_meta()))
+        Some(self.stack.context(heap, self.frame_base()))
     }
 
     pub fn handle_scope<R>(&self, f: impl for<'s> FnOnce(HandleScope<'s>) -> R) -> R {
@@ -391,7 +420,7 @@ impl EdgeVisitable for ContextState {
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
         self.handles.visit_edges(visitor);
         self.stack.visit_edges(visitor);
-        self.cache.visit_edges(visitor);
+        visitor.visit(self.acc.as_raw());
         visitor.visit(self.pending_exception.as_raw());
         visitor.visit(self.construct_cache.as_raw());
     }
@@ -453,7 +482,7 @@ impl Thread {
         args: &[Value],
     ) -> Result<Value, VmError> {
         debug_assert_eq!(self.state.stack.top(), 0);
-        debug_assert!(!self.state.cache.is_active());
+        debug_assert!(!self.state.is_frame_active());
 
         // don't leak pending exception if it exists
         let _ = self.state.take_pending_exception();
@@ -663,7 +692,9 @@ impl VM {
         let state = Arc::new(ContextState {
             handles: HandleData::new(the_hole),
             stack: Stack::new(STACK_SLOTS, undefined, undefined),
-            cache: StackCache::new(the_hole),
+            frame_base: Cell::new(0),
+            frame_active: Cell::new(false),
+            acc: unsafe { Register::from_value(undefined) },
             pending_exception: unsafe { Register::from_value(the_hole) },
             has_pending_exception: Cell::new(false),
             last_error: Cell::new(VmError::Type),

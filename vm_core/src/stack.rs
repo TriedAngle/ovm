@@ -33,10 +33,10 @@ pub const FEEDBACK_OFFSET: isize = -7;
 pub const SAVED_BASE_OFFSET: isize = -8;
 /// The caller's resume pc (the instruction after its call).
 pub const SAVED_PC_OFFSET: isize = -9;
-/// The caller's register-file size (its frame low is derived from it).
-pub const SAVED_REGCOUNT_OFFSET: isize = -10;
 /// The caller's exception handler lookup pc (its call site).
-pub const SAVED_HANDLER_PC_OFFSET: isize = -11;
+pub const SAVED_HANDLER_PC_OFFSET: isize = -10;
+/// The frame's own register-file size (its frame low is derived from it).
+pub const REGCOUNT_OFFSET: isize = -11;
 
 const _: () = assert!(
     -bytecode::REGISTER_FILE_START as usize == HEADER_SLOTS + 1,
@@ -47,13 +47,45 @@ fn offset_slot(base: usize, offset: isize) -> usize {
     (base as isize + offset) as usize
 }
 
+/// The pushed frame's function facts (from a `CallTarget::Bytecode`
+/// destructure or a call-IC hit).
+pub struct Callee<'a> {
+    pub callable: Tagged<'a, Value>,
+    pub info: Tagged<'a, CallableInfoObject>,
+    pub context: Tagged<'a, Value>,
+    pub register_count: usize,
+    pub formal_min: usize,
+}
+
+/// Where a pushed frame's parameters come from; element 0 is always
+/// the receiver.
+pub enum Params<'p> {
+    /// A staged slice: element 0 = receiver.
+    Slice(HandleSlice<'p>),
+    /// The caller's contiguous register window
+    /// `[base - count + 1 ..= base]`: element 0 (the receiver) rides
+    /// the window's lowest slot.
+    Window { base: i32, count: usize },
+    /// Scattered caller registers; `srcs[0]` is the receiver.
+    Scattered(&'p [i32]),
+    /// An `undefined` receiver followed by scattered caller registers.
+    Function(&'p [i32]),
+    /// A synthesized receiver at the anchor followed by the caller's
+    /// window arguments (`[[Construct]]`).
+    Construct {
+        receiver: Tagged<'p, Value>,
+        base: i32,
+        count: usize,
+    },
+}
+
 /// Frame layout
 /// index                     content
 /// base-HEADER-rc .. base-12 register file (r0 at base-12 = directly below
 ///                           the header, r_i at base-12-i, descending)
 /// base-11 .. base-1         header: new.target, context, argc, callable,
 ///                           code, constants, feedback, and the suspended
-///                           caller's base/pc/register count/handler pc
+///                           caller's base/pc/handler pc
 /// base   + 0                parameter 0 (the receiver)
 /// base   + 1 .. +padded-1   parameters (formal j at base+j), padded to
 ///                           formal_min with undefined
@@ -66,9 +98,10 @@ fn offset_slot(base: usize, offset: isize) -> usize {
 /// address of the window, so `args` slices are element-ordered and frame
 /// pushes are forward memcpys.
 ///
-/// Frames are self-describing: the currently executing frame's dispatch
-/// state lives in the [`StackCache`](StackCache), and a call writes the
-/// caller's suspended state into the callee's header, so no parallel frame list exists.
+/// Frames are self-describing: dispatch state (code, constants,
+/// feedback, accumulator, register count) lives in the frame header
+/// itself and a call writes the caller's suspended state into the
+/// callee's header, so no parallel frame list or shadow cache exists.
 pub struct Stack {
     slots: Box<[Register]>,
     top: Cell<usize>,
@@ -115,11 +148,6 @@ impl Stack {
         self.slots.as_ptr() as *mut Register
     }
 
-    /// The frame's lowest slot: below the register file and header.
-    pub fn frame_low(meta: &FrameMeta) -> usize {
-        meta.base - HEADER_SLOTS - meta.register_count
-    }
-
     #[inline]
     pub fn value_slice(&self, base: usize, count: usize) -> HandleSlice<'_> {
         let slots = &self.slots[base..base + count];
@@ -134,18 +162,18 @@ impl Stack {
     }
 
     /// The frame's callable, re-read under a heap borrow.
-    pub fn callable<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Object> {
+    pub fn callable<'a>(&self, heap: &'a Heap, base: usize) -> Tagged<'a, Object> {
         // Safety: frame callable slots hold strong object pointers.
-        unsafe { self.callable_slot(meta).get(heap).cast::<Object>() }
+        unsafe { self.callable_slot(base).get(heap).cast::<Object>() }
     }
 
-    pub fn callable_slot(&self, meta: &FrameMeta) -> &Register {
-        self.slot_unchecked(offset_slot(meta.base, CALLABLE_OFFSET))
+    pub fn callable_slot(&self, base: usize) -> &Register {
+        self.header_slot(base, CALLABLE_OFFSET)
     }
 
     /// The frame's current context, re-read under a heap borrow.
-    pub fn context<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Value> {
-        self.context_slot(meta).get(heap)
+    pub fn context<'a>(&self, heap: &'a Heap, base: usize) -> Tagged<'a, Value> {
+        self.context_slot(base).get(heap)
     }
 
     #[inline(always)]
@@ -153,253 +181,163 @@ impl Stack {
         self.slot_unchecked(offset_slot(base, offset))
     }
 
-    pub fn context_slot(&self, meta: &FrameMeta) -> &Register {
-        self.slot_unchecked(offset_slot(meta.base, CONTEXT_OFFSET))
+    pub fn context_slot(&self, base: usize) -> &Register {
+        self.header_slot(base, CONTEXT_OFFSET)
     }
 
     /// The frame's `new.target`, re-read under a heap borrow.
-    pub fn new_target<'a>(&self, heap: &'a Heap, meta: &FrameMeta) -> Tagged<'a, Value> {
-        self.new_target_slot(meta).get(heap)
+    pub fn new_target<'a>(&self, heap: &'a Heap, base: usize) -> Tagged<'a, Value> {
+        self.new_target_slot(base).get(heap)
     }
 
-    pub fn new_target_slot(&self, meta: &FrameMeta) -> &Register {
-        self.slot_unchecked(offset_slot(meta.base, NEW_TARGET_OFFSET))
+    pub fn new_target_slot(&self, base: usize) -> &Register {
+        self.header_slot(base, NEW_TARGET_OFFSET)
     }
 
     /// The frame's actual argument count, receiver included.
-    pub fn argc(&self, meta: &FrameMeta) -> usize {
-        self.slot_unchecked(offset_slot(meta.base, ARGC_OFFSET))
-            .read_smi()
-            .value() as usize
+    pub fn argc(&self, base: usize) -> usize {
+        self.header_slot(base, ARGC_OFFSET).read_smi().value() as usize
+    }
+
+    /// The frame's register-file size.
+    pub fn regcount(&self, base: usize) -> usize {
+        self.header_slot(base, REGCOUNT_OFFSET).read_smi().value() as usize
     }
 
     /// The operand is the anchor-relative slot offset
-    fn reg_index(meta: &FrameMeta, operand: i32) -> usize {
-        (meta.base as isize + operand as isize) as usize
+    fn slot_of(base: usize, operand: i32) -> usize {
+        (base as isize + operand as isize) as usize
     }
 
     /// Read a register under a heap borrow: rooted memory is updated in
     /// place by the GC, so the word is current and valid for `'a`.
-    pub fn reg<'a>(&self, _heap: &'a Heap, meta: &FrameMeta, i: i32) -> Tagged<'a, Value> {
-        self.slot_unchecked(Self::reg_index(meta, i)).get(_heap)
+    pub fn reg<'a>(&self, _heap: &'a Heap, base: usize, i: i32) -> Tagged<'a, Value> {
+        self.slot_unchecked(Self::slot_of(base, i)).get(_heap)
     }
 
-    pub fn set_reg<'x, T: 'x>(&self, meta: &FrameMeta, i: i32, v: Tagged<'x, T>) {
-        self.slot_unchecked(Self::reg_index(meta, i)).store(v);
+    pub fn set_reg<'x, T: 'x>(&self, base: usize, i: i32, v: Tagged<'x, T>) {
+        self.slot_unchecked(Self::slot_of(base, i)).store(v);
     }
 
     /// The call-argument window `[reg_base .. reg_base+count)`: element 0
     /// (the receiver) is the base register's window slot at
     /// `reg_base - count + 1`, so the ascending slice is element-ordered.
     #[inline]
-    pub fn args(&self, meta: &FrameMeta, reg_base: i32, count: usize) -> HandleSlice<'_> {
+    pub fn args(&self, base: usize, reg_base: i32, count: usize) -> HandleSlice<'_> {
         if count == 0 {
             return HandleSlice::EMPTY;
         }
-        self.value_slice(Self::reg_index(meta, reg_base - count as i32 + 1), count)
+        self.value_slice(Self::slot_of(base, reg_base - count as i32 + 1), count)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn push_initial_frame(
-        &self,
-        heap: &Heap,
-        callable: Tagged<'_, Value>,
-        info: Tagged<'_, CallableInfoObject>,
-        register_count: usize,
-        context: Tagged<'_, Value>,
-        new_target: Tagged<'_, Value>,
-        args: HandleSlice<'_>,
-        formal_min: usize,
-    ) -> Result<FrameMeta, VmError> {
-        let argc = args.len();
-        let padded = args.len().max(formal_min);
-        let anchor = self.reserve(heap, register_count, padded)?;
-        debug_assert!(args.raw().iter().all(|v| !v.is_weak_ptr()));
-        // params ascend above the anchor: element j (receiver = 0) at
-        // anchor+j — element-ordered, so one forward copy
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                args.raw().as_ptr(),
-                self.slots.as_ptr().add(anchor) as *mut Value,
-                args.len(),
-            );
-            // missing arguments are undefined (registers are the hole)
-            let undefined = self.undefined.get(heap);
-            for i in args.len()..padded {
-                self.slot_unchecked(anchor + i).store(undefined);
-            }
-        }
-        Ok(self.init_frame_header(
-            heap,
-            anchor,
-            register_count,
-            callable,
-            info,
-            context,
-            new_target,
-            argc,
-            FrameMeta {
-                base: 0,
-                pc: 0,
-                register_count: 0,
-                handler_pc: 0,
-            },
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
+    /// Push a frame: reserve its register file and parameter region
+    /// (padded to `formal_min` with undefined), write the parameters, and
+    /// initialize the header — including the caller's suspended state.
+    /// Entry is at pc 0; the accumulator slot is seeded undefined.
     #[inline(always)]
     pub fn push_frame(
         &self,
         heap: &Heap,
         caller: FrameMeta,
-        handler_pc: usize,
-        callable: Tagged<'_, Value>,
-        info: Tagged<'_, CallableInfoObject>,
-        register_count: usize,
-        context: Tagged<'_, Value>,
-        src_reg_base: i32,
-        count: usize,
+        callee: Callee<'_>,
         new_target: Tagged<'_, Value>,
-        formal_min: usize,
+        params: Params<'_>,
     ) -> Result<FrameMeta, VmError> {
-        let padded = count.max(formal_min);
-        let anchor = self.reserve(heap, register_count, padded)?;
-        // element 0 (receiver) sits at the window's lowest slot: the base
-        // operand minus count-1 — one forward copy into the params
-        let src = Self::reg_index(&caller, src_reg_base - count as i32 + 1);
-        debug_assert!(
-            self.slots[src..src + count]
-                .iter()
-                .all(|r| !r.raw().is_weak_ptr())
-        );
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                self.slots.as_ptr().add(src) as *const Value,
-                self.slots.as_ptr().add(anchor) as *mut Value,
-                count,
-            );
-            let undefined = self.undefined.get(heap);
-            for i in count..padded {
-                self.slot_unchecked(anchor + i).store(undefined);
-            }
-        }
-        let mut caller = caller;
-        caller.handler_pc = handler_pc;
-        Ok(self.init_frame_header(
-            heap,
-            anchor,
-            register_count,
-            callable,
-            info,
-            context,
-            new_target,
-            count,
-            caller,
-        ))
-    }
-
-    /// Push a `[[Construct]]` frame: the receiver is *synthesized* (not in
-    /// the caller's registers), so it is seeded at the anchor and the
-    /// contiguous argument range `base-count+1..=base` follows it.
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    pub fn push_construct_frame(
-        &self,
-        heap: &Heap,
-        caller: FrameMeta,
-        handler_pc: usize,
-        callable: Tagged<'_, Value>,
-        info: Tagged<'_, CallableInfoObject>,
-        register_count: usize,
-        context: Tagged<'_, Value>,
-        src_reg_base: i32,
-        count: usize,
-        new_target: Tagged<'_, Value>,
-        receiver: Tagged<'_, Value>,
-        formal_min: usize,
-    ) -> Result<FrameMeta, VmError> {
-        let total = count + 1;
-        let padded = total.max(formal_min);
-        let anchor = self.reserve(heap, register_count, padded)?;
-        self.slot_unchecked(anchor)
-            .as_raw()
-            .store_raw(receiver.raw().to_bits());
-        let src = Self::reg_index(&caller, src_reg_base - count as i32 + 1);
-        debug_assert!(
-            count == 0
-                || self.slots[src..src + count]
-                    .iter()
-                    .all(|r| !r.raw().is_weak_ptr())
-        );
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                self.slots.as_ptr().add(src) as *const Value,
-                self.slots.as_ptr().add(anchor + 1) as *mut Value,
-                count,
-            );
-        }
+        let count = match &params {
+            Params::Slice(args) => args.len(),
+            Params::Window { count, .. } => *count,
+            Params::Scattered(srcs) => srcs.len(),
+            Params::Function(srcs) => 1 + srcs.len(),
+            Params::Construct { count, .. } => 1 + count,
+        };
+        let padded = count.max(callee.formal_min);
+        let anchor = self.reserve(heap, callee.register_count, padded)?;
         let undefined = self.undefined.get(heap);
-        for i in total..padded {
-            self.slot_unchecked(anchor + i).store(undefined);
-        }
-        let mut caller = caller;
-        caller.handler_pc = handler_pc;
-        Ok(self.init_frame_header(
-            heap,
-            anchor,
-            register_count,
-            callable,
-            info,
-            context,
-            new_target,
-            total,
-            caller,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn push_frame_with_args(
-        &self,
-        heap: &Heap,
-        caller: FrameMeta,
-        handler_pc: usize,
-        callable: Tagged<'_, Value>,
-        info: Tagged<'_, CallableInfoObject>,
-        register_count: usize,
-        context: Tagged<'_, Value>,
-        args: HandleSlice<'_>,
-        new_target: Tagged<'_, Value>,
-        formal_min: usize,
-    ) -> Result<FrameMeta, VmError> {
-        let padded = args.len().max(formal_min);
-        let anchor = self.reserve(heap, register_count, padded)?;
-        debug_assert!(args.raw().iter().all(|v| !v.is_weak_ptr()));
-        // params ascend above the anchor, element-ordered: one forward copy
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                args.raw().as_ptr(),
-                self.slots.as_ptr().add(anchor) as *mut Value,
-                args.len(),
-            );
-            let undefined = self.undefined.get(heap);
-            for i in args.len()..padded {
-                self.slot_unchecked(anchor + i).store(undefined);
+        let param = |i: usize| self.slot_unchecked(anchor + i);
+        match &params {
+            Params::Slice(args) => {
+                self.write_params(anchor, args.raw());
+                for i in args.len()..padded {
+                    param(i).store(undefined);
+                }
+            }
+            Params::Window { base, count } => {
+                // element 0 (receiver) sits at the window's lowest slot:
+                // the base operand minus count-1 — one forward copy
+                let src = Self::slot_of(caller.base, base - *count as i32 + 1);
+                self.copy_slots(anchor, src, *count);
+                for i in *count..padded {
+                    param(i).store(undefined);
+                }
+            }
+            Params::Scattered(srcs) => {
+                for (i, &operand) in srcs.iter().enumerate() {
+                    let v = self
+                        .slot_unchecked(Self::slot_of(caller.base, operand))
+                        .get(heap);
+                    param(i).store(v);
+                }
+                for i in srcs.len()..padded {
+                    param(i).store(undefined);
+                }
+            }
+            Params::Function(srcs) => {
+                param(0).store(undefined);
+                for (i, &operand) in srcs.iter().enumerate() {
+                    let v = self
+                        .slot_unchecked(Self::slot_of(caller.base, operand))
+                        .get(heap);
+                    param(1 + i).store(v);
+                }
+                for i in (1 + srcs.len())..padded {
+                    param(i).store(undefined);
+                }
+            }
+            Params::Construct {
+                receiver,
+                base,
+                count,
+            } => {
+                param(0).store(*receiver);
+                let src = Self::slot_of(caller.base, base - *count as i32 + 1);
+                self.copy_slots(anchor + 1, src, *count);
+                for i in (1 + count)..padded {
+                    param(i).store(undefined);
+                }
             }
         }
-        let mut caller = caller;
-        caller.handler_pc = handler_pc;
-        Ok(self.init_frame_header(
-            heap,
-            anchor,
-            register_count,
-            callable,
-            info,
-            context,
-            new_target,
-            args.len(),
-            caller,
-        ))
+        Ok(self.init_frame_header(heap, anchor, &callee, new_target, count, caller))
+    }
+
+    /// Copy whole parameter words into the arena: the destination slots
+    /// are GC roots, the staged source is rooted by its staging scope.
+    #[inline(always)]
+    fn write_params(&self, dst: usize, values: &[Value]) {
+        if values.is_empty() {
+            return;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                values.as_ptr() as *const Register,
+                (self.slots.as_ptr() as *mut Register).add(dst),
+                values.len(),
+            );
+        }
+    }
+
+    /// Whole-word copy between arena slots; both sides are GC roots and
+    /// the ranges are disjoint by construction (the destination sits
+    /// above the pre-push top, the source inside the caller's frame).
+    #[inline(always)]
+    fn copy_slots(&self, dst: usize, src: usize, count: usize) {
+        debug_assert!(count == 0 || dst + count <= src || src + count <= dst);
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.slots.as_ptr().add(src),
+                (self.slots.as_ptr() as *mut Register).add(dst),
+                count,
+            );
+        }
     }
 
     /// Stage a construct argument window for a runtime constructor:
@@ -473,7 +411,7 @@ impl Stack {
     pub fn stage_args_regs<'s>(
         &'s self,
         heap: &Heap,
-        caller: &FrameMeta,
+        caller_base: usize,
         srcs: &[i32],
     ) -> Result<(usize, HandleSlice<'s>), VmError> {
         let saved_top = self.top();
@@ -489,7 +427,7 @@ impl Stack {
         }
         self.set_top(base + size);
         for (i, &operand) in srcs.iter().enumerate() {
-            let src = Self::reg_index(caller, operand);
+            let src = Self::slot_of(caller_base, operand);
             self.slot_unchecked(dst + i)
                 .as_raw()
                 .store_raw(self.slot_unchecked(src).raw().to_bits());
@@ -503,7 +441,7 @@ impl Stack {
     pub fn stage_function_args<'s>(
         &'s self,
         heap: &Heap,
-        caller: &FrameMeta,
+        caller_base: usize,
         srcs: &[i32],
     ) -> Result<(usize, HandleSlice<'s>), VmError> {
         let saved_top = self.top();
@@ -520,7 +458,7 @@ impl Stack {
         self.set_top(base + size);
         self.slot_unchecked(dst).store(self.undefined.get(heap));
         for (i, &operand) in srcs.iter().enumerate() {
-            let src = Self::reg_index(caller, operand);
+            let src = Self::slot_of(caller_base, operand);
             self.slot_unchecked(dst + 1 + i)
                 .as_raw()
                 .store_raw(self.slot_unchecked(src).raw().to_bits());
@@ -530,107 +468,17 @@ impl Stack {
         Ok((saved_top, staged))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    pub fn push_frame_function(
-        &self,
-        heap: &Heap,
-        caller: FrameMeta,
-        handler_pc: usize,
-        callable: Tagged<'_, Value>,
-        info: Tagged<'_, CallableInfoObject>,
-        register_count: usize,
-        context: Tagged<'_, Value>,
-        args: &[i32],
-        new_target: Tagged<'_, Value>,
-        formal_min: usize,
-    ) -> Result<FrameMeta, VmError> {
-        let count = 1 + args.len();
-        let padded = count.max(formal_min);
-        let anchor = self.reserve(heap, register_count, padded)?;
-        self.slot_unchecked(anchor).store(self.undefined.get(heap));
-        for (i, &operand) in args.iter().enumerate() {
-            let src = Self::reg_index(&caller, operand);
-            debug_assert!(!self.slot_unchecked(src).raw().is_weak_ptr());
-            self.slot_unchecked(anchor + 1 + i)
-                .as_raw()
-                .store_raw(self.slot_unchecked(src).raw().to_bits());
-        }
-        let undefined = self.undefined.get(heap);
-        for i in count..padded {
-            self.slot_unchecked(anchor + i).store(undefined);
-        }
-        let mut caller = caller;
-        caller.handler_pc = handler_pc;
-        Ok(self.init_frame_header(
-            heap,
-            anchor,
-            register_count,
-            callable,
-            info,
-            context,
-            new_target,
-            count,
-            caller,
-        ))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    pub fn push_frame_scattered(
-        &self,
-        heap: &Heap,
-        caller: FrameMeta,
-        handler_pc: usize,
-        callable: Tagged<'_, Value>,
-        info: Tagged<'_, CallableInfoObject>,
-        register_count: usize,
-        context: Tagged<'_, Value>,
-        srcs: &[i32],
-        new_target: Tagged<'_, Value>,
-        formal_min: usize,
-    ) -> Result<FrameMeta, VmError> {
-        let count = srcs.len();
-        let padded = count.max(formal_min);
-        let anchor = self.reserve(heap, register_count, padded)?;
-        for (i, &operand) in srcs.iter().enumerate() {
-            let src = Self::reg_index(&caller, operand);
-            debug_assert!(!self.slot_unchecked(src).raw().is_weak_ptr());
-            self.slot_unchecked(anchor + i)
-                .as_raw()
-                .store_raw(self.slot_unchecked(src).raw().to_bits());
-        }
-        let undefined = self.undefined.get(heap);
-        for i in count..padded {
-            self.slot_unchecked(anchor + i).store(undefined);
-        }
-        let mut caller = caller;
-        caller.handler_pc = handler_pc;
-        Ok(self.init_frame_header(
-            heap,
-            anchor,
-            register_count,
-            callable,
-            info,
-            context,
-            new_target,
-            count,
-            caller,
-        ))
-    }
-
     #[inline]
-    pub fn pop_frame(&self, frame: &FrameMeta) -> FrameMeta {
-        self.set_top(Self::frame_low(frame));
-        let read = |offset: isize| {
-            self.header_slot(frame.base, offset)
-                .read_smi_unchecked()
-                .value() as usize
-        };
+    pub fn pop_frame(&self, base: usize) -> FrameMeta {
+        self.set_top(base - HEADER_SLOTS - self.regcount(base));
+        let read = |offset: isize| self.header_slot(base, offset).read_smi().value() as usize;
+        let caller = read(SAVED_BASE_OFFSET);
+        // the caller's own header carries its register count: no saved
+        // copy rides in this frame
         FrameMeta {
-            base: read(SAVED_BASE_OFFSET),
+            base: caller,
             pc: read(SAVED_PC_OFFSET),
-            register_count: read(SAVED_REGCOUNT_OFFSET),
+            register_count: self.regcount(caller),
             handler_pc: read(SAVED_HANDLER_PC_OFFSET),
         }
     }
@@ -657,19 +505,12 @@ impl Stack {
         &self,
         heap: &Heap,
         anchor: usize,
-        register_count: usize,
-        callable: Tagged<'_, Value>,
-        info: Tagged<'_, CallableInfoObject>,
-        context: Tagged<'_, Value>,
+        callee: &Callee<'_>,
         new_target: Tagged<'_, Value>,
         argc: usize,
         caller: FrameMeta,
     ) -> FrameMeta {
-        // one held base for the whole header: the fixed header words sit
-        // contiguously below the anchor (offsets -1..-11), so the stores
-        // compile to plain offset writes instead of re-deriving the slot
-        // address through `self` per field
-        let info = info.as_ref();
+        let info = callee.info.as_ref();
         let bytecode = info.bytecode.get(heap).raw();
         let constants = info.constants.get(heap).raw();
         let feedback = info
@@ -677,9 +518,9 @@ impl Stack {
             .get(heap)
             .map_or_else(|| heap.known().the_hole.as_tagged(heap).raw(), |v| v.raw());
         let saved = [
-            (CALLABLE_OFFSET, callable.raw()),
+            (CALLABLE_OFFSET, callee.callable.raw()),
             (ARGC_OFFSET, Smi::new(argc as i64).encode()),
-            (CONTEXT_OFFSET, context.raw()),
+            (CONTEXT_OFFSET, callee.context.raw()),
             (NEW_TARGET_OFFSET, new_target.raw()),
             (CODE_OFFSET, bytecode),
             (CONSTANTS_OFFSET, constants),
@@ -687,14 +528,17 @@ impl Stack {
             (SAVED_BASE_OFFSET, Smi::new(caller.base as i64).encode()),
             (SAVED_PC_OFFSET, Smi::new(caller.pc as i64).encode()),
             (
-                SAVED_REGCOUNT_OFFSET,
-                Smi::new(caller.register_count as i64).encode(),
-            ),
-            (
                 SAVED_HANDLER_PC_OFFSET,
                 Smi::new(caller.handler_pc as i64).encode(),
             ),
+            (
+                REGCOUNT_OFFSET,
+                Smi::new(callee.register_count as i64).encode(),
+            ),
         ];
+        // the fixed header words sit contiguously below the anchor
+        // (offsets -1..=-11): plain offset writes through one held base
+        // instead of re-deriving the slot address through `self` per field
         unsafe {
             let base = (self.slots.as_ptr() as *mut Value).add(anchor);
             for (offset, word) in saved {
@@ -704,7 +548,7 @@ impl Stack {
         FrameMeta {
             base: anchor,
             pc: 0,
-            register_count,
+            register_count: callee.register_count,
             handler_pc: 0,
         }
     }
@@ -730,4 +574,15 @@ pub struct FrameMeta {
     pub register_count: usize,
     /// Pc used for exception handler lookup when unwinding
     pub handler_pc: usize,
+}
+
+impl FrameMeta {
+    /// The bootstrap caller of an execution's initial frame: no state is
+    /// ever resumed from it (returning past the anchor escapes).
+    pub const ROOT: FrameMeta = FrameMeta {
+        base: 0,
+        pc: 0,
+        register_count: 0,
+        handler_pc: 0,
+    };
 }

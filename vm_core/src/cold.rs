@@ -190,11 +190,10 @@ pub unsafe fn named_load<'a>(
     let heap = ctx.heap_mut();
     let state = ctx.state();
     state.handle_scope(|scope| {
-        let meta = ctx.meta(0);
         let recv = scope.handle(recv);
         let name = scope.handle(
             ctx.stack()
-                .callable(heap, &meta)
+                .callable(heap, ctx.frame_base())
                 .as_ref()
                 .constant_slot_name(heap, name_idx),
         );
@@ -215,7 +214,7 @@ pub unsafe fn named_load<'a>(
                 InlineCache::update_load(
                     heap,
                     &scope,
-                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                    ctx.feedback_ref(heap).map(|v| scope.handle(v)),
                     fb_slot,
                     recv.as_tagged(heap)
                         .as_heap_object()
@@ -276,7 +275,7 @@ pub unsafe fn keyed_load<'a>(
                 InlineCache::update_load_element(
                     heap,
                     &scope,
-                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                    ctx.feedback_ref(heap).map(|v| scope.handle(v)),
                     fb,
                     Some(recv),
                     i,
@@ -393,7 +392,7 @@ pub unsafe fn keyed_store<'a>(
                             InlineCache::update_store_element(
                                 heap,
                                 &scope,
-                                ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                                ctx.feedback_ref(heap).map(|v| scope.handle(v)),
                                 fb,
                                 Some(recv),
                                 grew,
@@ -416,7 +415,7 @@ pub unsafe fn keyed_store<'a>(
             Ok(o) => o,
             Err(e) => return ctx.raise_tag(e),
         };
-        match apply_store_outcome(ctx, recv, outcome) {
+        match apply_store_outcome(ctx, recv, outcome, value) {
             Ok(()) => value.as_tagged(heap).erase(),
             Err(()) => ctx.exception_word(),
         }
@@ -437,20 +436,14 @@ pub unsafe fn global_load<'a>(
     let state = ctx.state();
     state.handle_scope(|scope| {
         let global = heap.known().global_object;
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
+        let name = scope.handle(ctx.constants_ref(heap).at(heap, name_idx).erase().as_name());
         let out = match global.as_tagged(heap).lookup(heap, name.as_tagged(heap)) {
             Lookup::Data { slot, .. } => {
                 let v = scope.handle(slot.get(heap));
                 InlineCache::update_load(
                     heap,
                     &scope,
-                    ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+                    ctx.feedback_ref(heap).map(|v| scope.handle(v)),
                     fb_slot,
                     Some(scope.handle(global.as_tagged(heap))),
                     scope.handle(name.as_tagged(heap).erase().as_name()),
@@ -505,18 +498,10 @@ pub unsafe fn store_named<'a>(
     let vm = ctx.vm();
     let heap = ctx.heap_mut();
     let state = ctx.state();
-    // the store IC reads the accumulator from the cache slot
-    ctx.cache().acc_mut().store(value);
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
         let value = scope.handle(value);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
+        let name = scope.handle(ctx.constants_ref(heap).at(heap, name_idx).erase().as_name());
 
         // ES 20.2.5.10: a proxy receiver runs its `set` trap; no IC
         // update (dynamic traps must not be cached), and the probe is
@@ -532,11 +517,11 @@ pub unsafe fn store_named<'a>(
         if let Some(hit) = InlineCache::try_store(
             heap,
             &scope,
-            ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+            ctx.feedback_ref(heap).map(|v| scope.handle(v)),
             fb_slot,
             recv.erase(),
             name,
-            &ctx.cache().acc_mut(),
+            value,
         ) {
             return match hit {
                 StoreHit::Done => value.as_tagged(heap).erase(),
@@ -577,17 +562,10 @@ pub unsafe fn store_named_no_shadow<'a>(
 ) -> Tagged<'a, Value> {
     let heap = ctx.heap_mut();
     let state = ctx.state();
-    ctx.cache().acc_mut().store(value);
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
         let value = scope.handle(value);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
+        let name = scope.handle(ctx.constants_ref(heap).at(heap, name_idx).erase().as_name());
         store_named_tail(ctx, recv, name, value, None, StoreSemantics::WriteThrough)
     })
 }
@@ -601,16 +579,9 @@ pub unsafe fn store_global<'a>(
 ) -> Tagged<'a, Value> {
     let heap = ctx.heap_mut();
     let state = ctx.state();
-    ctx.cache().acc_mut().store(value);
     state.handle_scope(|scope| {
         let value = scope.handle(value);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
+        let name = scope.handle(ctx.constants_ref(heap).at(heap, name_idx).erase().as_name());
         let global = scope.handle(heap.known().global_object.as_tagged(heap).erase());
         store_named_tail(ctx, global, name, value, None, StoreSemantics::WriteThrough)
     })
@@ -665,14 +636,14 @@ unsafe fn store_named_tail_scoped<'a>(
         StoreOutcome::Transition { .. } => StoreOutcomeKind::Transition,
         StoreOutcome::CallSetter { .. } => StoreOutcomeKind::CallSetter,
     };
-    if let Err(()) = apply_store_outcome(ctx, recv, outcome) {
+    if let Err(()) = apply_store_outcome(ctx, recv, outcome, value) {
         return ctx.exception_word();
     }
     if let (Some(fb), Some(prev)) = (fb_slot, prev) {
         InlineCache::update_store(
             heap,
             &scope,
-            ctx.cache().feedback_ref(heap).map(|v| scope.handle(v)),
+            ctx.feedback_ref(heap).map(|v| scope.handle(v)),
             fb,
             recv.erase(),
             name,
@@ -690,6 +661,7 @@ pub unsafe fn apply_store_outcome(
     ctx: &Ctx<'_>,
     receiver: Handle<'_, Value>,
     outcome: StoreOutcome<'_>,
+    value: Handle<'_, Value>,
 ) -> Result<(), ()> {
     let vm = ctx.vm();
     let heap = ctx.heap_mut();
@@ -699,7 +671,6 @@ pub unsafe fn apply_store_outcome(
             receiver: recv,
             name,
         } => state.handle_scope(|scope| {
-            let value = scope.handle(ctx.cache().acc(heap));
             match Object::add_own_property(
                 heap,
                 &scope,
@@ -718,15 +689,12 @@ pub unsafe fn apply_store_outcome(
             }
         }),
         StoreOutcome::CallSetter { setter } => state.handle_scope(|scope| {
-            let value = scope.handle(ctx.cache().acc(heap));
             let args = scope.stage(&[receiver.as_tagged(heap).erase(), value.as_tagged(heap)]);
             match RuntimeContext::call(vm, heap, state, setter, args, None) {
                 Ok(v) => {
-                    // the setter's return value is ignored: restore the
-                    // stored value the call clobbered
-                    let threw = ctx.is_throw(v);
-                    ctx.cache().acc_mut().store(value.as_tagged(heap));
-                    if threw { Err(()) } else { Ok(()) }
+                    // the setter's return value is ignored: the stored
+                    // value stays the expression's result
+                    if ctx.is_throw(v) { Err(()) } else { Ok(()) }
                 }
                 Err(e) => {
                     ctx.raise_tag(e);
@@ -757,8 +725,7 @@ pub unsafe fn construct<'a>(
         if !obj.as_ref().header.map.get(heap).kind().is_constructor() {
             return ctx.raise_tag(VmError::Type);
         }
-        let meta = ctx.meta(0);
-        let args = ctx.stack().args(&meta, args_base, count);
+        let args = ctx.stack().args(ctx.frame_base(), args_base, count);
         if Proxy::is_proxy(heap, callee.as_tagged(heap)) {
             return match Proxy::construct(vm, heap, state, callee, args, callee) {
                 Ok(Coercion::Threw) => ctx.exception_word(),

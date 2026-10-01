@@ -4,20 +4,20 @@
 //! dispatch. Operand decoding falls back to `slow_layout` and the
 //! `read_*` helpers (the fast paths' const-generic `Ops` cursor is
 //! monomorphized per handler), and anything that can allocate
-//! re-derives `ip`/`regs` from the cache before resuming dispatch.
+//! re-derive `ip`/`regs` from the frame header before resuming dispatch.
 
 use bytecode::Opcode;
 use vm_core::proxy::Proxy;
 use vm_core::{
-    CallTarget, CallableInfoObject, Coercion, Context, ContextInit, ContextState, Convert, Ctx,
-    FixedArray, HandleSlice, Heap, Intrinsic, Object, RuntimeContext, RuntimeIndex, ScopeInfo, Smi,
-    StoreSemantics, Tagged, Value, VmError, spread_apply_args,
+    CallTarget, CallableInfoObject, Callee, Coercion, Context, ContextInit, ContextState, Convert,
+    Ctx, FixedArray, HandleSlice, Heap, Intrinsic, Object, Params, RuntimeContext, RuntimeIndex,
+    ScopeInfo, Smi, StoreSemantics, Tagged, Value, VmError, spread_apply_args,
 };
 
 use crate::{
     ApplyOut, FloatReg, MethodCall, Regs, RootsArg, TableArg, dispatch_runtime_contiguous,
-    dispatch_runtime_function, dispatch_runtime_method, push_contiguous_frame, push_function_frame,
-    push_scattered_method_frame, read_signed, read_unsigned, resume, slow_layout, slow_next_pc,
+    dispatch_runtime_function, dispatch_runtime_method, push_callee_frame, read_signed,
+    read_unsigned, resume, slow_layout, slow_next_pc,
 };
 
 macro_rules! slow_try {
@@ -45,7 +45,7 @@ pub extern "rust-preserve-none" fn slow_box_number<'a>(
 ) -> Tagged<'a, Value> {
     let v = unsafe { ctx.heap_mut() }.new_float(float.get());
     // the allocation may have moved the code object: re-derive the
-    // pointer and the resume point from the (updated) cache
+    // pointer and the resume point from the (updated) frame header
     let code = ctx.code_ptr();
     let next = unsafe { slow_next_pc(ip) } as usize - ip as usize;
     let pc = ip as usize - code as usize + next;
@@ -157,14 +157,14 @@ fn create_closure_slow<'a>(ctx: &Ctx<'a>, info_idx: usize) -> Result<Tagged<'a, 
     let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let meta = ctx.meta(0);
+        let base = ctx.frame_base();
         let Some(info) =
-            scope.cast::<CallableInfoObject>(ctx.cache().constants_ref(heap).at(heap, info_idx))
+            scope.cast::<CallableInfoObject>(ctx.constants_ref(heap).at(heap, info_idx))
         else {
             return Err(VmError::Type);
         };
         let context = scope
-            .cast::<Context>(ctx.stack().context_slot(&meta).get(heap))
+            .cast::<Context>(ctx.stack().context_slot(base).get(heap))
             .expect("frame context slot holds a Context");
         let obj = Object::create_closure(heap, &scope, info, context)?;
         Ok(obj.erase())
@@ -180,19 +180,18 @@ fn create_function_context_slow<'a>(
     let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let meta = ctx.meta(0);
+        let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(ctx.stack().context_slot(&meta).get(heap))
+            .cast::<Context>(ctx.stack().context_slot(base).get(heap))
             .expect("frame context slot holds a Context");
         let count = ctx
-            .cache()
             .constants_ref(heap)
             .at(heap, scope_idx)
             .get_as::<ScopeInfo>()
             .map(|r| r.as_ref().names.get(heap).len())
             .ok_or(VmError::Type)?;
         let scope_info = scope
-            .cast::<ScopeInfo>(ctx.cache().constants_ref(heap).at(heap, scope_idx))
+            .cast::<ScopeInfo>(ctx.constants_ref(heap).at(heap, scope_idx))
             .expect("constants slot holds a ScopeInfo");
         let slots = if count == 0 {
             heap.known().empty_fixed_array
@@ -222,8 +221,8 @@ pub fn proxy_apply_slow<'a>(
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
-        let meta = ctx.meta(0);
-        let staged = ctx.stack().args(&meta, args_base, count);
+        let base = ctx.frame_base();
+        let staged = ctx.stack().args(base, args_base, count);
         match Proxy::apply(vm, heap, state, callee, staged)? {
             Coercion::Threw => Ok(ctx.exception_word()),
             Coercion::Value(v) => Ok(v),
@@ -240,9 +239,9 @@ pub fn proxy_apply_regs_slow<'a>(
 ) -> Result<Tagged<'a, Value>, VmError> {
     let vm = ctx.vm();
     let state = ctx.state();
-    let meta = ctx.meta(0);
+    let base = ctx.frame_base();
     let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_args_regs(heap, &meta, srcs)?;
+    let (saved_top, staged) = ctx.stack().stage_args_regs(heap, base, srcs)?;
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
         match Proxy::apply(vm, heap, state, callee, staged)? {
@@ -279,16 +278,18 @@ pub fn intrinsic_call_scattered<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            push_scattered_method_frame(
+            push_callee_frame(
                 ctx,
                 pc,
                 size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                srcs,
+                Callee {
+                    callable: target.erase(),
+                    info: info,
+                    context: context.erase(),
+                    register_count: register_count,
+                    formal_min: formal_min,
+                },
+                Params::Scattered(srcs),
             )
         }
         Some(CallTarget::Runtime(idx)) => {
@@ -297,8 +298,8 @@ pub fn intrinsic_call_scattered<'a>(
         Some(CallTarget::Intrinsic(_)) => {
             // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
             // the reshaped window, never against the original operands
-            let meta = ctx.meta(0);
-            let (saved_top, staged) = ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs)?;
+            let base = ctx.frame_base();
+            let (saved_top, staged) = ctx.stack().stage_args_regs(ctx.heap(), base, srcs)?;
             let out = intrinsic_apply_call(ctx, pc, size, f, staged);
             ctx.stack().set_top(saved_top);
             match out? {
@@ -335,17 +336,21 @@ pub fn intrinsic_call_contiguous<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            push_contiguous_frame(
+            push_callee_frame(
                 ctx,
                 pc,
                 size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                base,
-                count,
+                Callee {
+                    callable: target.erase(),
+                    info: info,
+                    context: context.erase(),
+                    register_count: register_count,
+                    formal_min: formal_min,
+                },
+                Params::Window {
+                    base: base,
+                    count: count,
+                },
             )
         }
         Some(CallTarget::Runtime(idx)) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
@@ -354,8 +359,7 @@ pub fn intrinsic_call_contiguous<'a>(
         Some(CallTarget::Intrinsic(_)) => {
             // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
             // the reshaped window, never against the original operands
-            let meta = ctx.meta(0);
-            let staged = ctx.stack().args(&meta, base, count);
+            let staged = ctx.stack().args(ctx.frame_base(), base, count);
             match intrinsic_apply_call(ctx, pc, size, f, staged)? {
                 ApplyOut::Frame(frame) => Ok(MethodCall::Frame(frame)),
                 ApplyOut::Value(v) => Ok(MethodCall::Value(v)),
@@ -392,22 +396,20 @@ pub fn intrinsic_apply_call<'a>(
                 return Ok(ApplyOut::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
             let heap = unsafe { ctx.heap_mut() };
-            let meta = ctx.meta(pc + size);
-            let undefined = heap.known().undefined.as_tagged(heap).erase();
-            let frame = ctx.stack().push_frame_with_args(
+            let frame = ctx.stack().push_frame(
                 heap,
-                meta,
-                pc,
-                target.erase(),
-                info,
-                register_count,
-                context.erase(),
-                args,
-                undefined,
-                formal_min,
+                ctx.caller_meta(pc + size, pc),
+                Callee {
+                    callable: target.erase(),
+                    info,
+                    context: context.erase(),
+                    register_count,
+                    formal_min,
+                },
+                heap.known().undefined.as_tagged(heap).erase(),
+                Params::Slice(args),
             )?;
-            ctx.cache()
-                .load(ctx.stack(), frame, unsafe { ctx.heap_mut() });
+            ctx.set_frame_base(frame.base);
             Ok(ApplyOut::Frame(frame))
         }
         Some(CallTarget::Runtime(idx)) => {
@@ -486,11 +488,9 @@ pub extern "rust-preserve-none" fn throw_dispatch<'a>(
 ) -> Tagged<'a, Value> {
     let fault_pc = fault_ip as usize - ctx.code_ptr() as usize;
     match unsafe { vm_core::interp::unwind(ctx, fault_pc) } {
-        vm_core::interp::Unwind::Caught(ex) => {
-            // `unwind` parked the handler's entry in the cache pc; the
-            // walk itself never allocates, so the re-derived pointers
-            // are stable
-            let handler_pc = ctx.cache().pc();
+        vm_core::interp::Unwind::Caught { pc: handler_pc, ex } => {
+            // the walk itself never allocates, so the re-derived
+            // pointers are stable
             let code = ctx.code_ptr();
             let regs = unsafe { Regs::new(ctx.regs_ptr()) };
             let ip = unsafe { code.add(handler_pc) };
@@ -1199,7 +1199,7 @@ pub fn slow_call_method_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     None,
@@ -1211,7 +1211,7 @@ pub fn slow_call_method_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     None,
@@ -1233,22 +1233,24 @@ pub fn slow_call_method_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     Some(info),
                 )
             };
-            push_scattered_method_frame(
+            push_callee_frame(
                 ctx,
                 pc,
                 size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                srcs,
+                Callee {
+                    callable: target.erase(),
+                    info: info,
+                    context: context.erase(),
+                    register_count: register_count,
+                    formal_min: formal_min,
+                },
+                Params::Scattered(srcs),
             )
         }
     }
@@ -1271,7 +1273,7 @@ pub fn slow_call_function_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     None,
@@ -1283,7 +1285,7 @@ pub fn slow_call_function_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     None,
@@ -1305,22 +1307,24 @@ pub fn slow_call_function_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     Some(info),
                 )
             };
-            push_function_frame(
+            push_callee_frame(
                 ctx,
                 pc,
                 size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                args,
+                Callee {
+                    callable: target.erase(),
+                    info: info,
+                    context: context.erase(),
+                    register_count: register_count,
+                    formal_min: formal_min,
+                },
+                Params::Function(args),
             )
         }
     }
@@ -1344,7 +1348,7 @@ pub fn slow_call_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     None,
@@ -1358,7 +1362,7 @@ pub fn slow_call_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     None,
@@ -1380,23 +1384,27 @@ pub fn slow_call_miss<'a>(
             unsafe {
                 vm_core::ic::call_update(
                     ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
+                    ctx.feedback_ref(ctx.heap()),
                     fb,
                     callee_word,
                     Some(info),
                 )
             };
-            push_contiguous_frame(
+            push_callee_frame(
                 ctx,
                 pc,
                 size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                base,
-                count,
+                Callee {
+                    callable: target.erase(),
+                    info: info,
+                    context: context.erase(),
+                    register_count: register_count,
+                    formal_min: formal_min,
+                },
+                Params::Window {
+                    base: base,
+                    count: count,
+                },
             )
         }
     }
@@ -1557,9 +1565,9 @@ fn create_block_context_slow<'a>(
     let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let meta = ctx.meta(0);
+        let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(ctx.stack().context_slot(&meta).get(heap))
+            .cast::<Context>(ctx.stack().context_slot(base).get(heap))
             .expect("frame context slot holds a Context");
         let slots = if count == 0 {
             heap.known().empty_fixed_array
@@ -1799,13 +1807,7 @@ fn add_parent_slow<'a>(
     let state = ctx.state();
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let receiver = scope.handle(recv);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
+        let name = scope.handle(ctx.constants_ref(heap).at(heap, name_idx).erase().as_name());
         let value = scope.handle(value);
         let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
             return Err(VmError::Type);
@@ -1945,9 +1947,9 @@ fn proxy_apply_function_slow<'a>(
 ) -> Result<Tagged<'a, Value>, VmError> {
     let vm = ctx.vm();
     let state = ctx.state();
-    let meta = ctx.meta(0);
+    let base = ctx.frame_base();
     let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_function_args(heap, &meta, args)?;
+    let (saved_top, staged) = ctx.stack().stage_function_args(heap, base, args)?;
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
         match Proxy::apply(vm, heap, state, callee, staged)? {
