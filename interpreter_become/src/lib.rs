@@ -2604,7 +2604,7 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_method_start(ctx, pc, size, callee_word, &[recv], fb)
+        call_method_start(ctx, pc, size, callee_word, recv, [0, 0], 0, fb,)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2663,7 +2663,7 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_method_start(ctx, pc, size, callee_word, &[recv, arg0], fb)
+        call_method_start(ctx, pc, size, callee_word, recv, [arg0, 0], 1, fb,)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2723,7 +2723,7 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_method_start(ctx, pc, size, callee_word, &[recv, arg0, arg1], fb)
+        call_method_start(ctx, pc, size, callee_word, recv, [arg0, arg1], 2, fb,)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2780,7 +2780,7 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_function_start(ctx, pc, size, callee_word, &[], fb)
+        call_function_start(ctx, pc, size, callee_word, [0, 0], 0, fb,)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2840,7 +2840,7 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_function_start(ctx, pc, size, callee_word, &[arg0], fb)
+        call_function_start(ctx, pc, size, callee_word, [arg0, 0], 1, fb,)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2901,7 +2901,7 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_function_start(ctx, pc, size, callee_word, &[arg0, arg1], fb)
+        call_function_start(ctx, pc, size, callee_word, [arg0, arg1], 2, fb,)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -3040,8 +3040,6 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
             ..
         }) => {
@@ -3056,8 +3054,6 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
                     callable: target.erase(),
                     info,
                     context: context.erase(),
-                    register_count,
-                    formal_min,
                 },
                 heap.known().undefined.as_tagged(heap).erase(),
                 Params::Window {
@@ -3259,8 +3255,6 @@ fn construct_start<'a>(
         target,
         info,
         context,
-        register_count,
-        formal_min,
         kind,
         ..
     }) = Object::call_target(ctx.heap(), callee_word)
@@ -3282,8 +3276,6 @@ fn construct_start<'a>(
             callable: target.erase(),
             info,
             context: context.erase(),
-            register_count,
-            formal_min,
         },
         callee_word,
         Params::Construct {
@@ -3475,8 +3467,18 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
                 table,
                 roots,
                 float,
-                { intrinsic_call_scattered(ctx, ip as usize - code as usize, size, f, &[]) },
-                { proxy_apply_regs_slow(ctx, f, &[]) }
+                {
+                    intrinsic_call_scattered(
+                        ctx,
+                        ip as usize - code as usize,
+                        size,
+                        f,
+                        None,
+                        [0, 0],
+                        0,
+                    )
+                },
+                { proxy_apply_function_slow(ctx, f, [0, 0], 0) }
             )
         }
         Opcode::CallMethod1 => {
@@ -3493,8 +3495,18 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
                 table,
                 roots,
                 float,
-                { intrinsic_call_scattered(ctx, ip as usize - code as usize, size, f, &[arg0]) },
-                { proxy_apply_regs_slow(ctx, f, &[arg0]) }
+                {
+                    intrinsic_call_scattered(
+                        ctx,
+                        ip as usize - code as usize,
+                        size,
+                        f,
+                        Some(arg0),
+                        [0, 0],
+                        0,
+                    )
+                },
+                { proxy_apply_regs_slow(ctx, f, arg0, [0, 0], 0) }
             )
         }
         Opcode::CallMethod2 => {
@@ -3518,10 +3530,12 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
                         ip as usize - code as usize,
                         size,
                         f,
-                        &[arg0, arg1],
+                        Some(arg0),
+                        [arg1, 0],
+                        1,
                     )
                 },
-                { proxy_apply_regs_slow(ctx, f, &[arg0, arg1]) }
+                { proxy_apply_regs_slow(ctx, f, arg0, [arg1, 0], 1) }
             )
         }
         // `call` invoked with an undefined receiver (unbound): `this` is
@@ -3797,10 +3811,19 @@ enum MethodCall<'a> {
 }
 
 #[inline(always)]
-fn dispatch_runtime_method<'a>(ctx: &Ctx<'a>, idx: usize, srcs: &[i32]) -> Tagged<'a, Value> {
+fn dispatch_runtime_method<'a>(
+    ctx: &Ctx<'a>,
+    idx: usize,
+    recv: i32,
+    args: [i32; 2],
+    argc: usize,
+) -> Tagged<'a, Value> {
     let f = ctx.vm().runtime(RuntimeIndex(idx));
     let base = ctx.frame_base();
-    let (saved_top, args) = match ctx.stack().stage_args_regs(ctx.heap(), base, srcs) {
+    let (saved_top, args) = match ctx
+        .stack()
+        .stage_args_regs(ctx.heap(), base, recv, args, argc)
+    {
         Ok(staged) => staged,
         Err(err) => {
             let _ = unsafe { ctx.raise(err) };
@@ -3814,13 +3837,18 @@ fn dispatch_runtime_method<'a>(ctx: &Ctx<'a>, idx: usize, srcs: &[i32]) -> Tagge
 }
 
 #[inline(always)]
-fn dispatch_runtime_function<'a>(ctx: &Ctx<'a>, idx: usize, args: &[i32]) -> Tagged<'a, Value> {
+fn dispatch_runtime_function<'a>(
+    ctx: &Ctx<'a>,
+    idx: usize,
+    args: [i32; 2],
+    argc: usize,
+) -> Tagged<'a, Value> {
     let f = ctx.vm().runtime(RuntimeIndex(idx));
     let base = ctx.frame_base();
     let (saved_top, staged) =
         match ctx
             .stack()
-            .stage_function_args(ctx.heap(), ctx.frame_base(), args)
+            .stage_function_args(ctx.heap(), ctx.frame_base(), args, argc)
         {
             Ok(staged) => staged,
             Err(err) => {
@@ -3909,7 +3937,9 @@ fn call_method_start<'a>(
     pc: usize,
     size: usize,
     callee_word: Tagged<'a, Value>,
-    srcs: &[i32],
+    recv: i32,
+    args: [i32; 2],
+    argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match unsafe {
@@ -3919,8 +3949,6 @@ fn call_method_start<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         }) => {
             if kind.is_class_constructor() {
@@ -3934,17 +3962,17 @@ fn call_method_start<'a>(
                     callable: target.erase(),
                     info,
                     context: context.erase(),
-                    register_count,
-                    formal_min,
                 },
-                Params::Scattered(srcs),
+                Params::MethodFast { recv, args, argc },
             )
         }
-        vm_core::ic::CallProbe::Runtime(idx) => {
-            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
-        }
+        vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_method(
+            ctx, idx, recv, args, argc,
+        ))),
         vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        vm_core::ic::CallProbe::Miss => slow_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
+        vm_core::ic::CallProbe::Miss => {
+            slow_call_method_miss(ctx, pc, size, callee_word, recv, args, argc, fb)
+        }
     }
 }
 
@@ -3954,7 +3982,8 @@ fn call_function_start<'a>(
     pc: usize,
     size: usize,
     callee_word: Tagged<'a, Value>,
-    args: &[i32],
+    args: [i32; 2],
+    argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match unsafe {
@@ -3964,8 +3993,6 @@ fn call_function_start<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         }) => {
             if kind.is_class_constructor() {
@@ -3979,18 +4006,16 @@ fn call_function_start<'a>(
                     callable: target.erase(),
                     info: info,
                     context: context.erase(),
-                    register_count: register_count,
-                    formal_min: formal_min,
                 },
-                Params::Function(args),
+                Params::FunctionFast { args, argc },
             )
         }
-        vm_core::ic::CallProbe::Runtime(idx) => {
-            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
-        }
+        vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_function(
+            ctx, idx, args, argc,
+        ))),
         vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
         vm_core::ic::CallProbe::Miss => {
-            slow_call_function_miss(ctx, pc, size, callee_word, args, fb)
+            slow_call_function_miss(ctx, pc, size, callee_word, args, argc, fb)
         }
     }
 }
@@ -4013,8 +4038,6 @@ fn call_start<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         }) => {
             if kind.is_class_constructor() {
@@ -4028,8 +4051,6 @@ fn call_start<'a>(
                     callable: target.erase(),
                     info,
                     context: context.erase(),
-                    register_count,
-                    formal_min,
                 },
                 Params::Window { base, count },
             )
@@ -4338,8 +4359,6 @@ fn enter<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
             ..
         }) => {
@@ -4360,11 +4379,9 @@ fn enter<'a>(
                         callable: target.erase(),
                         info,
                         context: context.erase(),
-                        register_count,
-                        formal_min,
                     },
                     new_target_value,
-                    Params::Slice(args),
+                    Params::Slice(args.as_tagged()),
                 )?
             };
             state.set_frame_base(frame.base);

@@ -162,8 +162,6 @@ fn start<'b>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
             ..
         }) => {
@@ -188,11 +186,9 @@ fn start<'b>(
                         callable: target.erase(),
                         info,
                         context: context.erase(),
-                        register_count,
-                        formal_min,
                     },
                     new_target_value,
-                    Params::Slice(args),
+                    Params::Slice(args.as_tagged()),
                 )?
             };
             state.set_frame_base(frame.base);
@@ -1088,8 +1084,6 @@ unsafe fn step<'a>(
                                     callable: hit.target.erase(),
                                     info: hit.info,
                                     context: hit.context.erase(),
-                                    register_count: hit.register_count,
-                                    formal_min: hit.formal_min,
                                 },
                                 heap.known().undefined.as_tagged(heap).erase(),
                                 Params::Window {
@@ -1195,8 +1189,6 @@ unsafe fn step<'a>(
                     target: callee,
                     info,
                     context,
-                    register_count,
-                    formal_min,
                     kind,
                     ..
                 }) => {
@@ -1217,8 +1209,6 @@ unsafe fn step<'a>(
                                     callable: callee,
                                     info,
                                     context,
-                                    register_count,
-                                    formal_min,
                                 },
                                 undefined,
                                 Params::Window {
@@ -1300,8 +1290,6 @@ unsafe fn step<'a>(
                     target: callee,
                     info,
                     context,
-                    register_count,
-                    formal_min,
                     kind,
                     ..
                 }) => {
@@ -1322,8 +1310,6 @@ unsafe fn step<'a>(
                                     callable: callee,
                                     info,
                                     context,
-                                    register_count,
-                                    formal_min,
                                 },
                                 undefined,
                                 Params::Window {
@@ -1351,11 +1337,12 @@ unsafe fn step<'a>(
                 Opcode::CallMethod1 => 1,
                 _ => 2,
             };
-            let mut srcs = [0i32; 3];
-            for (i, src) in srcs.iter_mut().enumerate().take(argc + 1) {
-                *src = ops.reg(1 + i);
+            let recv = ops.reg(1);
+            let mut margs = [0i32; 2];
+            for (i, arg) in margs.iter_mut().enumerate().take(argc) {
+                *arg = ops.reg(2 + i);
             }
-            let srcs = &srcs[..argc + 1];
+            let srcs = (recv, margs, argc);
             let fb = ops.idx(argc as usize + 2);
             // the call IC: a monomorphic site skips call-target
             // classification entirely (the become interpreter's fast path)
@@ -1377,11 +1364,13 @@ unsafe fn step<'a>(
                                     callable: hit.target.erase(),
                                     info: hit.info,
                                     context: hit.context.erase(),
-                                    register_count: hit.register_count,
-                                    formal_min: hit.formal_min,
                                 },
                                 heap.known().undefined.as_tagged(heap).erase(),
-                                Params::Scattered(srcs),
+                                Params::MethodFast {
+                                    recv: srcs.0,
+                                    args: srcs.1,
+                                    argc: srcs.2,
+                                },
                             )
                         );
                         ctx.set_frame_base(frame.base);
@@ -1394,8 +1383,10 @@ unsafe fn step<'a>(
                     vm_core::ic::CallProbe::Runtime(idx) => {
                         let f = vm.runtime(RuntimeIndex(idx));
                         let exception = heap.known().exception.as_tagged(heap).raw();
-                        let (saved_top, staged) =
-                            fold!(ctx, stack.stage_args_regs(heap, frame_base, srcs));
+                        let (saved_top, staged) = fold!(
+                            ctx,
+                            stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                        );
                         let nctx = RuntimeContext::new(vm, heap, state);
                         let v = f(nctx, staged);
                         stack.set_top(saved_top);
@@ -1408,8 +1399,10 @@ unsafe fn step<'a>(
                         };
                     }
                     vm_core::ic::CallProbe::Intrinsic(intrinsic) => {
-                        let (saved_top, staged) =
-                            fold!(ctx, stack.stage_args_regs(heap, frame_base, srcs));
+                        let (saved_top, staged) = fold!(
+                            ctx,
+                            stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                        );
                         let step = intrinsic_step(ctx, acc, intrinsic, staged);
                         stack.set_top(saved_top);
                         return step;
@@ -1419,7 +1412,10 @@ unsafe fn step<'a>(
             }
 
             if Proxy::is_proxy(heap, stack.reg(heap, frame_base, callee_reg)) {
-                let (saved_top, staged) = fold!(ctx, stack.stage_args_regs(heap, frame_base, srcs));
+                let (saved_top, staged) = fold!(
+                    ctx,
+                    stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                );
                 let result = state.handle_scope(|scope| {
                     let callee = scope.handle(stack.reg(heap, frame_base, callee_reg));
                     Proxy::apply(vm, heap, state, callee, staged)
@@ -1438,8 +1434,10 @@ unsafe fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Intrinsic(intrinsic)) => {
-                    let (saved_top, staged) =
-                        fold!(ctx, stack.stage_args_regs(heap, frame_base, srcs));
+                    let (saved_top, staged) = fold!(
+                        ctx,
+                        stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                    );
                     let step = intrinsic_step(ctx, acc, intrinsic, staged);
                     stack.set_top(saved_top);
                     return step;
@@ -1447,8 +1445,10 @@ unsafe fn step<'a>(
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
-                    let (saved_top, staged) =
-                        fold!(ctx, stack.stage_args_regs(heap, frame_base, srcs));
+                    let (saved_top, staged) = fold!(
+                        ctx,
+                        stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                    );
                     let nctx = RuntimeContext::new(vm, heap, state);
                     let v = f(nctx, staged);
                     stack.set_top(saved_top);
@@ -1463,8 +1463,6 @@ unsafe fn step<'a>(
                     target: callee,
                     info,
                     context,
-                    register_count,
-                    formal_min,
                     kind,
                     ..
                 }) => {
@@ -1484,11 +1482,13 @@ unsafe fn step<'a>(
                                     callable: callee,
                                     info,
                                     context,
-                                    register_count,
-                                    formal_min,
                                 },
                                 undefined,
-                                Params::Scattered(srcs),
+                                Params::MethodFast {
+                                    recv: srcs.0,
+                                    args: srcs.1,
+                                    argc: srcs.2,
+                                },
                             )
                         )
                     };
@@ -1519,11 +1519,11 @@ unsafe fn step<'a>(
                 Opcode::CallFunction1 => 1,
                 _ => 2,
             };
-            let mut args = [0i32; 2];
-            for (i, arg) in args.iter_mut().enumerate().take(argc) {
+            let mut fargs = [0i32; 2];
+            for (i, arg) in fargs.iter_mut().enumerate().take(argc) {
                 *arg = ops.reg(1 + i);
             }
-            let args = &args[..argc];
+            let args = (fargs, argc);
             let fb = ops.idx(argc as usize + 1);
 
             // the call IC: a monomorphic site skips call-target
@@ -1546,11 +1546,12 @@ unsafe fn step<'a>(
                                     callable: hit.target.erase(),
                                     info: hit.info,
                                     context: hit.context.erase(),
-                                    register_count: hit.register_count,
-                                    formal_min: hit.formal_min,
                                 },
                                 heap.known().undefined.as_tagged(heap).erase(),
-                                Params::Function(args),
+                                Params::FunctionFast {
+                                    args: args.0,
+                                    argc: args.1,
+                                },
                             )
                         );
                         ctx.set_frame_base(frame.base);
@@ -1563,8 +1564,10 @@ unsafe fn step<'a>(
                     vm_core::ic::CallProbe::Runtime(idx) => {
                         let f = vm.runtime(RuntimeIndex(idx));
                         let exception = heap.known().exception.as_tagged(heap).raw();
-                        let (saved_top, staged) =
-                            fold!(ctx, stack.stage_function_args(heap, frame_base, args));
+                        let (saved_top, staged) = fold!(
+                            ctx,
+                            stack.stage_function_args(heap, frame_base, args.0, args.1)
+                        );
                         let nctx = RuntimeContext::new(vm, heap, state);
                         let v = f(nctx, staged);
                         stack.set_top(saved_top);
@@ -1577,8 +1580,10 @@ unsafe fn step<'a>(
                         };
                     }
                     vm_core::ic::CallProbe::Intrinsic(intrinsic) => {
-                        let (saved_top, staged) =
-                            fold!(ctx, stack.stage_function_args(heap, frame_base, args));
+                        let (saved_top, staged) = fold!(
+                            ctx,
+                            stack.stage_function_args(heap, frame_base, args.0, args.1)
+                        );
                         let step = intrinsic_step(ctx, acc, intrinsic, staged);
                         stack.set_top(saved_top);
                         return step;
@@ -1588,8 +1593,10 @@ unsafe fn step<'a>(
             }
 
             if Proxy::is_proxy(heap, stack.reg(heap, frame_base, callee_reg)) {
-                let (saved_top, staged) =
-                    fold!(ctx, stack.stage_function_args(heap, frame_base, args));
+                let (saved_top, staged) = fold!(
+                    ctx,
+                    stack.stage_function_args(heap, frame_base, args.0, args.1)
+                );
                 let result = state.handle_scope(|scope| {
                     let callee = scope.handle(stack.reg(heap, frame_base, callee_reg));
                     Proxy::apply(vm, heap, state, callee, staged)
@@ -1608,8 +1615,10 @@ unsafe fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Intrinsic(intrinsic)) => {
-                    let (saved_top, staged) =
-                        fold!(ctx, stack.stage_function_args(heap, frame_base, args));
+                    let (saved_top, staged) = fold!(
+                        ctx,
+                        stack.stage_function_args(heap, frame_base, args.0, args.1)
+                    );
                     let step = intrinsic_step(ctx, acc, intrinsic, staged);
                     stack.set_top(saved_top);
                     return step;
@@ -1617,8 +1626,10 @@ unsafe fn step<'a>(
                 Some(CallTarget::Runtime(idx)) => {
                     let f = vm.runtime(RuntimeIndex(idx));
                     let exception = heap.known().exception.as_tagged(heap).raw();
-                    let (saved_top, staged) =
-                        fold!(ctx, stack.stage_function_args(heap, frame_base, args));
+                    let (saved_top, staged) = fold!(
+                        ctx,
+                        stack.stage_function_args(heap, frame_base, args.0, args.1)
+                    );
                     let nctx = RuntimeContext::new(vm, heap, state);
                     let v = f(nctx, staged);
                     stack.set_top(saved_top);
@@ -1633,8 +1644,6 @@ unsafe fn step<'a>(
                     target: callee,
                     info,
                     context,
-                    register_count,
-                    formal_min,
                     kind,
                     ..
                 }) => {
@@ -1654,11 +1663,12 @@ unsafe fn step<'a>(
                                     callable: callee,
                                     info,
                                     context,
-                                    register_count,
-                                    formal_min,
                                 },
                                 undefined,
-                                Params::Function(args),
+                                Params::FunctionFast {
+                                    args: args.0,
+                                    argc: args.1,
+                                },
                             )
                         )
                     };

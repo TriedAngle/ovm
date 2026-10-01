@@ -235,13 +235,15 @@ pub fn proxy_apply_slow<'a>(
 pub fn proxy_apply_regs_slow<'a>(
     ctx: &Ctx<'a>,
     callee: Tagged<'_, Value>,
-    srcs: &[i32],
+    recv: i32,
+    args: [i32; 2],
+    argc: usize,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let vm = ctx.vm();
     let state = ctx.state();
     let base = ctx.frame_base();
     let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_args_regs(heap, base, srcs)?;
+    let (saved_top, staged) = ctx.stack().stage_args_regs(heap, base, recv, args, argc)?;
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
         match Proxy::apply(vm, heap, state, callee, staged)? {
@@ -263,15 +265,15 @@ pub fn intrinsic_call_scattered<'a>(
     pc: usize,
     size: usize,
     f: Tagged<'a, Value>,
-    srcs: &[i32],
+    recv: Option<i32>,
+    args: [i32; 2],
+    argc: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), f) {
         Some(CallTarget::Bytecode {
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
             ..
         }) => {
@@ -286,20 +288,29 @@ pub fn intrinsic_call_scattered<'a>(
                     callable: target.erase(),
                     info: info,
                     context: context.erase(),
-                    register_count: register_count,
-                    formal_min: formal_min,
                 },
-                Params::Scattered(srcs),
+                match recv {
+                    Some(recv) => Params::MethodFast { recv, args, argc },
+                    None => Params::FunctionFast { args, argc },
+                },
             )
         }
-        Some(CallTarget::Runtime(idx)) => {
-            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
-        }
+        Some(CallTarget::Runtime(idx)) => Ok(MethodCall::Value(match recv {
+            Some(recv) => dispatch_runtime_method(ctx, idx, recv, args, argc),
+            None => dispatch_runtime_function(ctx, idx, args, argc),
+        })),
         Some(CallTarget::Intrinsic(_)) => {
             // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
             // the reshaped window, never against the original operands
             let base = ctx.frame_base();
-            let (saved_top, staged) = ctx.stack().stage_args_regs(ctx.heap(), base, srcs)?;
+            let (saved_top, staged) = match recv {
+                Some(recv) => ctx
+                    .stack()
+                    .stage_args_regs(ctx.heap(), base, recv, args, argc)?,
+                None => ctx
+                    .stack()
+                    .stage_function_args(ctx.heap(), base, args, argc)?,
+            };
             let out = intrinsic_apply_call(ctx, pc, size, f, staged);
             ctx.stack().set_top(saved_top);
             match out? {
@@ -328,8 +339,6 @@ pub fn intrinsic_call_contiguous<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
             ..
         }) => {
@@ -344,8 +353,6 @@ pub fn intrinsic_call_contiguous<'a>(
                     callable: target.erase(),
                     info: info,
                     context: context.erase(),
-                    register_count: register_count,
-                    formal_min: formal_min,
                 },
                 Params::Window {
                     base: base,
@@ -387,8 +394,6 @@ pub fn intrinsic_apply_call<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
             ..
         }) => {
@@ -403,11 +408,9 @@ pub fn intrinsic_apply_call<'a>(
                     callable: target.erase(),
                     info,
                     context: context.erase(),
-                    register_count,
-                    formal_min,
                 },
                 heap.known().undefined.as_tagged(heap).erase(),
-                Params::Slice(args),
+                Params::Slice(args.as_tagged()),
             )?;
             ctx.set_frame_base(frame.base);
             Ok(ApplyOut::Frame(frame))
@@ -1189,7 +1192,9 @@ pub fn slow_call_method_miss<'a>(
     pc: usize,
     size: usize,
     callee_word: Tagged<'a, Value>,
-    srcs: &[i32],
+    recv: i32,
+    args: [i32; 2],
+    argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), callee_word) {
@@ -1205,7 +1210,9 @@ pub fn slow_call_method_miss<'a>(
                     None,
                 )
             };
-            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
+            Ok(MethodCall::Value(dispatch_runtime_method(
+                ctx, idx, recv, args, argc,
+            )))
         }
         Some(CallTarget::Intrinsic(i)) => {
             unsafe {
@@ -1223,8 +1230,6 @@ pub fn slow_call_method_miss<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         }) => {
             if kind.is_class_constructor() {
@@ -1247,10 +1252,8 @@ pub fn slow_call_method_miss<'a>(
                     callable: target.erase(),
                     info: info,
                     context: context.erase(),
-                    register_count: register_count,
-                    formal_min: formal_min,
                 },
-                Params::Scattered(srcs),
+                Params::MethodFast { recv, args, argc },
             )
         }
     }
@@ -1263,7 +1266,8 @@ pub fn slow_call_function_miss<'a>(
     pc: usize,
     size: usize,
     callee_word: Tagged<'a, Value>,
-    args: &[i32],
+    args: [i32; 2],
+    argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), callee_word) {
@@ -1279,7 +1283,9 @@ pub fn slow_call_function_miss<'a>(
                     None,
                 )
             };
-            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
+            Ok(MethodCall::Value(dispatch_runtime_function(
+                ctx, idx, args, argc,
+            )))
         }
         Some(CallTarget::Intrinsic(i)) => {
             unsafe {
@@ -1297,8 +1303,6 @@ pub fn slow_call_function_miss<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         }) => {
             if kind.is_class_constructor() {
@@ -1321,10 +1325,8 @@ pub fn slow_call_function_miss<'a>(
                     callable: target.erase(),
                     info: info,
                     context: context.erase(),
-                    register_count: register_count,
-                    formal_min: formal_min,
                 },
-                Params::Function(args),
+                Params::FunctionFast { args, argc },
             )
         }
     }
@@ -1374,8 +1376,6 @@ pub fn slow_call_miss<'a>(
             target,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         }) => {
             if kind.is_class_constructor() {
@@ -1398,8 +1398,6 @@ pub fn slow_call_miss<'a>(
                     callable: target.erase(),
                     info: info,
                     context: context.erase(),
-                    register_count: register_count,
-                    formal_min: formal_min,
                 },
                 Params::Window {
                     base: base,
@@ -1922,11 +1920,12 @@ pub extern "rust-preserve-none" fn slow_call_method_proxy<'a>(
         _ => 2,
     };
     let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let mut srcs = [0i32; 3];
-    for (i, src) in srcs.iter_mut().enumerate().take(argc + 1) {
-        *src = read_signed(ip, base + (i + 1) * stride, stride);
+    let recv = read_signed(ip, base + stride, stride);
+    let mut pargs = [0i32; 2];
+    for (i, arg) in pargs.iter_mut().enumerate().take(argc) {
+        *arg = read_signed(ip, base + (2 + i) * stride, stride);
     }
-    let v = slow_try!(ctx, proxy_apply_regs_slow(ctx, callee, &srcs[..argc + 1]));
+    let v = slow_try!(ctx, proxy_apply_regs_slow(ctx, callee, recv, pargs, argc));
     become resume(
         unsafe { ctx.code_ptr().add(pc) },
         regs,
@@ -1940,16 +1939,17 @@ pub extern "rust-preserve-none" fn slow_call_method_proxy<'a>(
 
 #[cold]
 #[inline(never)]
-fn proxy_apply_function_slow<'a>(
+pub fn proxy_apply_function_slow<'a>(
     ctx: &Ctx<'a>,
     callee: Tagged<'_, Value>,
-    args: &[i32],
+    args: [i32; 2],
+    argc: usize,
 ) -> Result<Tagged<'a, Value>, VmError> {
     let vm = ctx.vm();
     let state = ctx.state();
     let base = ctx.frame_base();
     let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_function_args(heap, base, args)?;
+    let (saved_top, staged) = ctx.stack().stage_function_args(heap, base, args, argc)?;
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
         match Proxy::apply(vm, heap, state, callee, staged)? {
@@ -1982,11 +1982,11 @@ pub extern "rust-preserve-none" fn slow_call_function_proxy<'a>(
         _ => 2,
     };
     let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let mut args = [0i32; 2];
-    for (i, arg) in args.iter_mut().enumerate().take(argc) {
+    let mut pargs = [0i32; 2];
+    for (i, arg) in pargs.iter_mut().enumerate().take(argc) {
         *arg = read_signed(ip, base + (i + 1) * stride, stride);
     }
-    let v = slow_try!(ctx, proxy_apply_function_slow(ctx, callee, &args[..argc]));
+    let v = slow_try!(ctx, proxy_apply_function_slow(ctx, callee, pargs, argc));
     become resume(
         unsafe { ctx.code_ptr().add(pc) },
         regs,

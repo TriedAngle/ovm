@@ -157,9 +157,6 @@ pub enum CallTarget<'a> {
         target: Tagged<'a, Object>,
         info: Tagged<'a, CallableInfoObject>,
         context: Tagged<'a, Context>,
-        register_count: usize,
-        /// formal parameters plus the receiver: the frame pads up to this
-        formal_min: usize,
         kind: FunctionKind,
     },
     Runtime(usize),
@@ -203,8 +200,6 @@ impl Object {
             target: obj,
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         })
     }
@@ -220,8 +215,6 @@ impl Object {
             target: obj,
             info,
             context,
-            register_count: (descriptor & 0xffff) as usize,
-            formal_min: ((descriptor >> 16) & 0xffff) as usize,
             kind: FunctionKind::decode(((descriptor >> 32) & 0xf) as i64),
         })
     }

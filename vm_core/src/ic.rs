@@ -1490,8 +1490,6 @@ pub struct CallHit<'a> {
     pub target: Tagged<'a, Object>,
     pub info: Tagged<'a, CallableInfoObject>,
     pub context: Tagged<'a, Context>,
-    pub register_count: usize,
-    pub formal_min: usize,
     pub kind: FunctionKind,
 }
 
@@ -1554,8 +1552,7 @@ pub unsafe fn call_probe<'a>(
         }
 
         let info: Tagged<'a, CallableInfoObject> = core::mem::transmute(raw);
-        let (register_count, formal_min, kind) =
-            decode_descriptor(info.as_ref().descriptor.to_smi_unchecked().value());
+        let (_, _, kind) = decode_descriptor(info.as_ref().descriptor.to_smi_unchecked().value());
         // Safety: a bytecode callable's slots are `[info, context]` by layout.
         let obj: Tagged<'a, Object> = core::mem::transmute(callee.raw());
         let context = obj.as_ref().slot(heap, 1).get(heap);
@@ -1564,8 +1561,6 @@ pub unsafe fn call_probe<'a>(
             target: core::mem::transmute(callee.raw()),
             info,
             context,
-            register_count,
-            formal_min,
             kind,
         })
     }

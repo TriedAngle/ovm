@@ -430,6 +430,13 @@ impl<'a> HandleSlice<'a> {
     /// The empty argument list.
     pub const EMPTY: HandleSlice<'static> = HandleSlice { raw: &[] };
 
+    /// The staged words as plain `Tagged`: for immediate consumption
+    /// (frame pushes copy them into rooted slots without allocating).
+    pub fn as_tagged(&self) -> &[Tagged<'_, Value>] {
+        // Safety: Tagged<Value> is layout-identical to Value.
+        unsafe { core::slice::from_raw_parts(self.raw.as_ptr().cast(), self.raw.len()) }
+    }
+
     /// The same rooted slots minus the first `n` elements.
     pub fn slice_from(&self, n: usize) -> Self {
         Self {

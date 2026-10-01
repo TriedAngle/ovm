@@ -161,6 +161,15 @@ impl EdgeVisitable for CallableInfoObject {
 }
 
 impl CallableInfoObject {
+    /// The packed frame facts off the descriptor Smi
+    /// (`register_count | formal_min << 16`, where `formal_min` counts
+    /// formal parameters plus the receiver): what a frame push needs.
+    #[inline(always)]
+    pub fn frame_facts(&self) -> (usize, usize) {
+        let d = self.descriptor.to_smi_unchecked().value() as u64;
+        ((d & 0xffff) as usize, ((d >> 16) & 0xffff) as usize)
+    }
+
     pub fn set_metadata(
         &self,
         heap: &Heap,
