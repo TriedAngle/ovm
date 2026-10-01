@@ -1,10 +1,10 @@
 //! Slow paths of the become interpreter: the handlers a fast path
 //! tails into when its inline check fails (numeric fallbacks, IC
 //! misses, allocation, proxies, construct) plus the shared exception
-//! dispatch. Operand decoding falls back to `slow_layout` and the
-//! `read_*` helpers (the fast paths' const-generic `Ops` cursor is
-//! monomorphized per handler), and anything that can allocate
-//! re-derive `ip`/`regs` from the frame header before resuming dispatch.
+//! dispatch. Each handler is monomorphized on the operand `STRIDE` and
+//! decodes through the same const-generic `Ops` cursor as the fast
+//! paths; anything that can allocate re-derives `ip`/`regs` from the
+//! frame header before resuming dispatch.
 
 use bytecode::Opcode;
 use vm_core::proxy::Proxy;
@@ -15,10 +15,49 @@ use vm_core::{
 };
 
 use crate::{
-    ApplyOut, FloatReg, MethodCall, Regs, RootsArg, TableArg, dispatch_runtime_contiguous,
-    dispatch_runtime_function, dispatch_runtime_method, push_callee_frame, read_signed,
-    read_unsigned, resume, slow_layout, slow_next_pc,
+    ApplyOut, FloatReg, MethodCall, Ops, Regs, RootsArg, TableArg, base,
+    dispatch_runtime_contiguous, dispatch_runtime_function, dispatch_runtime_method,
+    push_callee_frame, read_signed, resume, slow_next_pc,
 };
+
+/// Define a become-interpreter slow-path handler (always `pub`). The
+/// expansion snapshots the faulting instruction's code-relative pc
+/// BEFORE the body runs and resumes from the post-body code base: the
+/// body may allocate and move the code object, after which the old `ip`
+/// no longer pairs with the frame-header base. Bodies decode their
+/// operands from `ip` first; anything else derived from `ip` that must
+/// survive an allocation has to be computed code-relative up front
+/// (like `slow_compare_jump` does for its jump targets).
+macro_rules! slow_handler {
+    ($name:ident |$ip:ident, $ops:ident, $regs:ident, $acc:ident, $ctx:ident, $float:ident| $body:block) => {
+        #[cold]
+        #[inline(never)]
+        #[rustc_align(32)]
+        pub extern "rust-preserve-none" fn $name<'a, const STRIDE: usize>(
+            $ip: *const u8,
+            $regs: Regs,
+            $acc: Tagged<'a, Value>,
+            $ctx: &Ctx<'a>,
+            table: TableArg<'a>,
+            roots: RootsArg<'a>,
+            $float: FloatReg,
+        ) -> Tagged<'a, Value> {
+            // snapshot while `ip` still pairs with the current base
+            let pc = $ip as usize - $ctx.code_ptr() as usize;
+            let $ops = Ops::<STRIDE>::from_ip($ip);
+            let v = $body;
+            become resume(
+                unsafe { $ctx.code_ptr().add(pc) },
+                $regs,
+                v,
+                $ctx,
+                table,
+                roots,
+                $float,
+            )
+        }
+    };
+}
 
 macro_rules! slow_try {
     ($ctx:ident, $e:expr) => {
@@ -31,76 +70,348 @@ macro_rules! slow_try {
     };
 }
 
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_box_number<'a>(
-    ip: *const u8,
-    _regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
+slow_handler!(slow_box_number |ip, ops, regs, acc, ctx, float| {
+    unsafe { ctx.heap_mut() }.new_float(float.get())
+});
+
+slow_handler!(slow_box_add_loc |ip, ops, regs, acc, ctx, float| {
+    let dst = ops.signed::<0>();
     let v = unsafe { ctx.heap_mut() }.new_float(float.get());
-    // the allocation may have moved the code object: re-derive the
-    // pointer and the resume point from the (updated) frame header
-    let code = ctx.code_ptr();
-    let next = unsafe { slow_next_pc(ip) } as usize - ip as usize;
-    let pc = ip as usize - code as usize + next;
     let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    let h = table.get(unsafe { *code.add(pc) });
-    become h(unsafe { code.add(pc) }, regs, v, ctx, table, roots, float)
-}
+    regs.write(dst, v);
+    v
+});
+
+slow_handler!(slow_box_sub_loc |ip, ops, regs, acc, ctx, float| {
+    let dst = ops.signed::<0>();
+    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
+    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
+    regs.write(dst, v);
+    v
+});
+
+slow_handler!(slow_add |ip, ops, regs, acc, ctx, float| {
+    let lhs = regs.read(ops.signed::<0>(), ctx);
+    unsafe { vm_core::cold::add(ctx, lhs, acc) }
+});
+
+slow_handler!(slow_numeric |ip, ops, regs, acc, ctx, float| {
+    let lhs = regs.read(ops.signed::<0>(), ctx);
+    let op = unsafe { ops.op() };
+    let f: fn(f64, f64) -> f64 = match op {
+        Opcode::Sub => |a, b| a - b,
+        Opcode::Mul => |a, b| a * b,
+        Opcode::Mod => |a, b| a % b,
+        Opcode::Exp => |a, b| a.powf(b),
+        _ => |a, b| a / b,
+    };
+    let v = unsafe { vm_core::cold::numeric(ctx, lhs, acc, f) };
+    v
+});
+
+slow_handler!(slow_add_immediate |ip, ops, regs, acc, ctx, float| {
+    let lhs = regs.read(ops.signed::<0>(), ctx);
+    let imm = Smi::new(ops.signed::<1>() as i64).into_tagged();
+    unsafe { vm_core::cold::add(ctx, lhs, imm) }
+});
+
+slow_handler!(slow_numeric_immediate |ip, ops, regs, acc, ctx, float| {
+    let lhs = regs.read(ops.signed::<0>(), ctx);
+    let imm = Smi::new(ops.signed::<1>() as i64).into_tagged();
+    let op = unsafe { ops.op() };
+    let f: fn(f64, f64) -> f64 = match op {
+        Opcode::SubImmediate => |a, b| a - b,
+        Opcode::MulImmediate => |a, b| a * b,
+        Opcode::ModImmediate => |a, b| a % b,
+        Opcode::ExpImmediate => |a, b| a.powf(b),
+        _ => |a, b| a / b,
+    };
+    unsafe { vm_core::cold::numeric(ctx, lhs, imm, f) }
+});
+
+slow_handler!(slow_negate |ip, ops, regs, acc, ctx, float| {
+    unsafe { vm_core::cold::negate(ctx, acc) }
+});
+
+slow_handler!(slow_inc_loc |ip, ops, regs, acc, ctx, float| {
+    slow_try!(ctx, incdec_slow::<STRIDE>(ip, ctx, regs, 1.0))
+});
+
+slow_handler!(slow_dec_loc |ip, ops, regs, acc, ctx, float| {
+    slow_try!(ctx, incdec_slow::<STRIDE>(ip, ctx, regs, -1.0))
+});
+
+slow_handler!(slow_add_loc |ip, ops, regs, acc, ctx, float| {
+    let v = slow_try!(ctx, loc_op_slow::<STRIDE>(ip, ctx, regs, false));
+    v
+});
+
+slow_handler!(slow_sub_loc |ip, ops, regs, acc, ctx, float| {
+    let v = slow_try!(ctx, loc_op_slow::<STRIDE>(ip, ctx, regs, true));
+    v
+});
+
+slow_handler!(slow_keyed_load_reg |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let key = regs.read(ops.signed::<1>(), ctx);
+    let fb = ops.unsigned::<2>();
+    unsafe { vm_core::cold::keyed_load(ctx, recv, key, Some(fb)) }
+});
+
+slow_handler!(slow_equal |ip, ops, regs, acc, ctx, float| {
+    let other = regs.read(ops.signed::<0>(), ctx);
+    unsafe { vm_core::cold::compare(ctx, 0, acc, other) }
+});
+
+slow_handler!(slow_less_than |ip, ops, regs, acc, ctx, float| {
+    let other = regs.read(ops.signed::<0>(), ctx);
+    unsafe { vm_core::cold::compare(ctx, 2, acc, other) }
+});
+
+slow_handler!(slow_greater_than |ip, ops, regs, acc, ctx, float| {
+    let other = regs.read(ops.signed::<0>(), ctx);
+    unsafe { vm_core::cold::compare(ctx, 4, acc, other) }
+});
 
 #[cold]
 #[inline(never)]
 #[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_box_add_loc<'a>(
+pub extern "rust-preserve-none" fn slow_compare_jump<'a, const STRIDE: usize>(
     ip: *const u8,
-    _regs: Regs,
+    regs: Regs,
     acc: Tagged<'a, Value>,
     ctx: &Ctx<'a>,
     table: TableArg<'a>,
     roots: RootsArg<'a>,
     float: FloatReg,
 ) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let dst = read_signed(ip, base, stride);
-    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    regs.write(dst, v);
+    let ops = Ops::<STRIDE>::from_ip(ip);
+    // every target is captured code-relative BEFORE the compare below:
+    // it may allocate and move the code object, after which the old `ip`
+    // no longer pairs with the frame-header base
+    let pc = ip as usize - ctx.code_ptr() as usize;
+    let next_pc = slow_next_pc(ip) as usize - ctx.code_ptr() as usize;
+    let r = ops.signed::<0>();
+    let kind = ops.unsigned::<1>();
+    let off = ops.signed::<2>();
+    let jump_pc = (pc as isize + off as isize) as usize;
+    let other = regs.read(r, ctx);
+    let cmp = (kind / 2) as u8;
+    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
+        (Some(a), Some(b)) => match cmp {
+            0 | 1 => a == b,
+            2 => a < b,
+            3 => a <= b,
+            4 => a > b,
+            _ => a >= b,
+        },
+        _ => {
+            let v = unsafe { vm_core::cold::compare(ctx, cmp, acc, other) };
+            if ctx.is_throw(v) {
+                become resume(
+                    unsafe { ctx.code_ptr().add(pc) },
+                    regs,
+                    v,
+                    ctx,
+                    table,
+                    roots,
+                    float,
+                )
+            }
+            Convert::is_truthy(ctx.heap(), v)
+        }
+    };
+    let boolean = Convert::boolean(ctx.heap(), b);
     let code = ctx.code_ptr();
-    let next = unsafe { slow_next_pc(ip) } as usize - ip as usize;
-    let pc = ip as usize - code as usize + next;
-    let h = table.get(unsafe { *code.add(pc) });
-    become h(unsafe { code.add(pc) }, regs, v, ctx, table, roots, float)
+    let dest = unsafe {
+        if b != (kind % 2 == 1) {
+            code.add(jump_pc)
+        } else {
+            code.add(next_pc)
+        }
+    };
+    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
+    let h = table.get(unsafe { *dest });
+    become h(dest, regs, boolean, ctx, table, roots, float)
 }
 
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_box_sub_loc<'a>(
-    ip: *const u8,
-    _regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let dst = read_signed(ip, base, stride);
-    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    regs.write(dst, v);
-    let code = ctx.code_ptr();
-    let next = unsafe { slow_next_pc(ip) } as usize - ip as usize;
-    let pc = ip as usize - code as usize + next;
-    let h = table.get(unsafe { *code.add(pc) });
-    become h(unsafe { code.add(pc) }, regs, v, ctx, table, roots, float)
-}
+slow_handler!(slow_named_load |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let name_idx = ops.unsigned::<1>();
+    let fb_slot = ops.unsigned::<2>();
+    unsafe { vm_core::cold::named_load(ctx, recv, name_idx, fb_slot) }
+});
+
+slow_handler!(slow_keyed_load |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let fb = ops.unsigned::<1>();
+    unsafe { vm_core::cold::keyed_load(ctx, recv, acc, Some(fb)) }
+});
+
+slow_handler!(slow_keyed_load_imm |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let idx = ops.unsigned::<1>();
+    unsafe { vm_core::cold::keyed_load_imm(ctx, recv, idx) }
+});
+
+slow_handler!(slow_keyed_store |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let key = regs.read(ops.signed::<1>(), ctx);
+    let fb = ops.unsigned::<2>();
+    unsafe { vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow) }
+});
+
+slow_handler!(slow_keyed_store_no_shadow |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let key = regs.read(ops.signed::<1>(), ctx);
+    let fb = ops.unsigned::<2>();
+    unsafe {
+        vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
+    }
+});
+
+slow_handler!(slow_global_load |ip, ops, regs, acc, ctx, float| {
+    let name_idx = ops.unsigned::<0>();
+    let fb_slot = ops.unsigned::<1>();
+    unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, true) }
+});
+
+slow_handler!(slow_store_named |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let name_idx = ops.unsigned::<1>();
+    let fb_slot = ops.unsigned::<2>();
+    unsafe { vm_core::cold::store_named(ctx, recv, name_idx, fb_slot, acc) }
+});
+
+slow_handler!(slow_construct |ip, ops, regs, acc, ctx, float| {
+    let callee = regs.read(ops.signed::<0>(), ctx);
+    let args_base = ops.signed::<1>();
+    let count = ops.unsigned::<2>();
+    unsafe { vm_core::cold::construct(ctx, callee, args_base, count) }
+});
+
+slow_handler!(slow_create_closure |ip, ops, regs, acc, ctx, float| {
+    let info_idx = ops.unsigned::<0>();
+    slow_try!(ctx, create_closure_slow(ctx, info_idx))
+});
+
+slow_handler!(slow_create_empty_array |ip, ops, regs, acc, ctx, float| {
+    let heap = unsafe { ctx.heap_mut() };
+    let state = ctx.state();
+    let obj = state.handle_scope(|scope| {
+        let map = heap.known().js_array_map;
+        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
+    });
+    obj
+});
+
+slow_handler!(slow_create_empty_object |ip, ops, regs, acc, ctx, float| {
+    let heap = unsafe { ctx.heap_mut() };
+    let state = ctx.state();
+    let obj = state.handle_scope(|scope| {
+        let map = heap.known().object_initial_map;
+        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
+    });
+    obj
+});
+
+slow_handler!(slow_create_bare_object |ip, ops, regs, acc, ctx, float| {
+    let heap = unsafe { ctx.heap_mut() };
+    let state = ctx.state();
+    let obj = state.handle_scope(|scope| {
+        let map = heap.known().plain_object_map;
+        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
+    });
+    obj
+});
+
+slow_handler!(slow_create_block_context |ip, ops, regs, acc, ctx, float| {
+    let count = ops.unsigned::<0>();
+    slow_try!(ctx, create_block_context_slow(ctx, count))
+});
+
+slow_handler!(slow_less_than_or_equal |ip, ops, regs, acc, ctx, float| {
+    let other = regs.read(ops.signed::<0>(), ctx);
+    unsafe { vm_core::cold::compare(ctx, 3, acc, other) }
+});
+
+slow_handler!(slow_global_load_nothrow |ip, ops, regs, acc, ctx, float| {
+    let name_idx = ops.unsigned::<0>();
+    let fb_slot = ops.unsigned::<1>();
+    unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, false) }
+});
+
+slow_handler!(slow_store_global |ip, ops, regs, acc, ctx, float| {
+    let name_idx = ops.unsigned::<0>();
+    unsafe { vm_core::cold::store_global(ctx, name_idx, acc) }
+});
+
+slow_handler!(slow_store_named_no_shadow |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let name_idx = ops.unsigned::<1>();
+    unsafe { vm_core::cold::store_named_no_shadow(ctx, recv, name_idx, acc) }
+});
+
+slow_handler!(slow_instance_of |ip, ops, regs, acc, ctx, float| {
+    let callable = regs.read(ops.signed::<0>(), ctx);
+    slow_try!(ctx, instance_of_slow(ctx, acc, callable))
+});
+
+slow_handler!(slow_greater_than_or_equal |ip, ops, regs, acc, ctx, float| {
+    let other = regs.read(ops.signed::<0>(), ctx);
+    unsafe { vm_core::cold::compare(ctx, 5, acc, other) }
+});
+
+slow_handler!(slow_add_parent |ip, ops, regs, acc, ctx, float| {
+    let recv = regs.read(ops.signed::<0>(), ctx);
+    let name_idx = ops.unsigned::<1>();
+    slow_try!(ctx, add_parent_slow(ctx, recv, name_idx, acc))
+});
+
+slow_handler!(slow_create_function_context |ip, ops, regs, acc, ctx, float| {
+    let scope_idx = ops.unsigned::<0>();
+    slow_try!(ctx, create_function_context_slow(ctx, scope_idx))
+});
+
+slow_handler!(slow_proxy_apply |ip, ops, regs, acc, ctx, float| {
+    let callee = regs.read(ops.signed::<0>(), ctx);
+    let args_base = ops.signed::<1>();
+    let count = ops.unsigned::<2>();
+    slow_try!(ctx, proxy_apply_slow(ctx, callee, args_base, count))
+});
+
+slow_handler!(slow_call_method_proxy |ip, ops, regs, acc, ctx, float| {
+    let base = base::<STRIDE>();
+    let wide = unsafe { *ip } == Opcode::Wide as u8;
+    let argc = match unsafe { Opcode::from_byte_unchecked(unsafe { *ip.add(wide as usize) }) } {
+        Opcode::CallMethod0 => 0usize,
+        Opcode::CallMethod1 => 1,
+        _ => 2,
+    };
+    let callee = regs.read(ops.signed::<0>(), ctx);
+    let recv = ops.signed::<1>();
+    let mut pargs = [0i32; 2];
+    for (i, arg) in pargs.iter_mut().enumerate().take(argc) {
+        *arg = read_signed(ip, base + (2 + i) * STRIDE, STRIDE);
+    }
+    slow_try!(ctx, proxy_apply_regs_slow(ctx, callee, recv, pargs, argc))
+});
+
+slow_handler!(slow_call_function_proxy |ip, ops, regs, acc, ctx, float| {
+    let base = base::<STRIDE>();
+    let wide = unsafe { *ip } == Opcode::Wide as u8;
+    let argc = match unsafe { Opcode::from_byte_unchecked(unsafe { *ip.add(wide as usize) }) } {
+        Opcode::CallFunction0 => 0usize,
+        Opcode::CallFunction1 => 1,
+        _ => 2,
+    };
+    let callee = regs.read(ops.signed::<0>(), ctx);
+    let mut pargs = [0i32; 2];
+    for (i, arg) in pargs.iter_mut().enumerate().take(argc) {
+        *arg = read_signed(ip, base + (i + 1) * STRIDE, STRIDE);
+    }
+    slow_try!(ctx, proxy_apply_function_slow(ctx, callee, pargs, argc))
+});
 
 /// Best-effort cache fill: record the synthesized object's initial map
 /// keyed on the closure, validated by (function map, `.prototype` slot
@@ -506,168 +817,14 @@ pub extern "rust-preserve-none" fn throw_dispatch<'a>(
 
 #[cold]
 #[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_add<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let v = unsafe { vm_core::cold::add(ctx, lhs, acc) };
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_numeric<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let op = unsafe { Opcode::from_byte_unchecked(*ip.add((stride == 2) as usize)) };
-    let f: fn(f64, f64) -> f64 = match op {
-        Opcode::Sub => |a, b| a - b,
-        Opcode::Mul => |a, b| a * b,
-        Opcode::Mod => |a, b| a % b,
-        Opcode::Exp => |a, b| a.powf(b),
-        _ => |a, b| a / b,
-    };
-    let v = unsafe { vm_core::cold::numeric(ctx, lhs, acc, f) };
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_add_immediate<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let imm = Smi::new(read_signed(ip, base + stride, stride) as i64).into_tagged();
-    let v = unsafe { vm_core::cold::add(ctx, lhs, imm) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_numeric_immediate<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let imm = Smi::new(read_signed(ip, base + stride, stride) as i64).into_tagged();
-    let op = unsafe { Opcode::from_byte_unchecked(*ip.add((stride == 2) as usize)) };
-    let f: fn(f64, f64) -> f64 = match op {
-        Opcode::SubImmediate => |a, b| a - b,
-        Opcode::MulImmediate => |a, b| a * b,
-        Opcode::ModImmediate => |a, b| a % b,
-        Opcode::ExpImmediate => |a, b| a.powf(b),
-        _ => |a, b| a / b,
-    };
-    let v = unsafe { vm_core::cold::numeric(ctx, lhs, imm, f) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_negate<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::negate(ctx, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn incdec_slow<'a>(
+fn incdec_slow<'a, const STRIDE: usize>(
     ip: *const u8,
     ctx: &Ctx<'a>,
     regs: Regs,
     delta: f64,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let r = read_signed(ip, base, stride);
+    let ops = Ops::<STRIDE>::from_ip(ip);
+    let r = ops.signed::<0>();
     let old = regs.read(r, ctx);
     let heap = unsafe { ctx.heap_mut() };
     if let Some(bits) = old.smi_bits() {
@@ -694,65 +851,15 @@ fn incdec_slow<'a>(
     })
 }
 
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_inc_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = slow_try!(ctx, incdec_slow(ip, ctx, regs, 1.0));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_dec_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = slow_try!(ctx, incdec_slow(ip, ctx, regs, -1.0));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-fn loc_op_slow<'a>(
+fn loc_op_slow<'a, const STRIDE: usize>(
     ip: *const u8,
     ctx: &Ctx<'a>,
     regs: Regs,
     sub: bool,
 ) -> Result<Tagged<'a, Value>, VmError> {
-    let (base, stride) = slow_layout(ip);
-    let dst = read_signed(ip, base, stride);
-    let src = read_signed(ip, base + stride, stride);
+    let ops = Ops::<STRIDE>::from_ip(ip);
+    let dst = ops.signed::<0>();
+    let src = ops.signed::<1>();
     let lhs = regs.read(dst, ctx);
     let rhs = regs.read(src, ctx);
     let v = if sub {
@@ -764,425 +871,6 @@ fn loc_op_slow<'a>(
         regs.write(dst, v);
     }
     Ok(v)
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_add_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let v = slow_try!(ctx, loc_op_slow(ip, ctx, regs, false));
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_sub_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let v = slow_try!(ctx, loc_op_slow(ip, ctx, regs, true));
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_keyed_load_reg<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let key = regs.read(read_signed(ip, base + stride, stride), ctx);
-    let fb = read_unsigned(ip, base + 2 * stride, stride);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::keyed_load(ctx, recv, key, Some(fb)) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_equal<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::compare(ctx, 0, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_less_than<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::compare(ctx, 2, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_greater_than<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::compare(ctx, 4, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_compare_jump<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let next = slow_next_pc(ip);
-    let r = read_signed(ip, base, stride);
-    let kind = read_unsigned(ip, base + stride, stride);
-    let off = read_signed(ip, base + 2 * stride, stride);
-    let other = regs.read(r, ctx);
-    let cmp = (kind / 2) as u8;
-    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
-        (Some(a), Some(b)) => match cmp {
-            0 | 1 => a == b,
-            2 => a < b,
-            3 => a <= b,
-            4 => a > b,
-            _ => a >= b,
-        },
-        _ => {
-            let pc = ip as usize - ctx.code_ptr() as usize;
-            let v = unsafe { vm_core::cold::compare(ctx, cmp, acc, other) };
-            if ctx.is_throw(v) {
-                become resume(
-                    unsafe { ctx.code_ptr().add(pc) },
-                    regs,
-                    v,
-                    ctx,
-                    table,
-                    roots,
-                    float,
-                )
-            }
-            Convert::is_truthy(ctx.heap(), v)
-        }
-    };
-    let boolean = Convert::boolean(ctx.heap(), b);
-    let dest = if b != (kind % 2 == 1) {
-        ip.wrapping_offset(off as isize)
-    } else {
-        next
-    };
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    let h = table.get(unsafe { *dest });
-    become h(dest, regs, boolean, ctx, table, roots, float)
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_named_load<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let fb_slot = read_unsigned(ip, base + 2 * stride, stride);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::named_load(ctx, recv, name_idx, fb_slot) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_keyed_load<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let fb = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::keyed_load(ctx, recv, acc, Some(fb)) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_keyed_load_imm<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let idx = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::keyed_load_imm(ctx, recv, idx) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_keyed_store<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let key = regs.read(read_signed(ip, base + stride, stride), ctx);
-    let fb = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe {
-        vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)
-    };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_keyed_store_no_shadow<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let key = regs.read(read_signed(ip, base + stride, stride), ctx);
-    let fb = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe {
-        vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
-    };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_global_load<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let name_idx = read_unsigned(ip, base, stride);
-    let fb_slot = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, true) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_store_named<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let fb_slot = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe { vm_core::cold::store_named(ctx, recv, name_idx, fb_slot, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
 }
 
 #[cold]
@@ -1410,152 +1098,6 @@ pub fn slow_call_miss<'a>(
 
 #[cold]
 #[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_construct<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let args_base = read_signed(ip, base + stride, stride);
-    let count = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe { vm_core::cold::construct(ctx, callee, args_base, count) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_create_closure<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let info_idx = read_unsigned(ip, base, stride);
-    let v = slow_try!(ctx, create_closure_slow(ctx, info_idx));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_create_empty_array<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    let obj = state.handle_scope(|scope| {
-        let map = heap.known().js_array_map;
-        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
-    });
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        obj,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_create_empty_object<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    let obj = state.handle_scope(|scope| {
-        let map = heap.known().object_initial_map;
-        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
-    });
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        obj,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_create_bare_object<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    let obj = state.handle_scope(|scope| {
-        let map = heap.known().plain_object_map;
-        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
-    });
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        obj,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
 fn create_block_context_slow<'a>(
     ctx: &Ctx<'a>,
     count: usize,
@@ -1584,143 +1126,6 @@ fn create_block_context_slow<'a>(
 
 #[cold]
 #[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_create_block_context<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let count = read_unsigned(ip, base, stride);
-    let v = slow_try!(ctx, create_block_context_slow(ctx, count));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_less_than_or_equal<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let v = unsafe { vm_core::cold::compare(ctx, 3, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_global_load_nothrow<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let name_idx = read_unsigned(ip, base, stride);
-    let fb_slot = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, false) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_store_global<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let name_idx = read_unsigned(ip, base, stride);
-    let v = unsafe { vm_core::cold::store_global(ctx, name_idx, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_store_named_no_shadow<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::store_named_no_shadow(ctx, recv, name_idx, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
 fn instance_of_slow<'a>(
     ctx: &Ctx<'a>,
     object: Tagged<'_, Value>,
@@ -1737,60 +1142,6 @@ fn instance_of_slow<'a>(
             Some(r) => Ok(Convert::boolean(heap, r)),
         }
     })
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_instance_of<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let callable = regs.read(read_signed(ip, base, stride), ctx);
-    let v = slow_try!(ctx, instance_of_slow(ctx, acc, callable));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_greater_than_or_equal<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let v = unsafe { vm_core::cold::compare(ctx, 5, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
 }
 
 #[cold]
@@ -1817,128 +1168,6 @@ fn add_parent_slow<'a>(
 
 #[cold]
 #[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_add_parent<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let v = slow_try!(ctx, add_parent_slow(ctx, recv, name_idx, acc));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_create_function_context<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let scope_idx = read_unsigned(ip, base, stride);
-    let v = slow_try!(ctx, create_function_context_slow(ctx, scope_idx));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_proxy_apply<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let args_base = read_signed(ip, base + stride, stride);
-    let count = read_unsigned(ip, base + 2 * stride, stride);
-    let v = slow_try!(ctx, proxy_apply_slow(ctx, callee, args_base, count));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_call_method_proxy<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let wide = unsafe { *ip } == Opcode::Wide as u8;
-    let argc = match unsafe { Opcode::from_byte_unchecked(unsafe { *ip.add(wide as usize) }) } {
-        Opcode::CallMethod0 => 0usize,
-        Opcode::CallMethod1 => 1,
-        _ => 2,
-    };
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let recv = read_signed(ip, base + stride, stride);
-    let mut pargs = [0i32; 2];
-    for (i, arg) in pargs.iter_mut().enumerate().take(argc) {
-        *arg = read_signed(ip, base + (2 + i) * stride, stride);
-    }
-    let v = slow_try!(ctx, proxy_apply_regs_slow(ctx, callee, recv, pargs, argc));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
 pub fn proxy_apply_function_slow<'a>(
     ctx: &Ctx<'a>,
     callee: Tagged<'_, Value>,
@@ -1959,41 +1188,4 @@ pub fn proxy_apply_function_slow<'a>(
     });
     ctx.stack().set_top(saved_top);
     result
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-pub extern "rust-preserve-none" fn slow_call_function_proxy<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = slow_layout(ip);
-    let wide = unsafe { *ip } == Opcode::Wide as u8;
-    let argc = match unsafe { Opcode::from_byte_unchecked(unsafe { *ip.add(wide as usize) }) } {
-        Opcode::CallFunction0 => 0usize,
-        Opcode::CallFunction1 => 1,
-        _ => 2,
-    };
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let mut pargs = [0i32; 2];
-    for (i, arg) in pargs.iter_mut().enumerate().take(argc) {
-        *arg = read_signed(ip, base + (i + 1) * stride, stride);
-    }
-    let v = slow_try!(ctx, proxy_apply_function_slow(ctx, callee, pargs, argc));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
 }

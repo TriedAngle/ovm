@@ -142,9 +142,7 @@ pub struct ContextState {
     /// Whether an interpreted frame is current (intrinsics inspecting
     /// the running frame check this).
     frame_active: Cell<bool>,
-    /// The accumulator parking cell: interpreters park the value in
-    /// flight here across safepoint polls (park/poll/reload never
-    /// nests, so one cell serves every frame).
+    /// The accumulator cell: rooted, the GC updates it in place.
     acc: Register,
     pending_exception: Register,
     has_pending_exception: Cell<bool>,
@@ -188,7 +186,7 @@ impl ContextState {
         self.frame_active.set(active);
     }
 
-    /// The accumulator parking cell (see the field docs).
+    /// The accumulator cell (see the field docs).
     pub fn acc_slot(&self) -> &Register {
         &self.acc
     }

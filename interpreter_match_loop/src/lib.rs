@@ -8,8 +8,8 @@ use vm_core::interp::{Ctx, Unwind};
 use vm_core::{
     CallTarget, CallableInfoObject, Callee, Coercion, Compare, Context, ContextInit, ContextState,
     Convert, FixedArray, FixedByteArray, FrameMeta, Handle, HandleSlice, Heap, Intrinsic, Key,
-    LoadOutcome, Lookup, Object, Params, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi,
-    StoreSemantics, Tagged, Termination, VM, Value, VmError, spread_apply_args,
+    LoadOutcome, Lookup, Object, Params, Register, RuntimeContext, RuntimeIndex, ScopeInfo,
+    SlotName, Smi, StoreSemantics, Tagged, Termination, VM, Value, VmError, spread_apply_args,
 };
 
 /// The per-instruction control flow of the dispatch loop (the error
@@ -249,7 +249,7 @@ fn begin_termination(heap: &Heap, state: &ContextState) -> Flow {
 #[inline(never)]
 fn intrinsic_step<'a>(
     ctx: &Ctx<'a>,
-    acc: &mut Tagged<'a, Value>,
+    acc: &Register,
     intrinsic: Intrinsic,
     args: HandleSlice<'_>,
 ) -> Flow {
@@ -296,7 +296,7 @@ fn intrinsic_step<'a>(
     match result {
         Ok(v) if v.raw() == exception => Flow::Threw,
         Ok(v) => {
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Err(err) => {
@@ -308,33 +308,32 @@ fn intrinsic_step<'a>(
 
 fn dispatch<'a>(ctx: &Ctx<'a>) -> Result<Tagged<'a, Value>, VmError> {
     let mut frame_base = ctx.frame_base();
-    let mut acc = ctx.undefined_word();
+    let acc = ctx.acc_slot();
+    acc.store(ctx.undefined_word());
 
     let mut code = code_bytes(ctx);
     let mut pc = 0usize;
 
     loop {
         let (op, ops, next_pc) = decode(code, pc);
-        let result = unsafe { step(ctx, pc, next_pc, frame_base, &mut acc, ops, op) };
+        let result = unsafe { step(ctx, pc, next_pc, frame_base, acc, ops, op) };
         match result {
             Flow::Next => pc = next_pc,
             Flow::Jump(target) => pc = target,
             Flow::Sync => {
                 pc = next_pc;
-                // an allocation or nested run may have moved the bytecode
-                // object: re-derive the slice from the frame header
                 code = code_bytes(ctx);
             }
             Flow::Reframe(resume) => {
                 frame_base = ctx.frame_base();
                 code = code_bytes(ctx);
                 pc = resume;
-                acc = ctx.undefined_word();
+                acc.store(ctx.undefined_word());
             }
-            Flow::Return => return Ok(acc),
+            Flow::Return => return Ok(acc.get(ctx.heap())),
             Flow::Threw => match unsafe { vm_core::interp::unwind(ctx, pc) } {
                 Unwind::Caught { pc: handler, ex } => {
-                    acc = ex;
+                    acc.store(ex);
                     frame_base = ctx.frame_base();
                     code = code_bytes(ctx);
                     pc = handler;
@@ -369,7 +368,7 @@ unsafe fn step<'a>(
     pc: usize,
     next_pc: usize,
     frame_base: usize,
-    acc: &mut Tagged<'a, Value>,
+    acc: &Register,
     ops: Operands<'_>,
     op: Opcode,
 ) -> Flow {
@@ -388,39 +387,39 @@ unsafe fn step<'a>(
             Flow::Reframe(caller.pc)
         }
         Opcode::Load => {
-            *acc = stack.reg(heap, frame_base, ops.reg(0));
+            acc.store(stack.reg(heap, frame_base, ops.reg(0)));
             Flow::Next
         }
         Opcode::LoadSmi => {
-            *acc = Smi::new(ops.imm(0) as i64).into_tagged();
+            acc.store(Smi::new(ops.imm(0) as i64).into_tagged());
             Flow::Next
         }
         Opcode::LoadConstant => {
-            *acc = ctx.constants_ref(heap).at(heap, ops.idx(0));
+            acc.store(ctx.constants_ref(heap).at(heap, ops.idx(0)));
             Flow::Next
         }
         Opcode::LoadZero => {
-            *acc = Smi::new(0).into_tagged();
+            acc.store(Smi::new(0).into_tagged());
             Flow::Next
         }
         Opcode::LoadUndefined => {
-            *acc = heap.known().undefined.as_tagged(heap).erase();
+            acc.store(heap.known().undefined.as_tagged(heap).erase());
             Flow::Next
         }
         Opcode::LoadNull => {
-            *acc = heap.known().null.as_tagged(heap).erase();
+            acc.store(heap.known().null.as_tagged(heap).erase());
             Flow::Next
         }
         Opcode::LoadTrue => {
-            *acc = heap.known().true_object.as_tagged(heap).erase();
+            acc.store(heap.known().true_object.as_tagged(heap).erase());
             Flow::Next
         }
         Opcode::LoadFalse => {
-            *acc = heap.known().false_object.as_tagged(heap).erase();
+            acc.store(heap.known().false_object.as_tagged(heap).erase());
             Flow::Next
         }
         Opcode::LoadHole => {
-            *acc = heap.known().the_hole.as_tagged(heap).erase();
+            acc.store(heap.known().the_hole.as_tagged(heap).erase());
             Flow::Next
         }
         Opcode::LoadGlobal | Opcode::LoadGlobalFast => {
@@ -428,14 +427,14 @@ unsafe fn step<'a>(
             if let Some(Hit::Value(v)) =
                 InlineCache::try_load(heap, ctx.feedback_ref(heap), ops.idx(1), global)
             {
-                *acc = v;
+                acc.store(v);
                 return Flow::Next;
             }
             let v = vm_core::cold::global_load(ctx, ops.idx(0), ops.idx(1), true);
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::LoadGlobalNoThrow => {
@@ -443,14 +442,14 @@ unsafe fn step<'a>(
             if let Some(Hit::Value(v)) =
                 InlineCache::try_load(heap, ctx.feedback_ref(heap), ops.idx(1), global)
             {
-                *acc = v;
+                acc.store(v);
                 return Flow::Next;
             }
             let v = vm_core::cold::global_load(ctx, ops.idx(0), ops.idx(1), false);
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::LoadNamedProperty | Opcode::LoadNamedPropertyFast => {
@@ -459,12 +458,12 @@ unsafe fn step<'a>(
             // out-of-line monomorphic handler, polymorphic resume
             match InlineCache::probe_mono(heap, ctx.feedback_ref(heap), ops.idx(2), receiver) {
                 MonoProbe::Value(v) => {
-                    *acc = v;
+                    acc.store(v);
                     return Flow::Next;
                 }
                 MonoProbe::Handler(obj, handler) => {
                     if let Some(Hit::Value(v)) = InlineCache::apply_mono(heap, obj, handler) {
-                        *acc = v;
+                        acc.store(v);
                         return Flow::Next;
                     }
                 }
@@ -477,7 +476,7 @@ unsafe fn step<'a>(
                     if let Some(Hit::Value(v)) =
                         InlineCache::try_load_resume(heap, obj, map, pairs, start)
                     {
-                        *acc = v;
+                        acc.store(v);
                         return Flow::Next;
                     }
                 }
@@ -492,19 +491,19 @@ unsafe fn step<'a>(
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::LoadKeyedProperty => {
             let fb = ops.idx(1);
-            if let Some(idx) = (*acc).to_i64()
+            if let Some(idx) = acc.get(heap).to_i64()
                 && idx >= 0
             {
                 let recv = stack.reg(heap, frame_base, ops.reg(0));
                 if let Some(obj) = recv.as_heap_object()
                     && let Some(v) = obj.as_ref().element_value(heap, idx as usize)
                 {
-                    *acc = v;
+                    acc.store(v);
                     return Flow::Next;
                 }
                 if let Some(ElementHit::Value(v)) = InlineCache::try_load_element(
@@ -514,20 +513,20 @@ unsafe fn step<'a>(
                     recv,
                     idx as usize,
                 ) {
-                    *acc = v;
+                    acc.store(v);
                     return Flow::Next;
                 }
             }
             let v = vm_core::cold::keyed_load(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
-                *acc,
+                acc.get(heap),
                 Some(fb),
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::LoadKeyedPropertyReg => {
@@ -540,7 +539,7 @@ unsafe fn step<'a>(
                 if let Some(obj) = recv.as_heap_object()
                     && let Some(v) = obj.as_ref().element_value(heap, idx as usize)
                 {
-                    *acc = v;
+                    acc.store(v);
                     return Flow::Next;
                 }
                 if let Some(ElementHit::Value(v)) = InlineCache::try_load_element(
@@ -550,11 +549,11 @@ unsafe fn step<'a>(
                     recv,
                     idx as usize,
                 ) {
-                    *acc = v;
+                    acc.store(v);
                     return Flow::Next;
                 }
             }
-            *acc = stack.reg(heap, frame_base, key_reg);
+            acc.store(stack.reg(heap, frame_base, key_reg));
             let v = vm_core::cold::keyed_load(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
@@ -564,23 +563,23 @@ unsafe fn step<'a>(
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::LoadNewTarget => {
-            *acc = stack.new_target_slot(frame_base).get(heap);
+            acc.store(stack.new_target_slot(frame_base).get(heap));
             Flow::Next
         }
         Opcode::Store => {
-            stack.set_reg(frame_base, ops.reg(0), *acc);
+            stack.set_reg(frame_base, ops.reg(0), acc.get(heap));
             Flow::Next
         }
         Opcode::StoreGlobal => {
-            let v = vm_core::cold::store_global(ctx, ops.idx(0), *acc);
+            let v = vm_core::cold::store_global(ctx, ops.idx(0), acc.get(heap));
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::StoreNamedProperty => {
@@ -589,12 +588,12 @@ unsafe fn step<'a>(
                 stack.reg(heap, frame_base, ops.reg(0)),
                 ops.idx(1),
                 ops.idx(2),
-                *acc,
+                acc.get(heap),
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::StoreNamedPropertyNoShadow => {
@@ -602,12 +601,12 @@ unsafe fn step<'a>(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
                 ops.idx(1),
-                *acc,
+                acc.get(heap),
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::AddParent => {
@@ -620,7 +619,7 @@ unsafe fn step<'a>(
                     .as_ref()
                     .constant_slot_name(heap, name_idx);
                 let name = scope.handle(name);
-                let value = scope.handle(*acc);
+                let value = scope.handle(acc.get(heap));
                 let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
                     throw_err!(ctx, VmError::Type);
                 };
@@ -638,7 +637,9 @@ unsafe fn step<'a>(
                 && idx >= 0
             {
                 let recv = stack.reg(heap, frame_base, ops.reg(0));
-                if Object::store_array_element_in_place(heap, recv, idx as usize, *acc).is_ok() {
+                if Object::store_array_element_in_place(heap, recv, idx as usize, acc.get(heap))
+                    .is_ok()
+                {
                     return Flow::Next;
                 }
                 if let Some(v) = InlineCache::try_store_element(
@@ -647,9 +648,9 @@ unsafe fn step<'a>(
                     fb,
                     recv,
                     idx as usize,
-                    *acc,
+                    acc.get(heap),
                 ) {
-                    *acc = v;
+                    acc.store(v);
                     return Flow::Next;
                 }
             }
@@ -657,14 +658,14 @@ unsafe fn step<'a>(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
                 stack.reg(heap, frame_base, ops.reg(1)),
-                *acc,
+                acc.get(heap),
                 Some(fb),
                 semantics,
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::StoreKeyedSlot => {
@@ -687,7 +688,7 @@ unsafe fn step<'a>(
                             state,
                             receiver,
                             key.erase(),
-                            scope.handle(*acc),
+                            scope.handle(acc.get(heap)),
                             receiver,
                         )
                     ) {
@@ -703,7 +704,7 @@ unsafe fn step<'a>(
                                 throw_err!(ctx, VmError::Type);
                             };
                             if obj.as_tagged(heap).as_ref().is_array(heap) {
-                                let value = scope.handle(*acc);
+                                let value = scope.handle(acc.get(heap));
                                 fold!(
                                     ctx,
                                     Object::store_array_element_in_place(
@@ -728,7 +729,7 @@ unsafe fn step<'a>(
                         Key::Name(key) => scope.handle(key),
                     };
 
-                let value = scope.handle(*acc);
+                let value = scope.handle(acc.get(heap));
                 let outcome = fold!(
                     ctx,
                     receiver.as_tagged(heap).store_lookup(
@@ -760,19 +761,19 @@ unsafe fn step<'a>(
                     .global_object
                     .as_tagged(heap)
                     .erase()
-                    .store_lookup_existing(heap, name, *acc, StoreSemantics::WriteThrough)
+                    .store_lookup_existing(heap, name, acc.get(heap), StoreSemantics::WriteThrough)
             ) {
                 true => Flow::Sync,
                 false => throw_err!(ctx, VmError::OutOfBounds),
             }
         }
         Opcode::LoadKeyedPropertyFast => {
-            if let Some(idx) = Smi::decode((*acc).raw())
+            if let Some(idx) = Smi::decode(acc.get(heap).raw())
                 && idx.value() >= 0
                 && let Some(recv) = stack.reg(heap, frame_base, ops.reg(0)).as_heap_object()
                 && let Some(v) = recv.as_ref().element_value(heap, idx.value() as usize)
             {
-                *acc = v;
+                acc.store(v);
                 return Flow::Next;
             }
             debug_assert!(
@@ -780,12 +781,12 @@ unsafe fn step<'a>(
                 "fast load on a proxy receiver"
             );
             let receiver = stack.reg(heap, frame_base, ops.reg(0));
-            let key = (*acc).as_name();
+            let key = acc.get(heap).as_name();
             match fold!(ctx, Lookup::load_outcome_keyed(heap, receiver, key)) {
-                LoadOutcome::Value(v) => *acc = v,
+                LoadOutcome::Value(v) => acc.store(v),
                 LoadOutcome::Getter(_) => {
                     debug_assert!(false, "fast load on an accessor property");
-                    *acc = heap.known().undefined.as_tagged(heap).erase();
+                    acc.store(heap.known().undefined.as_tagged(heap).erase());
                 }
             }
             Flow::Sync
@@ -804,7 +805,7 @@ unsafe fn step<'a>(
                         .constant_slot_name(heap, ops.idx(1)),
                 );
                 let vector = ctx.feedback_ref(heap).map(|v| scope.handle(v));
-                let value = scope.handle(*acc);
+                let value = scope.handle(acc.get(heap));
 
                 // store IC (Shadow semantics only: WriteThrough stores
                 // into parent-pair arrays that no map describes)
@@ -835,7 +836,7 @@ unsafe fn step<'a>(
                     receiver.as_tagged(heap).erase().store_lookup_existing(
                         heap,
                         name.as_tagged(heap),
-                        *acc,
+                        acc.get(heap),
                         semantics,
                     )
                 );
@@ -866,7 +867,7 @@ unsafe fn step<'a>(
                     heap,
                     stack.reg(heap, frame_base, ops.reg(0)),
                     idx.value() as usize,
-                    *acc,
+                    acc.get(heap),
                 )
                 .is_ok()
             {
@@ -885,7 +886,7 @@ unsafe fn step<'a>(
                             let receiver = scope
                                 .cast::<Object>(receiver.as_tagged(heap))
                                 .expect("array receiver is an object");
-                            let value = scope.handle(*acc);
+                            let value = scope.handle(acc.get(heap));
                             fold!(
                                 ctx,
                                 Object::store_array_element(heap, &scope, &receiver, i, &value)
@@ -898,7 +899,7 @@ unsafe fn step<'a>(
                             receiver.as_tagged(heap).erase().store_lookup_existing(
                                 heap,
                                 name,
-                                *acc,
+                                acc.get(heap),
                                 StoreSemantics::Shadow,
                             )
                         ) {
@@ -912,7 +913,7 @@ unsafe fn step<'a>(
                             receiver.as_tagged(heap).erase().store_lookup_existing(
                                 heap,
                                 name,
-                                *acc,
+                                acc.get(heap),
                                 StoreSemantics::Shadow,
                             )
                         ) {
@@ -952,7 +953,7 @@ unsafe fn step<'a>(
                     .element_slot(ops.idx(0))
                     .get(heap)
             };
-            *acc = v;
+            acc.store(v);
             Flow::Next
         }
         Opcode::StoreContextSlot => {
@@ -973,7 +974,7 @@ unsafe fn step<'a>(
                 .get(heap)
                 .as_ref()
                 .element_slot(ops.idx(0))
-                .set(heap, host, *acc);
+                .set(heap, host, acc.get(heap));
             Flow::Next
         }
         Opcode::CreateFunctionContext => {
@@ -1003,7 +1004,7 @@ unsafe fn step<'a>(
                     scope_info,
                 })
             });
-            *acc = ctx.erase();
+            acc.store(ctx.erase());
             Flow::Sync
         }
         Opcode::CreateBlockContext => {
@@ -1021,13 +1022,13 @@ unsafe fn step<'a>(
                     scope_info: heap.known().empty_scope_info,
                 })
             });
-            *acc = ctx.erase();
+            acc.store(ctx.erase());
             Flow::Sync
         }
         Opcode::PushContext => {
             let old = stack.context_slot(frame_base).get(heap);
             stack.set_reg(frame_base, ops.reg(0), old);
-            let context = *acc;
+            let context = acc.get(heap);
             if context.get_as::<Context>().is_none() {
                 throw_err!(ctx, VmError::Type);
             }
@@ -1043,13 +1044,13 @@ unsafe fn step<'a>(
             Flow::Next
         }
         Opcode::ThrowReferenceErrorIfHole => {
-            if *acc == heap.known().the_hole.as_tagged(heap) {
+            if acc.get(heap) == heap.known().the_hole.as_tagged(heap) {
                 throw_err!(ctx, VmError::Reference);
             }
             Flow::Sync
         }
         Opcode::LoadContext => {
-            *acc = stack.context_slot(frame_base).get(heap);
+            acc.store(stack.context_slot(frame_base).get(heap));
             Flow::Sync
         }
         // TODO: feedback vectors and separation once they are there
@@ -1093,8 +1094,8 @@ unsafe fn step<'a>(
                             )
                         );
                         ctx.set_frame_base(frame.base);
-                        *acc = fold!(ctx, run_callee(ctx));
-                        if ctx.is_throw(*acc) {
+                        acc.store(fold!(ctx, run_callee(ctx)));
+                        if ctx.is_throw(acc.get(heap)) {
                             return Flow::Threw;
                         }
                         return Flow::Sync;
@@ -1108,7 +1109,7 @@ unsafe fn step<'a>(
                         return if v.raw() == exception {
                             Flow::Threw
                         } else {
-                            *acc = v;
+                            acc.store(v);
                             Flow::Sync
                         };
                     }
@@ -1135,7 +1136,7 @@ unsafe fn step<'a>(
                 }) {
                     Ok(Coercion::Threw) => Flow::Threw,
                     Ok(Coercion::Value(v)) => {
-                        *acc = v;
+                        acc.store(v);
                         Flow::Sync
                     }
                     Err(err) => throw_err!(ctx, err),
@@ -1171,8 +1172,7 @@ unsafe fn step<'a>(
                     if v.raw() == exception {
                         return Flow::Threw;
                     }
-                    // park across the IC update below (it may allocate)
-                    ctx.acc_slot().store(v);
+                    acc.store(v);
                     unsafe {
                         vm_core::ic::call_update(
                             heap,
@@ -1182,7 +1182,6 @@ unsafe fn step<'a>(
                             None,
                         );
                     }
-                    *acc = ctx.acc_slot().get(heap);
                     Flow::Sync
                 }
                 Some(CallTarget::Bytecode {
@@ -1232,8 +1231,8 @@ unsafe fn step<'a>(
                     ctx.set_frame_base(frame.base);
                     // blocking call: run the callee to completion; its
                     // value becomes the caller's accumulator
-                    *acc = fold!(ctx, run_callee(ctx));
-                    if ctx.is_throw(*acc) {
+                    acc.store(fold!(ctx, run_callee(ctx)));
+                    if ctx.is_throw(acc.get(heap)) {
                         return Flow::Threw;
                     }
                     Flow::Sync
@@ -1257,7 +1256,7 @@ unsafe fn step<'a>(
                 }) {
                     Ok(Coercion::Threw) => Flow::Threw,
                     Ok(Coercion::Value(v)) => {
-                        *acc = v;
+                        acc.store(v);
                         Flow::Sync
                     }
                     Err(err) => throw_err!(ctx, err),
@@ -1282,7 +1281,7 @@ unsafe fn step<'a>(
                     if v.raw() == exception {
                         Flow::Threw
                     } else {
-                        *acc = v;
+                        acc.store(v);
                         Flow::Sync
                     }
                 }
@@ -1322,8 +1321,8 @@ unsafe fn step<'a>(
                     ctx.set_frame_base(frame.base);
                     // blocking call: run the callee to completion; its
                     // value becomes the caller's accumulator
-                    *acc = fold!(ctx, run_callee(ctx));
-                    if ctx.is_throw(*acc) {
+                    acc.store(fold!(ctx, run_callee(ctx)));
+                    if ctx.is_throw(acc.get(heap)) {
                         return Flow::Threw;
                     }
                     Flow::Sync
@@ -1374,8 +1373,8 @@ unsafe fn step<'a>(
                             )
                         );
                         ctx.set_frame_base(frame.base);
-                        *acc = fold!(ctx, run_callee(ctx));
-                        if ctx.is_throw(*acc) {
+                        acc.store(fold!(ctx, run_callee(ctx)));
+                        if ctx.is_throw(acc.get(heap)) {
                             return Flow::Threw;
                         }
                         return Flow::Sync;
@@ -1394,7 +1393,7 @@ unsafe fn step<'a>(
                         return if v.raw() == exception {
                             Flow::Threw
                         } else {
-                            *acc = v;
+                            acc.store(v);
                             Flow::Sync
                         };
                     }
@@ -1424,7 +1423,7 @@ unsafe fn step<'a>(
                 return match result {
                     Ok(Coercion::Threw) => Flow::Threw,
                     Ok(Coercion::Value(v)) => {
-                        *acc = v;
+                        acc.store(v);
                         Flow::Sync
                     }
                     Err(err) => throw_err!(ctx, err),
@@ -1455,7 +1454,7 @@ unsafe fn step<'a>(
                     if v.raw() == exception {
                         Flow::Threw
                     } else {
-                        *acc = v;
+                        acc.store(v);
                         Flow::Sync
                     }
                 }
@@ -1504,8 +1503,8 @@ unsafe fn step<'a>(
                     ctx.set_frame_base(frame.base);
                     // blocking call: run the callee to completion; its
                     // value becomes the caller's accumulator
-                    *acc = fold!(ctx, run_callee(ctx));
-                    if ctx.is_throw(*acc) {
+                    acc.store(fold!(ctx, run_callee(ctx)));
+                    if ctx.is_throw(acc.get(heap)) {
                         return Flow::Threw;
                     }
                     Flow::Sync
@@ -1555,8 +1554,8 @@ unsafe fn step<'a>(
                             )
                         );
                         ctx.set_frame_base(frame.base);
-                        *acc = fold!(ctx, run_callee(ctx));
-                        if ctx.is_throw(*acc) {
+                        acc.store(fold!(ctx, run_callee(ctx)));
+                        if ctx.is_throw(acc.get(heap)) {
                             return Flow::Threw;
                         }
                         return Flow::Sync;
@@ -1575,7 +1574,7 @@ unsafe fn step<'a>(
                         return if v.raw() == exception {
                             Flow::Threw
                         } else {
-                            *acc = v;
+                            acc.store(v);
                             Flow::Sync
                         };
                     }
@@ -1605,7 +1604,7 @@ unsafe fn step<'a>(
                 return match result {
                     Ok(Coercion::Threw) => Flow::Threw,
                     Ok(Coercion::Value(v)) => {
-                        *acc = v;
+                        acc.store(v);
                         Flow::Sync
                     }
                     Err(err) => throw_err!(ctx, err),
@@ -1636,7 +1635,7 @@ unsafe fn step<'a>(
                     if v.raw() == exception {
                         Flow::Threw
                     } else {
-                        *acc = v;
+                        acc.store(v);
                         Flow::Sync
                     }
                 }
@@ -1684,8 +1683,8 @@ unsafe fn step<'a>(
                     ctx.set_frame_base(frame.base);
                     // blocking call: run the callee to completion; its
                     // value becomes the caller's accumulator
-                    *acc = fold!(ctx, run_callee(ctx));
-                    if ctx.is_throw(*acc) {
+                    acc.store(fold!(ctx, run_callee(ctx)));
+                    if ctx.is_throw(acc.get(heap)) {
                         return Flow::Threw;
                     }
                     Flow::Sync
@@ -1706,7 +1705,7 @@ unsafe fn step<'a>(
             if v.raw() == exception {
                 Flow::Threw
             } else {
-                *acc = v;
+                acc.store(v);
                 Flow::Sync
             }
         }
@@ -1720,7 +1719,7 @@ unsafe fn step<'a>(
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         // the fast interpreter parks the synthesized receiver in this
@@ -1732,7 +1731,7 @@ unsafe fn step<'a>(
                 let map = heap.known().object_initial_map;
                 heap.new_object(&scope, map, HandleSlice::EMPTY)
             });
-            *acc = obj.erase();
+            acc.store(obj.erase());
             Flow::Sync
         }
         Opcode::CreateEmptyArrayLiteral => {
@@ -1740,7 +1739,7 @@ unsafe fn step<'a>(
                 let map = heap.known().js_array_map;
                 heap.new_object(&scope, map, HandleSlice::EMPTY)
             });
-            *acc = obj.erase();
+            acc.store(obj.erase());
             Flow::Sync
         }
         Opcode::CreateBareObjectLiteral => {
@@ -1748,7 +1747,7 @@ unsafe fn step<'a>(
                 let map = heap.known().plain_object_map;
                 heap.new_object(&scope, map, HandleSlice::EMPTY)
             });
-            *acc = obj.erase();
+            acc.store(obj.erase());
             Flow::Sync
         }
         Opcode::CreateClosure => {
@@ -1763,32 +1762,33 @@ unsafe fn step<'a>(
                     .cast::<Context>(stack.context_slot(frame_base).get(heap))
                     .expect("frame context slot holds a Context");
                 let obj = fold!(ctx, Object::create_closure(heap, &scope, info, context));
-                *acc = obj.erase();
+                acc.store(obj.erase());
                 Flow::Sync
             })
         }
         Opcode::LoadCurrentClosure => {
-            *acc = stack.callable_slot(frame_base).get(heap);
+            acc.store(stack.callable_slot(frame_base).get(heap));
             Flow::Next
         }
         Opcode::Add => {
             let lhs = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.get(heap).to_i64())
                 && let Some(r) = a.checked_add(b)
                 && Smi::in_range(r)
             {
-                *acc = Smi::new(r).into_tagged();
+                acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(*acc)) {
-                *acc = heap.new_number(a + b);
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a + b));
                 return Flow::Next;
             }
-            let v = vm_core::cold::add(ctx, stack.reg(heap, frame_base, ops.reg(0)), *acc);
+            let v = vm_core::cold::add(ctx, stack.reg(heap, frame_base, ops.reg(0)), acc.get(heap));
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::AddLoc | Opcode::SubLoc => {
@@ -1805,7 +1805,7 @@ unsafe fn step<'a>(
                 if let Some(r) = stepped {
                     let v = Tagged::from_smi_bits(r);
                     stack.set_reg(frame_base, dst, v);
-                    *acc = v;
+                    acc.store(v);
                     return Flow::Next;
                 }
             }
@@ -1813,7 +1813,7 @@ unsafe fn step<'a>(
                 let r = if op == Opcode::AddLoc { a + b } else { a - b };
                 let v = heap.new_number(r);
                 stack.set_reg(frame_base, dst, v);
-                *acc = v;
+                acc.store(v);
                 return Flow::Sync;
             }
             let v = if op == Opcode::AddLoc {
@@ -1834,32 +1834,33 @@ unsafe fn step<'a>(
                 return Flow::Threw;
             }
             stack.set_reg(frame_base, dst, v);
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::Sub => {
             let lhs = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.get(heap).to_i64())
                 && let Some(r) = a.checked_sub(b)
                 && Smi::in_range(r)
             {
-                *acc = Smi::new(r).into_tagged();
+                acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(*acc)) {
-                *acc = heap.new_number(a - b);
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a - b));
                 return Flow::Next;
             }
             let v = vm_core::cold::numeric(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
-                *acc,
+                acc.get(heap),
                 |a, b| a - b,
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::IncLoc | Opcode::DecLoc => {
@@ -1875,7 +1876,7 @@ unsafe fn step<'a>(
                 if let Some(new) = stepped {
                     stack.set_reg(frame_base, reg, Tagged::from_smi_bits(new));
                     // the postfix value is the numeric old value
-                    *acc = Tagged::from_smi_bits(bits);
+                    acc.store(Tagged::from_smi_bits(bits));
                     return Flow::Next;
                 }
             }
@@ -1895,82 +1896,84 @@ unsafe fn step<'a>(
                 };
                 let new = heap.new_number(n + delta as f64);
                 stack.set_reg(frame_base, reg, new);
-                *acc = old_num.as_tagged(heap);
+                acc.store(old_num.as_tagged(heap));
                 Flow::Sync
             })
         }
         Opcode::Mul => {
             let lhs = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.get(heap).to_i64())
                 && let Some(r) = a.checked_mul(b)
                 && Smi::in_range(r)
             {
-                *acc = Smi::new(r).into_tagged();
+                acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(*acc)) {
-                *acc = heap.new_number(a * b);
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a * b));
                 return Flow::Next;
             }
             let v = vm_core::cold::numeric(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
-                *acc,
+                acc.get(heap),
                 |a, b| a * b,
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::Div => {
             // JS division is IEEE double division: 7/2 = 3.5, x/0 = ±Infinity
             // or NaN, MIN/-1 overflows to a double.
             let lhs = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.get(heap).to_i64())
                 && b != 0
                 && a % b == 0
                 && let Some(r) = a.checked_div(b)
             {
-                *acc = Smi::new(r).into_tagged();
+                acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(*acc)) {
-                *acc = heap.new_number(a / b);
+            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
+            {
+                acc.store(heap.new_number(a / b));
                 return Flow::Next;
             }
             let v = vm_core::cold::numeric(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
-                *acc,
+                acc.get(heap),
                 |a, b| a / b,
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::Mod => {
             // JS remainder is IEEE fmod: x % 0 = NaN, signs follow the dividend.
             let lhs = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.to_i64())
+            if let (Some(a), Some(b)) = (lhs.to_i64(), acc.get(heap).to_i64())
                 && b != 0
             {
-                *acc = Smi::new(a % b).into_tagged();
+                acc.store(Smi::new(a % b).into_tagged());
                 return Flow::Next;
             }
             let v = vm_core::cold::numeric(
                 ctx,
                 stack.reg(heap, frame_base, ops.reg(0)),
-                *acc,
+                acc.get(heap),
                 |a, b| a % b,
             );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::Exp => {
@@ -1979,7 +1982,7 @@ unsafe fn step<'a>(
                 // JS exponentiation is always IEEE double math; the result only
                 // needs a Smi tag when it is an in-range integer.
                 let a = scope.handle(stack.reg(heap, frame_base, reg));
-                let b = scope.handle(*acc);
+                let b = scope.handle(acc.get(heap));
                 let v = fold!(
                     ctx,
                     Object::numeric_op(vm, heap, state, a, b, |a, b| a.powf(b))
@@ -1987,7 +1990,7 @@ unsafe fn step<'a>(
                 let Some(v) = v else {
                     return Flow::Threw;
                 };
-                *acc = v;
+                acc.store(v);
                 Flow::Sync
             })
         }
@@ -2000,8 +2003,8 @@ unsafe fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            let b = fold!(ctx, acc.to_i64().ok_or(VmError::Type)) as i32;
-            *acc = Smi::new((a | b) as i64).into_tagged();
+            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as i32;
+            acc.store(Smi::new((a | b) as i64).into_tagged());
             Flow::Sync
         }
         Opcode::BitwiseXor => {
@@ -2012,8 +2015,8 @@ unsafe fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            let b = fold!(ctx, acc.to_i64().ok_or(VmError::Type)) as i32;
-            *acc = Smi::new((a ^ b) as i64).into_tagged();
+            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as i32;
+            acc.store(Smi::new((a ^ b) as i64).into_tagged());
             Flow::Sync
         }
         Opcode::BitwiseAnd => {
@@ -2024,8 +2027,8 @@ unsafe fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            let b = fold!(ctx, acc.to_i64().ok_or(VmError::Type)) as i32;
-            *acc = Smi::new((a & b) as i64).into_tagged();
+            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as i32;
+            acc.store(Smi::new((a & b) as i64).into_tagged());
             Flow::Sync
         }
         Opcode::ShiftLeft => {
@@ -2037,8 +2040,8 @@ unsafe fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            let b = fold!(ctx, acc.to_i64().ok_or(VmError::Type)) as u32;
-            *acc = Smi::new(a.wrapping_shl(b & 31) as i64).into_tagged();
+            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as u32;
+            acc.store(Smi::new(a.wrapping_shl(b & 31) as i64).into_tagged());
             Flow::Sync
         }
         Opcode::ShiftRight => {
@@ -2050,8 +2053,8 @@ unsafe fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as i32;
-            let b = fold!(ctx, acc.to_i64().ok_or(VmError::Type)) as u32;
-            *acc = Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged();
+            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as u32;
+            acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
             Flow::Sync
         }
         Opcode::ShiftRightLogical => {
@@ -2063,8 +2066,8 @@ unsafe fn step<'a>(
                     .to_i64()
                     .ok_or(VmError::Type)
             ) as u32;
-            let b = fold!(ctx, acc.to_i64().ok_or(VmError::Type)) as u32;
-            *acc = Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged();
+            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as u32;
+            acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
             Flow::Sync
         }
         Opcode::Jump => Flow::Jump(jump_target(pc, ops.imm(0))),
@@ -2072,30 +2075,25 @@ unsafe fn step<'a>(
             // read the offset before the safepoint poll: a collection
             // invalidates the operand cursor
             let offset = ops.imm(0);
-            // park the accumulator across the poll: a collection would
-            // invalidate the raw word riding the local
-            ctx.acc_slot().store(*acc);
-            let terminated = heap.safepoint_poll();
-            *acc = ctx.acc_slot().get(heap);
-            if terminated {
+            if ctx.safepoint_tick() && heap.safepoint_poll() {
                 return begin_termination(heap, state);
             }
             Flow::Jump(jump_target(pc, offset))
         }
         Opcode::JumpIfTruthy => {
-            if Convert::is_truthy(heap, *acc) {
+            if Convert::is_truthy(heap, acc.get(heap)) {
                 return Flow::Jump(jump_target(pc, ops.imm(0)));
             }
             Flow::Next
         }
         Opcode::JumpIfFalsy => {
-            if !Convert::is_truthy(heap, *acc) {
+            if !Convert::is_truthy(heap, acc.get(heap)) {
                 return Flow::Jump(jump_target(pc, ops.imm(0)));
             }
             Flow::Next
         }
         Opcode::JumpIfNotUndefined => {
-            if *acc != heap.known().undefined.as_tagged(heap) {
+            if acc.get(heap) != heap.known().undefined.as_tagged(heap) {
                 return Flow::Jump(jump_target(pc, ops.imm(0)));
             }
             Flow::Next
@@ -2103,35 +2101,35 @@ unsafe fn step<'a>(
         Opcode::TestReferenceEqual => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
             let known = heap.known();
-            *acc = if other == *acc {
+            acc.store(if other == acc.get(heap) {
                 known.true_object.as_tagged(heap).erase()
             } else {
                 known.false_object.as_tagged(heap).erase()
-            };
+            });
             Flow::Next
         }
         Opcode::TestTypeof => {
-            *acc = Object::type_of(heap, *acc);
+            acc.store(Object::type_of(heap, acc.get(heap)));
             Flow::Next
         }
         Opcode::Negate => {
-            let acc_word = *acc;
-            if let Some(n) = Convert::as_number(*acc) {
+            let acc_word = acc.get(heap);
+            if let Some(n) = Convert::as_number(acc.get(heap)) {
                 // `new_number` keeps -0.0 boxed and folds everything else
-                *acc = heap.new_number(-n);
+                acc.store(heap.new_number(-n));
             } else if let Some(v) = acc_word.to_i64() {
                 if v == 0 {
                     // preserve -0.0: `-0` must not fold into Smi 0
-                    *acc = heap.new_number(-0.0);
+                    acc.store(heap.new_number(-0.0));
                 } else if v == Smi::MIN {
                     // `-Smi::MIN` overflows i64
-                    *acc = heap.new_number(-(v as f64));
+                    acc.store(heap.new_number(-(v as f64)));
                 } else {
-                    *acc = Smi::new(-v).into_tagged();
+                    acc.store(Smi::new(-v).into_tagged());
                 }
             } else {
                 let n = state.handle_scope(|scope| {
-                    let acc = scope.handle(*acc);
+                    let acc = scope.handle(acc.get(heap));
                     Object::to_numeric(vm, heap, state, acc)
                 });
                 let n = fold!(ctx, n);
@@ -2139,92 +2137,127 @@ unsafe fn step<'a>(
                     return Flow::Threw;
                 };
                 // new_number boxes -0.0 itself
-                *acc = heap.new_number(-n);
+                acc.store(heap.new_number(-n));
             }
             Flow::Sync
         }
         Opcode::InstanceOf => {
             let callable_reg = ops.reg(0);
             state.handle_scope(|scope| -> Flow {
-                let object = scope.handle(*acc);
+                let object = scope.handle(acc.get(heap));
                 let callable = scope.handle(stack.reg(heap, frame_base, callable_reg));
                 let r = fold!(ctx, Object::instance_of(vm, heap, state, object, callable));
                 let Some(r) = r else {
                     return Flow::Threw;
                 };
-                *acc = Convert::boolean(heap, r);
+                acc.store(Convert::boolean(heap, r));
                 Flow::Sync
             })
         }
         Opcode::EqualStrict => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            let r = Compare::strict_equal(heap, *acc, other);
-            *acc = Convert::boolean(heap, r);
+            let r = Compare::strict_equal(heap, acc.get(heap), other);
+            acc.store(Convert::boolean(heap, r));
             Flow::Next
         }
         Opcode::Equal => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (Convert::as_number(*acc), Convert::as_number(other)) {
-                *acc = Convert::boolean(heap, a == b);
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(Convert::boolean(heap, a == b));
                 return Flow::Next;
             }
-            let v = vm_core::cold::compare(ctx, 0, *acc, stack.reg(heap, frame_base, ops.reg(0)));
+            let v = vm_core::cold::compare(
+                ctx,
+                0,
+                acc.get(heap),
+                stack.reg(heap, frame_base, ops.reg(0)),
+            );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::LessThan => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (Convert::as_number(*acc), Convert::as_number(other)) {
-                *acc = Convert::boolean(heap, a < b);
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(Convert::boolean(heap, a < b));
                 return Flow::Next;
             }
-            let v = vm_core::cold::compare(ctx, 2, *acc, stack.reg(heap, frame_base, ops.reg(0)));
+            let v = vm_core::cold::compare(
+                ctx,
+                2,
+                acc.get(heap),
+                stack.reg(heap, frame_base, ops.reg(0)),
+            );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::LessThanOrEqual => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (Convert::as_number(*acc), Convert::as_number(other)) {
-                *acc = Convert::boolean(heap, a <= b);
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(Convert::boolean(heap, a <= b));
                 return Flow::Next;
             }
-            let v = vm_core::cold::compare(ctx, 3, *acc, stack.reg(heap, frame_base, ops.reg(0)));
+            let v = vm_core::cold::compare(
+                ctx,
+                3,
+                acc.get(heap),
+                stack.reg(heap, frame_base, ops.reg(0)),
+            );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::GreaterThan => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (Convert::as_number(*acc), Convert::as_number(other)) {
-                *acc = Convert::boolean(heap, a > b);
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(Convert::boolean(heap, a > b));
                 return Flow::Next;
             }
-            let v = vm_core::cold::compare(ctx, 4, *acc, stack.reg(heap, frame_base, ops.reg(0)));
+            let v = vm_core::cold::compare(
+                ctx,
+                4,
+                acc.get(heap),
+                stack.reg(heap, frame_base, ops.reg(0)),
+            );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::GreaterThanOrEqual => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (Convert::as_number(*acc), Convert::as_number(other)) {
-                *acc = Convert::boolean(heap, a >= b);
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                acc.store(Convert::boolean(heap, a >= b));
                 return Flow::Next;
             }
-            let v = vm_core::cold::compare(ctx, 5, *acc, stack.reg(heap, frame_base, ops.reg(0)));
+            let v = vm_core::cold::compare(
+                ctx,
+                5,
+                acc.get(heap),
+                stack.reg(heap, frame_base, ops.reg(0)),
+            );
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::CompareJump => {
@@ -2234,23 +2267,24 @@ unsafe fn step<'a>(
             let cmp = (ops.uimm(1) / 2) as u8;
             let falsy_jump = ops.uimm(1) % 2 == 1;
             let offset = ops.imm(2);
-            let b =
-                if let (Some(a), Some(b)) = (Convert::as_number(*acc), Convert::as_number(other)) {
-                    match cmp {
-                        0 | 1 => a == b,
-                        2 => a < b,
-                        3 => a <= b,
-                        4 => a > b,
-                        _ => a >= b,
-                    }
-                } else {
-                    let v = vm_core::cold::compare(ctx, cmp, *acc, other);
-                    if ctx.is_throw(v) {
-                        return Flow::Threw;
-                    }
-                    Convert::is_truthy(heap, v)
-                };
-            *acc = Convert::boolean(heap, b);
+            let b = if let (Some(a), Some(b)) =
+                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
+            {
+                match cmp {
+                    0 | 1 => a == b,
+                    2 => a < b,
+                    3 => a <= b,
+                    4 => a > b,
+                    _ => a >= b,
+                }
+            } else {
+                let v = vm_core::cold::compare(ctx, cmp, acc.get(heap), other);
+                if ctx.is_throw(v) {
+                    return Flow::Threw;
+                }
+                Convert::is_truthy(heap, v)
+            };
+            acc.store(Convert::boolean(heap, b));
             if b != falsy_jump {
                 return Flow::Jump(jump_target(pc, offset));
             }
@@ -2297,7 +2331,7 @@ unsafe fn step<'a>(
                 if let Some(r) = fast
                     && Smi::in_range(r)
                 {
-                    *acc = Smi::new(r).into_tagged();
+                    acc.store(Smi::new(r).into_tagged());
                     return Flow::Next;
                 }
             }
@@ -2311,7 +2345,7 @@ unsafe fn step<'a>(
                     if ctx.is_throw(v) {
                         return Flow::Threw;
                     }
-                    *acc = v;
+                    acc.store(v);
                     Flow::Sync
                 }
                 Opcode::SubImmediate
@@ -2335,7 +2369,7 @@ unsafe fn step<'a>(
                     if ctx.is_throw(v) {
                         return Flow::Threw;
                     }
-                    *acc = v;
+                    acc.store(v);
                     Flow::Sync
                 }
                 // bitwise/shift: Smi-only (ToInt32/ToUint32)
@@ -2353,7 +2387,7 @@ unsafe fn step<'a>(
                         Opcode::ShiftRightImmediate => a.wrapping_shr(b & 31),
                         _ => (a as u32).wrapping_shr(b & 31) as i32,
                     };
-                    *acc = Smi::new(r as i64).into_tagged();
+                    acc.store(Smi::new(r as i64).into_tagged());
                     Flow::Sync
                 }
             }
@@ -2363,7 +2397,7 @@ unsafe fn step<'a>(
             if let Some(recv) = stack.reg(heap, frame_base, ops.reg(0)).as_heap_object()
                 && let Some(v) = recv.as_ref().element_value(heap, idx)
             {
-                *acc = v;
+                acc.store(v);
                 return Flow::Sync;
             }
             let v =
@@ -2371,11 +2405,11 @@ unsafe fn step<'a>(
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }
-            *acc = v;
+            acc.store(v);
             Flow::Sync
         }
         Opcode::Throw | Opcode::ReThrow => {
-            state.set_pending_exception(*acc);
+            state.set_pending_exception(acc.get(heap));
             Flow::Threw
         }
         Opcode::Wide => unreachable!("wide prefix is consumed by the decoder"),

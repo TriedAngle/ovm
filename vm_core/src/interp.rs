@@ -173,9 +173,7 @@ impl<'a> Ctx<'a> {
         (word.raw() != heap.known().the_hole.raw()).then(|| unsafe { word.cast() })
     }
 
-    /// The accumulator parking cell: the one rooted home for the value
-    /// in flight across a safepoint poll. Park/poll/reload never nests,
-    /// so a single per-thread cell serves every frame.
+    /// The accumulator cell.
     #[inline(always)]
     pub fn acc_slot(&self) -> &Register {
         self.state().acc_slot()

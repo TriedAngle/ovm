@@ -1,0 +1,3 @@
+unstable_features = true
+# keep the one-line `slow_handler!(name |ip, regs, acc, ctx, float| { .. })` head
+skip_macro_invocations = ["slow_handler"]

@@ -240,6 +240,25 @@ impl<const STRIDE: usize> Ops<STRIDE> {
         }
     }
 
+    /// Build a cursor for a handler that serves several opcodes (or is
+    /// entered generically): the opcode is read from the instruction
+    /// rather than asserted against a literal, keeping the operand-kind
+    /// debug checks.
+    #[inline(always)]
+    fn from_ip(ip: *const u8) -> Ops<STRIDE> {
+        Ops {
+            ip,
+            #[cfg(debug_assertions)]
+            op: unsafe { Opcode::from_byte_unchecked(*ip.add(if STRIDE == 2 { 1 } else { 0 })) },
+        }
+    }
+
+    /// The instruction's opcode (skipping the `Wide` prefix).
+    #[inline(always)]
+    fn op(&self) -> Opcode {
+        unsafe { Opcode::from_byte_unchecked(*self.ip.add(if STRIDE == 2 { 1 } else { 0 })) }
+    }
+
     #[inline(always)]
     fn signed<const I: usize>(&self) -> i32 {
         #[cfg(debug_assertions)]
@@ -593,9 +612,9 @@ extern "rust-preserve-none" fn op_add<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(sum) {
             next!(Add, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
+        become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
     }
-    become slow_add(ip, regs, acc, ctx, table, roots, float)
+    become slow_add::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -630,9 +649,9 @@ extern "rust-preserve-none" fn op_sub<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(diff) {
             next!(Sub, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
+        become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
     }
-    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -667,9 +686,9 @@ extern "rust-preserve-none" fn op_mul<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(product) {
             next!(Mul, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(product))
+        become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(product))
     }
-    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -700,7 +719,7 @@ extern "rust-preserve-none" fn op_add_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(sum)
         )
     }
-    become slow_add_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_add_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -731,7 +750,7 @@ extern "rust-preserve-none" fn op_sub_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(diff)
         )
     }
-    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -753,7 +772,7 @@ extern "rust-preserve-none" fn op_inc_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(IncLoc, ip, regs, ctx, table, roots, float, v)
     }
-    become slow_inc_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_inc_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -775,7 +794,7 @@ extern "rust-preserve-none" fn op_dec_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(DecLoc, ip, regs, ctx, table, roots, float, v)
     }
-    become slow_dec_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_dec_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -803,7 +822,7 @@ extern "rust-preserve-none" fn op_equal<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a == b)
         )
     }
-    become slow_equal(ip, regs, acc, ctx, table, roots, float)
+    become slow_equal::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -831,7 +850,7 @@ extern "rust-preserve-none" fn op_less_than<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a < b)
         )
     }
-    become slow_less_than(ip, regs, acc, ctx, table, roots, float)
+    become slow_less_than::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -859,7 +878,7 @@ extern "rust-preserve-none" fn op_greater_than<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a > b)
         )
     }
-    become slow_greater_than(ip, regs, acc, ctx, table, roots, float)
+    become slow_greater_than::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1283,7 +1302,7 @@ extern "rust-preserve-none" fn op_exp<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::Exp);
     let _ = ops.signed::<0>();
-    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1321,9 +1340,9 @@ extern "rust-preserve-none" fn op_div<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(quotient) {
             next!(Div, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(quotient))
+        become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(quotient))
     }
-    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1353,7 +1372,7 @@ extern "rust-preserve-none" fn op_mod<'a, const STRIDE: usize>(
             Smi::new(a % b).into_tagged()
         )
     }
-    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1385,7 +1404,7 @@ extern "rust-preserve-none" fn op_mul_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(encoded)
         )
     }
-    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1421,7 +1440,7 @@ extern "rust-preserve-none" fn op_div_immediate<'a, const STRIDE: usize>(
             )
         }
     }
-    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1452,7 +1471,7 @@ extern "rust-preserve-none" fn op_mod_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(((bits >> 1) % imm as i64) << 1)
         )
     }
-    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1467,7 +1486,7 @@ extern "rust-preserve-none" fn op_exp_immediate<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::ExpImmediate);
     let _ = (ops.signed::<0>(), ops.signed::<1>());
-    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1501,9 +1520,9 @@ extern "rust-preserve-none" fn op_negate<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(neg) {
             next!(Negate, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(neg))
+        become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(neg))
     }
-    become slow_negate(ip, regs, acc, ctx, table, roots, float)
+    become slow_negate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1538,7 +1557,7 @@ extern "rust-preserve-none" fn op_compare_jump<'a, const STRIDE: usize>(
             next!(CompareJump, ip, regs, ctx, table, roots, float, boolean)
         }
     }
-    become slow_compare_jump(ip, regs, acc, ctx, table, roots, float)
+    become slow_compare_jump::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1615,9 +1634,9 @@ extern "rust-preserve-none" fn op_add_loc<'a, const STRIDE: usize>(
             regs.write(dst, v);
             next!(AddLoc, ip, regs, ctx, table, roots, float, v)
         }
-        become slow_box_add_loc(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
+        become slow_box_add_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
     }
-    become slow_add_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_add_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1649,9 +1668,9 @@ extern "rust-preserve-none" fn op_sub_loc<'a, const STRIDE: usize>(
             regs.write(dst, v);
             next!(SubLoc, ip, regs, ctx, table, roots, float, v)
         }
-        become slow_box_sub_loc(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
+        become slow_box_sub_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
     }
-    become slow_sub_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_sub_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1675,7 +1694,8 @@ extern "rust-preserve-none" fn op_jump_loop<'a, const STRIDE: usize>(
             state.set_pending_exception(undefined);
             threw!(acc, ip, regs, ctx, table, roots, float)
         }
-        let pc = ip as usize - ctx.code_ptr() as usize + off as usize;
+        let target = ip.wrapping_offset(off as isize);
+        let pc = target as usize - ctx.code_ptr() as usize;
         let acc = ctx.acc_slot().get(ctx.heap());
         reenter!(
             ctx,
@@ -1725,7 +1745,7 @@ extern "rust-preserve-none" fn op_load_keyed_reg<'a, const STRIDE: usize>(
             next!(LoadKeyedPropertyReg, ip, regs, ctx, table, roots, float, v)
         }
     }
-    become slow_keyed_load_reg(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_load_reg::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1761,7 +1781,7 @@ extern "rust-preserve-none" fn op_store_keyed<'a, const STRIDE: usize>(
             next!(StoreKeyedProperty, ip, regs, ctx, table, roots, float, v)
         }
     }
-    become slow_keyed_store(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_store::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1815,7 +1835,7 @@ extern "rust-preserve-none" fn op_store_keyed_no_shadow<'a, const STRIDE: usize>
             )
         }
     }
-    become slow_keyed_store_no_shadow(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_store_no_shadow::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1853,7 +1873,7 @@ extern "rust-preserve-none" fn op_load_named<'a, const STRIDE: usize>(
         }
         MonoProbe::Miss | MonoProbe::NotReceiver => {}
     }
-    become slow_named_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_named_load::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1888,7 +1908,7 @@ extern "rust-preserve-none" fn op_load_keyed<'a, const STRIDE: usize>(
             next!(LoadKeyedProperty, ip, regs, ctx, table, roots, float, v)
         }
     }
-    become slow_keyed_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_load::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1910,7 +1930,7 @@ extern "rust-preserve-none" fn op_load_element_imm<'a, const STRIDE: usize>(
     {
         next!(LoadElementImm, ip, regs, ctx, table, roots, float, v)
     }
-    become slow_keyed_load_imm(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_load_imm::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1936,7 +1956,7 @@ extern "rust-preserve-none" fn op_load_global<'a, const STRIDE: usize>(
     {
         next!(LoadGlobal, ip, regs, ctx, table, roots, float, v)
     }
-    become slow_global_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_global_load::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1962,7 +1982,7 @@ extern "rust-preserve-none" fn op_store_named<'a, const STRIDE: usize>(
     ) {
         next!(StoreNamedProperty, ip, regs, ctx, table, roots, float, acc)
     }
-    become slow_store_named(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_named::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2098,7 +2118,7 @@ extern "rust-preserve-none" fn op_create_function_context<'a, const STRIDE: usiz
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::CreateFunctionContext);
     let _ = ops.unsigned::<0>();
-    become slow_create_function_context(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_function_context::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2113,7 +2133,7 @@ extern "rust-preserve-none" fn op_create_closure<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::CreateClosure);
     let _ = ops.unsigned::<0>();
-    become slow_create_closure(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_closure::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2127,7 +2147,7 @@ extern "rust-preserve-none" fn op_create_empty_array<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::CreateEmptyArrayLiteral);
-    become slow_create_empty_array(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_empty_array::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2141,7 +2161,7 @@ extern "rust-preserve-none" fn op_create_empty_object<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::CreateEmptyObjectLiteral);
-    become slow_create_empty_object(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_empty_object::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2319,7 +2339,7 @@ extern "rust-preserve-none" fn op_less_than_or_equal<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a <= b)
         )
     }
-    become slow_less_than_or_equal(ip, regs, acc, ctx, table, roots, float)
+    become slow_less_than_or_equal::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2347,7 +2367,7 @@ extern "rust-preserve-none" fn op_greater_than_or_equal<'a, const STRIDE: usize>
             Convert::boolean(ctx.heap(), a >= b)
         )
     }
-    become slow_greater_than_or_equal(ip, regs, acc, ctx, table, roots, float)
+    become slow_greater_than_or_equal::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2361,7 +2381,7 @@ extern "rust-preserve-none" fn op_create_bare_object<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::CreateBareObjectLiteral);
-    become slow_create_bare_object(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_bare_object::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2376,7 +2396,7 @@ extern "rust-preserve-none" fn op_create_block_context<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::CreateBlockContext);
     let _ = ops.unsigned::<0>();
-    become slow_create_block_context(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_block_context::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2402,7 +2422,7 @@ extern "rust-preserve-none" fn op_load_global_fast<'a, const STRIDE: usize>(
     {
         next!(LoadGlobalFast, ip, regs, ctx, table, roots, float, v)
     }
-    become slow_global_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_global_load::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2417,7 +2437,7 @@ extern "rust-preserve-none" fn op_load_global_nothrow<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::LoadGlobalNoThrow);
     let _ = (ops.unsigned::<0>(), ops.unsigned::<1>());
-    become slow_global_load_nothrow(ip, regs, acc, ctx, table, roots, float)
+    become slow_global_load_nothrow::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2432,7 +2452,7 @@ extern "rust-preserve-none" fn op_store_global<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::StoreGlobal);
     let _ = (ops.unsigned::<0>(), ops.unsigned::<1>());
-    become slow_store_global(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_global::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2447,7 +2467,7 @@ extern "rust-preserve-none" fn op_store_named_no_shadow<'a, const STRIDE: usize>
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::StoreNamedPropertyNoShadow);
     let _ = (ops.signed::<0>(), ops.unsigned::<1>(), ops.unsigned::<2>());
-    become slow_store_named_no_shadow(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_named_no_shadow::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2462,7 +2482,7 @@ extern "rust-preserve-none" fn op_store_named_no_shadow_fast<'a, const STRIDE: u
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::StoreNamedPropertyNoShadowFast);
     let _ = (ops.signed::<0>(), ops.unsigned::<1>(), ops.unsigned::<2>());
-    become slow_store_named_no_shadow(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_named_no_shadow::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2477,7 +2497,7 @@ extern "rust-preserve-none" fn op_instance_of<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::InstanceOf);
     let _ = ops.signed::<0>();
-    become slow_instance_of(ip, regs, acc, ctx, table, roots, float)
+    become slow_instance_of::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2507,7 +2527,7 @@ extern "rust-preserve-none" fn op_add_parent<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::AddParent);
     let _ = (ops.signed::<0>(), ops.unsigned::<1>());
-    become slow_add_parent(ip, regs, acc, ctx, table, roots, float)
+    become slow_add_parent::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2545,7 +2565,7 @@ extern "rust-preserve-none" fn op_load_named_fast<'a, const STRIDE: usize>(
         }
         MonoProbe::Miss | MonoProbe::NotReceiver => {}
     }
-    become slow_named_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_named_load::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2633,7 +2653,9 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become slow_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => {
+            become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
+        }
     }
 }
 
@@ -2692,7 +2714,9 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become slow_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => {
+            become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
+        }
     }
 }
 
@@ -2752,7 +2776,9 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become slow_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => {
+            become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
+        }
     }
 }
 
@@ -2810,7 +2836,7 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
         MethodCall::Proxy => {
-            become slow_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
+            become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
@@ -2870,7 +2896,7 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
         MethodCall::Proxy => {
-            become slow_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
+            become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
@@ -2931,7 +2957,7 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
         MethodCall::Proxy => {
-            become slow_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
+            become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
@@ -2991,7 +3017,9 @@ extern "rust-preserve-none" fn op_call_ic<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become slow_proxy_apply(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => {
+            become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
+        }
     }
 }
 
@@ -3015,7 +3043,7 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type),
         Some(CallTarget::Proxy(_)) => {
-            become slow_proxy_apply(ip, regs, acc, ctx, table, roots, float)
+            become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
         Some(CallTarget::Intrinsic(i)) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
@@ -3145,7 +3173,7 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
         }
         ConstructStart::Slow => {
             regs.write(out_r, ctx.undefined_word());
-            become slow_construct(ip, regs, acc, ctx, table, roots, float)
+            become slow_construct::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
