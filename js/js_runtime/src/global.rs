@@ -3,7 +3,10 @@
 use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::materialize::Materialize;
-use vm_core::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
+use vm_core::{
+    Context, ContextState, Convert, DenseString, Errors, Handle, HandleSlice, Heap, Smi, Tagged,
+    VM, Value, VmError,
+};
 use vm_core::{raise_runtime, rt_try};
 
 pub fn eval_runtime<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
@@ -97,24 +100,94 @@ pub fn print<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, 
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    state.handle_scope(|scope| {
-        if let Some(arg) = args.get(1) {
-            let s = match Convert::to_string(heap, &scope, arg).map(|v| v.raw()) {
-                Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-                Err(err) => return raise_runtime(vm, heap, state, err),
-            };
-            let s = s.raw();
+    let Some(arg) = args.get(1) else {
+        println!();
+        return heap.known().undefined.as_tagged(heap).erase();
+    };
+    let text = match Object::to_string(vm, heap, state, arg) {
+        Ok(Some(s)) => {
+            let word = s.raw();
             // Safety: fresh string word, no allocation since the read.
-            let text = unsafe { s.assume_valid(heap) }
+            unsafe { word.assume_valid(heap) }
                 .get_as::<DenseString>()
                 .map(|s| s.to_rust_string(heap))
-                .unwrap_or_default();
-            println!("{text}");
-        } else {
-            println!();
+                .unwrap_or_default()
         }
-        heap.known().undefined.as_tagged(heap).erase()
-    })
+        Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+        Err(err) => return raise_runtime(vm, heap, state, err),
+    };
+    println!("{text}");
+    heap.known().undefined.as_tagged(heap).erase()
+}
+
+/// The inline half of a `console.log` argument read: Smis, strings, and the
+/// singleton primitives stringify with no coercion and no allocation.
+#[inline]
+fn primitive_to_string(heap: &Heap, v: Tagged<'_, Value>) -> Option<String> {
+    let known = heap.known();
+    if let Some(smi) = Smi::decode(v.raw()) {
+        return Some(smi.value().to_string());
+    }
+    if v == known.undefined.as_tagged(heap) {
+        return Some("undefined".to_string());
+    }
+    if v == known.null.as_tagged(heap) {
+        return Some("null".to_string());
+    }
+    if v == known.true_object.as_tagged(heap) {
+        return Some("true".to_string());
+    }
+    if v == known.false_object.as_tagged(heap) {
+        return Some("false".to_string());
+    }
+    v.get_as::<DenseString>().map(|s| s.to_rust_string(heap))
+}
+
+/// The cold half: full ToString for boxed numbers, objects, and symbols.
+/// `Ok(None)` means user code threw (the pending exception holds the cause).
+#[cold]
+#[inline(never)]
+fn console_arg_cold(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    arg: Handle<'_, Value>,
+) -> Result<Option<String>, VmError> {
+    let Some(s) = Object::to_string(vm, heap, state, arg)? else {
+        return Ok(None);
+    };
+    let word = s.raw();
+    // Safety: fresh string word, no allocation since the read.
+    let text = unsafe { word.assume_valid(heap) }
+        .get_as::<DenseString>()
+        .map(|s| s.to_rust_string(heap))
+        .unwrap_or_default();
+    Ok(Some(text))
+}
+
+/// `console.log(...args)`: ToString every argument, join with single
+/// spaces, and write the result to stdout followed by a newline (Node's
+/// single-line formatting; a shell convenience, not an ES builtin).
+pub fn console_log<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let mut parts: Vec<String> = Vec::with_capacity(args.len().saturating_sub(1));
+    for i in 1..args.len() {
+        // Safety: `i < args.len()`, so the slot exists.
+        let arg = args.get(i).expect("in-bounds console.log argument");
+        if let Some(text) = primitive_to_string(heap, arg.as_tagged(heap)) {
+            parts.push(text);
+            continue;
+        }
+        match console_arg_cold(vm, heap, state, arg) {
+            Ok(Some(text)) => parts.push(text),
+            Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        }
+    }
+    println!("{}", parts.join(" "));
+    heap.known().undefined.as_tagged(heap).erase()
 }
 
 /// `performance.now()`: fractional milliseconds since the Unix epoch

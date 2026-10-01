@@ -2,7 +2,10 @@
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
 use vm_core::RuntimeContext;
-use vm_core::{Convert, HandleSlice, Object, Smi, Tagged, Value, VmError};
+use vm_core::{
+    ContextState, Convert, DenseString, Handle, HandleSlice, Heap, Object, Smi, Tagged, VM, Value,
+    VmError,
+};
 use vm_core::{raise_runtime, rt_try};
 
 /// `Array(...)`: call and construct behave the same (ES 23.1.1.1). No
@@ -231,6 +234,105 @@ pub fn array_iterator_symbol_iterator<'a>(
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
     arg.as_tagged(heap)
+}
+
+/// `Array.prototype.join(separator)` (ES 23.1.3.15): ToString each element
+/// in index order, separated by `separator` (default `","`). Holes,
+/// `undefined`, and `null` render as the empty string.
+pub fn array_join<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let Some(receiver) = args.get(0) else {
+        return raise_runtime(vm, heap, state, VmError::Arity);
+    };
+    join_impl(vm, heap, state, receiver, args.get(1))
+}
+
+/// `Array.prototype.toString` (ES 23.1.3.37): `join` with the default
+/// separator; any arguments are ignored.
+pub fn array_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    let Some(receiver) = args.get(0) else {
+        return raise_runtime(vm, heap, state, VmError::Arity);
+    };
+    join_impl(vm, heap, state, receiver, None)
+}
+
+fn join_impl<'a>(
+    vm: &'a VM,
+    heap: &'a mut Heap,
+    state: &'a ContextState,
+    receiver: Handle<'_, Value>,
+    separator: Option<Handle<'_, Value>>,
+) -> Tagged<'a, Value> {
+    state.handle_scope(|scope| {
+        let is_array = receiver
+            .as_tagged(heap)
+            .as_heap_object()
+            .is_some_and(|o| o.as_ref().is_array(heap));
+        if !is_array {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        }
+        // separator = ToString(separator); absent/undefined defaults to ","
+        let sep = match separator {
+            Some(h) if h.as_tagged(heap) != heap.known().undefined.as_tagged(heap) => {
+                match Object::to_string(vm, heap, state, h) {
+                    Ok(Some(s)) => {
+                        let word = s.raw();
+                        // Safety: fresh string word, no allocation since the read.
+                        unsafe { word.assume_valid(heap) }
+                            .get_as::<DenseString>()
+                            .map(|d| d.to_rust_string(heap))
+                            .unwrap_or_default()
+                    }
+                    Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+                    Err(err) => return raise_runtime(vm, heap, state, err),
+                }
+            }
+            _ => ",".to_string(),
+        };
+        // length is read once, then elements are Get in index order
+        let len = receiver
+            .as_tagged(heap)
+            .as_heap_object()
+            .map(|o| o.as_ref().length())
+            .unwrap_or(0);
+        let mut out = String::new();
+        for i in 0..len {
+            if i > 0 {
+                out.push_str(&sep);
+            }
+            let Some(v) = receiver
+                .as_tagged(heap)
+                .as_heap_object()
+                .and_then(|o| o.as_ref().element_value(heap, i))
+            else {
+                continue;
+            };
+            if v == heap.known().undefined.as_tagged(heap) || v == heap.known().null.as_tagged(heap)
+            {
+                continue;
+            }
+            let h = scope.handle(v);
+            match Object::to_string(vm, heap, state, h) {
+                Ok(Some(s)) => {
+                    let word = s.raw();
+                    // Safety: fresh string word, no allocation since the read.
+                    if let Some(d) = unsafe { word.assume_valid(heap) }.get_as::<DenseString>() {
+                        out.push_str(&d.to_rust_string(heap));
+                    }
+                }
+                Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+                Err(err) => return raise_runtime(vm, heap, state, err),
+            }
+        }
+        DenseString::from_utf8(heap, &scope, &out)
+            .as_tagged(heap)
+            .erase()
+    })
 }
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).

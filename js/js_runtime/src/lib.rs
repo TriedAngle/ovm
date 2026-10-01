@@ -20,7 +20,7 @@ pub mod symbol;
 
 use array::{
     array_constructor, array_is_array, array_iterator_next, array_iterator_symbol_iterator,
-    array_pop, array_push, array_values,
+    array_join, array_pop, array_push, array_to_string, array_values,
 };
 use boolean::{boolean_constructor, boolean_to_string, boolean_value_of};
 use date::{date_constructor, date_now, date_to_string, date_value_of};
@@ -31,8 +31,11 @@ use function::{
     BIND_PRELUDE, function_apply, function_bind, function_call, function_constructor,
     function_to_string,
 };
-use global::{eval_runtime, is_nan, performance_now, print};
-use math::{math_log, math_pow, math_sqrt};
+use global::{console_log, eval_runtime, is_nan, performance_now, print};
+use math::{
+    math_abs, math_ceil, math_floor, math_log, math_max, math_min, math_pow, math_random,
+    math_round, math_sqrt, math_trunc,
+};
 use number::{
     number_constructor, number_to_fixed, number_to_precision, number_to_string, number_value_of,
 };
@@ -141,6 +144,17 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
         object_seal: vm.register_runtime(object_seal),
         object_freeze: vm.register_runtime(object_freeze),
         math_sqrt: vm.register_runtime(math_sqrt),
+        math_abs: vm.register_runtime(math_abs),
+        math_floor: vm.register_runtime(math_floor),
+        math_ceil: vm.register_runtime(math_ceil),
+        math_trunc: vm.register_runtime(math_trunc),
+        math_round: vm.register_runtime(math_round),
+        math_min: vm.register_runtime(math_min),
+        math_max: vm.register_runtime(math_max),
+        math_random: vm.register_runtime(math_random),
+        console_log: vm.register_runtime(console_log),
+        array_join: vm.register_runtime(array_join),
+        array_to_string: vm.register_runtime(array_to_string),
     }
 }
 
@@ -202,6 +216,17 @@ pub struct BuiltinIndices {
     pub object_seal: RuntimeIndex,
     pub object_freeze: RuntimeIndex,
     pub math_sqrt: RuntimeIndex,
+    pub math_abs: RuntimeIndex,
+    pub math_floor: RuntimeIndex,
+    pub math_ceil: RuntimeIndex,
+    pub math_trunc: RuntimeIndex,
+    pub math_round: RuntimeIndex,
+    pub math_min: RuntimeIndex,
+    pub math_max: RuntimeIndex,
+    pub math_random: RuntimeIndex,
+    pub console_log: RuntimeIndex,
+    pub array_join: RuntimeIndex,
+    pub array_to_string: RuntimeIndex,
 }
 
 /// Build the builtin objects and install them on the global object.
@@ -636,6 +661,14 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
 
         install_method(thread, &scope, array_prototype, "push", idx.array_push)?;
         install_method(thread, &scope, array_prototype, "pop", idx.array_pop)?;
+        install_method(thread, &scope, array_prototype, "join", idx.array_join)?;
+        install_method(
+            thread,
+            &scope,
+            array_prototype,
+            "toString",
+            idx.array_to_string,
+        )?;
 
         // ---- Date -----------------------------------------------------------------
         let date_fn = make_runtime_function(thread, &scope, idx.date)?;
@@ -828,6 +861,14 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(thread, &scope, math_object, "sqrt", idx.math_sqrt)?;
         install_method(thread, &scope, math_object, "log", idx.math_log)?;
         install_method(thread, &scope, math_object, "pow", idx.math_pow)?;
+        install_method(thread, &scope, math_object, "abs", idx.math_abs)?;
+        install_method(thread, &scope, math_object, "floor", idx.math_floor)?;
+        install_method(thread, &scope, math_object, "ceil", idx.math_ceil)?;
+        install_method(thread, &scope, math_object, "trunc", idx.math_trunc)?;
+        install_method(thread, &scope, math_object, "round", idx.math_round)?;
+        install_method(thread, &scope, math_object, "min", idx.math_min)?;
+        install_method(thread, &scope, math_object, "max", idx.math_max)?;
+        install_method(thread, &scope, math_object, "random", idx.math_random)?;
         for (name, value) in [
             ("E", std::f64::consts::E),
             ("LN10", std::f64::consts::LN_10),
@@ -859,6 +900,31 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             global,
             math_name,
             PropertyDescriptor::data(math_object.erase()),
+        )?;
+
+        // ---- console (namespace object; shell convenience, not ES) -----------
+        let console_object = {
+            let map = thread.heap().allocate_handle::<Map>(
+                MapInit {
+                    kind: MapKind::OBJECT.union(MapKind::EXTENDABLE),
+                    value_slot_count: 0,
+                    descriptors: &[],
+                    prototype: object_prototype.erase(),
+                },
+                &scope,
+            );
+            roots.create_handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY))
+        };
+        install_plain_method(thread, &scope, console_object, "log", idx.console_log)?;
+        let console_name = thread.intern(&scope, "console");
+        // Safety: fresh interned word, rooted below before the define.
+        let console_name = scope.handle(console_name.as_tagged(&*thread.heap()));
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            global,
+            console_name,
+            PropertyDescriptor::data(console_object.erase()),
         )?;
 
         let is_nan_fn = make_runtime_function(thread, &scope, idx.is_nan)?;

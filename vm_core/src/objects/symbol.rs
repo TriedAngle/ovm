@@ -20,6 +20,13 @@ impl Symbol {
         let backing = heap.allocate_handle::<FixedByteArray>(description, scope);
         heap.allocate_handle::<Symbol>(backing, scope)
     }
+
+    /// The symbol's `[[Description]]` bytes; empty when it was created
+    /// without one (`Symbol()`). `SymbolDescriptiveString` wraps these as
+    /// `"Symbol(" + description + ")"`.
+    pub fn description<'a>(&'a self, heap: &'a Heap) -> &'a [u8] {
+        self.backing.get(heap).as_ref().as_slice()
+    }
 }
 
 impl HeapObject for Symbol {

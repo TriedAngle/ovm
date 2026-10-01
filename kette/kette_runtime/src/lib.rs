@@ -1,7 +1,7 @@
 use vm_core::raise_runtime;
 use vm_core::runtime_api::install_method;
 use vm_core::{
-    Convert, DenseString, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, Runtime,
+    DenseString, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, Runtime,
     RuntimeContext, Tagged, VM, Value, VmError,
 };
 
@@ -47,24 +47,22 @@ fn console_print<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    state.handle_scope(|scope| -> Tagged<'a, Value> {
-        match args.get(1) {
-            Some(v) => {
-                let text = match Convert::to_string(heap, &scope, v).map(|t| t.raw()) {
-                    Ok(t) => t,
-                    Err(err) => return raise_runtime(vm, heap, state, err),
-                };
-                // Safety: fresh anchored word, no allocation since.
-                let text = unsafe { Tagged::<Value>::from_value_unchecked(text) }
-                    .get_as::<DenseString>()
-                    .map(|s| s.to_rust_string(heap));
-                let Some(text) = text else {
-                    return raise_runtime(vm, heap, state, VmError::Type);
-                };
-                println!("{text}");
-            }
-            None => println!(),
+    let Some(v) = args.get(1) else {
+        println!();
+        return heap.known().undefined.as_tagged(heap).erase();
+    };
+    let text = match Object::to_string(vm, heap, state, v) {
+        Ok(Some(t)) => {
+            let word = t.raw();
+            // Safety: fresh string word, no allocation since the read.
+            unsafe { word.assume_valid(heap) }
+                .get_as::<DenseString>()
+                .map(|s| s.to_rust_string(heap))
+                .unwrap_or_default()
         }
-        heap.known().undefined.as_tagged(heap).erase()
-    })
+        Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+        Err(err) => return raise_runtime(vm, heap, state, err),
+    };
+    println!("{text}");
+    heap.known().undefined.as_tagged(heap).erase()
 }

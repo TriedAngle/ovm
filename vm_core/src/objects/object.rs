@@ -587,6 +587,30 @@ impl Object {
         })
     }
 
+    /// ToString (ES 7.1.17): primitives stringify directly; an object is
+    /// first ToPrimitive'd with hint String (`toString`, then `valueOf`),
+    /// then the resulting primitive is stringified. `None` means user code
+    /// threw (pending exception holds it); a Symbol argument is a TypeError.
+    pub fn to_string<'a>(
+        vm: &VM,
+        heap: &'a mut Heap,
+        state: &ContextState,
+        value: Handle<'_, Value>,
+    ) -> Result<Option<Tagged<'a, Value>>, VmError> {
+        state.handle_scope(|scope| {
+            let primitive = if Convert::is_primitive(heap, value.as_tagged(heap)) {
+                value
+            } else {
+                match Self::to_primitive(vm, heap, state, value, Hint::String)? {
+                    Coercion::Threw => return Ok(None),
+                    Coercion::Value(v) => scope.handle(v),
+                }
+            };
+            let s = scope.handle(Convert::to_string(heap, &scope, primitive)?);
+            Ok(Some(s.as_tagged(heap)))
+        })
+    }
+
     pub fn numeric_op<'a>(
         vm: &'a VM,
         heap: &'a mut Heap,
