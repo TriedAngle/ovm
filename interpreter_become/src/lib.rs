@@ -3335,8 +3335,7 @@ extern "rust-preserve-none" fn call_trampoline<'a>(
     roots: RootsArg<'a>,
     float: FloatReg,
 ) -> Tagged<'a, Value> {
-    // the pushed callee frame is the current frame
-    let fault_pc = fault_ip as usize - ctx.code_ptr() as usize;
+    let call_pc = fault_ip as usize - ctx.code_ptr() as usize;
     let frame_base = ctx.frame_base();
     let probe = 0u8;
     if ctx.stack_overflowed() {
@@ -3348,7 +3347,7 @@ extern "rust-preserve-none" fn call_trampoline<'a>(
         let v = ctx.exception_word();
         let code = ctx.code_ptr();
         become resume(
-            unsafe { code.add(fault_pc) },
+            unsafe { code.add(call_pc) },
             unsafe { Regs::new(core::ptr::null_mut()) },
             v,
             ctx,
@@ -3369,8 +3368,9 @@ extern "rust-preserve-none" fn call_trampoline<'a>(
     let caller = ctx.stack().pop_frame(frame_base);
     ctx.set_frame_base(caller.base);
     if ctx.is_throw(acc) {
+        let caller_code = ctx.code_ptr();
         become throw_dispatch(
-            unsafe { code.add(fault_pc) },
+            unsafe { caller_code.add(call_pc) },
             unsafe { Regs::new(core::ptr::null_mut()) },
             acc,
             ctx,
