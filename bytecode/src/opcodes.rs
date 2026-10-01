@@ -117,7 +117,7 @@ macro_rules! define_opcodes {
             /// Which table each operand addresses, parallel to
             /// [`Opcode::operands`] (non-`Index` operands are
             /// [`IndexKind::Unchecked`]).
-            pub(crate) const fn index_kinds(self) -> &'static [IndexKind] {
+            pub const fn index_kinds(self) -> &'static [IndexKind] {
                 match self {
                     $(Self::$name => define_opcodes!(@ikinds $($($index),*)?)),*
                 }

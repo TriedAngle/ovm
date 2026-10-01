@@ -5,19 +5,20 @@
 #![allow(unused_macros, unused_unsafe, unused_variables)]
 
 use bytecode::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode};
-use vm_core::StoreSemantics;
 use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe};
 use vm_core::proxy::Proxy;
 use vm_core::{
-    CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextInit, ContextState, Convert,
-    Ctx, ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter,
-    Intrinsic, Object, Register, RuntimeContext, RuntimeIndex, ScopeInfo, Smi, Tagged, VM, Value,
-    VmError, spread_apply_args,
+    CallTarget, CallableInfoObject, Coercion, Compare, Context, ContextState, Convert, Ctx,
+    ExecuteFn, FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter,
+    Intrinsic, Object, Register, RuntimeContext, RuntimeIndex, Smi, Tagged, VM, Value, VmError,
+    spread_apply_args,
 };
 
 pub struct BecomeInterpreter;
 
-/// The frame's register window: signed indices (negative = parameters).
+/// The frame's register window: signed indices are anchor-relative
+/// slot offsets (negative = locals below the frame header, positive =
+/// parameters above it, receiver = 0).
 #[derive(Clone, Copy)]
 pub struct Regs(*mut Register);
 
@@ -159,6 +160,10 @@ use std::marker::PhantomData;
 
 use vm_core::bootstrap::WellKnown;
 
+mod slow;
+
+use slow::*;
+
 pub struct HandlerTable([Handler; 256]);
 
 const fn star_lookahead(op: Opcode) -> bool {
@@ -206,17 +211,6 @@ const fn star_lookahead(op: Opcode) -> bool {
             | Opcode::AddLoc
             | Opcode::SubLoc
     )
-}
-
-macro_rules! cold_try {
-    ($ctx:ident, $e:expr) => {
-        match $e {
-            Ok(v) => v,
-            // the sentinel VALUE flows on to the caller's `become resume`,
-            // which routes it into `throw_dispatch`
-            Err(err) => unsafe { $ctx.raise_tag(err) },
-        }
-    };
 }
 
 // Plain-fn handlers using a const-indexed operand cursor and canonical
@@ -346,7 +340,7 @@ macro_rules! next {
     }};
 }
 
-macro_rules! cold_start {
+macro_rules! slow_start {
     ($ip:ident, $regs:ident, $acc:ident, $ctx:ident, $t:ident, $k:ident, $f:ident, $e:expr) => {
         match $e {
             Ok(m) => m,
@@ -599,9 +593,9 @@ extern "rust-preserve-none" fn op_add<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(sum) {
             next!(Add, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become cold_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
+        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
     }
-    become cold_add(ip, regs, acc, ctx, table, roots, float)
+    become slow_add(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -636,9 +630,9 @@ extern "rust-preserve-none" fn op_sub<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(diff) {
             next!(Sub, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become cold_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
+        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
     }
-    become cold_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -673,9 +667,9 @@ extern "rust-preserve-none" fn op_mul<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(product) {
             next!(Mul, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become cold_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(product))
+        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(product))
     }
-    become cold_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -706,7 +700,7 @@ extern "rust-preserve-none" fn op_add_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(sum)
         )
     }
-    become cold_add_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_add_immediate(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -737,7 +731,7 @@ extern "rust-preserve-none" fn op_sub_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(diff)
         )
     }
-    become cold_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -759,7 +753,7 @@ extern "rust-preserve-none" fn op_inc_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(IncLoc, ip, regs, ctx, table, roots, float, v)
     }
-    become cold_inc_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_inc_loc(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -781,7 +775,7 @@ extern "rust-preserve-none" fn op_dec_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(DecLoc, ip, regs, ctx, table, roots, float, v)
     }
-    become cold_dec_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_dec_loc(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -809,7 +803,7 @@ extern "rust-preserve-none" fn op_equal<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a == b)
         )
     }
-    become cold_equal(ip, regs, acc, ctx, table, roots, float)
+    become slow_equal(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -837,7 +831,7 @@ extern "rust-preserve-none" fn op_less_than<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a < b)
         )
     }
-    become cold_less_than(ip, regs, acc, ctx, table, roots, float)
+    become slow_less_than(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -865,7 +859,7 @@ extern "rust-preserve-none" fn op_greater_than<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a > b)
         )
     }
-    become cold_greater_than(ip, regs, acc, ctx, table, roots, float)
+    become slow_greater_than(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1293,7 +1287,7 @@ extern "rust-preserve-none" fn op_exp<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::Exp);
     let _ = ops.signed::<0>();
-    become cold_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1331,9 +1325,9 @@ extern "rust-preserve-none" fn op_div<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(quotient) {
             next!(Div, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become cold_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(quotient))
+        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(quotient))
     }
-    become cold_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1363,7 +1357,7 @@ extern "rust-preserve-none" fn op_mod<'a, const STRIDE: usize>(
             Smi::new(a % b).into_tagged()
         )
     }
-    become cold_numeric(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1395,7 +1389,7 @@ extern "rust-preserve-none" fn op_mul_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(encoded)
         )
     }
-    become cold_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1431,7 +1425,7 @@ extern "rust-preserve-none" fn op_div_immediate<'a, const STRIDE: usize>(
             )
         }
     }
-    become cold_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1462,7 +1456,7 @@ extern "rust-preserve-none" fn op_mod_immediate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(((bits >> 1) % imm as i64) << 1)
         )
     }
-    become cold_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1477,7 +1471,7 @@ extern "rust-preserve-none" fn op_exp_immediate<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::ExpImmediate);
     let _ = (ops.signed::<0>(), ops.signed::<1>());
-    become cold_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
+    become slow_numeric_immediate(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1511,9 +1505,9 @@ extern "rust-preserve-none" fn op_negate<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(neg) {
             next!(Negate, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
-        become cold_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(neg))
+        become slow_box_number(ip, regs, acc, ctx, table, roots, FloatReg::new(neg))
     }
-    become cold_negate(ip, regs, acc, ctx, table, roots, float)
+    become slow_negate(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1548,7 +1542,7 @@ extern "rust-preserve-none" fn op_compare_jump<'a, const STRIDE: usize>(
             next!(CompareJump, ip, regs, ctx, table, roots, float, boolean)
         }
     }
-    become cold_compare_jump(ip, regs, acc, ctx, table, roots, float)
+    become slow_compare_jump(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1625,9 +1619,9 @@ extern "rust-preserve-none" fn op_add_loc<'a, const STRIDE: usize>(
             regs.write(dst, v);
             next!(AddLoc, ip, regs, ctx, table, roots, float, v)
         }
-        become cold_box_add_loc(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
+        become slow_box_add_loc(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
     }
-    become cold_add_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_add_loc(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1659,9 +1653,9 @@ extern "rust-preserve-none" fn op_sub_loc<'a, const STRIDE: usize>(
             regs.write(dst, v);
             next!(SubLoc, ip, regs, ctx, table, roots, float, v)
         }
-        become cold_box_sub_loc(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
+        become slow_box_sub_loc(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
     }
-    become cold_sub_loc(ip, regs, acc, ctx, table, roots, float)
+    become slow_sub_loc(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1735,7 +1729,7 @@ extern "rust-preserve-none" fn op_load_keyed_reg<'a, const STRIDE: usize>(
             next!(LoadKeyedPropertyReg, ip, regs, ctx, table, roots, float, v)
         }
     }
-    become cold_keyed_load_reg(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_load_reg(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1771,7 +1765,7 @@ extern "rust-preserve-none" fn op_store_keyed<'a, const STRIDE: usize>(
             next!(StoreKeyedProperty, ip, regs, ctx, table, roots, float, v)
         }
     }
-    become cold_keyed_store(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_store(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1825,7 +1819,7 @@ extern "rust-preserve-none" fn op_store_keyed_no_shadow<'a, const STRIDE: usize>
             )
         }
     }
-    become cold_keyed_store_no_shadow(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_store_no_shadow(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1863,7 +1857,7 @@ extern "rust-preserve-none" fn op_load_named<'a, const STRIDE: usize>(
         }
         MonoProbe::Miss | MonoProbe::NotReceiver => {}
     }
-    become cold_named_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_named_load(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1898,7 +1892,7 @@ extern "rust-preserve-none" fn op_load_keyed<'a, const STRIDE: usize>(
             next!(LoadKeyedProperty, ip, regs, ctx, table, roots, float, v)
         }
     }
-    become cold_keyed_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_load(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1920,7 +1914,7 @@ extern "rust-preserve-none" fn op_load_element_imm<'a, const STRIDE: usize>(
     {
         next!(LoadElementImm, ip, regs, ctx, table, roots, float, v)
     }
-    become cold_keyed_load_imm(ip, regs, acc, ctx, table, roots, float)
+    become slow_keyed_load_imm(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1946,7 +1940,7 @@ extern "rust-preserve-none" fn op_load_global<'a, const STRIDE: usize>(
     {
         next!(LoadGlobal, ip, regs, ctx, table, roots, float, v)
     }
-    become cold_global_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_global_load(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -1972,7 +1966,7 @@ extern "rust-preserve-none" fn op_store_named<'a, const STRIDE: usize>(
     ) {
         next!(StoreNamedProperty, ip, regs, ctx, table, roots, float, acc)
     }
-    become cold_store_named(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_named(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2118,7 +2112,7 @@ extern "rust-preserve-none" fn op_create_function_context<'a, const STRIDE: usiz
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::CreateFunctionContext);
     let _ = ops.unsigned::<0>();
-    become cold_create_function_context(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_function_context(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2133,7 +2127,7 @@ extern "rust-preserve-none" fn op_create_closure<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::CreateClosure);
     let _ = ops.unsigned::<0>();
-    become cold_create_closure(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_closure(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2147,7 +2141,7 @@ extern "rust-preserve-none" fn op_create_empty_array<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::CreateEmptyArrayLiteral);
-    become cold_create_empty_array(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_empty_array(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2161,7 +2155,7 @@ extern "rust-preserve-none" fn op_create_empty_object<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::CreateEmptyObjectLiteral);
-    become cold_create_empty_object(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_empty_object(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2336,7 +2330,7 @@ extern "rust-preserve-none" fn op_less_than_or_equal<'a, const STRIDE: usize>(
             Convert::boolean(ctx.heap(), a <= b)
         )
     }
-    become cold_less_than_or_equal(ip, regs, acc, ctx, table, roots, float)
+    become slow_less_than_or_equal(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2364,7 +2358,7 @@ extern "rust-preserve-none" fn op_greater_than_or_equal<'a, const STRIDE: usize>
             Convert::boolean(ctx.heap(), a >= b)
         )
     }
-    become cold_greater_than_or_equal(ip, regs, acc, ctx, table, roots, float)
+    become slow_greater_than_or_equal(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2378,7 +2372,7 @@ extern "rust-preserve-none" fn op_create_bare_object<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::CreateBareObjectLiteral);
-    become cold_create_bare_object(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_bare_object(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2393,7 +2387,7 @@ extern "rust-preserve-none" fn op_create_block_context<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::CreateBlockContext);
     let _ = ops.unsigned::<0>();
-    become cold_create_block_context(ip, regs, acc, ctx, table, roots, float)
+    become slow_create_block_context(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2419,7 +2413,7 @@ extern "rust-preserve-none" fn op_load_global_fast<'a, const STRIDE: usize>(
     {
         next!(LoadGlobalFast, ip, regs, ctx, table, roots, float, v)
     }
-    become cold_global_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_global_load(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2434,7 +2428,7 @@ extern "rust-preserve-none" fn op_load_global_nothrow<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::LoadGlobalNoThrow);
     let _ = (ops.unsigned::<0>(), ops.unsigned::<1>());
-    become cold_global_load_nothrow(ip, regs, acc, ctx, table, roots, float)
+    become slow_global_load_nothrow(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2449,7 +2443,7 @@ extern "rust-preserve-none" fn op_store_global<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::StoreGlobal);
     let _ = (ops.unsigned::<0>(), ops.unsigned::<1>());
-    become cold_store_global(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_global(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2464,7 +2458,7 @@ extern "rust-preserve-none" fn op_store_named_no_shadow<'a, const STRIDE: usize>
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::StoreNamedPropertyNoShadow);
     let _ = (ops.signed::<0>(), ops.unsigned::<1>(), ops.unsigned::<2>());
-    become cold_store_named_no_shadow(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_named_no_shadow(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2479,7 +2473,7 @@ extern "rust-preserve-none" fn op_store_named_no_shadow_fast<'a, const STRIDE: u
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::StoreNamedPropertyNoShadowFast);
     let _ = (ops.signed::<0>(), ops.unsigned::<1>(), ops.unsigned::<2>());
-    become cold_store_named_no_shadow(ip, regs, acc, ctx, table, roots, float)
+    become slow_store_named_no_shadow(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2494,7 +2488,7 @@ extern "rust-preserve-none" fn op_instance_of<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::InstanceOf);
     let _ = ops.signed::<0>();
-    become cold_instance_of(ip, regs, acc, ctx, table, roots, float)
+    become slow_instance_of(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2524,7 +2518,7 @@ extern "rust-preserve-none" fn op_add_parent<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::AddParent);
     let _ = (ops.signed::<0>(), ops.unsigned::<1>());
-    become cold_add_parent(ip, regs, acc, ctx, table, roots, float)
+    become slow_add_parent(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2562,7 +2556,7 @@ extern "rust-preserve-none" fn op_load_named_fast<'a, const STRIDE: usize>(
         }
         MonoProbe::Miss | MonoProbe::NotReceiver => {}
     }
-    become cold_named_load(ip, regs, acc, ctx, table, roots, float)
+    become slow_named_load(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -2614,7 +2608,7 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
     let recv = ops.signed::<1>();
     let fb = ops.unsigned::<2>();
     let callee_word = regs.read(callee, ctx);
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -2651,7 +2645,7 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become cold_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => become slow_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
     }
 }
 
@@ -2673,7 +2667,7 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
     let arg0 = ops.signed::<2>();
     let fb = ops.unsigned::<3>();
     let callee_word = regs.read(callee, ctx);
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -2710,7 +2704,7 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become cold_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => become slow_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
     }
 }
 
@@ -2733,7 +2727,7 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
     let arg1 = ops.signed::<3>();
     let fb = ops.unsigned::<4>();
     let callee_word = regs.read(callee, ctx);
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -2770,7 +2764,7 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become cold_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => become slow_call_method_proxy(ip, regs, acc, ctx, table, roots, float),
     }
 }
 
@@ -2790,7 +2784,7 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
     let callee = ops.signed::<0>();
     let fb = ops.unsigned::<1>();
     let callee_word = regs.read(callee, ctx);
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -2828,7 +2822,7 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
         MethodCall::Proxy => {
-            become cold_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
+            become slow_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
@@ -2850,7 +2844,7 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
     let arg0 = ops.signed::<1>();
     let fb = ops.unsigned::<2>();
     let callee_word = regs.read(callee, ctx);
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -2888,7 +2882,7 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
         MethodCall::Proxy => {
-            become cold_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
+            become slow_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
@@ -2911,7 +2905,7 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
     let arg1 = ops.signed::<2>();
     let fb = ops.unsigned::<3>();
     let callee_word = regs.read(callee, ctx);
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -2949,7 +2943,7 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
         MethodCall::Proxy => {
-            become cold_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
+            become slow_call_function_proxy(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
@@ -2972,7 +2966,7 @@ extern "rust-preserve-none" fn op_call_ic<'a, const STRIDE: usize>(
     let count = ops.unsigned::<2>();
     let fb = ops.unsigned::<3>();
     let callee_word = regs.read(callee, ctx);
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -3009,7 +3003,7 @@ extern "rust-preserve-none" fn op_call_ic<'a, const STRIDE: usize>(
         MethodCall::Intrinsic(i) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
         }
-        MethodCall::Proxy => become cold_proxy_apply(ip, regs, acc, ctx, table, roots, float),
+        MethodCall::Proxy => become slow_proxy_apply(ip, regs, acc, ctx, table, roots, float),
     }
 }
 
@@ -3033,7 +3027,7 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type),
         Some(CallTarget::Proxy(_)) => {
-            become cold_proxy_apply(ip, regs, acc, ctx, table, roots, float)
+            become slow_proxy_apply(ip, regs, acc, ctx, table, roots, float)
         }
         Some(CallTarget::Intrinsic(i)) => {
             become INTRINSICS[i.id()](ip, regs, acc, ctx, table, roots, float)
@@ -3121,7 +3115,7 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
     let base_r = ops.signed::<1>();
     let count = ops.unsigned::<2>();
     let out_r = ops.signed::<3>();
-    let __mc = cold_start!(
+    let __mc = slow_start!(
         ip,
         regs,
         acc,
@@ -3167,9 +3161,9 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
                 float,
             )
         }
-        ConstructStart::Cold => {
+        ConstructStart::Slow => {
             regs.write(out_r, ctx.undefined_word());
-            become cold_construct(ip, regs, acc, ctx, table, roots, float)
+            become slow_construct(ip, regs, acc, ctx, table, roots, float)
         }
     }
 }
@@ -3218,77 +3212,6 @@ fn read_unsigned(ip: *const u8, off: usize, stride: usize) -> usize {
     }
 }
 
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_box_number<'a>(
-    ip: *const u8,
-    _regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
-    // the allocation may have moved the code object: re-derive the
-    // pointer and the resume point from the (updated) cache
-    let code = ctx.code_ptr();
-    let next = unsafe { cold_next_pc(ip) } as usize - ip as usize;
-    let pc = ip as usize - code as usize + next;
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    let h = table.get(unsafe { *code.add(pc) });
-    become h(unsafe { code.add(pc) }, regs, v, ctx, table, roots, float)
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_box_add_loc<'a>(
-    ip: *const u8,
-    _regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let dst = read_signed(ip, base, stride);
-    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    regs.write(dst, v);
-    let code = ctx.code_ptr();
-    let next = unsafe { cold_next_pc(ip) } as usize - ip as usize;
-    let pc = ip as usize - code as usize + next;
-    let h = table.get(unsafe { *code.add(pc) });
-    become h(unsafe { code.add(pc) }, regs, v, ctx, table, roots, float)
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_box_sub_loc<'a>(
-    ip: *const u8,
-    _regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let dst = read_signed(ip, base, stride);
-    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    regs.write(dst, v);
-    let code = ctx.code_ptr();
-    let next = unsafe { cold_next_pc(ip) } as usize - ip as usize;
-    let pc = ip as usize - code as usize + next;
-    let h = table.get(unsafe { *code.add(pc) });
-    become h(unsafe { code.add(pc) }, regs, v, ctx, table, roots, float)
-}
-
 /// Outcome of a `Construct` fast-path attempt.
 enum ConstructStart {
     /// a constructor frame was pushed (the cache already points at it):
@@ -3298,8 +3221,8 @@ enum ConstructStart {
     Threw(()),
     /// a runtime constructor: call it directly with `new_target` set
     Runtime(usize),
-    /// not an ordinary function constructor: fall back to `cold_construct`
-    Cold,
+    /// not an ordinary function constructor: fall back to `slow_construct`
+    Slow,
 }
 
 fn construct_start<'a>(
@@ -3319,7 +3242,7 @@ fn construct_start<'a>(
         // the instance itself, no frame and no nested execute
         Some(CallTarget::Runtime(idx)) => return Ok(ConstructStart::Runtime(idx)),
         Some(CallTarget::Bytecode { kind, .. }) => kind,
-        _ => return Ok(ConstructStart::Cold),
+        _ => return Ok(ConstructStart::Slow),
     };
     // ordinary and base-class constructors synthesize the receiver; a
     // derived constructor's `this` is the hole until `super()` binds it
@@ -3333,7 +3256,7 @@ fn construct_start<'a>(
         ctx.heap().known().the_hole.as_tagged(ctx.heap()).erase()
     } else {
         if kind != FunctionKind::Normal && kind != FunctionKind::BaseClassConstructor {
-            return Ok(ConstructStart::Cold);
+            return Ok(ConstructStart::Slow);
         }
         match construct_receiver_fast(ctx, callee_word)? {
             Some(r) => r,
@@ -3356,14 +3279,14 @@ fn construct_start<'a>(
         ..
     }) = Object::call_target(ctx.heap(), callee_word)
     else {
-        return Ok(ConstructStart::Cold);
+        return Ok(ConstructStart::Slow);
     };
     let derived2 = matches!(
         kind,
         FunctionKind::DerivedClassConstructor | FunctionKind::DefaultDerivedConstructor
     );
     if !derived2 && kind != FunctionKind::Normal && kind != FunctionKind::BaseClassConstructor {
-        return Ok(ConstructStart::Cold);
+        return Ok(ConstructStart::Slow);
     }
     let heap = unsafe { ctx.heap_mut() };
     let meta = ctx.meta(pc + size);
@@ -3417,158 +3340,6 @@ fn construct_receiver_fast<'a>(
     })
 }
 
-/// Best-effort cache fill: record the synthesized object's initial map
-/// keyed on the closure, validated by (function map, `.prototype` slot
-/// word) compares. Skips anything unusual (no data `prototype` slot,
-/// non-object prototype) — those just stay uncached.
-#[cold]
-#[inline(never)]
-fn construct_cache_record(
-    heap: &mut Heap,
-    state: &ContextState,
-    scope: &vm_core::HandleScope,
-    callee: vm_core::Handle<'_, Object>,
-    obj: vm_core::Handle<'_, Object>,
-) {
-    // Safety: fresh synthesized-receiver word; the insert's allocation
-    // runs before it reads parameters, so the raw word stays stable.
-    let map: Tagged<vm_core::Map> = unsafe {
-        Tagged::from_value_unchecked(obj.as_tagged(heap).as_ref().header.map.get(heap).raw())
-    };
-    // find the closure's `.prototype` data-property slot
-    let proto_name = heap.known().strings.prototype.as_tagged(heap);
-    let closure_map = callee.as_tagged(heap).as_ref().header.map.get(heap);
-    let mut found = None;
-    for d in closure_map.as_ref().descriptors() {
-        if d.name(heap).raw() == proto_name.raw() && !d.flags().is_accessor() {
-            found = Some(d.offset());
-            break;
-        }
-    }
-    let Some(offset) = found else { return };
-    let proto_word = callee
-        .as_tagged(heap)
-        .as_ref()
-        .slot(heap, offset)
-        .get(heap)
-        .raw();
-    if !proto_word.is_strong_ptr() {
-        return; // non-object prototype: ES falls back, stays uncached
-    }
-    // Safety: fresh rooted-slot words; the insert's only allocation runs
-    // before it reads parameters, so raw words stay stable.
-    let proto: Tagged<Value> = unsafe { Tagged::from_value_unchecked(proto_word) };
-    let _ = scope;
-    // Safety: the insert's only allocation (the first-use table) runs
-    // before it reads these words — they stay stable throughout.
-    let callee_obj: Tagged<Object> =
-        unsafe { Tagged::from_value_unchecked(callee.as_tagged(heap).raw()) };
-    state.construct_cache_insert(heap, callee_obj, proto, offset, map);
-}
-
-#[cold]
-#[inline(never)]
-fn create_closure_cold<'a>(ctx: &Ctx<'a>, info_idx: usize) -> Result<Tagged<'a, Value>, VmError> {
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let meta = ctx.meta(0);
-        let Some(info) =
-            scope.cast::<CallableInfoObject>(ctx.cache().constants_ref(heap).at(heap, info_idx))
-        else {
-            return Err(VmError::Type);
-        };
-        let context = scope
-            .cast::<Context>(ctx.stack().context_slot(&meta).get(heap))
-            .expect("frame context slot holds a Context");
-        let obj = Object::create_closure(heap, &scope, info, context)?;
-        Ok(obj.erase())
-    })
-}
-
-#[cold]
-#[inline(never)]
-fn create_function_context_cold<'a>(
-    ctx: &Ctx<'a>,
-    scope_idx: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let meta = ctx.meta(0);
-        let outer = scope
-            .cast::<Context>(ctx.stack().context_slot(&meta).get(heap))
-            .expect("frame context slot holds a Context");
-        let count = ctx
-            .cache()
-            .constants_ref(heap)
-            .at(heap, scope_idx)
-            .get_as::<ScopeInfo>()
-            .map(|r| r.as_ref().names.get(heap).len())
-            .ok_or(VmError::Type)?;
-        let scope_info = scope
-            .cast::<ScopeInfo>(ctx.cache().constants_ref(heap).at(heap, scope_idx))
-            .expect("constants slot holds a ScopeInfo");
-        let slots = if count == 0 {
-            heap.known().empty_fixed_array
-        } else {
-            let values = scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
-            heap.allocate_handle::<FixedArray>(values, &scope)
-        };
-        let ctx_obj = heap.allocate::<Context>(ContextInit {
-            outer: Some(outer),
-            slots,
-            scope_info,
-        });
-        Ok(ctx_obj.erase())
-    })
-}
-
-#[cold]
-#[inline(never)]
-fn proxy_apply_cold<'a>(
-    ctx: &Ctx<'a>,
-    callee: Tagged<'_, Value>,
-    args_base: i32,
-    count: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let callee = scope.handle(callee);
-        let meta = ctx.meta(0);
-        let staged = ctx.stack().args(&meta, args_base, count);
-        match Proxy::apply(vm, heap, state, callee, staged)? {
-            Coercion::Threw => Ok(ctx.exception_word()),
-            Coercion::Value(v) => Ok(v),
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
-fn proxy_apply_regs_cold<'a>(
-    ctx: &Ctx<'a>,
-    callee: Tagged<'_, Value>,
-    srcs: &[i32],
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let state = ctx.state();
-    let meta = ctx.meta(0);
-    let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_args_regs(heap, &meta, srcs)?;
-    let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let callee = scope.handle(callee);
-        match Proxy::apply(vm, heap, state, callee, staged)? {
-            Coercion::Threw => Ok(ctx.exception_word()),
-            Coercion::Value(v) => Ok(v),
-        }
-    });
-    ctx.stack().set_top(saved_top);
-    result
-}
-
 // -- interpreter intrinsics ----------------------------------------------
 //
 // Handler-shaped builtins (`Function.prototype.call` / `apply` and
@@ -3600,118 +3371,6 @@ extern "rust-preserve-none" fn enter_fresh_frame<'a>(
     let ip = unsafe { code.add(pc) };
     let h = table.get(unsafe { *ip });
     become h(ip, regs, acc, ctx, table, roots, float)
-}
-
-/// Resolve the (already reshaped) call and push a frame, dispatch a
-/// runtime callee, or report an intrinsic/proxy for the caller to tail
-/// into. `args[0]` is the receiver of the call being made.
-#[cold]
-#[inline(never)]
-fn intrinsic_call_scattered<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    f: Tagged<'a, Value>,
-    srcs: &[i32],
-) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), f) {
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            register_count,
-            formal_min,
-            kind,
-            ..
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            push_scattered_method_frame(
-                ctx,
-                pc,
-                size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                srcs,
-            )
-        }
-        Some(CallTarget::Runtime(idx)) => {
-            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
-        }
-        Some(CallTarget::Intrinsic(_)) => {
-            // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
-            // the reshaped window, never against the original operands
-            let meta = ctx.meta(0);
-            let (saved_top, staged) = ctx.stack().stage_args_regs(ctx.heap(), &meta, srcs)?;
-            let out = intrinsic_apply_call(ctx, pc, size, f, staged);
-            ctx.stack().set_top(saved_top);
-            match out? {
-                ApplyOut::Frame(frame) => Ok(MethodCall::Frame(frame)),
-                ApplyOut::Value(v) => Ok(MethodCall::Value(v)),
-            }
-        }
-        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        None => Err(VmError::Type),
-    }
-}
-
-/// `intrinsic_call_scattered` for the contiguous call window.
-#[cold]
-#[inline(never)]
-fn intrinsic_call_contiguous<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    f: Tagged<'a, Value>,
-    base: i32,
-    count: usize,
-) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), f) {
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            register_count,
-            formal_min,
-            kind,
-            ..
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            push_contiguous_frame(
-                ctx,
-                pc,
-                size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                base,
-                count,
-            )
-        }
-        Some(CallTarget::Runtime(idx)) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
-            ctx, idx, base, count,
-        ))),
-        Some(CallTarget::Intrinsic(_)) => {
-            // a nested intrinsic (`f.call.call(g, x)`): unwrap it against
-            // the reshaped window, never against the original operands
-            let meta = ctx.meta(0);
-            let staged = ctx.stack().args(&meta, base, count);
-            match intrinsic_apply_call(ctx, pc, size, f, staged)? {
-                ApplyOut::Frame(frame) => Ok(MethodCall::Frame(frame)),
-                ApplyOut::Value(v) => Ok(MethodCall::Value(v)),
-            }
-        }
-        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        None => Err(VmError::Type),
-    }
 }
 
 /// Shared tail of the intrinsics: run the resolved `MethodCall`.
@@ -3770,8 +3429,8 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     let code = ctx.code_ptr();
-    let (base, stride) = cold_layout(ip);
-    let next = cold_next_pc(ip);
+    let (base, stride) = slow_layout(ip);
+    let next = slow_next_pc(ip);
     let op = unsafe { Opcode::from_byte_unchecked(*ip.add(base / 2)) };
     match op {
         // contiguous window `[f, thisArg, args...]`: element 0 rides the
@@ -3813,7 +3472,7 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
                         count - 1,
                     )
                 },
-                { proxy_apply_cold(ctx, f, args_base, count - 1) }
+                { proxy_apply_slow(ctx, f, args_base, count - 1) }
             )
         }
         // scattered: the receiver register holds the real target
@@ -3831,7 +3490,7 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
                 roots,
                 float,
                 { intrinsic_call_scattered(ctx, ip as usize - code as usize, size, f, &[]) },
-                { proxy_apply_regs_cold(ctx, f, &[]) }
+                { proxy_apply_regs_slow(ctx, f, &[]) }
             )
         }
         Opcode::CallMethod1 => {
@@ -3849,7 +3508,7 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
                 roots,
                 float,
                 { intrinsic_call_scattered(ctx, ip as usize - code as usize, size, f, &[arg0]) },
-                { proxy_apply_regs_cold(ctx, f, &[arg0]) }
+                { proxy_apply_regs_slow(ctx, f, &[arg0]) }
             )
         }
         Opcode::CallMethod2 => {
@@ -3876,7 +3535,7 @@ extern "rust-preserve-none" fn intrinsic_function_call<'a>(
                         &[arg0, arg1],
                     )
                 },
-                { proxy_apply_regs_cold(ctx, f, &[arg0, arg1]) }
+                { proxy_apply_regs_slow(ctx, f, &[arg0, arg1]) }
             )
         }
         // `call` invoked with an undefined receiver (unbound): `this` is
@@ -3916,105 +3575,6 @@ enum ApplyOut<'a> {
     Value(Tagged<'a, Value>),
 }
 
-/// Resolve a call on `target` with a staged argument window
-/// (`args[0]` = receiver) and push the callee frame when it is bytecode.
-/// Nested intrinsics (`f.call.apply(...)`) are unwrapped recursively.
-#[cold]
-#[inline(never)]
-fn intrinsic_apply_call<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    target: Tagged<'a, Value>,
-    args: HandleSlice<'_>,
-) -> Result<ApplyOut<'a>, VmError> {
-    match Object::call_target(ctx.heap(), target) {
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            register_count,
-            formal_min,
-            kind,
-            ..
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(ApplyOut::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            let heap = unsafe { ctx.heap_mut() };
-            let meta = ctx.meta(pc + size);
-            let undefined = heap.known().undefined.as_tagged(heap).erase();
-            let frame = ctx.stack().push_frame_with_args(
-                heap,
-                meta,
-                pc,
-                target.erase(),
-                info,
-                register_count,
-                context.erase(),
-                args,
-                undefined,
-                formal_min,
-            )?;
-            ctx.cache()
-                .load(ctx.stack(), frame, unsafe { ctx.heap_mut() });
-            Ok(ApplyOut::Frame(frame))
-        }
-        Some(CallTarget::Runtime(idx)) => {
-            // the spread is rooted by the caller's scope staging
-            let f = ctx.vm().runtime(RuntimeIndex(idx));
-            let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-            Ok(ApplyOut::Value(f(nctx, args)))
-        }
-        Some(CallTarget::Intrinsic(intrinsic)) => {
-            // unwrap the nested intrinsic and retry on the reshaped args
-            match intrinsic {
-                Intrinsic::FunctionCall => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(ctx.heap()))
-                        .ok_or(VmError::Arity)?;
-                    let rest = args.slice_from(1);
-                    intrinsic_apply_call(ctx, pc, size, f, rest)
-                }
-                Intrinsic::FunctionApply => {
-                    let f = args
-                        .get(0)
-                        .map(|h| h.as_tagged(ctx.heap()))
-                        .ok_or(VmError::Arity)?;
-                    let this_arg = args
-                        .get(1)
-                        .map(|h| h.as_tagged(ctx.heap()))
-                        .unwrap_or_else(|| ctx.undefined_word());
-                    let array = args.get(2).map(|h| h.as_tagged(ctx.heap()));
-                    ctx.state()
-                        .handle_scope(|scope| -> Result<ApplyOut<'a>, VmError> {
-                            // Safety: fresh reads of rooted slots, staged before
-                            // the frame push below can move anything.
-                            let staged =
-                                scope.stage(&spread_apply_args(ctx.heap(), this_arg, array));
-                            intrinsic_apply_call(ctx, pc, size, f, staged)
-                        })
-                }
-            }
-        }
-        Some(CallTarget::Proxy(_)) => {
-            let vm = ctx.vm();
-            let heap = unsafe { ctx.heap_mut() };
-            let state = ctx.state();
-            let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-                let target = scope.handle(target);
-                match Proxy::apply(vm, heap, state, target, args)? {
-                    Coercion::Threw => Ok(ctx.exception_word()),
-                    Coercion::Value(v) => Ok(v),
-                }
-            });
-            Ok(ApplyOut::Value(result?))
-        }
-        None => Err(VmError::Type),
-    }
-}
-
 #[rustc_align(32)]
 extern "rust-preserve-none" fn intrinsic_function_apply<'a>(
     ip: *const u8,
@@ -4026,8 +3586,8 @@ extern "rust-preserve-none" fn intrinsic_function_apply<'a>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     let code = ctx.code_ptr();
-    let (base, stride) = cold_layout(ip);
-    let next = cold_next_pc(ip);
+    let (base, stride) = slow_layout(ip);
+    let next = slow_next_pc(ip);
     let op = unsafe { Opcode::from_byte_unchecked(*ip.add(base / 2)) };
     // recover (f, thisArg, argsArray) from the invoking call shape
     let (f, this_arg, array) = match op {
@@ -4134,7 +3694,7 @@ static INTRINSICS: [Handler; Intrinsic::COUNT] = [
 ];
 
 #[inline(always)]
-fn cold_layout(ip: *const u8) -> (usize, usize) {
+fn slow_layout(ip: *const u8) -> (usize, usize) {
     if unsafe { *ip } == Opcode::Wide as u8 {
         (2, 2)
     } else {
@@ -4143,7 +3703,7 @@ fn cold_layout(ip: *const u8) -> (usize, usize) {
 }
 
 #[inline(always)]
-fn cold_next_pc(ip: *const u8) -> *const u8 {
+fn slow_next_pc(ip: *const u8) -> *const u8 {
     let wide = unsafe { *ip } == Opcode::Wide as u8;
     let op = unsafe { *ip.add(wide as usize) } as usize;
     let size = if wide {
@@ -4152,42 +3712,6 @@ fn cold_next_pc(ip: *const u8) -> *const u8 {
         *unsafe { OPERAND_SIZES_NARROW.get_unchecked(op) }
     } as usize;
     unsafe { ip.add(wide as usize + 1 + size) }
-}
-
-/// Exception dispatch: walk the ovm frames from the faulting one, consulting
-/// each frame's static handler table for a try range covering
-/// `fault_pc`; on a hit, take the pending exception and tail-dispatch
-/// into the handler with it in the accumulator. Pops frames until the
-/// anchor; then the sentinel escapes to the `execute` caller with the
-/// pending exception left set. A termination is uncatchable: no
-/// handler may observe it, so it unwinds straight out.
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn throw_dispatch<'a>(
-    fault_ip: *const u8,
-    _regs: Regs,
-    _acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let fault_pc = fault_ip as usize - ctx.code_ptr() as usize;
-    match unsafe { vm_core::interp::unwind(ctx, fault_pc) } {
-        vm_core::interp::Unwind::Caught(ex) => {
-            // `unwind` parked the handler's entry in the cache pc; the
-            // walk itself never allocates, so the re-derived pointers
-            // are stable
-            let handler_pc = ctx.cache().pc();
-            let code = ctx.code_ptr();
-            let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-            let ip = unsafe { code.add(handler_pc) };
-            let h = table.get(unsafe { *ip });
-            become h(ip, regs, ex, ctx, table, roots, float)
-        }
-        vm_core::interp::Unwind::Escaped => ctx.exception_word(),
-    }
 }
 
 #[inline(never)]
@@ -4270,691 +3794,10 @@ extern "rust-preserve-none" fn resume<'a>(
     if ctx.is_throw(acc) {
         become throw_dispatch(fault_ip, _regs, acc, ctx, table, roots, float)
     }
-    let ip = unsafe { cold_next_pc(ctx.code_ptr().add(fault_pc)) };
+    let ip = unsafe { slow_next_pc(ctx.code_ptr().add(fault_pc)) };
     let regs = unsafe { Regs::new(ctx.regs_ptr()) };
     let h = table.get(unsafe { *ip });
     become h(ip, regs, acc, ctx, table, roots, float)
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_add<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let v = unsafe { vm_core::cold::add(ctx, lhs, acc) };
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_numeric<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let op = unsafe { Opcode::from_byte_unchecked(*ip.add((stride == 2) as usize)) };
-    let f: fn(f64, f64) -> f64 = match op {
-        Opcode::Sub => |a, b| a - b,
-        Opcode::Mul => |a, b| a * b,
-        Opcode::Mod => |a, b| a % b,
-        Opcode::Exp => |a, b| a.powf(b),
-        _ => |a, b| a / b,
-    };
-    let v = unsafe { vm_core::cold::numeric(ctx, lhs, acc, f) };
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_add_immediate<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let imm = Smi::new(read_signed(ip, base + stride, stride) as i64).into_tagged();
-    let v = unsafe { vm_core::cold::add(ctx, lhs, imm) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_numeric_immediate<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let lhs = regs.read(read_signed(ip, base, stride), ctx);
-    let imm = Smi::new(read_signed(ip, base + stride, stride) as i64).into_tagged();
-    let op = unsafe { Opcode::from_byte_unchecked(*ip.add((stride == 2) as usize)) };
-    let f: fn(f64, f64) -> f64 = match op {
-        Opcode::SubImmediate => |a, b| a - b,
-        Opcode::MulImmediate => |a, b| a * b,
-        Opcode::ModImmediate => |a, b| a % b,
-        Opcode::ExpImmediate => |a, b| a.powf(b),
-        _ => |a, b| a / b,
-    };
-    let v = unsafe { vm_core::cold::numeric(ctx, lhs, imm, f) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_negate<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::negate(ctx, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn incdec_cold<'a>(
-    ip: *const u8,
-    ctx: &Ctx<'a>,
-    regs: Regs,
-    delta: f64,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let r = read_signed(ip, base, stride);
-    let old = regs.read(r, ctx);
-    let heap = unsafe { ctx.heap_mut() };
-    if let Some(bits) = old.smi_bits() {
-        let new = heap.new_number((bits >> 1) as f64 + delta);
-        regs.write(r, new);
-        return Ok(old);
-    }
-    let vm = ctx.vm();
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let old = scope.handle(old);
-        let Some(n) = Object::to_numeric(vm, heap, state, old)? else {
-            return Ok(ctx.exception_word());
-        };
-        let old_num =
-            if n.fract() == 0.0 && Smi::in_range(n as i64) && !(n == 0.0 && n.is_sign_negative()) {
-                scope.handle(Smi::new(n as i64).into_tagged())
-            } else {
-                scope.handle(heap.new_number(n))
-            };
-        let new = heap.new_number(n + delta);
-        regs.write(r, new);
-        Ok(old_num.as_tagged(heap))
-    })
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_inc_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = cold_try!(ctx, incdec_cold(ip, ctx, regs, 1.0));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_dec_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = cold_try!(ctx, incdec_cold(ip, ctx, regs, -1.0));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-fn loc_op_cold<'a>(
-    ip: *const u8,
-    ctx: &Ctx<'a>,
-    regs: Regs,
-    sub: bool,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let (base, stride) = cold_layout(ip);
-    let dst = read_signed(ip, base, stride);
-    let src = read_signed(ip, base + stride, stride);
-    let lhs = regs.read(dst, ctx);
-    let rhs = regs.read(src, ctx);
-    let v = if sub {
-        unsafe { vm_core::cold::numeric(ctx, lhs, rhs, |a, b| a - b) }
-    } else {
-        unsafe { vm_core::cold::add(ctx, lhs, rhs) }
-    };
-    if !ctx.is_throw(v) {
-        regs.write(dst, v);
-    }
-    Ok(v)
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_add_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let v = cold_try!(ctx, loc_op_cold(ip, ctx, regs, false));
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_sub_loc<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let v = cold_try!(ctx, loc_op_cold(ip, ctx, regs, true));
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_keyed_load_reg<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let key = regs.read(read_signed(ip, base + stride, stride), ctx);
-    let fb = read_unsigned(ip, base + 2 * stride, stride);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::keyed_load(ctx, recv, key, Some(fb)) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_equal<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::compare(ctx, 0, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_less_than<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::compare(ctx, 2, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_greater_than<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::compare(ctx, 4, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_compare_jump<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let next = cold_next_pc(ip);
-    let r = read_signed(ip, base, stride);
-    let kind = read_unsigned(ip, base + stride, stride);
-    let off = read_signed(ip, base + 2 * stride, stride);
-    let other = regs.read(r, ctx);
-    let cmp = (kind / 2) as u8;
-    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
-        (Some(a), Some(b)) => match cmp {
-            0 | 1 => a == b,
-            2 => a < b,
-            3 => a <= b,
-            4 => a > b,
-            _ => a >= b,
-        },
-        _ => {
-            let pc = ip as usize - ctx.code_ptr() as usize;
-            let v = unsafe { vm_core::cold::compare(ctx, cmp, acc, other) };
-            if ctx.is_throw(v) {
-                become resume(
-                    unsafe { ctx.code_ptr().add(pc) },
-                    regs,
-                    v,
-                    ctx,
-                    table,
-                    roots,
-                    float,
-                )
-            }
-            Convert::is_truthy(ctx.heap(), v)
-        }
-    };
-    let boolean = Convert::boolean(ctx.heap(), b);
-    let dest = if b != (kind % 2 == 1) {
-        ip.wrapping_offset(off as isize)
-    } else {
-        next
-    };
-    let regs = unsafe { Regs::new(ctx.regs_ptr()) };
-    let h = table.get(unsafe { *dest });
-    become h(dest, regs, boolean, ctx, table, roots, float)
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_named_load<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let fb_slot = read_unsigned(ip, base + 2 * stride, stride);
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let v = unsafe { vm_core::cold::named_load(ctx, recv, name_idx, fb_slot) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_keyed_load<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let fb = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::keyed_load(ctx, recv, acc, Some(fb)) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_keyed_load_imm<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let idx = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::keyed_load_imm(ctx, recv, idx) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_keyed_store<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let key = regs.read(read_signed(ip, base + stride, stride), ctx);
-    let fb = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe {
-        vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)
-    };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_keyed_store_no_shadow<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let key = regs.read(read_signed(ip, base + stride, stride), ctx);
-    let fb = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe {
-        vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
-    };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_global_load<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let name_idx = read_unsigned(ip, base, stride);
-    let fb_slot = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, true) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_store_named<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let fb_slot = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe { vm_core::cold::store_named(ctx, recv, name_idx, fb_slot, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
 }
 
 enum MethodCall<'a> {
@@ -4964,7 +3807,7 @@ enum MethodCall<'a> {
     /// a bytecode frame was pushed and the cache switched to it: enter it
     /// through the machine-call trampoline
     Frame(FrameMeta),
-    /// a callable proxy: the caller tail-calls the cold trap dispatch
+    /// a callable proxy: the caller tail-calls the slow trap dispatch
     Proxy,
     /// an interpreter intrinsic: the caller tail-calls it like a handler
     Intrinsic(vm_core::Intrinsic),
@@ -5194,79 +4037,7 @@ fn call_method_start<'a>(
             Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
         }
         vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        vm_core::ic::CallProbe::Miss => cold_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn cold_call_method_miss<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    callee_word: Tagged<'a, Value>,
-    srcs: &[i32],
-    fb: usize,
-) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), callee_word) {
-        None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
-        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(idx)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Value(dispatch_runtime_method(ctx, idx, srcs)))
-        }
-        Some(CallTarget::Intrinsic(i)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Intrinsic(i))
-        }
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            register_count,
-            formal_min,
-            kind,
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    Some(info),
-                )
-            };
-            push_scattered_method_frame(
-                ctx,
-                pc,
-                size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                srcs,
-            )
-        }
+        vm_core::ic::CallProbe::Miss => slow_call_method_miss(ctx, pc, size, callee_word, srcs, fb),
     }
 }
 
@@ -5315,79 +4086,7 @@ fn call_function_start<'a>(
         }
         vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
         vm_core::ic::CallProbe::Miss => {
-            cold_call_function_miss(ctx, pc, size, callee_word, args, fb)
-        }
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn cold_call_function_miss<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    callee_word: Tagged<'a, Value>,
-    args: &[i32],
-    fb: usize,
-) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), callee_word) {
-        None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
-        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(idx)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Value(dispatch_runtime_function(ctx, idx, args)))
-        }
-        Some(CallTarget::Intrinsic(i)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Intrinsic(i))
-        }
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            register_count,
-            formal_min,
-            kind,
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    Some(info),
-                )
-            };
-            push_function_frame(
-                ctx,
-                pc,
-                size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                args,
-            )
+            slow_call_function_miss(ctx, pc, size, callee_word, args, fb)
         }
     }
 }
@@ -5439,678 +4138,8 @@ fn call_start<'a>(
             ctx, idx, base, count,
         ))),
         vm_core::ic::CallProbe::Intrinsic(i) => Ok(MethodCall::Intrinsic(i)),
-        vm_core::ic::CallProbe::Miss => cold_call_miss(ctx, pc, size, callee_word, base, count, fb),
+        vm_core::ic::CallProbe::Miss => slow_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
-}
-
-#[cold]
-#[inline(never)]
-fn cold_call_miss<'a>(
-    ctx: &Ctx<'a>,
-    pc: usize,
-    size: usize,
-    callee_word: Tagged<'a, Value>,
-    base: i32,
-    count: usize,
-    fb: usize,
-) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), callee_word) {
-        None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
-        Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(idx)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Value(dispatch_runtime_contiguous(
-                ctx, idx, base, count,
-            )))
-        }
-        Some(CallTarget::Intrinsic(i)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Intrinsic(i))
-        }
-        Some(CallTarget::Bytecode {
-            target,
-            info,
-            context,
-            register_count,
-            formal_min,
-            kind,
-        }) => {
-            if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
-            }
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.cache().feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    Some(info),
-                )
-            };
-            push_contiguous_frame(
-                ctx,
-                pc,
-                size,
-                target,
-                info,
-                context,
-                register_count,
-                formal_min,
-                base,
-                count,
-            )
-        }
-    }
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_construct<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let args_base = read_signed(ip, base + stride, stride);
-    let count = read_unsigned(ip, base + 2 * stride, stride);
-    let v = unsafe { vm_core::cold::construct(ctx, callee, args_base, count) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_create_closure<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let info_idx = read_unsigned(ip, base, stride);
-    let v = cold_try!(ctx, create_closure_cold(ctx, info_idx));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_create_empty_array<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    let obj = state.handle_scope(|scope| {
-        let map = heap.known().js_array_map;
-        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
-    });
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        obj,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_create_empty_object<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    let obj = state.handle_scope(|scope| {
-        let map = heap.known().object_initial_map;
-        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
-    });
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        obj,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_create_bare_object<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    let obj = state.handle_scope(|scope| {
-        let map = heap.known().plain_object_map;
-        heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
-    });
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        obj,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn create_block_context_cold<'a>(
-    ctx: &Ctx<'a>,
-    count: usize,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let meta = ctx.meta(0);
-        let outer = scope
-            .cast::<Context>(ctx.stack().context_slot(&meta).get(heap))
-            .expect("frame context slot holds a Context");
-        let slots = if count == 0 {
-            heap.known().empty_fixed_array
-        } else {
-            let values = scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
-            heap.allocate_handle::<FixedArray>(values, &scope)
-        };
-        let ctx_obj = heap.allocate::<Context>(ContextInit {
-            outer: Some(outer),
-            slots,
-            scope_info: heap.known().empty_scope_info,
-        });
-        Ok(ctx_obj.erase())
-    })
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_create_block_context<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let count = read_unsigned(ip, base, stride);
-    let v = cold_try!(ctx, create_block_context_cold(ctx, count));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_less_than_or_equal<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let v = unsafe { vm_core::cold::compare(ctx, 3, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_global_load_nothrow<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let name_idx = read_unsigned(ip, base, stride);
-    let fb_slot = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, false) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_store_global<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let name_idx = read_unsigned(ip, base, stride);
-    let v = unsafe { vm_core::cold::store_global(ctx, name_idx, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_store_named_no_shadow<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let v = unsafe { vm_core::cold::store_named_no_shadow(ctx, recv, name_idx, acc) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn instance_of_cold<'a>(
-    ctx: &Ctx<'a>,
-    object: Tagged<'_, Value>,
-    callable: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let object = scope.handle(object);
-        let callable = scope.handle(callable);
-        match Object::instance_of(vm, heap, state, object, callable)? {
-            None => Ok(ctx.exception_word()),
-            Some(r) => Ok(Convert::boolean(heap, r)),
-        }
-    })
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_instance_of<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let callable = regs.read(read_signed(ip, base, stride), ctx);
-    let v = cold_try!(ctx, instance_of_cold(ctx, acc, callable));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_greater_than_or_equal<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let other = regs.read(read_signed(ip, base, stride), ctx);
-    let v = unsafe { vm_core::cold::compare(ctx, 5, acc, other) };
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn add_parent_cold<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    name_idx: usize,
-    value: Tagged<'_, Value>,
-) -> Result<Tagged<'a, Value>, VmError> {
-    let heap = unsafe { ctx.heap_mut() };
-    let state = ctx.state();
-    state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let receiver = scope.handle(recv);
-        let name = scope.handle(
-            ctx.cache()
-                .constants_ref(heap)
-                .at(heap, name_idx)
-                .erase()
-                .as_name(),
-        );
-        let value = scope.handle(value);
-        let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
-            return Err(VmError::Type);
-        };
-        Object::add_parent(heap, &scope, receiver, name, value)?;
-        Ok(value.as_tagged(heap).erase())
-    })
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_add_parent<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let recv = regs.read(read_signed(ip, base, stride), ctx);
-    let name_idx = read_unsigned(ip, base + stride, stride);
-    let v = cold_try!(ctx, add_parent_cold(ctx, recv, name_idx, acc));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_create_function_context<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let scope_idx = read_unsigned(ip, base, stride);
-    let v = cold_try!(ctx, create_function_context_cold(ctx, scope_idx));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_proxy_apply<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let args_base = read_signed(ip, base + stride, stride);
-    let count = read_unsigned(ip, base + 2 * stride, stride);
-    let v = cold_try!(ctx, proxy_apply_cold(ctx, callee, args_base, count));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_call_method_proxy<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let wide = unsafe { *ip } == Opcode::Wide as u8;
-    let argc = match unsafe { Opcode::from_byte_unchecked(unsafe { *ip.add(wide as usize) }) } {
-        Opcode::CallMethod0 => 0usize,
-        Opcode::CallMethod1 => 1,
-        _ => 2,
-    };
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let mut srcs = [0i32; 3];
-    for (i, src) in srcs.iter_mut().enumerate().take(argc + 1) {
-        *src = read_signed(ip, base + (i + 1) * stride, stride);
-    }
-    let v = cold_try!(ctx, proxy_apply_regs_cold(ctx, callee, &srcs[..argc + 1]));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
-}
-
-#[cold]
-#[inline(never)]
-fn proxy_apply_function_cold<'a>(
-    ctx: &Ctx<'a>,
-    callee: Tagged<'_, Value>,
-    args: &[i32],
-) -> Result<Tagged<'a, Value>, VmError> {
-    let vm = ctx.vm();
-    let state = ctx.state();
-    let meta = ctx.meta(0);
-    let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_function_args(heap, &meta, args)?;
-    let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
-        let callee = scope.handle(callee);
-        match Proxy::apply(vm, heap, state, callee, staged)? {
-            Coercion::Threw => Ok(ctx.exception_word()),
-            Coercion::Value(v) => Ok(v),
-        }
-    });
-    ctx.stack().set_top(saved_top);
-    result
-}
-
-#[cold]
-#[inline(never)]
-#[rustc_align(32)]
-extern "rust-preserve-none" fn cold_call_function_proxy<'a>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let pc = ip as usize - ctx.code_ptr() as usize;
-    let (base, stride) = cold_layout(ip);
-    let wide = unsafe { *ip } == Opcode::Wide as u8;
-    let argc = match unsafe { Opcode::from_byte_unchecked(unsafe { *ip.add(wide as usize) }) } {
-        Opcode::CallFunction0 => 0usize,
-        Opcode::CallFunction1 => 1,
-        _ => 2,
-    };
-    let callee = regs.read(read_signed(ip, base, stride), ctx);
-    let mut args = [0i32; 2];
-    for (i, arg) in args.iter_mut().enumerate().take(argc) {
-        *arg = read_signed(ip, base + (i + 1) * stride, stride);
-    }
-    let v = cold_try!(ctx, proxy_apply_function_cold(ctx, callee, &args[..argc]));
-    become resume(
-        unsafe { ctx.code_ptr().add(pc) },
-        regs,
-        v,
-        ctx,
-        table,
-        roots,
-        float,
-    )
 }
 
 const fn table_narrow() -> [Handler; 256] {
@@ -6362,7 +4391,7 @@ fn enter<'a>(
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
         Some(CallTarget::Intrinsic(intrinsic)) => {
             // Rust-world entry of an intrinsic: unwrap it and re-enter.
-            // This is the cold path — bytecode call sites reach intrinsics
+            // This is the slow path — bytecode call sites reach intrinsics
             // through the handler-shaped table instead.
             state.handle_scope(|scope| match intrinsic {
                 Intrinsic::FunctionCall => {
