@@ -53,45 +53,108 @@ pub fn array_push<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
+    // The overwhelmingly common shape — `a.push(x)` where `a` has headroom —
+    // is handled by a tiny leaf so the general path's frame and spills never
+    // touch it.
+    if let Some(v) = array_push_fast(heap, args) {
+        return v;
+    }
+    array_push_impl(vm, heap, state, args)
+}
+
+/// One argument, receiver already an array with spare capacity: append with
+/// no allocation and no handle scope. Returns `None` for anything else.
+#[inline(always)]
+fn array_push_fast<'a>(heap: &Heap, args: HandleSlice<'_>) -> Option<Tagged<'a, Value>> {
+    if args.len() != 2 {
+        return None;
+    }
+    let receiver = args.get(0)?;
+    let arg = args.get(1)?;
+    let r = receiver.as_tagged(heap);
+    let obj = r.as_heap_object()?;
+    if !obj.as_ref().is_array(heap) {
+        return None;
+    }
+    let len = obj.as_ref().length();
+    let elements = obj.as_ref().elements_array(heap)?;
+    if len >= elements.len() {
+        return None;
+    }
+    elements.as_ref().set(heap, len, arg.as_tagged(heap));
+    obj.as_ref()
+        .length
+        .set(heap, r.erase(), Smi::new((len + 1) as i64));
+    Some(Smi::new((len + 1) as i64).into_tagged())
+}
+
+#[cold]
+#[inline(never)]
+fn array_push_impl<'a>(
+    vm: &'a VM,
+    heap: &'a mut Heap,
+    state: &'a ContextState,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
+    let Some(receiver) = args.get(0) else {
+        return raise_runtime(vm, heap, state, VmError::Arity);
+    };
+    let mut len = {
+        let r = receiver.as_tagged(heap);
+        let Some(obj) = r.as_heap_object() else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         if !obj.as_ref().is_array(heap) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
-        let obj = scope.handle(obj);
-        let mut len = obj.as_tagged(heap).as_ref().length();
-        for arg in args.iter().skip(1) {
-            let capacity = obj
-                .as_tagged(heap)
-                .as_ref()
-                .elements_array(heap)
-                .map(|e| e.len())
-                .unwrap_or(0);
-            if len < capacity {
-                // in-place append: no growth, no re-derivation
-                let obj_t = obj.as_tagged(heap);
-                let elements = obj_t.as_ref().elements_array(heap).expect("capacity > len");
-                elements.as_ref().set(heap, len, arg.as_tagged(heap));
-                obj_t
-                    .as_ref()
-                    .length
-                    .set(heap, obj_t.erase(), Smi::new((len + 1) as i64));
-            } else {
-                rt_try!(
-                    vm,
-                    heap,
-                    state,
-                    Object::store_array_element(heap, &scope, &obj, len, &arg)
-                );
+        obj.as_ref().length()
+    };
+    for arg in args.iter().skip(1) {
+        let in_place = {
+            let r = receiver.as_tagged(heap);
+            let obj = r.as_heap_object().expect("validated above");
+            match obj.as_ref().elements_array(heap) {
+                Some(elements) if len < elements.len() => {
+                    elements.as_ref().set(heap, len, arg.as_tagged(heap));
+                    obj.as_ref()
+                        .length
+                        .set(heap, r.erase(), Smi::new((len + 1) as i64));
+                    true
+                }
+                _ => false,
             }
-            len += 1;
+        };
+        if !in_place {
+            rt_try!(
+                vm,
+                heap,
+                state,
+                array_push_grow(heap, state, &receiver, len, &arg)
+            );
         }
-        Smi::new(len as i64).into_tagged()
+        len += 1;
+    }
+    Smi::new(len as i64).into_tagged()
+}
+
+/// The rare grow path, kept out of line so `array_push`'s hot in-place loop
+/// keeps a small frame and register set. Growth may allocate, so the
+/// receiver is rooted here first.
+#[cold]
+#[inline(never)]
+fn array_push_grow<'a>(
+    heap: &'a mut Heap,
+    state: &'a ContextState,
+    receiver: &Handle<'_, Value>,
+    len: usize,
+    arg: &Handle<'_, Value>,
+) -> Result<(), VmError> {
+    state.handle_scope(|scope| {
+        let obj = receiver
+            .as_tagged(heap)
+            .as_heap_object()
+            .ok_or(VmError::Type)?;
+        Object::store_array_element(heap, &scope, &scope.handle(obj), len, arg)
     })
 }
 

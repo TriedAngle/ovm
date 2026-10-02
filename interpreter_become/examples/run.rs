@@ -1,5 +1,4 @@
 use interpreter_become::BecomeInterpreter;
-use js_compiler::JavascriptCompiler;
 use js_runtime::JSRuntime;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm_core::VM;

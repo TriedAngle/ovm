@@ -1,5 +1,4 @@
 use interpreter_become::BecomeInterpreter;
-use js_compiler::JavascriptCompiler;
 use js_runtime::JSRuntime;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use std::time::Instant;
@@ -21,7 +20,7 @@ fn bench(name: &str, src: &str, iters: usize) {
             .unwrap();
         let mut thread = vm.attach();
         let t = Instant::now();
-        let result = thread
+        let _result = thread
             .run_source(
                 src,
                 js_compiler::compile_js,
@@ -38,7 +37,6 @@ fn bench(name: &str, src: &str, iters: usize) {
                 .unwrap_or_else(|| format!("{:?}", tagged));
             panic!("{name} threw: {msg}");
         }
-        drop(result);
         times.push(dt.as_secs_f64() * 1e3);
     }
     let best = times.iter().cloned().fold(f64::INFINITY, f64::min);

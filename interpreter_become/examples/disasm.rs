@@ -1,4 +1,4 @@
-use bytecode::{Constant, Opcode, Operand, SourceMode, decode};
+use bytecode::{Constant, Operand, SourceMode, decode};
 use js_compiler::compile_js;
 
 fn show_const(c: &Constant) -> String {

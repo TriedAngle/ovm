@@ -2,7 +2,7 @@ use interpreter_become::BecomeInterpreter;
 use js_compiler::JavascriptCompiler;
 use js_runtime::JSRuntime;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
-use vm_core::{Interpreter, VM};
+use vm_core::VM;
 
 fn run(label: &str, src: &str) {
     let vm = VM::new::<MarkSweep, BecomeInterpreter>(MarkSweepConfig::default())

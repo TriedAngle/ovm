@@ -12,7 +12,7 @@ fn run(path: &str) {
         .unwrap();
     vm.arm_gc_stress();
     let mut thread = vm.attach();
-    let result = thread.eval::<JavascriptCompiler>(&src).expect("nbody runs");
+    let _result = thread.eval::<JavascriptCompiler>(&src).expect("nbody runs");
     if let Some(ex) = thread.take_pending_exception() {
         let heap = thread.heap();
         let tagged = unsafe { ex.assume_valid(heap) };

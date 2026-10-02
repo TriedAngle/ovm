@@ -580,7 +580,7 @@ pub fn proxy_apply_regs_slow<'a>(
     let state = ctx.state();
     let base = ctx.frame_base();
     let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_args_regs(heap, base, recv, args, argc)?;
+    let (saved_top, staged) = ctx.stack().stage_args_regs(base, recv, args, argc)?;
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
         match Proxy::apply(vm, heap, state, callee, staged)? {

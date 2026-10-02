@@ -3437,10 +3437,7 @@ fn dispatch_runtime_method<'a>(
 ) -> Tagged<'a, Value> {
     let f = ctx.vm().runtime(RuntimeIndex(idx));
     let base = ctx.frame_base();
-    let (saved_top, args) = match ctx
-        .stack()
-        .stage_args_regs(ctx.heap(), base, recv, args, argc)
-    {
+    let (saved_top, args) = match ctx.stack().stage_args_regs(base, recv, args, argc) {
         Ok(staged) => staged,
         Err(err) => {
             let _ = unsafe { ctx.raise(err) };
@@ -3926,11 +3923,8 @@ fn enter<'a>(
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
-            let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
-            let v = f(nctx, fargs);
-            state.stack().set_top(saved_top);
-            Ok(v)
+            Ok(f(nctx, args))
         }
         Some(CallTarget::Bytecode {
             target,

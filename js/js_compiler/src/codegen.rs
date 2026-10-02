@@ -2465,8 +2465,22 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             let callee = self.b.stage_acc();
             let mut args = [Reg::new(0); 2];
             for (i, arg) in c.arguments.iter().enumerate() {
-                self.call_argument(arg)?;
-                args[i] = self.b.stage_acc();
+                // a plain local/parameter is already in a register: read it
+                // in place instead of `Load`+`Store` through the
+                // accumulator. The last argument needs no stability (nothing
+                // evaluates after it); earlier ones must survive sibling
+                // evaluation, which `stable_register` guarantees.
+                let direct = match arg.as_expression() {
+                    Some(inner) if i + 1 == argc => self.simple_register(inner),
+                    Some(inner) => self.stable_register(inner),
+                    None => None,
+                };
+                if let Some(reg) = direct {
+                    args[i] = reg;
+                } else {
+                    self.call_argument(arg)?;
+                    args[i] = self.b.stage_acc();
+                }
             }
             match argc {
                 0 => {
@@ -2561,8 +2575,20 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             let callee = self.b.stage_acc();
             let mut args = [Reg::new(0); 2];
             for (i, arg) in c.arguments.iter().enumerate() {
-                self.call_argument(arg)?;
-                args[i] = self.b.stage_acc();
+                // see `emit_method_call`: read a plain local/parameter
+                // argument in place rather than copying through the
+                // accumulator.
+                let direct = match arg.as_expression() {
+                    Some(inner) if i + 1 == argc => self.simple_register(inner),
+                    Some(inner) => self.stable_register(inner),
+                    None => None,
+                };
+                if let Some(reg) = direct {
+                    args[i] = reg;
+                } else {
+                    self.call_argument(arg)?;
+                    args[i] = self.b.stage_acc();
+                }
             }
             match argc {
                 0 => {

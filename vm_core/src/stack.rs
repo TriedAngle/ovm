@@ -370,18 +370,12 @@ impl Stack {
         args: HandleSlice<'_>,
     ) -> Result<(usize, HandleSlice<'_>), VmError> {
         let saved_top = self.top();
-        let size = HEADER_SLOTS + 1 + args.len();
+        let size = 1 + args.len();
         if saved_top + size > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
-        let base = saved_top;
-        let dst = base + HEADER_SLOTS;
-        let fill = self.fill.get(heap);
-        for i in 0..HEADER_SLOTS {
-            self.slot_unchecked(base + i).store(fill);
-        }
-        let undefined = self.undefined.get(heap);
-        self.slot_unchecked(dst).store(undefined);
+        let dst = saved_top;
+        self.slot_unchecked(dst).store(self.undefined.get(heap));
         if !args.is_empty() {
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -391,64 +385,25 @@ impl Stack {
                 )
             }
         }
-        self.set_top(base + size);
+        self.set_top(dst + size);
         let staged = self.value_slice(dst, 1 + args.len());
-        Ok((saved_top, staged))
-    }
-
-    pub fn stage_args(
-        &self,
-        heap: &Heap,
-        args: HandleSlice<'_>,
-    ) -> Result<(usize, HandleSlice<'_>), VmError> {
-        let saved_top = self.top();
-        let size = HEADER_SLOTS + args.len();
-        if saved_top + size > self.slots.len() {
-            return Err(VmError::StackOverflow);
-        }
-        let base = saved_top;
-        let dst = base + HEADER_SLOTS;
-        // the staged region reserves frame-header slots it never writes:
-        // they sit below `top`, so the GC would scan whatever stale words
-        // previous frames left there — fill them like fresh registers
-        let fill = self.fill.get(heap);
-        for i in 0..HEADER_SLOTS {
-            self.slot_unchecked(base + i).store(fill);
-        }
-        self.set_top(base + size);
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                args.raw().as_ptr(),
-                self.slots.as_ptr().add(dst) as *mut Value,
-                args.len(),
-            )
-        }
-        // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
-        let staged = self.value_slice(dst, args.len());
         Ok((saved_top, staged))
     }
 
     #[inline]
     pub fn stage_args_regs<'s>(
         &'s self,
-        heap: &Heap,
         caller_base: usize,
         recv: i32,
         args: [i32; 2],
         argc: usize,
     ) -> Result<(usize, HandleSlice<'s>), VmError> {
         let saved_top = self.top();
-        let size = HEADER_SLOTS + 1 + argc;
+        let size = 1 + argc;
         if saved_top + size > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
-        let base = saved_top;
-        let dst = base + HEADER_SLOTS;
-        let fill = self.fill.get(heap);
-        for i in 0..HEADER_SLOTS {
-            self.slot_unchecked(base + i).store(fill);
-        }
-        self.set_top(base + size);
+        let dst = saved_top;
         let recv_regs = [recv, args[0], args[1]];
         for (i, &operand) in recv_regs.iter().enumerate().take(1 + argc) {
             let src = Self::slot_of(caller_base, operand);
@@ -456,6 +411,7 @@ impl Stack {
                 .as_raw()
                 .store_raw(self.slot_unchecked(src).raw().to_bits());
         }
+        self.set_top(dst + size);
         // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
         let staged = self.value_slice(dst, 1 + argc);
         Ok((saved_top, staged))
@@ -470,17 +426,11 @@ impl Stack {
         argc: usize,
     ) -> Result<(usize, HandleSlice<'s>), VmError> {
         let saved_top = self.top();
-        let size = HEADER_SLOTS + 1 + argc;
+        let size = 1 + argc;
         if saved_top + size > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
-        let base = saved_top;
-        let dst = base + HEADER_SLOTS;
-        let fill = self.fill.get(heap);
-        for i in 0..HEADER_SLOTS {
-            self.slot_unchecked(base + i).store(fill);
-        }
-        self.set_top(base + size);
+        let dst = saved_top;
         self.slot_unchecked(dst).store(self.undefined.get(heap));
         for (i, &operand) in args.iter().enumerate().take(argc) {
             let src = Self::slot_of(caller_base, operand);
@@ -488,6 +438,7 @@ impl Stack {
                 .as_raw()
                 .store_raw(self.slot_unchecked(src).raw().to_bits());
         }
+        self.set_top(dst + size);
         // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
         let staged = self.value_slice(dst, 1 + argc);
         Ok((saved_top, staged))

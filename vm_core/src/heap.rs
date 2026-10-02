@@ -611,6 +611,36 @@ impl Heap {
         self.allocate::<T>(config).as_handle(handles)
     }
 
+    /// Allocate a fresh `FixedArray` of `len` slots, each initialized to
+    /// the hole. A specialized single-allocation constructor for array
+    /// growth: the caller overwrites the prefix with the old elements, so
+    /// no staging slice is ever materialized.
+    pub fn allocate_hole_array(&mut self, len: usize) -> Tagged<'_, FixedArray> {
+        #[cfg(feature = "stress-minor-gc")]
+        if self.stress_armed.load(std::sync::atomic::Ordering::Acquire) {
+            self.collect_minor();
+        }
+        // resolve the fill after any stress collection so the word is
+        // current, then no GC can run again before the slots are written
+        let fill = self.known().the_hole.as_tagged(self).raw();
+        let raw = self
+            .allocate_raw(FixedArray::<Value>::layout_for(len))
+            .expect("heap allocation failed (out of memory)");
+        let mut ptr = raw.cast::<FixedArray>();
+        // Safety: raw memory just reserved; no GC can run inside init
+        // (the &mut borrow is still outstanding).
+        let obj = unsafe { ptr.as_mut() };
+        let host = obj.tagged(self);
+        obj.header.map.init(self.known().array_map.as_tagged(self));
+        obj.size.set(self, host, Smi::new(len as i64));
+        for i in 0..len {
+            // the host is fresh, so no old→young barrier is needed
+            obj.element_slot(i).as_raw().store_raw(fill.to_bits());
+        }
+        // Safety: fresh strong pointer, anchored at this borrow.
+        unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
+    }
+
     // TODO: potentially remove this in favor of a better allocate function
     pub fn allocate_object<'a>(
         &mut self,

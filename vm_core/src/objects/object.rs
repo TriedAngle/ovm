@@ -64,6 +64,7 @@ impl Object {
         Some(CallTarget::Runtime(usize::try_from(idx).ok()?))
     }
 
+    #[inline(always)]
     pub fn is_array<'a>(&'a self, heap: &'a Heap) -> bool {
         self.header.map.get(heap).kind().is_array()
     }
@@ -103,10 +104,12 @@ impl Object {
         self.slots.get(heap).as_ref().element_slot(offset)
     }
 
+    #[inline(always)]
     pub fn length(&self) -> usize {
         self.length.to_smi_unchecked().value() as usize
     }
 
+    #[inline(always)]
     pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, FixedArray>> {
         let elements = self.elements.get(heap);
         elements.is_strong_ptr().then_some(elements)
@@ -246,24 +249,29 @@ impl Object {
         }
 
         if grows {
-            let staged = {
+            // V8's `NewElementsCapacity`: 1.5x + 16, never below the
+            // current backing store.
+            let (capacity, keep) = {
                 let heap_ref: &Heap = heap;
                 let obj = receiver.as_tagged(heap_ref);
                 let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
                 let keep = obj.as_ref().length().min(elements.len());
                 let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
-                let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(capacity);
-                for k in 0..keep {
-                    values.push(elements.at(heap_ref, k));
-                }
-                values.resize(
-                    capacity,
-                    heap_ref.known().the_hole.as_tagged(heap_ref).erase(),
-                );
-                values[i] = value.as_tagged(heap_ref).erase();
-                scope.stage(&values)
+                (capacity, keep)
             };
-            let elements = heap.allocate_handle::<FixedArray>(staged, scope);
+            // one allocation, one copy: the old elements go straight into
+            // the fresh backing store (no intermediate Vec or staging block)
+            let elements = heap.allocate_hole_array(capacity).as_handle(scope);
+            {
+                let heap_ref: &Heap = heap;
+                let obj = receiver.as_tagged(heap_ref);
+                let old = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
+                let new = elements.as_tagged(heap_ref);
+                for k in 0..keep {
+                    new.as_ref().set(heap_ref, k, old.at(heap_ref, k));
+                }
+                new.as_ref().set(heap_ref, i, value.as_tagged(heap_ref));
+            }
             let obj = receiver.as_tagged(heap);
             obj.elements
                 .set(heap, obj.erase(), elements.as_tagged(heap));

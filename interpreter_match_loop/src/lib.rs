@@ -119,11 +119,8 @@ fn start<'b>(
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
         Some(CallTarget::Runtime(idx)) => {
             let f = vm.runtime(RuntimeIndex(idx));
-            let (saved_top, fargs) = state.stack().stage_args(heap, args)?;
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
-            let v = f(nctx, fargs);
-            state.stack().set_top(saved_top);
-            Ok(v)
+            Ok(f(nctx, args))
         }
         Some(CallTarget::Bytecode {
             target,
@@ -1254,7 +1251,7 @@ unsafe fn step<'a>(
                         let exception = heap.known().exception.as_tagged(heap).raw();
                         let (saved_top, staged) = fold!(
                             ctx,
-                            stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                            stack.stage_args_regs(frame_base, srcs.0, srcs.1, srcs.2)
                         );
                         let nctx = RuntimeContext::new(vm, heap, state);
                         let v = f(nctx, staged);
@@ -1274,7 +1271,7 @@ unsafe fn step<'a>(
             if Proxy::is_proxy(heap, stack.reg(heap, frame_base, callee_reg)) {
                 let (saved_top, staged) = fold!(
                     ctx,
-                    stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                    stack.stage_args_regs(frame_base, srcs.0, srcs.1, srcs.2)
                 );
                 let result = state.handle_scope(|scope| {
                     let callee = scope.handle(stack.reg(heap, frame_base, callee_reg));
@@ -1298,7 +1295,7 @@ unsafe fn step<'a>(
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let (saved_top, staged) = fold!(
                         ctx,
-                        stack.stage_args_regs(heap, frame_base, srcs.0, srcs.1, srcs.2)
+                        stack.stage_args_regs(frame_base, srcs.0, srcs.1, srcs.2)
                     );
                     let nctx = RuntimeContext::new(vm, heap, state);
                     let v = f(nctx, staged);
