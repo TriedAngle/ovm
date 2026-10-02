@@ -3110,7 +3110,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let mut i = 0u32;
         for el in &a.elements {
             match el {
-                ArrayExpressionElement::Elision(_) => {}
+                // an elision is a hole: it consumes an index but stores
+                // nothing (the gap grow/holes below fill it in)
+                ArrayExpressionElement::Elision(_) => i += 1,
                 ArrayExpressionElement::SpreadElement(_) => {
                     return self.err(a.span, "spread in array literals");
                 }
@@ -3125,6 +3127,15 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     i += 1;
                 }
             }
+        }
+        // trailing elisions raise the length past the last store: the
+        // elements store cannot do it (nothing is stored), so set it
+        // explicitly (`length` is the array accessor)
+        if matches!(a.elements.last(), Some(ArrayExpressionElement::Elision(_))) {
+            self.b.load_smi(a.elements.len() as i32);
+            let name = self.b.name(b"length");
+            let feedback = self.b.new_feedback();
+            self.b.store_named_property(arr, name, feedback);
         }
         self.b.load(arr);
         self.b.drop_temp();

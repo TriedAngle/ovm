@@ -814,9 +814,6 @@ fn analyze_store<'s>(
         setter: None,
         entries: Vec::new(),
     };
-    if receiver.as_ref().array_length(heap, name).is_some() {
-        return plan;
-    }
     let mut entries: Vec<ChainEntry<'s>> = Vec::new();
     match walk(heap, scope, receiver, name, -1, &mut entries) {
         Some(Found::Data { offset }) if entries.is_empty() => plan.field = Some(offset),

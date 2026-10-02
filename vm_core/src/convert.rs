@@ -69,6 +69,28 @@ impl Convert {
         Err(VmError::Type)
     }
 
+    /// ES 7.1.6 ToInt32 applied to a number: truncate, reduce mod 2^32,
+    /// map the upper half to negatives. NaN and ±∞ are +0.
+    pub fn number_to_int32(n: f64) -> i32 {
+        if !n.is_finite() {
+            return 0;
+        }
+        let n = n.trunc().rem_euclid(4_294_967_296.0);
+        if n >= 2_147_483_648.0 {
+            (n - 4_294_967_296.0) as i32
+        } else {
+            n as i32
+        }
+    }
+
+    /// ES 7.1.7 ToUint32 applied to a number. NaN and ±∞ are +0.
+    pub fn number_to_uint32(n: f64) -> u32 {
+        if !n.is_finite() {
+            return 0;
+        }
+        n.trunc().rem_euclid(4_294_967_296.0) as u32
+    }
+
     /// StringNumericLiteral → f64 (ES 7.1.4.1). `None` means NaN (invalid
     /// numeric content); empty or all-whitespace input is +0.
     fn string_to_number(data: StringData<'_>) -> Option<f64> {
@@ -98,6 +120,26 @@ impl Convert {
         }
         if matches(b"NaN") {
             return Some(f64::NAN);
+        }
+        // NonDecimalIntegerLiteral (ES 7.1.4.1): 0x/0o/0b radix prefixes,
+        // no sign allowed before them
+        if hi - lo >= 2 && unit(lo) == b'0' as u16 {
+            let radix = match unit(lo + 1) as u8 {
+                b'x' | b'X' => Some(16),
+                b'o' | b'O' => Some(8),
+                b'b' | b'B' => Some(2),
+                _ => None,
+            };
+            if let Some(radix) = radix {
+                let mut acc = 0.0f64;
+                for i in lo + 2..hi {
+                    let c = char::from_u32(unit(i) as u32)?;
+                    let digit = c.to_digit(radix)?;
+                    acc = acc * radix as f64 + digit as f64;
+                }
+                // "0x" with no digits is NaN (empty digit run)
+                return (hi - lo > 2).then_some(acc);
+            }
         }
         // any unit above 0x7F cannot participate in a numeric literal
         let bytes: Vec<u8> = (lo..hi)

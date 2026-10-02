@@ -20,10 +20,14 @@ pub mod symbol;
 
 use array::{
     array_constructor, array_is_array, array_iterator_next, array_iterator_symbol_iterator,
-    array_join, array_pop, array_push, array_to_string, array_values,
+    array_join, array_length_get, array_length_set, array_pop, array_push, array_slice, array_sort,
+    array_to_string, array_values,
 };
 use boolean::{boolean_constructor, boolean_to_string, boolean_value_of};
-use date::{date_constructor, date_now, date_to_string, date_value_of};
+use date::{
+    date_constructor, date_now, date_parse, date_to_gmt_string, date_to_iso_string, date_to_string,
+    date_value_of,
+};
 use error::{
     error_constructor, error_to_string, reference_error_constructor, type_error_constructor,
 };
@@ -54,8 +58,9 @@ use vm_core::runtime_api::{
     make_runtime_plain_function, run_prelude,
 };
 use vm_core::{
-    EdgeVisitable, Float, Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor,
-    Runtime, RuntimeIndex, SlotFlags, SlotName, Smi, Tagged, VM, Value, Visitor, VmError,
+    AccessorPair, EdgeVisitable, Float, Handle, HandleSlice, Map, MapInit, MapKind, Object,
+    PropertyDescriptor, Runtime, RuntimeIndex, SlotFlags, SlotName, Smi, Tagged, VM, Value,
+    Visitor, VmError,
 };
 
 pub struct JSRuntime;
@@ -121,6 +126,9 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
         date_now: vm.register_runtime(date_now),
         date_value_of: vm.register_runtime(date_value_of),
         date_to_string: vm.register_runtime(date_to_string),
+        date_to_iso_string: vm.register_runtime(date_to_iso_string),
+        date_to_gmt_string: vm.register_runtime(date_to_gmt_string),
+        date_parse: vm.register_runtime(date_parse),
         print: vm.register_runtime(print),
         performance_now: vm.register_runtime(performance_now),
         array_iterator_next: vm.register_runtime(array_iterator_next),
@@ -155,6 +163,10 @@ pub fn register_builtin_runtimes(vm: &mut VM) -> BuiltinIndices {
         console_log: vm.register_runtime(console_log),
         array_join: vm.register_runtime(array_join),
         array_to_string: vm.register_runtime(array_to_string),
+        array_length_get: vm.register_runtime(array_length_get),
+        array_length_set: vm.register_runtime(array_length_set),
+        array_slice: vm.register_runtime(array_slice),
+        array_sort: vm.register_runtime(array_sort),
     }
 }
 
@@ -193,6 +205,9 @@ pub struct BuiltinIndices {
     pub date_now: RuntimeIndex,
     pub date_value_of: RuntimeIndex,
     pub date_to_string: RuntimeIndex,
+    pub date_to_iso_string: RuntimeIndex,
+    pub date_to_gmt_string: RuntimeIndex,
+    pub date_parse: RuntimeIndex,
     pub print: RuntimeIndex,
     pub performance_now: RuntimeIndex,
     pub array_iterator_next: RuntimeIndex,
@@ -227,6 +242,10 @@ pub struct BuiltinIndices {
     pub console_log: RuntimeIndex,
     pub array_join: RuntimeIndex,
     pub array_to_string: RuntimeIndex,
+    pub array_length_get: RuntimeIndex,
+    pub array_length_set: RuntimeIndex,
+    pub array_slice: RuntimeIndex,
+    pub array_sort: RuntimeIndex,
 }
 
 /// Build the builtin objects and install them on the global object.
@@ -662,6 +681,8 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
         install_method(thread, &scope, array_prototype, "push", idx.array_push)?;
         install_method(thread, &scope, array_prototype, "pop", idx.array_pop)?;
         install_method(thread, &scope, array_prototype, "join", idx.array_join)?;
+        install_method(thread, &scope, array_prototype, "slice", idx.array_slice)?;
+        install_method(thread, &scope, array_prototype, "sort", idx.array_sort)?;
         install_method(
             thread,
             &scope,
@@ -669,6 +690,42 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             "toString",
             idx.array_to_string,
         )?;
+
+        // array `length` is an own accessor on the array map (V8-style):
+        // the load fast path reads the internal slot, and stores route
+        // through the setter (ArraySetLength) via the ordinary accessor
+        // machinery — no store-path special case needed.
+        {
+            let get_fn = make_runtime_plain_function(thread, &scope, idx.array_length_get)?;
+            let set_fn = make_runtime_plain_function(thread, &scope, idx.array_length_set)?;
+            let get_fn = scope.handle(get_fn.as_tagged(&*thread.heap()).erase());
+            let set_fn = scope.handle(set_fn.as_tagged(&*thread.heap()).erase());
+            let pair = thread
+                .heap()
+                .allocate_handle::<AccessorPair>((get_fn, set_fn), &scope);
+            let length_name = wks.length;
+            let prototype = scope
+                .handle(unsafe { Tagged::<Value>::from_value_unchecked(array_prototype.raw()) });
+            let map = thread
+                .heap()
+                .allocate_token_enter_heap(Map::layout_for(1), |token, heap| {
+                    let descriptors: [(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>); 1] =
+                        [(
+                            length_name,
+                            SlotFlags::ACCESSOR,
+                            scope.handle(pair.as_tagged(heap).erase()),
+                        )];
+                    roots.create_handle(token.allocate::<Map>(MapInit {
+                        kind: MapKind::ARRAY.union(MapKind::EXTENDABLE),
+                        value_slot_count: 0,
+                        descriptors: &descriptors,
+                        prototype,
+                    }))
+                });
+            let mut known = *thread.heap().known();
+            known.js_array_map = map;
+            thread.heap().set_known(known);
+        }
 
         // ---- Date -----------------------------------------------------------------
         let date_fn = make_runtime_function(thread, &scope, idx.date)?;
@@ -694,6 +751,38 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             date_prototype,
             "toString",
             idx.date_to_string,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            date_prototype,
+            "toISOString",
+            idx.date_to_iso_string,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            date_prototype,
+            "toGMTString",
+            idx.date_to_gmt_string,
+        )?;
+        install_method(
+            thread,
+            &scope,
+            date_prototype,
+            "toUTCString",
+            idx.date_to_gmt_string,
+        )?;
+        let date_parse_fn = make_runtime_plain_function(thread, &scope, idx.date_parse)?;
+        let date_parse_name = thread.intern(&scope, "parse");
+        // Safety: fresh interned word, rooted below before the define.
+        let date_parse_name = scope.handle(date_parse_name.as_tagged(&*thread.heap()));
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            date_fn,
+            date_parse_name,
+            PropertyDescriptor::data(date_parse_fn.erase()),
         )?;
         let date_now_fn = make_runtime_plain_function(thread, &scope, idx.date_now)?;
         let date_now_name = thread.intern(&scope, "now");

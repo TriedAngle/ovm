@@ -1829,79 +1829,90 @@ unsafe fn step<'a>(
             })
         }
         Opcode::BitwiseOr => {
-            // ToInt32 semantics on the (integer) smi inputs
-            let a = fold!(
-                ctx,
-                stack
-                    .reg(heap, frame_base, ops.reg(0))
-                    .to_i64()
-                    .ok_or(VmError::Type)
-            ) as i32;
-            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as i32;
-            acc.store(Smi::new((a | b) as i64).into_tagged());
+            let a = stack.reg(heap, frame_base, ops.reg(0));
+            let b = acc.get(heap);
+            if let (Some(ai), Some(bi)) = (a.to_i64(), b.to_i64()) {
+                acc.store(Smi::new(((ai as i32) | (bi as i32)) as i64).into_tagged());
+                return Flow::Sync;
+            }
+            let v = vm_core::cold::bitwise(ctx, 0, a, b);
+            if ctx.is_throw(v) {
+                return Flow::Threw;
+            }
+            acc.store(v);
             Flow::Sync
         }
         Opcode::BitwiseXor => {
-            let a = fold!(
-                ctx,
-                stack
-                    .reg(heap, frame_base, ops.reg(0))
-                    .to_i64()
-                    .ok_or(VmError::Type)
-            ) as i32;
-            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as i32;
-            acc.store(Smi::new((a ^ b) as i64).into_tagged());
+            let a = stack.reg(heap, frame_base, ops.reg(0));
+            let b = acc.get(heap);
+            if let (Some(ai), Some(bi)) = (a.to_i64(), b.to_i64()) {
+                acc.store(Smi::new(((ai as i32) ^ (bi as i32)) as i64).into_tagged());
+                return Flow::Sync;
+            }
+            let v = vm_core::cold::bitwise(ctx, 1, a, b);
+            if ctx.is_throw(v) {
+                return Flow::Threw;
+            }
+            acc.store(v);
             Flow::Sync
         }
         Opcode::BitwiseAnd => {
-            let a = fold!(
-                ctx,
-                stack
-                    .reg(heap, frame_base, ops.reg(0))
-                    .to_i64()
-                    .ok_or(VmError::Type)
-            ) as i32;
-            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as i32;
-            acc.store(Smi::new((a & b) as i64).into_tagged());
+            let a = stack.reg(heap, frame_base, ops.reg(0));
+            let b = acc.get(heap);
+            if let (Some(ai), Some(bi)) = (a.to_i64(), b.to_i64()) {
+                acc.store(Smi::new(((ai as i32) & (bi as i32)) as i64).into_tagged());
+                return Flow::Sync;
+            }
+            let v = vm_core::cold::bitwise(ctx, 2, a, b);
+            if ctx.is_throw(v) {
+                return Flow::Threw;
+            }
+            acc.store(v);
             Flow::Sync
         }
         Opcode::ShiftLeft => {
             // ToInt32(lhs) << (ToUint32(rhs) & 31), truncated to int32
-            let a = fold!(
-                ctx,
-                stack
-                    .reg(heap, frame_base, ops.reg(0))
-                    .to_i64()
-                    .ok_or(VmError::Type)
-            ) as i32;
-            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as u32;
-            acc.store(Smi::new(a.wrapping_shl(b & 31) as i64).into_tagged());
+            let a = stack.reg(heap, frame_base, ops.reg(0));
+            let b = acc.get(heap);
+            if let (Some(ai), Some(bi)) = (a.to_i64(), b.to_i64()) {
+                acc.store(Smi::new((ai as i32).wrapping_shl(bi as u32 & 31) as i64).into_tagged());
+                return Flow::Sync;
+            }
+            let v = vm_core::cold::bitwise(ctx, 3, a, b);
+            if ctx.is_throw(v) {
+                return Flow::Threw;
+            }
+            acc.store(v);
             Flow::Sync
         }
         Opcode::ShiftRight => {
             // ToInt32(lhs) >> (ToUint32(rhs) & 31), sign-extending
-            let a = fold!(
-                ctx,
-                stack
-                    .reg(heap, frame_base, ops.reg(0))
-                    .to_i64()
-                    .ok_or(VmError::Type)
-            ) as i32;
-            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as u32;
-            acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
+            let a = stack.reg(heap, frame_base, ops.reg(0));
+            let b = acc.get(heap);
+            if let (Some(ai), Some(bi)) = (a.to_i64(), b.to_i64()) {
+                acc.store(Smi::new((ai as i32).wrapping_shr(bi as u32 & 31) as i64).into_tagged());
+                return Flow::Sync;
+            }
+            let v = vm_core::cold::bitwise(ctx, 4, a, b);
+            if ctx.is_throw(v) {
+                return Flow::Threw;
+            }
+            acc.store(v);
             Flow::Sync
         }
         Opcode::ShiftRightLogical => {
             // ToUint32(lhs) >>> (ToUint32(rhs) & 31): always non-negative
-            let a = fold!(
-                ctx,
-                stack
-                    .reg(heap, frame_base, ops.reg(0))
-                    .to_i64()
-                    .ok_or(VmError::Type)
-            ) as u32;
-            let b = fold!(ctx, acc.get(heap).to_i64().ok_or(VmError::Type)) as u32;
-            acc.store(Smi::new(a.wrapping_shr(b & 31) as i64).into_tagged());
+            let a = stack.reg(heap, frame_base, ops.reg(0));
+            let b = acc.get(heap);
+            if let (Some(ai), Some(bi)) = (a.to_i64(), b.to_i64()) {
+                acc.store(Smi::new((ai as u32).wrapping_shr(bi as u32 & 31) as i64).into_tagged());
+                return Flow::Sync;
+            }
+            let v = vm_core::cold::bitwise(ctx, 5, a, b);
+            if ctx.is_throw(v) {
+                return Flow::Threw;
+            }
+            acc.store(v);
             Flow::Sync
         }
         Opcode::Jump => Flow::Jump(jump_target(pc, ops.imm(0))),
@@ -2206,22 +2217,26 @@ unsafe fn step<'a>(
                     acc.store(v);
                     Flow::Sync
                 }
-                // bitwise/shift: Smi-only (ToInt32/ToUint32)
+                // bitwise/shift: ToInt32/ToUint32 coercion of the lhs
                 _ => {
-                    let Some(a) = stack.reg(heap, frame_base, reg).to_i64() else {
-                        throw_err!(ctx, VmError::Type);
+                    let kind = match op {
+                        Opcode::BitwiseOrImmediate => 0,
+                        Opcode::BitwiseXorImmediate => 1,
+                        Opcode::BitwiseAndImmediate => 2,
+                        Opcode::ShiftLeftImmediate => 3,
+                        Opcode::ShiftRightImmediate => 4,
+                        _ => 5,
                     };
-                    let a = a as i32;
-                    let b = imm as u32;
-                    let r = match op {
-                        Opcode::BitwiseOrImmediate => a | b as i32,
-                        Opcode::BitwiseXorImmediate => a ^ b as i32,
-                        Opcode::BitwiseAndImmediate => a & b as i32,
-                        Opcode::ShiftLeftImmediate => a.wrapping_shl(b & 31),
-                        Opcode::ShiftRightImmediate => a.wrapping_shr(b & 31),
-                        _ => (a as u32).wrapping_shr(b & 31) as i32,
-                    };
-                    acc.store(Smi::new(r as i64).into_tagged());
+                    let v = vm_core::cold::bitwise(
+                        ctx,
+                        kind,
+                        stack.reg(heap, frame_base, reg),
+                        Smi::new(imm as i64).into_tagged(),
+                    );
+                    if ctx.is_throw(v) {
+                        return Flow::Threw;
+                    }
+                    acc.store(v);
                     Flow::Sync
                 }
             }

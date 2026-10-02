@@ -272,16 +272,9 @@ pub fn object_get_own_property_names<'a>(
         return raise_runtime(vm, heap, state, VmError::Arity);
     };
     let target = target.as_tagged(heap);
-    let names: Vec<Value> = {
-        let mut keys = own_property_keys(heap, target);
-        // arrays also list "length" (and it sorts with the strings)
-        if let Some(obj) = target.as_heap_object()
-            && obj.as_ref().is_array(heap)
-        {
-            keys.push(heap.known().strings.length.as_tagged(heap).raw());
-        }
-        keys
-    };
+    // array `length` is a real (accessor) descriptor on the array map, so
+    // `own_property_keys` already lists it
+    let names: Vec<Value> = own_property_keys(heap, target);
     state.handle_scope(|scope| {
         let staged = scope.stage(
             &names

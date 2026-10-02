@@ -972,7 +972,7 @@ extern "rust-preserve-none" fn op_bitwise_or<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::BitwiseOr);
     let r = ops.signed::<0>();
     let (Some(a), Some(b)) = (regs.read(r, ctx).to_i64(), acc.to_i64()) else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         BitwiseOr,
@@ -999,7 +999,7 @@ extern "rust-preserve-none" fn op_bitwise_xor<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::BitwiseXor);
     let r = ops.signed::<0>();
     let (Some(a), Some(b)) = (regs.read(r, ctx).to_i64(), acc.to_i64()) else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         BitwiseXor,
@@ -1026,7 +1026,7 @@ extern "rust-preserve-none" fn op_bitwise_and<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::BitwiseAnd);
     let r = ops.signed::<0>();
     let (Some(a), Some(b)) = (regs.read(r, ctx).to_i64(), acc.to_i64()) else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         BitwiseAnd,
@@ -1053,7 +1053,7 @@ extern "rust-preserve-none" fn op_shift_left<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::ShiftLeft);
     let r = ops.signed::<0>();
     let (Some(a), Some(b)) = (regs.read(r, ctx).to_i64(), acc.to_i64()) else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         ShiftLeft,
@@ -1080,7 +1080,7 @@ extern "rust-preserve-none" fn op_shift_right<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::ShiftRight);
     let r = ops.signed::<0>();
     let (Some(a), Some(b)) = (regs.read(r, ctx).to_i64(), acc.to_i64()) else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         ShiftRight,
@@ -1107,7 +1107,7 @@ extern "rust-preserve-none" fn op_shift_right_logical<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::ShiftRightLogical);
     let r = ops.signed::<0>();
     let (Some(a), Some(b)) = (regs.read(r, ctx).to_i64(), acc.to_i64()) else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         ShiftRightLogical,
@@ -1135,7 +1135,7 @@ extern "rust-preserve-none" fn op_bitwise_or_immediate<'a, const STRIDE: usize>(
     let r = ops.signed::<0>();
     let imm = ops.signed::<1>();
     let Some(a) = regs.read(r, ctx).to_i64() else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         BitwiseOrImmediate,
@@ -1163,7 +1163,7 @@ extern "rust-preserve-none" fn op_bitwise_xor_immediate<'a, const STRIDE: usize>
     let r = ops.signed::<0>();
     let imm = ops.signed::<1>();
     let Some(a) = regs.read(r, ctx).to_i64() else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         BitwiseXorImmediate,
@@ -1191,7 +1191,7 @@ extern "rust-preserve-none" fn op_bitwise_and_immediate<'a, const STRIDE: usize>
     let r = ops.signed::<0>();
     let imm = ops.signed::<1>();
     let Some(a) = regs.read(r, ctx).to_i64() else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         BitwiseAndImmediate,
@@ -1219,7 +1219,7 @@ extern "rust-preserve-none" fn op_shift_left_immediate<'a, const STRIDE: usize>(
     let r = ops.signed::<0>();
     let imm = ops.signed::<1>();
     let Some(a) = regs.read(r, ctx).to_i64() else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         ShiftLeftImmediate,
@@ -1247,7 +1247,7 @@ extern "rust-preserve-none" fn op_shift_right_immediate<'a, const STRIDE: usize>
     let r = ops.signed::<0>();
     let imm = ops.signed::<1>();
     let Some(a) = regs.read(r, ctx).to_i64() else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         ShiftRightImmediate,
@@ -1275,7 +1275,7 @@ extern "rust-preserve-none" fn op_shift_right_logical_immediate<'a, const STRIDE
     let r = ops.signed::<0>();
     let imm = ops.signed::<1>();
     let Some(a) = regs.read(r, ctx).to_i64() else {
-        bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
+        become slow_bitwise_immediate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
     };
     next!(
         ShiftRightLogicalImmediate,

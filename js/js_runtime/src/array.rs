@@ -57,20 +57,38 @@ pub fn array_push<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged
         let Some(receiver) = args.get(0) else {
             return raise_runtime(vm, heap, state, VmError::Arity);
         };
-        let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+        let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
-        if !obj.as_tagged(heap).as_ref().is_array(heap) {
+        if !obj.as_ref().is_array(heap) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
+        let obj = scope.handle(obj);
         let mut len = obj.as_tagged(heap).as_ref().length();
         for arg in args.iter().skip(1) {
-            rt_try!(
-                vm,
-                heap,
-                state,
-                Object::store_array_element(heap, &scope, &obj, len, &arg)
-            );
+            let capacity = obj
+                .as_tagged(heap)
+                .as_ref()
+                .elements_array(heap)
+                .map(|e| e.len())
+                .unwrap_or(0);
+            if len < capacity {
+                // in-place append: no growth, no re-derivation
+                let obj_t = obj.as_tagged(heap);
+                let elements = obj_t.as_ref().elements_array(heap).expect("capacity > len");
+                elements.as_ref().set(heap, len, arg.as_tagged(heap));
+                obj_t
+                    .as_ref()
+                    .length
+                    .set(heap, obj_t.erase(), Smi::new((len + 1) as i64));
+            } else {
+                rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    Object::store_array_element(heap, &scope, &obj, len, &arg)
+                );
+            }
             len += 1;
         }
         Smi::new(len as i64).into_tagged()
@@ -351,4 +369,378 @@ pub fn array_is_array<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Ta
         .as_heap_object()
         .is_some_and(|o| o.as_ref().is_array(heap));
     Convert::boolean(heap, is_array)
+}
+
+/// The array `length` accessor getter: reads the internal slot (the
+/// descriptor exists so the generic lookup finds `length`; the fast load
+/// path never reaches this).
+pub fn array_length_get<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm: _,
+        heap,
+        state: _,
+        ..
+    } = nctx;
+    let Some(receiver) = args.get(0) else {
+        return heap.known().undefined.as_tagged(heap).erase();
+    };
+    receiver
+        .as_tagged(heap)
+        .as_heap_object()
+        .map(|o| Smi::new(o.as_ref().length() as i64).into_tagged())
+        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase())
+}
+
+/// The array `length` accessor setter (ES 10.4.2.3 ArraySetLength):
+/// ToNumber, then the uint32 truncation must equal it exactly (else a
+/// RangeError — approximated by `OutOfBounds`); shrinking punches holes
+/// in the dropped elements.
+pub fn array_length_set<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
+        let Some(receiver) = args.get(0) else {
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
+        let Some(value) = args.get(1) else {
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
+        let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        };
+        if !obj.as_ref().is_array(heap) {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        }
+        let obj = scope.handle(obj);
+        let value = scope.handle(value.as_tagged(heap));
+        let n = match Object::to_numeric(vm, heap, state, value) {
+            Ok(Some(n)) => n,
+            Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        };
+        let new_len = Convert::number_to_uint32(n);
+        if new_len as f64 != n {
+            // spec: RangeError ("invalid array length")
+            return raise_runtime(vm, heap, state, VmError::OutOfBounds);
+        }
+        let new_len = new_len as usize;
+        let obj_t = obj.as_tagged(heap);
+        let old_len = obj_t.as_ref().length();
+        if new_len < old_len {
+            let hole = heap.known().the_hole.as_tagged(heap).erase();
+            if let Some(elements) = obj_t.as_ref().elements_array(heap) {
+                for i in new_len..old_len.min(elements.len()) {
+                    elements.as_ref().set(heap, i, hole);
+                }
+            }
+            obj_t.as_ref().mark_holey(heap);
+        }
+        obj_t
+            .as_ref()
+            .length
+            .set(heap, obj_t.erase(), Smi::new(new_len as i64));
+        heap.known().undefined.as_tagged(heap).erase()
+    })
+}
+
+/// A `slice` boundary: absent/undefined → `default`, Smi passes straight
+/// through, otherwise ToNumber and truncate (NaN → 0). `Ok(None)` is a
+/// pending exception.
+fn slice_bound(
+    vm: &VM,
+    heap: &mut Heap,
+    state: &ContextState,
+    arg: Option<Handle<'_, Value>>,
+    default: f64,
+) -> Result<Option<f64>, VmError> {
+    let Some(h) = arg else {
+        return Ok(Some(default));
+    };
+    let v = h.as_tagged(heap);
+    if v == heap.known().undefined.as_tagged(heap) {
+        return Ok(Some(default));
+    }
+    if let Some(smi) = Smi::decode(v.raw()) {
+        return Ok(Some(smi.value() as f64));
+    }
+    match Object::to_numeric(vm, heap, state, h)? {
+        Some(n) => Ok(Some(if n.is_nan() { 0.0 } else { n.trunc() })),
+        None => Ok(None),
+    }
+}
+
+/// `Array.prototype.slice(start, end)` (ES 23.1.3.34): a new array with
+/// the `[start, end)` elements, holes preserved. An absent/undefined bound
+/// is the fast path (no coercion; `slice()` clones the whole backing
+/// store).
+pub fn array_slice<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
+        let Some(receiver) = args.get(0) else {
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
+        let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        };
+        if !obj.as_ref().is_array(heap) {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        }
+        let obj = scope.handle(obj);
+        let len = obj.as_tagged(heap).as_ref().length() as f64;
+
+        let start = match slice_bound(vm, heap, state, args.get(1), 0.0) {
+            Ok(Some(v)) => v,
+            Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        };
+        let end = match slice_bound(vm, heap, state, args.get(2), len) {
+            Ok(Some(v)) => v,
+            Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        };
+        let start = if start < 0.0 {
+            (len + start).max(0.0)
+        } else {
+            start.min(len)
+        };
+        let end = if end < 0.0 {
+            (len + end).max(0.0)
+        } else {
+            end.min(len)
+        };
+        let count = (end - start).max(0.0) as usize;
+        let start = start as usize;
+
+        // one gather pass, then a single bulk FixedArray allocation
+        let hole = heap.known().the_hole.as_tagged(heap).erase().raw();
+        let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(count);
+        let mut has_hole = false;
+        for i in start..start + count {
+            match obj.as_tagged(heap).as_ref().element_value(heap, i) {
+                Some(v) => values.push(v),
+                None => {
+                    // Safety: old-gen singleton word.
+                    values.push(unsafe { Tagged::<Value>::from_value_unchecked(hole) });
+                    has_hole = true;
+                }
+            }
+        }
+        let staged = scope.stage(&values);
+        let arr = heap.new_array(&scope, staged).as_handle(&scope);
+        if has_hole {
+            arr.as_tagged(heap).as_ref().mark_holey(heap);
+        }
+        arr.as_tagged(heap).erase()
+    })
+}
+
+/// `Array.prototype.sort(comparefn)` (ES 23.1.3.30): in-place, stable.
+/// Holes move last, `undefined` before them without invoking `comparefn`;
+/// the default comparator is the elements' `ToString` order. Returns the
+/// receiver.
+pub fn array_sort<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    let RuntimeContext {
+        vm, heap, state, ..
+    } = nctx;
+    state.handle_scope(|scope| {
+        let Some(receiver) = args.get(0) else {
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        };
+        let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        };
+        if !obj.as_ref().is_array(heap) {
+            return raise_runtime(vm, heap, state, VmError::Type);
+        }
+        let obj = scope.handle(obj);
+        // an explicit `undefined` comparator means the default one
+        let cmpfn = match args.get(1) {
+            Some(c) if c.as_tagged(heap) != heap.known().undefined.as_tagged(heap) => {
+                if !Object::is_callable(heap, c.as_tagged(heap)) {
+                    return raise_runtime(vm, heap, state, VmError::Type);
+                }
+                Some(scope.handle(c.as_tagged(heap)))
+            }
+            _ => None,
+        };
+        let undefined = heap.known().undefined.as_tagged(heap).erase().raw();
+        let exception = heap.known().exception.as_tagged(heap).erase().raw();
+        let len = obj.as_tagged(heap).as_ref().length();
+
+        // Root every element up front. The sort can allocate (`ToString`
+        // for the default keys, user code for a comparator); a collection
+        // would invalidate raw words, but handles are updated in place by
+        // the GC, so they stay valid throughout.
+        let mut elems: Vec<Handle<'_, Value>> = Vec::new();
+        let mut undefined_count = 0usize;
+        for i in 0..len {
+            match obj.as_tagged(heap).as_ref().element_value(heap, i) {
+                None => {}
+                Some(v) if v.raw() == undefined => undefined_count += 1,
+                Some(v) => elems.push(scope.handle(v)),
+            }
+        }
+        let count = elems.len();
+
+        match &cmpfn {
+            None => {
+                // default comparator. When every element is already a
+                // string, compare the rooted DenseStrings in place — no key
+                // materialization at all.
+                let all_strings = elems
+                    .iter()
+                    .all(|h| h.as_tagged(heap).get_as::<DenseString>().is_some());
+                if all_strings {
+                    elems.sort_by(|a, b| {
+                        cmp_dense_strings(heap, a.as_tagged(heap), b.as_tagged(heap))
+                    });
+                } else {
+                    // materialize each element's ToString once (rooted),
+                    // then sort the (value, key) pairs directly by key
+                    let mut pairs: Vec<(Handle<'_, Value>, Handle<'_, Value>)> =
+                        Vec::with_capacity(count);
+                    for h in elems.iter() {
+                        let key = match Object::to_string(vm, heap, state, *h) {
+                            Ok(Some(s)) => s,
+                            Ok(None) => {
+                                // Safety: old-gen singleton word.
+                                return unsafe { Tagged::<Value>::from_value_unchecked(exception) };
+                            }
+                            Err(err) => return raise_runtime(vm, heap, state, err),
+                        };
+                        let kh = scope
+                            .handle(unsafe { Tagged::<Value>::from_value_unchecked(key.raw()) });
+                        pairs.push((*h, kh));
+                    }
+                    pairs.sort_by(|a, b| {
+                        cmp_dense_strings(heap, a.1.as_tagged(heap), b.1.as_tagged(heap))
+                    });
+                    elems = pairs.into_iter().map(|p| p.0).collect();
+                }
+            }
+            Some(cmp) => {
+                let threw = core::cell::Cell::new(false);
+                elems.sort_by(|a, b| {
+                    if threw.get() {
+                        return core::cmp::Ordering::Equal;
+                    }
+                    // a fresh scope per comparison reclaims its slots
+                    state.handle_scope(|cscope| {
+                        let x = a.as_tagged(heap);
+                        let y = b.as_tagged(heap);
+                        let call_args = cscope.stage(&[
+                            // Safety: old-gen singleton word.
+                            unsafe { Tagged::<Value>::from_value_unchecked(undefined) },
+                            x,
+                            y,
+                        ]);
+                        let v = match RuntimeContext::call(vm, heap, state, *cmp, call_args, None) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                threw.set(true);
+                                return core::cmp::Ordering::Equal;
+                            }
+                        };
+                        if v.raw() == exception {
+                            threw.set(true);
+                            return core::cmp::Ordering::Equal;
+                        }
+                        // Safety: fresh word, no allocation since the read.
+                        let arg = unsafe { Tagged::<Value>::from_value_unchecked(v.raw()) };
+                        match Object::to_numeric(vm, heap, state, cscope.handle(arg)) {
+                            Ok(Some(n)) => {
+                                if n < 0.0 {
+                                    core::cmp::Ordering::Less
+                                } else if n > 0.0 {
+                                    core::cmp::Ordering::Greater
+                                } else {
+                                    core::cmp::Ordering::Equal
+                                }
+                            }
+                            _ => {
+                                threw.set(true);
+                                core::cmp::Ordering::Equal
+                            }
+                        }
+                    })
+                });
+                if threw.get() {
+                    // Safety: old-gen singleton word.
+                    return unsafe { Tagged::<Value>::from_value_unchecked(exception) };
+                }
+            }
+        }
+
+        // write back: a tight direct loop into the elements backing store
+        // when it has room; per-element stores only when it must grow
+        let total = count + undefined_count;
+        let capacity = obj
+            .as_tagged(heap)
+            .as_ref()
+            .elements_array(heap)
+            .map(|e| e.len())
+            .unwrap_or(0);
+        if total <= capacity {
+            let elements = obj
+                .as_tagged(heap)
+                .as_ref()
+                .elements_array(heap)
+                .expect("capacity > 0");
+            for (j, h) in elems.iter().enumerate() {
+                // Safety: rooted handle re-read under the shared borrow.
+                let v = h.as_tagged(heap);
+                elements.as_ref().set(heap, j, v);
+            }
+            for j in count..total {
+                // Safety: old-gen singleton word.
+                elements.as_ref().set(heap, j, unsafe {
+                    Tagged::<Value>::from_value_unchecked(undefined)
+                });
+            }
+        } else {
+            for (j, h) in elems.iter().enumerate() {
+                if let Err(e) = Object::store_array_element(heap, &scope, &obj, j, h) {
+                    return raise_runtime(vm, heap, state, e);
+                }
+            }
+            for j in count..total {
+                let h = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(undefined) });
+                if let Err(e) = Object::store_array_element(heap, &scope, &obj, j, &h) {
+                    return raise_runtime(vm, heap, state, e);
+                }
+            }
+        }
+        // the remainder become holes
+        if total < len {
+            let hole = heap.known().the_hole.as_tagged(heap).erase().raw();
+            if let Some(elements) = obj.as_tagged(heap).as_ref().elements_array(heap) {
+                for j in total..len.min(elements.len()) {
+                    // Safety: old-gen singleton word.
+                    elements.as_ref().set(heap, j, unsafe {
+                        Tagged::<Value>::from_value_unchecked(hole)
+                    });
+                }
+            }
+            obj.as_tagged(heap).as_ref().mark_holey(heap);
+        }
+        obj.as_tagged(heap).erase()
+    })
+}
+
+/// Lexicographic `DenseString` comparison over UTF-16 code units, in
+/// place (no allocation). Non-strings compare equal (the caller only uses
+/// this where both sides are known strings).
+#[inline]
+fn cmp_dense_strings(
+    heap: &Heap,
+    a: Tagged<'_, Value>,
+    b: Tagged<'_, Value>,
+) -> core::cmp::Ordering {
+    match (a.get_as::<DenseString>(), b.get_as::<DenseString>()) {
+        (Some(x), Some(y)) => x.as_ref().data(heap).cmp(&y.as_ref().data(heap)),
+        _ => core::cmp::Ordering::Equal,
+    }
 }

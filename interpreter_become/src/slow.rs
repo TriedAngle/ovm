@@ -133,6 +133,32 @@ slow_handler!(slow_negate |ip, ops, regs, acc, ctx, float| {
     unsafe { vm_core::cold::negate(ctx, acc) }
 });
 
+/// Map a bitwise/shift opcode to `cold::bitwise`'s kind index
+/// (0 = `|`, 1 = `^`, 2 = `&`, 3 = `<<`, 4 = `>>`, 5 = `>>>`).
+fn bitwise_kind(op: Opcode) -> u8 {
+    match op {
+        Opcode::BitwiseOr | Opcode::BitwiseOrImmediate => 0,
+        Opcode::BitwiseXor | Opcode::BitwiseXorImmediate => 1,
+        Opcode::BitwiseAnd | Opcode::BitwiseAndImmediate => 2,
+        Opcode::ShiftLeft | Opcode::ShiftLeftImmediate => 3,
+        Opcode::ShiftRight | Opcode::ShiftRightImmediate => 4,
+        _ => 5,
+    }
+}
+
+slow_handler!(slow_bitwise |ip, ops, regs, acc, ctx, float| {
+    let lhs = regs.read(ops.signed::<0>(), ctx);
+    let kind = bitwise_kind(unsafe { ops.op() });
+    unsafe { vm_core::cold::bitwise(ctx, kind, lhs, acc) }
+});
+
+slow_handler!(slow_bitwise_immediate |ip, ops, regs, acc, ctx, float| {
+    let lhs = regs.read(ops.signed::<0>(), ctx);
+    let imm = Smi::new(ops.signed::<1>() as i64).into_tagged();
+    let kind = bitwise_kind(unsafe { ops.op() });
+    unsafe { vm_core::cold::bitwise(ctx, kind, lhs, imm) }
+});
+
 slow_handler!(slow_inc_loc |ip, ops, regs, acc, ctx, float| {
     slow_try!(ctx, incdec_slow::<STRIDE>(ip, ctx, regs, 1.0))
 });

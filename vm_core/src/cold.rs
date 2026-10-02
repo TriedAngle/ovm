@@ -115,6 +115,45 @@ pub unsafe fn negate<'a>(ctx: &Ctx<'a>, v: Tagged<'_, Value>) -> Tagged<'a, Valu
     })
 }
 
+/// `Bitwise*`/`Shift*` cold body: ToInt32/ToUint32 both operands and apply
+/// the op. `kind`: 0 = `|`, 1 = `^`, 2 = `&`, 3 = `<<`, 4 = `>>`,
+/// 5 = `>>>`.
+pub unsafe fn bitwise<'a>(
+    ctx: &Ctx<'a>,
+    kind: u8,
+    lhs: Tagged<'_, Value>,
+    rhs: Tagged<'_, Value>,
+) -> Tagged<'a, Value> {
+    let vm = ctx.vm();
+    let heap = ctx.heap_mut();
+    let state = ctx.state();
+    state.handle_scope(|scope| {
+        let lhs = scope.handle(lhs);
+        let rhs = scope.handle(rhs);
+        let a = match Object::to_numeric(vm, heap, state, lhs) {
+            Ok(Some(n)) => n,
+            Ok(None) => return ctx.exception_word(),
+            Err(e) => return ctx.raise_tag(e),
+        };
+        let b = match Object::to_numeric(vm, heap, state, rhs) {
+            Ok(Some(n)) => n,
+            Ok(None) => return ctx.exception_word(),
+            Err(e) => return ctx.raise_tag(e),
+        };
+        let (ai, bi) = (Convert::number_to_int32(a), Convert::number_to_uint32(b));
+        let r: i64 = match kind {
+            0 => (ai | (bi as i32)) as i64,
+            1 => (ai ^ (bi as i32)) as i64,
+            2 => (ai & (bi as i32)) as i64,
+            3 => ai.wrapping_shl(bi & 31) as i64,
+            4 => ai.wrapping_shr(bi & 31) as i64,
+            // >>>: the uint32 result is always non-negative
+            _ => Convert::number_to_uint32(a).wrapping_shr(bi & 31) as i64,
+        };
+        Smi::new(r).into_tagged()
+    })
+}
+
 /// The compare cold body: `cmp` selects the relation (0 = loose `==`,
 /// 1 = strict `===`, 2 = `<`, 3 = `<=`, 4 = `>`, 5 = `>=`). Returns the
 /// boolean result value or the sentinel (a coercion threw).

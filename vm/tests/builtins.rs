@@ -289,3 +289,163 @@ fn harness_style_throw_and_catch() {
         "#1"
     );
 }
+
+#[test]
+fn bitwise_coerces_non_smi_operands() {
+    let vm = vm();
+    assert_eq!(run_smi(&vm, "var x = 1.5; x | 0;"), 1);
+    assert_eq!(run_smi(&vm, "var x = '12'; x | 0;"), 12);
+    assert_eq!(run_smi(&vm, "var x = 5.5; var y = 3.2; x ^ y;"), 6);
+    assert_eq!(run_smi(&vm, "var x = 2.9; x << 1;"), 4);
+    assert_eq!(run_smi(&vm, "var x = 1.5; x >> 0;"), 1);
+    assert_eq!(run_smi(&vm, "var x = -1; x >>> 0;"), 4294967295);
+    assert_eq!(run_smi(&vm, "var x = 4294967296; x | 0;"), 0);
+    assert_eq!(run_smi(&vm, "var x = 3 * 1.1 + 1; x >> 0;"), 4);
+    assert_eq!(run_smi(&vm, "var x = NaN; x | 0;"), 0);
+    assert_eq!(run_smi(&vm, "var x = null; x | 0;"), 0);
+    assert_eq!(run_smi(&vm, "var x = true; x | 0;"), 1);
+}
+
+#[test]
+fn date_format_and_parse_round_trip() {
+    let vm = vm();
+    assert_eq!(
+        run_str(&vm, "new Date(0).toISOString();"),
+        "1970-01-01T00:00:00.000Z"
+    );
+    assert_eq!(
+        run_str(&vm, "new Date(0).toGMTString();"),
+        "Thu, 01 Jan 1970 00:00:00 GMT"
+    );
+    assert_eq!(
+        run_str(&vm, "new Date(0).toString();"),
+        "Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time)"
+    );
+    assert_eq!(
+        run_str(&vm, "new Date(8.64e15).toISOString();"),
+        "+275760-09-13T00:00:00.000Z"
+    );
+    assert_eq!(
+        run_str(&vm, "new Date(-8.64e15).toISOString();"),
+        "-271821-04-20T00:00:00.000Z"
+    );
+    assert_eq!(
+        run_str(&vm, "new Date(1609459200123).toISOString();"),
+        "2021-01-01T00:00:00.123Z"
+    );
+    assert!(run_bool(
+        &vm,
+        "Date.parse(new Date(1609459200123).toISOString()) === 1609459200123;"
+    ));
+    assert!(run_bool(
+        &vm,
+        "Date.parse(new Date(0).toGMTString()) === 0;"
+    ));
+    assert!(run_bool(
+        &vm,
+        "Date.parse(new Date(0).toString()) === 0;"
+    ));
+    assert!(run_bool(
+        &vm,
+        "Date.parse(new Date(8.64e15).toISOString()) === 8.64e15;"
+    ));
+    assert!(run_bool(
+        &vm,
+        "Date.parse(new Date(-8.64e15).toGMTString()) === -8.64e15;"
+    ));
+    assert!(run_bool(&vm, "Date.parse('2021-01-01') === 1609459200000;"));
+    assert!(run_bool(
+        &vm,
+        "Date.parse('2021-01-01T00:00:00.500Z') === 1609459200500;"
+    ));
+    assert!(run_bool(&vm, "isNaN(Date.parse('not a date'));"));
+    assert!(run_bool(&vm, "isNaN(Date.parse(''));"));
+}
+
+#[test]
+fn string_to_number_radix_prefixes() {
+    let vm = vm();
+    assert_eq!(run_smi(&vm, "Number('0xff');"), 255);
+    assert_eq!(run_smi(&vm, "Number('0X10');"), 16);
+    assert_eq!(run_smi(&vm, "Number('0o17');"), 15);
+    assert_eq!(run_smi(&vm, "Number('0b101');"), 5);
+    assert_eq!(run_smi(&vm, "Number('010');"), 10);
+    assert_eq!(run_smi(&vm, "'0xff' | 0;"), 255);
+    assert_eq!(run_smi(&vm, "+'0b1111';"), 15);
+    assert!(run_bool(&vm, "isNaN(Number('0x'));"));
+    assert!(run_bool(&vm, "isNaN(Number('0b2'));"));
+    assert!(run_bool(&vm, "isNaN(Number('-0x10'));"));
+}
+
+#[test]
+fn array_length_setter() {
+    let vm = vm();
+    assert_eq!(run_smi(&vm, "var a=[1,2,3]; a.length=1; a.length;"), 1);
+    assert!(run_bool(&vm, "var a=[1,2,3]; a.length=1; a[1] === undefined;"));
+    assert_eq!(run_smi(&vm, "var a=[1,2,3]; a.length=5; a.length;"), 5);
+    assert_eq!(
+        run_str(&vm, "var a=[1,2,3]; a.length=1; Object.getOwnPropertyNames(a).join(',');"),
+        "0,length"
+    );
+    assert_eq!(run_smi(&vm, "var a=[]; a[0]=1; a[5]=2; a.length=1; a.length;"), 1);
+    assert!(run_bool(&vm, "var a=[1]; delete a.length === false;"));
+    assert!(run_bool(
+        &vm,
+        "var a=[1,2,3]; a.length='2'; a.length === 2 && a[2] === undefined;"
+    ));
+    assert!(run_bool(
+        &vm,
+        "var a=[1,2,3]; var t=false; try { a.length=-1; } catch(e){ t=true; } t;"
+    ));
+    assert!(run_bool(
+        &vm,
+        "var a=[1,2,3]; var t=false; try { a.length=1.5; } catch(e){ t=true; } t;"
+    ));
+}
+
+#[test]
+fn array_slice_and_sort() {
+    let vm = vm();
+    assert_eq!(run_str(&vm, "[1,2,3,4,5].slice().join(',');"), "1,2,3,4,5");
+    assert_eq!(run_str(&vm, "[1,2,3,4,5].slice(1).join(',');"), "2,3,4,5");
+    assert_eq!(run_str(&vm, "[1,2,3,4,5].slice(1,3).join(',');"), "2,3");
+    assert_eq!(run_str(&vm, "[1,2,3,4,5].slice(-2).join(',');"), "4,5");
+    assert_eq!(run_smi(&vm, "[1,2,3].slice(3,1).length;"), 0);
+    assert_eq!(
+        run_str(&vm, "[3,1,2].sort().join(',');"),
+        "1,2,3"
+    );
+    assert_eq!(run_str(&vm, "[10,9,1,100].sort().join(',');"), "1,10,100,9");
+    assert_eq!(
+        run_str(&vm, "[3,1,2].sort(function(a,b){return a-b;}).join(',');"),
+        "1,2,3"
+    );
+    assert_eq!(
+        run_str(&vm, "[3,1,2].sort(function(a,b){return b-a;}).join(',');"),
+        "3,2,1"
+    );
+    assert!(run_bool(
+        &vm,
+        "var a=[3,1,2]; a.sort() === a && a[0] === 1;"
+    ));
+    // undefined sorts before holes, both after defined values
+    assert_eq!(
+        run_str(&vm, "[5,undefined,3,undefined,1].sort().join(',');"),
+        "1,3,5,,"
+    );
+}
+
+#[test]
+fn array_literal_elisions_are_holes() {
+    let vm = vm();
+    assert_eq!(run_smi(&vm, "[1,,3].length;"), 3);
+    assert_eq!(run_smi(&vm, "[1,,].length;"), 2);
+    assert_eq!(run_smi(&vm, "[,].length;"), 1);
+    assert_eq!(run_smi(&vm, "[,,].length;"), 2);
+    assert_eq!(run_smi(&vm, "[1,2,].length;"), 2);
+    assert_eq!(run_smi(&vm, "[,,3,,].length;"), 4);
+    assert!(run_bool(&vm, "!(1 in [1,,3]);"));
+    assert!(run_bool(&vm, "!(0 in [,1]);"));
+    assert!(run_bool(&vm, "1 in [,1];"));
+    assert_eq!(run_str(&vm, "[1,,3].join();"), "1,,3");
+}
