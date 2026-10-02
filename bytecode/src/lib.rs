@@ -229,7 +229,7 @@ impl RuntimeFn {
 pub enum Operand {
     Register,          // scalable, signed (negative indices are parameters)
     RegisterListStart, // first register of a start+count range; scalable, signed
-    RegisterCount,     // UImmediate but not scalable
+    RegisterCount,     // UImmediate (scales with the stream like the rest)
     Immediate,         // scalable, signed
     UImmediate,        // scalable
     Index,             // scalable
@@ -237,11 +237,12 @@ pub enum Operand {
 
 impl Operand {
     pub const fn size_in_stream(self, scale: Scale) -> usize {
-        use Operand::*;
-        match self {
-            RegisterCount => 1, // ALWAYS 1 byte
-            Register | RegisterListStart | Immediate | UImmediate | Index => scale as usize,
-        }
+        // Every operand widens with the stream. Keeping `RegisterCount`
+        // scalable lets the interpreter use a uniform `base + I * STRIDE`
+        // operand stride (and `STRIDE * operands().len()` instruction
+        // sizing) in both encodings, at the cost of one extra byte per
+        // call in the wide form.
+        scale as usize
     }
 
     pub const fn is_signed(self) -> bool {
@@ -345,9 +346,6 @@ pub fn emit(code: &mut Vec<u8>, op: Opcode, operands: &[u32]) {
     assert_eq!(kinds.len(), operands.len(), "operand count mismatch");
 
     let wide = kinds.iter().zip(operands).any(|(kind, value)| {
-        if *kind == Operand::RegisterCount {
-            return false;
-        }
         if kind.is_signed() {
             let v = *value as i32;
             v < i8::MIN as i32 || v > i8::MAX as i32

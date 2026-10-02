@@ -513,11 +513,15 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         object_prototype,
     );
     let date_prototype = alloc_object(heap, &scope, roots, date_prototype_map);
-    let date_instance_map = alloc_parent_map(
+    // Date instances carry the [[DateValue]] in one in-object value slot
+    // (date.rs stores it via `new_object`); declaring it here keeps the
+    // map's layout in sync so later property stores transition correctly.
+    let date_instance_map = alloc_parent_map_with_slots(
         heap,
         roots,
         MapKind::OBJECT.union(MapKind::EXTENDABLE),
         date_prototype,
+        1,
     );
 
     let error_prototype_map = alloc_parent_map(

@@ -153,9 +153,45 @@ const UNSUPPORTED_PATHS: &[&str] = &[
     "parse-mega-huge-array",
 ];
 
+/// Paths that must be skipped even in audit mode: running them would
+/// panic the VM or balloon memory (sparse/hole-y dense allocations and
+/// multi-GB generated sources), not merely fail.
+const HARD_SKIP_PATHS: &[&str] = &[
+    "/dynamic-import/",
+    "_FIXTURE",
+    "15.4.4.14-5-12",
+    "15.4.4.14-5-16",
+    "15.4.4.15-5-12",
+    "15.4.4.15-5-16",
+    "15.2.3.6-1-3",
+    "15.2.3.6-1-4",
+    "15.2.3.6-4-183",
+    "/identifiers/start-unicode-",
+    "S15.4.5.2_A1_T1",
+    "S15.4.2.2_A2.1_T1",
+    "S15.4.5.2_A3_T4",
+    "property-cast-number",
+    "15.4.4.14-9-9",
+    "15.4.4.15-8-9",
+    "length-truncate-with-indexed",
+    "S15.4_A1.1_T10",
+    "S12.6.3_A3",
+    "15.4.4.16-7-c-ii-2",
+    "15.4.4.17-7-c-ii-2",
+    "15.4.4.18-7-c-ii-1",
+    "15.4.4.19-8-c-ii-1",
+    "15.4.4.20-9-c-ii-1",
+    "15.4.4.14-10-1",
+    "15.4.4.15-9-1",
+    "length-truncate-nonconfigurable-sparse",
+    "parse-mega-huge-array",
+];
+
 #[derive(Default)]
 struct Stats {
     pass: usize,
+    /// Paths of passing tests; kept only so `OVM_AUDIT` can dump them.
+    passed: Vec<PathBuf>,
     fail: Vec<(PathBuf, String)>,
     panicked: Vec<PathBuf>,
     skipped_feature: usize,
@@ -252,11 +288,17 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn run_test(harness: &str, harness_dir: Option<&Path>, path: &Path, stats: &mut Stats) {
+fn run_test(
+    harness: &str,
+    harness_dir: Option<&Path>,
+    path: &Path,
+    stats: &mut Stats,
+    audit: bool,
+) {
     // survive panics (e.g. bytecode operand overflow on huge generated
     // files): count them separately and keep going
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_test_inner(harness, harness_dir, path, stats)
+        run_test_inner(harness, harness_dir, path, stats, audit)
     }));
     if result.is_err() {
         stats.panicked.push(path.to_path_buf());
@@ -291,7 +333,13 @@ fn exception_name(thread: &mut vm::Thread) -> String {
 /// Run one test in `vm`. The harness prelude is `harness` plus any files
 /// the test's `includes:` frontmatter names (resolved in the first harness
 /// file's directory, INTERPRETING.md).
-fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats: &mut Stats) {
+fn run_test_inner(
+    harness: &str,
+    harness_dir: Option<&Path>,
+    path: &Path,
+    stats: &mut Stats,
+    audit: bool,
+) {
     let Ok(src) = std::fs::read_to_string(path) else {
         stats.fail.push((path.to_path_buf(), "not utf-8".into()));
         return;
@@ -307,18 +355,27 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
         stats.skipped_panic += 1;
         return;
     }
-    if UNSUPPORTED_FEATURES.iter().any(|f| fm.contains(f)) {
+    // `OVM_AUDIT=1` runs the soft-skipped tests too (feature/path/pattern
+    // frontmatter): used to spot skips the VM no longer needs. The hard
+    // resource skips and KNOWN_PANICS still apply.
+    let hard = HARD_SKIP_PATHS.iter().any(|p| path_str.contains(p));
+    if hard {
         stats.skipped_feature += 1;
         return;
     }
-    let path_str = path.to_string_lossy();
-    if UNSUPPORTED_PATHS.iter().any(|p| path_str.contains(p)) {
-        stats.skipped_feature += 1;
-        return;
-    }
-    if UNSUPPORTED_PATTERNS.iter().any(|p| src.contains(p)) {
-        stats.skipped_feature += 1;
-        return;
+    if !audit {
+        if UNSUPPORTED_FEATURES.iter().any(|f| fm.contains(f)) {
+            stats.skipped_feature += 1;
+            return;
+        }
+        if UNSUPPORTED_PATHS.iter().any(|p| path_str.contains(p)) {
+            stats.skipped_feature += 1;
+            return;
+        }
+        if UNSUPPORTED_PATTERNS.iter().any(|p| src.contains(p)) {
+            stats.skipped_feature += 1;
+            return;
+        }
     }
     let expect_parse_error =
         fm.contains("negative:") && (fm.contains("phase: parse") || fm.contains("phase: syntax"));
@@ -353,7 +410,7 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
             }
         }
     }
-    if include_unsupported {
+    if include_unsupported && !audit {
         stats.skipped_feature += 1;
         return;
     }
@@ -371,7 +428,7 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
     // block is small enough that its per-test mmap/munmap stays cheap
     // (a 64 MiB block per test storms the kernel's page tables under
     // parallel runs).
-    let vm = vm::VM::new::<DummyHeap, vm::MatchLoopInterpreter>(DummyHeapConfig {
+    let vm = vm::VM::new::<DummyHeap, vm::DefaultInterpreter>(DummyHeapConfig {
         heap_size: 8 * 1024 * 1024,
     })
     .expect("vm")
@@ -401,9 +458,17 @@ fn run_test_inner(harness: &str, harness_dir: Option<&Path>, path: &Path, stats:
                 ));
             } else {
                 stats.pass += 1;
+                if audit {
+                    stats.passed.push(path.to_path_buf());
+                }
             }
         }
-        Err(ScriptError::Parse(_)) if expect_parse_error => stats.pass += 1,
+        Err(ScriptError::Parse(_)) if expect_parse_error => {
+            stats.pass += 1;
+            if audit {
+                stats.passed.push(path.to_path_buf());
+            }
+        }
         Err(e) => {
             stats.fail.push((path.to_path_buf(), e.to_string()));
         }
@@ -428,6 +493,7 @@ fn real_main() -> i32 {
         std::panic::set_hook(Box::new(|_| {}));
     }
     let progress = std::env::var_os("OVM_PROGRESS").is_some();
+    let audit = std::env::var_os("OVM_AUDIT").is_some();
     let args: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
     if args.is_empty() {
         eprintln!("usage: test262 <harness...> <test-file-or-dir>...");
@@ -476,6 +542,7 @@ fn real_main() -> i32 {
             let harness = &harness;
             let harness_dir = harness_dir.as_deref();
             let progress = progress;
+            let audit = audit;
             let handle = std::thread::Builder::new()
                 .stack_size(1 << 30)
                 .spawn_scoped(scope, move || {
@@ -485,7 +552,7 @@ fn real_main() -> i32 {
                             // last line before a crash identifies the culprit test
                             eprintln!("running {}", file.display());
                         }
-                        run_test(harness, harness_dir, file, &mut local);
+                        run_test(harness, harness_dir, file, &mut local, audit);
                     }
                     local
                 })
@@ -496,6 +563,7 @@ fn real_main() -> i32 {
             match handle.join() {
                 Ok(local) => {
                     stats.pass += local.pass;
+                    stats.passed.extend(local.passed);
                     stats.skipped_feature += local.skipped_feature;
                     stats.skipped_module += local.skipped_module;
                     stats.skipped_panic += local.skipped_panic;
@@ -529,6 +597,13 @@ fn real_main() -> i32 {
     // one line per failure, for offline aggregation
     for (path, err) in &stats.fail {
         println!("  FAIL {}: {err}", path.display());
+    }
+    // audit mode: dump the passing set so callers can diff which
+    // previously-skipped tests now run green
+    if audit {
+        for path in &stats.passed {
+            println!("  PASS {}", path.display());
+        }
     }
     if !stats.fail.is_empty() || !stats.panicked.is_empty() {
         return 1;

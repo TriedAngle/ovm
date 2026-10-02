@@ -341,10 +341,7 @@ fn date_format_and_parse_round_trip() {
         &vm,
         "Date.parse(new Date(0).toGMTString()) === 0;"
     ));
-    assert!(run_bool(
-        &vm,
-        "Date.parse(new Date(0).toString()) === 0;"
-    ));
+    assert!(run_bool(&vm, "Date.parse(new Date(0).toString()) === 0;"));
     assert!(run_bool(
         &vm,
         "Date.parse(new Date(8.64e15).toISOString()) === 8.64e15;"
@@ -381,13 +378,22 @@ fn string_to_number_radix_prefixes() {
 fn array_length_setter() {
     let vm = vm();
     assert_eq!(run_smi(&vm, "var a=[1,2,3]; a.length=1; a.length;"), 1);
-    assert!(run_bool(&vm, "var a=[1,2,3]; a.length=1; a[1] === undefined;"));
+    assert!(run_bool(
+        &vm,
+        "var a=[1,2,3]; a.length=1; a[1] === undefined;"
+    ));
     assert_eq!(run_smi(&vm, "var a=[1,2,3]; a.length=5; a.length;"), 5);
     assert_eq!(
-        run_str(&vm, "var a=[1,2,3]; a.length=1; Object.getOwnPropertyNames(a).join(',');"),
+        run_str(
+            &vm,
+            "var a=[1,2,3]; a.length=1; Object.getOwnPropertyNames(a).join(',');"
+        ),
         "0,length"
     );
-    assert_eq!(run_smi(&vm, "var a=[]; a[0]=1; a[5]=2; a.length=1; a.length;"), 1);
+    assert_eq!(
+        run_smi(&vm, "var a=[]; a[0]=1; a[5]=2; a.length=1; a.length;"),
+        1
+    );
     assert!(run_bool(&vm, "var a=[1]; delete a.length === false;"));
     assert!(run_bool(
         &vm,
@@ -411,10 +417,7 @@ fn array_slice_and_sort() {
     assert_eq!(run_str(&vm, "[1,2,3,4,5].slice(1,3).join(',');"), "2,3");
     assert_eq!(run_str(&vm, "[1,2,3,4,5].slice(-2).join(',');"), "4,5");
     assert_eq!(run_smi(&vm, "[1,2,3].slice(3,1).length;"), 0);
-    assert_eq!(
-        run_str(&vm, "[3,1,2].sort().join(',');"),
-        "1,2,3"
-    );
+    assert_eq!(run_str(&vm, "[3,1,2].sort().join(',');"), "1,2,3");
     assert_eq!(run_str(&vm, "[10,9,1,100].sort().join(',');"), "1,10,100,9");
     assert_eq!(
         run_str(&vm, "[3,1,2].sort(function(a,b){return a-b;}).join(',');"),

@@ -3211,6 +3211,15 @@ fn construct_start<'a>(
     out: i32,
 ) -> Result<ConstructStart, VmError> {
     let callee_word = regs.read(callee, ctx);
+    // only objects whose map marks them as constructors may be `new`-ed:
+    // Function.prototype is callable but has no [[Construct]]. The slow
+    // path raises the TypeError (cold::construct)
+    let constructible = callee_word
+        .as_heap_object()
+        .is_some_and(|o| o.as_ref().header.map.get(ctx.heap()).kind().is_constructor());
+    if !constructible {
+        return Ok(ConstructStart::Slow);
+    }
     let kind = match Object::call_target(ctx.heap(), callee_word) {
         // runtime constructors (`new Array`, `new Object`, …) run as a
         // plain tier-1 call with `new_target` set — the callee allocates
