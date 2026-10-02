@@ -132,6 +132,11 @@ impl<'a> RootsArg<'a> {
     }
 
     #[inline(always)]
+    pub fn from_heap(_heap: &Heap) -> RootsArg<'a> {
+        RootsArg(PhantomData)
+    }
+
+    #[inline(always)]
     pub fn known<'h>(&self, heap: &'h Heap) -> &'static WellKnown {
         heap.known()
     }
@@ -146,6 +151,11 @@ impl<'a> RootsArg<'a> {
     #[inline(always)]
     pub fn new(known: &'static WellKnown) -> RootsArg<'a> {
         RootsArg(known, PhantomData)
+    }
+
+    #[inline(always)]
+    pub fn from_heap(heap: &Heap) -> RootsArg<'a> {
+        RootsArg(heap.known(), PhantomData)
     }
 
     #[inline(always)]
@@ -3967,7 +3977,7 @@ fn enter<'a>(
             let regs = unsafe { Regs::new(ctx.regs_ptr()) };
             let acc = ctx.undefined_word();
             let table = TableArg::new(&TABLE_NARROW);
-            let roots = RootsArg::new(ctx.heap().known());
+            let roots = RootsArg::from_heap(ctx.heap());
             Ok(unsafe {
                 table.get(*ip)(ip, regs, acc, &ctx, table, roots, FloatReg::new(f64::NAN))
             })
