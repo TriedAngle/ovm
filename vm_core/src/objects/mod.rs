@@ -1,11 +1,14 @@
 pub mod array;
 pub mod byte_array;
 pub mod callable;
+pub mod cell;
 pub mod context;
+pub mod data_handler;
 pub mod feedback;
 pub mod float;
 pub mod map;
 pub mod object;
+pub mod prototype_info;
 pub mod proxy;
 pub mod string;
 pub mod symbol;
@@ -13,14 +16,17 @@ pub mod symbol;
 pub use array::{FixedArray, WeakFixedArray, WeakFixedArrayInit};
 pub use byte_array::FixedByteArray;
 pub use callable::{CallableInfoInit, CallableInfoObject, FunctionKind};
+pub use cell::{Cell, CellInit};
 pub use context::{
     Context, ContextInit, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit,
     ScopeInfo, ScopeInfoInit,
 };
+pub use data_handler::{DataHandler, DataHandlerInit};
 pub use feedback::{FeedbackVector, FeedbackVectorInit, new_feedback_vector};
 pub use float::Float;
 pub use map::{AccessorPair, Map, MapInit, MapKind, SlotDescriptor, SlotFlags, SlotName};
 pub use object::{CallTarget, Object, ObjectInit, ObjectSlotsInit};
+pub use prototype_info::{PrototypeInfo, PrototypeInfoInit};
 pub use proxy::{ProxyInit, ProxyObject};
 pub use string::{DenseString, Encoding, StringData, decode_wtf8, string_content_hash};
 pub use symbol::Symbol;
@@ -119,6 +125,9 @@ pub enum ObjectKind {
     Proxy = 18,
     /// Sentinel and odd heap values
     Oddball = 19,
+    Cell = 20,
+    PrototypeInfo = 21,
+    DataHandler = 22,
 }
 
 impl ObjectKind {
@@ -162,6 +171,9 @@ pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
             ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).layout(),
             ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).layout(),
             ObjectKind::FeedbackVector => (*addr.cast::<FeedbackVector>().as_ptr()).layout(),
+            ObjectKind::Cell => (*addr.cast::<Cell>().as_ptr()).layout(),
+            ObjectKind::PrototypeInfo => (*addr.cast::<PrototypeInfo>().as_ptr()).layout(),
+            ObjectKind::DataHandler => (*addr.cast::<DataHandler>().as_ptr()).layout(),
             ObjectKind::Object
             | ObjectKind::Array
             | ObjectKind::ByteArray
@@ -201,6 +213,11 @@ pub unsafe fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
             ObjectKind::FeedbackVector => {
                 (*addr.cast::<FeedbackVector>().as_ptr()).visit_edges(visitor)
             }
+            ObjectKind::Cell => (*addr.cast::<Cell>().as_ptr()).visit_edges(visitor),
+            ObjectKind::PrototypeInfo => {
+                (*addr.cast::<PrototypeInfo>().as_ptr()).visit_edges(visitor)
+            }
+            ObjectKind::DataHandler => (*addr.cast::<DataHandler>().as_ptr()).visit_edges(visitor),
             ObjectKind::Object
             | ObjectKind::Array
             | ObjectKind::ByteArray

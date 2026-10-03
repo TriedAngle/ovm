@@ -167,12 +167,6 @@ fn start<'b>(
 
 /// Run a just-pushed callee frame to completion: the blocking-call
 /// primitive mirroring the become interpreter's call trampoline. The
-/// callee's value comes back as the dispatch result; the caller's frame
-/// is restored on every
-/// path. Returns `Ok(true)` when the callee threw (the pending exception
-/// is set).
-/// Run a just-pushed callee frame to completion: the blocking-call
-/// primitive mirroring the become interpreter's call trampoline. The
 /// callee's value is returned (the exception sentinel when it threw);
 /// the caller's current frame is restored on every path.
 fn run_callee<'a>(ctx: &Ctx<'a>) -> Result<Tagged<'a, Value>, VmError> {
@@ -1553,10 +1547,6 @@ unsafe fn step<'a>(
             acc.store(v);
             Flow::Sync
         }
-        // the fast interpreter parks the synthesized receiver in this
-        // register and re-checks here; the match loop's `construct`
-        // applies the ES 9.2.2 fixup itself, so this is a pass-through
-        Opcode::ConstructCheck => Flow::Sync,
         Opcode::CreateEmptyObjectLiteral => {
             let obj = state.handle_scope(|scope| {
                 let map = heap.known().object_initial_map;

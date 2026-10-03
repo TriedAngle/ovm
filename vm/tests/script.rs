@@ -710,3 +710,57 @@ fn deferred_left_arithmetic_keeps_evaluation_order() {
         16
     );
 }
+
+#[test]
+fn for_let_heads_live_in_registers() {
+    assert_eq!(
+        run_smi(
+            "var c = { value: 0 };
+             for (let i = 0; i < 5; i++) { c.value = c.value + 1; }
+             c.value;"
+        ),
+        5
+    );
+    // mixed declarators, compound update
+    assert_eq!(
+        run_smi("var s = 0; for (let i = 0, j = 10; i < 3; i++, j--) { s += i + j; } s;"),
+        30
+    );
+    // nested heads and a labelled continue across both
+    assert_eq!(
+        run_smi(
+            "var s = 0;
+             outer: for (let i = 0; i < 3; i++) {
+                 for (let j = 0; j < 3; j++) { if (j == 1) continue outer; s += i * 3 + j; }
+             }
+             s;"
+        ),
+        9
+    );
+    // uncaptured lets in the body are registers too
+    assert_eq!(
+        run_smi("var s = 0; for (let i = 0; i < 3; i++) { let x = i * 2; s += x; } s;"),
+        6
+    );
+}
+
+#[test]
+fn for_let_head_semantics_are_preserved() {
+    // closures still capture each iteration's binding
+    assert_eq!(
+        run_smi(
+            "var fns = [];
+             for (let i = 0; i < 3; i++) { fns.push(function() { return i; }); }
+             fns[0]() + fns[1]() + fns[2]();"
+        ),
+        3
+    );
+    // TDZ: a head binding read by its own initializer throws
+    assert!(run_bool(
+        "var threw = false;
+         try { for (let i = i; false; ) {} } catch (e) { threw = e instanceof ReferenceError; }
+         threw;"
+    ));
+    // an uninitialized head binding starts as undefined, not TDZ
+    assert_eq!(run_smi("var s = 0; for (let i; i < 3; i++) s++; s;"), 0);
+}

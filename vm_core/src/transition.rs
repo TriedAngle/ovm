@@ -3,8 +3,8 @@ use core::alloc::Layout;
 use crate::proxy::Proxy;
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, Key,
-    Lookup, Map, MapInit, MaybeWeak, Object, SlotFlags, SlotName, Smi, Tagged, Value, VmError,
-    WeakFixedArray, WeakFixedArrayInit,
+    Lookup, Map, MapInit, MaybeWeak, Object, Prototype, SlotFlags, SlotName, Smi, Tagged, Value,
+    VmError, WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Store semantics:
@@ -457,6 +457,7 @@ impl Transition {
                 let slots = token.allocate::<FixedArray>(scope.stage(&values));
                 let host = receiver.as_tagged(heap).erase();
                 receiver_ref.slots.set(heap, host, slots);
+                Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
                 receiver_ref.header.map.set(heap, host, target);
             },
         );
@@ -475,6 +476,7 @@ impl Transition {
             .map_ref(heap)
             .find_transition(heap, name.as_tagged(heap), flags, pair_values)
             .expect("transition recorded above");
+        Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
         receiver_ref
             .header
             .map
@@ -594,6 +596,7 @@ impl Transition {
                         let slots = token.allocate::<FixedArray>(values);
                         let host = receiver.as_tagged(heap).erase();
                         obj.slots.set(heap, host, slots);
+                        Prototype::shape_changed(heap, obj.map_ref(heap));
                         obj.header.map.set(heap, host, existing.as_tagged(heap));
                     },
                 );
@@ -654,6 +657,7 @@ impl Transition {
                     Ok(()) => {
                         let host = receiver.as_tagged(heap).erase();
                         obj.slots.set(heap, host, slots);
+                        Prototype::shape_changed(heap, obj.map_ref(heap));
                         obj.header.map.set(heap, host, child);
                         Some(())
                     }
@@ -1222,6 +1226,7 @@ impl Object {
             proto,
         );
         let host = receiver.as_tagged(heap).erase();
+        Prototype::shape_changed(heap, receiver.as_tagged(heap).map_ref(heap));
         receiver
             .as_tagged(heap)
             .header

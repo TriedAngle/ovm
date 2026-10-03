@@ -2,9 +2,10 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
 use crate::{
-    CallableInfoInit, CallableInfoObject, Context, ContextInit, FixedArray, FixedByteArray, Global,
-    Handle, HandleData, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, ObjectInit,
-    RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi, StringInterner, Symbol, Tagged,
+    CallableInfoInit, CallableInfoObject, Cell, CellInit, Context, ContextInit, FixedArray,
+    FixedByteArray, Global, Handle, HandleData, HandleScope, HandleSlice, Heap, Map, MapInit,
+    MapKind, Object, ObjectInit, RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi,
+    StringInterner, Symbol, Tagged, Value,
 };
 
 #[derive(Clone, Copy)]
@@ -34,6 +35,14 @@ pub struct WellKnown {
     pub context_map: Global<Map>,
     pub scope_info_map: Global<Map>,
     pub feedback_vector_map: Global<Map>,
+    /// Maps of the prototype-validity machinery: `Cell` and `PrototypeInfo`.
+    pub cell_map: Global<Map>,
+    pub prototype_info_map: Global<Map>,
+    pub handler_map_0: Global<Map>,
+    pub handler_map_1: Global<Map>,
+    pub handler_map_2: Global<Map>,
+    pub handler_map_3: Global<Map>,
+    pub invalid_prototype_validity_cell: Global<Cell>,
     /// Shared immutable scope description for contexts without named slots
     /// (block/catch contexts, the empty context)
     pub empty_scope_info: Global<ScopeInfo>,
@@ -220,6 +229,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     let context = unsafe { smi_handle::<Context>(roots) };
     let scope_info = unsafe { smi_handle::<ScopeInfo>(roots) };
     let symbol = unsafe { smi_handle::<Symbol>(roots) };
+    let cell = unsafe { smi_handle::<Cell>(roots) };
     WellKnown {
         map_map: map,
         the_hole: obj,
@@ -240,6 +250,13 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         context_map: map,
         scope_info_map: map,
         feedback_vector_map: map,
+        cell_map: map,
+        prototype_info_map: map,
+        handler_map_0: map,
+        handler_map_1: map,
+        handler_map_2: map,
+        handler_map_3: map,
+        invalid_prototype_validity_cell: cell,
         empty_scope_info: scope_info,
         undefined: obj,
         undefined_map: map,
@@ -290,6 +307,22 @@ fn alloc_map(heap: &mut Heap, roots: &RootHandles, kind: MapKind) -> Global<Map>
     roots.create_handle(heap.allocate::<Map>(MapInit {
         kind,
         value_slot_count: 0,
+        descriptors: &[],
+        prototype: heap.known().null.erase(),
+    }))
+}
+
+/// A builtin map whose `value_slot_count` doubles as per-kind metadata (the
+/// `DataHandler` data count).
+fn alloc_map_with_slots(
+    heap: &mut Heap,
+    roots: &RootHandles,
+    kind: MapKind,
+    value_slot_count: usize,
+) -> Global<Map> {
+    roots.create_handle(heap.allocate::<Map>(MapInit {
+        kind,
+        value_slot_count,
         descriptors: &[],
         prototype: heap.known().null.erase(),
     }))
@@ -385,6 +418,11 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     map_map.as_tagged(heap).transitions.clear(heap);
     the_hole_map.as_tagged(heap).transitions.clear(heap);
     null_map.as_tagged(heap).transitions.clear(heap);
+    // these three maps were initialized before the real hole existed, so
+    // their prototype_info holds the Smi placeholder; re-clear it now
+    map_map.as_tagged(heap).prototype_info.clear(heap);
+    the_hole_map.as_tagged(heap).prototype_info.clear(heap);
+    null_map.as_tagged(heap).prototype_info.clear(heap);
     the_hole_map.as_tagged(heap).prototype.set(
         heap,
         the_hole_map.as_tagged(heap).erase(),
@@ -395,6 +433,17 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
         null_map.as_tagged(heap).erase(),
         null.as_tagged(heap).erase(),
     );
+
+    let cell_map = alloc_map(heap, roots, MapKind::CELL);
+    let prototype_info_map = alloc_map(heap, roots, MapKind::PROTOTYPE_INFO);
+    known.cell_map = cell_map;
+    known.prototype_info_map = prototype_info_map;
+    heap.set_known(known);
+    let invalid_prototype_validity_cell = roots.create_handle(heap.allocate::<Cell>(CellInit {
+        value: Value::CLEARED,
+    }));
+    known.invalid_prototype_validity_cell = invalid_prototype_validity_cell;
+    heap.set_known(known);
 
     // builtin maps: every allocation init path looks these up, so they must
     // exist before any other object is created (incl. interned strings)
@@ -412,6 +461,10 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let context_map = alloc_map(heap, roots, MapKind::CONTEXT);
     let scope_info_map = alloc_map(heap, roots, MapKind::SCOPE_INFO);
     let feedback_vector_map = alloc_map(heap, roots, MapKind::FEEDBACK_VECTOR);
+    let handler_map_0 = alloc_map_with_slots(heap, roots, MapKind::DATA_HANDLER, 0);
+    let handler_map_1 = alloc_map_with_slots(heap, roots, MapKind::DATA_HANDLER, 1);
+    let handler_map_2 = alloc_map_with_slots(heap, roots, MapKind::DATA_HANDLER, 2);
+    let handler_map_3 = alloc_map_with_slots(heap, roots, MapKind::DATA_HANDLER, 3);
 
     let function_map = roots.create_handle(
         heap.allocate::<Map>(MapInit {
@@ -462,6 +515,10 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.context_map = context_map;
     known.scope_info_map = scope_info_map;
     known.feedback_vector_map = feedback_vector_map;
+    known.handler_map_0 = handler_map_0;
+    known.handler_map_1 = handler_map_1;
+    known.handler_map_2 = handler_map_2;
+    known.handler_map_3 = handler_map_3;
     known.function_map = function_map;
     known.non_constructor_function_map = non_constructor_function_map;
     known.class_constructor_map = class_constructor_map;

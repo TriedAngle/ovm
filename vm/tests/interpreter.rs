@@ -3158,9 +3158,8 @@ fn create_closure_function_kind_controls_call_and_construct() {
     emit(
         &mut construct,
         Opcode::Construct,
-        &[reg_op(0), reg_op(0), 0, reg_op(1)],
+        &[reg_op(0), reg_op(0), 0],
     );
-    emit(&mut construct, Opcode::ConstructCheck, &[reg_op(1)]);
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[method]);
     expect_escaped(&mut thread, result, "TypeError");
@@ -3212,9 +3211,8 @@ fn create_closure_function_kind_controls_call_and_construct() {
     emit(
         &mut construct,
         Opcode::Construct,
-        &[reg_op(0), reg_op(0), 0, reg_op(1)],
+        &[reg_op(0), reg_op(0), 0],
     );
-    emit(&mut construct, Opcode::ConstructCheck, &[reg_op(1)]);
     emit(&mut construct, Opcode::Return, &[]);
     let result = run_program_consts(&mut thread, construct, 1, &[], &[class_constructor]).unwrap();
     assert!(
@@ -4281,12 +4279,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(
-            &mut program,
-            Opcode::Construct,
-            &[reg_op(0), reg_op(0), 0, reg_op(1)],
-        );
-        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[g]).unwrap();
         assert!(r.is_strong_ptr(), "primitive result: receiver must win");
@@ -4296,12 +4289,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(
-            &mut program,
-            Opcode::Construct,
-            &[reg_op(0), reg_op(0), 0, reg_op(1)],
-        );
-        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::Load, &[reg_op(1)]);
         emit(&mut program, Opcode::InstanceOf, &[reg_op(0)]);
@@ -4315,12 +4303,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(
-            &mut program,
-            Opcode::Construct,
-            &[reg_op(0), reg_op(0), 0, reg_op(1)],
-        );
-        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[f]).unwrap();
         assert!(r.is_strong_ptr(), "object result must win");
@@ -4332,12 +4315,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(
-            &mut program,
-            Opcode::Construct,
-            &[reg_op(0), reg_op(0), 0, reg_op(1)],
-        );
-        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Return, &[]);
         let r = run_program_consts(&mut *thread, program, 1, &[], &[plain]);
         expect_escaped(&mut *thread, r, "TypeError");
@@ -4401,12 +4379,7 @@ fn construct_sets_runtime_construct_flag() {
         emit(&mut program, Opcode::LoadConstant, &[0]);
         emit(&mut program, Opcode::Store, &[reg_op(0)]);
         emit(&mut program, Opcode::LoadSmi, &[0]);
-        emit(
-            &mut program,
-            Opcode::Construct,
-            &[reg_op(0), reg_op(0), 0, reg_op(1)],
-        );
-        emit(&mut program, Opcode::ConstructCheck, &[reg_op(1)]);
+        emit(&mut program, Opcode::Construct, &[reg_op(0), reg_op(0), 0]);
         emit(&mut program, Opcode::Store, &[reg_op(1)]);
         emit(&mut program, Opcode::LoadGlobal, &[1, 0]);
         emit(&mut program, Opcode::Return, &[]);

@@ -93,9 +93,7 @@ macro_rules! acc_reg_op {
     };
 }
 
-/// The register file's first slot, in anchor-relative offsets: `r0` sits
-/// directly below the frame header (the ABI twin of
-/// `vm_core::stack::HEADER_SLOTS`, which occupies offsets -1..=-11).
+/// The register file's first slot
 pub const REGISTER_FILE_START: i32 = -12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -828,16 +826,9 @@ impl FnBuilder {
         self.emit_tracked(Opcode::CallRuntime, &[f as u32, base, count]);
     }
 
-    /// `new callee(args)`: parks the synthesized receiver in `out` and
-    /// emits the `ConstructCheck` fixup that replaces a primitive result
-    /// with it. The pair is atomic — nothing may jump between the two.
-    pub fn construct(&mut self, callee: Reg, args: RegList, out: Reg) {
+    pub fn construct(&mut self, callee: Reg, args: RegList) {
         let [base, count] = args.operands();
-        self.emit_tracked(
-            Opcode::Construct,
-            &[callee.operand(), base, count, out.operand()],
-        );
-        self.emit_tracked(Opcode::ConstructCheck, &[out.operand()]);
+        self.emit_tracked(Opcode::Construct, &[callee.operand(), base, count]);
     }
 
     acc_void!(create_empty_object_literal, CreateEmptyObjectLiteral);

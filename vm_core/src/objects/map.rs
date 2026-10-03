@@ -1,8 +1,9 @@
 use core::alloc::Layout;
 
 use crate::{
-    AtomicOptionGcSlot, Compare, DenseString, EdgeVisitable, GcSlot, Handle, Header, Heap,
-    HeapObject, ObjectKind, OptionGcSlot, Smi, Symbol, Tagged, Value, Visitor, WeakFixedArray,
+    AtomicOptionGcSlot, Cell, Compare, DenseString, EdgeVisitable, GcSlot, Handle, Header, Heap,
+    HeapObject, MaybeWeak, MaybeWeakGcSlot, ObjectKind, OptionGcSlot, PrototypeInfo, Smi, Symbol,
+    Tagged, Value, Visitor, WeakFixedArray,
 };
 
 #[repr(C)]
@@ -22,10 +23,14 @@ pub struct Map {
     /// RCU-style (see [`AtomicOptionGcSlot`]): arrays are immutable after
     /// publication, inserts race-publish a grown copy with a CAS.
     pub transitions: AtomicOptionGcSlot<WeakFixedArray>,
+    pub prototype_info: AtomicOptionGcSlot<PrototypeInfo>,
+    pub prototype_validity_cell: MaybeWeakGcSlot<Cell>,
     pub descriptors: [SlotDescriptor; 0],
 }
 
 impl Map {
+    pub const NO_VALIDITY_CELL_SENTINEL: Smi = Smi::new(0);
+
     pub fn layout_for(descriptor_count: usize) -> Layout {
         let descriptors_layout =
             Layout::array::<SlotDescriptor>(descriptor_count).expect("descriptors layout");
@@ -57,6 +62,62 @@ impl Map {
 
     pub fn kind(&self) -> MapKind {
         MapKind::new(self.kind.to_smi_unchecked().value() as u64)
+    }
+
+    pub fn is_prototype(&self) -> bool {
+        self.kind().is_prototype()
+    }
+
+    pub fn mark_prototype(&self, heap: &Heap) {
+        let kind = self.kind();
+        if kind.contains(MapKind::PROTOTYPE) {
+            return;
+        }
+        let host = self.tagged(heap);
+        self.kind.set(
+            heap,
+            host,
+            Smi::new(kind.union(MapKind::PROTOTYPE).bits() as i64),
+        );
+    }
+
+    pub fn try_get_prototype_info<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, PrototypeInfo>> {
+        let value = Value::from_bits(self.prototype_info.load_word(heap));
+        if !value.is_strong_ptr() {
+            return None;
+        }
+        // Safety: the slot is only ever published a strong `PrototypeInfo`.
+        unsafe { Tagged::<Value>::from_value_unchecked(value) }.get_as::<PrototypeInfo>()
+    }
+
+    pub fn published_validity_cell<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Cell>> {
+        self.prototype_validity_cell.get(heap).as_strong()
+    }
+
+    pub fn is_prototype_validity_cell_valid(&self, heap: &Heap) -> bool {
+        match self.published_validity_cell(heap) {
+            Some(cell) => cell.as_ref().is_valid(heap),
+            None => true,
+        }
+    }
+
+    /// Publish a freshly created validity cell into this map. The caller
+    /// (prototype registration) holds the registry lock, so a plain strong
+    /// store with a write barrier suffices.
+    pub fn set_validity_cell(&self, heap: &Heap, cell: Tagged<'_, Cell>) {
+        let host = self.tagged(heap);
+        self.prototype_validity_cell.set_strong(heap, host, cell);
+    }
+
+    pub fn set_validity_cell_sentinel(&self, heap: &Heap) {
+        let host = self.tagged(heap);
+        // Safety: sentinel word; writes are never weak pointers.
+        let sentinel = unsafe {
+            Tagged::<MaybeWeak<Cell>>::from_maybe_weak_unchecked(
+                Map::NO_VALIDITY_CELL_SENTINEL.encode(),
+            )
+        };
+        self.prototype_validity_cell.set(heap, host, sentinel);
     }
 
     fn data_ptr(&self) -> *mut SlotDescriptor {
@@ -214,6 +275,22 @@ impl HeapObject for Map {
             .set(heap, host, config.prototype.as_tagged(heap));
         self.pred.clear(heap);
         self.transitions.clear(heap);
+        if config.kind.is_js_receiver() {
+            self.prototype_validity_cell.set_strong(
+                heap,
+                host,
+                heap.known().invalid_prototype_validity_cell.as_tagged(heap),
+            );
+        } else {
+            // Safety: sentinel word; writes are never weak pointers.
+            let sentinel = unsafe {
+                Tagged::<MaybeWeak<Cell>>::from_maybe_weak_unchecked(
+                    Map::NO_VALIDITY_CELL_SENTINEL.encode(),
+                )
+            };
+            self.prototype_validity_cell.set(heap, host, sentinel);
+        }
+        self.prototype_info.clear(heap);
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let name_word = name.as_tagged(heap);
             // integer-named own properties make element misses observable
@@ -243,6 +320,8 @@ impl EdgeVisitable for Map {
         visitor.visit(self.prototype.as_raw());
         visitor.visit(self.pred.as_raw());
         visitor.visit(self.transitions.as_raw());
+        visitor.visit(self.prototype_info.as_raw());
+        visitor.visit(self.prototype_validity_cell.as_raw());
         for d in self.descriptors() {
             visitor.visit(d.name.as_raw());
             visitor.visit(d.value.as_raw());
@@ -279,6 +358,8 @@ impl MapKind {
     /// promotion is conservative for every array sharing the map).
     pub const HOLEY: MapKind = MapKind(1 << 15);
 
+    pub const PROTOTYPE: MapKind = MapKind(1 << 16);
+
     pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
     pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
     pub const FIXED_BYTE_ARRAY: MapKind = MapKind(ObjectKind::FixedByteArray as u64);
@@ -297,6 +378,9 @@ impl MapKind {
     pub const STRING: MapKind = MapKind(ObjectKind::String as u64);
     pub const PROXY: MapKind = MapKind(ObjectKind::Proxy as u64);
     pub const ODDBALL: MapKind = MapKind(ObjectKind::Oddball as u64);
+    pub const CELL: MapKind = MapKind(ObjectKind::Cell as u64);
+    pub const PROTOTYPE_INFO: MapKind = MapKind(ObjectKind::PrototypeInfo as u64);
+    pub const DATA_HANDLER: MapKind = MapKind(ObjectKind::DataHandler as u64);
 
     pub const fn new(bits: u64) -> Self {
         Self(bits)
@@ -336,6 +420,9 @@ impl MapKind {
             Self::STRING => ObjectKind::String,
             Self::PROXY => ObjectKind::Proxy,
             Self::ODDBALL => ObjectKind::Oddball,
+            Self::CELL => ObjectKind::Cell,
+            Self::PROTOTYPE_INFO => ObjectKind::PrototypeInfo,
+            Self::DATA_HANDLER => ObjectKind::DataHandler,
             _ => panic!("invalid object kind"),
         }
     }
@@ -372,6 +459,10 @@ impl MapKind {
     /// Whether this array map may hold holes (see [`MapKind::HOLEY`]).
     pub const fn is_holey(self) -> bool {
         self.0 & Self::HOLEY.0 != 0
+    }
+
+    pub const fn is_prototype(self) -> bool {
+        self.0 & Self::PROTOTYPE.0 != 0
     }
 
     pub const fn is_callable(self) -> bool {

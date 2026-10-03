@@ -2,7 +2,7 @@ use std::any::{Any, TypeId};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use core::cell::Cell;
+use core::cell::Cell as StdCell;
 use core::ptr::NonNull;
 
 pub mod bootstrap;
@@ -20,6 +20,7 @@ pub mod intrinsics;
 pub mod lookup;
 pub mod materialize;
 pub mod objects;
+pub mod prototype;
 pub mod runtime;
 pub mod runtime_api;
 pub mod stack;
@@ -49,14 +50,16 @@ pub use interner::StringInterner;
 pub use interp::{Ctx, Unwind};
 pub use lookup::{Key, LoadOutcome, Lookup};
 pub use objects::{
-    AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Context, ContextInit,
-    DenseString, Encoding, FeedbackVector, FeedbackVectorInit, FixedArray, FixedByteArray, Float,
-    FunctionKind, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit, Header,
-    HeapObject, Map, MapInit, MapKind, Object, ObjectInit, ObjectKind, ObjectSlotsInit, ProxyInit,
+    AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Cell, CellInit, Context,
+    ContextInit, DataHandler, DataHandlerInit, DenseString, Encoding, FeedbackVector,
+    FeedbackVectorInit, FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry,
+    HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map, MapInit, MapKind,
+    Object, ObjectInit, ObjectKind, ObjectSlotsInit, PrototypeInfo, PrototypeInfoInit, ProxyInit,
     ProxyObject, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol,
     WeakFixedArray, WeakFixedArrayInit, decode_wtf8, new_feedback_vector, object_kind,
     object_layout, string_content_hash, visit_object,
 };
+pub use prototype::{Prototype, PrototypeRegistry};
 pub use runtime::{
     Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Runtime, RuntimeCall,
     RuntimeContext, RuntimeIndex, RuntimeRegistry, raise_runtime, spread_apply_args,
@@ -114,6 +117,7 @@ pub struct SharedVM {
     // TODO: investiage if Mutex is fine, maybe a lock-free mechanism exists
     threads: Mutex<Vec<Weak<ContextState>>>,
     interner: StringInterner,
+    prototype_registry: PrototypeRegistry,
     runtimes: RuntimeRegistry,
     states: Mutex<Vec<(TypeId, Box<dyn ErasedRuntimeState>)>>,
     /// Weak slots the GC clears when their targets die; used for tests and
@@ -138,21 +142,21 @@ pub struct ContextState {
     /// The current (innermost) interpreter frame's anchor. Frames are
     /// self-describing (see [`Stack`]): this cell is the only shadow
     /// state, written by push/pop/unwind frame switches.
-    frame_base: Cell<usize>,
+    frame_base: StdCell<usize>,
     /// Whether an interpreted frame is current (runtime calls inspecting
     /// the running frame check this).
-    frame_active: Cell<bool>,
+    frame_active: StdCell<bool>,
     /// The accumulator cell: rooted, the GC updates it in place.
     acc: Register,
     pending_exception: Register,
-    has_pending_exception: Cell<bool>,
+    has_pending_exception: StdCell<bool>,
     /// The error code behind the current sentinel-channel raise, for
     /// edges that surface `Result` again (`Thread::run_runtime`).
-    last_error: Cell<VmError>,
+    last_error: StdCell<VmError>,
     /// Why this thread's execution terminated, if it did. Set exactly once,
     /// right before the uncatchable unwind; guest code can never observe or
     /// intercept it.
-    termination: Cell<Option<Termination>>,
+    termination: StdCell<Option<Termination>>,
     /// Construct-receiver cache: a `WeakFixedArray` table mapping closures
     /// to their synthesized initial map identity-keyed per closure since `.prototype` is per-closure.
     /// Entries are `[closure(weak), fn_map, proto, proto_slot(Smi),
@@ -606,6 +610,7 @@ impl VM {
             roots,
             threads: Mutex::new(Vec::new()),
             interner,
+            prototype_registry: PrototypeRegistry::new(),
             runtimes: RuntimeRegistry::new(),
             states: Mutex::new(Vec::new()),
             weak_slots: Mutex::new(Vec::new()),
@@ -613,7 +618,9 @@ impl VM {
             execute: I::EXECUTE,
         });
         shared.heap.set_host(shared.gc_host());
-        let mut local = shared.heap.new_local(&shared.known);
+        let mut local = shared
+            .heap
+            .new_local(&shared.known, &shared.prototype_registry);
         bootstrap_basics(&mut local, &shared.roots);
         intern_well_known_strings(&mut local, &shared.interner, &shared.roots);
         bootstrap_well_known(&mut local, &shared.roots);
@@ -683,20 +690,23 @@ impl VM {
     }
 
     pub fn attach(&self) -> Thread {
-        let heap = self.shared.heap.new_local(&self.shared.known);
+        let heap = self
+            .shared
+            .heap
+            .new_local(&self.shared.known, &self.shared.prototype_registry);
         // Safety: root-slot reads stored straight into rooted fill cells.
         let the_hole = heap.known().the_hole.raw();
         let undefined = heap.known().undefined.raw();
         let state = Arc::new(ContextState {
             handles: HandleData::new(the_hole),
             stack: Stack::new(STACK_SLOTS, undefined, undefined),
-            frame_base: Cell::new(0),
-            frame_active: Cell::new(false),
+            frame_base: StdCell::new(0),
+            frame_active: StdCell::new(false),
             acc: unsafe { Register::from_value(undefined) },
             pending_exception: unsafe { Register::from_value(the_hole) },
-            has_pending_exception: Cell::new(false),
-            last_error: Cell::new(VmError::Type),
-            termination: Cell::new(None),
+            has_pending_exception: StdCell::new(false),
+            last_error: StdCell::new(VmError::Type),
+            termination: StdCell::new(None),
             construct_cache: unsafe { Register::from_value(the_hole) },
         });
         let mut threads = self.shared.threads.lock().unwrap();

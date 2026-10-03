@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
     HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MapKind, MaybeWeak, Object,
-    ObjectInit, ObjectSlotsInit, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, Value, Visitor,
-    Word,
+    ObjectInit, ObjectSlotsInit, PrototypeRegistry, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged,
+    Value, Visitor, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -482,6 +482,7 @@ impl EdgeVisitable for () {
 pub struct Heap {
     local: Box<dyn LocalHeap>,
     known: *const KnownCell,
+    prototype_registry: *const PrototypeRegistry,
     /// Bumped whenever an array map gains the holey flag: packed element
     /// inline caches recorded under an older epoch must re-record.
     holey_epoch: Cell<u32>,
@@ -501,6 +502,10 @@ impl Heap {
 
     pub fn known(&self) -> &'static WellKnown {
         unsafe { (*self.known).get() }
+    }
+
+    pub fn prototype_registry(&self) -> &'static PrototypeRegistry {
+        unsafe { &*self.prototype_registry }
     }
 
     /// The current holey-map epoch (see [`Heap::promote_holey`]).
@@ -770,10 +775,11 @@ impl GlobalHeap {
         {}
     }
 
-    pub fn new_local(&self, known: &KnownCell) -> Heap {
+    pub fn new_local(&self, known: &KnownCell, prototype_registry: &PrototypeRegistry) -> Heap {
         Heap {
             local: self.shared.new_local(),
             known: known as *const KnownCell,
+            prototype_registry: prototype_registry as *const PrototypeRegistry,
             holey_epoch: Cell::new(0),
             indexed_props: Cell::new(true),
             #[cfg(feature = "stress-minor-gc")]

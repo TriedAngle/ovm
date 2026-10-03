@@ -196,8 +196,12 @@ pub struct Facts<'a> {
     pub captures_new_target: HashSet<Fid>,
     /// derived constructors with an arrow-delegated super()
     pub needs_this_function: HashSet<Fid>,
-    /// for/for-in loop nodes → number of lexical head bindings
+    /// for/for-in loop nodes → number of context-allocated lexical head
+    /// bindings (absent: the head needs no context at all)
     pub for_slots: HashMap<NodeId, u32>,
+    /// references that must not emit a TDZ hole check (for-head bindings
+    /// outside their head initializer, which always ran first)
+    pub ref_skip_hole: HashSet<ReferenceId>,
     /// lexical-head for scope → loop node
     pub for_of_scope: HashMap<ScopeId, NodeId>,
     /// loop nodes needing a fresh context per iteration
@@ -289,7 +293,7 @@ impl<'a, 'p> Collector<'a, 'p> {
             classes: &mut self.classes,
             class_of_node: &self.class_of_node,
             class_of_scope: &self.class_of_scope,
-            for_slots: &self.for_slots,
+            for_slots: &mut self.for_slots,
             for_of_scope: &self.for_of_scope,
             fn_scope_to_fid: &self.fn_scope_to_fid,
             captured: HashSet::new(),
@@ -300,6 +304,9 @@ impl<'a, 'p> Collector<'a, 'p> {
             obj_lit_home: HashSet::new(),
             special: HashMap::new(),
             ref_depth: HashMap::new(),
+            ref_skip_hole: HashSet::new(),
+            for_init_decl: HashMap::new(),
+            for_initialized: HashSet::new(),
             repl_root: matches!(self.mode, Mode::Repl),
             fid_node: &self.fid_node,
         };
@@ -310,12 +317,14 @@ impl<'a, 'p> Collector<'a, 'p> {
         // final before any depth is resolved
         d.scan_special_owners();
         d.scan_captures();
+        d.finalize_for_slots();
         d.creates_context = d.compute_creates_context();
         d.scan_special_nodes();
         d.compute_reference_depths();
         let Deriver {
             special,
             ref_depth,
+            ref_skip_hole,
             captured,
             creates_context,
             captures_this,
@@ -393,6 +402,7 @@ impl<'a, 'p> Collector<'a, 'p> {
             class_of_scope: self.class_of_scope,
             special,
             ref_depth,
+            ref_skip_hole,
             captured,
             creates_context,
             captures_this,
@@ -867,7 +877,7 @@ struct Deriver<'a, 'p, 'f> {
     classes: &'f mut Vec<ClassInfo<'a>>,
     class_of_node: &'f HashMap<NodeId, ClassIdx>,
     class_of_scope: &'f HashMap<ScopeId, ClassIdx>,
-    for_slots: &'f HashMap<NodeId, u32>,
+    for_slots: &'f mut HashMap<NodeId, u32>,
     for_of_scope: &'f HashMap<ScopeId, NodeId>,
     fn_scope_to_fid: &'f HashMap<ScopeId, Fid>,
     captured: HashSet<SymbolId>,
@@ -878,6 +888,9 @@ struct Deriver<'a, 'p, 'f> {
     obj_lit_home: HashSet<NodeId>,
     special: HashMap<NodeId, Special>,
     ref_depth: HashMap<ReferenceId, u32>,
+    ref_skip_hole: HashSet<ReferenceId>,
+    for_init_decl: HashMap<ScopeId, NodeId>,
+    for_initialized: HashSet<SymbolId>,
     /// REPL mode: root-level bindings are global properties, not slots
     repl_root: bool,
     /// fid → its AST node (program, function, property definition)
@@ -1140,6 +1153,107 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
 
     /// Count context-creating scopes strictly between `node` and the
     /// ancestor `target` (the use site's own context is depth 0).
+    /// For plain `for` heads whose bindings nothing captures (and whose
+    /// owner runs no direct eval), drop the head context: its bindings
+    /// live in registers. Nested scopes are unaffected; captured ones
+    /// keep the context, along with every head binding.
+    fn finalize_for_slots(&mut self) {
+        let eval_fns: HashSet<Fid> = self
+            .fn_scope_to_fid
+            .iter()
+            .filter(|(scope, _)| {
+                self.scoping
+                    .scope_flags(**scope)
+                    .contains(ScopeFlags::DirectEval)
+            })
+            .map(|(_, &fid)| fid)
+            .collect();
+        let mut captured_for: HashSet<NodeId> = HashSet::new();
+        for &sym in &self.captured {
+            let mut cur = self.scoping.symbol_scope_id(sym);
+            loop {
+                if let Some(&node) = self.for_of_scope.get(&cur) {
+                    captured_for.insert(node);
+                    break;
+                }
+                if self.fn_scope_to_fid.contains_key(&cur) || self.class_of_scope.contains_key(&cur)
+                {
+                    break;
+                }
+                match self.scoping.scope_parent_id(cur) {
+                    Some(p) => cur = p,
+                    None => break,
+                }
+            }
+        }
+        let loops: Vec<(ScopeId, NodeId)> = self
+            .for_of_scope
+            .iter()
+            .map(|(&scope, &node)| (scope, node))
+            .collect();
+        let mut candidates: Vec<(ScopeId, NodeId)> = Vec::new();
+        for (scope, node) in loops {
+            let plain = matches!(self.nodes.get_node(node).kind(), AstKind::ForStatement(_));
+            let eval = self
+                .for_scope_owner(scope)
+                .is_some_and(|fid| eval_fns.contains(&fid));
+            if !plain || eval || captured_for.contains(&node) {
+                continue;
+            }
+            let AstKind::ForStatement(f) = self.nodes.get_node(node).kind() else {
+                continue;
+            };
+            let Some(ForStatementInit::VariableDeclaration(d)) = &f.init else {
+                continue;
+            };
+            self.for_init_decl.insert(scope, d.node_id.get());
+            for declarator in &d.declarations {
+                if declarator.init.is_some() {
+                    self.for_initialized
+                        .extend(collect_binding_symbols(&declarator.id));
+                }
+            }
+            candidates.push((scope, node));
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        // a head binding referenced inside the head initializer is in TDZ
+        // there; registers hold `undefined`, so the context (hole-filled)
+        // must stay
+        let mut tdz_for: HashSet<NodeId> = HashSet::new();
+        for rid in 0..self.scoping.references_len() {
+            let reference = self.scoping.get_reference(ReferenceId::from_usize(rid));
+            let Some(symbol) = reference.symbol_id() else {
+                continue;
+            };
+            let decl_scope = self.scoping.symbol_scope_id(symbol);
+            let Some(&init_node) = self.for_init_decl.get(&decl_scope) else {
+                continue;
+            };
+            let ref_node = reference.node_id();
+            if ref_node == init_node || self.nodes.ancestors(ref_node).any(|a| a.id() == init_node)
+            {
+                tdz_for.insert(self.for_of_scope[&decl_scope]);
+            }
+        }
+        for (_, node) in candidates {
+            if !tdz_for.contains(&node) {
+                self.for_slots.remove(&node);
+            }
+        }
+    }
+
+    fn for_scope_owner(&self, scope: ScopeId) -> Option<Fid> {
+        let mut cur = self.scoping.scope_parent_id(scope)?;
+        loop {
+            if let Some(&fid) = self.fn_scope_to_fid.get(&cur) {
+                return Some(fid);
+            }
+            cur = self.scoping.scope_parent_id(cur)?;
+        }
+    }
+
     fn ctx_hops_until(&self, node: NodeId, target: NodeId) -> u32 {
         // depth = index of the target context in the use site's context
         // chain (innermost = 0)
@@ -1382,17 +1496,30 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
                 continue;
             };
             // only context loads need a depth: captured symbols, and
-            // class / for-head slots (always context-allocated). Local
-            // and param references never consult the table.
+            // class / context-bearing for-head slots. Local and param
+            // references never consult the table.
             let decl_scope = self.scoping.symbol_scope_id(symbol);
+            if let Some(&init_node) = self.for_init_decl.get(&decl_scope)
+                && self.for_initialized.contains(&symbol)
+            {
+                let ref_node = reference.node_id();
+                let in_init = ref_node == init_node
+                    || self.nodes.ancestors(ref_node).any(|a| a.id() == init_node);
+                if !in_init {
+                    self.ref_skip_hole.insert(rid);
+                }
+            }
             if !self.captured.contains(&symbol) {
                 let mut cur = decl_scope;
                 let fn_hosted = loop {
                     if self.fn_scope_to_fid.contains_key(&cur) {
                         break true;
                     }
-                    if self.class_of_scope.contains_key(&cur)
-                        || self.for_of_scope.contains_key(&cur)
+                    if self.class_of_scope.contains_key(&cur) {
+                        break false;
+                    }
+                    if let Some(&node) = self.for_of_scope.get(&cur)
+                        && self.for_slots.contains_key(&node)
                     {
                         break false;
                     }

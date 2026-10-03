@@ -207,6 +207,7 @@ impl Stack {
     }
 
     /// The frame's register-file size.
+    #[inline(always)]
     pub fn regcount(&self, base: usize) -> usize {
         self.header_slot(base, REGCOUNT_OFFSET).read_smi().value() as usize
     }

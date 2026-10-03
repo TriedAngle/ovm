@@ -654,6 +654,7 @@ pub fn set_integrity_flags(
             descriptors: &descriptors,
             prototype,
         });
+        vm_core::Prototype::shape_changed(heap, obj_ref.map_ref(heap));
         obj_ref
             .header
             .map

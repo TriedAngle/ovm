@@ -249,8 +249,6 @@ impl Object {
         }
 
         if grows {
-            // V8's `NewElementsCapacity`: 1.5x + 16, never below the
-            // current backing store.
             let (capacity, keep) = {
                 let heap_ref: &Heap = heap;
                 let obj = receiver.as_tagged(heap_ref);

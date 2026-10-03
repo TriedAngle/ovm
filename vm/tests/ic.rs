@@ -211,6 +211,18 @@ fn run_value(src: &str) -> (Value, Thread) {
     (result, thread)
 }
 
+/// Like [`run_value`] but REPL mode: state persists across evaluations.
+fn run_value_repl(src: &str) -> (Value, Thread) {
+    let vm = vm::VM::new::<MarkSweep, vm::DefaultInterpreter>(MarkSweepConfig::default())
+        .unwrap()
+        .add::<vm::JSRuntime>()
+        .unwrap();
+    vm.arm_gc_stress();
+    let mut thread = vm.attach();
+    let result = thread.eval_repl::<vm::JavascriptCompiler>(src).unwrap();
+    (result, thread)
+}
+
 fn feedback_vector_of<'a>(heap: &'a vm::Heap, result: Value) -> Option<Tagged<'a, FeedbackVector>> {
     // Safety: strong result value of a completed script run.
     let f = unsafe { Tagged::<vm::Object>::from_value_unchecked(result) };
@@ -305,7 +317,7 @@ fn five_shapes_go_megamorphic() {
 }
 
 #[test]
-fn prototype_hit_installs_one_hop_handler() {
+fn prototype_hit_installs_data_handler_with_cell() {
     let (result, mut thread) = run_value(
         "const p = {x: 1}; const o = {}; Object.setPrototypeOf(o, p);
          function f(r){ return r.x; } f(o); f(o); f;",
@@ -318,17 +330,61 @@ fn prototype_hit_installs_one_hop_handler() {
         state.is_ptr() && state.is_weak_ptr(),
         "mono on the receiver map"
     );
+    let handler_word = vector.as_ref().slot(slot + 1).raw();
+    assert!(
+        handler_word.is_ptr() && handler_word.is_strong_ptr(),
+        "prototype handlers are strong DataHandlers"
+    );
+    let handler = unsafe { Tagged::<Value>::from_value_unchecked(handler_word) }
+        .get_as::<vm::DataHandler>()
+        .expect("prototype chain hit is a DataHandler");
+    let smi = handler.as_ref().smi_handler(heap);
+    let (kind, offset) = decode_handler(smi.raw()).expect("kind Smi");
+    assert_eq!(
+        (kind, offset),
+        (0, 0),
+        "DataHandler wraps kField at offset 0"
+    );
+
+    // the whole guard is the receiver map's chain validity cell
+    let cell = handler
+        .as_ref()
+        .validity_cell(heap)
+        .as_strong()
+        .expect("field handlers carry a cell");
+    let cell = cell.get_as::<vm::Cell>().expect("validity cell is a Cell");
+    assert!(cell.as_ref().is_valid(heap), "cell starts valid");
+
+    // data[0] is the weak holder object (p), whose x slot holds 1
+    assert_eq!(handler.as_ref().data_len(), 1);
+    let holder = handler
+        .as_ref()
+        .data(heap, 0)
+        .as_strong()
+        .expect("live weak holder");
+    let holder = holder.get_as::<vm::Object>().expect("holder is an object");
+    assert_eq!(
+        Smi::decode(holder.as_ref().slot(heap, offset as usize).get(heap).raw())
+            .unwrap()
+            .value(),
+        1
+    );
+}
+
+#[test]
+fn own_field_handler_stays_bare_smi() {
+    let (result, mut thread) =
+        run_value("function f(o){ return o.x; } const o = {x: 1}; f(o); f(o); f;");
+    let heap = &*thread.heap();
+    let slot = first_named_load_slot(heap, result);
+    let vector = feedback_vector_of(heap, result).expect("feedback vector");
     let handler = vector.as_ref().slot(slot + 1).raw();
-    let chain = unsafe { Tagged::<Value>::from_value_unchecked(handler) }
-        .get_as::<WeakFixedArray>()
-        .expect("one-hop handler array");
-    let heap = thread.heap();
-    // [Smi ProtoField|offset, weak holder map] (accessors carry a third word)
-    assert_eq!(chain.as_ref().len(), 2);
-    let head = decode_handler(chain.as_ref().get(heap, 0).raw()).expect("kind Smi");
-    assert_eq!(head.0, 6, "ProtoField kind");
-    // after the prototype map changes (delete p.x), behavior stays correct —
-    // covered by deleted_prototype_property_disappears
+    let (kind, offset) = decode_handler(handler).expect("bare Smi handler");
+    assert_eq!(
+        (kind, offset),
+        (0, 0),
+        "OwnField at offset 0, no DataHandler"
+    );
 }
 
 #[test]
@@ -537,6 +593,11 @@ fn store_transition_handler_is_weak_target_map() {
         map.as_ref().map_ref(heap).kind().kind() == vm::ObjectKind::Map,
         "handler upgrades to a Map"
     );
+    let target = unsafe { map.cast::<vm::Map>() };
+    assert!(
+        target.as_ref().is_prototype_validity_cell_valid(heap),
+        "transition target carries a valid chain cell"
+    );
 }
 
 #[test]
@@ -715,5 +776,127 @@ fn kette_object_literal_stores_cache() {
              a.x"
         ),
         3
+    );
+}
+
+#[test]
+fn store_transition_late_prototype_setter_runs() {
+    // A cached store transition must re-check the target map's prototype
+    // validity cell: adding a setter to the prototype later invalidates it,
+    // so the store falls back to OrdinarySet and runs the setter.
+    assert!(run_bool(
+        "let log = 0;
+         function P(){}
+         function f(o,v){ o.x = v; }
+         f(new P(), 1);
+         f(new P(), 2);
+         Object.defineProperty(P.prototype, 'x', {set: function(v){ log = 10 + v; }});
+         var o3 = new P();
+         f(o3, 3);
+         log === 13 && o3.x === undefined;"
+    ));
+}
+
+/// The validity `Cell` of the DataHandler recorded at `slot`.
+fn handler_cell<'a>(heap: &'a vm::Heap, result: Value, slot: usize) -> Tagged<'a, vm::Cell> {
+    let vector = feedback_vector_of(heap, result).expect("vector");
+    let handler_word = vector.as_ref().slot(slot + 1).raw();
+    let handler = unsafe { Tagged::<Value>::from_value_unchecked(handler_word) }
+        .get_as::<vm::DataHandler>()
+        .expect("DataHandler");
+    handler
+        .as_ref()
+        .validity_cell(heap)
+        .as_strong()
+        .expect("cell")
+        .get_as::<vm::Cell>()
+        .expect("Cell")
+}
+
+#[test]
+fn prototype_mutation_invalidates_and_replaces_cell() {
+    let (r1, mut thread) = run_value_repl(
+        "var p = {x: 1}; var o = {}; Object.setPrototypeOf(o, p);
+         function f(r){ return r.x; } f(o); f(o); f;",
+    );
+    let slot = {
+        let heap = &*thread.heap();
+        let slot = first_named_load_slot(heap, r1);
+        assert!(
+            handler_cell(heap, r1, slot).as_ref().is_valid(heap),
+            "cached prototype hit has a valid cell"
+        );
+        slot
+    };
+
+    thread
+        .eval_repl::<vm::JavascriptCompiler>(
+            "Object.defineProperty(p, 'x', {value: 2, enumerable: false, writable: true, configurable: true}); 0;",
+        )
+        .unwrap();
+    {
+        let heap = &*thread.heap();
+        assert!(
+            handler_cell(heap, r1, slot).as_ref().is_cleared(),
+            "prototype mutation clears the embedded cell"
+        );
+    }
+
+    // The next load misses, re-analyzes and installs a fresh *valid* cell
+    // (a cleared cell can never become valid again).
+    let r2 = thread.eval_repl::<vm::JavascriptCompiler>("f(o);").unwrap();
+    let heap = &*thread.heap();
+    assert_eq!(Smi::decode(r2).unwrap().value(), 2);
+    let cell = handler_cell(heap, r1, slot);
+    assert!(cell.as_ref().is_valid(heap), "re-cache is valid");
+    let (kind, offset) = {
+        let vector = feedback_vector_of(heap, r1).expect("vector");
+        let handler_word = vector.as_ref().slot(slot + 1).raw();
+        let handler = unsafe { Tagged::<Value>::from_value_unchecked(handler_word) }
+            .get_as::<vm::DataHandler>()
+            .expect("DataHandler");
+        decode_handler(handler.as_ref().smi_handler(heap).raw()).unwrap()
+    };
+    assert_eq!((kind, offset), (0, 0), "still a field handler");
+}
+
+#[test]
+fn grandparent_mutation_invalidates_child_chain() {
+    let (r1, mut thread) = run_value_repl(
+        "function GP(){} GP.prototype.x = 1;
+         function P(){} P.prototype = new GP();
+         var o = new P();
+         function f(r){ return r.x; }
+         f(o); f(o); f;",
+    );
+    let slot = {
+        let heap = &*thread.heap();
+        let slot = first_named_load_slot(heap, r1);
+        assert!(
+            handler_cell(heap, r1, slot).as_ref().is_valid(heap),
+            "two-hop prototype field has a valid cell"
+        );
+        slot
+    };
+
+    thread
+        .eval_repl::<vm::JavascriptCompiler>(
+            "Object.defineProperty(GP.prototype, 'x', {value: 2, enumerable: false, writable: true, configurable: true}); 0;",
+        )
+        .unwrap();
+    {
+        let heap = &*thread.heap();
+        assert!(
+            handler_cell(heap, r1, slot).as_ref().is_cleared(),
+            "grandparent change propagates through the user link"
+        );
+    }
+
+    let r2 = thread.eval_repl::<vm::JavascriptCompiler>("f(o);").unwrap();
+    let heap = &*thread.heap();
+    assert_eq!(Smi::decode(r2).unwrap().value(), 2);
+    assert!(
+        handler_cell(heap, r1, slot).as_ref().is_valid(heap),
+        "grandparent change installs a fresh cell"
     );
 }

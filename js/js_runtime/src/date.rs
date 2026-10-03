@@ -99,8 +99,6 @@ fn year_iso(y: i64) -> String {
     }
 }
 
-/// The year in the DateString form: 4 digits in 0..=9999, else a bare
-/// signed value (V8-style: `-271821`, `275760`).
 fn year_date_string(y: i64) -> String {
     if (0..=9999).contains(&y) {
         format!("{y:04}")

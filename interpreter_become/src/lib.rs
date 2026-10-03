@@ -2623,8 +2623,8 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
     let pc = ip as usize - ctx.code_ptr() as usize;
     let callee = ops.signed::<0>();
     let recv = ops.signed::<1>();
-    let fb = ops.unsigned::<2>();
     let callee_word = regs.read(callee, ctx);
+    let fb = ops.unsigned::<2>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -2633,7 +2633,7 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_method_start(ctx, pc, size, callee_word, recv, [0, 0], 0, fb,)
+        call_method_start(ctx, pc, size, callee_word, recv, [0, 0], 0, fb)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2647,17 +2647,15 @@ extern "rust-preserve-none" fn op_call_method0<'a, const STRIDE: usize>(
                 float,
             )
         }
-        MethodCall::Frame(_frame) => {
-            become call_trampoline(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
+        MethodCall::Frame(_frame) => dispatch!(
+            ctx.code_ptr(),
+            ctx.undefined_word(),
+            unsafe { Regs::new(ctx.regs_ptr()) },
+            ctx,
+            table,
+            roots,
+            float
+        ),
 
         MethodCall::Proxy => {
             become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -2681,8 +2679,8 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
     let callee = ops.signed::<0>();
     let recv = ops.signed::<1>();
     let arg0 = ops.signed::<2>();
-    let fb = ops.unsigned::<3>();
     let callee_word = regs.read(callee, ctx);
+    let fb = ops.unsigned::<3>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -2691,7 +2689,7 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_method_start(ctx, pc, size, callee_word, recv, [arg0, 0], 1, fb,)
+        call_method_start(ctx, pc, size, callee_word, recv, [arg0, 0], 1, fb)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2705,17 +2703,15 @@ extern "rust-preserve-none" fn op_call_method1<'a, const STRIDE: usize>(
                 float,
             )
         }
-        MethodCall::Frame(_frame) => {
-            become call_trampoline(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
+        MethodCall::Frame(_frame) => dispatch!(
+            ctx.code_ptr(),
+            ctx.undefined_word(),
+            unsafe { Regs::new(ctx.regs_ptr()) },
+            ctx,
+            table,
+            roots,
+            float
+        ),
 
         MethodCall::Proxy => {
             become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -2740,8 +2736,8 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
     let recv = ops.signed::<1>();
     let arg0 = ops.signed::<2>();
     let arg1 = ops.signed::<3>();
-    let fb = ops.unsigned::<4>();
     let callee_word = regs.read(callee, ctx);
+    let fb = ops.unsigned::<4>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -2750,7 +2746,7 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_method_start(ctx, pc, size, callee_word, recv, [arg0, arg1], 2, fb,)
+        call_method_start(ctx, pc, size, callee_word, recv, [arg0, arg1], 2, fb)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2764,17 +2760,15 @@ extern "rust-preserve-none" fn op_call_method2<'a, const STRIDE: usize>(
                 float,
             )
         }
-        MethodCall::Frame(_frame) => {
-            become call_trampoline(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
+        MethodCall::Frame(_frame) => dispatch!(
+            ctx.code_ptr(),
+            ctx.undefined_word(),
+            unsafe { Regs::new(ctx.regs_ptr()) },
+            ctx,
+            table,
+            roots,
+            float
+        ),
 
         MethodCall::Proxy => {
             become slow_call_method_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -2796,8 +2790,8 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
     let size = base::<STRIDE>() + STRIDE * const { Opcode::CallFunction0.operands().len() };
     let pc = ip as usize - ctx.code_ptr() as usize;
     let callee = ops.signed::<0>();
-    let fb = ops.unsigned::<1>();
     let callee_word = regs.read(callee, ctx);
+    let fb = ops.unsigned::<1>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -2806,7 +2800,7 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_function_start(ctx, pc, size, callee_word, [0, 0], 0, fb,)
+        call_function_start(ctx, pc, size, callee_word, [0, 0], 0, fb)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2820,17 +2814,15 @@ extern "rust-preserve-none" fn op_call_function0<'a, const STRIDE: usize>(
                 float,
             )
         }
-        MethodCall::Frame(_frame) => {
-            become call_trampoline(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
+        MethodCall::Frame(_frame) => dispatch!(
+            ctx.code_ptr(),
+            ctx.undefined_word(),
+            unsafe { Regs::new(ctx.regs_ptr()) },
+            ctx,
+            table,
+            roots,
+            float
+        ),
 
         MethodCall::Proxy => {
             become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -2853,8 +2845,8 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
     let pc = ip as usize - ctx.code_ptr() as usize;
     let callee = ops.signed::<0>();
     let arg0 = ops.signed::<1>();
-    let fb = ops.unsigned::<2>();
     let callee_word = regs.read(callee, ctx);
+    let fb = ops.unsigned::<2>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -2863,7 +2855,7 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_function_start(ctx, pc, size, callee_word, [arg0, 0], 1, fb,)
+        call_function_start(ctx, pc, size, callee_word, [arg0, 0], 1, fb)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2877,17 +2869,15 @@ extern "rust-preserve-none" fn op_call_function1<'a, const STRIDE: usize>(
                 float,
             )
         }
-        MethodCall::Frame(_frame) => {
-            become call_trampoline(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
+        MethodCall::Frame(_frame) => dispatch!(
+            ctx.code_ptr(),
+            ctx.undefined_word(),
+            unsafe { Regs::new(ctx.regs_ptr()) },
+            ctx,
+            table,
+            roots,
+            float
+        ),
 
         MethodCall::Proxy => {
             become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -2911,8 +2901,8 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
     let callee = ops.signed::<0>();
     let arg0 = ops.signed::<1>();
     let arg1 = ops.signed::<2>();
-    let fb = ops.unsigned::<3>();
     let callee_word = regs.read(callee, ctx);
+    let fb = ops.unsigned::<3>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -2921,7 +2911,7 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        call_function_start(ctx, pc, size, callee_word, [arg0, arg1], 2, fb,)
+        call_function_start(ctx, pc, size, callee_word, [arg0, arg1], 2, fb)
     );
     match __mc {
         MethodCall::Value(v) => {
@@ -2935,17 +2925,15 @@ extern "rust-preserve-none" fn op_call_function2<'a, const STRIDE: usize>(
                 float,
             )
         }
-        MethodCall::Frame(_frame) => {
-            become call_trampoline(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
+        MethodCall::Frame(_frame) => dispatch!(
+            ctx.code_ptr(),
+            ctx.undefined_word(),
+            unsafe { Regs::new(ctx.regs_ptr()) },
+            ctx,
+            table,
+            roots,
+            float
+        ),
 
         MethodCall::Proxy => {
             become slow_call_function_proxy::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -2969,8 +2957,8 @@ extern "rust-preserve-none" fn op_call_ic<'a, const STRIDE: usize>(
     let callee = ops.signed::<0>();
     let base_r = ops.signed::<1>();
     let count = ops.unsigned::<2>();
-    let fb = ops.unsigned::<3>();
     let callee_word = regs.read(callee, ctx);
+    let fb = ops.unsigned::<3>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -2993,17 +2981,15 @@ extern "rust-preserve-none" fn op_call_ic<'a, const STRIDE: usize>(
                 float,
             )
         }
-        MethodCall::Frame(_frame) => {
-            become call_trampoline(
-                unsafe { ctx.code_ptr().add(pc) },
-                regs,
-                acc,
-                ctx,
-                table,
-                roots,
-                float,
-            )
-        }
+        MethodCall::Frame(_frame) => dispatch!(
+            ctx.code_ptr(),
+            ctx.undefined_word(),
+            unsafe { Regs::new(ctx.regs_ptr()) },
+            ctx,
+            table,
+            roots,
+            float
+        ),
 
         MethodCall::Proxy => {
             become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -3109,7 +3095,6 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
     let callee = ops.signed::<0>();
     let base_r = ops.signed::<1>();
     let count = ops.unsigned::<2>();
-    let out_r = ops.signed::<3>();
     let __mc = slow_start!(
         ip,
         regs,
@@ -3118,11 +3103,11 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
         table,
         roots,
         float,
-        construct_start(ctx, pc, size, regs, callee, base_r, count, out_r)
+        construct_start(ctx, pc, size, regs, callee, base_r, count)
     );
     match __mc {
         ConstructStart::Frame => {
-            become call_trampoline(
+            become construct_trampoline(
                 unsafe { ctx.code_ptr().add(pc) },
                 regs,
                 acc,
@@ -3133,7 +3118,6 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
             )
         }
         ConstructStart::Runtime(idx) => {
-            regs.write(out_r, ctx.undefined_word());
             let v = dispatch_runtime_construct(ctx, idx, callee, base_r, count);
             become resume(
                 unsafe { ctx.code_ptr().add(pc) },
@@ -3157,34 +3141,9 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
             )
         }
         ConstructStart::Slow => {
-            regs.write(out_r, ctx.undefined_word());
             become slow_construct::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
     }
-}
-
-#[rustc_align(32)]
-extern "rust-preserve-none" fn op_construct_check<'a, const STRIDE: usize>(
-    ip: *const u8,
-    regs: Regs,
-    acc: Tagged<'a, Value>,
-    ctx: &Ctx<'a>,
-    table: TableArg<'a>,
-    roots: RootsArg<'a>,
-    float: FloatReg,
-) -> Tagged<'a, Value> {
-    let ops = Ops::<STRIDE>::new(ip, Opcode::ConstructCheck);
-    let out_r = ops.signed::<0>();
-    let v = if Convert::is_primitive(ctx.heap(), acc) {
-        let recv = regs.read(out_r, ctx);
-        if recv == ctx.heap().known().the_hole.as_tagged(ctx.heap()).erase() {
-            bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
-        }
-        recv
-    } else {
-        acc
-    };
-    next!(ConstructCheck, ip, regs, ctx, table, roots, float, v)
 }
 
 fn read_signed(ip: *const u8, off: usize, stride: usize) -> i32 {
@@ -3200,7 +3159,8 @@ fn read_signed(ip: *const u8, off: usize, stride: usize) -> i32 {
 /// Outcome of a `Construct` fast-path attempt.
 enum ConstructStart {
     /// a constructor frame was pushed (the cache already points at it):
-    /// enter it through the trampoline
+    /// enter it at this execution's anchor; its `Return` applies the
+    /// receiver fixup
     Frame,
     /// receiver synthesis threw; the pending exception is set
     Threw(()),
@@ -3218,30 +3178,24 @@ fn construct_start<'a>(
     callee: i32,
     base: i32,
     count: usize,
-    out: i32,
 ) -> Result<ConstructStart, VmError> {
     let callee_word = regs.read(callee, ctx);
-    // only objects whose map marks them as constructors may be `new`-ed:
-    // Function.prototype is callable but has no [[Construct]]. The slow
-    // path raises the TypeError (cold::construct)
-    let constructible = callee_word
-        .as_heap_object()
-        .is_some_and(|o| o.as_ref().header.map.get(ctx.heap()).kind().is_constructor());
+    let constructible = callee_word.as_heap_object().is_some_and(|o| {
+        o.as_ref()
+            .header
+            .map
+            .get(ctx.heap())
+            .kind()
+            .is_constructor()
+    });
     if !constructible {
         return Ok(ConstructStart::Slow);
     }
     let kind = match Object::call_target(ctx.heap(), callee_word) {
-        // runtime constructors (`new Array`, `new Object`, …) run as a
-        // plain tier-1 call with `new_target` set — the callee allocates
-        // the instance itself, no frame and no nested execute
         Some(CallTarget::Runtime(idx)) => return Ok(ConstructStart::Runtime(idx)),
         Some(CallTarget::Bytecode { kind, .. }) => kind,
         _ => return Ok(ConstructStart::Slow),
     };
-    // ordinary and base-class constructors synthesize the receiver; a
-    // derived constructor's `this` is the hole until `super()` binds it
-    // and the hole doubles
-    // as the ConstructCheck's derived marker
     let derived = matches!(
         kind,
         FunctionKind::DerivedClassConstructor | FunctionKind::DefaultDerivedConstructor
@@ -3257,11 +3211,6 @@ fn construct_start<'a>(
             None => return Ok(ConstructStart::Threw(())),
         }
     };
-    // park the receiver in the caller's `out` register: it stays
-    // GC-rooted for the whole callee run and the ConstructCheck that
-    // follows the callee's return reads it (register-file slots are a
-    // fixed-capacity arena, so `regs` survives the allocation above)
-    regs.write(out, receiver);
     let callee_word = regs.read(callee, ctx);
     let Some(CallTarget::Bytecode {
         target,
@@ -3318,8 +3267,6 @@ fn construct_receiver_fast<'a>(
             let obj = heap.new_object(&scope, map, HandleSlice::EMPTY);
             return Ok(Some(obj.erase()));
         }
-        // miss: full synthesis, then record `[closure, fn_map, proto,
-        // proto_slot] -> initial_map` for next time
         let Some(obj) = Object::create_construct_receiver_value(vm, heap, state, callee.erase())?
         else {
             return Ok(None);
@@ -3344,8 +3291,9 @@ fn slow_next_pc(ip: *const u8) -> *const u8 {
 }
 
 #[inline(never)]
+
 #[rustc_align(32)]
-extern "rust-preserve-none" fn call_trampoline<'a>(
+extern "rust-preserve-none" fn construct_trampoline<'a>(
     fault_ip: *const u8,
     _regs: Regs,
     _acc: Tagged<'a, Value>,
@@ -3358,8 +3306,6 @@ extern "rust-preserve-none" fn call_trampoline<'a>(
     let frame_base = ctx.frame_base();
     let probe = 0u8;
     if ctx.stack_overflowed() {
-        // drop the half-built callee frame and surface the overflow
-        // through the sentinel channel
         let caller = ctx.stack().pop_frame(frame_base);
         ctx.set_frame_base(caller.base);
         let _ = unsafe { ctx.raise_tag(VmError::StackOverflow) };
@@ -3375,8 +3321,6 @@ extern "rust-preserve-none" fn call_trampoline<'a>(
             float,
         );
     }
-    // the push helper already switched the current frame to the callee;
-    // entry is pc 0 with the accumulator seeded undefined
     let code = ctx.code_ptr();
     let regs = unsafe { Regs::new(ctx.regs_ptr()) };
     let acc0 = ctx.stack().undefined_word(ctx.heap());
@@ -3384,9 +3328,9 @@ extern "rust-preserve-none" fn call_trampoline<'a>(
     let ip0 = code;
     let op = unsafe { *ip0 } as usize;
     let acc = unsafe { table.get(op as u8)(ip0, regs, acc0, &callee_ctx, table, roots, float) };
-    let caller = ctx.stack().pop_frame(frame_base);
-    ctx.set_frame_base(caller.base);
     if ctx.is_throw(acc) {
+        let caller = ctx.stack().pop_frame(frame_base);
+        ctx.set_frame_base(caller.base);
         let caller_code = ctx.code_ptr();
         become throw_dispatch(
             unsafe { caller_code.add(call_pc) },
@@ -3398,11 +3342,33 @@ extern "rust-preserve-none" fn call_trampoline<'a>(
             float,
         )
     }
+    // `this` lives in parameter register 0 of the callee window
+    let this_val = regs.read(0, ctx.heap());
+    let caller = ctx.stack().pop_frame(frame_base);
+    ctx.set_frame_base(caller.base);
+    let v = if Convert::is_primitive(ctx.heap(), acc) {
+        if this_val == ctx.heap().known().the_hole.as_tagged(ctx.heap()).erase() {
+            let _ = unsafe { ctx.raise_tag(VmError::Type) };
+            let caller_code = ctx.code_ptr();
+            become throw_dispatch(
+                unsafe { caller_code.add(caller.pc) },
+                unsafe { Regs::new(core::ptr::null_mut()) },
+                ctx.exception_word(),
+                ctx,
+                table,
+                roots,
+                float,
+            )
+        }
+        this_val
+    } else {
+        acc
+    };
     let code = ctx.code_ptr();
     let regs = unsafe { Regs::new(ctx.regs_ptr()) };
     let ip = unsafe { code.add(caller.pc) };
     let h = table.get(unsafe { *ip });
-    become h(ip, regs, acc, ctx, table, roots, float)
+    become h(ip, regs, v, ctx, table, roots, float)
 }
 
 #[inline(always)]
@@ -3763,7 +3729,6 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::CallMethod1 as usize] = op_call_method1::<1> as Handler;
     t[Opcode::CallMethod2 as usize] = op_call_method2::<1> as Handler;
     t[Opcode::Construct as usize] = op_construct::<1> as Handler;
-    t[Opcode::ConstructCheck as usize] = op_construct_check::<1> as Handler;
     t[Opcode::LoadHole as usize] = op_load_hole::<1> as Handler;
     t[Opcode::LoadNewTarget as usize] = op_load_new_target::<1> as Handler;
     t[Opcode::LoadContext as usize] = op_load_context::<1> as Handler;
@@ -3870,7 +3835,6 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::CallMethod1 as usize] = op_call_method1::<2> as Handler;
     t[Opcode::CallMethod2 as usize] = op_call_method2::<2> as Handler;
     t[Opcode::Construct as usize] = op_construct::<2> as Handler;
-    t[Opcode::ConstructCheck as usize] = op_construct_check::<2> as Handler;
     t[Opcode::LoadHole as usize] = op_load_hole::<2> as Handler;
     t[Opcode::LoadNewTarget as usize] = op_load_new_target::<2> as Handler;
     t[Opcode::LoadContext as usize] = op_load_context::<2> as Handler;

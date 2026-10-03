@@ -1,13 +1,12 @@
 use crate::{
-    AccessorPair, CallTarget, CallableInfoObject, Context, DenseString, FeedbackVector, FixedArray,
-    FunctionKind, Handle, HandleScope, Heap, Map, MaybeWeak, Object, SlotName, Smi, Tagged, Value,
-    WeakFixedArray, WeakFixedArrayInit,
+    AccessorPair, CallTarget, CallableInfoObject, Cell, Context, DataHandler, DataHandlerInit,
+    DenseString, FeedbackVector, FixedArray, FunctionKind, Handle, HandleScope, Heap, Map,
+    MaybeWeak, Object, Prototype, SlotName, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
 pub const MAX_POLYMORPHIC_ENTRIES: usize = 4;
 
-/// Smi kinds for bare (chain-free) handlers.
 const KIND_FIELD: i64 = 0;
 const KIND_SLOW: i64 = 1;
 /// Dense array element load; payload = flags + (when packed) the holey
@@ -20,6 +19,14 @@ const KIND_INDEXED_STRING: i64 = 4;
 /// Array `length`: read the receiver's length slot directly (the map check
 /// in the probe already pinned it to an array map). Payload unused.
 const KIND_ARRAY_LENGTH: i64 = 5;
+/// Prototype getter: `data[0]` is the weak `AccessorPair`; the receiver's
+/// chain is guarded by the handler's validity cell.
+const KIND_ACCESSOR: i64 = 6;
+/// Prototype setter: `data[0]` is the weak `AccessorPair`; the receiver's
+/// chain is guarded by the handler's validity cell.
+const KIND_SETTER: i64 = 7;
+/// Cached miss: the guarded chain has no such property.
+const KIND_NON_EXISTENT: i64 = 8;
 
 /// Element-load payload flags.
 const ELEMENT_HOLEY: i64 = 1 << 0;
@@ -30,18 +37,11 @@ const ELEMENT_EPOCH_SHIFT: i64 = 2;
 const STORE_HOLEY: i64 = 1 << 0;
 const STORE_GROW: i64 = 1 << 1;
 
-/// Smi kinds stored at index 0 of a chain-handler array.
 const CHAIN_FIELD: i64 = 0;
 const CHAIN_ACCESSOR: i64 = 1;
 const CHAIN_SETTER: i64 = 4;
 const CHAIN_NON_EXISTENT: i64 = 3;
 const CHAIN_PARENT_NAME: i64 = 5;
-/// One-hop prototype handlers: `[kind|offset, weak holder map, weak pair]`.
-const CHAIN_PROTO_FIELD: i64 = 6;
-const CHAIN_PROTO_ACCESSOR: i64 = 7;
-/// Two-hop prototype field: `[kind|offset, weak holder0 map, weak holder1 map]`
-/// (`inheritsFrom`: receiver → subclass prototype → superclass prototype).
-const CHAIN_PROTO_FIELD2: i64 = 8;
 
 fn kind_smi(kind: i64, payload: i64) -> Smi {
     Smi::new(kind | (payload << 8))
@@ -49,7 +49,13 @@ fn kind_smi(kind: i64, payload: i64) -> Smi {
 
 /// Decode the `(kind, payload)` Smi view of a handler word.
 fn decode_smi(word: Tagged<'_, MaybeWeak<Value>>) -> Option<(i64, i64)> {
-    let v = Smi::decode(word.raw())?.value();
+    decode_handler_smi(word.raw())
+}
+
+/// Decode the `(kind, payload)` view of any Smi word (bare handler,
+/// `DataHandler::smi_handler` or chain head).
+fn decode_handler_smi(word: Value) -> Option<(i64, i64)> {
+    let v = Smi::decode(word)?.value();
     Some((v & 0xff, v >> 8))
 }
 
@@ -154,13 +160,11 @@ fn probe<'a>(
 enum Handler<'s> {
     /// `Field { offset }` or `Slow`
     Smi(Smi),
-    /// a chain handler array (field through the chain, accessor/setter,
-    /// parent name, non-existent)
+    /// a Kette/mixed chain handler array (field through parent pairs,
+    /// accessor/setter, parent name, non-existent)
     Chain(Handle<'s, WeakFixedArray>),
-    /// a one-hop prototype data field: holder map + slot offset
-    ProtoField(Handle<'s, WeakFixedArray>),
-    /// a one-hop prototype accessor: holder map + weak getter pair
-    ProtoAccessor(Handle<'s, WeakFixedArray>),
+    Data(Handle<'s, DataHandler>),
+    WeakPair(Handle<'s, AccessorPair>),
     /// a store transition: migrate the receiver to this map
     WeakMap(Handle<'s, Map>),
 }
@@ -169,9 +173,9 @@ impl Handler<'_> {
     fn word<'a>(&self, heap: &'a Heap) -> Tagged<'a, MaybeWeak<Value>> {
         match self {
             Self::Smi(s) => s.into_tagged().as_maybe_weak(),
-            Self::Chain(arr) | Self::ProtoField(arr) | Self::ProtoAccessor(arr) => {
-                arr.as_tagged(heap).erase().as_maybe_weak()
-            }
+            Self::Chain(arr) => arr.as_tagged(heap).erase().as_maybe_weak(),
+            Self::Data(dh) => dh.as_tagged(heap).erase().as_maybe_weak(),
+            Self::WeakPair(pair) => pair.as_tagged(heap).erase().as_weak(),
             Self::WeakMap(m) => m.as_tagged(heap).erase().as_weak(),
         }
     }
@@ -199,6 +203,7 @@ struct ChainEntry<'s> {
 enum Found<'s> {
     Data {
         offset: usize,
+        holder: Handle<'s, Object>,
     },
     Accessor {
         pair: Handle<'s, AccessorPair>,
@@ -237,7 +242,10 @@ fn walk<'s>(
                 pair: scope.handle(pair),
             });
         }
-        return Some(Found::Data { offset: d.offset() });
+        return Some(Found::Data {
+            offset: d.offset(),
+            holder: scope.handle(obj),
+        });
     }
     let proto = map.prototype.get(heap);
     if proto == heap.known().null.as_tagged(heap) {
@@ -358,6 +366,216 @@ fn chain_step<'a>(
     next.map_ref(heap).ptr_eq(expected).then_some(next)
 }
 
+fn is_normal_chain(entries: &[ChainEntry<'_>]) -> bool {
+    entries
+        .iter()
+        .enumerate()
+        .all(|(i, e)| e.hop < 0 && e.owner == i as i64 - 1)
+}
+
+/// A weak word stored in a `DataHandler`'s flexible `data[]` array.
+enum DataWord<'s> {
+    Object(Handle<'s, Object>),
+    Pair(Handle<'s, AccessorPair>),
+}
+
+fn build_data_handler<'s>(
+    heap: &mut Heap,
+    scope: &'s HandleScope<'_>,
+    receiver_map: &Handle<'s, Map>,
+    smi_handler: Smi,
+    data: &[DataWord<'s>],
+) -> Handle<'s, DataHandler> {
+    let cell = Prototype::get_or_create_prototype_chain_validity_cell(heap, scope, *receiver_map);
+    let count = data.len();
+    heap.allocate_token_enter_heap(DataHandler::layout_for(count), |token, heap| {
+        let validity_cell = match &cell {
+            Some(cell) => cell.as_tagged(heap).erase().as_maybe_weak(),
+            None => unsafe {
+                Tagged::from_maybe_weak_unchecked(Map::NO_VALIDITY_CELL_SENTINEL.encode())
+            },
+        };
+        let words: Vec<Tagged<'_, MaybeWeak<Value>>> = data
+            .iter()
+            .map(|word| match word {
+                DataWord::Object(obj) => obj.as_tagged(heap).erase().as_weak(),
+                DataWord::Pair(pair) => pair.as_tagged(heap).erase().as_weak(),
+            })
+            .collect();
+        token
+            .allocate::<DataHandler>(DataHandlerInit {
+                smi_handler,
+                validity_cell,
+                data: &words,
+            })
+            .as_handle(scope)
+    })
+}
+
+/// What the load analysis found, rooted so it survives handler
+/// construction.
+struct Plan<'s> {
+    kind: PlanKind,
+    /// field offset (data) or parent-pair element index (parent name)
+    offset: usize,
+    receiver_map: Handle<'s, Map>,
+    /// visited prototype chain in walk order
+    entries: Vec<ChainEntry<'s>>,
+    pair: Option<Handle<'s, AccessorPair>>,
+    holder: Option<Handle<'s, Object>>,
+}
+
+enum PlanKind {
+    Field,
+    ArrayLength,
+    Slow,
+    Accessor,
+    ParentName,
+    NonExistent,
+}
+
+impl<'s> Plan<'s> {
+    fn non_existent(&self) -> bool {
+        matches!(self.kind, PlanKind::NonExistent)
+    }
+
+    fn into_handler(self, heap: &mut Heap, scope: &'s HandleScope<'_>) -> Handler<'s> {
+        let normal = is_normal_chain(&self.entries);
+        match self.kind {
+            // Own data field: a bare, chain-free Smi handler.
+            PlanKind::Field if self.entries.is_empty() => {
+                Handler::Smi(kind_smi(KIND_FIELD, self.offset as i64))
+            }
+            PlanKind::Field if normal => Handler::Data(build_data_handler(
+                heap,
+                scope,
+                &self.receiver_map,
+                kind_smi(KIND_FIELD, self.offset as i64),
+                &[DataWord::Object(
+                    self.holder.expect("prototype field has a holder"),
+                )],
+            )),
+            PlanKind::ArrayLength => Handler::Smi(kind_smi(KIND_ARRAY_LENGTH, 0)),
+            PlanKind::Field => Handler::Chain(build_chain_array(
+                heap,
+                scope,
+                CHAIN_FIELD,
+                self.offset as i64,
+                None,
+                &self.entries,
+            )),
+            PlanKind::Slow => Handler::Smi(kind_smi(KIND_SLOW, 0)),
+            PlanKind::Accessor if self.entries.is_empty() => {
+                let pair = self.pair.expect("accessor has a pair");
+                Handler::WeakPair(pair.as_tagged(heap).as_handle(scope))
+            }
+            // Prototype accessor: `LoadHandler::LoadFromPrototype` with
+            // `kAccessorFromPrototype` and weak data.
+            PlanKind::Accessor if normal => Handler::Data(build_data_handler(
+                heap,
+                scope,
+                &self.receiver_map,
+                kind_smi(KIND_ACCESSOR, 0),
+                &[DataWord::Pair(self.pair.expect("accessor has a pair"))],
+            )),
+            PlanKind::Accessor => Handler::Chain(build_chain_array(
+                heap,
+                scope,
+                CHAIN_ACCESSOR,
+                0,
+                self.pair.as_ref(),
+                &self.entries,
+            )),
+            PlanKind::ParentName => Handler::Chain(build_chain_array(
+                heap,
+                scope,
+                CHAIN_PARENT_NAME,
+                self.offset as i64,
+                None,
+                &self.entries,
+            )),
+            PlanKind::NonExistent if normal => Handler::Data(build_data_handler(
+                heap,
+                scope,
+                &self.receiver_map,
+                kind_smi(KIND_NON_EXISTENT, 0),
+                &[],
+            )),
+            PlanKind::NonExistent => Handler::Chain(build_chain_array(
+                heap,
+                scope,
+                CHAIN_NON_EXISTENT,
+                0,
+                None,
+                &self.entries,
+            )),
+        }
+    }
+}
+
+/// Analyze a load into a cacheable plan.
+fn analyze_load<'s>(
+    heap: &Heap,
+    scope: &'s HandleScope<'_>,
+    receiver: Tagged<'_, Object>,
+    name: Tagged<'_, SlotName>,
+) -> Plan<'s> {
+    let receiver_map = scope.handle(receiver.map_ref(heap));
+    let slow = || Plan {
+        kind: PlanKind::Slow,
+        offset: 0,
+        receiver_map,
+        entries: Vec::new(),
+        pair: None,
+        holder: None,
+    };
+    if receiver.as_ref().array_length(heap, name).is_some() {
+        return Plan {
+            kind: PlanKind::ArrayLength,
+            offset: 0,
+            receiver_map,
+            entries: Vec::new(),
+            pair: None,
+            holder: None,
+        };
+    }
+    let mut entries: Vec<ChainEntry<'s>> = Vec::new();
+    match walk(heap, scope, receiver, name, -1, &mut entries) {
+        Some(Found::Data { offset, holder }) => Plan {
+            kind: PlanKind::Field,
+            offset,
+            receiver_map,
+            entries,
+            pair: None,
+            holder: Some(holder),
+        },
+        Some(Found::Accessor { pair }) => Plan {
+            kind: PlanKind::Accessor,
+            offset: 0,
+            receiver_map,
+            entries,
+            pair: Some(pair),
+            holder: None,
+        },
+        Some(Found::ParentName { index }) => Plan {
+            kind: PlanKind::ParentName,
+            offset: index as usize,
+            receiver_map,
+            entries,
+            pair: None,
+            holder: None,
+        },
+        None => Plan {
+            kind: PlanKind::NonExistent,
+            offset: 0,
+            receiver_map,
+            entries,
+            pair: None,
+            holder: None,
+        },
+        Some(Found::Uncacheable) => slow(),
+    }
+}
 /// Allocate `[kind, payload, (hop, owner, map) × n]`.
 fn build_chain_array<'s>(
     heap: &mut Heap,
@@ -386,210 +604,57 @@ fn build_chain_array<'s>(
     })
 }
 
-/// Allocate `[kind|offset, weak holder map, weak pair-or-zero]`: a one-hop
-/// prototype handler whose single map check replaces the chain walk.
-fn build_proto_array<'s>(
-    heap: &mut Heap,
-    scope: &'s HandleScope<'_>,
-    kind: i64,
-    offset: i64,
-    holder_map: &Handle<'_, Map>,
-    pair: Option<&Handle<'_, AccessorPair>>,
-) -> Handle<'s, WeakFixedArray> {
-    // a data field needs only [kind|offset, weak holder map]; accessors
-    // carry the weak pair in a third word
-    let len = if pair.is_some() { 3 } else { 2 };
-    heap.allocate_token_enter_heap(WeakFixedArray::<Value>::layout_for(len), |token, heap| {
-        let mut words: [Tagged<'_, MaybeWeak<Value>>; 3] = [
-            kind_smi(kind, offset).into_tagged().as_maybe_weak(),
-            holder_map.as_tagged(heap).erase().as_weak(),
-            Smi::new(0).into_tagged().as_maybe_weak(),
-        ];
-        if let Some(pair) = pair {
-            words[2] = pair.as_tagged(heap).erase().as_weak();
-        }
-        let arr = token.allocate::<WeakFixedArray>(WeakFixedArrayInit {
-            values: &words[..len],
-        });
-        scope.handle(arr)
-    })
-}
-
-/// Allocate `[kind|offset, weak holder0 map, weak holder1 map]`: a two-hop
-/// prototype field handler verified by two map checks instead of a chain
-/// walk.
-fn build_proto2_array<'s>(
-    heap: &mut Heap,
-    scope: &'s HandleScope<'_>,
-    kind: i64,
-    offset: i64,
-    holder0: &Handle<'_, Map>,
-    holder1: &Handle<'_, Map>,
-) -> Handle<'s, WeakFixedArray> {
-    heap.allocate_token_enter_heap(WeakFixedArray::<Value>::layout_for(3), |token, heap| {
-        let words: [Tagged<'_, MaybeWeak<Value>>; 3] = [
-            kind_smi(kind, offset).into_tagged().as_maybe_weak(),
-            holder0.as_tagged(heap).erase().as_weak(),
-            holder1.as_tagged(heap).erase().as_weak(),
-        ];
-        let arr = token.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &words });
-        scope.handle(arr)
-    })
-}
-
-/// What the load analysis found, rooted so it survives handler
-/// construction.
-struct Plan<'s> {
-    kind: PlanKind,
-    /// field offset (data) or parent-pair element index (parent name)
-    offset: usize,
-    /// visited prototype chain in walk order
-    entries: Vec<ChainEntry<'s>>,
-    pair: Option<Handle<'s, AccessorPair>>,
-}
-
-enum PlanKind {
-    Field,
-    ArrayLength,
-    Slow,
-    Accessor,
-    ParentName,
-    NonExistent,
-}
-
-impl Plan<'_> {
-    fn non_existent(&self) -> bool {
-        matches!(self.kind, PlanKind::NonExistent)
-    }
-
-    fn into_handler<'s>(self, heap: &mut Heap, scope: &'s HandleScope<'_>) -> Handler<'s> {
-        // a property found on the direct prototype can be cached as a
-        // one-hop handler whose holder map check replaces the chain walk
-        let one_hop =
-            self.entries.len() == 1 && self.entries[0].hop < 0 && self.entries[0].owner < 0;
-        let two_hop = self.entries.len() == 2
-            && self.entries[0].hop < 0
-            && self.entries[0].owner < 0
-            && self.entries[1].hop < 0
-            && self.entries[1].owner == 0;
-        match self.kind {
-            PlanKind::Field if self.entries.is_empty() => {
-                Handler::Smi(kind_smi(KIND_FIELD, self.offset as i64))
-            }
-            PlanKind::Field if one_hop => Handler::ProtoField(build_proto_array(
-                heap,
-                scope,
-                CHAIN_PROTO_FIELD,
-                self.offset as i64,
-                &self.entries[0].map,
-                None,
-            )),
-            PlanKind::Field if two_hop => Handler::ProtoField(build_proto2_array(
-                heap,
-                scope,
-                CHAIN_PROTO_FIELD2,
-                self.offset as i64,
-                &self.entries[0].map,
-                &self.entries[1].map,
-            )),
-            PlanKind::ArrayLength => Handler::Smi(kind_smi(KIND_ARRAY_LENGTH, 0)),
-            PlanKind::Field => Handler::Chain(build_chain_array(
-                heap,
-                scope,
-                CHAIN_FIELD,
-                self.offset as i64,
-                None,
-                &self.entries,
-            )),
-            PlanKind::Slow => Handler::Smi(kind_smi(KIND_SLOW, 0)),
-            PlanKind::Accessor if one_hop => Handler::ProtoAccessor(build_proto_array(
-                heap,
-                scope,
-                CHAIN_PROTO_ACCESSOR,
-                0,
-                &self.entries[0].map,
-                self.pair.as_ref(),
-            )),
-            PlanKind::Accessor => Handler::Chain(build_chain_array(
-                heap,
-                scope,
-                CHAIN_ACCESSOR,
-                0,
-                self.pair.as_ref(),
-                &self.entries,
-            )),
-            PlanKind::ParentName => Handler::Chain(build_chain_array(
-                heap,
-                scope,
-                CHAIN_PARENT_NAME,
-                self.offset as i64,
-                None,
-                &self.entries,
-            )),
-            PlanKind::NonExistent => Handler::Chain(build_chain_array(
-                heap,
-                scope,
-                CHAIN_NON_EXISTENT,
-                0,
-                None,
-                &self.entries,
-            )),
-        }
-    }
-}
-
-/// Analyze a load into a cacheable plan.
-fn analyze_load<'s>(
-    heap: &Heap,
-    scope: &'s HandleScope<'_>,
-    receiver: Tagged<'_, Object>,
-    name: Tagged<'_, SlotName>,
-) -> Plan<'s> {
-    let slow = || Plan {
-        kind: PlanKind::Slow,
-        offset: 0,
-        entries: Vec::new(),
-        pair: None,
-    };
-    if receiver.as_ref().array_length(heap, name).is_some() {
-        return Plan {
-            kind: PlanKind::ArrayLength,
-            offset: 0,
-            entries: Vec::new(),
-            pair: None,
-        };
-    }
-    let mut entries: Vec<ChainEntry<'s>> = Vec::new();
-    match walk(heap, scope, receiver, name, -1, &mut entries) {
-        Some(Found::Data { offset }) => Plan {
-            kind: PlanKind::Field,
-            offset,
-            entries,
-            pair: None,
-        },
-        Some(Found::Accessor { pair }) => Plan {
-            kind: PlanKind::Accessor,
-            offset: 0,
-            entries,
-            pair: Some(pair),
-        },
-        Some(Found::ParentName { index }) => Plan {
-            kind: PlanKind::ParentName,
-            offset: index as usize,
-            entries,
-            pair: None,
-        },
-        None => Plan {
-            kind: PlanKind::NonExistent,
-            offset: 0,
-            entries,
-            pair: None,
-        },
-        Some(Found::Uncacheable) => slow(),
-    }
-}
-
 pub struct InlineCache;
+
+#[inline(always)]
+fn check_prototype_validity_cell(heap: &Heap, handler: Tagged<'_, DataHandler>) -> bool {
+    match handler.as_ref().validity_cell(heap).as_strong() {
+        None => true,
+        Some(cell) => cell
+            .get_as::<Cell>()
+            .is_some_and(|cell| cell.as_ref().is_valid(heap)),
+    }
+}
+
+/// A getter hit (or an `undefined` value when the accessor has no getter).
+fn getter_hit<'a>(heap: &'a Heap, pair: Tagged<'a, AccessorPair>) -> Hit<'a> {
+    let getter = pair.as_ref().get.get(heap);
+    if getter == heap.known().undefined.as_tagged(heap) {
+        Hit::Value(heap.known().undefined.as_tagged(heap).erase())
+    } else {
+        Hit::Getter(getter)
+    }
+}
+
+#[inline(always)]
+fn apply_data_handler<'a>(heap: &'a Heap, handler: Tagged<'a, DataHandler>) -> Option<Hit<'a>> {
+    if !check_prototype_validity_cell(heap, handler) {
+        return None;
+    }
+    let (kind, payload) = decode_handler_smi(handler.as_ref().smi_handler(heap).raw())?;
+    match kind {
+        KIND_FIELD => {
+            let holder = handler
+                .as_ref()
+                .data(heap, 0)
+                .as_strong()?
+                .get_as::<Object>()?;
+            Some(Hit::Value(
+                holder.as_ref().slot(heap, payload as usize).get(heap),
+            ))
+        }
+        KIND_ACCESSOR => {
+            let pair = handler
+                .as_ref()
+                .data(heap, 0)
+                .as_strong()?
+                .get_as::<AccessorPair>()?;
+            Some(getter_hit(heap, pair))
+        }
+        KIND_NON_EXISTENT => Some(Hit::NotFound),
+        _ => None,
+    }
+}
 
 #[inline(always)]
 fn apply_fast<'a>(
@@ -605,27 +670,15 @@ fn apply_fast<'a>(
             _ => None,
         };
     }
-    // Safety: a non-Smi load handler is always a WeakFixedArray written by
-    // this module (stores use a weak map, loads never do).
-    let chain = unsafe { handler.cast::<WeakFixedArray>() };
-    let chain_ref = unsafe { chain.as_ref_unchecked() };
-    let (kind, payload) = decode_smi(chain_ref.get(heap, 0))?;
-    match kind {
-        CHAIN_PROTO_FIELD => {
-            let holder = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
-            Some(Hit::Value(holder.slot(heap, payload as usize).get(heap)))
-        }
-        CHAIN_PROTO_FIELD2 => {
-            let h0 = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
-            let holder = proto_holder(heap, h0, chain_ref.get(heap, 2))?;
-            Some(Hit::Value(holder.slot(heap, payload as usize).get(heap)))
-        }
-        _ => None,
+    if handler.raw().is_weak_ptr() {
+        // own accessor as a whole weak pair, cleared weak maps, ...
+        return None;
     }
+    apply_data_handler(heap, handler.as_strong()?.get_as::<DataHandler>()?)
 }
 
 /// The subset of load handlers the interpreter can complete inline: an own
-/// field, or a field on the immediate prototype (one-hop method lookup).
+/// field or a guarded prototype field.
 #[inline(always)]
 fn apply_value_fast<'a>(
     heap: &'a Heap,
@@ -650,87 +703,44 @@ fn apply_load_handler<'a>(
     if !handler.raw().is_ptr() {
         return None;
     }
-    apply_rest(heap, receiver, handler)
+    if handler.raw().is_weak_ptr() {
+        let pair = handler.as_strong()?.get_as::<AccessorPair>()?;
+        return Some(getter_hit(heap, pair));
+    }
+    let strong = handler.as_strong()?;
+    if let Some(handler) = strong.get_as::<DataHandler>() {
+        return apply_data_handler(heap, handler);
+    }
+    apply_rest(heap, receiver, strong.get_as::<WeakFixedArray>()?)
 }
 
 #[inline(never)]
 fn apply_rest<'a>(
     heap: &'a Heap,
     receiver: Tagged<'a, Object>,
-    handler: Tagged<'a, MaybeWeak<Value>>,
+    chain: Tagged<'a, WeakFixedArray>,
 ) -> Option<Hit<'a>> {
-    // Safety: a non-Smi load handler is always a WeakFixedArray written by
-    // this module (stores use a weak map, loads never do).
-    debug_assert!(
-        handler
-            .as_strong()
-            .is_some_and(|h| h.get_as::<WeakFixedArray>().is_some())
-    );
-    let chain = unsafe { handler.as_strong()?.cast::<WeakFixedArray>() };
     let chain_ref = chain.as_ref();
-    let head = decode_smi(chain_ref.get(heap, 0))?;
-    match head.0 {
-        CHAIN_PROTO_FIELD => {
-            let holder = proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
-            Some(Hit::Value(holder.slot(heap, head.1 as usize).get(heap)))
+    let (kind, payload) = decode_smi(chain_ref.get(heap, 0))?;
+    let holder = verify_chain(heap, receiver, chain)?;
+    match kind {
+        CHAIN_FIELD => Some(Hit::Value(holder.slot(heap, payload as usize).get(heap))),
+        CHAIN_ACCESSOR => {
+            // Safety: accessor chains store the pair weakly at 1.
+            let pair = unsafe { chain_ref.get(heap, 1).as_strong()?.cast::<AccessorPair>() };
+            Some(getter_hit(heap, pair))
         }
-        CHAIN_PROTO_ACCESSOR => {
-            proto_holder(heap, receiver, chain_ref.get(heap, 1))?;
-            // Safety: proto-accessor chains store the pair weakly at 2.
-            let pair = unsafe { chain_ref.get(heap, 2).as_strong()?.cast::<AccessorPair>() };
-            let getter = pair.get.get(heap);
-            Some(if getter == heap.known().undefined.as_tagged(heap) {
-                Hit::Value(heap.known().undefined.as_tagged(heap).erase())
-            } else {
-                Hit::Getter(getter)
-            })
+        CHAIN_PARENT_NAME => {
+            let pairs = holder
+                .map_ref(heap)
+                .prototype
+                .get(heap)
+                .get_as::<FixedArray>()?;
+            Some(Hit::Value(pairs.at(heap, payload as usize)))
         }
-        _ => {
-            let holder = verify_chain(heap, receiver, chain)?;
-            match head.0 {
-                CHAIN_FIELD => Some(Hit::Value(holder.slot(heap, head.1 as usize).get(heap))),
-                CHAIN_ACCESSOR => {
-                    // Safety: accessor chains store the pair weakly at 1.
-                    let pair =
-                        unsafe { chain_ref.get(heap, 1).as_strong()?.cast::<AccessorPair>() };
-                    let getter = pair.get.get(heap);
-                    Some(if getter == heap.known().undefined.as_tagged(heap) {
-                        Hit::Value(heap.known().undefined.as_tagged(heap).erase())
-                    } else {
-                        Hit::Getter(getter)
-                    })
-                }
-                CHAIN_PARENT_NAME => {
-                    let pairs = holder
-                        .map_ref(heap)
-                        .prototype
-                        .get(heap)
-                        .get_as::<FixedArray>()?;
-                    Some(Hit::Value(pairs.at(heap, head.1 as usize)))
-                }
-                CHAIN_NON_EXISTENT => Some(Hit::NotFound),
-                _ => None,
-            }
-        }
+        CHAIN_NON_EXISTENT => Some(Hit::NotFound),
+        _ => None,
     }
-}
-
-#[inline(always)]
-fn proto_holder<'a>(
-    heap: &'a Heap,
-    receiver: Tagged<'a, Object>,
-    expected: Tagged<'a, MaybeWeak<Value>>,
-) -> Option<Tagged<'a, Object>> {
-    // Safety: one-hop handlers store the holder map weakly in this slot.
-    debug_assert!(
-        expected
-            .as_strong()
-            .is_some_and(|m| m.get_as::<Map>().is_some())
-    );
-    let expected = unsafe { expected.as_strong()?.cast::<Map>() };
-    let proto = receiver.map_ref(heap).prototype.get(heap);
-    let holder = proto.as_heap_object()?;
-    holder.map_ref(heap).ptr_eq(expected).then_some(holder)
 }
 
 /// The `undefined` singleton as a value.
@@ -798,6 +808,7 @@ fn apply_indexed_string<'a>(
 struct StorePlan<'s> {
     field: Option<usize>,
     setter: Option<Handle<'s, AccessorPair>>,
+    receiver_map: Handle<'s, Map>,
     entries: Vec<ChainEntry<'s>>,
 }
 
@@ -809,14 +820,15 @@ fn analyze_store<'s>(
     receiver: Tagged<'_, Object>,
     name: Tagged<'_, SlotName>,
 ) -> StorePlan<'s> {
+    let mut entries: Vec<ChainEntry<'s>> = Vec::new();
     let mut plan = StorePlan {
         field: None,
         setter: None,
+        receiver_map: scope.handle(receiver.map_ref(heap)),
         entries: Vec::new(),
     };
-    let mut entries: Vec<ChainEntry<'s>> = Vec::new();
     match walk(heap, scope, receiver, name, -1, &mut entries) {
-        Some(Found::Data { offset }) if entries.is_empty() => plan.field = Some(offset),
+        Some(Found::Data { offset, .. }) if entries.is_empty() => plan.field = Some(offset),
         Some(Found::Accessor { pair }) => plan.setter = Some(pair),
         _ => {}
     }
@@ -831,21 +843,52 @@ fn store_handler<'s>(
     plan: StorePlan<'s>,
 ) -> Handler<'s> {
     if let Some(target) = transition_target {
-        return Handler::WeakMap(target);
+        if !target.as_tagged(heap).as_ref().is_prototype() {
+            Prototype::ensure_store_transition_validity_cell(heap, scope, target);
+            return Handler::WeakMap(target);
+        }
+        return Handler::Smi(kind_smi(KIND_SLOW, 0));
     }
     if let Some(offset) = plan.field {
         return Handler::Smi(kind_smi(KIND_FIELD, offset as i64));
     }
-    match plan.setter {
-        Some(pair) => Handler::Chain(build_chain_array(
+    let Some(pair) = plan.setter else {
+        return Handler::Smi(kind_smi(KIND_SLOW, 0));
+    };
+    if plan.entries.is_empty() {
+        return Handler::WeakPair(pair);
+    }
+    if is_normal_chain(&plan.entries) {
+        return Handler::Data(build_data_handler(
             heap,
             scope,
-            CHAIN_SETTER,
-            0,
-            Some(&pair),
-            &plan.entries,
-        )),
-        None => Handler::Smi(kind_smi(KIND_SLOW, 0)),
+            &plan.receiver_map,
+            kind_smi(KIND_SETTER, 0),
+            &[DataWord::Pair(pair)],
+        ));
+    }
+    Handler::Chain(build_chain_array(
+        heap,
+        scope,
+        CHAIN_SETTER,
+        0,
+        Some(&pair),
+        &plan.entries,
+    ))
+}
+
+/// A setter found on a prototype or owned by the receiver: run it, or treat
+/// a setter-less accessor as a silently ignored write.
+fn setter_action<'s>(
+    heap: &Heap,
+    scope: &'s HandleScope<'_>,
+    pair: Tagged<'_, AccessorPair>,
+) -> StoreAction<'s> {
+    let setter = pair.as_ref().set.get(heap);
+    if setter == heap.known().undefined.as_tagged(heap) {
+        StoreAction::Noop
+    } else {
+        StoreAction::Setter(scope.handle(setter))
     }
 }
 
@@ -1200,9 +1243,36 @@ impl InlineCache {
                     _ => return None,
                 }
             } else if handler.raw().is_weak_ptr() {
-                let target = handler.as_strong()?.get_as::<Map>()?;
-                StoreAction::Transition(scope.handle(target))
+                let strong = handler.as_strong()?;
+                if let Some(target) = strong.get_as::<Map>() {
+                    if !target.as_ref().is_prototype_validity_cell_valid(heap) {
+                        return None;
+                    }
+                    StoreAction::Transition(scope.handle(target))
+                } else if let Some(pair) = strong.get_as::<AccessorPair>() {
+                    // own setter as a whole weak pair
+                    setter_action(heap, scope, pair)
+                } else {
+                    return None;
+                }
+            } else if let Some(data_handler) = handler.as_strong()?.get_as::<DataHandler>() {
+                if !check_prototype_validity_cell(heap, data_handler) {
+                    return None;
+                }
+                let (kind, _) = decode_handler_smi(data_handler.as_ref().smi_handler(heap).raw())?;
+                match kind {
+                    KIND_SETTER => {
+                        let pair = data_handler
+                            .as_ref()
+                            .data(heap, 0)
+                            .as_strong()?
+                            .get_as::<AccessorPair>()?;
+                        setter_action(heap, scope, pair)
+                    }
+                    _ => return None,
+                }
             } else {
+                // Kette/mixed chain array.
                 let chain = handler.as_strong()?.get_as::<WeakFixedArray>()?;
                 let chain_ref = chain.as_ref();
                 if decode_smi(chain_ref.get(heap, 0))?.0 != CHAIN_SETTER {
@@ -1213,12 +1283,7 @@ impl InlineCache {
                     .get(heap, 1)
                     .as_strong()?
                     .get_as::<AccessorPair>()?;
-                let setter = pair.set.get(heap);
-                if setter == heap.known().undefined.as_tagged(heap) {
-                    StoreAction::Noop
-                } else {
-                    StoreAction::Setter(scope.handle(setter))
-                }
+                setter_action(heap, scope, pair)
             }
         };
         match action {
@@ -1298,6 +1363,7 @@ fn apply_transition(
         let host = recv.erase();
         recv.slot(heap, offset)
             .set(heap, host, value.as_tagged(heap));
+        Prototype::shape_changed(heap, recv.as_ref().map_ref(heap));
         recv.as_ref()
             .header
             .map
@@ -1324,6 +1390,7 @@ fn apply_transition(
         let slots = token.allocate::<FixedArray>(scope.stage(&values));
         let host = recv.erase();
         recv.slots.set(heap, host, slots);
+        Prototype::shape_changed(heap, recv.as_ref().map_ref(heap));
         recv.header.map.set(heap, host, target.as_tagged(heap));
     });
     true
@@ -1517,7 +1584,7 @@ fn decode_descriptor(desc: i64) -> (usize, usize, FunctionKind) {
 #[inline(always)]
 #[allow(unused_unsafe)]
 pub unsafe fn call_probe<'a>(
-    heap: &Heap,
+    heap: &'a Heap,
     vector: Option<Tagged<'a, FeedbackVector>>,
     fb: usize,
     callee: Tagged<'a, Value>,
@@ -1527,7 +1594,29 @@ pub unsafe fn call_probe<'a>(
             return CallProbe::Miss;
         };
         let state = vector.as_ref().slot(fb).get(heap);
-        if !state.raw().is_weak_ptr() || !state.ptr_eq(callee) {
+        if !state.raw().is_weak_ptr() {
+            if state.raw().is_strong_ptr()
+                && !state.ptr_eq(heap.known().the_hole.as_tagged(heap).erase())
+            {
+                return match Object::call_target(heap, callee) {
+                    Some(CallTarget::Runtime(idx)) => CallProbe::Runtime(idx),
+                    Some(CallTarget::Bytecode {
+                        target,
+                        info,
+                        context,
+                        kind,
+                    }) => CallProbe::Bytecode(CallHit {
+                        target,
+                        info,
+                        context,
+                        kind,
+                    }),
+                    _ => CallProbe::Miss,
+                };
+            }
+            return CallProbe::Miss;
+        }
+        if !state.ptr_eq(callee) {
             return CallProbe::Miss;
         }
         let payload = vector.as_ref().slot(fb + 1).get(heap);

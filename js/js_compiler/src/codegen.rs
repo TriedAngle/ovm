@@ -449,6 +449,10 @@ pub struct Compiler<'a, 'p> {
     /// scopes allocating from each function's register/context space
     /// (class / for contexts excluded), in scope-id order
     scopes_by_fid: Vec<Vec<ScopeId>>,
+    /// context-free for-head scopes allocating function registers
+    for_scopes_by_fid: Vec<Vec<ScopeId>>,
+    /// scopes nested under a for scope that the function hosts
+    nested_scopes_by_fid: Vec<Vec<ScopeId>>,
     /// symbol → slot, the single source of agreement between stores/loads
     slots: HashMap<SymbolId, Slot>,
     /// per-fid layouts, filled as functions are compiled (reads only ever
@@ -471,10 +475,54 @@ pub fn generate<'a>(scoping: &Scoping, facts: &Facts<'a>) -> Result<Program, Com
             }
         }
     }
+    // register-allocated for heads (no context) and bindings nested under
+    // a for scope that the function hosts
+    let mut for_scopes_by_fid: Vec<Vec<ScopeId>> = (0..n).map(|_| Vec::new()).collect();
+    let mut nested_scopes_by_fid: Vec<Vec<ScopeId>> = (0..n).map(|_| Vec::new()).collect();
+    for sid in 0..scoping.scopes_len() {
+        let sid = ScopeId::from_usize(sid);
+        if facts.class_of_scope.contains_key(&sid) || facts.fn_scope_to_fid.contains_key(&sid) {
+            continue;
+        }
+        if let Some(&node) = facts.for_of_scope.get(&sid) {
+            if !facts.for_slots.contains_key(&node) {
+                let mut cur = scoping.scope_parent_id(sid);
+                while let Some(s) = cur {
+                    if let Some(&fid) = facts.fn_scope_to_fid.get(&s) {
+                        for_scopes_by_fid[fid.0 as usize].push(sid);
+                        break;
+                    }
+                    cur = scoping.scope_parent_id(s);
+                }
+            }
+            continue;
+        }
+        let mut crossed_for = false;
+        let mut owner = None;
+        let mut cur = scoping.scope_parent_id(sid);
+        while let Some(s) = cur {
+            if let Some(&fid) = facts.fn_scope_to_fid.get(&s) {
+                owner = Some(fid);
+                break;
+            }
+            if facts.class_of_scope.contains_key(&s) {
+                break;
+            }
+            if facts.for_of_scope.contains_key(&s) {
+                crossed_for = true;
+            }
+            cur = scoping.scope_parent_id(s);
+        }
+        if crossed_for && let Some(fid) = owner {
+            nested_scopes_by_fid[fid.0 as usize].push(sid);
+        }
+    }
     let mut compiler = Compiler {
         scoping,
         facts,
         scopes_by_fid,
+        for_scopes_by_fid,
+        nested_scopes_by_fid,
         slots: HashMap::new(),
         layouts: (0..n)
             .map(|_| Layout {
@@ -523,7 +571,10 @@ impl<'a, 'p> Compiler<'a, 'p> {
         if let Some(&idx) = self.facts.class_of_scope.get(&scope) {
             return self.facts.classes[idx.0 as usize].slot_count > 0;
         }
-        self.facts.for_of_scope.contains_key(&scope)
+        self.facts
+            .for_of_scope
+            .get(&scope)
+            .is_some_and(|node| self.facts.for_slots.contains_key(node))
     }
 
     /// Whether `host` is the context-creating scope at or above
@@ -676,6 +727,36 @@ impl<'a, 'p> Compiler<'a, 'p> {
                     Slot::Local { reg, hole_check }
                 };
                 self.slots.insert(sym, slot);
+            }
+        }
+
+        for i in 0..self.for_scopes_by_fid[fid.0 as usize].len() {
+            let sid = self.for_scopes_by_fid[fid.0 as usize][i];
+            for sym in self.scoping.iter_bindings_in(sid) {
+                let reg = next_reg;
+                next_reg += 1;
+                self.slots.insert(
+                    sym,
+                    Slot::Local {
+                        reg,
+                        hole_check: true,
+                    },
+                );
+            }
+        }
+        for i in 0..self.nested_scopes_by_fid[fid.0 as usize].len() {
+            let sid = self.nested_scopes_by_fid[fid.0 as usize][i];
+            for sym in self.scoping.iter_bindings_in(sid) {
+                if calls_eval || self.facts.captured.contains(&sym) {
+                    continue;
+                }
+                let hole_check = self
+                    .scoping
+                    .symbol_flags(sym)
+                    .intersects(SymbolFlags::BlockScopedVariable | SymbolFlags::Class);
+                let reg = next_reg;
+                next_reg += 1;
+                self.slots.insert(sym, Slot::Local { reg, hole_check });
             }
         }
 
@@ -930,16 +1011,26 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 _ => IdRes::Global,
             }),
             Some(sym) => {
+                let skip_hole = self.c.facts.ref_skip_hole.contains(&rid);
+                let check = |hole: bool| hole && !skip_hole;
                 let slot = self.c.slot_of(sym);
                 match slot {
                     Slot::Global => Ok(IdRes::Global),
                     // registers carry no depth
-                    Slot::Param { index, hole_check } => {
-                        Ok(IdRes::Slot(Slot::Param { index, hole_check }, 0))
-                    }
-                    Slot::Local { reg, hole_check } => {
-                        Ok(IdRes::Slot(Slot::Local { reg, hole_check }, 0))
-                    }
+                    Slot::Param { index, hole_check } => Ok(IdRes::Slot(
+                        Slot::Param {
+                            index,
+                            hole_check: check(hole_check),
+                        },
+                        0,
+                    )),
+                    Slot::Local { reg, hole_check } => Ok(IdRes::Slot(
+                        Slot::Local {
+                            reg,
+                            hole_check: check(hole_check),
+                        },
+                        0,
+                    )),
                     Slot::CtxAt { slot, hole_check } | Slot::Ctx { slot, hole_check } => {
                         // depths are precomputed over node ancestry
                         // (synthesized field-initializer frames count);
@@ -954,7 +1045,13 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                                     let decl_scope = self.c.scoping.symbol_scope_id(sym);
                                     self.c.depth_to(reference.scope_id(), decl_scope)
                                 });
-                        Ok(IdRes::Slot(Slot::Ctx { slot, hole_check }, depth))
+                        Ok(IdRes::Slot(
+                            Slot::Ctx {
+                                slot,
+                                hole_check: check(hole_check),
+                            },
+                            depth,
+                        ))
                     }
                 }
             }
@@ -2510,8 +2607,17 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let callee = Reg::new(top + 1);
         self.b.store(callee);
         for (i, arg) in c.arguments.iter().enumerate() {
-            self.call_argument(arg)?;
-            self.b.store(Reg::new(top - 1 - i as i32));
+            let direct = match arg.as_expression() {
+                Some(inner) if i + 1 == argc as usize => self.simple_register(inner),
+                Some(inner) => self.stable_register(inner),
+                None => None,
+            };
+            if let Some(reg) = direct {
+                self.b.move_reg(Reg::new(top - 1 - i as i32), reg);
+            } else {
+                self.call_argument(arg)?;
+                self.b.store(Reg::new(top - 1 - i as i32));
+            }
         }
         self.b.move_reg(Reg::new(top), recv);
         let fb = self.b.new_feedback();
@@ -2617,8 +2723,17 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         self.b.load_undefined();
         self.b.store(Reg::new(top));
         for (i, arg) in c.arguments.iter().enumerate() {
-            self.call_argument(arg)?;
-            self.b.store(Reg::new(top - 1 - i as i32));
+            let direct = match arg.as_expression() {
+                Some(inner) if i + 1 == argc as usize => self.simple_register(inner),
+                Some(inner) => self.stable_register(inner),
+                None => None,
+            };
+            if let Some(reg) = direct {
+                self.b.move_reg(Reg::new(top - 1 - i as i32), reg);
+            } else {
+                self.call_argument(arg)?;
+                self.b.store(Reg::new(top - 1 - i as i32));
+            }
         }
         let fb = self.b.new_feedback();
         self.b.call(callee, RegList::new(args_base, argc + 1), fb);
@@ -2655,18 +2770,29 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let argc = n.arguments.len() as u32;
         let mark = self.b.temp_depth();
         self.expr(&n.callee)?;
-        // window [args...] with argument 0 at the top slot, callee above,
-        // and the receiver-parking register above the callee
-        let args_base = self.b.reserve_temps(argc + 2);
+        // window [args...] with argument 0 at the top slot, callee above
+        let args_base = self.b.reserve_temps(argc + 1);
         let top = args_base.index() + argc as i32 - 1;
         let callee = Reg::new(top + 1);
-        let out = Reg::new(top + 2);
         self.b.store(callee);
         for (i, arg) in n.arguments.iter().enumerate() {
-            self.call_argument(arg)?;
-            self.b.store(Reg::new(top - i as i32));
+            // like the call paths: a plain local/parameter is already in a
+            // register, so move it directly instead of routing through the
+            // accumulator; earlier arguments must survive sibling
+            // evaluation (`stable_register`), the last needs no stability.
+            let direct = match arg.as_expression() {
+                Some(inner) if i + 1 == argc as usize => self.simple_register(inner),
+                Some(inner) => self.stable_register(inner),
+                None => None,
+            };
+            if let Some(reg) = direct {
+                self.b.move_reg(Reg::new(top - i as i32), reg);
+            } else {
+                self.call_argument(arg)?;
+                self.b.store(Reg::new(top - i as i32));
+            }
         }
-        self.b.construct(callee, RegList::new(args_base, argc), out);
+        self.b.construct(callee, RegList::new(args_base, argc));
         self.b.drop_temps(mark);
         Ok(())
     }
@@ -2699,8 +2825,17 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // ride the top, closure/new.target the two bottom slots
         let arg_top = arg_base.index() + argc as i32 + i32::from(!direct) * 2 - 1;
         for (i, arg) in c.arguments.iter().enumerate() {
-            self.call_argument(arg)?;
-            self.b.store(Reg::new(arg_top - i as i32));
+            let direct_reg = match arg.as_expression() {
+                Some(inner) if i + 1 == argc as usize => self.simple_register(inner),
+                Some(inner) => self.stable_register(inner),
+                None => None,
+            };
+            if let Some(reg) = direct_reg {
+                self.b.move_reg(Reg::new(arg_top - i as i32), reg);
+            } else {
+                self.call_argument(arg)?;
+                self.b.store(Reg::new(arg_top - i as i32));
+            }
         }
         if direct {
             self.b

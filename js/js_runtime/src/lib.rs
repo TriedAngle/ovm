@@ -691,10 +691,6 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             idx.array_to_string,
         )?;
 
-        // array `length` is an own accessor on the array map (V8-style):
-        // the load fast path reads the internal slot, and stores route
-        // through the setter (ArraySetLength) via the ordinary accessor
-        // machinery — no store-path special case needed.
         {
             let get_fn = make_runtime_plain_function(thread, &scope, idx.array_length_get)?;
             let set_fn = make_runtime_plain_function(thread, &scope, idx.array_length_set)?;

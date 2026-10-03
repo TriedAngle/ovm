@@ -5,7 +5,8 @@ use crate::runtime::Coercion;
 use crate::{
     Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
     Header, Heap, HeapObject, Key, Lookup, Map, Object, ObjectKind, PartialDescriptor,
-    PropertyDescriptor, RuntimeContext, SlotName, Tagged, Transition, VM, Value, Visitor, VmError,
+    PropertyDescriptor, Prototype, RuntimeContext, SlotName, Tagged, Transition, VM, Value,
+    Visitor, VmError,
 };
 
 pub struct Proxy;
@@ -1027,6 +1028,7 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
             descriptors: &rows,
             prototype,
         });
+        Prototype::shape_changed(heap, obj_ref.map_ref(heap));
         obj_ref.header.map.set(heap, obj_ref.erase(), new_map);
     });
 }
