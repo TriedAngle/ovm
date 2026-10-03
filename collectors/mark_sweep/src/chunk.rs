@@ -321,7 +321,9 @@ impl ChunkedHeap {
             let removed = self.slots[index].take().unwrap();
             debug_assert!(removed.is_young(), "only young chunks are freed wholesale");
             self.young_chunks -= 1;
-            self.buffer.decommit(removed.base, removed.size);
+            // Keep the pages resident: minors recycle the same young chunks
+            // right away, and MADV_DONTNEED here only buys refault churn on
+            // the next allocation cycle.
             drop(removed);
             self.pooled.push(index);
         }

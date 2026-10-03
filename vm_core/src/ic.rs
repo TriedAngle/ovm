@@ -48,12 +48,14 @@ fn kind_smi(kind: i64, payload: i64) -> Smi {
 }
 
 /// Decode the `(kind, payload)` Smi view of a handler word.
+#[inline]
 fn decode_smi(word: Tagged<'_, MaybeWeak<Value>>) -> Option<(i64, i64)> {
     decode_handler_smi(word.raw())
 }
 
 /// Decode the `(kind, payload)` view of any Smi word (bare handler,
 /// `DataHandler::smi_handler` or chain head).
+#[inline]
 fn decode_handler_smi(word: Value) -> Option<(i64, i64)> {
     let v = Smi::decode(word)?.value();
     Some((v & 0xff, v >> 8))

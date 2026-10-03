@@ -715,16 +715,38 @@ impl Heap {
         )
     }
 
-    /// A number value: a Smi when the double is an in-range integer, a
-    /// freshly boxed Float otherwise. `-0.0` always boxes (it must not
-    /// collapse into `+0`).
-    /// A heap number known not to be Smi-representable: skips the range
-    /// check (the boxing continuations already know the fast path failed).
+    /// Bump-only float boxing: reserves and initializes a fresh `Float`
+    /// from the current TLAB. Never parks, collects or refills — `None`
+    /// when the window is exhausted, leaving the caller free to take a
+    /// slow path that snapshots any raw code pointer first (no GC can run
+    /// on the `Some` path, so an `ip`/`code_ptr` pair captured before the
+    /// call stays valid).
     #[inline]
-    pub fn new_float<'a>(&'a mut self, f: f64) -> Tagged<'a, Value> {
-        self.allocate::<Float>(f).erase()
+    pub fn try_new_float<'a>(&'a mut self, f: f64) -> Option<Tagged<'a, Value>> {
+        // With GC stress every allocation must collect first: decline the
+        // fast path so the caller falls back to the boxing slow handler.
+        #[cfg(feature = "stress-minor-gc")]
+        if self.stress_armed.load(std::sync::atomic::Ordering::Acquire) {
+            return None;
+        }
+        let size = Float::layout_for(&f).size().next_multiple_of(Tlab::ALIGN);
+        let raw = self.tlab.try_alloc(size)?;
+        let mut ptr = raw.cast::<Float>();
+        // Safety: raw memory just reserved; no GC can run here.
+        unsafe { ptr.as_mut() }.init(self, &f);
+        // Safety: fresh strong pointer, anchored at this borrow.
+        Some(unsafe {
+            Tagged::<Float>::from_value_unchecked(
+                HeapPtr::<Float>::new(ptr.as_ptr()).encode_strong(),
+            )
+            .erase()
+        })
     }
 
+    /// A number value: a Smi when the double is an in-range integer, a
+    /// freshly boxed Float otherwise. `-0.0` always boxes (it must not
+    /// collapse into `+0`). Takes the collector slow path (park/collect/
+    /// refill) when the TLAB is exhausted.
     #[inline]
     pub fn new_number<'a>(&'a mut self, f: f64) -> Tagged<'a, Value> {
         if let Some(s) = Smi::from_f64(f) {

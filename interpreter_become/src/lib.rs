@@ -621,6 +621,9 @@ extern "rust-preserve-none" fn op_add<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(sum) {
             next!(Add, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
+        if let Some(v) = unsafe { ctx.heap_mut() }.try_new_float(sum) {
+            next!(Add, ip, regs, ctx, table, roots, float, v)
+        }
         become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
     }
     become slow_add::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -658,6 +661,9 @@ extern "rust-preserve-none" fn op_sub<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(diff) {
             next!(Sub, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
+        if let Some(v) = unsafe { ctx.heap_mut() }.try_new_float(diff) {
+            next!(Sub, ip, regs, ctx, table, roots, float, v)
+        }
         become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(diff))
     }
     become slow_numeric::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -694,6 +700,9 @@ extern "rust-preserve-none" fn op_mul<'a, const STRIDE: usize>(
         let product = a * b;
         if let Some(s) = Smi::from_f64(product) {
             next!(Mul, ip, regs, ctx, table, roots, float, s.into_tagged())
+        }
+        if let Some(v) = unsafe { ctx.heap_mut() }.try_new_float(product) {
+            next!(Mul, ip, regs, ctx, table, roots, float, v)
         }
         become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(product))
     }
@@ -781,6 +790,17 @@ extern "rust-preserve-none" fn op_inc_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(IncLoc, ip, regs, ctx, table, roots, float, v)
     }
+    if let Some(n) = Convert::as_number(v) {
+        let new = n + 1.0;
+        if let Some(s) = Smi::from_f64(new) {
+            regs.write(r, s.into_tagged());
+            next!(IncLoc, ip, regs, ctx, table, roots, float, v)
+        }
+        if let Some(t) = unsafe { ctx.heap_mut() }.try_new_float(new) {
+            regs.write(r, t);
+            next!(IncLoc, ip, regs, ctx, table, roots, float, v)
+        }
+    }
     become slow_inc_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
@@ -802,6 +822,17 @@ extern "rust-preserve-none" fn op_dec_loc<'a, const STRIDE: usize>(
     {
         regs.write(r, Tagged::from_smi_bits(new));
         next!(DecLoc, ip, regs, ctx, table, roots, float, v)
+    }
+    if let Some(n) = Convert::as_number(v) {
+        let new = n - 1.0;
+        if let Some(s) = Smi::from_f64(new) {
+            regs.write(r, s.into_tagged());
+            next!(DecLoc, ip, regs, ctx, table, roots, float, v)
+        }
+        if let Some(t) = unsafe { ctx.heap_mut() }.try_new_float(new) {
+            regs.write(r, t);
+            next!(DecLoc, ip, regs, ctx, table, roots, float, v)
+        }
     }
     become slow_dec_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
@@ -1349,6 +1380,9 @@ extern "rust-preserve-none" fn op_div<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(quotient) {
             next!(Div, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
+        if let Some(v) = unsafe { ctx.heap_mut() }.try_new_float(quotient) {
+            next!(Div, ip, regs, ctx, table, roots, float, v)
+        }
         become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(quotient))
     }
     become slow_numeric::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -1529,6 +1563,9 @@ extern "rust-preserve-none" fn op_negate<'a, const STRIDE: usize>(
         if let Some(s) = Smi::from_f64(neg) {
             next!(Negate, ip, regs, ctx, table, roots, float, s.into_tagged())
         }
+        if let Some(v) = unsafe { ctx.heap_mut() }.try_new_float(neg) {
+            next!(Negate, ip, regs, ctx, table, roots, float, v)
+        }
         become slow_box_number::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(neg))
     }
     become slow_negate::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -1643,6 +1680,10 @@ extern "rust-preserve-none" fn op_add_loc<'a, const STRIDE: usize>(
             regs.write(dst, v);
             next!(AddLoc, ip, regs, ctx, table, roots, float, v)
         }
+        if let Some(v) = unsafe { ctx.heap_mut() }.try_new_float(sum) {
+            regs.write(dst, v);
+            next!(AddLoc, ip, regs, ctx, table, roots, float, v)
+        }
         become slow_box_add_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, FloatReg::new(sum))
     }
     become slow_add_loc::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -1674,6 +1715,10 @@ extern "rust-preserve-none" fn op_sub_loc<'a, const STRIDE: usize>(
         let diff = a - b;
         if let Some(s) = Smi::from_f64(diff) {
             let v = s.into_tagged();
+            regs.write(dst, v);
+            next!(SubLoc, ip, regs, ctx, table, roots, float, v)
+        }
+        if let Some(v) = unsafe { ctx.heap_mut() }.try_new_float(diff) {
             regs.write(dst, v);
             next!(SubLoc, ip, regs, ctx, table, roots, float, v)
         }

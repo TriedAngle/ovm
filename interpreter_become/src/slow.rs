@@ -71,12 +71,12 @@ macro_rules! slow_try {
 }
 
 slow_handler!(slow_box_number |ip, ops, regs, acc, ctx, float| {
-    unsafe { ctx.heap_mut() }.new_float(float.get())
+    unsafe { ctx.heap_mut() }.new_number(float.get())
 });
 
 slow_handler!(slow_box_add_loc |ip, ops, regs, acc, ctx, float| {
     let dst = ops.signed::<0>();
-    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
+    let v = unsafe { ctx.heap_mut() }.new_number(float.get());
     let regs = unsafe { Regs::new(ctx.regs_ptr()) };
     regs.write(dst, v);
     v
@@ -84,7 +84,7 @@ slow_handler!(slow_box_add_loc |ip, ops, regs, acc, ctx, float| {
 
 slow_handler!(slow_box_sub_loc |ip, ops, regs, acc, ctx, float| {
     let dst = ops.signed::<0>();
-    let v = unsafe { ctx.heap_mut() }.new_float(float.get());
+    let v = unsafe { ctx.heap_mut() }.new_number(float.get());
     let regs = unsafe { Regs::new(ctx.regs_ptr()) };
     regs.write(dst, v);
     v
