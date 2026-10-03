@@ -1,7 +1,7 @@
 use core::alloc::Layout;
 use core::ptr::NonNull;
 
-use heap_api::{GcHost, Visitor};
+use heap_api::{GcHost, Tlab, Visitor};
 
 use mark_sweep::heap::{MarkSweepConfig, MarkSweepLocal, MarkSweepState};
 
@@ -42,10 +42,15 @@ fn main() {
         let during_sweeping = Arc::clone(&during_sweeping);
         mutators.push(std::thread::spawn(move || {
             let local = MarkSweepLocal::new(Arc::clone(&state));
+            let mut tlab = Tlab::empty();
             let layout = Layout::from_size_align(16 * 1024, 8).unwrap();
+            let size = layout.size().next_multiple_of(Tlab::ALIGN);
             let mut since_poll = 0;
             while running.load(Ordering::Relaxed) {
-                local.allocate(layout).unwrap();
+                if tlab.try_alloc(size).is_none() {
+                    tlab = local.allocate_slow(size).unwrap();
+                    let _ = tlab.try_alloc(size).unwrap();
+                }
                 allocations.fetch_add(1, Ordering::Relaxed);
                 since_poll += 1;
                 if since_poll == 32 {

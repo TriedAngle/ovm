@@ -2,13 +2,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use core::alloc::Layout;
-use core::cell::Cell;
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
 use std::thread::JoinHandle;
 
 use heap_api::{
     AllocError, CLEARED, GcHost, HeapBackend, HeapStats, LocalHeap, RawCell, STRONG_PTR,
-    SharedHeap, TAG_MASK, Visitor, WEAK_PTR, Word,
+    SharedHeap, TAG_MASK, Tlab, Visitor, WEAK_PTR, Word,
 };
 
 use heap_utils::{LocalNode, Safepoint};
@@ -819,17 +818,7 @@ impl Visitor for MinorScanner<'_, '_> {
 pub struct MarkSweepLocal {
     state: Arc<MarkSweepState>,
     node: LocalNode,
-    tlab: Tlab,
 }
-
-struct Tlab {
-    cursor: Cell<*mut u8>,
-    end: Cell<*mut u8>,
-}
-
-// SAFETY: the cursors are plain addresses into this thread's bump region;
-// a Tlab is only ever touched by the thread owning the local heap.
-unsafe impl Send for Tlab {}
 
 const TLAB_SIZES: [usize; 2] = [32 * 1024, 8 * 1024];
 const MIN_GC_THRESHOLD: usize = 16 * 1024 * 1024;
@@ -840,21 +829,11 @@ enum TerminalAllocation {
     Done(Option<NonNull<u8>>),
 }
 
-impl Tlab {
-    const fn empty() -> Self {
-        Self {
-            cursor: Cell::new(ptr::null_mut()),
-            end: Cell::new(ptr::null_mut()),
-        }
-    }
-}
-
 impl MarkSweepLocal {
     pub fn new(state: Arc<MarkSweepState>) -> Box<Self> {
         let local = Box::new(Self {
             state,
             node: LocalNode::detached(),
-            tlab: Tlab::empty(),
         });
         local.state.safepoint.attach(&local.node);
         local
@@ -865,54 +844,54 @@ impl MarkSweepLocal {
     }
 
     pub fn collect(&self) {
-        self.invalidate_tlab();
         self.state.collect_internal(Some(self));
     }
 
     pub fn collect_minor(&self) {
-        self.invalidate_tlab();
         self.state.collect_minor_internal(Some(self));
     }
 
-    pub fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
+    /// Slow allocation: park, collect if the heuristics demand it, then
+    /// hand back a [`Tlab`] of at least `min_size` usable bytes. `min_size`
+    /// is a multiple of [`heap_api::Tlab::ALIGN`]; callers bump the window
+    /// for the object they are allocating.
+    pub fn allocate_slow(&self, min_size: usize) -> Result<Tlab, AllocError> {
         self.park_if_requested();
-        let need = need_for(layout);
-        if let Some(ptr) = self.tlab_bump(need) {
-            return Ok(ptr);
-        }
+        let layout = Layout::from_size_align(min_size, ALIGN).expect("allocation layout");
         if self.state.should_minor_gc() {
             self.collect_minor();
         }
         if self.state.used_exceeds_threshold() {
             self.collect();
         }
-        if let Some(ptr) = self.tlab_refill(need) {
-            return Ok(ptr);
+        if let Some(tlab) = self.tlab_refill(min_size) {
+            return Ok(tlab);
         }
         // Contended slow path. A collect may be absorbed by another
         // thread's cycle whose memory siblings consume before the retry
         for _ in 0..TRANSIENT_ATTEMPTS {
             if let Some(ptr) = self.state.alloc_block(layout, false) {
-                return Ok(ptr);
+                return Ok(Tlab::new(ptr, min_size));
             }
             if self.state.should_minor_gc() {
                 self.collect_minor();
             }
             self.collect();
-            if let Some(ptr) = self.tlab_bump(need) {
-                return Ok(ptr);
-            }
-            if let Some(ptr) = self.tlab_refill(need) {
-                return Ok(ptr);
+            if let Some(tlab) = self.tlab_refill(min_size) {
+                return Ok(tlab);
             }
         }
         loop {
             if let Some(ptr) = self.state.alloc_block(layout, false) {
-                return Ok(ptr);
+                return Ok(Tlab::new(ptr, min_size));
             }
             match self.state.collect_terminal(Some(&self.node), layout) {
-                TerminalAllocation::Done(Some(ptr)) => return Ok(ptr),
-                TerminalAllocation::Done(None) => return Err(AllocError::OutOfMemory(layout)),
+                TerminalAllocation::Done(Some(ptr)) => {
+                    return Ok(Tlab::new(ptr, min_size));
+                }
+                TerminalAllocation::Done(None) => {
+                    return Err(AllocError::OutOfMemory(layout));
+                }
                 TerminalAllocation::Absorbed => continue,
             }
         }
@@ -920,52 +899,27 @@ impl MarkSweepLocal {
 
     fn park_if_requested(&self) -> bool {
         if self.node.requested() {
-            self.invalidate_tlab();
             return self.state.safepoint.park_for_collection(&self.node);
         }
         false
     }
 
-    fn tlab_bump(&self, need: usize) -> Option<NonNull<u8>> {
-        let cursor = self.tlab.cursor.get();
-        if cursor.is_null() {
-            return None;
-        }
-        let next = cursor.wrapping_add(need);
-        if next > self.tlab.end.get() {
-            return None;
-        }
-        self.tlab.cursor.set(next);
-        Some(unsafe { NonNull::new_unchecked(cursor) })
-    }
-
-    fn tlab_refill(&self, need: usize) -> Option<NonNull<u8>> {
+    fn tlab_refill(&self, need: usize) -> Option<Tlab> {
         if need > *TLAB_SIZES.last().unwrap() {
             return None;
         }
-        self.invalidate_tlab();
         for &size in &TLAB_SIZES {
             let layout = Layout::from_size_align(size, ALIGN).unwrap();
             if let Some(block) = self.state.alloc_block(layout, true) {
-                unsafe {
-                    self.tlab.cursor.set(block.as_ptr());
-                    self.tlab.end.set(block.as_ptr().add(size));
-                }
-                return self.tlab_bump(need);
+                return Some(Tlab::new(block, size));
             }
         }
         None
-    }
-
-    fn invalidate_tlab(&self) {
-        self.tlab.cursor.set(ptr::null_mut());
-        self.tlab.end.set(ptr::null_mut());
     }
 }
 
 impl Drop for MarkSweepLocal {
     fn drop(&mut self) {
-        self.invalidate_tlab();
         self.state.safepoint.detach(&self.node);
     }
 }
@@ -987,8 +941,8 @@ impl MarkSweep {
 }
 
 impl LocalHeap for MarkSweepLocal {
-    fn allocate_raw(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        self.allocate(layout)
+    fn allocate_slow(&self, min_size: usize) -> Result<Tlab, AllocError> {
+        self.allocate_slow(min_size)
     }
 
     fn write_barrier(&self, _host: Word, slot: &RawCell, value: Word) {

@@ -4,7 +4,7 @@ use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
     HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MapKind, MaybeWeak, Object,
     ObjectInit, ObjectSlotsInit, PrototypeRegistry, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged,
-    Value, Visitor, Word,
+    Tlab, Value, Visitor, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -481,6 +481,7 @@ impl EdgeVisitable for () {
 /// Type-erased per-thread heap.
 pub struct Heap {
     local: Box<dyn LocalHeap>,
+    tlab: Tlab,
     known: *const KnownCell,
     prototype_registry: *const PrototypeRegistry,
     /// Bumped whenever an array map gains the holey flag: packed element
@@ -496,8 +497,32 @@ pub struct Heap {
 unsafe impl Send for Heap {}
 
 impl Heap {
+    #[inline]
     pub fn allocate_raw(&mut self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        self.local.allocate_raw(layout)
+        debug_assert!(
+            layout.align() <= Tlab::ALIGN,
+            "unsupported allocation alignment {}",
+            layout.align()
+        );
+        let size = layout.size().next_multiple_of(Tlab::ALIGN);
+        if let Some(ptr) = self.tlab.try_alloc(size) {
+            return Ok(ptr);
+        }
+        self.allocate_slow(size)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn allocate_slow(&mut self, size: usize) -> Result<NonNull<u8>, AllocError> {
+        // The collector may park or collect below, reclaiming the current
+        // window: drop it before crossing the boundary.
+        self.tlab.invalidate();
+        let mut tlab = self.local.allocate_slow(size)?;
+        let ptr = tlab
+            .try_alloc(size)
+            .expect("collector must supply a TLAB of at least min_size");
+        self.tlab = tlab;
+        Ok(ptr)
     }
 
     pub fn known(&self) -> &'static WellKnown {
@@ -565,6 +590,7 @@ impl Heap {
     }
 
     pub fn cancel_executions(&mut self, protocol: &dyn Fn()) {
+        self.tlab.invalidate();
         self.local.cancel_executions(protocol)
     }
 
@@ -575,6 +601,7 @@ impl Heap {
     #[inline]
     pub fn safepoint_poll(&mut self) -> bool {
         if self.collection_requested() {
+            self.tlab.invalidate();
             self.park_for_collection() && self.take_cancel()
         } else {
             false
@@ -582,16 +609,19 @@ impl Heap {
     }
 
     pub fn collect(&mut self) {
+        self.tlab.invalidate();
         self.local.force_collect();
     }
 
     pub fn collect_minor(&mut self) {
+        self.tlab.invalidate();
         self.local.collect_minor();
     }
 
     /// Allocate a fresh `T`. The returned `Tagged` is anchored at this
     /// borrow: any further allocation (or anything else requiring
     /// `&mut Heap`) requires rooting it first.
+    #[inline]
     pub fn allocate<'a, T: HeapObject>(&'a mut self, config: T::Init<'_>) -> Tagged<'a, T> {
         #[cfg(feature = "stress-minor-gc")]
         if self.stress_armed.load(std::sync::atomic::Ordering::Acquire) {
@@ -608,6 +638,7 @@ impl Heap {
         unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
     }
 
+    #[inline]
     pub fn allocate_handle<'s, T: HeapObject>(
         &mut self,
         config: T::Init<'_>,
@@ -647,6 +678,7 @@ impl Heap {
     }
 
     // TODO: potentially remove this in favor of a better allocate function
+    #[inline]
     pub fn allocate_object<'a>(
         &mut self,
         handles: &'a impl HandleSet,
@@ -665,6 +697,7 @@ impl Heap {
         })
     }
 
+    #[inline]
     pub fn new_object<'a>(
         &mut self,
         handles: &'a impl HandleSet,
@@ -692,6 +725,7 @@ impl Heap {
         self.allocate::<Float>(f).erase()
     }
 
+    #[inline]
     pub fn new_number<'a>(&'a mut self, f: f64) -> Tagged<'a, Value> {
         if let Some(s) = Smi::from_f64(f) {
             return s.into_tagged();
@@ -778,6 +812,7 @@ impl GlobalHeap {
     pub fn new_local(&self, known: &KnownCell, prototype_registry: &PrototypeRegistry) -> Heap {
         Heap {
             local: self.shared.new_local(),
+            tlab: Tlab::empty(),
             known: known as *const KnownCell,
             prototype_registry: prototype_registry as *const PrototypeRegistry,
             holey_epoch: Cell::new(0),

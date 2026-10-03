@@ -2,7 +2,8 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 
 use heap_api::{
-    CLEARED, GcHost, HeapBackend, RawCell, STRONG_PTR, TAG_MASK, Visitor, WEAK_PTR, Word,
+    AllocError, CLEARED, GcHost, HeapBackend, RawCell, STRONG_PTR, TAG_MASK, Tlab, Visitor,
+    WEAK_PTR, Word,
 };
 
 use mark_sweep::heap::{MarkSweep, MarkSweepConfig, MarkSweepLocal, MarkSweepState};
@@ -56,10 +57,42 @@ impl Roots {
     }
 }
 
+/// The VM's allocation fast path in miniature: bump the window, refilling
+/// through the collector on a miss.
+fn alloc(
+    local: &MarkSweepLocal,
+    tlab: &mut Tlab,
+    layout: Layout,
+) -> Result<NonNull<u8>, AllocError> {
+    let size = layout.size().next_multiple_of(Tlab::ALIGN);
+    if let Some(ptr) = tlab.try_alloc(size) {
+        return Ok(ptr);
+    }
+    *tlab = local.allocate_slow(size)?;
+    Ok(tlab
+        .try_alloc(size)
+        .expect("allocate_slow must supply a TLAB of at least min_size"))
+}
+
+fn collect(local: &MarkSweepLocal, tlab: &mut Tlab) {
+    tlab.invalidate();
+    local.collect();
+}
+
+fn collect_minor(local: &MarkSweepLocal, tlab: &mut Tlab) {
+    tlab.invalidate();
+    local.collect_minor();
+}
+
 /// Allocates and roots; registered so the fake `layout_of` can size the
 /// object during the sweep.
-fn rooted(local: &MarkSweepLocal, roots: &mut Roots, layout: Layout) -> NonNull<u8> {
-    let ptr = local.allocate(layout).unwrap();
+fn rooted(
+    local: &MarkSweepLocal,
+    tlab: &mut Tlab,
+    roots: &mut Roots,
+    layout: Layout,
+) -> NonNull<u8> {
+    let ptr = alloc(local, tlab, layout).unwrap();
     register(ptr, layout.size());
     roots.strong(ptr);
     ptr
@@ -143,7 +176,8 @@ fn shared_heap_smoke() {
     .unwrap()
     .into_shared();
     let local = shared.new_local();
-    let ptr = local.allocate_raw(Layout::new::<u64>()).unwrap();
+    let mut tlab = local.allocate_slow(16).unwrap();
+    let ptr = tlab.try_alloc(16).unwrap();
     assert!(shared.contains(ptr.as_ptr() as Word));
     // capacity counts the usable region: the chunk header is carved out
     let usable = 64 * 1024 - mark_sweep::chunk::HEADER_SIZE;
@@ -154,10 +188,9 @@ fn shared_heap_smoke() {
 #[test]
 fn allocations_are_aligned_and_accounted() {
     let (state, local, _roots) = backend(64 * 1024, Roots::empty());
-    let a = local
-        .allocate(Layout::from_size_align(5, 8).unwrap())
-        .unwrap();
-    let b = local.allocate(Layout::new::<u64>()).unwrap();
+    let mut tlab = Tlab::empty();
+    let a = alloc(&local, &mut tlab, Layout::from_size_align(5, 8).unwrap()).unwrap();
+    let b = alloc(&local, &mut tlab, Layout::new::<u64>()).unwrap();
     assert_eq!(a.as_ptr() as usize % 16, 0);
     assert_eq!(b.as_ptr() as usize % 16, 0);
     assert_ne!(a, b);
@@ -171,20 +204,22 @@ fn allocations_are_aligned_and_accounted() {
 #[test]
 fn garbage_is_reclaimed_and_coalesced() {
     let (state, local, _roots) = backend(64 * 1024, Roots::empty());
+    let mut tlab = Tlab::empty();
     for _ in 0..16 {
-        local
-            .allocate(Layout::from_size_align(512, 8).unwrap())
-            .unwrap();
+        alloc(&local, &mut tlab, Layout::from_size_align(512, 8).unwrap()).unwrap();
     }
     assert_eq!(state.stats().used, 32 * 1024);
 
-    local.collect();
+    collect(&local, &mut tlab);
 
     assert_eq!(state.stats().used, 0);
     // the whole arena must be one free run again
-    let big = local
-        .allocate(Layout::from_size_align(48 * 1024, 8).unwrap())
-        .unwrap();
+    let big = alloc(
+        &local,
+        &mut tlab,
+        Layout::from_size_align(48 * 1024, 8).unwrap(),
+    )
+    .unwrap();
     assert_eq!(state.stats().used, 48 * 1024);
     let _ = big;
 }
@@ -192,9 +227,10 @@ fn garbage_is_reclaimed_and_coalesced() {
 #[test]
 fn oom_when_live_data_exhausts_arena() {
     let (state, local, mut roots) = backend(16 * 1024, Roots::empty());
+    let mut tlab = Tlab::empty();
     let layout = Layout::new::<u64>();
     let mut live = Vec::new();
-    while let Ok(ptr) = local.allocate(layout) {
+    while let Ok(ptr) = alloc(&local, &mut tlab, layout) {
         register(ptr, 8);
         roots.strong(ptr);
         live.push(ptr);
@@ -203,26 +239,27 @@ fn oom_when_live_data_exhausts_arena() {
     // freeing the roots lets the next allocation trigger a cycle and succeed
     roots.slots.clear();
     drop(live);
-    local.allocate(layout).unwrap();
+    alloc(&local, &mut tlab, layout).unwrap();
 }
 
 #[test]
 fn collect_keeps_rooted_objects_only() {
     let (state, local, mut roots) = backend(64 * 1024, Roots::empty());
+    let mut tlab = Tlab::empty();
     // 16KB objects bypass the tlab (direct free-list allocations)
     let layout = Layout::from_size_align(16 * 1024, 8).unwrap();
-    let a = rooted(&local, &mut roots, layout);
-    let b = local.allocate(layout).unwrap();
-    let c = rooted(&local, &mut roots, layout);
+    let a = rooted(&local, &mut tlab, &mut roots, layout);
+    let b = alloc(&local, &mut tlab, layout).unwrap();
+    let c = rooted(&local, &mut tlab, &mut roots, layout);
     let cycle_before = state.cycles();
 
-    local.collect();
+    collect(&local, &mut tlab);
 
     assert_eq!(state.cycles(), cycle_before + 1);
     assert_eq!(state.stats().used, 2 * 16 * 1024);
     // rooted payloads sit at their original addresses, and the garbage in
     // between is the first free run: a fresh allocation reuses b's address
-    let reused = local.allocate(layout).unwrap();
+    let reused = alloc(&local, &mut tlab, layout).unwrap();
     assert_eq!(reused.as_ptr(), b.as_ptr());
     let _ = (a, c);
 }
@@ -230,22 +267,26 @@ fn collect_keeps_rooted_objects_only() {
 #[test]
 fn sweep_coalesces_dead_block_with_surrounding_free_space() {
     let (state, local, mut roots) = backend(64 * 1024, Roots::empty());
+    let mut tlab = Tlab::empty();
     let layout = Layout::from_size_align(16 * 1024, 8).unwrap();
-    rooted(&local, &mut roots, layout);
-    rooted(&local, &mut roots, layout);
-    let tail = local.allocate(layout).unwrap();
+    rooted(&local, &mut tlab, &mut roots, layout);
+    rooted(&local, &mut tlab, &mut roots, layout);
+    let tail = alloc(&local, &mut tlab, layout).unwrap();
 
-    local.collect();
+    collect(&local, &mut tlab);
 
     assert_eq!(state.stats().used, 2 * 16 * 1024);
     // the first free run starts where the dead tail began
-    let next = local.allocate(layout).unwrap();
+    let next = alloc(&local, &mut tlab, layout).unwrap();
     assert_eq!(next.as_ptr(), tail.as_ptr());
     // the tail merged with all trailing free space: everything but the two
     // live objects fits in one allocation
-    let big = local
-        .allocate(Layout::from_size_align(state.stats().capacity - 3 * 16 * 1024, 8).unwrap())
-        .unwrap();
+    let big = alloc(
+        &local,
+        &mut tlab,
+        Layout::from_size_align(state.stats().capacity - 3 * 16 * 1024, 8).unwrap(),
+    )
+    .unwrap();
     assert_eq!(big.as_ptr() as usize, tail.as_ptr() as usize + 16 * 1024);
     assert_eq!(state.stats().used, state.stats().capacity);
 }
@@ -253,13 +294,14 @@ fn sweep_coalesces_dead_block_with_surrounding_free_space() {
 #[test]
 fn weak_refs_to_dead_objects_are_cleared() {
     let (state, local, mut roots) = backend(64 * 1024, Roots::empty());
+    let mut tlab = Tlab::empty();
     let layout = Layout::new::<u64>();
-    let live = rooted(&local, &mut roots, layout);
-    let dead = local.allocate(layout).unwrap();
+    let live = rooted(&local, &mut tlab, &mut roots, layout);
+    let dead = alloc(&local, &mut tlab, layout).unwrap();
     let weak_dead = roots.weak(dead);
     let weak_live = roots.weak(live);
 
-    local.collect();
+    collect(&local, &mut tlab);
 
     assert_eq!(roots.slots[weak_dead].load(), CLEARED);
     assert_eq!(roots.slots[weak_live].load(), weak_word(live));
@@ -273,17 +315,18 @@ fn weak_word(target: NonNull<u8>) -> Word {
 #[test]
 fn used_plus_free_conserve_arena_after_cycles() {
     let (state, local, mut roots) = backend(64 * 1024, Roots::empty());
+    let mut tlab = Tlab::empty();
     let layout = Layout::from_size_align(48, 8).unwrap();
     let mut keepers = Vec::new();
     for i in 0..5 {
         if i % 2 == 0 {
-            keepers.push(rooted(&local, &mut roots, layout));
+            keepers.push(rooted(&local, &mut tlab, &mut roots, layout));
         } else {
-            local.allocate(layout).unwrap();
+            alloc(&local, &mut tlab, layout).unwrap();
         }
     }
-    local.collect();
-    local.collect();
+    collect(&local, &mut tlab);
+    collect(&local, &mut tlab);
 
     assert_eq!(
         state.stats().used + state.free_bytes(),
@@ -311,9 +354,10 @@ fn allocation_continues_across_external_cycles() {
         let allocations = Arc::clone(&allocations);
         threads.push(std::thread::spawn(move || {
             let local = MarkSweepLocal::new(state);
+            let mut tlab = Tlab::empty();
             let layout = Layout::from_size_align(64, 8).unwrap();
             while running.load(Ordering::Relaxed) {
-                local.allocate(layout).unwrap();
+                alloc(&local, &mut tlab, layout).unwrap();
                 allocations.fetch_add(1, Ordering::Relaxed);
             }
             local.collect();
@@ -353,14 +397,15 @@ fn heap_grows_and_shrinks_by_chunks() {
     // movement-safe host: minors may fire mid-loop and relocate keepers
     let mut roots = Roots::empty().install_with(&state, fixed_host_16k_for);
     let local = MarkSweepLocal::new(Arc::clone(&state));
+    let mut tlab = Tlab::empty();
     let layout = Layout::from_size_align(16 * 1024, 8).unwrap();
     assert_eq!(state.stats().capacity, 0);
 
     for _ in 0..20 {
-        roots.strong(local.allocate(layout).unwrap());
+        roots.strong(alloc(&local, &mut tlab, layout).unwrap());
     }
     // a full (non-moving) collection quiesces: garbage gone, live = 320KB
-    local.collect();
+    collect(&local, &mut tlab);
     // 20 x 16KB live spans two 256KB chunks
     assert_eq!(state.active_chunks(), 2);
     assert_eq!(
@@ -369,7 +414,7 @@ fn heap_grows_and_shrinks_by_chunks() {
     );
 
     roots.slots.clear();
-    local.collect();
+    collect(&local, &mut tlab);
 
     // every chunk emptied: decommitted back to the pool
     assert_eq!(state.active_chunks(), 0);
@@ -377,7 +422,7 @@ fn heap_grows_and_shrinks_by_chunks() {
     assert_eq!(state.stats().used, 0);
 
     // allocation re-activates a pooled chunk
-    rooted(&local, &mut roots, layout);
+    rooted(&local, &mut tlab, &mut roots, layout);
     assert_eq!(state.active_chunks(), 1);
     assert_eq!(
         state.stats().capacity,
@@ -438,22 +483,23 @@ fn marking_traces_linked_chains_exactly() {
     // chains are built and move nodes around
     let mut roots = Roots::empty().install_with(&state, fixed_host_16b_for);
     let local = MarkSweepLocal::new(Arc::clone(&state));
+    let mut tlab = Tlab::empty();
     let layout = Layout::from_size_align(16, 8).unwrap();
 
     // every node rooted as it is allocated: a mid-build minor collection
     // must not strand a chain held only in a Rust local
     for _ in 0..CHAINS * CHAIN_LEN {
-        let node = local.allocate(layout).unwrap();
+        let node = alloc(&local, &mut tlab, layout).unwrap();
         unsafe { *(node.as_ptr() as *mut Word) = 0 };
         roots.strong(node);
     }
 
-    local.collect();
+    collect(&local, &mut tlab);
 
     assert_eq!(state.stats().used, CHAINS * CHAIN_LEN * 16);
 
     roots.slots.clear();
-    local.collect();
+    collect(&local, &mut tlab);
 
     assert_eq!(state.stats().used, 0);
 }
@@ -468,12 +514,13 @@ fn parked_mutators_assist_marking() {
     .unwrap();
     let mut roots = Roots::empty().install_with(&state, fixed_host_16b_for);
     let local = MarkSweepLocal::new(Arc::clone(&state));
+    let mut tlab = Tlab::empty();
     let layout = Layout::from_size_align(16, 8).unwrap();
 
     // every node rooted as it is allocated: a mid-build minor collection
     // must not strand a chain held only in a Rust local
     for _ in 0..CHAINS * CHAIN_LEN {
-        let node = local.allocate(layout).unwrap();
+        let node = alloc(&local, &mut tlab, layout).unwrap();
         unsafe { *(node.as_ptr() as *mut Word) = 0 };
         roots.strong(node);
     }
@@ -489,9 +536,10 @@ fn parked_mutators_assist_marking() {
         let running = Arc::clone(&running);
         threads.push(std::thread::spawn(move || {
             let local = MarkSweepLocal::new(state);
+            let mut tlab = Tlab::empty();
             let layout = Layout::from_size_align(16, 8).unwrap();
             while running.load(Ordering::Relaxed) {
-                local.allocate(layout).unwrap();
+                alloc(&local, &mut tlab, layout).unwrap();
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }));
@@ -527,6 +575,7 @@ fn background_sweeper_drains_pendings() {
     .unwrap();
     let mut roots = Roots::empty().install_with(&state, fixed_host_16k_for);
     let local = MarkSweepLocal::new(Arc::clone(&state));
+    let mut tlab = Tlab::empty();
     let layout = Layout::from_size_align(16 * 1024, 8).unwrap();
 
     // Minors reclaim young chunks wholesale, so the sweeper's workload is
@@ -545,11 +594,11 @@ fn background_sweeper_drains_pendings() {
             "background sweeper never won a claim in 50 rounds"
         );
         for _ in 0..200 {
-            roots.strong(local.allocate(layout).unwrap());
+            roots.strong(alloc(&local, &mut tlab, layout).unwrap());
         }
-        local.collect_minor();
+        collect_minor(&local, &mut tlab);
         roots.slots.clear();
-        local.collect();
+        collect(&local, &mut tlab);
         assert_eq!(state.stats().used, 0);
         assert_eq!(
             state.stats().used + state.free_bytes(),

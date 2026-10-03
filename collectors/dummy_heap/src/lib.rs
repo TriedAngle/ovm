@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use heap_api::{
-    AllocError, GcHost, HeapBackend, HeapStats, LocalHeap, RawCell, SharedHeap, Visitor, Word,
+    AllocError, GcHost, HeapBackend, HeapStats, LocalHeap, RawCell, SharedHeap, Tlab, Visitor, Word,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -114,8 +114,13 @@ impl DummyLocalHeap {
 }
 
 impl LocalHeap for DummyLocalHeap {
-    fn allocate_raw(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        self.shared.allocate(layout)
+    /// The dummy heap never collects and never keeps a reusable window:
+    /// every allocation is a one-object [`Tlab`], which keeps `used`
+    /// exact for tests.
+    fn allocate_slow(&self, min_size: usize) -> Result<Tlab, AllocError> {
+        let layout = Layout::from_size_align(min_size, Tlab::ALIGN).expect("allocation layout");
+        let ptr = self.shared.allocate(layout)?;
+        Ok(Tlab::new(ptr, min_size))
     }
 
     fn write_barrier(&self, _host: Word, _slot: &RawCell, _value: Word) {}

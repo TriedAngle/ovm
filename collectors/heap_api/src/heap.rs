@@ -5,7 +5,7 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::Word;
+use crate::{Tlab, Word};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocError {
@@ -103,7 +103,12 @@ unsafe impl Send for GcHost {}
 unsafe impl Sync for GcHost {}
 
 pub trait LocalHeap: Send {
-    fn allocate_raw(&self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
+    /// Slow allocation path. May park the thread and collect; returns a
+    /// fresh [`Tlab`] with at least `min_size` bytes available
+    /// (`min_size` is a multiple of [`Tlab::ALIGN`], so the caller can
+    /// bump it immediately). Large or contended allocations hand back a
+    /// one-object window instead of a reusable buffer.
+    fn allocate_slow(&self, min_size: usize) -> Result<Tlab, AllocError>;
     fn write_barrier(&self, host: Word, slot: &RawCell, value: Word);
     fn collection_requested(&self) -> bool;
     fn park_for_collection(&self) -> bool;

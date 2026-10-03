@@ -75,7 +75,7 @@ pub use value::{
 };
 
 pub use heap_api::{
-    AllocError, GcHost, HeapBackend, HeapStats, LocalHeap, RawCell, SharedHeap, Visitor,
+    AllocError, GcHost, HeapBackend, HeapStats, LocalHeap, RawCell, SharedHeap, Tlab, Visitor,
 };
 
 pub type Local<'scope, T> = Handle<'scope, T>;
