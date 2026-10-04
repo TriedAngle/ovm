@@ -145,6 +145,7 @@ fn materialize_function<'s>(
             constants,
             register_count: function.register_count as usize,
             handlers,
+            expected_slots: function.expected_slots as usize,
         },
         scope,
     );

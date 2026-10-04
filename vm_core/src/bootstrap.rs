@@ -664,6 +664,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
             constants: known.empty_fixed_array,
             register_count: 0,
             handlers: None,
+            expected_slots: 0,
         })
         .as_handle(&scope);
     let function_prototype = roots.create_handle(heap.new_object(

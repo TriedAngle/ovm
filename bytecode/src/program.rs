@@ -182,6 +182,9 @@ pub struct Function {
     /// Feedback-vector slots (inline-cache state) the function needs.
     /// Property-access sites index into it via their feedback operand.
     pub feedback_count: u32,
+    /// Parser estimate: `this.<name> = ...` stores in the function's own
+    /// body. Seeds constructor object preallocation.
+    pub expected_slots: u32,
     pub strict: bool,
 }
 

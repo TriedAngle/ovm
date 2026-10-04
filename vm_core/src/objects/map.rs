@@ -31,6 +31,9 @@ pub struct Map {
 impl Map {
     pub const NO_VALIDITY_CELL_SENTINEL: Smi = Smi::new(0);
 
+    /// Extra slots reserved beyond the parser's property estimate.
+    pub const SLACK_MARGIN: usize = 8;
+
     pub fn layout_for(descriptor_count: usize) -> Layout {
         let descriptors_layout =
             Layout::array::<SlotDescriptor>(descriptor_count).expect("descriptors layout");

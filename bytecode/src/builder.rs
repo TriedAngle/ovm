@@ -332,6 +332,9 @@ pub struct FnBuilder {
     other_pool: HashMap<Constant, u32>,
     feedback_slots: u32,
 
+    /// `this.<name> = ...` assignments seen while emitting the body.
+    expected_slots: u32,
+
     // accumulator analysis
     acc: Acc,
 
@@ -361,6 +364,7 @@ impl FnBuilder {
             string_pool: HashMap::new(),
             other_pool: HashMap::new(),
             feedback_slots: 0,
+            expected_slots: 0,
             acc: Acc::Dead,
             last: LastOp::None,
             temp_base: 0,
@@ -958,6 +962,12 @@ impl FnBuilder {
         self.emit_tracked(op, operands);
     }
 
+    /// Record one `this.<name> = ...` store seen in the body: a hint for
+    /// how many property slots a constructed instance will need.
+    pub fn note_this_property(&mut self) {
+        self.expected_slots = self.expected_slots.saturating_add(1);
+    }
+
     /// Resolve labels, lay out the final code (widening long jumps), and
     /// freeze the function.
     pub fn finish(mut self, meta: FunctionMeta) -> Result<Function, BuildError> {
@@ -1005,6 +1015,7 @@ impl FnBuilder {
             arity: self.arity,
             length: meta.length,
             feedback_count: self.feedback_slots,
+            expected_slots: self.expected_slots,
             strict: meta.strict,
         })
     }

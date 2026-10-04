@@ -452,8 +452,12 @@ pub fn construct_cache_record(
     callee: vm_core::Handle<'_, Object>,
     obj: vm_core::Handle<'_, Object>,
 ) {
-    // Safety: fresh synthesized-receiver word; the insert's allocation
-    // runs before it reads parameters, so the raw word stays stable.
+    // The first-use cache-table allocation may collect; take it before
+    // capturing any raw words that must survive the allocations below.
+    state.construct_cache_ensure_table(heap);
+
+    // Safety: fresh synthesized-receiver word; read before any allocation
+    // below, and no collection can run until then.
     let map: Tagged<vm_core::Map> = unsafe {
         Tagged::from_value_unchecked(obj.as_tagged(heap).as_ref().header.map.get(heap).raw())
     };
@@ -477,15 +481,16 @@ pub fn construct_cache_record(
     if !proto_word.is_strong_ptr() {
         return; // non-object prototype: ES falls back, stays uncached
     }
-    // Safety: fresh rooted-slot words; the insert's only allocation runs
-    // before it reads parameters, so raw words stay stable.
-    let proto: Tagged<Value> = unsafe { Tagged::from_value_unchecked(proto_word) };
-    let _ = scope;
-    // Safety: the insert's only allocation (the first-use table) runs
-    // before it reads these words — they stay stable throughout.
+    let proto: vm_core::Handle<'_, Value> =
+        scope.handle(unsafe { Tagged::from_value_unchecked(proto_word) });
+
+    // Allocation-free from here: read the raw words last, immediately
+    // before the (allocation-free) insert.
     let callee_obj: Tagged<Object> =
         unsafe { Tagged::from_value_unchecked(callee.as_tagged(heap).raw()) };
-    state.construct_cache_insert(heap, callee_obj, proto, offset, map);
+    let proto_word: Tagged<Value> =
+        unsafe { Tagged::from_value_unchecked(proto.as_tagged(heap).raw()) };
+    state.construct_cache_insert(heap, callee_obj, proto_word, offset, map);
 }
 
 #[cold]

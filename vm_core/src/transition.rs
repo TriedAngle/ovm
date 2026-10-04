@@ -434,33 +434,66 @@ impl Transition {
         flags: SlotFlags,
         value: Handle<Value>,
     ) {
-        let slot_count = receiver.as_tagged(heap).map_ref(heap).value_slot_count() + 1;
-        heap.allocate_token_enter_heap(
-            FixedArray::<Value>::layout_for(slot_count),
-            |token, heap| {
-                let receiver_ref = receiver.as_tagged(heap);
-                let target = receiver_ref
-                    .map_ref(heap)
-                    .find_transition(heap, name.as_tagged(heap), flags, None)
-                    .expect("transition recorded above");
-                let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(slot_count);
-                values.extend(
-                    receiver_ref
-                        .slots
-                        .get(heap)
-                        .as_slice()
-                        .iter()
-                        .map(|slot| slot.get(heap)),
-                );
-                values.push(value.as_tagged(heap));
-                debug_assert_eq!(values.len(), slot_count, "slot count desynced from map");
-                let slots = token.allocate::<FixedArray>(scope.stage(&values));
-                let host = receiver.as_tagged(heap).erase();
-                receiver_ref.slots.set(heap, host, slots);
-                Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
-                receiver_ref.header.map.set(heap, host, target);
-            },
-        );
+        // The append's target row and offset, plus the parent's used count
+        // and the array's current reservation: a preallocated array can
+        // absorb the write in place.
+        let (offset, parent_count, old_len) = {
+            let receiver_ref = receiver.as_tagged(heap);
+            let parent = receiver_ref.map_ref(heap);
+            let target = parent
+                .find_transition(heap, name.as_tagged(heap), flags, None)
+                .expect("transition recorded above");
+            let index = target
+                .as_ref()
+                .descriptors()
+                .iter()
+                .position(|d| d.name(heap).ptr_eq(name.as_tagged(heap)) && d.flags() == flags)
+                .expect("transition target row");
+            (
+                target.as_ref().descriptor(index).offset(),
+                parent.value_slot_count(),
+                receiver_ref.slots.get(heap).as_slice().len(),
+            )
+        };
+
+        if offset < old_len {
+            let receiver_ref = receiver.as_tagged(heap);
+            let target = receiver_ref
+                .map_ref(heap)
+                .find_transition(heap, name.as_tagged(heap), flags, None)
+                .expect("transition recorded above");
+            let host = receiver_ref.erase();
+            receiver_ref
+                .slot(heap, offset)
+                .set(heap, host, value.as_tagged(heap));
+            Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
+            receiver_ref.header.map.set(heap, host, target);
+            return;
+        }
+
+        // Reservation exhausted: grow with fresh headroom so the next
+        // appends land in place.
+        debug_assert_eq!(offset, old_len, "append out of order");
+        debug_assert_eq!(offset, parent_count, "slot count desynced from map");
+        let capacity = parent_count + 1 + Map::SLACK_MARGIN;
+        let slots = heap.allocate_hole_array(capacity).as_handle(scope);
+        let receiver_ref = receiver.as_tagged(heap);
+        let target = receiver_ref
+            .map_ref(heap)
+            .find_transition(heap, name.as_tagged(heap), flags, None)
+            .expect("transition recorded above");
+        {
+            let old = receiver_ref.slots.get(heap);
+            let new = slots.as_tagged(heap);
+            for k in 0..old_len {
+                new.as_ref().set(heap, k, old.at(heap, k));
+            }
+            new.as_ref().set(heap, offset, value.as_tagged(heap));
+        }
+        let host = receiver_ref.erase();
+        receiver_ref.slots.set(heap, host, slots.as_tagged(heap));
+        Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
+        receiver_ref.header.map.set(heap, host, target);
     }
 
     fn swap_map(

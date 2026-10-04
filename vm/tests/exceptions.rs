@@ -33,6 +33,7 @@ fn callable(
     });
     let info = thread.heap().allocate_handle::<CallableInfoObject>(
         CallableInfoInit {
+            expected_slots: 0,
             bytecode,
             constants,
             register_count,

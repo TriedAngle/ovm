@@ -2025,13 +2025,24 @@ extern "rust-preserve-none" fn op_store_named<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::StoreNamedProperty);
     let r = ops.signed::<0>();
+    let name_idx = ops.unsigned::<1>();
     let fb = ops.unsigned::<2>();
     let recv = regs.read(r, ctx);
+    // The constant-pool name is a stable interned string; the word stays
+    // valid for the allocation-free fast path.
+    let name_word = ctx
+        .constants_ref(ctx.heap())
+        .as_ref()
+        .at(ctx.heap(), name_idx)
+        .raw();
+    let name: Tagged<'_, vm_core::SlotName> =
+        unsafe { Tagged::from_value_unchecked(name_word) };
     if InlineCache::try_store_fast(
         unsafe { ctx.heap_mut() },
         ctx.feedback_ref(ctx.heap()),
         fb,
         recv,
+        name,
         acc,
     ) {
         next!(StoreNamedProperty, ip, regs, ctx, table, roots, float, acc)
@@ -3309,7 +3320,19 @@ fn construct_receiver_fast<'a>(
         // identity-keyed initial-map cache hit: allocate directly
         if let Some(map) = state.construct_initial_map(heap, callee.as_tagged(heap)) {
             let map = scope.handle(map);
-            let obj = heap.new_object(&scope, map, HandleSlice::EMPTY);
+            // Parser-estimated slots plus margin: the first property adds
+            // land in the preallocated array instead of growing it.
+            let expected = callee
+                .as_tagged(heap)
+                .as_ref()
+                .callable_info(heap)
+                .map_or(0, |info| info.as_ref().expected_slots());
+            let capacity = if expected == 0 {
+                0
+            } else {
+                expected.max(2) + vm_core::Map::SLACK_MARGIN
+            };
+            let obj = heap.new_object_prealloc(&scope, map, capacity);
             return Ok(Some(obj.erase()));
         }
         let Some(obj) = Object::create_construct_receiver_value(vm, heap, state, callee.erase())?

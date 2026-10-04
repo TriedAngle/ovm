@@ -138,6 +138,7 @@ fn callable_info_carries_handler_table() {
             .allocate_handle::<FixedArray>(scope.stage::<vm::Value>(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants,
                 register_count: 0,
@@ -192,6 +193,7 @@ fn callable_info_without_handler_table() {
             .allocate_handle::<FixedArray>(scope.stage::<vm::Value>(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants,
                 register_count: 0,

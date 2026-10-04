@@ -43,8 +43,8 @@ pub use handle::{
     EscapableHandleScope, Handle, HandleData, HandleScope, HandleSet, HandleSlice, RootHandles,
 };
 pub use heap::{
-    AllocToken, AtomicOptionGcSlot, EdgeVisitable, GcSlot, GlobalHeap, Heap, MaybeWeakGcSlot,
-    OptionGcSlot, Register, WordType,
+    AllocToken, AtomicGcSlot, AtomicOptionGcSlot, EdgeVisitable, GcSlot, GlobalHeap, Heap,
+    MaybeWeakGcSlot, OptionGcSlot, Register, WordType,
 };
 pub use interner::StringInterner;
 pub use interp::{Ctx, Unwind};
@@ -244,8 +244,24 @@ impl ContextState {
         None
     }
 
+    /// Ensure the weak `closure -> initial_map` table exists. Callers
+    /// that capture raw heap words across later allocations must call this
+    /// first: this is the only allocation a cache fill may trigger, and a
+    /// collection here would leave captured words stale.
+    pub fn construct_cache_ensure_table(&self, heap: &mut Heap) {
+        let the_hole = heap.known().the_hole.as_tagged(heap).raw();
+        if self.construct_cache.get(heap).raw() != the_hole {
+            return;
+        }
+        self.handle_scope(|_scope| {
+            let table = heap.allocate_hole_weak_array(320);
+            self.construct_cache.store(table.erase());
+        });
+    }
+
     /// Record `closure -> initial_map` (miss path; `proto_slot` is the
     /// object-slot offset of the closure's `.prototype` data property).
+    /// The table must already exist ([`Self::construct_cache_ensure_table`]).
     pub fn construct_cache_insert(
         &self,
         heap: &mut Heap,
@@ -260,13 +276,8 @@ impl ContextState {
             let initial_map = scope.handle(initial_map);
             let the_hole = heap.known().the_hole.as_tagged(heap).raw();
             let word = self.construct_cache.get(heap);
-            if word.raw() == the_hole {
-                let hole_weak =
-                    unsafe { Tagged::<Value>::from_value_unchecked(the_hole) }.as_maybe_weak();
-                let vals = vec![hole_weak; 320];
-                let table = heap.allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &vals });
-                self.construct_cache.store(table.erase());
-            }
+            debug_assert_ne!(word.raw(), the_hole, "cache table must be ensured");
+            let _ = (word, the_hole);
             // allocation-free from here: every word is read through a root
             let table: Tagged<WeakFixedArray> =
                 unsafe { Tagged::from_value_unchecked(self.construct_cache.get(heap).raw()) };

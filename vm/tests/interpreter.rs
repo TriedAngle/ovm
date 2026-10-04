@@ -144,6 +144,7 @@ fn run_program(
             .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants,
                 register_count,
@@ -173,6 +174,7 @@ fn create_closure_of_kind(
             .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants,
                 register_count: 0,
@@ -234,6 +236,7 @@ fn run_program_ctx(
             .allocate_handle::<FixedArray>(stage_values(&scope, &[w2]), &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants,
                 register_count,
@@ -388,6 +391,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
             .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode: callee_bytecode,
                 constants: callee_constants,
                 register_count: 2,
@@ -416,6 +420,7 @@ fn call_resolves_callable_object_and_pushes_frames() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let caller = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: receiver_consts,
                 register_count: 2,
@@ -565,6 +570,7 @@ fn object_literal_built_with_manual_stores() {
                 .allocate_handle::<FixedByteArray>(&program, &scope);
             let callable = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
+                    expected_slots: 0,
                     bytecode,
                     constants: consts,
                     register_count: 1,
@@ -653,6 +659,7 @@ fn define_named_own_property_attributes_and_value() {
                 .allocate_handle::<FixedByteArray>(&program, &scope);
             let callable = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
+                    expected_slots: 0,
                     bytecode,
                     constants: consts,
                     register_count: 5,
@@ -822,6 +829,7 @@ fn define_own_property_accessor_invokes_getter() {
             .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants,
                 register_count: 0,
@@ -1098,6 +1106,7 @@ fn object_program(thread: &mut Thread, build: impl FnOnce(&mut Vec<u8>)) -> Resu
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 4,
@@ -1199,6 +1208,7 @@ fn transition_object_program(
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 5,
@@ -1415,6 +1425,7 @@ fn parent_object_program(thread: &mut Thread, store_op: Opcode) -> Result<Value,
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 6,
@@ -1680,6 +1691,7 @@ fn accessor_object_program(
                 .allocate_handle::<FixedArray>(stage_values(&scope, &[y_word]), &scope);
             let info = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
+                    expected_slots: 0,
                     bytecode,
                     constants,
                     register_count: 1,
@@ -1751,6 +1763,7 @@ fn accessor_object_program(
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 4,
@@ -1917,6 +1930,7 @@ fn store_new_accessor_property_defines_own_accessor() {
                 .allocate_handle::<FixedArray>(stage_values(&scope, &[y_word]), &scope);
             let info = thread.heap().allocate_handle::<CallableInfoObject>(
                 CallableInfoInit {
+                    expected_slots: 0,
                     bytecode,
                     constants,
                     register_count: 1,
@@ -1962,6 +1976,7 @@ fn store_new_accessor_property_defines_own_accessor() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 1,
@@ -2026,6 +2041,7 @@ fn bytecode_fn<'a>(
     let constants = heap.allocate_handle::<FixedArray>(stage_values(scope, constants), scope);
     let info = heap.allocate_handle::<CallableInfoObject>(
         CallableInfoInit {
+            expected_slots: 0,
             bytecode,
             constants,
             register_count,
@@ -2097,6 +2113,7 @@ fn call_dispatches_to_runtime_function_object() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let caller = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 1,
@@ -2809,6 +2826,7 @@ fn run_program_consts(
             .allocate_handle::<FixedArray>(stage_values(&scope, constants), &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants,
                 register_count,
@@ -2970,6 +2988,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
             .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode: callee_bytecode,
                 constants: callee_consts,
                 register_count: 0,
@@ -3005,6 +3024,7 @@ fn create_closure_inherits_current_context_and_is_callable() {
             .allocate_handle::<FixedArray>(stage_values(&scope, &[w17, w18]), &scope);
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 2,
@@ -3065,6 +3085,7 @@ fn create_closure_shares_callable_info_template() {
             .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode: callee_bytecode,
                 constants: callee_consts,
                 register_count: 0,
@@ -3352,6 +3373,7 @@ fn closure_captures_function_context_end_to_end() {
             .allocate_handle::<FixedArray>(scope.stage::<Value>(&[]), &scope);
         let callee_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode: callee_bytecode,
                 constants: callee_consts,
                 register_count: 0,
@@ -3397,6 +3419,7 @@ fn closure_captures_function_context_end_to_end() {
             .allocate_handle::<FixedArray>(stage_values(&scope, &[w22, w23]), &scope);
         let caller_info = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 3,
@@ -3484,6 +3507,7 @@ fn set_prototype_changes_property_lookup_chain() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 4,
@@ -3540,6 +3564,7 @@ fn set_prototype_survives_property_transitions() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 4,
@@ -3637,6 +3662,7 @@ fn set_prototype_on_non_extensible_throws_type_error() {
             .allocate_handle::<FixedByteArray>(&program, &scope);
         let callable = thread.heap().allocate_handle::<CallableInfoObject>(
             CallableInfoInit {
+                expected_slots: 0,
                 bytecode,
                 constants: consts,
                 register_count: 4,
@@ -3665,6 +3691,7 @@ fn make_callable(
         .allocate_handle::<FixedArray>(stage_values(scope, constants), scope);
     let info = thread.heap().allocate_handle::<CallableInfoObject>(
         CallableInfoInit {
+            expected_slots: 0,
             bytecode,
             constants,
             register_count: 1,

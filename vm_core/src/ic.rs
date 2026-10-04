@@ -1196,6 +1196,7 @@ impl InlineCache {
         vector: Option<Tagged<'_, FeedbackVector>>,
         slot: usize,
         receiver: Tagged<'_, Value>,
+        name: Tagged<'_, SlotName>,
         value: Tagged<'_, Value>,
     ) -> bool {
         let Some(vector) = vector else {
@@ -1211,16 +1212,48 @@ impl InlineCache {
         let Some(handler) = probe(heap, vector, slot, map) else {
             return false;
         };
-        if handler.raw().is_ptr() {
-            return false;
+        if !handler.raw().is_ptr() {
+            let Some((KIND_FIELD, payload)) = decode_smi(handler) else {
+                return false;
+            };
+            recv.as_ref()
+                .slot(heap, payload as usize)
+                .set(heap, recv.erase(), value);
+            return true;
         }
-        let Some((KIND_FIELD, payload)) = decode_smi(handler) else {
-            return false;
-        };
-        recv.as_ref()
-            .slot(heap, payload as usize)
-            .set(heap, recv.erase(), value);
-        true
+        if handler.raw().is_weak_ptr() {
+            // Cached own-property add (StoreHandler::StoreTransition):
+            // swap to the target map and write the pre-reserved slot. A
+            // missing reservation falls back to the cold grow path.
+            let Some(strong) = handler.as_strong() else {
+                return false;
+            };
+            let Some(target) = strong.get_as::<Map>() else {
+                return false;
+            };
+            if !target.as_ref().is_prototype_validity_cell_valid(heap) {
+                return false;
+            }
+            let Some(row) = target
+                .as_ref()
+                .descriptors()
+                .iter()
+                .find(|d| d.name(heap).ptr_eq(name.erase()) && !d.flags().is_accessor())
+            else {
+                return false;
+            };
+            let offset = row.offset();
+            let old_len = recv.slots.get(heap).as_slice().len();
+            if offset >= old_len {
+                return false;
+            }
+            let host = recv.erase();
+            recv.slot(heap, offset).set(heap, host, value);
+            Prototype::shape_changed(heap, recv.as_ref().map_ref(heap));
+            recv.header.map.set(heap, host, target);
+            return true;
+        }
+        false
     }
 
     pub fn try_store<'a>(
@@ -1361,7 +1394,9 @@ fn apply_transition(
     let old_len = recv.slots.get(heap).as_slice().len();
     let new_len = target_ref.value_slot_count();
 
-    if new_len == old_len && offset < old_len {
+    if offset < old_len {
+        // The receiver's array already reserves the slot: an own-field
+        // write or an append inside the slack capacity.
         let host = recv.erase();
         recv.slot(heap, offset)
             .set(heap, host, value.as_tagged(heap));
@@ -1376,25 +1411,26 @@ fn apply_transition(
         return false;
     }
 
-    heap.allocate_token_enter_heap(FixedArray::<Value>::layout_for(new_len), |token, heap| {
+    // Reservation exhausted: grow with fresh headroom so the next appends
+    // land in place.
+    let capacity = new_len + Map::SLACK_MARGIN;
+    let slots = heap.allocate_hole_array(capacity).as_handle(scope);
+    {
         let recv = receiver
             .as_tagged(heap)
             .as_heap_object()
             .expect("gated receiver");
-        let mut values: Vec<Tagged<'_, Value>> = recv
-            .slots
-            .get(heap)
-            .as_slice()
-            .iter()
-            .map(|slot| slot.get(heap))
-            .collect();
-        values.push(value.as_tagged(heap));
-        let slots = token.allocate::<FixedArray>(scope.stage(&values));
+        let old = recv.slots.get(heap);
+        let new = slots.as_tagged(heap);
+        for k in 0..old_len {
+            new.as_ref().set(heap, k, old.at(heap, k));
+        }
+        new.as_ref().set(heap, offset, value.as_tagged(heap));
         let host = recv.erase();
-        recv.slots.set(heap, host, slots);
+        recv.slots.set(heap, host, new);
         Prototype::shape_changed(heap, recv.as_ref().map_ref(heap));
         recv.header.map.set(heap, host, target.as_tagged(heap));
-    });
+    }
     true
 }
 

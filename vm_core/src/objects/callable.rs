@@ -23,6 +23,9 @@ pub struct CallableInfoObject {
     /// JS-visible `length` (differs from `formal_parameter_count` when the
     /// parameter list has defaults / patterns / a rest parameter)
     pub formal_length: GcSlot<Smi>,
+    /// Parser estimate: how many `this.<name> = ...` stores run in this
+    /// function's own body. Seeds the constructor slack preallocation.
+    pub expected_slots: GcSlot<Smi>,
     pub kind: GcSlot<Smi>,
     /// Language mode is preserved now; strict-sensitive call/store/delete
     /// branches are intentionally deferred.
@@ -99,6 +102,7 @@ pub struct CallableInfoInit<'a> {
     pub constants: Handle<'a, FixedArray>,
     pub register_count: usize,
     pub handlers: Option<Handle<'a, HandlerTable>>,
+    pub expected_slots: usize,
 }
 
 impl HeapObject for CallableInfoObject {
@@ -134,6 +138,8 @@ impl HeapObject for CallableInfoObject {
             .init(heap.known().the_hole.as_tagged(heap).erase());
         self.formal_parameter_count.set(heap, host, Smi::new(0));
         self.formal_length.set(heap, host, Smi::new(0));
+        self.expected_slots
+            .set(heap, host, Smi::new(config.expected_slots as i64));
         self.kind
             .set(heap, host, Smi::new(FunctionKind::Normal as i64));
         self.strict.set(heap, host, Smi::new(0));
@@ -239,6 +245,11 @@ impl CallableInfoObject {
     /// JS-visible `length`
     pub fn formal_length(&self) -> usize {
         self.formal_length.to_smi().value() as usize
+    }
+
+    /// Parser estimate of `this.<name> = ...` stores in this function.
+    pub fn expected_slots(&self) -> usize {
+        self.expected_slots.to_smi().value() as usize
     }
 
     pub fn function_kind(&self) -> FunctionKind {

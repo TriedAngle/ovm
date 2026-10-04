@@ -411,6 +411,17 @@ fn is_super_member(m: MemberRef<'_>) -> bool {
     }
 }
 
+/// `this.<name> = ...` stores: V8 counts them to presize constructor
+/// instances. Only plain assignments count (compound/update stores are
+/// absorbed by slack).
+fn is_this_member(m: MemberRef<'_>) -> bool {
+    match m {
+        MemberRef::Static(e) => matches!(e.object, Expression::ThisExpression(_)),
+        MemberRef::Computed(e) => matches!(e.object, Expression::ThisExpression(_)),
+        MemberRef::Private(_) => false,
+    }
+}
+
 /// A member expression inside a simple assignment target.
 fn assign_member_ref_for_left<'a>(t: &'a ForStatementLeft<'a>) -> Option<MemberRef<'a>> {
     match t {
@@ -1656,6 +1667,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             t if assign_member_ref(t).is_some() => {
                 let m = assign_member_ref(t).unwrap();
+                if is_this_member(m) {
+                    self.b.note_this_property();
+                }
                 let store = if is_super_member(m) {
                     self.prepare_super_store(m)?
                 } else {

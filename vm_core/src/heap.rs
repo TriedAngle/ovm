@@ -4,7 +4,7 @@ use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
     HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MapKind, MaybeWeak, Object,
     ObjectInit, ObjectSlotsInit, PrototypeRegistry, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged,
-    Tlab, Value, Visitor, Word,
+    Tlab, Value, Visitor, WeakFixedArray, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -363,6 +363,98 @@ impl<T> OptionGcSlot<T> {
     }
 }
 
+/// A strongly-held GC slot whose word is read and written atomically:
+/// shared mutable map state (slack tracking) that several mutators may
+/// touch. Smi payloads need no barrier; pointer stores go through the
+/// generational barrier.
+#[repr(transparent)]
+pub struct AtomicGcSlot<T = Value> {
+    slot: GcSlot<T>,
+}
+
+unsafe impl<T> Send for AtomicGcSlot<T> {}
+unsafe impl<T> Sync for AtomicGcSlot<T> {}
+
+impl<T> AtomicGcSlot<T> {
+    pub fn load_word(&self, _heap: &Heap) -> Word {
+        self.slot
+            .as_raw()
+            .load_atomic(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Atomic store via a CAS loop (`RawCell` has no atomic store).
+    pub fn store_word(&self, word: Word) {
+        let raw = self.slot.as_raw();
+        let mut current = raw.load_atomic(core::sync::atomic::Ordering::Relaxed);
+        loop {
+            match raw.compare_exchange(
+                current,
+                word,
+                core::sync::atomic::Ordering::Release,
+                core::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub fn compare_exchange_word(&self, current: Word, new: Word) -> Result<Word, Word> {
+        self.slot.as_raw().compare_exchange(
+            current,
+            new,
+            core::sync::atomic::Ordering::AcqRel,
+            core::sync::atomic::Ordering::Acquire,
+        )
+    }
+
+    pub fn load<'a>(&self, heap: &'a Heap) -> Tagged<'a, T> {
+        // Safety: the GC keeps slots current; anchored by the borrow.
+        unsafe { Tagged::from_value_unchecked(Value::from_bits(self.load_word(heap))) }
+    }
+
+    pub fn store<'h, 'x>(
+        &self,
+        heap: &Heap,
+        host: Tagged<'h, Value>,
+        value: impl Into<Tagged<'x, T>>,
+    ) where
+        T: 'x,
+    {
+        let value = value.into();
+        let v = value.raw();
+        debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
+        if v.is_ptr() {
+            heap.write_barrier(host, self.slot.as_raw(), value.erase());
+        }
+        self.store_word(v.to_bits());
+    }
+}
+
+impl AtomicGcSlot<Smi> {
+    /// The packed Smi payload (used for bit-field counters).
+    pub fn load_smi(&self, heap: &Heap) -> Smi {
+        Smi::decode(Value::from_bits(self.load_word(heap)))
+            .expect("AtomicGcSlot<Smi> invariant violated")
+    }
+
+    pub fn store_smi(&self, value: Smi) {
+        self.store_word(value.into_tagged().raw().to_bits());
+    }
+
+    pub fn compare_exchange_smi(&self, current: Smi, new: Smi) -> Result<Smi, Smi> {
+        let decode = |word: Word| {
+            Smi::decode(Value::from_bits(word)).expect("AtomicGcSlot<Smi> invariant violated")
+        };
+        self.compare_exchange_word(
+            current.into_tagged().raw().to_bits(),
+            new.into_tagged().raw().to_bits(),
+        )
+        .map(decode)
+        .map_err(decode)
+    }
+}
+
 #[repr(transparent)]
 pub struct AtomicOptionGcSlot<T = Value> {
     slot: OptionGcSlot<T>,
@@ -656,12 +748,14 @@ impl Heap {
         if self.stress_armed.load(std::sync::atomic::Ordering::Acquire) {
             self.collect_minor();
         }
-        // resolve the fill after any stress collection so the word is
-        // current, then no GC can run again before the slots are written
-        let fill = self.known().the_hole.as_tagged(self).raw();
         let raw = self
             .allocate_raw(FixedArray::<Value>::layout_for(len))
             .expect("heap allocation failed (out of memory)");
+        // Resolve the fill after the reservation: a TLAB refill above can
+        // run a minor collection (the hole is not immortal), and no GC can
+        // run between this read and the slot writes below. Resolving earlier
+        // left a stale hole word in the fresh array.
+        let fill = self.known().the_hole.as_tagged(self).raw();
         let mut ptr = raw.cast::<FixedArray>();
         // Safety: raw memory just reserved; no GC can run inside init
         // (the &mut borrow is still outstanding).
@@ -672,6 +766,39 @@ impl Heap {
         for i in 0..len {
             // the host is fresh, so no old→young barrier is needed
             obj.element_slot(i).as_raw().store_raw(fill.to_bits());
+        }
+        // Safety: fresh strong pointer, anchored at this borrow.
+        unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
+    }
+
+    /// [`Heap::allocate_hole_array`] for a weak array: every entry is a
+    /// weak reference to the hole (the "empty" sentinel). The fill word is
+    /// resolved after the reservation so a TLAB-refill collection cannot
+    /// leave stale holes behind.
+    pub fn allocate_hole_weak_array(&mut self, len: usize) -> Tagged<'_, WeakFixedArray> {
+        #[cfg(feature = "stress-minor-gc")]
+        if self.stress_armed.load(std::sync::atomic::Ordering::Acquire) {
+            self.collect_minor();
+        }
+        let raw = self
+            .allocate_raw(WeakFixedArray::<Value>::layout_for(len))
+            .expect("heap allocation failed (out of memory)");
+        let fill = self
+            .known()
+            .the_hole
+            .as_tagged(self)
+            .as_maybe_weak()
+            .raw()
+            .to_bits();
+        let mut ptr = raw.cast::<WeakFixedArray>();
+        // Safety: raw memory just reserved; no GC can run inside init
+        // (the &mut borrow is still outstanding).
+        let obj = unsafe { ptr.as_mut() };
+        let host = obj.tagged(self);
+        obj.header.map.init(self.known().array_map.as_tagged(self));
+        obj.size.set(self, host, Smi::new(len as i64));
+        for i in 0..len {
+            obj.element_slot(i).as_raw().store_raw(fill);
         }
         // Safety: fresh strong pointer, anchored at this borrow.
         unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
@@ -713,6 +840,30 @@ impl Heap {
                 length: 0,
             },
         )
+    }
+
+    /// Like [`Heap::new_object`] with an empty slot list, but reserving
+    /// `capacity` hole-filled slots so constructor property stores append
+    /// in place instead of reallocating the backing array per property.
+    #[inline]
+    pub fn new_object_prealloc<'a>(
+        &mut self,
+        handles: &'a impl HandleSet,
+        map: Handle<'a, Map>,
+        capacity: usize,
+    ) -> Tagged<'_, Object> {
+        let capacity = capacity.max(map.as_tagged(self).as_ref().value_slot_count());
+        let slots: Handle<'a, FixedArray> = if capacity == 0 {
+            self.known().empty_fixed_array
+        } else {
+            self.allocate_hole_array(capacity).as_handle(handles)
+        };
+        self.allocate::<Object>(ObjectInit {
+            map,
+            slots,
+            elements: self.known().empty_fixed_array,
+            length: 0,
+        })
     }
 
     /// Bump-only float boxing: reserves and initializes a fresh `Float`
