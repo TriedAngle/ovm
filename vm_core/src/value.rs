@@ -282,6 +282,19 @@ impl<'a, T> Tagged<'a, T> {
     pub fn ptr_eq<U>(self, other: Tagged<'a, U>) -> bool {
         self.raw.raw_address_word() == other.raw.raw_address_word()
     }
+
+    /// True when `self` is exactly `other` with the weak tag bit set — the
+    /// word a weak slot stores for `other`. One OR+compare: unlike
+    /// [`ptr_eq`] it does not run `raw_address_word`'s `is_ptr` branches.
+    #[inline(always)]
+    pub fn is_weak_ref_to<U>(self, other: Tagged<'a, U>) -> bool {
+        self.raw.to_bits() == (other.raw.to_bits() | WEAK_PTR)
+    }
+
+    /// The Smi payload as an `i64`; `None` for pointers (incl. weak).
+    pub fn to_i64(self) -> Option<i64> {
+        self.raw.to_i64()
+    }
 }
 
 /// Identity equality across anchors and phantom types: two `Tagged`s are
@@ -309,11 +322,6 @@ impl<'a, T> PartialEq<Tagged<'a, T>> for Value {
 }
 
 impl<'a> Tagged<'a, Value> {
-    /// The Smi payload as an `i64`; `None` for pointers (incl. weak).
-    pub fn to_i64(self) -> Option<i64> {
-        self.raw.to_i64()
-    }
-
     /// The *encoded* Smi word (`value << 1`, tag bit clear), or `None` for
     /// a heap pointer. Operations that are linear in the value — add, sub,
     /// negate, ordered compare — can run directly on this word: the shift

@@ -409,7 +409,6 @@ impl<'a> HandleSlice<'a> {
     /// The empty argument list.
     pub const EMPTY: HandleSlice<'static> = HandleSlice { raw: &[] };
 
-
     pub fn as_tagged(&self) -> &[Tagged<'_, Value>] {
         // Safety: Tagged<Value> is layout-identical to Value.
         unsafe { core::slice::from_raw_parts(self.raw.as_ptr().cast(), self.raw.len()) }
@@ -449,9 +448,8 @@ impl<'a> HandleSlice<'a> {
     /// Free handles over every element (see [`Self::get`]).
     pub fn iter(&self) -> impl Iterator<Item = Handle<'a, Value>> + 'a {
         let raw: &'a [Value] = self.raw;
-        raw.iter().map(|word| {
-            unsafe { Handle::from_location(NonNull::from(word)) }
-        })
+        raw.iter()
+            .map(|word| unsafe { Handle::from_location(NonNull::from(word)) })
     }
 
     /// Raw words, for storage copies into fresh objects (no GC can run
