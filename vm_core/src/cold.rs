@@ -20,11 +20,7 @@ use crate::{Compare, Errors, VmError};
 
 /// `Add` cold body: ToPrimitive both operands, string concatenation when
 /// either side is a string, numeric addition otherwise (ES 13.15.3).
-pub fn add<'a>(
-    ctx: &Ctx<'a>,
-    lhs: Tagged<'_, Value>,
-    rhs: Tagged<'_, Value>,
-) -> Tagged<'a, Value> {
+pub fn add<'a>(ctx: &Ctx<'a>, lhs: Tagged<'_, Value>, rhs: Tagged<'_, Value>) -> Tagged<'a, Value> {
     let vm = ctx.vm();
     let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
@@ -42,8 +38,8 @@ pub fn add<'a>(
             Err(e) => return ctx.raise_tag(e),
         };
         let is_string = (
-            lhs.as_tagged(heap).get_as::<DenseString>().is_some(),
-            rhs.as_tagged(heap).get_as::<DenseString>().is_some(),
+            lhs.as_tagged(heap).get_as::<DenseString>(heap).is_some(),
+            rhs.as_tagged(heap).get_as::<DenseString>(heap).is_some(),
         );
         if is_string.0 || is_string.1 {
             let a = match Convert::to_string(heap, &scope, lhs) {
@@ -342,11 +338,7 @@ pub fn keyed_load<'a>(
 
 /// `LoadElementImm` cold body: the keyed-load tail with the constant
 /// index as the key (string receivers, proxies, named fallback).
-pub fn keyed_load_imm<'a>(
-    ctx: &Ctx<'a>,
-    recv: Tagged<'_, Value>,
-    idx: usize,
-) -> Tagged<'a, Value> {
+pub fn keyed_load_imm<'a>(ctx: &Ctx<'a>, recv: Tagged<'_, Value>, idx: usize) -> Tagged<'a, Value> {
     let vm = ctx.vm();
     let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
@@ -420,7 +412,7 @@ pub fn keyed_store<'a>(
                         .is_some_and(|obj| obj.as_ref().is_array(heap))
                     {
                         let obj = scope
-                            .cast::<Object>(recv.as_tagged(heap))
+                            .cast::<Object>(heap, recv.as_tagged(heap))
                             .expect("array receiver is an object");
                         let grew = i >= obj.as_tagged(heap).as_ref().length();
                         if let Err(e) = Object::store_array_element(heap, &scope, &obj, i, &value) {
@@ -508,7 +500,7 @@ pub fn global_load<'a>(
                     let text = name
                         .as_tagged(heap)
                         .erase()
-                        .get_as::<DenseString>()
+                        .get_as::<DenseString>(heap)
                         .map(|s| s.to_rust_string(heap))
                         .unwrap_or_default();
                     let ex = Errors::not_defined(vm, heap, state, &text)
@@ -786,7 +778,7 @@ pub fn construct<'a>(
                 .callable_info(heap)
                 .is_some_and(|info| info.function_kind().is_derived_class_constructor());
         let callee = scope
-            .cast::<Object>(callee.as_tagged(heap))
+            .cast::<Object>(heap, callee.as_tagged(heap))
             .expect("constructible callee is an object");
         let receiver = if derived {
             scope.handle(heap.known().the_hole.as_tagged(heap).erase())

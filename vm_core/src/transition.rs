@@ -49,7 +49,7 @@ impl<'a> Tagged<'a, Value> {
         // smis are not property stores' targets: sloppy-mode stores onto
         // primitives are silently ignored (strict throws — deferred with
         // the other language-mode TODOs)
-        let Some(receiver) = scope.cast::<Object>(self) else {
+        let Some(receiver) = scope.cast::<Object>(heap, self) else {
             return Ok(StoreOutcome::Done);
         };
         match self.lookup(heap, name) {
@@ -171,7 +171,7 @@ fn super_store_on_receiver<'a, 's>(
     name: Tagged<'a, SlotName>,
     value: Tagged<'a, Value>,
 ) -> Result<StoreOutcome<'s>, VmError> {
-    let Some(receiver) = scope.cast::<Object>(recv) else {
+    let Some(receiver) = scope.cast::<Object>(heap, recv) else {
         return Err(VmError::Type);
     };
     match recv.lookup(heap, name) {
@@ -1020,7 +1020,7 @@ impl Object {
         let mut pairs: Vec<Handle<'_, Value>> = Vec::new();
         {
             let base = receiver.as_tagged(heap).map_ref(heap).prototype.get(heap);
-            if let Some(existing) = base.get_as::<FixedArray>() {
+            if let Some(existing) = base.get_as::<FixedArray>(heap) {
                 for i in 0..existing.len() {
                     pairs.push(scope.handle(existing.at(heap, i)));
                 }
@@ -1237,7 +1237,7 @@ impl Object {
                 }
                 Ok(())
             }
-            if let Some(pairs) = start.get_as::<FixedArray>() {
+            if let Some(pairs) = start.get_as::<FixedArray>(heap) {
                 let mut i = 1;
                 while i < pairs.len() {
                     walk(heap, null, this, pairs.at(heap, i))?;
@@ -1296,7 +1296,7 @@ fn validate_define<'a, 's>(
         }
         let cur_pair = cur_desc_value
             .as_tagged(heap)
-            .get_as::<AccessorPair>()
+            .get_as::<AccessorPair>(heap)
             .expect("accessor descriptor must hold a pair");
         if !Compare::same_value(heap, get.as_tagged(heap), cur_pair.get.get(heap))
             || !Compare::same_value(heap, set.as_tagged(heap), cur_pair.set.get(heap))

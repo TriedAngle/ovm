@@ -53,7 +53,7 @@ fn run_str(src: &str) -> String {
     {
         let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .expect("string result");
         s.to_rust_string(heap)
     }
@@ -85,7 +85,7 @@ fn run_error_name(src: &str) -> String {
                 vm::Lookup::Data { slot, .. } => {
                     let s = slot
                         .get(heap)
-                        .get_as::<DenseString>()
+                        .get_as::<DenseString>(heap)
                         .expect("error name is a string");
                     s.to_rust_string(heap)
                 }

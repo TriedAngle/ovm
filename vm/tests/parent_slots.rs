@@ -81,7 +81,7 @@ fn one_parent_is_a_pair_array() {
         let heap = &*thread.heap();
         let proto = obj.as_tagged(heap).map_ref(heap).prototype.get(heap);
         let pairs = proto
-            .get_as::<FixedArray>()
+            .get_as::<FixedArray>(heap)
             .expect("parents are always an inline pair array");
         assert_eq!(pairs.len(), 2, "[name, parent]");
         assert!(
@@ -114,7 +114,7 @@ fn several_parents_keep_priority_order() {
 
         let heap = &*thread.heap();
         let proto = child.as_tagged(heap).map_ref(heap).prototype.get(heap);
-        let pairs = proto.get_as::<FixedArray>().expect("pair array");
+        let pairs = proto.get_as::<FixedArray>(heap).expect("pair array");
         assert_eq!(pairs.len(), 4);
         assert!(pairs.at(heap, 0).ptr_eq(parent.as_tagged(heap).erase()));
         assert!(pairs.at(heap, 1).ptr_eq(p1.as_tagged(heap).erase()));

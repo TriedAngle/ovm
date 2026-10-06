@@ -7,8 +7,8 @@ use core::{
 
 use crate::stack::Args;
 use crate::{
-    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, Heap, HeapObject, HeapPtr, Map,
-    RawCell, Register, Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Heap, HeapObject, RawCell, Register, Tagged,
+    Value, Visitor,
 };
 
 /// A rooted reference to a `T` that survives relocation by the GC.
@@ -71,15 +71,6 @@ impl<'s, T> Handle<'s, T> {
             location: self.location,
             _phantom: PhantomData,
         }
-    }
-}
-
-impl<'s, T: HeapObject> Handle<'s, T> {
-    pub fn get(self) -> HeapPtr<T> {
-        // Safety: handle slots only ever hold strong values.
-        unsafe { Tagged::<T>::from_value_unchecked(self.raw()) }
-            .as_ptr()
-            .expect("strong local slot must contain strong pointer")
     }
 }
 
@@ -262,17 +253,12 @@ impl<'d> HandleScope<'d> {
         unsafe { HandleSlice::from_slice(core::slice::from_raw_parts(start, values.len())) }
     }
 
-    pub fn cast<T: HeapObject>(&self, value: Tagged<'_, Value>) -> Option<Handle<'_, T>> {
-        let ptr = HeapPtr::decode_strong(value.raw())?;
-        // Safety: raw header read for a kind check.
-        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.raw();
-        let kind = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() }
-            .kind()
-            .kind();
-        if !T::matches_kind(kind) {
-            return None;
-        }
-        Some(self.handle(unsafe { value.cast() }))
+    pub fn cast<T: HeapObject>(
+        &self,
+        heap: &Heap,
+        value: Tagged<'_, Value>,
+    ) -> Option<Handle<'_, T>> {
+        Some(self.handle(value.get_as::<T>(heap)?))
     }
 
     pub fn escapable_scope<'a>(&'a mut self) -> EscapableHandleScope<'a, 'd> {

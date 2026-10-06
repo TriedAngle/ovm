@@ -16,7 +16,7 @@ fn run(path: &str) {
     if let Some(ex) = thread.take_pending_exception() {
         let heap = thread.heap();
         let tagged = unsafe { ex.assume_valid(heap) };
-        if let Some(s) = tagged.get_as::<vm_core::DenseString>() {
+        if let Some(s) = tagged.get_as::<vm_core::DenseString>(heap) {
             panic!("nbody threw: {}", s.to_rust_string(heap));
         }
         panic!("nbody threw: {ex:?}");

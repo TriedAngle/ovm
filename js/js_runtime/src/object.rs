@@ -110,7 +110,7 @@ pub fn object_create<'a>(
         let empty: [Tagged<'_, Value>; 0] = [];
         let obj = scope.handle(heap.new_object(&scope, map, scope.stage(&empty)));
         let obj = scope
-            .cast::<Object>(obj.as_tagged(heap).erase())
+            .cast::<Object>(heap, obj.as_tagged(heap).erase())
             .expect("fresh object");
         rt_try!(
             vm,
@@ -476,7 +476,7 @@ pub fn object_set_prototype_of<'a>(
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         let target_obj = scope
-            .cast::<Object>(target.as_tagged(heap))
+            .cast::<Object>(heap, target.as_tagged(heap))
             .expect("target checked to be an object");
         rt_try!(
             vm,
@@ -689,7 +689,7 @@ pub fn object_seal<'a>(
             return target_handle.as_tagged(heap).erase();
         }
         let obj = scope
-            .cast::<Object>(target_handle.as_tagged(heap))
+            .cast::<Object>(heap, target_handle.as_tagged(heap))
             .expect("checked above");
         set_integrity_flags(heap, &scope, obj, false);
         // re-read through the handle: traps may have moved the receiver
@@ -745,7 +745,7 @@ pub fn object_freeze<'a>(
             return target_handle.as_tagged(heap).erase();
         }
         let obj = scope
-            .cast::<Object>(target_handle.as_tagged(heap))
+            .cast::<Object>(heap, target_handle.as_tagged(heap))
             .expect("checked above");
         set_integrity_flags(heap, &scope, obj, true);
         // re-read through the handle: traps may have moved the receiver

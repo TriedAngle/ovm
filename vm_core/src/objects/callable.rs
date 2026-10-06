@@ -232,7 +232,7 @@ impl CallableInfoObject {
     }
 
     pub fn name<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
-        self.name.get(heap).get_as::<DenseString>().map(|_| {
+        self.name.get(heap).get_as::<DenseString>(heap).map(|_| {
             // Safety: fresh slot read under the anchor.
             unsafe { Tagged::from_value_unchecked(self.name.raw()) }
         })
@@ -265,7 +265,7 @@ impl CallableInfoObject {
     pub fn constant_slot_name<'a>(&self, heap: &'a Heap, idx: usize) -> Tagged<'a, SlotName> {
         let v = self.constants.get(heap).at(heap, idx);
         let name = v
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .expect("property name constant must be an interned string");
         name.into()
     }

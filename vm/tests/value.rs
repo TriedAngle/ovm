@@ -1,10 +1,10 @@
 use core::alloc::Layout;
 
-use vm::{Header, Heap, HeapObject, HeapPtr, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
+use vm::{Header, Heap, HeapObject, STRONG_PTR, Smi, Tagged, Value, WEAK_PTR};
 
 /// Stand-in heap object, aligned like a real heap allocation.
 #[repr(align(8))]
-struct TestObj(u64);
+struct TestObj;
 
 impl HeapObject for TestObj {
     type Init<'a> = ();
@@ -29,11 +29,16 @@ impl HeapObject for TestObj {
 }
 
 fn alloc_test_obj() -> *mut TestObj {
-    Box::into_raw(Box::new(TestObj(0xDEAD_BEEF)))
+    Box::into_raw(Box::new(TestObj))
 }
 
 unsafe fn free_test_obj(ptr: *mut TestObj) {
     drop(unsafe { Box::from_raw(ptr) });
+}
+
+/// The strong pointer word for a stand-in object.
+fn strong(raw: *mut TestObj) -> Value {
+    Value::from_bits(raw as u64 | STRONG_PTR)
 }
 
 mod value {
@@ -107,78 +112,6 @@ mod smi {
     }
 }
 
-mod heap_ptr {
-    use super::*;
-
-    #[test]
-    fn strong_pointer_roundtrip() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::new(raw) };
-
-        let v = ptr.encode_strong();
-        assert!(v.is_strong_ptr());
-        assert!(v.is_ptr());
-        assert!(!v.is_smi());
-        assert!(!v.is_weak_ptr());
-        assert_eq!(v.raw_addr(), raw as u64);
-
-        let decoded = unsafe { HeapPtr::decode_strong(v).unwrap().cast::<TestObj>() };
-        assert_eq!(decoded.as_ptr(), raw);
-
-        unsafe { free_test_obj(raw) };
-    }
-
-    #[test]
-    fn weak_pointer_roundtrip() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::new(raw) };
-
-        let v = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }
-            .as_weak()
-            .raw();
-        assert!(v.is_weak_ptr());
-        assert!(v.is_ptr());
-        assert!(!v.is_smi());
-        assert!(!v.is_strong_ptr());
-        assert_eq!(v.raw_addr(), raw as u64);
-
-        assert!(HeapPtr::decode_strong(v).is_none());
-        let decoded = unsafe { HeapPtr::decode(v).unwrap().cast::<TestObj>() };
-        assert_eq!(decoded.as_ptr(), raw);
-
-        unsafe { free_test_obj(raw) };
-    }
-
-    #[test]
-    fn decode_rejects_smi() {
-        let v = Smi::new(1).encode();
-        assert!(HeapPtr::decode(v).is_none());
-        assert!(HeapPtr::decode_strong(v).is_none());
-    }
-
-    #[test]
-    fn as_ref_reads_pointee() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::new(raw) };
-
-        let obj = unsafe { ptr.as_ref() };
-        assert_eq!(obj.0, 0xDEAD_BEEF);
-
-        unsafe { free_test_obj(raw) };
-    }
-
-    #[test]
-    fn as_mut_writes_pointee() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::new(raw) };
-
-        unsafe { ptr.as_mut() }.0 = 42;
-        assert_eq!(unsafe { ptr.as_ref() }.0, 42);
-
-        unsafe { free_test_obj(raw) };
-    }
-}
-
 mod debug {
     use super::*;
 
@@ -203,16 +136,6 @@ mod debug {
     fn smi_formats_inner_value() {
         assert_eq!(format!("{:?}", Smi::new(42)), "Smi(42)");
     }
-
-    #[test]
-    fn heap_ptr_formats_address() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-
-        assert_eq!(format!("{:?}", ptr), format!("HeapPtr({:#x})", raw as u64));
-
-        unsafe { free_test_obj(raw) };
-    }
 }
 
 mod tagged {
@@ -236,42 +159,23 @@ mod tagged {
 
     #[test]
     fn to_smi_rejects_pointers() {
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let tagged = unsafe { Tagged::<Smi>::from_value_unchecked(ptr.encode_strong()) };
+        // Safety: bit-level test; the value is never dereferenced.
+        let word = Value::from_bits(0x1000 | STRONG_PTR);
+        let tagged = unsafe { Tagged::<Smi>::from_value_unchecked(word) };
 
         assert_eq!(tagged.to_smi(), None);
-
-        unsafe { free_test_obj(raw) };
     }
 
     #[test]
-    fn from_ptr_roundtrip() {
+    fn strong_word_roundtrip() {
         let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let tagged = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
+        let tagged = unsafe { Tagged::<TestObj>::from_value_unchecked(strong(raw)) };
 
         assert!(tagged.is_ptr());
         assert!(tagged.is_strong_ptr());
         assert!(!tagged.is_weak_ptr());
         assert!(!tagged.is_smi());
-        assert_eq!(tagged.as_ptr().unwrap().as_ptr(), raw);
-
-        unsafe { free_test_obj(raw) };
-    }
-
-    #[test]
-    fn as_ptr_rejects_smi_and_weak() {
-        let smi = unsafe { Tagged::<TestObj>::from_value_unchecked(Smi::new(1).encode()) };
-        assert!(smi.as_ptr().is_none());
-
-        let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        // weak references live in MaybeWeak: the weak tag keeps them out of a
-        // strong Tagged, so a weak word can never reach `as_ptr`
-        let weak =
-            unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) }.as_weak();
-        assert!(weak.raw().is_weak_ptr());
+        assert_eq!(tagged.raw().raw_addr(), raw as u64);
 
         unsafe { free_test_obj(raw) };
     }
@@ -279,8 +183,7 @@ mod tagged {
     #[test]
     fn maybe_weak_roundtrip() {
         let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let strong = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
+        let strong = unsafe { Tagged::<TestObj>::from_value_unchecked(strong(raw)) };
 
         let weak = strong.as_weak();
         assert!(weak.raw().is_weak_ptr());
@@ -308,10 +211,9 @@ mod tagged {
     #[test]
     fn erase_recovers_the_raw_value() {
         let raw = alloc_test_obj();
-        let ptr = unsafe { HeapPtr::<TestObj>::new(raw) };
-        let tagged = unsafe { Tagged::<TestObj>::from_value_unchecked(ptr.encode_strong()) };
+        let tagged = unsafe { Tagged::<TestObj>::from_value_unchecked(strong(raw)) };
 
-        assert_eq!(tagged.raw(), ptr.encode_strong());
+        assert_eq!(tagged.raw(), strong(raw));
 
         unsafe { free_test_obj(raw) };
     }

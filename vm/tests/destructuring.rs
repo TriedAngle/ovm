@@ -30,7 +30,7 @@ fn run_str(src: &str) -> String {
     {
         let heap = &*thread.heap();
         let s = unsafe { v.assume_valid(heap) }
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .expect("string result");
         s.to_rust_string(heap)
     }
@@ -94,7 +94,7 @@ fn throws_named(src: &str, want: &str) -> bool {
             match o.lookup(heap, name.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => slot
                     .get(heap)
-                    .get_as::<DenseString>()
+                    .get_as::<DenseString>(heap)
                     .map(|s| s.data(heap).matches_ascii(want.as_bytes()))
                     .unwrap_or(false),
                 _ => false,

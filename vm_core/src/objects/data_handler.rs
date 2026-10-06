@@ -1,8 +1,8 @@
 use core::alloc::Layout;
 
 use crate::{
-    EdgeVisitable, GcSlot, Header, Heap, HeapObject, HeapPtr, Map, MaybeWeak, MaybeWeakGcSlot,
-    ObjectKind, Smi, Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Header, Heap, HeapObject, Map, MaybeWeak, MaybeWeakGcSlot, ObjectKind,
+    Smi, Tagged, Value, Visitor,
 };
 
 #[repr(C)]
@@ -29,8 +29,11 @@ impl DataHandler {
     }
 
     fn raw_map(&self) -> &Map {
+        // Safety: layout/visit callbacks run without a heap borrow, so
+        // the map word is promoted unsafely; the map cannot move under
+        // the GC callback.
         let map = self.header.map.raw();
-        unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() }
+        unsafe { Tagged::<Map>::from_value_unchecked(map) }.as_ref()
     }
 
     pub fn data_len(&self) -> usize {

@@ -90,7 +90,7 @@ impl Map {
             return None;
         }
         // Safety: the slot is only ever published a strong `PrototypeInfo`.
-        unsafe { Tagged::<Value>::from_value_unchecked(value) }.get_as::<PrototypeInfo>()
+        unsafe { Tagged::<Value>::from_value_unchecked(value) }.get_as::<PrototypeInfo>(heap)
     }
 
     pub fn published_validity_cell<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Cell>> {
@@ -156,7 +156,7 @@ impl Map {
             let Some(target) = entry[1].get_strong(heap) else {
                 continue;
             };
-            let Some(target) = target.get_as::<Map>() else {
+            let Some(target) = target.get_as::<Map>(heap) else {
                 continue;
             };
 
@@ -172,7 +172,7 @@ impl Map {
                 let matches = row
                     .value
                     .get(heap)
-                    .get_as::<AccessorPair>()
+                    .get_as::<AccessorPair>(heap)
                     .is_some_and(|p| {
                         Compare::same_value(heap, get, p.get.get(heap))
                             && Compare::same_value(heap, set, p.set.get(heap))
@@ -204,7 +204,7 @@ impl Map {
             let Some(target) = entry[1].get_strong(heap) else {
                 continue;
             };
-            let Some(target) = target.get_as::<Map>() else {
+            let Some(target) = target.get_as::<Map>(heap) else {
                 continue;
             };
             if target.descriptor_count() + 1 == self.descriptor_count()
@@ -238,7 +238,7 @@ impl Map {
             let Some(target) = entry[1].get_strong(heap) else {
                 continue;
             };
-            let Some(target) = target.get_as::<Map>() else {
+            let Some(target) = target.get_as::<Map>(heap) else {
                 continue;
             };
             if target.prototype.get(heap).ptr_eq(proto) {

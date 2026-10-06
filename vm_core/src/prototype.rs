@@ -163,7 +163,7 @@ fn trackable_prototype<'a>(heap: &'a Heap, value: Tagged<'a, Value>) -> Option<T
     {
         return None;
     }
-    let object = value.get_as::<Object>()?;
+    let object = value.get_as::<Object>(heap)?;
     if !object.as_ref().map_ref(heap).kind().kind().is_js_receiver() {
         return None;
     }
@@ -349,7 +349,7 @@ fn invalidate_prototype_chains_internal(heap: &Heap, map: Tagged<'_, Map>) {
             let Some(user) = users.element_slot(i).get(heap).as_strong() else {
                 continue;
             };
-            let Some(user_map) = user.get_as::<Map>() else {
+            let Some(user_map) = user.get_as::<Map>(heap) else {
                 continue;
             };
             if next.is_none() {

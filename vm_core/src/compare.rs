@@ -18,9 +18,9 @@ impl Compare {
         {
             return false;
         }
-        if v.get_as::<DenseString>().is_some()
-            || v.get_as::<Float>().is_some()
-            || v.get_as::<Symbol>().is_some()
+        if v.get_as::<DenseString>(heap).is_some()
+            || v.get_as::<Float>(heap).is_some()
+            || v.get_as::<Symbol>(heap).is_some()
         {
             return false;
         }
@@ -28,15 +28,15 @@ impl Compare {
     }
 
     pub fn strict_equal<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {
-        let x_num = x.is_smi() || x.get_as::<Float>().is_some();
-        let y_num = y.is_smi() || y.get_as::<Float>().is_some();
+        let x_num = x.is_smi() || x.get_as::<Float>(heap).is_some();
+        let y_num = y.is_smi() || y.get_as::<Float>(heap).is_some();
         if x_num || y_num {
             // both must be numbers (Float === "1" is false, no parsing);
             // NaN is unequal to everything (even itself), -0 equals +0
             if !x_num || !y_num {
                 return false;
             }
-            let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>() {
+            let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>(heap) {
                 Some(f) => f.value.get(),
                 None => v.raw().to_i64().unwrap() as f64,
             };
@@ -51,7 +51,8 @@ impl Compare {
         if x == y {
             return true;
         }
-        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(), y.get_as::<DenseString>()) {
+        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(heap), y.get_as::<DenseString>(heap))
+        {
             return sx.as_ref().content_eq(heap, sy.as_ref());
         }
         false
@@ -76,8 +77,8 @@ impl Compare {
         let is_bool = |v: Tagged<'_, Value>| {
             v == known.true_object.as_tagged(heap) || v == known.false_object.as_tagged(heap)
         };
-        let is_string = |v: Tagged<'_, Value>| v.get_as::<DenseString>().is_some();
-        let is_number = |v: Tagged<'_, Value>| v.is_smi() || v.get_as::<Float>().is_some();
+        let is_string = |v: Tagged<'_, Value>| v.get_as::<DenseString>(heap).is_some();
+        let is_number = |v: Tagged<'_, Value>| v.is_smi() || v.get_as::<Float>(heap).is_some();
         // number ↔ string: the string parses as a number
         if is_number(x) && is_string(y) {
             return Ok(Convert::to_number(heap, x)? == Convert::to_number(heap, y)?);
@@ -122,10 +123,10 @@ impl Compare {
         if x == y {
             return true;
         }
-        let x_num = x.is_smi() || x.get_as::<Float>().is_some();
-        let y_num = y.is_smi() || y.get_as::<Float>().is_some();
+        let x_num = x.is_smi() || x.get_as::<Float>(heap).is_some();
+        let y_num = y.is_smi() || y.get_as::<Float>(heap).is_some();
         if x_num && y_num {
-            let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>() {
+            let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>(heap) {
                 Some(f) => f.value.get(),
                 None => v.raw().to_i64().unwrap() as f64,
             };
@@ -140,7 +141,8 @@ impl Compare {
             // equal values: +/-0 are distinct
             return !(a == 0.0 && a.is_sign_negative() != b.is_sign_negative());
         }
-        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(), y.get_as::<DenseString>()) {
+        if let (Some(sx), Some(sy)) = (x.get_as::<DenseString>(heap), y.get_as::<DenseString>(heap))
+        {
             return sx.as_ref().content_eq(heap, sy.as_ref());
         }
         false
@@ -153,8 +155,8 @@ impl Compare {
         x: Tagged<'a, Value>,
         y: Tagged<'a, Value>,
     ) -> Option<core::cmp::Ordering> {
-        let sx = x.get_as::<DenseString>()?.as_ref();
-        let sy = y.get_as::<DenseString>()?.as_ref();
+        let sx = x.get_as::<DenseString>(heap)?.as_ref();
+        let sy = y.get_as::<DenseString>(heap)?.as_ref();
         Some(sx.data(heap).cmp(&sy.data(heap)))
     }
 

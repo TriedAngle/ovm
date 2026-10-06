@@ -25,7 +25,7 @@ fn run_str(vm: &VM, src: &str) -> String {
     {
         let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
-            .get_as::<vm::DenseString>()
+            .get_as::<vm::DenseString>(heap)
             .expect("string result");
         s.to_rust_string(heap)
     }

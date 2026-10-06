@@ -126,7 +126,7 @@ fn parts<'a>(
     heap: &'a Heap,
     proxy: Tagged<'a, Value>,
 ) -> Option<(Tagged<'a, Value>, Tagged<'a, Value>)> {
-    let p = proxy.get_as::<ProxyObject>()?;
+    let p = proxy.get_as::<ProxyObject>(heap)?;
     Some(p.as_ref().parts(heap))
 }
 
@@ -405,7 +405,7 @@ fn define_internal_h<'s>(
             return Err(VmError::Type);
         };
         let array = scope
-            .cast::<Object>(obj.as_tagged(heap))
+            .cast::<Object>(heap, obj.as_tagged(heap))
             .expect("array checked above");
         Object::store_array_element(heap, scope, &array, i, &value)?;
         return Ok(Flow::Value(true));
@@ -414,7 +414,7 @@ fn define_internal_h<'s>(
         Lookup::ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap));
     let full = partial.complete_against(undefined, current.as_ref());
     let obj_ref = scope
-        .cast::<Object>(obj.as_tagged(heap))
+        .cast::<Object>(heap, obj.as_tagged(heap))
         .expect("non-proxy target is an object");
     let name_ref: Handle<'_, SlotName> = scope.handle(name.as_tagged(heap).as_name());
     let defined = Object::define_own_property(heap, scope, obj_ref, name_ref, full)?;
@@ -725,7 +725,7 @@ fn delete_h<'a>(
                 delete_h(vm, heap, state, scope, &target, key)
             } else {
                 let target_obj = scope
-                    .cast::<Object>(target.as_tagged(heap))
+                    .cast::<Object>(heap, target.as_tagged(heap))
                     .expect("ordinary target");
                 let deleted = Object::delete_own_property(heap, scope, target_obj, *key)?;
                 Ok(Coercion::Value(Convert::boolean(heap, deleted)))
@@ -1042,7 +1042,7 @@ fn prevent_extensions_h<'a>(
 ) -> Result<Coercion<'a>, VmError> {
     let cond_20 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if !cond_20 {
-        let Some(obj) = scope.cast::<Object>(obj.as_tagged(heap)) else {
+        let Some(obj) = scope.cast::<Object>(heap, obj.as_tagged(heap)) else {
             return Err(VmError::Type);
         };
         ordinary_prevent_extensions(heap, scope, obj);
@@ -1186,7 +1186,7 @@ impl Proxy {
     }
 
     pub fn revoke(heap: &mut Heap, proxy: Tagged<'_, Value>) {
-        let Some(p) = proxy.get_as::<ProxyObject>() else {
+        let Some(p) = proxy.get_as::<ProxyObject>(heap) else {
             return;
         };
         if p.as_ref().is_revoked(heap) {

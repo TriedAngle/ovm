@@ -106,7 +106,7 @@ impl<'a> RuntimeContext<'a> {
         new_target: Option<Handle<'_, Value>>,
     ) -> Result<Tagged<'h, Value>, VmError> {
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&state.handles)) };
-        let Some(callable) = scope.cast::<Object>(callable.as_tagged(&*heap)) else {
+        let Some(callable) = scope.cast::<Object>(heap, callable.as_tagged(&*heap)) else {
             return Err(VmError::Type);
         };
         let new_target = match new_target {

@@ -1,4 +1,3 @@
-
 use bytecode::{Opcode, Operands, decode, jump_target};
 use vm_core::proxy::Proxy;
 
@@ -517,7 +516,7 @@ fn step<'a>(
                     .constant_slot_name(heap, name_idx);
                 let name = scope.handle(name);
                 let value = scope.handle(acc.get(heap));
-                let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+                let Some(receiver) = scope.cast::<Object>(heap, receiver.as_tagged(heap)) else {
                     throw_err!(ctx, VmError::Type);
                 };
                 fold!(ctx, Object::add_parent(heap, &scope, receiver, name, value));
@@ -597,7 +596,8 @@ fn step<'a>(
                 let name: Handle<'_, SlotName> =
                     match fold!(ctx, Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
                         Key::Element(i) => {
-                            let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+                            let Some(obj) = scope.cast::<Object>(heap, receiver.as_tagged(heap))
+                            else {
                                 throw_err!(ctx, VmError::Type);
                             };
                             if obj.as_tagged(heap).as_ref().is_array(heap) {
@@ -779,7 +779,7 @@ fn step<'a>(
                             .is_some_and(|obj| obj.as_ref().is_array(heap))
                         {
                             let receiver = scope
-                                .cast::<Object>(receiver.as_tagged(heap))
+                                .cast::<Object>(heap, receiver.as_tagged(heap))
                                 .expect("array receiver is an object");
                             let value = scope.handle(acc.get(heap));
                             fold!(
@@ -830,7 +830,10 @@ fn step<'a>(
         Opcode::LoadContextSlot => {
             let depth = ops.uimm(1);
             let v = {
-                let mut context = match stack.context_slot(frame_base).get(heap).get_as::<Context>()
+                let mut context = match stack
+                    .context_slot(frame_base)
+                    .get(heap)
+                    .get_as::<Context>(heap)
                 {
                     Some(context) => context,
                     None => throw_err!(ctx, VmError::Type),
@@ -852,7 +855,11 @@ fn step<'a>(
             Flow::Next
         }
         Opcode::StoreContextSlot => {
-            let mut context = match stack.context_slot(frame_base).get(heap).get_as::<Context>() {
+            let mut context = match stack
+                .context_slot(frame_base)
+                .get(heap)
+                .get_as::<Context>(heap)
+            {
                 Some(context) => context,
                 None => throw_err!(ctx, VmError::Type),
             };
@@ -879,18 +886,18 @@ fn step<'a>(
             let count = fold!(ctx, {
                 ctx.constants_ref(heap)
                     .at(heap, scope_idx)
-                    .get_as::<ScopeInfo>()
+                    .get_as::<ScopeInfo>(heap)
                     .map(|r| r.as_ref().names.get(heap).len())
                     .ok_or(VmError::Type)
             });
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(stack.context_slot(frame_base).get(heap))
+                    .cast::<Context>(heap, stack.context_slot(frame_base).get(heap))
                     .expect("frame context slot holds a Context");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
                 let scope_info = scope
-                    .cast::<ScopeInfo>(ctx.constants_ref(heap).at(heap, scope_idx))
+                    .cast::<ScopeInfo>(heap, ctx.constants_ref(heap).at(heap, scope_idx))
                     .expect("constants slot holds a ScopeInfo");
                 let slots = heap.allocate_handle::<FixedArray>(values, &scope);
                 heap.allocate::<Context>(ContextInit {
@@ -906,7 +913,7 @@ fn step<'a>(
             let count = ops.uimm(0) as usize;
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(stack.context_slot(frame_base).get(heap))
+                    .cast::<Context>(heap, stack.context_slot(frame_base).get(heap))
                     .expect("frame context slot holds a Context");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
@@ -924,7 +931,7 @@ fn step<'a>(
             let old = stack.context_slot(frame_base).get(heap);
             stack.set_reg(frame_base, ops.reg(0), old);
             let context = acc.get(heap);
-            if context.get_as::<Context>().is_none() {
+            if context.get_as::<Context>(heap).is_none() {
                 throw_err!(ctx, VmError::Type);
             }
             stack.context_slot(frame_base).store(context);
@@ -932,7 +939,7 @@ fn step<'a>(
         }
         Opcode::PopContext => {
             let context = stack.reg(heap, frame_base, ops.reg(0));
-            if context.get_as::<Context>().is_none() {
+            if context.get_as::<Context>(heap).is_none() {
                 throw_err!(ctx, VmError::Type);
             }
             stack.context_slot(frame_base).store(context);
@@ -1554,13 +1561,13 @@ fn step<'a>(
         Opcode::CreateClosure => {
             let info_idx = ops.idx(0);
             state.handle_scope(|scope| -> Flow {
-                let Some(info) =
-                    scope.cast::<CallableInfoObject>(ctx.constants_ref(heap).at(heap, info_idx))
+                let Some(info) = scope
+                    .cast::<CallableInfoObject>(heap, ctx.constants_ref(heap).at(heap, info_idx))
                 else {
                     throw_err!(ctx, VmError::Type);
                 };
                 let context = scope
-                    .cast::<Context>(stack.context_slot(frame_base).get(heap))
+                    .cast::<Context>(heap, stack.context_slot(frame_base).get(heap))
                     .expect("frame context slot holds a Context");
                 let obj = fold!(ctx, Object::create_closure(heap, &scope, info, context));
                 acc.store(obj.erase());
@@ -1580,8 +1587,10 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, lhs),
+                Convert::as_number(heap, acc.get(heap)),
+            ) {
                 acc.store(heap.new_number(a + b));
                 return Flow::Next;
             }
@@ -1610,7 +1619,9 @@ fn step<'a>(
                     return Flow::Next;
                 }
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(rhs)) {
+            if let (Some(a), Some(b)) =
+                (Convert::as_number(heap, lhs), Convert::as_number(heap, rhs))
+            {
                 let r = if op == Opcode::AddLoc { a + b } else { a - b };
                 let v = heap.new_number(r);
                 stack.set_reg(frame_base, dst, v);
@@ -1647,8 +1658,10 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, lhs),
+                Convert::as_number(heap, acc.get(heap)),
+            ) {
                 acc.store(heap.new_number(a - b));
                 return Flow::Next;
             }
@@ -1710,8 +1723,10 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, lhs),
+                Convert::as_number(heap, acc.get(heap)),
+            ) {
                 acc.store(heap.new_number(a * b));
                 return Flow::Next;
             }
@@ -1739,8 +1754,10 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc.get(heap)))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, lhs),
+                Convert::as_number(heap, acc.get(heap)),
+            ) {
                 acc.store(heap.new_number(a / b));
                 return Flow::Next;
             }
@@ -1926,7 +1943,7 @@ fn step<'a>(
         }
         Opcode::Negate => {
             let acc_word = acc.get(heap);
-            if let Some(n) = Convert::as_number(acc.get(heap)) {
+            if let Some(n) = Convert::as_number(heap, acc.get(heap)) {
                 // `new_number` keeps -0.0 boxed and folds everything else
                 acc.store(heap.new_number(-n));
             } else if let Some(v) = acc_word.to_i64() {
@@ -1974,9 +1991,10 @@ fn step<'a>(
         }
         Opcode::Equal => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, acc.get(heap)),
+                Convert::as_number(heap, other),
+            ) {
                 acc.store(Convert::boolean(heap, a == b));
                 return Flow::Next;
             }
@@ -1994,9 +2012,10 @@ fn step<'a>(
         }
         Opcode::LessThan => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, acc.get(heap)),
+                Convert::as_number(heap, other),
+            ) {
                 acc.store(Convert::boolean(heap, a < b));
                 return Flow::Next;
             }
@@ -2014,9 +2033,10 @@ fn step<'a>(
         }
         Opcode::LessThanOrEqual => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, acc.get(heap)),
+                Convert::as_number(heap, other),
+            ) {
                 acc.store(Convert::boolean(heap, a <= b));
                 return Flow::Next;
             }
@@ -2034,9 +2054,10 @@ fn step<'a>(
         }
         Opcode::GreaterThan => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, acc.get(heap)),
+                Convert::as_number(heap, other),
+            ) {
                 acc.store(Convert::boolean(heap, a > b));
                 return Flow::Next;
             }
@@ -2054,9 +2075,10 @@ fn step<'a>(
         }
         Opcode::GreaterThanOrEqual => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
+            if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, acc.get(heap)),
+                Convert::as_number(heap, other),
+            ) {
                 acc.store(Convert::boolean(heap, a >= b));
                 return Flow::Next;
             }
@@ -2079,9 +2101,10 @@ fn step<'a>(
             let cmp = (ops.uimm(1) / 2) as u8;
             let falsy_jump = ops.uimm(1) % 2 == 1;
             let offset = ops.imm(2);
-            let b = if let (Some(a), Some(b)) =
-                (Convert::as_number(acc.get(heap)), Convert::as_number(other))
-            {
+            let b = if let (Some(a), Some(b)) = (
+                Convert::as_number(heap, acc.get(heap)),
+                Convert::as_number(heap, other),
+            ) {
                 match cmp {
                     0 | 1 => a == b,
                     2 => a < b,

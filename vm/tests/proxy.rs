@@ -80,7 +80,7 @@ fn assert_type_error(src: &str) {
             match obj.lookup(heap, name_handle.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => slot
                     .get(heap)
-                    .get_as::<vm::DenseString>()
+                    .get_as::<vm::DenseString>(heap)
                     .map(|s| s.to_rust_string(heap))
                     .unwrap_or_default(),
                 _ => String::new(),
@@ -123,7 +123,7 @@ fn constructor_has_no_prototype_and_metadata() {
     {
         let heap = &*thread.heap();
         let s = unsafe { name.assume_valid(heap) }
-            .get_as::<vm::DenseString>()
+            .get_as::<vm::DenseString>(heap)
             .expect("Proxy.name is a string");
         assert!(s.data(heap).matches_ascii(b"Proxy"));
     };

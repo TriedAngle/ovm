@@ -2,9 +2,9 @@ use std::sync::Arc;
 
 use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
-    HeapBackend, HeapObject, HeapPtr, HeapStats, LocalHeap, Map, MapKind, MaybeWeak, Object,
-    ObjectInit, ObjectSlotsInit, PrototypeRegistry, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged,
-    Tlab, Value, Visitor, WeakFixedArray, Word,
+    HeapBackend, HeapObject, HeapStats, LocalHeap, Map, MapKind, MaybeWeak, Object, ObjectInit,
+    ObjectSlotsInit, PrototypeRegistry, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, Tlab, Value,
+    Visitor, WeakFixedArray, Word,
 };
 
 use crate::bootstrap::{KnownCell, WellKnown};
@@ -48,7 +48,7 @@ impl<'heap> AllocToken<'heap> {
         unsafe { ptr.as_mut() }.init(self.heap(), &config);
         // Safety: fresh strong pointer; the token's heap borrow is the
         // anchor and no GC can run while it is outstanding.
-        unsafe { Tagged::from_value_unchecked(HeapPtr::<T>::new(ptr.as_ptr()).encode_strong()) }
+        unsafe { Tagged::from_raw_ptr(ptr) }
     }
 
     pub fn remaining(&self) -> usize {
@@ -196,10 +196,14 @@ unsafe impl<T> Sync for MaybeWeakGcSlot<T> {}
 impl<T: HeapObject> MaybeWeakGcSlot<T> {
     /// A standalone cell holding a strong reference: the GC treats it as
     /// reachable until the entry is weakened.
-    pub fn new_strong(ptr: HeapPtr<T>) -> Self {
+    pub fn new_strong(value: Tagged<'_, T>) -> Self {
+        debug_assert!(
+            !value.raw().is_weak_ptr(),
+            "weak value stored into a strong cell"
+        );
         Self {
             // Safety: constructing the storage word of a fresh cell.
-            cell: unsafe { RawCell::from_word(ptr.encode_strong().to_bits()) },
+            cell: unsafe { RawCell::from_word(value.raw().to_bits()) },
             _phantom: PhantomData,
         }
     }
@@ -727,7 +731,7 @@ impl Heap {
         // (the &mut borrow is still outstanding).
         unsafe { ptr.as_mut() }.init(self, &config);
         // Safety: fresh strong pointer, anchored at this borrow.
-        unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
+        unsafe { Tagged::from_raw_ptr(ptr) }
     }
 
     #[inline]
@@ -768,7 +772,7 @@ impl Heap {
             obj.element_slot(i).as_raw().store_raw(fill.to_bits());
         }
         // Safety: fresh strong pointer, anchored at this borrow.
-        unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
+        unsafe { Tagged::from_raw_ptr(ptr) }
     }
 
     /// [`Heap::allocate_hole_array`] for a weak array: every entry is a
@@ -801,7 +805,7 @@ impl Heap {
             obj.element_slot(i).as_raw().store_raw(fill);
         }
         // Safety: fresh strong pointer, anchored at this borrow.
-        unsafe { Tagged::from_value_unchecked(HeapPtr::new(ptr.as_ptr()).encode_strong()) }
+        unsafe { Tagged::from_raw_ptr(ptr) }
     }
 
     // TODO: potentially remove this in favor of a better allocate function
@@ -886,12 +890,7 @@ impl Heap {
         // Safety: raw memory just reserved; no GC can run here.
         unsafe { ptr.as_mut() }.init(self, &f);
         // Safety: fresh strong pointer, anchored at this borrow.
-        Some(unsafe {
-            Tagged::<Float>::from_value_unchecked(
-                HeapPtr::<Float>::new(ptr.as_ptr()).encode_strong(),
-            )
-            .erase()
-        })
+        Some(unsafe { Tagged::<Float>::from_raw_ptr(ptr).erase() })
     }
 
     /// A number value: a Smi when the double is an in-range integer, a

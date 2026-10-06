@@ -221,8 +221,8 @@ pub fn wrapper_value<'a>(
     {
         let known = heap.known();
         let is_primitive = receiver.as_heap_object().is_none()
-            || receiver.get_as::<Float>().is_some()
-            || receiver.get_as::<DenseString>().is_some()
+            || receiver.get_as::<Float>(heap).is_some()
+            || receiver.get_as::<DenseString>(heap).is_some()
             || receiver == known.true_object.as_tagged(heap)
             || receiver == known.false_object.as_tagged(heap);
         if is_primitive {

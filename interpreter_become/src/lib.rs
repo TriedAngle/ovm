@@ -612,7 +612,7 @@ extern "rust-preserve-none" fn op_add<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(sum)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
+    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
         let sum = a + b;
         if let Some(s) = Smi::from_f64(sum) {
             next!(Add, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -652,7 +652,7 @@ extern "rust-preserve-none" fn op_sub<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(diff)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
+    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
         let diff = a - b;
         if let Some(s) = Smi::from_f64(diff) {
             next!(Sub, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -692,7 +692,7 @@ extern "rust-preserve-none" fn op_mul<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(product)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
+    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
         let product = a * b;
         if let Some(s) = Smi::from_f64(product) {
             next!(Mul, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -786,7 +786,7 @@ extern "rust-preserve-none" fn op_inc_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(IncLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let Some(n) = Convert::as_number(v) {
+    if let Some(n) = Convert::as_number(ctx.heap(), v) {
         let new = n + 1.0;
         if let Some(s) = Smi::from_f64(new) {
             regs.write(r, s.into_tagged());
@@ -819,7 +819,7 @@ extern "rust-preserve-none" fn op_dec_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(DecLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let Some(n) = Convert::as_number(v) {
+    if let Some(n) = Convert::as_number(ctx.heap(), v) {
         let new = n - 1.0;
         if let Some(s) = Smi::from_f64(new) {
             regs.write(r, s.into_tagged());
@@ -1371,7 +1371,7 @@ extern "rust-preserve-none" fn op_div<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(encoded)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(acc)) {
+    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
         let quotient = a / b;
         if let Some(s) = Smi::from_f64(quotient) {
             next!(Div, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -1554,7 +1554,7 @@ extern "rust-preserve-none" fn op_negate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(neg)
         )
     }
-    if let Some(a) = Convert::as_number(acc) {
+    if let Some(a) = Convert::as_number(ctx.heap(), acc) {
         let neg = -a;
         if let Some(s) = Smi::from_f64(neg) {
             next!(Negate, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -1669,7 +1669,7 @@ extern "rust-preserve-none" fn op_add_loc<'a, const STRIDE: usize>(
         regs.write(dst, v);
         next!(AddLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(rhs)) {
+    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), rhs)) {
         let sum = a + b;
         if let Some(s) = Smi::from_f64(sum) {
             let v = s.into_tagged();
@@ -1707,7 +1707,7 @@ extern "rust-preserve-none" fn op_sub_loc<'a, const STRIDE: usize>(
         regs.write(dst, v);
         next!(SubLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(lhs), Convert::as_number(rhs)) {
+    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), rhs)) {
         let diff = a - b;
         if let Some(s) = Smi::from_f64(diff) {
             let v = s.into_tagged();
@@ -2071,7 +2071,7 @@ extern "rust-preserve-none" fn op_load_context_slot<'a, const STRIDE: usize>(
     }
     let v = {
         let heap = ctx.heap();
-        let Some(mut context) = ctx.stack().context_slot(base).get(heap).get_as::<Context>() else {
+        let Some(mut context) = ctx.stack().context_slot(base).get(heap).get_as::<Context>(heap) else {
             bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
         };
         for _ in 0..depth {
@@ -2105,7 +2105,7 @@ extern "rust-preserve-none" fn op_store_context_slot<'a, const STRIDE: usize>(
     let depth = ops.unsigned::<1>();
     let base = ctx.frame_base();
     let heap = ctx.heap();
-    let Some(mut context) = ctx.stack().context_slot(base).get(heap).get_as::<Context>() else {
+    let Some(mut context) = ctx.stack().context_slot(base).get(heap).get_as::<Context>(heap) else {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     };
     for _ in 0..depth {
@@ -2139,7 +2139,7 @@ extern "rust-preserve-none" fn op_push_context<'a, const STRIDE: usize>(
     let base = ctx.frame_base();
     let old = ctx.stack().context_slot(base).get(ctx.heap());
     regs.write(r, old);
-    if acc.get_as::<Context>().is_none() {
+    if acc.get_as::<Context>(ctx.heap()).is_none() {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     }
     ctx.stack().context_slot(base).store(acc);
@@ -2160,7 +2160,7 @@ extern "rust-preserve-none" fn op_pop_context<'a, const STRIDE: usize>(
     let r = ops.signed::<0>();
     let base = ctx.frame_base();
     let context = regs.read(r, ctx);
-    if context.get_as::<Context>().is_none() {
+    if context.get_as::<Context>(ctx.heap()).is_none() {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     }
     ctx.stack().context_slot(base).store(context);
@@ -3303,7 +3303,7 @@ fn construct_receiver_fast<'a>(
     let state = ctx.state();
     state.handle_scope(|scope| {
         let callee = scope
-            .cast::<Object>(callee)
+            .cast::<Object>(heap, callee)
             .expect("constructible callee is an object");
         // identity-keyed initial-map cache hit: allocate directly
         if let Some(map) = state.construct_initial_map(heap, callee.as_tagged(heap)) {
@@ -3327,8 +3327,11 @@ fn construct_receiver_fast<'a>(
         else {
             return Ok(None);
         };
+        // Root the word: the returned `Tagged` keeps the `&mut Heap` borrow
+        // alive, which would conflict with the cast's shared map read.
+        let obj = scope.handle(obj);
         let obj: vm_core::Handle<Object> =
-            scope.cast::<Object>(obj).expect("receiver is an object");
+            scope.cast::<Object>(heap, obj.as_tagged(heap)).expect("receiver is an object");
         construct_cache_record(heap, state, &scope, callee, obj);
         Ok(Some(obj.as_tagged(heap).erase()))
     })

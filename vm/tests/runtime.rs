@@ -3,7 +3,7 @@ use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::RuntimeContext;
 use vm::raise_runtime;
 use vm::rt_try;
-use vm::{Float, HandleSlice, Smi, Tagged, Value};
+use vm::{Args, Float, Handle, Smi, Tagged, Value};
 use vm::{Thread, VM, VmError};
 
 fn float(thread: &mut Thread, v: f64) -> Value {
@@ -22,13 +22,10 @@ fn smi_add<'a>(
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let (a, b) = match (
-        args.get(heap, 1).map(|h| h.as_tagged(heap)),
-        args.get(heap, 2).map(|h| h.as_tagged(heap)),
-    ) {
-        (Some(a), Some(b)) => (a.raw(), b.raw()),
-        _ => return raise_runtime(vm, heap, state, VmError::Arity),
-    };
+    if args.len() < 3 {
+        return raise_runtime(vm, heap, state, VmError::Arity);
+    }
+    let (a, b) = (args.get(heap, 1).raw(), args.get(heap, 2).raw());
     let (Some(a), Some(b)) = (Smi::decode(a), Smi::decode(b)) else {
         return raise_runtime(vm, heap, state, VmError::Type);
     };
@@ -68,19 +65,26 @@ fn runtime_result_is_boxed_when_not_smi() {
             vm, heap, state, ..
         } = nctx;
         let sum = {
-            let (a, b) = match (
-                args.get(heap, 1).map(|h| h.as_tagged(heap)),
-                args.get(heap, 2).map(|h| h.as_tagged(heap)),
-            ) {
-                (Some(a), Some(b)) => (a, b),
-                _ => return raise_runtime(vm, heap, state, VmError::Arity),
-            };
-            let fa = rt_try!(vm, heap, state, a.get_as::<Float>().ok_or(VmError::Type))
-                .value
-                .get();
-            let fb = rt_try!(vm, heap, state, b.get_as::<Float>().ok_or(VmError::Type))
-                .value
-                .get();
+            if args.len() < 3 {
+                return raise_runtime(vm, heap, state, VmError::Arity);
+            }
+            let (a, b) = (args.get(heap, 1), args.get(heap, 2));
+            let fa = rt_try!(
+                vm,
+                heap,
+                state,
+                a.get_as::<Float>(heap).ok_or(VmError::Type)
+            )
+            .value
+            .get();
+            let fb = rt_try!(
+                vm,
+                heap,
+                state,
+                b.get_as::<Float>(heap).ok_or(VmError::Type)
+            )
+            .value
+            .get();
             fa + fb
         };
         heap.new_number(sum)
@@ -95,7 +99,7 @@ fn runtime_result_is_boxed_when_not_smi() {
     let out = {
         let heap = &*thread.heap();
         unsafe { r.assume_valid(heap) }
-            .get_as::<Float>()
+            .get_as::<Float>(heap)
             .unwrap()
             .value
             .get()

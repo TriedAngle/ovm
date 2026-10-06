@@ -311,8 +311,9 @@ fn super_store_readonly_and_nullish_receiver_throw() {
         let name = thread.intern(&scope, "x");
         let name = scope.handle(name.as_tagged(&*thread.heap()));
         // Safety: parent word freshly returned, consumed here.
+        let heap = &*thread.heap();
         let parent_obj = scope
-            .cast::<Object>(unsafe { parent.assume_valid(&*thread.heap()) })
+            .cast::<Object>(heap, unsafe { parent.assume_valid(heap) })
             .expect("object_with returns an object");
         let value = scope.handle(Smi::new(1));
         Object::add_own_property(

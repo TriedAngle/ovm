@@ -61,7 +61,7 @@ fn console_print<'a>(
             let word = t.raw();
             // Safety: fresh string word, no allocation since the read.
             unsafe { word.assume_valid(heap) }
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .map(|s| s.to_rust_string(heap))
                 .unwrap_or_default()
         }

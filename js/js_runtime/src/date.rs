@@ -316,7 +316,7 @@ pub fn date_parse<'a>(
             let word = s.raw();
             // Safety: fresh string word, no allocation since the read.
             unsafe { word.assume_valid(heap) }
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .map(|d| d.to_rust_string(heap))
                 .unwrap_or_default()
         }
@@ -439,7 +439,8 @@ fn format_with<'a>(
             return unsafe { Tagged::<Value>::from_value_unchecked(word) };
         }
         // Safety: fresh slot word, no allocation since the read.
-        let Some(ms) = Convert::as_number(unsafe { Tagged::<Value>::from_value_unchecked(word) })
+        let Some(ms) =
+            Convert::as_number(heap, unsafe { Tagged::<Value>::from_value_unchecked(word) })
         else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };

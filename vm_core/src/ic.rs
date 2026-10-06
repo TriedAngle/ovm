@@ -145,7 +145,7 @@ fn probe<'a>(
         }
         return Some(unsafe { vector.as_ref_unchecked().slot(slot + 1) }.get(heap));
     }
-    let pairs = state.as_strong()?.get_as::<WeakFixedArray>()?;
+    let pairs = state.as_strong()?.get_as::<WeakFixedArray>(heap)?;
     let len = unsafe { pairs.as_ref_unchecked() }.len();
     let mut i = 0;
     while i + 1 < len {
@@ -239,7 +239,7 @@ fn walk<'s>(
             let pair = d
                 .value
                 .get(heap)
-                .get_as::<AccessorPair>()
+                .get_as::<AccessorPair>(heap)
                 .expect("accessor descriptor holds an AccessorPair");
             return Some(Found::Accessor {
                 pair: scope.handle(pair),
@@ -254,7 +254,7 @@ fn walk<'s>(
     if proto == heap.known().null.as_tagged(heap) {
         return None;
     }
-    if let Some(pairs) = proto.get_as::<FixedArray>() {
+    if let Some(pairs) = proto.get_as::<FixedArray>(heap) {
         let mut i = 0;
         while i < pairs.len() {
             if pairs.at(heap, i).ptr_eq(name) {
@@ -362,7 +362,7 @@ fn chain_step<'a>(
         proto.as_heap_object()?
     } else {
         proto
-            .get_as::<FixedArray>()?
+            .get_as::<FixedArray>(heap)?
             .at(heap, hop as usize)
             .as_heap_object()?
     };
@@ -614,7 +614,7 @@ fn check_prototype_validity_cell(heap: &Heap, handler: Tagged<'_, DataHandler>) 
     match handler.as_ref().validity_cell(heap).as_strong() {
         None => true,
         Some(cell) => cell
-            .get_as::<Cell>()
+            .get_as::<Cell>(heap)
             .is_some_and(|cell| cell.as_ref().is_valid(heap)),
     }
 }
@@ -641,7 +641,7 @@ fn apply_data_handler<'a>(heap: &'a Heap, handler: Tagged<'a, DataHandler>) -> O
                 .as_ref()
                 .data(heap, 0)
                 .as_strong()?
-                .get_as::<Object>()?;
+                .get_as::<Object>(heap)?;
             Some(Hit::Value(
                 holder.as_ref().slot(heap, payload as usize).get(heap),
             ))
@@ -651,7 +651,7 @@ fn apply_data_handler<'a>(heap: &'a Heap, handler: Tagged<'a, DataHandler>) -> O
                 .as_ref()
                 .data(heap, 0)
                 .as_strong()?
-                .get_as::<AccessorPair>()?;
+                .get_as::<AccessorPair>(heap)?;
             Some(getter_hit(heap, pair))
         }
         KIND_NON_EXISTENT => Some(Hit::NotFound),
@@ -677,7 +677,7 @@ fn apply_fast<'a>(
         // own accessor as a whole weak pair, cleared weak maps, ...
         return None;
     }
-    apply_data_handler(heap, handler.as_strong()?.get_as::<DataHandler>()?)
+    apply_data_handler(heap, handler.as_strong()?.get_as::<DataHandler>(heap)?)
 }
 
 /// The subset of load handlers the interpreter can complete inline: an own
@@ -707,14 +707,14 @@ fn apply_load_handler<'a>(
         return None;
     }
     if handler.raw().is_weak_ptr() {
-        let pair = handler.as_strong()?.get_as::<AccessorPair>()?;
+        let pair = handler.as_strong()?.get_as::<AccessorPair>(heap)?;
         return Some(getter_hit(heap, pair));
     }
     let strong = handler.as_strong()?;
-    if let Some(handler) = strong.get_as::<DataHandler>() {
+    if let Some(handler) = strong.get_as::<DataHandler>(heap) {
         return apply_data_handler(heap, handler);
     }
-    apply_rest(heap, receiver, strong.get_as::<WeakFixedArray>()?)
+    apply_rest(heap, receiver, strong.get_as::<WeakFixedArray>(heap)?)
 }
 
 #[inline(never)]
@@ -738,7 +738,7 @@ fn apply_rest<'a>(
                 .map_ref(heap)
                 .prototype
                 .get(heap)
-                .get_as::<FixedArray>()?;
+                .get_as::<FixedArray>(heap)?;
             Some(Hit::Value(pairs.at(heap, payload as usize)))
         }
         CHAIN_NON_EXISTENT => Some(Hit::NotFound),
@@ -798,7 +798,7 @@ fn apply_indexed_string<'a>(
     index: usize,
     payload: i64,
 ) -> Option<ElementHit<'a>> {
-    let s = receiver.get_as::<DenseString>()?;
+    let s = receiver.get_as::<DenseString>(heap)?;
     if index >= s.as_ref().len() {
         if payload & ELEMENT_ALLOW_OOB != 0 && heap.indexed_props_valid() {
             return Some(ElementHit::Value(undefined(heap)));
@@ -932,7 +932,10 @@ impl InlineCache {
             return MonoProbe::Miss;
         }
 
-        let Some(pairs) = state.as_strong().and_then(|s| s.get_as::<WeakFixedArray>()) else {
+        let Some(pairs) = state
+            .as_strong()
+            .and_then(|s| s.get_as::<WeakFixedArray>(heap))
+        else {
             return MonoProbe::Miss;
         };
         let len = unsafe { pairs.as_ref_unchecked() }.len();
@@ -1127,7 +1130,7 @@ impl InlineCache {
             return;
         };
         let map = scope.handle(obj.map_ref(heap));
-        let handler = if let Some(s) = recv.get_as::<DenseString>() {
+        let handler = if let Some(s) = recv.get_as::<DenseString>(heap) {
             let s = s.as_ref();
             if index < s.len() && s.code_unit(heap, index) > 0xFF {
                 return;
@@ -1229,7 +1232,7 @@ impl InlineCache {
             let Some(strong) = handler.as_strong() else {
                 return false;
             };
-            let Some(target) = strong.get_as::<Map>() else {
+            let Some(target) = strong.get_as::<Map>(heap) else {
                 return false;
             };
             if !target.as_ref().is_prototype_validity_cell_valid(heap) {
@@ -1280,18 +1283,18 @@ impl InlineCache {
                 }
             } else if handler.raw().is_weak_ptr() {
                 let strong = handler.as_strong()?;
-                if let Some(target) = strong.get_as::<Map>() {
+                if let Some(target) = strong.get_as::<Map>(heap) {
                     if !target.as_ref().is_prototype_validity_cell_valid(heap) {
                         return None;
                     }
                     StoreAction::Transition(scope.handle(target))
-                } else if let Some(pair) = strong.get_as::<AccessorPair>() {
+                } else if let Some(pair) = strong.get_as::<AccessorPair>(heap) {
                     // own setter as a whole weak pair
                     setter_action(heap, scope, pair)
                 } else {
                     return None;
                 }
-            } else if let Some(data_handler) = handler.as_strong()?.get_as::<DataHandler>() {
+            } else if let Some(data_handler) = handler.as_strong()?.get_as::<DataHandler>(heap) {
                 if !check_prototype_validity_cell(heap, data_handler) {
                     return None;
                 }
@@ -1302,14 +1305,14 @@ impl InlineCache {
                             .as_ref()
                             .data(heap, 0)
                             .as_strong()?
-                            .get_as::<AccessorPair>()?;
+                            .get_as::<AccessorPair>(heap)?;
                         setter_action(heap, scope, pair)
                     }
                     _ => return None,
                 }
             } else {
                 // Kette/mixed chain array.
-                let chain = handler.as_strong()?.get_as::<WeakFixedArray>()?;
+                let chain = handler.as_strong()?.get_as::<WeakFixedArray>(heap)?;
                 let chain_ref = chain.as_ref();
                 if decode_smi(chain_ref.get(heap, 0))?.0 != CHAIN_SETTER {
                     return None;
@@ -1318,7 +1321,7 @@ impl InlineCache {
                 let pair = chain_ref
                     .get(heap, 1)
                     .as_strong()?
-                    .get_as::<AccessorPair>()?;
+                    .get_as::<AccessorPair>(heap)?;
                 setter_action(heap, scope, pair)
             }
         };
@@ -1473,7 +1476,7 @@ fn update_site(
         if strong.ptr_eq(heap.known().megamorphic_symbol.as_tagged(heap).erase()) {
             return;
         }
-        if let Some(pairs) = strong.get_as::<WeakFixedArray>() {
+        if let Some(pairs) = strong.get_as::<WeakFixedArray>(heap) {
             let pairs = scope.handle(pairs);
             update_poly(heap, scope, vector, slot, pairs, map, handler);
             return;

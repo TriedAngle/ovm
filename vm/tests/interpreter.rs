@@ -2,9 +2,9 @@ use bytecode::{Opcode, PropertyFlags, emit};
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::raise_runtime;
 use vm::{
-    AccessorPair, CallableInfoInit, CallableInfoObject, Context, ContextInit, DenseString,
+    AccessorPair, Args, CallableInfoInit, CallableInfoObject, Context, ContextInit, DenseString,
     FixedArray, FixedByteArray, Float, FunctionKind, Handle, HandleScope, HandleSlice, Heap,
-    HeapPtr, Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo,
+    Lookup, Map, MapInit, MapKind, Object, ObjectSlotsInit, PropertyDescriptor, ScopeInfo,
     ScopeInfoInit, SlotFlags, SlotName, Smi, StoreOutcome, StoreSemantics, Tagged, Value,
 };
 use vm::{RuntimeContext, RuntimeIndex, Thread, VM, VmError};
@@ -276,13 +276,10 @@ fn call_runtime_passes_receiver_and_args() {
         let RuntimeContext {
             vm, heap, state, ..
         } = nctx;
-        let (a, b) = match (
-            args.get(heap, 1).map(|h| h.as_tagged(heap)),
-            args.get(heap, 2).map(|h| h.as_tagged(heap)),
-        ) {
-            (Some(a), Some(b)) => (a.raw(), b.raw()),
-            _ => return raise_runtime(vm, heap, state, VmError::Arity),
-        };
+        if args.len() < 3 {
+            return raise_runtime(vm, heap, state, VmError::Arity);
+        }
+        let (a, b) = (args.get(heap, 1).raw(), args.get(heap, 2).raw());
         let (Some(a), Some(b)) = (Smi::decode(a), Smi::decode(b)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
@@ -467,7 +464,7 @@ fn array_literal_built_with_manual_stores() {
     {
         let heap = &*thread.heap();
         let a = unsafe { anchored(heap, array) }
-            .get_as::<Object>()
+            .get_as::<Object>(heap)
             .expect("array literal result");
         let a = a.as_ref();
         assert!(a.is_array(heap));
@@ -493,7 +490,7 @@ fn create_empty_array_literal_starts_empty() {
     {
         let heap = &*thread.heap();
         let a = unsafe { anchored(heap, array) }
-            .get_as::<Object>()
+            .get_as::<Object>(heap)
             .expect("array literal result");
         let a = a.as_ref();
         assert!(a.is_array(heap));
@@ -530,7 +527,7 @@ fn array_literal_with_holes_keeps_length() {
     {
         let heap = &*thread.heap();
         let a = unsafe { anchored(heap, array) }
-            .get_as::<Object>()
+            .get_as::<Object>(heap)
             .expect("array literal result");
         let a = a.as_ref();
         assert_eq!(a.length(), 3);
@@ -592,13 +589,12 @@ fn object_literal_built_with_manual_stores() {
     let ((x1, y1, map1), (x2, y2, map2), initial) = {
         let heap = &*thread.heap();
         let read = |heap: &Heap, obj: Value| {
-            let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
             // Safety: `obj` is a strong, live reference to the object
             // literal, and no collection can happen inside the non-allocating region.
-            let o = unsafe { ptr.cast::<Object>().as_ref() };
-            let slots = o.slots.get(heap).as_ptr().unwrap();
-            // Safety: anchored slot read under `heap`.
-            let slots = unsafe { slots.as_ref() };
+            let o = unsafe { obj.assume_valid(heap) }
+                .get_as::<Object>(heap)
+                .expect("object literal result");
+            let slots = o.slots.get(heap).as_ref();
             (
                 Smi::decode(slots.at(heap, 0).raw()).unwrap().value(),
                 Smi::decode(slots.at(heap, 1).raw()).unwrap().value(),
@@ -683,8 +679,11 @@ fn define_named_own_property_attributes_and_value() {
         {
             let heap = &*thread.heap();
             let read = |heap: &Heap, obj: Value| {
-                let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
-                let o = Tagged::from_ptr(heap, unsafe { ptr.cast::<Object>() });
+                // Safety: `obj` is a strong, live reference and no
+                // collection can happen in the non-allocating region.
+                let o = unsafe { obj.assume_valid(heap) }
+                    .get_as::<Object>(heap)
+                    .expect("object literal result");
                 match o.lookup(heap, name(heap, m)) {
                     Lookup::Data { slot, flags, .. } => {
                         assert_eq!(slot.get(heap).raw(), smi(8), "re-define updates the value");
@@ -787,10 +786,11 @@ fn define_keyed_own_property_string_and_smi_keys() {
     let obj = run_program_consts(&mut thread, program, 6, &[], &[x]).unwrap();
     {
         let heap = &*thread.heap();
-        let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
         // happen inside the non-allocating region.
-        let o = Tagged::from_ptr(heap, unsafe { ptr.cast::<Object>() });
+        let o = unsafe { obj.assume_valid(heap) }
+            .get_as::<Object>(heap)
+            .expect("object literal result");
         let expected_flags = SlotFlags::VALUE
             .union(SlotFlags::WRITABLE)
             .union(SlotFlags::CONFIGURABLE);
@@ -893,10 +893,11 @@ fn define_own_property_accessor_invokes_getter() {
     let obj = run_program_consts(&mut thread, accessor_program(false), 6, &[], &constants).unwrap();
     {
         let heap = &*thread.heap();
-        let ptr = HeapPtr::decode_strong(obj).expect("object literal result");
         // Safety: `obj` is a strong, live reference and no collection can
         // happen inside the non-allocating region.
-        let o = Tagged::from_ptr(heap, unsafe { ptr.cast::<Object>() });
+        let o = unsafe { obj.assume_valid(heap) }
+            .get_as::<Object>(heap)
+            .expect("object literal result");
         match o.lookup(heap, name(heap, p)) {
             Lookup::Accessor { pair, .. } => {
                 assert_eq!(pair.get.get(heap).raw(), getter);
@@ -2074,7 +2075,7 @@ fn bytecode_fn<'a>(
 fn forty_two<'a>(
     _: RuntimeContext<'a>,
     _: Option<Handle<'_, Value>>,
-    _: HandleSlice<'_>,
+    _: Args,
 ) -> Tagged<'a, Value> {
     Tagged::from(Smi::new(42))
 }
@@ -2322,7 +2323,7 @@ fn arithmetic_overflow_promotes_to_float() {
     let value = {
         let heap = &*thread.heap();
         unsafe { anchored(heap, result) }
-            .get_as::<Float>()
+            .get_as::<Float>(heap)
             .expect("overflow must promote to float")
             .value
             .get()
@@ -2382,7 +2383,7 @@ fn float_value(thread: &mut Thread, v: Value) -> f64 {
     {
         let heap = &*thread.heap();
         unsafe { anchored(heap, v) }
-            .get_as::<Float>()
+            .get_as::<Float>(heap)
             .expect("expected float result")
             .value
             .get()
@@ -3734,8 +3735,9 @@ fn set_property_fn(
     constants: &[Value],
 ) {
     let f = make_callable(thread, scope, program, constants);
+    let heap = &*thread.heap();
     let obj = scope
-        .cast::<Object>(unsafe { obj.assume_valid(&*thread.heap()) })
+        .cast::<Object>(heap, unsafe { obj.assume_valid(heap) })
         .expect("object");
     let name_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), name_word));
     let value = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(f) });
@@ -3852,7 +3854,7 @@ fn to_primitive_falls_back_to_to_string_when_value_of_yields_object() {
         {
             let heap = &*thread.heap();
             let s = unsafe { anchored(heap, r) }
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .expect("concat result must be a string");
             assert_eq!(s.to_rust_string(heap), "x1");
         };
@@ -3879,7 +3881,7 @@ fn add_concatenates_strings() {
             {
                 let heap = &*thread.heap();
                 let s = unsafe { anchored(heap, r) }
-                    .get_as::<DenseString>()
+                    .get_as::<DenseString>(heap)
                     .expect("concat result must be a string");
                 assert_eq!(s.to_rust_string(heap), expected, "{lhs:?} + {rhs:?}");
             };
@@ -4159,7 +4161,7 @@ fn negate_arithmetic_rules() {
     let r = {
         let heap = &*thread.heap();
         unsafe { anchored(heap, r) }
-            .get_as::<Float>()
+            .get_as::<Float>(heap)
             .expect("-0 must stay a float")
             .value
             .get()
@@ -4207,8 +4209,9 @@ fn instance_of_walks_prototype_chain() {
         // F with a .prototype object
         let f = make_callable(thread, &scope, &program_return_1(), &[]);
         let f_proto_h = empty_object(thread, &scope);
+        let heap = &*thread.heap();
         let f_obj = scope
-            .cast::<Object>(unsafe { f.assume_valid(&*thread.heap()) })
+            .cast::<Object>(heap, unsafe { f.assume_valid(heap) })
             .expect("callable object");
         let prototype_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), prototype));
         Object::define_own_property(
@@ -4255,8 +4258,9 @@ fn instance_of_walks_prototype_chain() {
 
         // a non-object .prototype is a TypeError
         let f2 = make_callable(thread, &scope, &program_return_1(), &[]);
+        let heap = &*thread.heap();
         let f2_obj = scope
-            .cast::<Object>(unsafe { f2.assume_valid(&*thread.heap()) })
+            .cast::<Object>(heap, unsafe { f2.assume_valid(heap) })
             .expect("callable object");
         let prototype_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), prototype));
         let value = scope.handle(Smi::new(42));
@@ -4301,8 +4305,9 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
             &[],
         );
         let g_proto_h = empty_object(thread, &scope);
+        let heap = &*thread.heap();
         let g_obj = scope
-            .cast::<Object>(unsafe { g.assume_valid(&*thread.heap()) })
+            .cast::<Object>(heap, unsafe { g.assume_valid(heap) })
             .expect("callable object");
         let prototype_h: Handle<'_, SlotName> = scope.handle(name(&*thread.heap(), prototype));
         Object::define_own_property(

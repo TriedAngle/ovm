@@ -176,7 +176,7 @@ pub fn array_pop<'a>(
     } = nctx;
     state.handle_scope(|scope| {
         let receiver = args.get_handle(heap, 0);
-        let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+        let Some(obj) = scope.cast::<Object>(heap, receiver.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let is_array = obj.as_tagged(heap).as_ref().is_array(heap);
@@ -382,7 +382,7 @@ fn join_impl<'a>(
                         let word = s.raw();
                         // Safety: fresh string word, no allocation since the read.
                         unsafe { word.assume_valid(heap) }
-                            .get_as::<DenseString>()
+                            .get_as::<DenseString>(heap)
                             .map(|d| d.to_rust_string(heap))
                             .unwrap_or_default()
                     }
@@ -419,7 +419,8 @@ fn join_impl<'a>(
                 Ok(Some(s)) => {
                     let word = s.raw();
                     // Safety: fresh string word, no allocation since the read.
-                    if let Some(d) = unsafe { word.assume_valid(heap) }.get_as::<DenseString>() {
+                    if let Some(d) = unsafe { word.assume_valid(heap) }.get_as::<DenseString>(heap)
+                    {
                         out.push_str(&d.to_rust_string(heap));
                     }
                 }
@@ -695,7 +696,7 @@ pub fn array_sort<'a>(
                 // materialization at all.
                 let all_strings = elems
                     .iter()
-                    .all(|h| h.as_tagged(heap).get_as::<DenseString>().is_some());
+                    .all(|h| h.as_tagged(heap).get_as::<DenseString>(heap).is_some());
                 if all_strings {
                     elems.sort_by(|a, b| {
                         cmp_dense_strings(heap, a.as_tagged(heap), b.as_tagged(heap))
@@ -842,7 +843,7 @@ fn cmp_dense_strings(
     a: Tagged<'_, Value>,
     b: Tagged<'_, Value>,
 ) -> core::cmp::Ordering {
-    match (a.get_as::<DenseString>(), b.get_as::<DenseString>()) {
+    match (a.get_as::<DenseString>(heap), b.get_as::<DenseString>(heap)) {
         (Some(x), Some(y)) => x.as_ref().data(heap).cmp(&y.as_ref().data(heap)),
         _ => core::cmp::Ordering::Equal,
     }

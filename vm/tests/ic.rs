@@ -230,7 +230,7 @@ fn feedback_vector_of<'a>(heap: &'a vm::Heap, result: Value) -> Option<Tagged<'a
         .as_ref()
         .slot(heap, 0)
         .get(heap)
-        .get_as::<vm::CallableInfoObject>()
+        .get_as::<vm::CallableInfoObject>(heap)
         .expect("closure info");
     info.as_ref().feedback(heap)
 }
@@ -241,7 +241,7 @@ fn first_named_load_slot(heap: &vm::Heap, result: Value) -> usize {
         .as_ref()
         .slot(heap, 0)
         .get(heap)
-        .get_as::<vm::CallableInfoObject>()
+        .get_as::<vm::CallableInfoObject>(heap)
         .expect("closure info");
     let code = info.as_ref().bytecode.get(heap);
     let bytes = code.as_ref().as_slice();
@@ -293,7 +293,7 @@ fn second_shape_goes_polymorphic() {
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
     let word = vector.as_ref().slot(slot).raw();
     let pairs = unsafe { Tagged::<Value>::from_value_unchecked(word) }
-        .get_as::<WeakFixedArray>()
+        .get_as::<WeakFixedArray>(heap)
         .expect("poly state is a WeakFixedArray");
     assert_eq!(pairs.as_ref().len(), 4, "two [map, handler] pairs");
 }
@@ -336,7 +336,7 @@ fn prototype_hit_installs_data_handler_with_cell() {
         "prototype handlers are strong DataHandlers"
     );
     let handler = unsafe { Tagged::<Value>::from_value_unchecked(handler_word) }
-        .get_as::<vm::DataHandler>()
+        .get_as::<vm::DataHandler>(heap)
         .expect("prototype chain hit is a DataHandler");
     let smi = handler.as_ref().smi_handler(heap);
     let (kind, offset) = decode_handler(smi.raw()).expect("kind Smi");
@@ -352,7 +352,9 @@ fn prototype_hit_installs_data_handler_with_cell() {
         .validity_cell(heap)
         .as_strong()
         .expect("field handlers carry a cell");
-    let cell = cell.get_as::<vm::Cell>().expect("validity cell is a Cell");
+    let cell = cell
+        .get_as::<vm::Cell>(heap)
+        .expect("validity cell is a Cell");
     assert!(cell.as_ref().is_valid(heap), "cell starts valid");
 
     // data[0] is the weak holder object (p), whose x slot holds 1
@@ -362,7 +364,9 @@ fn prototype_hit_installs_data_handler_with_cell() {
         .data(heap, 0)
         .as_strong()
         .expect("live weak holder");
-    let holder = holder.get_as::<vm::Object>().expect("holder is an object");
+    let holder = holder
+        .get_as::<vm::Object>(heap)
+        .expect("holder is an object");
     assert_eq!(
         Smi::decode(holder.as_ref().slot(heap, offset as usize).get(heap).raw())
             .unwrap()
@@ -412,7 +416,7 @@ fn try_load_hits_directly() {
         .as_ref()
         .slot(heap, 0)
         .get(heap)
-        .get_as::<vm::CallableInfoObject>()
+        .get_as::<vm::CallableInfoObject>(heap)
         .unwrap();
     let vector = info.as_ref().feedback(heap).expect("vector");
     let slot = {
@@ -555,7 +559,7 @@ fn first_named_store_slot(heap: &vm::Heap, result: Value) -> usize {
         .as_ref()
         .slot(heap, 0)
         .get(heap)
-        .get_as::<vm::CallableInfoObject>()
+        .get_as::<vm::CallableInfoObject>(heap)
         .expect("closure info");
     let code = info.as_ref().bytecode.get(heap);
     let bytes = code.as_ref().as_slice();
@@ -626,7 +630,7 @@ fn store_second_shape_goes_polymorphic() {
     let vector = feedback_vector_of(heap, result).expect("feedback vector");
     let word = vector.as_ref().slot(slot).raw();
     let pairs = unsafe { Tagged::<Value>::from_value_unchecked(word) }
-        .get_as::<WeakFixedArray>()
+        .get_as::<WeakFixedArray>(heap)
         .expect("poly state");
     assert_eq!(pairs.as_ref().len(), 4, "two [map, handler] pairs");
 }
@@ -802,14 +806,14 @@ fn handler_cell<'a>(heap: &'a vm::Heap, result: Value, slot: usize) -> Tagged<'a
     let vector = feedback_vector_of(heap, result).expect("vector");
     let handler_word = vector.as_ref().slot(slot + 1).raw();
     let handler = unsafe { Tagged::<Value>::from_value_unchecked(handler_word) }
-        .get_as::<vm::DataHandler>()
+        .get_as::<vm::DataHandler>(heap)
         .expect("DataHandler");
     handler
         .as_ref()
         .validity_cell(heap)
         .as_strong()
         .expect("cell")
-        .get_as::<vm::Cell>()
+        .get_as::<vm::Cell>(heap)
         .expect("Cell")
 }
 
@@ -853,7 +857,7 @@ fn prototype_mutation_invalidates_and_replaces_cell() {
         let vector = feedback_vector_of(heap, r1).expect("vector");
         let handler_word = vector.as_ref().slot(slot + 1).raw();
         let handler = unsafe { Tagged::<Value>::from_value_unchecked(handler_word) }
-            .get_as::<vm::DataHandler>()
+            .get_as::<vm::DataHandler>(heap)
             .expect("DataHandler");
         decode_handler(handler.as_ref().smi_handler(heap).raw()).unwrap()
     };

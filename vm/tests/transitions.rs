@@ -42,7 +42,7 @@ fn object_map_word(thread: &mut Thread, obj: Handle<'_, Object>) -> Value {
 fn pred_word(thread: &mut Thread, map: Value) -> Option<Value> {
     let heap = &*thread.heap();
     let map = unsafe { map.assume_valid(heap) }
-        .get_as::<Map>()
+        .get_as::<Map>(heap)
         .expect("map");
     map.pred(heap).map(|p| p.raw())
 }
@@ -50,7 +50,7 @@ fn pred_word(thread: &mut Thread, map: Value) -> Option<Value> {
 fn root_word(thread: &mut Thread, map: Value) -> Value {
     let heap = &*thread.heap();
     let map = unsafe { map.assume_valid(heap) }
-        .get_as::<Map>()
+        .get_as::<Map>(heap)
         .expect("map");
     map.root_map(heap).raw()
 }
@@ -232,7 +232,7 @@ fn live_transition_subtree_survives_gc() {
             "root -> {{a}} must survive while an object uses {{a, b}}"
         );
         let map_ab = unsafe { map_ab.assume_valid(heap) }
-            .get_as::<Map>()
+            .get_as::<Map>(heap)
             .expect("map");
         assert_eq!(
             map_ab.root_map(heap).raw(),

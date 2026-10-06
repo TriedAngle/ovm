@@ -321,7 +321,7 @@ fn exception_name(thread: &mut vm::Thread) -> String {
             match o.lookup(heap, name_key.as_tagged(heap).into()) {
                 vm::Lookup::Data { slot, .. } => slot
                     .get(heap)
-                    .get_as::<vm::DenseString>()
+                    .get_as::<vm::DenseString>(heap)
                     .map(|s| s.to_rust_string(heap))
                     .unwrap_or_else(|| "exception".into()),
                 _ => "exception".into(),

@@ -24,7 +24,7 @@ fn random_bits() -> u64 {
 /// (a Smi, or a boxed `Float`) needs no ToPrimitive/ToNumber round-trip.
 #[inline]
 fn number_arg(heap: &Heap, args: Args, i: usize) -> Option<f64> {
-    Convert::as_number(args.get(heap, i))
+    Convert::as_number(heap, args.get(heap, i))
 }
 
 /// The cold half of an argument read: full ToNumeric for strings, objects,

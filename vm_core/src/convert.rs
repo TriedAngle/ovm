@@ -7,11 +7,11 @@ pub struct Convert;
 impl Convert {
     /// The numeric value of a value that already IS a number
     #[inline]
-    pub fn as_number(v: Tagged<'_, Value>) -> Option<f64> {
+    pub fn as_number(heap: &Heap, v: Tagged<'_, Value>) -> Option<f64> {
         if let Some(smi) = Smi::decode(v.raw()) {
             return Some(smi.value() as f64);
         }
-        v.get_as::<Float>().map(|f| f.value.get())
+        v.get_as::<Float>(heap).map(|f| f.value.get())
     }
 
     /// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN,
@@ -32,12 +32,12 @@ impl Convert {
         if v == known.true_object.as_tagged(heap) {
             return true;
         }
-        if let Some(f) = v.get_as::<Float>() {
+        if let Some(f) = v.get_as::<Float>(heap) {
             let x = f.value.get();
             // -0.0 compares equal to 0.0; NaN compares unequal to everything
             return x != 0.0 && !x.is_nan();
         }
-        if let Some(s) = v.get_as::<DenseString>() {
+        if let Some(s) = v.get_as::<DenseString>(heap) {
             return !s.is_empty();
         }
         true
@@ -60,10 +60,10 @@ impl Convert {
         if v == known.true_object.as_tagged(heap) {
             return Ok(1.0);
         }
-        if let Some(f) = v.get_as::<Float>() {
+        if let Some(f) = v.get_as::<Float>(heap) {
             return Ok(f.value.get());
         }
-        if let Some(s) = v.get_as::<DenseString>() {
+        if let Some(s) = v.get_as::<DenseString>(heap) {
             return Ok(Self::string_to_number(s.data(heap)).unwrap_or(f64::NAN));
         }
         Err(VmError::Type)
@@ -172,9 +172,9 @@ impl Convert {
             || v == known.null.as_tagged(heap)
             || v == known.true_object.as_tagged(heap)
             || v == known.false_object.as_tagged(heap)
-            || v.get_as::<Float>().is_some()
-            || v.get_as::<DenseString>().is_some()
-            || v.get_as::<Symbol>().is_some()
+            || v.get_as::<Float>(heap).is_some()
+            || v.get_as::<DenseString>(heap).is_some()
+            || v.get_as::<Symbol>(heap).is_some()
     }
 
     /// ES ToString on a primitive (no ToPrimitive recursion: the input is
@@ -211,9 +211,9 @@ impl Convert {
                 PrimitiveString::True
             } else if word == known.false_object.as_tagged(heap) {
                 PrimitiveString::False
-            } else if vt.get_as::<DenseString>().is_some() {
+            } else if vt.get_as::<DenseString>(heap).is_some() {
                 PrimitiveString::IsString
-            } else if let Some(f) = vt.get_as::<Float>() {
+            } else if let Some(f) = vt.get_as::<Float>(heap) {
                 PrimitiveString::Float(f.value.get())
             } else {
                 PrimitiveString::Other

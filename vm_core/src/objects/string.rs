@@ -1,8 +1,8 @@
 use core::{alloc::Layout, cell::UnsafeCell, cmp::Ordering};
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, HeapPtr, Map, MapKind,
-    ObjectKind, Smi, Value, Visitor,
+    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, Map, MapKind, ObjectKind,
+    Smi, Tagged, Value, Visitor,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,9 +151,11 @@ impl DenseString {
     }
 
     fn encoding_of(header: &Header) -> Encoding {
-        // Safety: raw header read (encoding is map-kind metadata).
+        // Safety: layout callbacks run without a heap borrow, so the map
+        // word read from the header is promoted unsafely; only its kind
+        // bits are read and the map cannot move under the GC callback.
         let map = header.map.raw();
-        let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
+        let map_ref = unsafe { Tagged::<Map>::from_value_unchecked(map) }.as_ref();
         if map_ref.kind().contains(MapKind::LATIN1) {
             Encoding::Latin1
         } else {
@@ -231,7 +233,7 @@ impl DenseString {
     ) -> Option<Handle<'s, DenseString>> {
         let unit = receiver
             .as_tagged(heap)
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .filter(|s| i < s.len())
             .map(|s| s.code_unit(heap, i))?;
         Some(Self::from_units(heap, scope, &[unit]))
@@ -294,12 +296,12 @@ impl DenseString {
         let units = {
             let sa = a
                 .as_tagged(heap)
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .expect("concat operand must be a string")
                 .as_ref();
             let sb = b
                 .as_tagged(heap)
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .expect("concat operand must be a string")
                 .as_ref();
             let mut out = Vec::with_capacity(sa.len() + sb.len());

@@ -50,7 +50,7 @@ fn run_str(src: &str) -> String {
     {
         let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .expect("string result");
         s.to_rust_string(heap)
     }

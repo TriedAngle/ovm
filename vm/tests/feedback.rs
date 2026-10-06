@@ -82,7 +82,7 @@ fn materialized_vector_is_hole_filled() {
             .as_tagged(heap)
             .slot(heap, 0)
             .get(heap)
-            .get_as::<vm::CallableInfoObject>()
+            .get_as::<vm::CallableInfoObject>(heap)
             .expect("script closure info");
         let vector = info
             .as_ref()

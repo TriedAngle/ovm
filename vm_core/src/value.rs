@@ -1,6 +1,6 @@
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::{Header, Heap, HeapObject, Map, MapKind, Object, VmError};
+use crate::{Heap, HeapObject, MapKind, Object, VmError};
 
 // imports flattened
 use crate::Handle;
@@ -8,7 +8,7 @@ use crate::HandleSet;
 use crate::SlotName;
 
 // The word/tag representation is shared with the heap ABI crate; the VM
-// layers the typed Value/Tagged/HeapPtr wrappers on top of it.
+// layers the typed Value/Tagged wrappers on top of it.
 pub use heap_api::{PTR_BIT, STRONG_PTR, TAG_MASK, TAG_SMI, WEAK_BIT, WEAK_PTR, Word};
 
 /// Generic Value
@@ -154,74 +154,6 @@ pub fn encode_smi(r: i64) -> Result<Value, VmError> {
         return Err(VmError::Overflow);
     }
     Ok(Smi::new(r).encode())
-}
-
-/// Pointer to the Heap
-/// because the GC may be moving this is NOT safe to dereference acroess GC safepoints.
-pub struct HeapPtr<T>(NonNull<T>);
-
-unsafe impl<T: HeapObject> Send for HeapPtr<T> {}
-unsafe impl<T: HeapObject> Sync for HeapPtr<T> {}
-
-impl<T> Clone for HeapPtr<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<T> Copy for HeapPtr<T> {}
-
-impl<T> core::fmt::Debug for HeapPtr<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "HeapPtr({:#x})", self.0.as_ptr() as Word)
-    }
-}
-
-// TODO: consider swapping the interface safety
-// creation should be safe and encoding to value unsafe?
-impl<T> HeapPtr<T> {
-    pub unsafe fn new(ptr: *mut T) -> Self {
-        unsafe { Self(NonNull::new_unchecked(ptr)) }
-    }
-
-    pub const fn as_ptr(self) -> *mut T {
-        self.0.as_ptr()
-    }
-
-    pub unsafe fn cast<U>(self) -> HeapPtr<U> {
-        unsafe { HeapPtr::new(self.as_ptr() as *mut U) }
-    }
-}
-
-impl HeapPtr<Value> {
-    pub fn decode_strong(v: Value) -> Option<Self> {
-        if v.is_strong_ptr() {
-            Some(unsafe { Self::new(v.raw_addr() as *mut Value) })
-        } else {
-            None
-        }
-    }
-
-    pub fn decode(v: Value) -> Option<Self> {
-        if v.is_ptr() {
-            Some(unsafe { Self::new(v.raw_addr() as *mut Value) })
-        } else {
-            None
-        }
-    }
-}
-
-impl<T: HeapObject> HeapPtr<T> {
-    pub unsafe fn as_ref<'a>(self) -> &'a T {
-        unsafe { &*self.0.as_ptr() }
-    }
-
-    pub unsafe fn as_mut<'a>(mut self) -> &'a mut T {
-        unsafe { self.0.as_mut() }
-    }
-
-    pub fn encode_strong(self) -> Value {
-        Value(self.as_ptr() as Word | STRONG_PTR)
-    }
 }
 
 pub struct MaybeWeak<T>(PhantomData<fn() -> T>);
@@ -412,24 +344,17 @@ impl<'a> Tagged<'a, Value> {
     }
 
     #[inline]
-    pub fn get_as<T: HeapObject>(self) -> Option<Tagged<'a, T>> {
-        let ptr = HeapPtr::decode_strong(self.raw)?;
-        // Safety: strong pointer; reads only the header's map slot.
-        let map = unsafe { &*(ptr.as_ptr() as *const Header) }.map.raw();
-        // Safety: raw header read under the anchor.
-        let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
-        let kind = map_ref.kind();
+    pub fn get_as<T: HeapObject>(self, heap: &Heap) -> Option<Tagged<'a, T>> {
+        // strong-pointer witness; every heap object is header-prefixed,
+        // so the map slot is readable under the anchor
+        let obj = self.as_heap_object()?;
+        let kind = obj.as_ref().header.map.get(heap).as_ref().kind();
         // exact-kind fast path: one mask + compare, no decode match
-        if kind.bits() & MapKind::KIND_MASK == T::KIND as u64 {
+        if kind.bits() & MapKind::KIND_MASK == T::KIND as u64 || T::matches_kind(kind.kind()) {
             // Safety: the map-kind check above is the type witness.
-            return Some(unsafe { Tagged::from_value_unchecked(self.raw) });
+            return Some(unsafe { obj.cast::<T>() });
         }
-        if !T::matches_kind(kind.kind()) {
-            return None;
-        }
-        // Safety: the map-kind check above is the type witness; the
-        // anchor `'a` proves no GC ran since the load.
-        Some(unsafe { Tagged::from_value_unchecked(self.raw) })
+        None
     }
 
     /// Narrow an anchored value word to a property-name tag (type-level
@@ -473,28 +398,33 @@ impl<'a> Tagged<'a, Smi> {
 }
 
 impl<'a, T: HeapObject> Tagged<'a, T> {
-    pub fn from_ptr(_heap: &'a Heap, ptr: HeapPtr<T>) -> Self {
-        // Safety: `ptr` is a strong heap pointer re-anchored at a live
-        // borrow of the heap — no GC can have run since it was obtained.
-        unsafe { Self::from_value_unchecked(ptr.encode_strong()) }
+    /// A strong `Tagged` for a raw heap pointer, without going through a
+    /// `Value` word.
+    ///
+    /// # Safety
+    /// `ptr` must point at a live `T`, and no GC may run until the end of
+    /// `'a` (the borrow the result is anchored at).
+    pub unsafe fn from_raw_ptr(ptr: NonNull<T>) -> Self {
+        Self {
+            raw: Value::from_bits(ptr.as_ptr() as Word | STRONG_PTR),
+            _phantom: PhantomData,
+        }
     }
 
-    pub fn as_ptr(self) -> Option<HeapPtr<T>> {
-        if self.raw.is_strong_ptr() {
-            Some(unsafe { HeapPtr::new(self.raw.raw_addr() as *mut T) })
-        } else {
-            None
-        }
+    pub fn from_ptr(_heap: &'a Heap, ptr: NonNull<T>) -> Self {
+        // Safety: `ptr` is a strong heap pointer re-anchored at a live
+        // borrow of the heap — no GC can have run since it was obtained.
+        unsafe { Self::from_raw_ptr(ptr) }
     }
 
     /// The anchored referent. The `'a` heap borrow proves the pointer is
     /// live and cannot move for the whole borrow, so no GC can invalidate
-    /// it. (Unlike [`HeapPtr`], which is only usable until the next
-    /// safepoint.)
+    /// it: unlike a raw word, the value may be dereferenced freely until
+    /// the borrow ends.
     pub fn as_ref(self) -> &'a T {
         // Safety: a `Tagged<'a, T: HeapObject>` is always a strong heap
         // pointer valid for `'a` (Smi/weak words have no `HeapObject` type).
-        unsafe { self.as_ptr().expect("strong pointer").as_ref() }
+        unsafe { self.as_ref_unchecked() }
     }
 
     /// [`as_ref`] without the strong-pointer witness. Hot handlers that
@@ -523,13 +453,7 @@ impl<'a, T: HeapObject> core::ops::Deref for Tagged<'a, T> {
     fn deref(&self) -> &T {
         // Safety: `Tagged<'a, T>` holds a strong pointer valid for `'a`,
         // so the (shorter) borrow of `self` is valid too.
-        unsafe { self.as_ptr().expect("strong pointer").as_ref() }
-    }
-}
-
-impl<'a, T: HeapObject> From<Tagged<'a, T>> for HeapPtr<T> {
-    fn from(v: Tagged<'a, T>) -> Self {
-        unsafe { HeapPtr::new(v.raw().raw_addr() as *mut T) }
+        unsafe { self.as_ref_unchecked() }
     }
 }
 

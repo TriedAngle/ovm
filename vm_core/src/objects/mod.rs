@@ -33,9 +33,7 @@ pub use symbol::Symbol;
 
 use core::{alloc::Layout, ptr::NonNull};
 
-use crate::{
-    EdgeVisitable, GcSlot, Heap, HeapPtr, STRONG_PTR, Tagged, Value, Visitor, WEAK_PTR, Word,
-};
+use crate::{EdgeVisitable, GcSlot, Heap, STRONG_PTR, Tagged, Value, Visitor, WEAK_PTR, Word};
 
 pub trait HeapObject: 'static {
     type Init<'a>;
@@ -68,10 +66,7 @@ pub trait HeapObject: 'static {
     where
         Self: Sized,
     {
-        Tagged::from_ptr(heap, unsafe {
-            HeapPtr::new(self as *const Self as *mut Self)
-        })
-        .erase()
+        Tagged::from_ptr(heap, NonNull::from(self)).erase()
     }
 
     fn erase_weak(&self) -> Value
@@ -149,10 +144,13 @@ impl ObjectKind {
 
 pub unsafe fn object_kind(addr: NonNull<()>) -> ObjectKind {
     let header = unsafe { &*addr.cast::<Header>().as_ptr() };
-    // Safety: GC-callback context; raw header read.
+    // Safety: GC-callback context — there is no heap borrow to anchor at,
+    // so the map word read from the visited header is promoted unsafely.
     let map = header.map.raw();
-    let map_ref = unsafe { HeapPtr::<Map>::new(map.raw_addr() as *mut Map).as_ref() };
-    map_ref.kind().kind()
+    unsafe { Tagged::<Map>::from_value_unchecked(map) }
+        .as_ref()
+        .kind()
+        .kind()
 }
 
 pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {

@@ -117,7 +117,7 @@ impl StringInterner {
                 table
                     .entry(hash)
                     .or_default()
-                    .push((key, MaybeWeakGcSlot::new_strong(handle.get())));
+                    .push((key, MaybeWeakGcSlot::new_strong(handle.as_tagged(heap))));
                 handle
             }
         }

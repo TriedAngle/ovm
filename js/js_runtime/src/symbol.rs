@@ -28,7 +28,7 @@ pub fn symbol_constructor<'a>(
                     let word = s.raw();
                     // Safety: fresh string word, no allocation since the read.
                     unsafe { word.assume_valid(heap) }
-                        .get_as::<DenseString>()
+                        .get_as::<DenseString>(heap)
                         .map(|d| d.to_rust_string(heap))
                         .unwrap_or_default()
                 }

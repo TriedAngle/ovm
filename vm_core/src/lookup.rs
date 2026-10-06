@@ -47,7 +47,7 @@ impl Lookup<'_> {
             }
             return Ok(Key::Name(Tagged::from(smi)));
         }
-        if let Some(s) = key.get_as::<DenseString>() {
+        if let Some(s) = key.get_as::<DenseString>(heap) {
             // Canonical index strings ("0", "1", … up to 2^32−2) name the same
             // property as their numeric form (ES 6.1.7: ToString(i) is the
             // canonical key); non-canonical spellings ("01", "-0", "1e2") stay
@@ -60,7 +60,7 @@ impl Lookup<'_> {
             }
             return Ok(Key::Name(s.into()));
         }
-        if let Some(s) = key.get_as::<Symbol>() {
+        if let Some(s) = key.get_as::<Symbol>(heap) {
             return Ok(Key::Name(s.into()));
         }
         Err(VmError::Type)
@@ -110,10 +110,10 @@ impl Lookup<'_> {
         // string primitives expose `length` (UTF-16 code units) as an own
         // property without boxing (ES 5.4.3.1); index loads need a fresh
         // one-character string and stay unsupported here
-        if let Some(s) = holder.get_as::<DenseString>()
+        if let Some(s) = holder.get_as::<DenseString>(heap)
             && name
                 .erase()
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
         {
             let len = s.len() as i64;
@@ -124,17 +124,18 @@ impl Lookup<'_> {
         // (string `length` above) have already been handled. The prototype
         // objects are the identity-stable entry points — never their maps —
         // so later prototype mutations are always visible here.
-        let holder = if Smi::decode(holder.raw()).is_some() || holder.get_as::<Float>().is_some() {
-            known.number_prototype.as_tagged(heap).erase()
-        } else if holder.get_as::<DenseString>().is_some() {
-            known.string_prototype.as_tagged(heap).erase()
-        } else if holder == known.true_object.as_tagged(heap)
-            || holder == known.false_object.as_tagged(heap)
-        {
-            known.boolean_prototype.as_tagged(heap).erase()
-        } else {
-            holder
-        };
+        let holder =
+            if Smi::decode(holder.raw()).is_some() || holder.get_as::<Float>(heap).is_some() {
+                known.number_prototype.as_tagged(heap).erase()
+            } else if holder.get_as::<DenseString>(heap).is_some() {
+                known.string_prototype.as_tagged(heap).erase()
+            } else if holder == known.true_object.as_tagged(heap)
+                || holder == known.false_object.as_tagged(heap)
+            {
+                known.boolean_prototype.as_tagged(heap).erase()
+            } else {
+                holder
+            };
         match holder.lookup(heap, name) {
             Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.get(heap))),
             Lookup::Accessor { pair, .. } => {
@@ -220,7 +221,7 @@ impl Lookup<'_> {
                 let pair = d
                     .value
                     .get(heap)
-                    .get_as::<AccessorPair>()
+                    .get_as::<AccessorPair>(heap)
                     .expect("accessor descriptor holds a pair");
                 return Some(PropertyDescriptor::Accessor {
                     get: scope.handle(pair.get.get(heap)),
@@ -271,7 +272,7 @@ impl Lookup<'_> {
         // "length" may live in an array's internal slot at any chain level
         if name
             .erase()
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
         {
             return array_length_in_chain(heap, receiver);
@@ -287,7 +288,7 @@ impl Lookup<'_> {
         if proto == heap.known().null.as_tagged(heap) {
             return Lookup::NotFound;
         }
-        if let Some(pairs) = proto.get_as::<FixedArray>() {
+        if let Some(pairs) = proto.get_as::<FixedArray>(heap) {
             // look *inside* the parents: the pair names are slots of the child
             let mut i = 1;
             while i < pairs.len() {
@@ -541,7 +542,7 @@ fn super_start_from_proto<'a>(heap: &'a Heap, proto: Option<Tagged<'a, Value>>) 
     if proto == heap.known().null.as_tagged(heap) || !proto.is_strong_ptr() {
         return SuperStart::End;
     }
-    if let Some(parents) = proto.get_as::<FixedArray>() {
+    if let Some(parents) = proto.get_as::<FixedArray>(heap) {
         return SuperStart::Parents(parents);
     }
     SuperStart::Object(proto)
@@ -563,7 +564,7 @@ fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> boo
         if proto == heap.known().null.as_tagged(heap) || !proto.is_strong_ptr() {
             return false;
         }
-        if let Some(pairs) = proto.get_as::<FixedArray>() {
+        if let Some(pairs) = proto.get_as::<FixedArray>(heap) {
             // Self-style parent pairs: stride over the parent values
             let mut i = 1;
             while i < pairs.len() {
@@ -630,7 +631,7 @@ impl Map {
                         pair: d
                             .value
                             .get(heap)
-                            .get_as::<AccessorPair>()
+                            .get_as::<AccessorPair>(heap)
                             .expect("accessor descriptor holds an AccessorPair"),
                     };
                 }
@@ -645,7 +646,7 @@ impl Map {
         }
 
         let proto = self.prototype.get(heap);
-        if let Some(pairs) = proto.get_as::<FixedArray>() {
+        if let Some(pairs) = proto.get_as::<FixedArray>(heap) {
             let name_word = name.erase();
             let mut i = 0;
             while i < pairs.len() {

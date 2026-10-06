@@ -60,7 +60,7 @@ fn run_num(src: &str) -> f64 {
             return smi.value() as f64;
         }
         unsafe { result.assume_valid(heap) }
-            .get_as::<Float>()
+            .get_as::<Float>(heap)
             .expect("number result")
             .value
             .get()
@@ -72,7 +72,7 @@ fn run_str(src: &str) -> String {
     {
         let heap = &*thread.heap();
         let s = unsafe { result.assume_valid(heap) }
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .expect("string result");
         s.to_rust_string(heap)
     }
@@ -639,7 +639,7 @@ fn unresolvable_global_names_the_binding() {
         let msg = match o.lookup(heap, message.as_tagged(heap).into()) {
             Lookup::Data { slot, .. } => slot
                 .get(heap)
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .expect("string message")
                 .to_rust_string(heap),
             _ => panic!("error object must have a message property"),

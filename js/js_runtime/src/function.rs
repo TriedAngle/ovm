@@ -198,7 +198,7 @@ pub fn function_constructor<'a>(
             });
             parts.push(
                 s.as_tagged(heap)
-                    .get_as::<DenseString>()
+                    .get_as::<DenseString>(heap)
                     .map(|x| x.to_rust_string(heap))
                     .unwrap_or_default(),
             );
@@ -221,7 +221,7 @@ pub fn function_constructor<'a>(
                 return heap.known().exception.as_tagged(heap).erase();
             }
         };
-        let Some(context) = scope.cast::<Context>(context.as_tagged(heap)) else {
+        let Some(context) = scope.cast::<Context>(heap, context.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let closure = rt_try!(

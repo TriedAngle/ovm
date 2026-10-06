@@ -32,7 +32,7 @@ fn bench(name: &str, src: &str, iters: usize) {
             let heap = thread.heap();
             let tagged = unsafe { ex.assume_valid(heap) };
             let msg = tagged
-                .get_as::<vm_core::DenseString>()
+                .get_as::<vm_core::DenseString>(heap)
                 .map(|s| s.to_rust_string(heap))
                 .unwrap_or_else(|| format!("{:?}", tagged));
             panic!("{name} threw: {msg}");

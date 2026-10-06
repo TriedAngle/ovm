@@ -225,7 +225,7 @@ pub extern "rust-preserve-none" fn slow_compare_jump<'a, const STRIDE: usize>(
     let jump_pc = (pc as isize + off as isize) as usize;
     let other = regs.read(r, ctx);
     let cmp = (kind / 2) as u8;
-    let b = match (Convert::as_number(acc), Convert::as_number(other)) {
+    let b = match (Convert::as_number(ctx.heap(), acc), Convert::as_number(ctx.heap(), other)) {
         (Some(a), Some(b)) => match cmp {
             0 | 1 => a == b,
             2 => a < b,
@@ -501,12 +501,12 @@ fn create_closure_slow<'a>(ctx: &Ctx<'a>, info_idx: usize) -> Result<Tagged<'a, 
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let base = ctx.frame_base();
         let Some(info) =
-            scope.cast::<CallableInfoObject>(ctx.constants_ref(heap).at(heap, info_idx))
+            scope.cast::<CallableInfoObject>(heap, ctx.constants_ref(heap).at(heap, info_idx))
         else {
             return Err(VmError::Type);
         };
         let context = scope
-            .cast::<Context>(ctx.stack().context_slot(base).get(heap))
+            .cast::<Context>(heap, ctx.stack().context_slot(base).get(heap))
             .expect("frame context slot holds a Context");
         let obj = Object::create_closure(heap, &scope, info, context)?;
         Ok(obj.erase())
@@ -524,16 +524,16 @@ fn create_function_context_slow<'a>(
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(ctx.stack().context_slot(base).get(heap))
+            .cast::<Context>(heap, ctx.stack().context_slot(base).get(heap))
             .expect("frame context slot holds a Context");
         let count = ctx
             .constants_ref(heap)
             .at(heap, scope_idx)
-            .get_as::<ScopeInfo>()
+            .get_as::<ScopeInfo>(heap)
             .map(|r| r.as_ref().names.get(heap).len())
             .ok_or(VmError::Type)?;
         let scope_info = scope
-            .cast::<ScopeInfo>(ctx.constants_ref(heap).at(heap, scope_idx))
+            .cast::<ScopeInfo>(heap, ctx.constants_ref(heap).at(heap, scope_idx))
             .expect("constants slot holds a ScopeInfo");
         let slots = if count == 0 {
             heap.known().empty_fixed_array
@@ -891,7 +891,7 @@ fn create_block_context_slow<'a>(
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(ctx.stack().context_slot(base).get(heap))
+            .cast::<Context>(heap, ctx.stack().context_slot(base).get(heap))
             .expect("frame context slot holds a Context");
         let slots = if count == 0 {
             heap.known().empty_fixed_array
@@ -942,7 +942,7 @@ fn add_parent_slow<'a>(
         let receiver = scope.handle(recv);
         let name = scope.handle(ctx.constants_ref(heap).at(heap, name_idx).erase().as_name());
         let value = scope.handle(value);
-        let Some(receiver) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
+        let Some(receiver) = scope.cast::<Object>(heap, receiver.as_tagged(heap)) else {
             return Err(VmError::Type);
         };
         Object::add_parent(heap, &scope, receiver, name, value)?;

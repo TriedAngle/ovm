@@ -197,7 +197,7 @@ fn delete_property_core(
         return Ok(!owned);
     }
     let receiver = scope
-        .cast::<Object>(target.as_tagged(heap))
+        .cast::<Object>(heap, target.as_tagged(heap))
         .expect("non-primitive receivers are objects");
     Object::delete_own_property(heap, scope, receiver, key)
 }
@@ -207,14 +207,14 @@ fn delete_property_core(
 /// 10.4.3.3/4 StringGetOwnProperty). Deleting those yields false; every
 /// other primitive property deletes as absent (true).
 fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Value>) -> bool {
-    let Some(s) = target.get_as::<DenseString>() else {
+    let Some(s) = target.get_as::<DenseString>(heap) else {
         return false;
     };
     if let Some(idx) = Smi::decode(key.raw()) {
         let i = idx.value();
         return i >= 0 && (i as u64) < s.len() as u64;
     }
-    let Some(name) = key.get_as::<DenseString>() else {
+    let Some(name) = key.get_as::<DenseString>(heap) else {
         return false; // symbols own nothing on primitives
     };
     let data = name.as_ref().data(heap);
@@ -347,7 +347,7 @@ fn for_in_initial_level<'a>(
     heap: &'a Heap,
     subject: Tagged<'a, Value>,
 ) -> Option<Tagged<'a, Value>> {
-    if subject.get_as::<DenseString>().is_some() {
+    if subject.get_as::<DenseString>(heap).is_some() {
         return Some(subject);
     }
     if !Convert::is_primitive(heap, subject) {
@@ -355,13 +355,13 @@ fn for_in_initial_level<'a>(
     }
     let ctor_name = if Smi::decode(subject.raw()).is_some() {
         "Number"
-    } else if subject.get_as::<Float>().is_some() {
+    } else if subject.get_as::<Float>(heap).is_some() {
         "Number"
     } else if subject == heap.known().true_object.as_tagged(heap)
         || subject == heap.known().false_object.as_tagged(heap)
     {
         "Boolean"
-    } else if subject.get_as::<Symbol>().is_some() {
+    } else if subject.get_as::<Symbol>(heap).is_some() {
         "Symbol"
     } else {
         return None;
@@ -400,7 +400,7 @@ fn for_in_level_keys<'s>(
         let level = level.as_tagged(heap);
         let mut indices: Vec<i64> = Vec::new();
         let mut names: Vec<Handle<'s, Value>> = Vec::new();
-        if let Some(s) = level.get_as::<DenseString>() {
+        if let Some(s) = level.get_as::<DenseString>(heap) {
             // string exotic: the only own string keys are the indices
             // ("length" is non-enumerable; the wrapper's own "length"
             // shadowing String.prototype additions is not modeled)
@@ -437,7 +437,7 @@ fn for_in_level_keys<'s>(
                 }
                 continue;
             }
-            if name.erase().get_as::<Symbol>().is_some() {
+            if name.erase().get_as::<Symbol>(heap).is_some() {
                 continue; // symbols are never yielded
             }
             // canonical index strings classify as index keys (a store
@@ -445,7 +445,7 @@ fn for_in_level_keys<'s>(
             // literals and defines can still reach here)
             let index = name
                 .erase()
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .and_then(|s| Lookup::canonical_index(s.as_ref().data(heap)))
                 .filter(|i| *i < u32::MAX as usize);
             match index {
@@ -507,7 +507,7 @@ fn for_in_next<'a>(
                     state,
                     slots
                         .at(heap, FOR_IN_KEYS)
-                        .get_as::<FixedArray>()
+                        .get_as::<FixedArray>(heap)
                         .ok_or(VmError::Type)
                 );
                 let index = rt_try!(
@@ -573,7 +573,7 @@ fn for_in_next<'a>(
                         .slots
                         .get(heap)
                         .at(heap, FOR_IN_VISITED)
-                        .get_as::<FixedArray>()
+                        .get_as::<FixedArray>(heap)
                         .ok_or(VmError::Type)
                 );
                 let key_word = key.as_tagged(heap);
@@ -599,7 +599,7 @@ fn for_in_next<'a>(
                             .slots
                             .get(heap)
                             .at(heap, FOR_IN_VISITED)
-                            .get_as::<FixedArray>()
+                            .get_as::<FixedArray>(heap)
                             .ok_or(VmError::Type)
                     );
                     let mut words: Vec<Tagged<'_, Value>> =
@@ -636,7 +636,7 @@ fn for_in_next_level<'s>(
     level: Handle<'_, Value>,
 ) -> Result<Option<Handle<'s, Value>>, VmError> {
     let level = level.as_tagged(heap);
-    if level.get_as::<DenseString>().is_some() {
+    if level.get_as::<DenseString>(heap).is_some() {
         // String.prototype via the global object (both plain data
         // lookups; no user code can run)
         let global = heap.known().global_object.as_tagged(heap);
@@ -675,7 +675,7 @@ fn for_in_next_level<'s>(
     // a FixedArray prototype is the Self-style multi-parent form;
     // the chain walk does not model it (ends the enumeration)
     Ok(proto
-        .get_as::<FixedArray>()
+        .get_as::<FixedArray>(heap)
         .map_or(Some(proto), |_| None)
         .map(|p| scope.handle(p)))
 }
@@ -687,7 +687,7 @@ fn for_in_next_level<'s>(
 fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value>) -> Option<bool> {
     match Lookup::classify_key(heap, key).ok()? {
         Key::Element(i) => {
-            if let Some(s) = level.get_as::<DenseString>() {
+            if let Some(s) = level.get_as::<DenseString>(heap) {
                 // string indices are enumerable own properties
                 return Some((i as u64) < s.len() as u64);
             }
@@ -989,7 +989,7 @@ fn copy_data_properties<'a>(
                 continue;
             }
             let target_obj = scope
-                .cast::<Object>(target.as_tagged(heap))
+                .cast::<Object>(heap, target.as_tagged(heap))
                 .expect("copy target is an object");
             let key_name = scope.handle(key.as_tagged(heap).as_name());
             rt_try!(
@@ -1022,7 +1022,7 @@ fn create_private_name<'a>(
     } = nctx;
     let text = args
         .get(heap, 1)
-        .get_as::<DenseString>()
+        .get_as::<DenseString>(heap)
         .map(|s| s.to_rust_string(heap));
     state.handle_scope(|scope| {
         let desc = text.unwrap_or_default();
@@ -1210,7 +1210,7 @@ fn init_instance_fields<'a>(
                 return heap.known().exception.as_tagged(heap).erase();
             }
             let instance_obj = scope
-                .cast::<Object>(instance.as_tagged(heap))
+                .cast::<Object>(heap, instance.as_tagged(heap))
                 .expect("class instance is an object");
             let defined = rt_try!(
                 vm,
@@ -1261,7 +1261,7 @@ fn dynamic_slot<'a>(
 ) -> Result<&'a GcSlot, VmError> {
     // both sides are interned (constant pool / ScopeInfo names), so
     // pointer identity decides — no content comparison in lookup
-    name.get_as::<DenseString>().ok_or(VmError::Type)?;
+    name.get_as::<DenseString>(heap).ok_or(VmError::Type)?;
     loop {
         let ctx = context.as_ref();
         let names = ctx.scope_info.get(heap).as_ref().names.get(heap);
@@ -1288,7 +1288,7 @@ fn dynamic_lookup_frame<'s>(
     name: Handle<'_, Value>,
 ) -> Result<Option<Handle<'s, Value>>, VmError> {
     let context = frame_context_value(state, heap)?;
-    let mut context = context.get_as::<Context>().ok_or(VmError::Type)?;
+    let mut context = context.get_as::<Context>(heap).ok_or(VmError::Type)?;
     match dynamic_slot(heap, &mut context, name.as_tagged(heap)) {
         Ok(slot) => Ok(Some(scope.handle(slot.get(heap)))),
         Err(VmError::Reference) => Ok(None),
@@ -1441,7 +1441,7 @@ fn set_function_name<'a>(
         let units = {
             let s = text
                 .as_tagged(heap)
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .expect("ToString yields a string");
             let mut full: Vec<u16> = match prefix {
                 1 => b"get ".iter().map(|&b| b as u16).collect(),
@@ -1455,7 +1455,7 @@ fn set_function_name<'a>(
             .interner()
             .intern(heap, &scope, StringData::Utf16(&units))
             .erase();
-        let Some(fn_obj) = scope.cast::<Object>(fn_value.as_tagged(heap)) else {
+        let Some(fn_obj) = scope.cast::<Object>(heap, fn_value.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let name_key = heap.known().strings.name;
@@ -1549,7 +1549,7 @@ fn install_accessor<'a>(
                     let pair = d
                         .value
                         .get(heap)
-                        .get_as::<AccessorPair>()
+                        .get_as::<AccessorPair>(heap)
                         .expect("accessor descriptor holds a pair");
                     get = pair.get.get(heap);
                     set = pair.set.get(heap);
@@ -1572,7 +1572,7 @@ fn install_accessor<'a>(
             configurable: true,
         };
         let target_obj = scope
-            .cast::<Object>(target.as_tagged(heap))
+            .cast::<Object>(heap, target.as_tagged(heap))
             .expect("checked object above");
         let defined = rt_try!(
             vm,
@@ -1628,7 +1628,7 @@ fn define_own_property<'a>(
                     state,
                     value
                         .as_tagged(heap)
-                        .get_as::<AccessorPair>()
+                        .get_as::<AccessorPair>(heap)
                         .ok_or(VmError::Type)
                 );
                 let pair = pair.as_ref();
@@ -1682,7 +1682,7 @@ fn define_own_property<'a>(
                 state,
                 value
                     .as_tagged(heap)
-                    .get_as::<AccessorPair>()
+                    .get_as::<AccessorPair>(heap)
                     .ok_or(VmError::Type)
             );
             let pair = pair.as_ref();
@@ -1702,7 +1702,7 @@ fn define_own_property<'a>(
         };
         let name = scope.handle(name);
         let receiver_obj = scope
-            .cast::<Object>(receiver.as_tagged(heap))
+            .cast::<Object>(heap, receiver.as_tagged(heap))
             .expect("checked object above");
         let defined = rt_try!(
             vm,
@@ -1730,7 +1730,7 @@ fn set_prototype<'a>(
         let obj = args.get_handle(heap, 0);
         let proto = args.get_handle(heap, 1);
         let obj_ref = scope
-            .cast::<Object>(obj.as_tagged(heap))
+            .cast::<Object>(heap, obj.as_tagged(heap))
             .expect("obj is an object");
         rt_try!(
             vm,
@@ -1857,10 +1857,10 @@ fn construct_super_construct<'a>(
             .as_heap_object()
             .and_then(|obj| obj.as_ref().callable_info(heap))
             .is_some_and(|info| info.function_kind().is_derived_class_constructor());
-        let Some(callee) = scope.cast::<Object>(callee.as_tagged(heap)) else {
+        let Some(callee) = scope.cast::<Object>(heap, callee.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
-        let Some(new_target) = scope.cast::<Object>(new_target.as_tagged(heap)) else {
+        let Some(new_target) = scope.cast::<Object>(heap, new_target.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let (receiver, allocated) = if derived {
@@ -2081,7 +2081,7 @@ fn store_dynamic_name<'a>(
                     vm,
                     heap,
                     state,
-                    context.get_as::<Context>().ok_or(VmError::Type)
+                    context.get_as::<Context>(heap).ok_or(VmError::Type)
                 );
                 let target = rt_try!(
                     vm,

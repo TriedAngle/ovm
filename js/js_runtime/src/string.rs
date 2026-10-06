@@ -20,7 +20,7 @@ pub fn string_constructor<'a>(
         // `String(sym)` (call, not NewTarget) is SymbolDescriptiveString
         // (ES 22.1.1.1 step 2.a): "Symbol(" + [[Description]] + ")".
         if !is_construct {
-            if let Some(sym) = arg.as_tagged(heap).get_as::<Symbol>() {
+            if let Some(sym) = arg.as_tagged(heap).get_as::<Symbol>(heap) {
                 let mut text = String::from("Symbol(");
                 text.push_str(&String::from_utf8_lossy(sym.as_ref().description(heap)));
                 text.push(')');

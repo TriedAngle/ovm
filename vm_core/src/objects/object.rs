@@ -33,7 +33,7 @@ impl Object {
         if !self.header.map.get(heap).kind().is_callable() {
             return None;
         }
-        self.slots.get(heap).at(heap, 1).get_as::<Context>()
+        self.slots.get(heap).at(heap, 1).get_as::<Context>(heap)
     }
 
     /// The `idx`-th entry of the callable's constant pool, as a slot name.
@@ -82,7 +82,7 @@ impl Object {
         if !self.is_array(heap) {
             return None;
         }
-        let s = name.erase().get_as::<DenseString>()?.as_ref();
+        let s = name.erase().get_as::<DenseString>(heap)?.as_ref();
         s.data(heap)
             .matches_ascii(b"length")
             .then(|| self.length.get(heap).erase())
@@ -660,11 +660,11 @@ impl Object {
             return Ok(Some(Tagged::from(smi)));
         }
         state.handle_scope(|scope| {
-            let cond_5 = v.as_tagged(heap).get_as::<Symbol>().is_some();
+            let cond_5 = v.as_tagged(heap).get_as::<Symbol>(heap).is_some();
             if cond_5 {
                 return Ok(Some(v.as_tagged(heap).as_name()));
             }
-            let is_string = v.as_tagged(heap).get_as::<DenseString>().is_some();
+            let is_string = v.as_tagged(heap).get_as::<DenseString>(heap).is_some();
             let primitive: Handle<'_, Value> = if is_string {
                 v
             } else {
@@ -677,7 +677,10 @@ impl Object {
             // canonicalize exactly once here, then every downstream
             // bits-compare is sound.
             let stringified = Convert::to_string(heap, &scope, primitive)?;
-            let interned = match scope.cast::<DenseString>(stringified) {
+            // Root the word: the `Tagged<'a>` keeps the `&mut Heap` borrow
+            // alive, which would conflict with the cast's shared map read.
+            let stringified = scope.handle(stringified);
+            let interned = match scope.cast::<DenseString>(heap, stringified.as_tagged(heap)) {
                 Some(s) => vm.interner().intern_value(heap, &scope, &s),
                 // ToString of a symbol primitive throws (ES 6.1.7.1)
                 None => return Err(VmError::Type),
@@ -694,16 +697,16 @@ impl Object {
         let s = known.strings;
         // `null` needs no arm of its own: it is a non-callable object, and
         // so is anything that is not one of the primitive kinds above
-        let type_name = if v.is_smi() || v.get_as::<Float>().is_some() {
+        let type_name = if v.is_smi() || v.get_as::<Float>(heap).is_some() {
             s.number
         } else if v == known.undefined.as_tagged(heap) || v == known.the_hole.as_tagged(heap) {
             s.undefined
         } else if v == known.true_object.as_tagged(heap) || v == known.false_object.as_tagged(heap)
         {
             s.boolean
-        } else if v.get_as::<DenseString>().is_some() {
+        } else if v.get_as::<DenseString>(heap).is_some() {
             s.string
-        } else if v.get_as::<Symbol>().is_some() {
+        } else if v.get_as::<Symbol>(heap).is_some() {
             s.symbol
         } else if Self::is_callable(heap, v) {
             s.function
@@ -768,7 +771,7 @@ impl Object {
         if proto == heap.known().null.as_tagged(heap) {
             return false;
         }
-        if let Some(parents) = proto.get_as::<FixedArray>() {
+        if let Some(parents) = proto.get_as::<FixedArray>(heap) {
             for i in 0..parents.len() {
                 if Self::has_proto_in_chain(heap, parents.at(heap, i), target) {
                     return true;
@@ -796,7 +799,7 @@ impl Object {
                 Coercion::Value(v) => scope.handle(v),
             };
             // non-object prototypes fall back to the ordinary prototype
-            let proto = scope.cast::<Object>(proto.as_tagged(heap));
+            let proto = scope.cast::<Object>(heap, proto.as_tagged(heap));
             let known = heap.known();
             let obj = heap
                 .new_object(&scope, known.object_initial_map, HandleSlice::EMPTY)

@@ -186,10 +186,10 @@ fn show_value(thread: &mut Thread, v: Value) -> String {
         if v == known.false_object.as_tagged(heap).raw() {
             return "false".into();
         }
-        if let Some(f) = unsafe { v.assume_valid(heap) }.get_as::<Float>() {
+        if let Some(f) = unsafe { v.assume_valid(heap) }.get_as::<Float>(heap) {
             return f.value.get().to_string();
         }
-        if let Some(s) = unsafe { v.assume_valid(heap) }.get_as::<DenseString>() {
+        if let Some(s) = unsafe { v.assume_valid(heap) }.get_as::<DenseString>(heap) {
             return s.to_rust_string(heap);
         }
         if let Some(text) = error_text(heap, v) {
@@ -219,7 +219,9 @@ fn error_property<'a>(
     name: Tagged<'a, SlotName>,
 ) -> Option<String> {
     match Lookup::load_outcome_on(heap, v, name) {
-        Ok(LoadOutcome::Value(x)) => x.get_as::<DenseString>().map(|s| s.to_rust_string(heap)),
+        Ok(LoadOutcome::Value(x)) => x
+            .get_as::<DenseString>(heap)
+            .map(|s| s.to_rust_string(heap)),
         _ => None,
     }
 }

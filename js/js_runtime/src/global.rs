@@ -32,7 +32,7 @@ pub fn eval_runtime<'a>(
         );
         let Some(text) = s
             .as_tagged(heap)
-            .get_as::<DenseString>()
+            .get_as::<DenseString>(heap)
             .map(|s| s.to_rust_string(heap))
         else {
             return raise_runtime(vm, heap, state, VmError::Type);
@@ -53,7 +53,7 @@ pub fn eval_runtime<'a>(
             }
         };
 
-        let Some(context) = scope.cast::<Context>(context.as_tagged(heap)) else {
+        let Some(context) = scope.cast::<Context>(heap, context.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let closure = rt_try!(
@@ -116,7 +116,7 @@ pub fn print<'a>(
             let word = s.raw();
             // Safety: fresh string word, no allocation since the read.
             unsafe { word.assume_valid(heap) }
-                .get_as::<DenseString>()
+                .get_as::<DenseString>(heap)
                 .map(|s| s.to_rust_string(heap))
                 .unwrap_or_default()
         }
@@ -147,7 +147,8 @@ fn primitive_to_string(heap: &Heap, v: Tagged<'_, Value>) -> Option<String> {
     if v == known.false_object.as_tagged(heap) {
         return Some("false".to_string());
     }
-    v.get_as::<DenseString>().map(|s| s.to_rust_string(heap))
+    v.get_as::<DenseString>(heap)
+        .map(|s| s.to_rust_string(heap))
 }
 
 /// The cold half: full ToString for boxed numbers, objects, and symbols.
@@ -166,7 +167,7 @@ fn console_arg_cold(
     let word = s.raw();
     // Safety: fresh string word, no allocation since the read.
     let text = unsafe { word.assume_valid(heap) }
-        .get_as::<DenseString>()
+        .get_as::<DenseString>(heap)
         .map(|s| s.to_rust_string(heap))
         .unwrap_or_default();
     Ok(Some(text))

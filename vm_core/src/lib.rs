@@ -70,8 +70,8 @@ pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
 };
 pub use value::{
-    HeapPtr, MaybeWeak, PTR_BIT, STRONG_PTR, Smi, TAG_MASK, TAG_SMI, Tagged, Value, WEAK_BIT,
-    WEAK_PTR, Word, encode_smi,
+    MaybeWeak, PTR_BIT, STRONG_PTR, Smi, TAG_MASK, TAG_SMI, Tagged, Value, WEAK_BIT, WEAK_PTR,
+    Word, encode_smi,
 };
 
 pub use heap_api::{
