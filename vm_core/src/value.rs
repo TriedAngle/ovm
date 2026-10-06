@@ -212,10 +212,7 @@ impl<'a> From<Smi> for Tagged<'a, Smi> {
 }
 
 impl<'a, T> Tagged<'a, T> {
-    /// # Safety
-    /// The value must be a strong (non-weak) word that was loaded (or
-    /// allocated) under a borrow of the heap that is still alive for
-    /// `'a`, and no GC may have run since.
+    #[inline(always)]
     pub unsafe fn from_value_unchecked(value: Value) -> Self {
         debug_assert!(
             !value.is_weak_ptr(),
@@ -227,8 +224,8 @@ impl<'a, T> Tagged<'a, T> {
         }
     }
 
-    /// Try to reinterpret an erased word as a Smi: the only safe
-    /// promotion from `Value`, since Smis cannot dangle.
+    // TODO: this can be removed I believe
+    #[inline(always)]
     pub fn try_smi(value: Value) -> Option<Tagged<'static, Value>> {
         if value.is_smi() {
             Some(Tagged {
@@ -244,11 +241,7 @@ impl<'a, T> Tagged<'a, T> {
         self.raw
     }
 
-    /// Erase the phantom type only: the anchor is unchanged. This is
-    /// purely type-level (any heap object is a `Value`).
-    ///
-    /// Must not be used on a weak word: `Tagged<Value>` means "strong".
-    /// Use [`Tagged::erase_weak`] for [`Tagged<MaybeWeak>`].
+    #[inline(always)]
     pub fn erase(self) -> Tagged<'a, Value> {
         debug_assert!(
             !self.raw.is_weak_ptr(),
@@ -260,29 +253,32 @@ impl<'a, T> Tagged<'a, T> {
         }
     }
 
+    #[inline(always)]
     pub unsafe fn cast<U>(self) -> Tagged<'a, U> {
         unsafe { Tagged::from_value_unchecked(self.raw) }
     }
 
+    #[inline(always)]
     pub fn is_smi(self) -> bool {
         self.raw.is_smi()
     }
 
+    #[inline(always)]
     pub fn is_ptr(self) -> bool {
         self.raw.is_ptr()
     }
 
+    #[inline(always)]
     pub fn is_strong_ptr(self) -> bool {
         self.raw.is_strong_ptr()
     }
 
+    #[inline(always)]
     pub fn is_weak_ptr(self) -> bool {
         self.raw.is_weak_ptr()
     }
 
-    /// Pointer equality: compares the canonical address word
-    /// ([`Value::raw_address_word`]), so strong and weak references to the
-    /// same object are equal and Smis compare by their encoded value.
+    #[inline(always)]
     pub fn ptr_eq<U>(self, other: Tagged<'a, U>) -> bool {
         self.raw.raw_address_word() == other.raw.raw_address_word()
     }
@@ -417,24 +413,9 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
         unsafe { Self::from_raw_ptr(ptr) }
     }
 
-    /// The anchored referent. The `'a` heap borrow proves the pointer is
-    /// live and cannot move for the whole borrow, so no GC can invalidate
-    /// it: unlike a raw word, the value may be dereferenced freely until
-    /// the borrow ends.
     pub fn as_ref(self) -> &'a T {
         // Safety: a `Tagged<'a, T: HeapObject>` is always a strong heap
         // pointer valid for `'a` (Smi/weak words have no `HeapObject` type).
-        unsafe { self.as_ref_unchecked() }
-    }
-
-    /// [`as_ref`] without the strong-pointer witness. Hot handlers that
-    /// already proved the anchor is a strong pointer (an unchecked cast from
-    /// a verified slot) use this to skip the redundant tag check.
-    ///
-    /// # Safety
-    /// `self` must hold a strong heap pointer (`raw.is_strong_ptr()`).
-    #[inline(always)]
-    pub unsafe fn as_ref_unchecked(self) -> &'a T {
         unsafe { &*(self.raw.raw_addr() as *const T) }
     }
 
@@ -451,9 +432,7 @@ impl<'a, T: HeapObject> core::ops::Deref for Tagged<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        // Safety: `Tagged<'a, T>` holds a strong pointer valid for `'a`,
-        // so the (shorter) borrow of `self` is valid too.
-        unsafe { self.as_ref_unchecked() }
+        self.as_ref()
     }
 }
 

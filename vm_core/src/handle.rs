@@ -40,9 +40,7 @@ impl<'s, T> core::fmt::Debug for Handle<'s, T> {
 
 impl<'s, T> Handle<'s, T> {
     /// # Safety
-    /// `location` must point at a live GC-visited slot that holds a strong
-    /// value and that stays valid for `'s` (i.e. is owned by a handle scope
-    /// that outlives `'s`).
+    /// `location` must point at a live GC-visited slot that holds a strong value
     pub unsafe fn from_location(location: NonNull<Value>) -> Self {
         Handle {
             location,
@@ -50,18 +48,12 @@ impl<'s, T> Handle<'s, T> {
         }
     }
 
-    /// Re-read the rooted slot under a heap borrow: the returned
-    /// snapshot is valid for `'a` because no GC can run while the
-    /// borrow lives. This is the only safe `Handle -> Tagged` path.
     pub fn as_tagged<'a>(self, _heap: &'a Heap) -> Tagged<'a, T> {
         // Safety: handle slots only ever hold strong values, and the
         // anchor borrow proves no GC ran since the load.
         unsafe { Tagged::from_value_unchecked(*self.location.as_ptr()) }
     }
 
-    /// The current word without an anchor. It may be moved by a later
-    /// collection; only safe to use as an opaque `Value` or re-anchored
-    /// (`Value::assume_valid`).
     pub fn raw(self) -> Value {
         unsafe { *self.location.as_ptr() }
     }
@@ -417,15 +409,12 @@ impl<'a> HandleSlice<'a> {
     /// The empty argument list.
     pub const EMPTY: HandleSlice<'static> = HandleSlice { raw: &[] };
 
-    /// The staged words as plain `Tagged`: for immediate consumption
-    /// (frame pushes copy them into rooted slots without allocating).
+
     pub fn as_tagged(&self) -> &[Tagged<'_, Value>] {
         // Safety: Tagged<Value> is layout-identical to Value.
         unsafe { core::slice::from_raw_parts(self.raw.as_ptr().cast(), self.raw.len()) }
     }
 
-    /// The same window without the lifetime tie: the caller holds the
-    /// rooting by convention.
     #[inline]
     pub fn as_args(&self) -> Args {
         if self.raw.is_empty() {
@@ -450,9 +439,6 @@ impl<'a> HandleSlice<'a> {
         Self { raw }
     }
 
-    /// A free handle to the element at `index`: the slot is already
-    /// rooted, so this allocates nothing and the handle survives
-    /// collection for as long as the slice lives.
     pub fn get(&self, index: usize) -> Option<Handle<'a, Value>> {
         let raw: &'a [Value] = self.raw;
         let word = raw.get(index)?;
@@ -464,7 +450,6 @@ impl<'a> HandleSlice<'a> {
     pub fn iter(&self) -> impl Iterator<Item = Handle<'a, Value>> + 'a {
         let raw: &'a [Value] = self.raw;
         raw.iter().map(|word| {
-            // Safety: see `get`.
             unsafe { Handle::from_location(NonNull::from(word)) }
         })
     }
