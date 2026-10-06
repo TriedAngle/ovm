@@ -12,7 +12,11 @@ use vm_core::{raise_runtime, rt_try};
 /// arguments → `[]`; one non-negative Smi → that many holes (negative or
 /// non-integer numbers are a RangeError); otherwise the arguments are the
 /// elements.
-pub fn array_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_constructor<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -49,7 +53,11 @@ pub fn array_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) ->
 
 /// `Array.prototype.push` (ES 23.1.3.21): append the arguments in order,
 /// growing the elements store; returns the new length.
-pub fn array_push<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_push<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -160,7 +168,11 @@ fn array_push_grow<'a>(
 
 /// `Array.prototype.pop` (ES 23.1.3.20): remove the last element, shorten
 /// `length`, and punch a hole so the store releases the value.
-pub fn array_pop<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_pop<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -200,7 +212,11 @@ pub fn array_pop<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<
 
 /// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):
 /// returns a fresh array-iterator over the receiver (CreateArrayIterator).
-pub fn array_values<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_values<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -233,6 +249,7 @@ pub fn array_values<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagg
 /// iterated array, producing `{ value, done }`.
 pub fn array_iterator_next<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -306,6 +323,7 @@ pub fn array_iterator_next<'a>(
 /// `%ArrayIteratorPrototype%[@@iterator]`: returns the receiver.
 pub fn array_iterator_symbol_iterator<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -320,7 +338,11 @@ pub fn array_iterator_symbol_iterator<'a>(
 /// `Array.prototype.join(separator)` (ES 23.1.3.15): ToString each element
 /// in index order, separated by `separator` (default `","`). Holes,
 /// `undefined`, and `null` render as the empty string.
-pub fn array_join<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_join<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -332,7 +354,11 @@ pub fn array_join<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged
 
 /// `Array.prototype.toString` (ES 23.1.3.37): `join` with the default
 /// separator; any arguments are ignored.
-pub fn array_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_to_string<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -417,7 +443,11 @@ fn join_impl<'a>(
 }
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).
-pub fn array_is_array<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_is_array<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm: _,
         heap,
@@ -437,7 +467,11 @@ pub fn array_is_array<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Ta
 /// The array `length` accessor getter: reads the internal slot (the
 /// descriptor exists so the generic lookup finds `length`; the fast load
 /// path never reaches this).
-pub fn array_length_get<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_length_get<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm: _,
         heap,
@@ -458,7 +492,11 @@ pub fn array_length_get<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> 
 /// ToNumber, then the uint32 truncation must equal it exactly (else a
 /// RangeError — approximated by `OutOfBounds`); shrinking punches holes
 /// in the dropped elements.
-pub fn array_length_set<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_length_set<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -537,7 +575,11 @@ fn slice_bound(
 /// the `[start, end)` elements, holes preserved. An absent/undefined bound
 /// is the fast path (no coercion; `slice()` clones the whole backing
 /// store).
-pub fn array_slice<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_slice<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -604,7 +646,11 @@ pub fn array_slice<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagge
 /// Holes move last, `undefined` before them without invoking `comparefn`;
 /// the default comparator is the elements' `ToString` order. Returns the
 /// receiver.
-pub fn array_sort<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn array_sort<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

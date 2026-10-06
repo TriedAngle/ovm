@@ -60,7 +60,9 @@ impl Object {
             return None;
         }
         let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
-        Some(CallTarget::Runtime(RuntimeIndex(usize::try_from(idx).ok()?)))
+        Some(CallTarget::Runtime(RuntimeIndex(
+            usize::try_from(idx).ok()?,
+        )))
     }
 
     #[inline(always)]

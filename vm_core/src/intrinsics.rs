@@ -76,6 +76,7 @@ pub fn runtime_fn(id: bytecode::RuntimeFn) -> RuntimeCall {
 /// null/undefined (object destructuring sources).
 fn require_object_coercible<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     // internal-runtime convention: the register list IS the argument list
@@ -101,22 +102,25 @@ fn require_object_coercible<'a>(
 /// `delete obj.key` in sloppy code: (obj, key) -> bool.
 fn delete_property_sloppy<'a>(
     nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    delete_property(nctx, args, false)
+    delete_property(nctx, new_target, args, false)
 }
 
 /// `delete obj.key` in strict code: (obj, key) -> bool, TypeError when
 /// the delete fails (ES 13.5.1.2 step 4.h).
 fn delete_property_strict<'a>(
     nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    delete_property(nctx, args, true)
+    delete_property(nctx, new_target, args, true)
 }
 
 fn delete_property<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
     strict: bool,
 ) -> Tagged<'a, Value> {
@@ -229,6 +233,7 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
 /// properties reach here, and sloppy references never throw on failure.
 fn delete_identifier_sloppy<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -255,6 +260,7 @@ fn delete_identifier_sloppy<'a>(
 /// never coerced — delete-super fails before any ToPropertyKey.
 fn delete_super_property<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     _args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -296,7 +302,11 @@ fn stage_handles<'s>(
 /// zero iterations; objects and strings snapshot level 0 of the lazy
 /// chain walk. Other primitives' prototypes are not walked yet (their
 /// own properties are none, so they enumerate empty).
-fn for_in_enumerate<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn for_in_enumerate<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -472,7 +482,11 @@ fn for_in_level_keys<'s>(
 /// an earlier level (yielded or non-enumerable) are skipped; enumerable
 /// survivors are yielded at most once. When a level's snapshot runs
 /// dry, the walk advances to the live prototype and snapshots it.
-fn for_in_next<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn for_in_next<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -714,7 +728,11 @@ fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value
 }
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
-fn get_iterator<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn get_iterator<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -751,7 +769,11 @@ fn get_iterator<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'
 }
 
 /// IteratorNext (ES 8.5.6): (iterator) -> result object.
-fn iterator_next<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn iterator_next<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -793,7 +815,11 @@ fn iterator_next<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<
 }
 
 /// IteratorComplete (ES 8.5.7): (result) -> bool.
-fn iterator_done<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn iterator_done<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -817,7 +843,11 @@ fn iterator_done<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<
 }
 
 /// IteratorValue (ES 8.5.8): (result) -> value.
-fn iterator_value<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn iterator_value<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -841,7 +871,11 @@ fn iterator_value<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged
 
 /// The `in` operator (ES 14.11.2): (key, obj) -> bool. Proxy receivers
 /// run their `has` trap (ES 20.2.5.9).
-fn has_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn has_property<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -884,7 +918,11 @@ fn has_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'
 
 /// CopyDataProperties (ES 8.5.1) with an exclusion list (object rest):
 /// (excluded..., target, source); `excluded` has count−2 entries.
-fn copy_data_properties<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn copy_data_properties<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -996,7 +1034,11 @@ fn copy_data_properties<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> 
 }
 
 /// A fresh private name: (description) -> Symbol.
-fn create_private_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn create_private_name<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm: _, heap, state, ..
     } = nctx;
@@ -1013,7 +1055,11 @@ fn create_private_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
 }
 
 /// PrivateGet (ES 7.3.30): (obj, key) -> value, TypeError when absent.
-fn private_get<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn private_get<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1030,7 +1076,11 @@ fn private_get<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a
 }
 
 /// PrivateSet (ES 7.3.31): (obj, key, value), TypeError when absent.
-fn private_set<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn private_set<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1065,7 +1115,11 @@ fn private_set<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a
 }
 
 /// `#x in obj`: (key, obj) -> bool (own private presence only).
-fn private_in<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn private_in<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1081,7 +1135,11 @@ fn private_in<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a,
 
 /// Attach the instance-field array to the class constructor:
 /// (ctor, fields).
-fn set_class_fields<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn set_class_fields<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1120,7 +1178,11 @@ fn set_class_fields<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagg
 /// InitializeInstanceElements (ES 7.3.33): (ctor, instance) -> instance.
 /// Runs each field initializer with the instance as receiver and defines
 /// the result onto it ({w+, e+, c+}).
-fn init_instance_fields<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn init_instance_fields<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1389,7 +1451,11 @@ fn get_property_lenient<'a>(
 /// constructor after ClassDefinitionEvaluation set its name — an already
 /// explicitly defined `name` wins (ES 15.7.14: SetFunctionName happens
 /// before element installation).
-fn set_function_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn set_function_name<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1487,7 +1553,11 @@ fn set_function_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tag
 /// flags). Defines one accessor half, merging with an existing pair under
 /// the same key; flags bit 0 marks the getter half, PropertyFlags bits
 /// carry enumerability.
-fn install_accessor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn install_accessor<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1584,7 +1654,11 @@ fn install_accessor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagg
 /// installation): (obj, key, value, flags) -> obj. Define sites are
 /// strict-mode code: a rejected define throws a TypeError. flags are
 /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair).
-fn define_own_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn define_own_property<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1718,7 +1792,11 @@ fn define_own_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
 }
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
-fn set_prototype<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn set_prototype<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1746,6 +1824,7 @@ fn set_prototype<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<
 /// TypeError unless the superclass is null or a constructor.
 fn throw_if_not_constructor_or_null<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -1772,6 +1851,7 @@ fn throw_if_not_constructor_or_null<'a>(
 /// value is an Object or null.
 fn throw_if_not_object_or_null<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -1795,6 +1875,7 @@ fn throw_if_not_object_or_null<'a>(
 /// (value) -> value, ReferenceError when `this` is still the hole.
 fn throw_super_not_called_if_hole<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -1816,6 +1897,7 @@ fn throw_super_not_called_if_hole<'a>(
 /// ReferenceError unless `this` is still the hole (super() runs once).
 fn throw_super_already_called_if_not_hole<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -1921,7 +2003,11 @@ fn construct_super_construct<'a>(
 
 /// super(...): (args...) -> instance. Resolves the super constructor and
 /// new.target from the executing frame.
-fn construct_super<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn construct_super<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -1947,6 +2033,7 @@ fn construct_super<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagge
 /// derived constructors, ES 15.7.13): () -> instance.
 fn construct_super_all_args<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     _args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -1978,7 +2065,11 @@ fn construct_super_all_args<'a>(
 /// Arrow-delegated super(): (args..., closure, new_target) -> instance.
 /// The constructor closure and its new.target ride the tail of the
 /// argument window (threaded through .this_function).
-fn construct_super_via<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn construct_super_via<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2030,7 +2121,11 @@ fn construct_super_via<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
 
 /// Direct-eval name load: (name) -> value. Walks the frame context chain
 /// by name; unresolved names fall back to the global object.
-fn load_dynamic_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn load_dynamic_name<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2058,7 +2153,11 @@ fn load_dynamic_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tag
 
 /// Direct-eval name store: (value, name) -> value. Writes through to the
 /// context-chain slot; unresolved names store on the global object.
-fn store_dynamic_name<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn store_dynamic_name<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2126,7 +2225,11 @@ fn is_the_hole(heap: &Heap, v: Tagged<'_, Value>) -> bool {
 
 /// A fresh array of the frame's arguments from formal index `first`:
 /// (first) -> array.
-fn create_rest_parameter<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn create_rest_parameter<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2168,7 +2271,11 @@ fn create_rest_parameter<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) ->
 /// object walked with the split receiver/lookup-start; key coercion runs
 /// after the parent link is resolved (user toString must not change the
 /// chain searched).
-fn super_get_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn super_get_property<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -2249,7 +2356,11 @@ fn super_get_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Ta
 /// shadow inherited data properties on `this` unless the write-through
 /// semantics flag is set; the parent link is resolved before any user key
 /// coercion runs.
-fn super_set_property<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn super_set_property<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

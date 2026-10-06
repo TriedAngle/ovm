@@ -1,6 +1,6 @@
 use crate::runtime_api::make_runtime_plain_function_in;
 use crate::{
-    HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
+    Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object, PropertyDescriptor,
     RuntimeContext, RuntimeIndex, StringInterner, Tagged, Value, VmError,
 };
 
@@ -14,6 +14,7 @@ pub struct KetteTools;
 impl KetteTools {
     pub fn force_minor_gc<'a>(
         ctx: RuntimeContext<'a>,
+        _new_target: Option<Handle<'_, Value>>,
         _args: HandleSlice<'_>,
     ) -> Tagged<'a, Value> {
         let RuntimeContext { heap, .. } = ctx;
@@ -23,6 +24,7 @@ impl KetteTools {
 
     pub fn force_major_gc<'a>(
         ctx: RuntimeContext<'a>,
+        _new_target: Option<Handle<'_, Value>>,
         _args: HandleSlice<'_>,
     ) -> Tagged<'a, Value> {
         let RuntimeContext { heap, .. } = ctx;
@@ -30,7 +32,11 @@ impl KetteTools {
         heap.known().undefined.as_tagged(heap).erase()
     }
 
-    pub fn shutdown<'a>(ctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    pub fn shutdown<'a>(
+        ctx: RuntimeContext<'a>,
+        _new_target: Option<Handle<'_, Value>>,
+        _args: HandleSlice<'_>,
+    ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = ctx;

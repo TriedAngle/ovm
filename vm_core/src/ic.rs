@@ -1582,8 +1582,7 @@ fn update_poly(
 // a second, unrelated callee permanently disables the site.
 // ---------------------------------------------------------------------------
 
-/// The low bit tagging a Smi payload as a runtime callee; the rest is
-/// the registry index shifted up by one.
+/// The low bit tagging a Smi payload as a runtime callee (index << 1).
 pub const CALL_TAG_RUNTIME: i64 = 1;
 
 #[inline]
@@ -1593,8 +1592,7 @@ fn encode_runtime_payload(index: crate::RuntimeIndex) -> i64 {
 
 #[inline]
 fn decode_runtime_payload(raw: i64) -> Option<crate::RuntimeIndex> {
-    (raw & CALL_TAG_RUNTIME != 0)
-        .then(|| crate::RuntimeIndex((raw >> 1) as usize))
+    (raw & CALL_TAG_RUNTIME != 0).then(|| crate::RuntimeIndex((raw >> 1) as usize))
 }
 
 /// A monomorphic bytecode-callee hit: everything a frame push needs,
@@ -1624,15 +1622,9 @@ fn decode_descriptor(desc: i64) -> (usize, usize, FunctionKind) {
     )
 }
 
-/// Probe a call site: a weak-callee match returns the pre-decoded hit (or
-/// the packed runtime callee); anything else is a miss for the generic
-/// call path to handle and record.
-///
-/// The hit tails trust two invariants this module maintains: a weak-ref
-/// hit implies the payload slot pair was written by `call_update` for
-/// this exact callee (bytecode: the resolved `CallableInfoObject`;
-/// runtime: the packed index/shape), and a bytecode callable's slots are
-/// `[info, context]` by layout. The probe never allocates.
+/// Probe a call site: a weak-callee match returns the pre-decoded hit
+/// (or the packed runtime callee); anything else is a miss for the
+/// generic call path to handle and record.
 #[inline(always)]
 pub fn call_probe<'a>(
     heap: &'a Heap,
@@ -1640,9 +1632,9 @@ pub fn call_probe<'a>(
     fb: usize,
     callee: Tagged<'a, Value>,
 ) -> CallProbe<'a> {
-    // Safety: the transmutes below only reinterpret words whose types
-    // the recorded invariants pin down (see above); the borrow is
-    // anchored to `heap`, which the caller holds.
+    // Safety: the transmuted hit words trust invariants this module
+    // maintains — `call_update` recorded the payload for this exact
+    // callee, and bytecode callables are `[info, context]` by layout.
     unsafe {
         let Some(vector) = vector else {
             return CallProbe::Miss;
@@ -1699,8 +1691,7 @@ pub fn call_probe<'a>(
     }
 }
 
-/// What the generic path resolved a call site's callee to: the payload
-/// recorded beside the weak callee reference.
+/// What the generic path resolved a call site's callee to.
 pub enum CallRecord<'a> {
     Bytecode(Tagged<'a, CallableInfoObject>),
     Runtime(crate::RuntimeIndex),

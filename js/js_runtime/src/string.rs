@@ -4,13 +4,14 @@ use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::raise_runtime;
 use vm_core::runtime_api::wrapper_value;
-use vm_core::{DenseString, HandleSlice, Symbol, Tagged, Value, VmError};
+use vm_core::{DenseString, Handle, HandleSlice, Symbol, Tagged, Value, VmError};
 
 pub fn string_constructor<'a>(
     nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let is_construct = nctx.is_construct();
+    let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -44,7 +45,11 @@ pub fn string_constructor<'a>(
     })
 }
 
-pub fn string_value_of<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn string_value_of<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -63,7 +68,11 @@ pub fn string_value_of<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
     }
 }
 
-pub fn string_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn string_to_string<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

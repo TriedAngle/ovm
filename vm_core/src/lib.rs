@@ -532,6 +532,7 @@ impl Thread {
         self.state.handle_scope(|scope| {
             let v = f(
                 nctx,
+                None,
                 scope.stage(
                     &args
                         .iter()

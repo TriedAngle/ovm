@@ -14,7 +14,11 @@ fn smi(v: i64) -> Value {
     Smi::new(v).encode()
 }
 
-fn smi_add<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn smi_add<'a>(
+    nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -55,7 +59,11 @@ fn registered_runtime_invokes_and_checks_types() {
 
 #[test]
 fn runtime_result_is_boxed_when_not_smi() {
-    fn fadd<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    fn fadd<'a>(
+        nctx: RuntimeContext<'a>,
+        new_target: Option<Handle<'_, Value>>,
+        args: HandleSlice<'_>,
+    ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = nctx;
@@ -151,7 +159,11 @@ fn trampoline_maps_errors_to_sentinel_and_pending_exception() {
 
 #[test]
 fn register_runtime_appends_after_well_known() {
-    fn double<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    fn double<'a>(
+        nctx: RuntimeContext<'a>,
+        new_target: Option<Handle<'_, Value>>,
+        args: HandleSlice<'_>,
+    ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = nctx;

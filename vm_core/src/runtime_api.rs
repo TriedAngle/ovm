@@ -8,9 +8,7 @@ use crate::{RuntimeContext, RuntimeIndex};
 
 /// A runtime function object: `CALLABLE | CONSTRUCTOR | RUNTIME`, slots[0]
 /// = runtime index, slots[1] = empty context, [[Prototype]] =
-/// Function.prototype. Every callee takes the call receiver as element 0
-/// of its argument window (the uniform ABI); callees that don't need it
-/// simply ignore it.
+/// Function.prototype.
 pub fn make_runtime_function<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,

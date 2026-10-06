@@ -9,7 +9,11 @@ use vm_core::{
 };
 use vm_core::{raise_runtime, rt_try};
 
-pub fn eval_runtime<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn eval_runtime<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -68,7 +72,11 @@ pub fn eval_runtime<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagg
 }
 
 /// `isNaN(x)`: ToNumber(x) is NaN.
-pub fn is_nan<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn is_nan<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -96,7 +104,11 @@ pub fn is_nan<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a,
 
 /// `print(x)`: ToString(x) to stdout followed by a newline (a shell
 /// convenience, not an ES builtin; the Octane runner reports through it).
-pub fn print<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn print<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -168,7 +180,11 @@ fn console_arg_cold(
 /// `console.log(...args)`: ToString every argument, join with single
 /// spaces, and write the result to stdout followed by a newline (Node's
 /// single-line formatting; a shell convenience, not an ES builtin).
-pub fn console_log<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn console_log<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -192,7 +208,11 @@ pub fn console_log<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagge
 
 /// `performance.now()`: fractional milliseconds since the Unix epoch
 /// (shell timing convenience mirroring the browser API).
-pub fn performance_now<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn performance_now<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    _args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)

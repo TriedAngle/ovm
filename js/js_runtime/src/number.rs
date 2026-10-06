@@ -3,14 +3,15 @@
 use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::runtime_api::wrapper_value;
-use vm_core::{Convert, DenseString, HandleSlice, Heap, Smi, Tagged, Value, VmError};
+use vm_core::{Convert, DenseString, Handle, HandleSlice, Heap, Smi, Tagged, Value, VmError};
 use vm_core::{raise_runtime, rt_try};
 
 pub fn number_constructor<'a>(
     nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
-    let is_construct = nctx.is_construct();
+    let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -41,7 +42,11 @@ pub fn number_constructor<'a>(
     })
 }
 
-pub fn number_value_of<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn number_value_of<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -60,7 +65,11 @@ pub fn number_value_of<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
     }
 }
 
-pub fn number_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn number_to_string<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -100,7 +109,11 @@ fn number_receiver(heap: &Heap, args: &HandleSlice<'_>) -> Result<f64, VmError> 
 
 /// `Number.prototype.toFixed(fractionDigits?)` (ES 21.1.3.3): fixed-point
 /// notation with `fractionDigits` digits after the decimal point.
-pub fn number_to_fixed<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn number_to_fixed<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -134,6 +147,7 @@ pub fn number_to_fixed<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
 /// significant digits, fixed or exponential per the magnitude.
 pub fn number_to_precision<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {

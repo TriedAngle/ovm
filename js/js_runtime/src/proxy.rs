@@ -10,16 +10,21 @@ use vm_core::proxy::Proxy;
 use vm_core::raise_runtime;
 use vm_core::rt_try;
 use vm_core::runtime::Coercion;
-use vm_core::{HandleSlice, Tagged, Value, VmError};
+use vm_core::{Handle, HandleSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
 /// observable (`typeof`, future `Call`/`Construct` dispatch).
-pub fn proxy_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn proxy_constructor<'a>(
+    nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
+    let construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    if nctx.new_target.is_none() {
+    if !construct {
         return raise_runtime(vm, heap, state, VmError::Message(Message::ProxyRequiresNew));
     }
     let (Some(target), Some(handler)) = (args.get(1), args.get(2)) else {
@@ -50,7 +55,11 @@ pub fn proxy_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) ->
 /// `{ proxy, revoke }`; the revoke closure is the JS template installed
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
 /// hidden `__revokeProxy` runtime).
-pub fn proxy_revocable<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn proxy_revocable<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -143,7 +152,11 @@ pub fn proxy_revocable<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> T
 /// Hidden `__revokeProxy(p)`: nulls the proxy's target/handler slots
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
-pub fn proxy_revoke<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn proxy_revoke<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

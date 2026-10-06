@@ -268,7 +268,11 @@ fn load_smi_signed_immediates() {
 
 #[test]
 fn call_runtime_passes_receiver_and_args() {
-    fn add<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+    fn add<'a>(
+        nctx: RuntimeContext<'a>,
+        new_target: Option<Handle<'_, Value>>,
+        args: HandleSlice<'_>,
+    ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = nctx;
@@ -2067,7 +2071,11 @@ fn bytecode_fn<'a>(
     .erase()
 }
 
-fn forty_two<'a>(_: RuntimeContext<'a>, _: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn forty_two<'a>(
+    _: RuntimeContext<'a>,
+    _: Option<Handle<'_, Value>>,
+    _: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     Tagged::from(Smi::new(42))
 }
 
@@ -2130,7 +2138,11 @@ fn call_dispatches_to_runtime_function_object() {
 
 /// Runtime that runs bytecode which throws one call deep; the suspended inner
 /// frames are abandoned and must be unwound when the runtime recovers.
-fn run_failing_inner<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn run_failing_inner<'a>(
+    nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
+    _args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -4351,8 +4363,12 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
 
 /// Runtime constructor probe: reports `nctx.is_construct()` by storing 1/0
 /// into the global property "constructProbe".
-fn construct_probe<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
-    let is_construct = nctx.is_construct();
+fn construct_probe<'a>(
+    nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
+    _args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
+    let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

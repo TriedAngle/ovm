@@ -2,7 +2,7 @@
 
 use vm_core::RuntimeContext;
 use vm_core::raise_runtime;
-use vm_core::{DenseString, HandleSlice, Object, Symbol, Tagged, Value};
+use vm_core::{DenseString, Handle, HandleSlice, Object, Symbol, Tagged, Value};
 
 /// `Symbol(desc)`: a fresh Symbol primitive (ES 20.4.1.1). The description
 /// is ToString'd and stored raw as `[[Description]]`; the `"Symbol(…)"`
@@ -12,6 +12,7 @@ use vm_core::{DenseString, HandleSlice, Object, Symbol, Tagged, Value};
 /// well-known one.
 pub fn symbol_constructor<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {

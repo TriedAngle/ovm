@@ -68,35 +68,11 @@ pub struct RuntimeContext<'a> {
     pub vm: &'a VM,
     pub heap: &'a mut Heap,
     pub state: &'a ContextState,
-    pub new_target: Option<Handle<'a, Value>>,
 }
 
 impl<'a> RuntimeContext<'a> {
     pub fn new(vm: &'a VM, heap: &'a mut Heap, state: &'a ContextState) -> Self {
-        Self {
-            vm,
-            heap,
-            state,
-            new_target: None,
-        }
-    }
-
-    pub fn with_new_target(
-        vm: &'a VM,
-        heap: &'a mut Heap,
-        state: &'a ContextState,
-        new_target: Option<Handle<'a, Value>>,
-    ) -> Self {
-        Self {
-            vm,
-            heap,
-            state,
-            new_target,
-        }
-    }
-
-    pub fn is_construct(&self) -> bool {
-        self.new_target.is_some()
+        Self { vm, heap, state }
     }
 
     /// The state runtime `R` stored during `VM::add`.
@@ -151,7 +127,11 @@ impl<'a> RuntimeContext<'a> {
 /// The runtime-call ABI (tier 1): a single tagged word in the first
 /// return register. Errors are the exception sentinel with the pending
 /// exception set — one error channel at the boundary. `Result` survives only above `execute`.
-pub type RuntimeCall = for<'a, 'r> fn(RuntimeContext<'a>, HandleSlice<'r>) -> Tagged<'a, Value>;
+pub type RuntimeCall = for<'a, 'nt, 'r> fn(
+    RuntimeContext<'a>,
+    Option<Handle<'nt, Value>>,
+    HandleSlice<'r>,
+) -> Tagged<'a, Value>;
 
 /// Materialize `err` as the pending exception and return the sentinel:
 /// the single-channel bridge for runtime bodies.

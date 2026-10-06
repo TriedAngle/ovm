@@ -1,8 +1,8 @@
 use core::cell::Cell;
 
 use crate::{
-    CallableInfoObject, EdgeVisitable, HandleSlice, Heap, Object, Register, Smi, Tagged, Value,
-    Visitor,
+    CallableInfoObject, EdgeVisitable, Handle, HandleSlice, Heap, Object, Register, Smi, Tagged,
+    Value, Visitor,
 };
 
 use crate::VmError;
@@ -56,10 +56,8 @@ pub struct Callee<'a> {
     pub context: Tagged<'a, Value>,
 }
 
-/// A normalized argument window in the arena: `count` words starting
-/// at the absolute slot `src`. Element 0 is always the receiver
-/// (parameter 0 for bytecode frames; runtime callees ignore it when
-/// they don't need it — the one calling ABI, V8-style).
+/// A normalized argument window: `count` words starting at the
+/// absolute slot `src`; element 0 is the receiver.
 #[derive(Copy, Clone)]
 pub struct Args {
     /// absolute slot index of element 0
@@ -67,9 +65,7 @@ pub struct Args {
     pub count: usize,
 }
 
-/// What a scattered call site stages at element 0: the receiver
-/// register's word, or dispatcher-synthesized undefined for function
-/// call sites (V8's ConvertReceiverMode).
+/// What a scattered call site stages at element 0.
 #[derive(Copy, Clone)]
 pub enum Recv {
     /// the receiver register's word (method call sites)
@@ -234,12 +230,6 @@ impl Stack {
     /// (padded to `formal_min` with undefined), write the parameters, and
     /// initialize the header — including the caller's suspended state.
     /// Entry is at pc 0; the accumulator slot is seeded undefined.
-    ///
-    /// `args` may point into the caller's frame (a call window) or at the
-    /// incoming top (scattered staging — see [`Stack::stage_scattered`]):
-    /// the param copy runs before the register-file fill so a source at
-    /// the frame low survives, and the reservation's bounds check covers
-    /// a staged window because it lies inside `[low, low + padded)`.
     #[inline(always)]
     pub fn push_frame(
         &self,
@@ -250,18 +240,23 @@ impl Stack {
         args: Args,
     ) -> Result<FrameMeta, VmError> {
         let count = args.count;
-        self.push_frame_with(heap, caller, callee, new_target, count, |stack, anchor, _| {
-            // params first: a staged source at the frame low would be
-            // clobbered by the register fill. Nothing allocates in
-            // between, so reading not-yet-rooted words here is sound.
-            stack.copy_params(anchor, args.src, count);
-        })
+        self.push_frame_with(
+            heap,
+            caller,
+            callee,
+            new_target,
+            count,
+            |stack, anchor, _| {
+                // params first: a staged source at the frame low would be
+                // clobbered by the register fill. Nothing allocates in
+                // between, so reading not-yet-rooted words here is sound.
+                stack.copy_params(anchor, args.src, count);
+            },
+        )
     }
 
     /// Push a callee frame from scattered call-site registers: the
-    /// parameters are written straight from the caller's operands — no
-    /// intermediate staging — making the hot ≤2-arg JS→JS path a single
-    /// copy per word.
+    /// parameters are written straight from the caller's operands.
     #[inline(always)]
     pub fn push_scattered_frame(
         &self,
@@ -274,35 +269,41 @@ impl Stack {
         argc: usize,
     ) -> Result<FrameMeta, VmError> {
         let count = 1 + argc;
-        self.push_frame_with(heap, caller, callee, new_target, count, |stack, anchor, base| {
-            match recv {
-                Recv::Reg(recv) => {
-                    let src = Self::slot_of(base, recv);
+        self.push_frame_with(
+            heap,
+            caller,
+            callee,
+            new_target,
+            count,
+            |stack, anchor, base| {
+                match recv {
+                    Recv::Reg(recv) => {
+                        let src = Self::slot_of(base, recv);
+                        stack
+                            .slot_unchecked(anchor)
+                            .as_raw()
+                            .store_raw(stack.slot_unchecked(src).raw().to_bits());
+                    }
+                    Recv::Undefined => {
+                        stack
+                            .slot_unchecked(anchor)
+                            .store(stack.undefined.get(heap));
+                    }
+                }
+                for (i, &operand) in sargs.iter().enumerate().take(argc) {
+                    let src = Self::slot_of(base, operand);
                     stack
-                        .slot_unchecked(anchor)
+                        .slot_unchecked(anchor + 1 + i)
                         .as_raw()
                         .store_raw(stack.slot_unchecked(src).raw().to_bits());
                 }
-                Recv::Undefined => {
-                    stack
-                        .slot_unchecked(anchor)
-                        .store(stack.undefined.get(heap));
-                }
-            }
-            for (i, &operand) in sargs.iter().enumerate().take(argc) {
-                let src = Self::slot_of(base, operand);
-                stack
-                    .slot_unchecked(anchor + 1 + i)
-                    .as_raw()
-                    .store_raw(stack.slot_unchecked(src).raw().to_bits());
-            }
-        })
+            },
+        )
     }
 
-    /// The frame-push core shared by every entry point: one bounds
-    /// check, `write` fills `[anchor, anchor+count)` from the call
-    /// site's shape, then the formals pad, register-file fill and
-    /// header init run once for all of them.
+    /// The frame-push core: `write` fills `[anchor, anchor+count)`
+    /// from the call site's shape; the pad, register fill and header
+    /// init are shared by every entry point.
     #[inline(always)]
     fn push_frame_with<P: FnOnce(&Self, usize, usize)>(
         &self,
@@ -358,9 +359,7 @@ impl Stack {
         }
     }
 
-    /// Whole-word copy between arena slots. Overlap-safe: a staged
-    /// window at the incoming top can reach past a small register file
-    /// into the destination param region.
+    /// Whole-word, overlap-safe copy between arena slots.
     #[inline(always)]
     fn copy_params(&self, dst: usize, src: usize, count: usize) {
         unsafe {
@@ -372,13 +371,10 @@ impl Stack {
         }
     }
 
-    /// Stage scattered call operands into one contiguous window
-    /// `[receiver, args...]` at the incoming top WITHOUT bumping it, for
-    /// runtime callees and proxy traps. The words sit above `top` —
-    /// outside the GC's scan — until the consumer bumps `top` over them
-    /// (see `Ctx::call_runtime`); nothing may allocate in between.
-    /// Bytecode frames use `push_scattered_frame` instead (direct write,
-    /// no staging).
+    /// Stage scattered call operands into one contiguous
+    /// `[receiver, args...]` window at the incoming top without bumping
+    /// it: the words are outside the GC's scan until the consumer bumps
+    /// `top` over them — nothing may allocate in between.
     #[inline]
     pub fn stage_scattered(
         &self,
@@ -414,8 +410,7 @@ impl Stack {
     }
 
     /// Stage `[receiver, window...]` at the incoming top (construct
-    /// pushes and method-flavor runtime constructors): the synthesized
-    /// receiver at element 0 followed by the caller's call window.
+    /// pushes and runtime constructors).
     #[inline]
     pub fn stage_construct(
         &self,
@@ -439,9 +434,7 @@ impl Stack {
         })
     }
 
-    /// Stage an external slice at the incoming top (execution entry):
-    /// the following `push_frame` covers the region with its
-    /// reservation.
+    /// Stage an external slice at the incoming top (execution entry).
     #[inline]
     pub fn stage_slice(&self, values: &[Tagged<'_, Value>]) -> Result<Args, VmError> {
         let dst = self.top();
@@ -455,8 +448,20 @@ impl Stack {
         })
     }
 
-    /// The caller's contiguous call window `[base-count+1 .. base]` as a
-    /// normalized [`Args`]: element 0 (the receiver) at its lowest slot.
+    /// A handle over a caller register slot: rooted by the live frame
+    /// for the borrow.
+    #[inline]
+    pub fn reg_handle<'s>(&'s self, base: usize, i: i32) -> Handle<'s, Value> {
+        let slot = self.slot_unchecked(Self::slot_of(base, i));
+        // Safety: Register and Value are whole-word layout twins; the
+        // slot is a rooted, GC-visited word for `'s`.
+        unsafe {
+            let word: &Value = &*(slot as *const Register).cast::<Value>();
+            Handle::from_location(core::ptr::NonNull::from(word))
+        }
+    }
+
+    /// The caller's call window `[base-count+1 .. base]` as an [`Args`].
     #[inline]
     pub fn window(&self, caller_base: usize, base: i32, count: usize) -> Args {
         Args {

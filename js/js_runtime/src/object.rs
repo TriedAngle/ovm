@@ -13,7 +13,11 @@ use vm_core::{
 use vm_core::{raise_runtime, rt_try};
 
 /// Stub: `Object.prototype.toString` returns "[object Object]".
-pub fn object_to_string<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn object_to_string<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    _args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -28,12 +32,13 @@ pub fn object_to_string<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) ->
 /// receiver, so [[Construct]] just returns it.
 pub fn object_constructor<'a>(
     nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
+    let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let is_construct = nctx.new_target.is_some();
     let arg = args
         .get(1)
         .map(|h| h.raw())
@@ -65,6 +70,7 @@ pub fn object_constructor<'a>(
 /// ES2015+ boxes them).
 pub fn object_get_prototype_of<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -84,7 +90,11 @@ pub fn object_get_prototype_of<'a>(
 /// ordinary object with `O` as its [[Prototype]] and no own properties.
 /// The `Properties` argument is accepted only as `undefined` (property
 /// descriptors are not implemented for it yet).
-pub fn object_create<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn object_create<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -158,6 +168,7 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
 /// only).
 pub fn object_has_own_property<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -206,6 +217,7 @@ pub fn object_has_own_property<'a>(
 /// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
 pub fn object_property_is_enumerable<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -263,6 +275,7 @@ pub fn object_property_is_enumerable<'a>(
 /// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
 pub fn object_get_own_property_names<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -312,6 +325,7 @@ pub fn plain_object<'a>(
 /// to a descriptor object via FromPropertyDescriptor semantics.
 pub fn object_get_own_property_descriptor<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -401,6 +415,7 @@ pub fn object_get_own_property_descriptor<'a>(
 /// `defineProperty` trap for proxy receivers, ES 20.2.5.6).
 pub fn object_define_property<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -458,6 +473,7 @@ pub fn object_define_property<'a>(
 
 pub fn object_set_prototype_of<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -510,6 +526,7 @@ pub fn object_set_prototype_of<'a>(
 /// `preventExtensions` trap for proxies (ES 20.2.5.3).
 pub fn object_prevent_extensions<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -567,6 +584,7 @@ pub fn object_prevent_extensions<'a>(
 /// proxies run the `isExtensible` trap with its must-match invariant.
 pub fn object_is_extensible<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -663,7 +681,11 @@ pub fn set_integrity_flags(
 }
 
 /// `Object.seal(O)` (ES 20.1.2.17).
-pub fn object_seal<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn object_seal<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -730,7 +752,11 @@ pub fn object_seal<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagge
 }
 
 /// `Object.freeze(O)` (ES 20.1.2.9).
-pub fn object_freeze<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn object_freeze<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

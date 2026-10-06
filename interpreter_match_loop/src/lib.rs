@@ -119,8 +119,8 @@ fn start<'b>(
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
         Some(CallTarget::Runtime(rt)) => {
             let f = vm.runtime(rt);
-            let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
-            Ok(f(nctx, args))
+            let nctx = RuntimeContext::new(vm, heap, state);
+            Ok(f(nctx, new_target, args))
         }
         Some(CallTarget::Bytecode {
             target,
@@ -1243,13 +1243,7 @@ unsafe fn step<'a>(
             if Proxy::is_proxy(heap, stack.reg(heap, frame_base, callee_reg)) {
                 let staged = fold!(
                     ctx,
-                    stack.stage_scattered(
-                        heap,
-                        frame_base,
-                        Recv::Reg(srcs.0),
-                        srcs.1,
-                        srcs.2
-                    )
+                    stack.stage_scattered(heap, frame_base, Recv::Reg(srcs.0), srcs.1, srcs.2)
                 );
                 let saved_top = stack.top();
                 stack.set_top(staged.src + staged.count);
@@ -1274,13 +1268,7 @@ unsafe fn step<'a>(
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let staged = fold!(
                         ctx,
-                        stack.stage_scattered(
-                            heap,
-                            frame_base,
-                            Recv::Reg(srcs.0),
-                            srcs.1,
-                            srcs.2
-                        )
+                        stack.stage_scattered(heap, frame_base, Recv::Reg(srcs.0), srcs.1, srcs.2)
                     );
                     let v = ctx.call_runtime(rt, staged);
                     vm_core::ic::call_update(
@@ -1391,7 +1379,13 @@ unsafe fn step<'a>(
                         let exception = heap.known().exception.as_tagged(heap).raw();
                         let staged = fold!(
                             ctx,
-                            stack.stage_scattered(heap, frame_base, Recv::Undefined, args.0, args.1)
+                            stack.stage_scattered(
+                                heap,
+                                frame_base,
+                                Recv::Undefined,
+                                args.0,
+                                args.1
+                            )
                         );
                         let v = ctx.call_runtime(rt, staged);
                         // Safety: old-gen singleton word.
@@ -1504,7 +1498,8 @@ unsafe fn step<'a>(
             let count = ops.reg_count(2);
             let exception = heap.known().exception.as_tagged(heap).raw();
             let nctx = RuntimeContext::new(vm, heap, state);
-            let v = f(nctx, stack.args(frame_base, args_base, count));            // Safety: old-gen singleton word.
+            let v = f(nctx, None, stack.args(frame_base, args_base, count));
+            // Safety: old-gen singleton word.
             if v.raw() == exception {
                 Flow::Threw
             } else {

@@ -6,13 +6,14 @@ use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::materialize::Materialize;
 use vm_core::runtime::Coercion;
-use vm_core::{Context, Convert, DenseString, Errors, HandleSlice, Tagged, Value, VmError};
+use vm_core::{Context, Convert, DenseString, Errors, Handle, HandleSlice, Tagged, Value, VmError};
 use vm_core::{raise_runtime, rt_try, spread_apply_args};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
 pub fn function_to_string<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     _args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
@@ -30,7 +31,11 @@ pub fn function_to_string<'a>(
 /// `Function.prototype.call(thisArg, ...args)` (ES 20.2.3.1): invoke the
 /// receiver (args[0], per the receiver-first runtime calling convention)
 /// with `thisArg` as `this`.
-pub fn function_call<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn function_call<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -49,7 +54,11 @@ pub fn function_call<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tag
 /// `Function.prototype.apply(thisArg, argsArray)` (ES 20.2.3.2): invoke
 /// the receiver with `thisArg` as `this` and the array-like spread as
 /// arguments.
-pub fn function_apply<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn function_apply<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -79,7 +88,11 @@ pub fn function_apply<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Ta
 /// `Function.prototype.bind(thisArg, ...prepend)` (ES 20.2.3.5): the
 /// bound function is the JS closure template installed by BIND_PRELUDE,
 /// called with (target, thisArg, prepend-array).
-pub fn function_bind<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn function_bind<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -176,6 +189,7 @@ Function.prototype.__makeBound = function (f, t, p) {
 /// provides the parsing).
 pub fn function_constructor<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {

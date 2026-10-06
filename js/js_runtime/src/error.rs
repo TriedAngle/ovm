@@ -3,16 +3,21 @@ use vm_core::RuntimeContext;
 use vm_core::runtime::Coercion;
 
 use vm_core::{
-    Convert, DenseString, HandleSlice, Object, PropertyDescriptor, Tagged, Value, VmError,
+    Convert, DenseString, Handle, HandleSlice, Object, PropertyDescriptor, Tagged, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
-pub fn error_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn error_constructor<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     make_error(nctx, args, "Error")
 }
 
 pub fn type_error_constructor<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     make_error(nctx, args, "TypeError")
@@ -20,6 +25,7 @@ pub fn type_error_constructor<'a>(
 
 pub fn reference_error_constructor<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     make_error(nctx, args, "ReferenceError")
@@ -83,7 +89,11 @@ pub fn make_error<'a>(
     })
 }
 
-pub fn error_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn error_to_string<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

@@ -2,6 +2,7 @@
 //! database, so every operation is UTC. `Date.parse`/`toISOString`/
 //! `toGMTString`/`toString` are written to round-trip each other exactly.
 
+use vm_core::Handle;
 use vm_core::Heap;
 use vm_core::Object;
 use vm_core::RuntimeContext;
@@ -301,7 +302,11 @@ fn parse_loose(s: &str) -> Option<f64> {
 
 /// `Date.parse(string)` (ES 21.4.2.2): the ISO form plus the formats our
 /// `toGMTString`/`toString` emit. Unparseable input is NaN.
-pub fn date_parse<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn date_parse<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -329,8 +334,12 @@ pub fn date_parse<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged
 /// `Date(...)` / `new Date(...)`: no arguments → now; one numeric
 /// argument → that many epoch milliseconds; anything richer stays
 /// unimplemented.
-pub fn date_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
-    let is_construct = nctx.is_construct();
+pub fn date_constructor<'a>(
+    nctx: RuntimeContext<'a>,
+    new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
+    let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -374,13 +383,21 @@ pub fn date_constructor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> 
 }
 
 /// `Date.now()` (ES 21.4.2.2): epoch milliseconds as a Number.
-pub fn date_now<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn date_now<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    _args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     nctx.heap.new_number(now_millis())
 }
 
 /// `Date.prototype.valueOf` (ES 21.4.4.40): the wrapped epoch
 /// milliseconds. Only real Date instances qualify.
-pub fn date_value_of<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn date_value_of<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -446,6 +463,7 @@ fn format_with<'a>(
 /// (approximated here as a TypeError).
 pub fn date_to_iso_string<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     format_with(nctx, args, format_iso, None)
@@ -454,13 +472,18 @@ pub fn date_to_iso_string<'a>(
 /// `Date.prototype.toGMTString` / `toUTCString` (ES 21.4.4.43).
 pub fn date_to_gmt_string<'a>(
     nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
     args: HandleSlice<'_>,
 ) -> Tagged<'a, Value> {
     format_with(nctx, args, format_gmt, Some("Invalid Date"))
 }
 
 /// `Date.prototype.toString` (ES 21.4.4.41; UTC-formatted).
-pub fn date_to_string<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn date_to_string<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     format_with(nctx, args, format_date_string, Some("Invalid Date"))
 }
 

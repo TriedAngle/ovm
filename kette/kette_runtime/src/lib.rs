@@ -1,7 +1,7 @@
 use vm_core::raise_runtime;
 use vm_core::runtime_api::install_method;
 use vm_core::{
-    DenseString, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, Runtime,
+    DenseString, Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, Runtime,
     RuntimeContext, Tagged, VM, Value, VmError,
 };
 
@@ -43,7 +43,11 @@ impl Runtime for KetteRuntime {
     }
 }
 
-fn console_print<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+fn console_print<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;

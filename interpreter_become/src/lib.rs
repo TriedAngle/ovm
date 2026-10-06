@@ -2652,7 +2652,7 @@ extern "rust-preserve-none" fn op_call_runtime<'a, const STRIDE: usize>(
     let f = ctx.vm().runtime(RuntimeIndex(rt));
     let args = ctx.stack().args(ctx.frame_base(), base, count);
     let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-    let v = f(nctx, args);
+    let v = f(nctx, None, args);
     become resume(
         unsafe { ctx.code_ptr().add(pc) },
         regs,
@@ -3351,7 +3351,6 @@ fn slow_next_pc(ip: *const u8) -> *const u8 {
 }
 
 #[inline(never)]
-
 #[rustc_align(32)]
 extern "rust-preserve-none" fn construct_trampoline<'a>(
     fault_ip: *const u8,
@@ -3463,9 +3462,7 @@ enum MethodCall<'a> {
     Proxy,
 }
 
-/// Invoke a runtime callee over scattered call-site registers: stage the
-/// `[receiver, args...]` window and call (the receiver rides element 0,
-/// exactly as for a bytecode frame).
+/// Invoke a runtime callee over scattered call-site registers.
 #[inline(always)]
 fn dispatch_runtime_scattered<'a>(
     ctx: &Ctx<'a>,
@@ -3486,9 +3483,8 @@ fn dispatch_runtime_scattered<'a>(
     }
 }
 
-/// Invoke a runtime constructor: the construct window carries no
-/// receiver, so undefined is synthesized at element 0 (the uniform ABI)
-/// and `new_target` rides the context.
+/// Invoke a runtime constructor: undefined receiver at element 0,
+/// `new_target` rooted over the callee register.
 #[inline(always)]
 fn dispatch_runtime_construct<'a>(
     ctx: &Ctx<'a>,
@@ -3513,22 +3509,14 @@ fn dispatch_runtime_construct<'a>(
     if staged {
         stack.set_top(rooted);
     }
-    let callee = stack.reg(ctx.heap(), ctx.frame_base(), callee_reg);
-    let raw = ctx.state().handle_scope(|scope| -> Value {
-        let new_target = scope.handle(callee);
-        let nctx = RuntimeContext::with_new_target(
-            ctx.vm(),
-            unsafe { ctx.heap_mut() },
-            ctx.state(),
-            Some(new_target),
-        );
-        f(nctx, stack.slice(args)).raw()
-    });
+    // new.target for the Construct opcode is the callee itself
+    let new_target = Some(stack.reg_handle(ctx.frame_base(), callee_reg));
+    let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
+    let v = f(nctx, new_target, stack.slice(args));
     if staged {
         stack.set_top(saved);
     }
-    // Safety: fresh result word, consumed before any allocation.
-    unsafe { Tagged::<Value>::from_value_unchecked(raw) }
+    v
 }
 
 /// Push a callee frame (facts from a `CallTarget::Bytecode` destructure
@@ -3554,9 +3542,8 @@ fn push_callee_frame<'a>(
     Ok(MethodCall::Frame(frame))
 }
 
-/// Push a callee frame from scattered call-site registers: the
-/// parameters are written straight from the caller's operands (one copy
-/// per word, no intermediate staging).
+/// Push a callee frame from scattered call-site registers (one copy
+/// per word).
 #[inline(always)]
 fn push_scattered_frame<'a>(
     ctx: &Ctx<'a>,
@@ -3617,7 +3604,11 @@ fn call_method_start<'a>(
             )
         }
         vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
-            ctx, rt, Recv::Reg(recv), args, argc,
+            ctx,
+            rt,
+            Recv::Reg(recv),
+            args,
+            argc,
         ))),
         vm_core::ic::CallProbe::Miss => {
             slow_call_method_miss(ctx, pc, size, callee_word, recv, args, argc, fb)
@@ -3660,7 +3651,11 @@ fn call_function_start<'a>(
             )
         }
         vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
-            ctx, rt, Recv::Undefined, args, argc,
+            ctx,
+            rt,
+            Recv::Undefined,
+            args,
+            argc,
         ))),
         vm_core::ic::CallProbe::Miss => {
             slow_call_function_miss(ctx, pc, size, callee_word, args, argc, fb)
@@ -3701,10 +3696,9 @@ fn call_start<'a>(
                 ctx.stack().window(ctx.frame_base(), base, count),
             )
         }
-        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(ctx.call_runtime(
-            rt,
-            ctx.stack().window(ctx.frame_base(), base, count),
-        ))),
+        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(
+            ctx.call_runtime(rt, ctx.stack().window(ctx.frame_base(), base, count)),
+        )),
         vm_core::ic::CallProbe::Miss => slow_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
 }
@@ -3956,8 +3950,8 @@ fn enter<'a>(
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
         Some(CallTarget::Runtime(rt)) => {
             let f = vm.runtime(rt);
-            let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
-            Ok(f(nctx, args))
+            let nctx = RuntimeContext::new(vm, heap, state);
+            Ok(f(nctx, new_target, args))
         }
         Some(CallTarget::Bytecode {
             target,

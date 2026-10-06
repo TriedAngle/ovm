@@ -248,12 +248,8 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// Invoke runtime callee `rt` over a normalized argument window.
-    ///
-    /// `args` may be a window inside the caller's frame (already rooted)
-    /// or staged above `top` ([`Stack::stage_scattered`]): the latter is
-    /// covered by bumping `top` over it for the call's duration, so the
-    /// GC sees the words and a re-entrant execution pushes above them.
+    /// Invoke a runtime callee over a normalized window: one staged
+    /// above `top` is rooted by bumping `top` for the call's duration.
     #[inline(always)]
     pub fn call_runtime(&self, rt: crate::RuntimeIndex, args: crate::Args) -> Tagged<'a, Value> {
         let f = self.vm().runtime(rt);
@@ -265,9 +261,8 @@ impl<'a> Ctx<'a> {
             stack.set_top(rooted);
         }
         // Safety: the heap parts carry Ctx's original borrows.
-        let nctx =
-            crate::RuntimeContext::new(self.vm(), unsafe { self.heap_mut() }, self.state());
-        let v = f(nctx, stack.slice(args));
+        let nctx = crate::RuntimeContext::new(self.vm(), unsafe { self.heap_mut() }, self.state());
+        let v = f(nctx, None, stack.slice(args));
         if staged {
             stack.set_top(saved);
         }

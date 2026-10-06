@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::rt_try;
-use vm_core::{ContextState, Convert, HandleSlice, Heap, Smi, Tagged, VM, Value, VmError};
+use vm_core::{ContextState, Convert, Handle, HandleSlice, Heap, Smi, Tagged, VM, Value, VmError};
 
 /// TODO: better distribution
 /// xorshift64
@@ -103,7 +103,11 @@ fn math_integral<'a>(
 
 /// `Math.sqrt(x)` (ES 22.1.2.29): ToNumber, then the IEEE-754 square root
 /// (NaN/negative input → NaN, ±0 → ±0).
-pub fn math_sqrt<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_sqrt<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -111,7 +115,11 @@ pub fn math_sqrt<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<
 }
 
 /// `Math.log(x)` (ES 22.1.2.15): natural logarithm.
-pub fn math_log<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_log<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -119,7 +127,11 @@ pub fn math_log<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'
 }
 
 /// `Math.pow(base, exponent)` (ES 22.1.2.20).
-pub fn math_pow<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_pow<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -145,7 +157,11 @@ fn js_round(x: f64) -> f64 {
 }
 
 /// `Math.abs(x)` (ES 22.1.2.1).
-pub fn math_abs<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_abs<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -153,7 +169,11 @@ pub fn math_abs<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'
 }
 
 /// `Math.floor(x)` (ES 22.1.2.11).
-pub fn math_floor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_floor<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -161,7 +181,11 @@ pub fn math_floor<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged
 }
 
 /// `Math.ceil(x)` (ES 22.1.2.2).
-pub fn math_ceil<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_ceil<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -169,7 +193,11 @@ pub fn math_ceil<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<
 }
 
 /// `Math.trunc(x)` (ES 22.1.2.31).
-pub fn math_trunc<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_trunc<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -177,7 +205,11 @@ pub fn math_trunc<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged
 }
 
 /// `Math.round(x)` (ES 22.1.2.24).
-pub fn math_round<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_round<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
@@ -220,18 +252,30 @@ fn math_minmax<'a>(
 }
 
 /// `Math.min(...args)` (ES 22.1.2.14).
-pub fn math_min<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_min<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     math_minmax(nctx, args, true)
 }
 
 /// `Math.max(...args)` (ES 22.1.2.13).
-pub fn math_max<'a>(nctx: RuntimeContext<'a>, args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_max<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     math_minmax(nctx, args, false)
 }
 
 /// `Math.random()` (ES 22.1.2.22): a number in `[0, 1)` built from the top
 /// 53 random bits.
-pub fn math_random<'a>(nctx: RuntimeContext<'a>, _args: HandleSlice<'_>) -> Tagged<'a, Value> {
+pub fn math_random<'a>(
+    nctx: RuntimeContext<'a>,
+    _new_target: Option<Handle<'_, Value>>,
+    _args: HandleSlice<'_>,
+) -> Tagged<'a, Value> {
     let bits = random_bits() >> 11;
     nctx.heap
         .new_number((bits as f64) * (1.0 / 9_007_199_254_740_992.0))
