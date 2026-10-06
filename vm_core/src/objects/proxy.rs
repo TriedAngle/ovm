@@ -1346,12 +1346,9 @@ impl Proxy {
         vm: &VM,
         heap: &'a mut Heap,
         state: &ContextState,
-        obj: Tagged<'_, Value>,
+        obj: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
-        state.handle_scope(|scope| {
-            let obj = scope.handle(obj);
-            prevent_extensions_h(vm, heap, state, &scope, &obj)
-        })
+        state.handle_scope(|scope| prevent_extensions_h(vm, heap, state, &scope, &obj))
     }
 
     /// `Object.isExtensible` (ES 20.1.2.14) including the proxy trap and

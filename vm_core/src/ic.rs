@@ -1,7 +1,8 @@
 use crate::{
     AccessorPair, CallTarget, CallableInfoObject, Cell, Context, DataHandler, DataHandlerInit,
     DenseString, FeedbackVector, FixedArray, FunctionKind, Handle, HandleScope, Heap, Map,
-    MaybeWeak, Object, Prototype, SlotName, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
+    MaybeWeak, Object, Prototype, RuntimeIndex, SlotName, Smi, Tagged, Value, WeakFixedArray,
+    WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
@@ -1586,13 +1587,13 @@ fn update_poly(
 pub const CALL_TAG_RUNTIME: i64 = 1;
 
 #[inline]
-fn encode_runtime_payload(index: crate::RuntimeIndex) -> i64 {
+fn encode_runtime_payload(index: RuntimeIndex) -> i64 {
     CALL_TAG_RUNTIME | ((index.0 as i64) << 1)
 }
 
 #[inline]
-fn decode_runtime_payload(raw: i64) -> Option<crate::RuntimeIndex> {
-    (raw & CALL_TAG_RUNTIME != 0).then(|| crate::RuntimeIndex((raw >> 1) as usize))
+fn decode_runtime_payload(raw: i64) -> Option<RuntimeIndex> {
+    (raw & CALL_TAG_RUNTIME != 0).then(|| RuntimeIndex((raw >> 1) as usize))
 }
 
 /// A monomorphic bytecode-callee hit: everything a frame push needs,
@@ -1606,7 +1607,7 @@ pub struct CallHit<'a> {
 
 pub enum CallProbe<'a> {
     Bytecode(CallHit<'a>),
-    Runtime(crate::RuntimeIndex),
+    Runtime(RuntimeIndex),
     Miss,
 }
 
@@ -1622,135 +1623,141 @@ fn decode_descriptor(desc: i64) -> (usize, usize, FunctionKind) {
     )
 }
 
-/// Probe a call site: a weak-callee match returns the pre-decoded hit
-/// (or the packed runtime callee); anything else is a miss for the
-/// generic call path to handle and record.
-#[inline(always)]
-pub fn call_probe<'a>(
-    heap: &'a Heap,
-    vector: Option<Tagged<'a, FeedbackVector>>,
-    fb: usize,
-    callee: Tagged<'a, Value>,
-) -> CallProbe<'a> {
-    // Safety: the transmuted hit words trust invariants this module
-    // maintains — `call_update` recorded the payload for this exact
-    // callee, and bytecode callables are `[info, context]` by layout.
-    unsafe {
-        let Some(vector) = vector else {
-            return CallProbe::Miss;
-        };
-        let state = vector.as_ref().slot(fb).get(heap);
-        if !state.raw().is_weak_ptr() {
-            if state.raw().is_strong_ptr()
-                && !state.ptr_eq(heap.known().the_hole.as_tagged(heap).erase())
-            {
-                return match Object::call_target(heap, callee) {
-                    Some(CallTarget::Runtime(rt)) => CallProbe::Runtime(rt),
-                    Some(CallTarget::Bytecode {
-                        target,
-                        info,
-                        context,
-                        kind,
-                    }) => CallProbe::Bytecode(CallHit {
-                        target,
-                        info,
-                        context,
-                        kind,
-                    }),
-                    _ => CallProbe::Miss,
+impl InlineCache {
+    /// Probe a call site: a weak-callee match returns the pre-decoded hit
+    /// (or the packed runtime callee); anything else is a miss for the
+    /// generic call path to handle and record.
+    #[inline(always)]
+    pub fn call_probe<'a>(
+        heap: &'a Heap,
+        vector: Option<Tagged<'a, FeedbackVector>>,
+        fb: usize,
+        callee: Tagged<'a, Value>,
+    ) -> CallProbe<'a> {
+        // Safety: the transmuted hit words trust invariants this module
+        // maintains — `call_update` recorded the payload for this exact
+        // callee, and bytecode callables are `[info, context]` by layout.
+        unsafe {
+            let Some(vector) = vector else {
+                return CallProbe::Miss;
+            };
+            let state = vector.as_ref().slot(fb).get(heap);
+            if !state.raw().is_weak_ptr() {
+                if state.raw().is_strong_ptr()
+                    && !state.ptr_eq(heap.known().the_hole.as_tagged(heap).erase())
+                {
+                    return match Object::call_target(heap, callee) {
+                        Some(CallTarget::Runtime(rt)) => CallProbe::Runtime(rt),
+                        Some(CallTarget::Bytecode {
+                            target,
+                            info,
+                            context,
+                            kind,
+                        }) => CallProbe::Bytecode(CallHit {
+                            target,
+                            info,
+                            context,
+                            kind,
+                        }),
+                        _ => CallProbe::Miss,
+                    };
+                }
+                return CallProbe::Miss;
+            }
+            if !state.ptr_eq(callee) {
+                return CallProbe::Miss;
+            }
+            let payload = vector.as_ref().slot(fb + 1).get(heap);
+            let raw = payload.raw();
+            if let Some(tag) = Smi::decode(raw) {
+                // runtime callee: index and shape come straight from the
+                // payload — no object decode needed
+                return match decode_runtime_payload(tag.value()) {
+                    Some(rt) => CallProbe::Runtime(rt),
+                    None => CallProbe::Miss,
                 };
             }
-            return CallProbe::Miss;
-        }
-        if !state.ptr_eq(callee) {
-            return CallProbe::Miss;
-        }
-        let payload = vector.as_ref().slot(fb + 1).get(heap);
-        let raw = payload.raw();
-        if let Some(tag) = Smi::decode(raw) {
-            // runtime callee: index and shape come straight from the
-            // payload — no object decode needed
-            return match decode_runtime_payload(tag.value()) {
-                Some(rt) => CallProbe::Runtime(rt),
-                None => CallProbe::Miss,
-            };
-        }
 
-        let info: Tagged<'a, CallableInfoObject> = core::mem::transmute(raw);
-        let (_, _, kind) = decode_descriptor(info.as_ref().descriptor.to_smi_unchecked().value());
-        // Safety: a bytecode callable's slots are `[info, context]` by layout.
-        let obj: Tagged<'a, Object> = core::mem::transmute(callee.raw());
-        let context = obj.as_ref().slot(heap, 1).get(heap);
-        let context: Tagged<'a, Context> = core::mem::transmute(context.raw());
-        CallProbe::Bytecode(CallHit {
-            target: core::mem::transmute(callee.raw()),
-            info,
-            context,
-            kind,
-        })
+            let info: Tagged<'a, CallableInfoObject> = core::mem::transmute(raw);
+            let (_, _, kind) =
+                decode_descriptor(info.as_ref().descriptor.to_smi_unchecked().value());
+            // Safety: a bytecode callable's slots are `[info, context]` by layout.
+            let obj: Tagged<'a, Object> = core::mem::transmute(callee.raw());
+            let context = obj.as_ref().slot(heap, 1).get(heap);
+            let context: Tagged<'a, Context> = core::mem::transmute(context.raw());
+            CallProbe::Bytecode(CallHit {
+                target: core::mem::transmute(callee.raw()),
+                info,
+                context,
+                kind,
+            })
+        }
     }
 }
 
 /// What the generic path resolved a call site's callee to.
 pub enum CallRecord<'a> {
     Bytecode(Tagged<'a, CallableInfoObject>),
-    Runtime(crate::RuntimeIndex),
+    Runtime(RuntimeIndex),
 }
 
-/// Record a call site's callee after the generic path resolved it: re-arm
-/// a cleared weak entry, flip the site megamorphic on an unrelated second
-/// callee, and keep it monomorphic across closures sharing the same
-/// `CallableInfoObject`.
-pub fn call_update(
-    heap: &Heap,
-    vector: Option<Tagged<FeedbackVector>>,
-    fb: usize,
-    callee: Tagged<'_, Value>,
-    record: CallRecord<'_>,
-) {
-    let Some(vector) = vector else {
-        return;
-    };
-    let Some((state_slot, tag_slot)) = vector.as_ref().site(fb) else {
-        return;
-    };
-    let host = vector.erase();
-    if state_slot.is_cleared() {
-        // a collected weak entry leaves the site free to become
-        // monomorphic again
-    } else {
-        let state = state_slot.get(heap);
-        if state.raw().is_strong_ptr() {
-            let hole = heap.known().the_hole.as_tagged(heap).erase();
-            if !state.ptr_eq(hole) {
-                // megamorphic: leave it alone
-                return;
-            }
-        } else if !state.ptr_eq(callee) {
-            let same_code = match (&record, state.as_strong().and_then(|c| c.as_heap_object())) {
-                (CallRecord::Bytecode(info), Some(old)) => old
-                    .as_ref()
-                    .callable_info(heap)
-                    .is_some_and(|old_info| old_info.ptr_eq(*info)),
-                _ => false,
-            };
-            if !same_code {
-                vector.as_ref().set_megamorphic(heap, fb);
-                return;
+impl InlineCache {
+    /// Record a call site's callee after the generic path resolved it:
+    /// re-arm a cleared weak entry, flip the site megamorphic on an
+    /// unrelated second callee, and keep it monomorphic across closures
+    /// sharing the same `CallableInfoObject`.
+    pub fn call_update(
+        heap: &Heap,
+        vector: Option<Tagged<FeedbackVector>>,
+        fb: usize,
+        callee: Tagged<'_, Value>,
+        record: CallRecord<'_>,
+    ) {
+        let Some(vector) = vector else {
+            return;
+        };
+        let Some((state_slot, tag_slot)) = vector.as_ref().site(fb) else {
+            return;
+        };
+        let host = vector.erase();
+        if state_slot.is_cleared() {
+            // a collected weak entry leaves the site free to become
+            // monomorphic again
+        } else {
+            let state = state_slot.get(heap);
+            if state.raw().is_strong_ptr() {
+                let hole = heap.known().the_hole.as_tagged(heap).erase();
+                if !state.ptr_eq(hole) {
+                    // megamorphic: leave it alone
+                    return;
+                }
+            } else if !state.ptr_eq(callee) {
+                let same_code = match (&record, state.as_strong().and_then(|c| c.as_heap_object()))
+                {
+                    (CallRecord::Bytecode(info), Some(old)) => old
+                        .as_ref()
+                        .callable_info(heap)
+                        .is_some_and(|old_info| old_info.ptr_eq(*info)),
+                    _ => false,
+                };
+                if !same_code {
+                    vector.as_ref().set_megamorphic(heap, fb);
+                    return;
+                }
             }
         }
-    }
-    state_slot.set_weak(heap, host, callee);
-    match record {
-        // bytecode: the payload IS the resolved info
-        CallRecord::Bytecode(info) => tag_slot.set_strong(heap, host, info.erase()),
-        // runtime: index and argument shape packed into the payload
-        CallRecord::Runtime(rt) => tag_slot.set(
-            heap,
-            host,
-            Smi::new(encode_runtime_payload(rt))
-                .into_tagged()
-                .as_maybe_weak(),
-        ),
+        state_slot.set_weak(heap, host, callee);
+        match record {
+            // bytecode: the payload IS the resolved info
+            CallRecord::Bytecode(info) => tag_slot.set_strong(heap, host, info.erase()),
+            // runtime: index and argument shape packed into the payload
+            CallRecord::Runtime(rt) => tag_slot.set(
+                heap,
+                host,
+                Smi::new(encode_runtime_payload(rt))
+                    .into_tagged()
+                    .as_maybe_weak(),
+            ),
+        }
     }
 }

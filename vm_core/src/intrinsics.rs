@@ -4,7 +4,7 @@
 //! its ES section), not JS-visible library functions.
 
 use crate::{
-    AccessorPair, Context, Convert, DenseString, FixedArray, Handle, HandleSlice, Heap, Key,
+    AccessorPair, Args, Context, Convert, DenseString, FixedArray, Handle, HandleSlice, Heap, Key,
     LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, StoreOutcome,
     StoreSemantics, StringData, Symbol, Tagged, Transition, Value, VmError, runtime::Coercion,
 };
@@ -77,16 +77,14 @@ pub fn runtime_fn(id: bytecode::RuntimeFn) -> RuntimeCall {
 fn require_object_coercible<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     // internal-runtime convention: the register list IS the argument list
     // (no receiver slot)
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(arg) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let arg = args.get(heap, 0);
     let null = heap.known().null.as_tagged(heap).raw();
     let undefined = heap.known().undefined.as_tagged(heap).raw();
     let raw = arg.raw();
@@ -103,7 +101,7 @@ fn require_object_coercible<'a>(
 fn delete_property_sloppy<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     delete_property(nctx, new_target, args, false)
 }
@@ -113,7 +111,7 @@ fn delete_property_sloppy<'a>(
 fn delete_property_strict<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     delete_property(nctx, new_target, args, true)
 }
@@ -121,23 +119,19 @@ fn delete_property_strict<'a>(
 fn delete_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
     strict: bool,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(target) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(raw_key) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
     // the reference's key is coerced before the base is touched (ES
     // 13.15.5 EvaluatePropertyAccess: user toString/valueOf of a
     // computed key runs even when the delete afterwards throws);
     // the coercion allocates, so the base must stay rooted across it
     state.handle_scope(|scope| {
+        let target = scope.handle(args.get(heap, 0));
+        let raw_key = args.get_handle(heap, 1);
         let Some(key) = rt_try!(
             vm,
             heap,
@@ -234,20 +228,18 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
 fn delete_identifier_sloppy<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(name) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
     let ok = rt_try!(
         vm,
         heap,
         state,
         state.handle_scope(|scope| {
             let global = scope.handle(heap.known().global_object.as_tagged(heap).erase());
+            let name = scope.handle(args.get(heap, 0));
             delete_property_core(heap, &scope, global, name)
         })
     );
@@ -261,7 +253,7 @@ fn delete_identifier_sloppy<'a>(
 fn delete_super_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    _args: HandleSlice<'_>,
+    _args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -305,22 +297,24 @@ fn stage_handles<'s>(
 fn for_in_enumerate<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(subject) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let subject = args.get_handle(heap, 0);
     state.handle_scope(|scope| {
-        let subject = subject.as_tagged(heap);
-        if subject.ptr_eq(heap.known().null.as_tagged(heap))
-            || subject.ptr_eq(heap.known().undefined.as_tagged(heap))
+        let subject = subject;
+        if subject
+            .as_tagged(heap)
+            .ptr_eq(heap.known().null.as_tagged(heap))
+            || subject
+                .as_tagged(heap)
+                .ptr_eq(heap.known().undefined.as_tagged(heap))
         {
             return heap.known().undefined.as_tagged(heap).erase();
         }
-        let Some(level) = for_in_initial_level(heap, subject) else {
+        let Some(level) = for_in_initial_level(heap, subject.as_tagged(heap)) else {
             return heap.known().undefined.as_tagged(heap).erase();
         };
         // the level must survive the key collection and FixedArray
@@ -485,14 +479,12 @@ fn for_in_level_keys<'s>(
 fn for_in_next<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(enumerator) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let enumerator = args.get_handle(heap, 0);
     state.handle_scope(|scope| {
         if enumerator
             .as_tagged(heap)
@@ -731,15 +723,13 @@ fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value
 fn get_iterator<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(obj) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let obj = scope.handle(args.get(heap, 0));
         let symbol = scope.handle(heap.known().iterator_symbol.as_tagged(heap).erase());
         let method = rt_try!(
             vm,
@@ -772,15 +762,13 @@ fn get_iterator<'a>(
 fn iterator_next<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(iter) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let iter = scope.handle(args.get(heap, 0));
         let next_name = scope.handle(heap.known().strings.next.as_tagged(heap).erase());
         let next = rt_try!(
             vm,
@@ -818,15 +806,13 @@ fn iterator_next<'a>(
 fn iterator_done<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(result) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let result = scope.handle(args.get(heap, 0));
         let done_name = scope.handle(heap.known().strings.done.as_tagged(heap).erase());
         let v = match rt_try!(
             vm,
@@ -846,15 +832,13 @@ fn iterator_done<'a>(
 fn iterator_value<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(result) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let result = scope.handle(args.get(heap, 0));
         let value_name = scope.handle(heap.known().strings.value.as_tagged(heap).erase());
         let v = match rt_try!(
             vm,
@@ -874,17 +858,13 @@ fn iterator_value<'a>(
 fn has_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(key) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(obj) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let key = args.get_handle(heap, 0);
+    let obj = args.get_handle(heap, 1);
     // the key coercion allocates (wrapper keys run toString/valueOf):
     // the receiver stays rooted in its argument handle across it
     state.handle_scope(|scope| {
@@ -921,7 +901,7 @@ fn has_property<'a>(
 fn copy_data_properties<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -930,13 +910,11 @@ fn copy_data_properties<'a>(
     if n < 2 {
         return raise_runtime(vm, heap, state, VmError::Arity);
     }
-    let target = rt_try!(vm, heap, state, args.get(n - 2).ok_or(VmError::Arity));
-    let source = rt_try!(vm, heap, state, args.get(n - 1).ok_or(VmError::Arity));
-    let excluded: Vec<Handle<'_, Value>> =
-        match (0..n - 2).map(|i| args.get(i)).collect::<Option<Vec<_>>>() {
-            Some(excluded) => excluded,
-            None => return raise_runtime(vm, heap, state, VmError::Arity),
-        };
+    let target = args.get_handle(heap, n - 2);
+    let source = args.get_handle(heap, n - 1);
+    // the window's own slots root the list across CopyDataProperties'
+    // allocations (getters)
+    let excluded: Vec<Handle<'_, Value>> = (0..n - 2).map(|i| args.get_handle(heap, i)).collect();
     {
         let source_tagged = source.as_tagged(heap);
         // null/undefined and other primitives contribute nothing (string
@@ -1037,15 +1015,14 @@ fn copy_data_properties<'a>(
 fn create_private_name<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm: _, heap, state, ..
     } = nctx;
     let text = args
-        .get(1)
-        .map(|h| h.as_tagged(heap))
-        .and_then(|d| d.get_as::<DenseString>())
+        .get(heap, 1)
+        .get_as::<DenseString>()
         .map(|s| s.to_rust_string(heap));
     state.handle_scope(|scope| {
         let desc = text.unwrap_or_default();
@@ -1058,18 +1035,14 @@ fn create_private_name<'a>(
 fn private_get<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(obj) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(key) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    match Lookup::private_find(heap, obj.as_tagged(heap), key.as_tagged(heap)) {
+    let obj = args.get(heap, 0);
+    let key = args.get(heap, 1);
+    match Lookup::private_find(heap, obj, key) {
         Some(s) => s.get(heap),
         None => raise_runtime(vm, heap, state, VmError::Type),
     }
@@ -1079,27 +1052,21 @@ fn private_get<'a>(
 fn private_set<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(obj) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(key) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(value) = args.get(2) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let value = value.as_tagged(heap).raw();
-    let obj_tagged = obj.as_tagged(heap).raw();
+    let obj = args.get(heap, 0);
+    let key = args.get(heap, 1);
+    let value = args.get(heap, 2);
+    let value = value.raw();
+    let obj_tagged = obj.raw();
     // Safety: fresh rooted words above; `private_find` allocates nothing.
     match Lookup::private_find(
         heap,
         unsafe { Tagged::<Value>::from_value_unchecked(obj_tagged) },
-        key.as_tagged(heap),
+        key,
     ) {
         Some(slot) => {
             slot.set(
@@ -1118,17 +1085,16 @@ fn private_set<'a>(
 fn private_in<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _,
+        heap,
+        state: _,
+        ..
     } = nctx;
-    let Some(key) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(obj) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let key = args.get_handle(heap, 0);
+    let obj = args.get_handle(heap, 1);
     let has = Lookup::private_find(heap, obj.as_tagged(heap), key.as_tagged(heap)).is_some();
     Convert::boolean(heap, has)
 }
@@ -1138,17 +1104,13 @@ fn private_in<'a>(
 fn set_class_fields<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(ctor) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(fields) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let ctor = args.get_handle(heap, 0);
+    let fields = args.get_handle(heap, 1);
     let mut ok = false;
     if let Some(obj) = ctor.as_tagged(heap).as_heap_object() {
         let slots = obj.as_ref().slots.get(heap);
@@ -1161,11 +1123,10 @@ fn set_class_fields<'a>(
             .is_class_constructor()
             && slots.len() >= 3
         {
-            slots.as_ref().element_slot(2).set(
-                heap,
-                ctor.as_tagged(heap).erase(),
-                fields.as_tagged(heap).erase(),
-            );
+            slots
+                .as_ref()
+                .element_slot(2)
+                .set(heap, ctor.as_tagged(heap), fields.as_tagged(heap));
             ok = true;
         }
     }
@@ -1181,17 +1142,13 @@ fn set_class_fields<'a>(
 fn init_instance_fields<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(ctor) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(instance) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let ctor = args.get_handle(heap, 0);
+    let instance = args.get_handle(heap, 1);
     state.handle_scope(|scope| -> Tagged<'a, Value> {
         let fields = {
             let Some(obj) = ctor.as_tagged(heap).as_heap_object() else {
@@ -1454,23 +1411,14 @@ fn get_property_lenient<'a>(
 fn set_function_name<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(fn_value) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(raw_key) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let prefix = args
-        .get(2)
-        .map(|h| h.as_tagged(heap))
-        .and_then(|v| Smi::decode(v.raw()))
-        .map(|s| s.value())
-        .unwrap_or(0);
+    let fn_value = args.get_handle(heap, 0);
+    let raw_key = args.get_handle(heap, 1);
+    let prefix = args.get(heap, 2).to_i64().unwrap_or(0);
     // name construction allocates (interning): the closure stays rooted
     // in its argument handle across it
     state.handle_scope(|scope| {
@@ -1556,26 +1504,15 @@ fn set_function_name<'a>(
 fn install_accessor<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(target) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(raw_key) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(closure) = args.get(2) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let flags = args
-        .get(3)
-        .map(|h| h.as_tagged(heap))
-        .and_then(|v| Smi::decode(v.raw()))
-        .map(|s| s.value() as u32)
-        .unwrap_or(0);
+    let target = args.get_handle(heap, 0);
+    let raw_key = args.get_handle(heap, 1);
+    let closure = args.get_handle(heap, 2);
+    let flags = args.get(heap, 3).to_i64().map(|v| v as u32).unwrap_or(0);
     // the key coercion allocates: target and closure stay rooted in
     // their argument handles across it
     state.handle_scope(|scope| {
@@ -1620,7 +1557,7 @@ fn install_accessor<'a>(
                 }
             }
         }
-        let closure_word = closure.as_tagged(heap).erase();
+        let closure_word = closure.as_tagged(heap);
         if is_getter {
             get = closure_word;
         } else {
@@ -1657,26 +1594,15 @@ fn install_accessor<'a>(
 fn define_own_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(receiver) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(raw_key) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(value) = args.get(2) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let flags = args
-        .get(3)
-        .map(|h| h.as_tagged(heap))
-        .and_then(|v| Smi::decode(v.raw()))
-        .map(|s| s.value() as u32)
-        .unwrap_or(0);
+    let receiver = args.get_handle(heap, 0);
+    let raw_key = args.get_handle(heap, 1);
+    let value = args.get_handle(heap, 2);
+    let flags = args.get(heap, 3).to_i64().map(|v| v as u32).unwrap_or(0);
     // the key coercion allocates: receiver and value stay rooted in
     // their argument handles across it
     state.handle_scope(|scope| {
@@ -1795,18 +1721,14 @@ fn define_own_property<'a>(
 fn set_prototype<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(obj) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let Some(proto) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let obj = args.get_handle(heap, 0);
+        let proto = args.get_handle(heap, 1);
         let obj_ref = scope
             .cast::<Object>(obj.as_tagged(heap))
             .expect("obj is an object");
@@ -1825,14 +1747,12 @@ fn set_prototype<'a>(
 fn throw_if_not_constructor_or_null<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(v) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let v = args.get(heap, 0);
     let v_raw = v.raw();
     let null = heap.known().null.as_tagged(heap).raw();
     // Safety: rooted-slot word re-anchored fresh; no allocation between
@@ -1852,14 +1772,12 @@ fn throw_if_not_constructor_or_null<'a>(
 fn throw_if_not_object_or_null<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(v) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let v = args.get(heap, 0);
     let raw = v.raw();
     let null = heap.known().null.as_tagged(heap).raw();
     // Safety: rooted-slot word, fresh at both uses below.
@@ -1876,14 +1794,12 @@ fn throw_if_not_object_or_null<'a>(
 fn throw_super_not_called_if_hole<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(v) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let v = args.get(heap, 0);
     let raw = v.raw();
     if raw == heap.known().the_hole.as_tagged(heap).raw() {
         // "Must call super constructor before accessing 'this'"
@@ -1898,14 +1814,12 @@ fn throw_super_not_called_if_hole<'a>(
 fn throw_super_already_called_if_not_hole<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(v) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let v = args.get(heap, 0);
     let raw = v.raw();
     if raw != heap.known().the_hole.as_tagged(heap).raw() {
         // "Super constructor may only be called once"
@@ -1966,7 +1880,7 @@ fn construct_super_construct<'a>(
         };
         let mut args_v = Vec::with_capacity(args.len() + 1);
         args_v.push(receiver);
-        args_v.extend(args.iter().copied());
+        args_v.extend_from_slice(args);
         let call_args = stage_handles(heap, &scope, &args_v);
         let result = scope.handle(rt_try!(
             vm,
@@ -2006,7 +1920,7 @@ fn construct_super_construct<'a>(
 fn construct_super<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -2016,10 +1930,7 @@ fn construct_super<'a>(
         // keep the resolved parts rooted across the construct below
         let callee = scope.handle(callee);
         let new_target = scope.handle(new_target);
-        let arg_words: Vec<Handle<'_, Value>> = args
-            .iter()
-            .map(|h| scope.handle(h.as_tagged(heap)))
-            .collect();
+        let arg_words: Vec<Handle<'_, Value>> = args.iter(heap).map(|t| scope.handle(t)).collect();
         construct_super_construct(
             RuntimeContext::new(vm, heap, state),
             callee,
@@ -2034,7 +1945,7 @@ fn construct_super<'a>(
 fn construct_super_all_args<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    _args: HandleSlice<'_>,
+    _args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -2068,7 +1979,7 @@ fn construct_super_all_args<'a>(
 fn construct_super_via<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -2078,8 +1989,8 @@ fn construct_super_via<'a>(
         return raise_runtime(vm, heap, state, VmError::Arity);
     }
     state.handle_scope(|scope| {
-        let closure = rt_try!(vm, heap, state, args.get(n - 2).ok_or(VmError::Arity));
-        let new_target = rt_try!(vm, heap, state, args.get(n - 1).ok_or(VmError::Arity));
+        let closure = args.get_handle(heap, n - 2);
+        let new_target = args.get_handle(heap, n - 1);
         let callee = {
             let Some(obj) = closure.as_tagged(heap).as_heap_object() else {
                 return raise_runtime(vm, heap, state, VmError::Type);
@@ -2100,14 +2011,8 @@ fn construct_super_via<'a>(
             }
             scope.handle(proto)
         };
-        let arg_words: Vec<Handle<'_, Value>> = rt_try!(
-            vm,
-            heap,
-            state,
-            (0..n - 2)
-                .map(|i| args.get(i).ok_or(VmError::Arity))
-                .collect::<Result<_, _>>()
-        );
+        let arg_words: Vec<Handle<'_, Value>> =
+            (0..n - 2).map(|i| args.get_handle(heap, i)).collect();
         construct_super_construct(
             RuntimeContext::new(vm, heap, state),
             callee,
@@ -2124,14 +2029,12 @@ fn construct_super_via<'a>(
 fn load_dynamic_name<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(name) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let name = args.get_handle(heap, 0);
     state.handle_scope(|scope| {
         let found = rt_try!(
             vm,
@@ -2156,17 +2059,13 @@ fn load_dynamic_name<'a>(
 fn store_dynamic_name<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(value) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(name) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let value = args.get_handle(heap, 0);
+    let name = args.get_handle(heap, 1);
     state.handle_scope(|scope| {
         let found = rt_try!(
             vm,
@@ -2228,17 +2127,12 @@ fn is_the_hole(heap: &Heap, v: Tagged<'_, Value>) -> bool {
 fn create_rest_parameter<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let first = args
-        .get(0)
-        .map(|h| h.as_tagged(heap))
-        .and_then(|v| Smi::decode(v.raw()))
-        .map(|s| s.value() as usize)
-        .unwrap_or(0);
+    let first = args.get(heap, 0).to_i64().map(|v| v as usize).unwrap_or(0);
     state.handle_scope(|scope| {
         if !state.is_frame_active() {
             return raise_runtime(vm, heap, state, VmError::Type);
@@ -2274,20 +2168,14 @@ fn create_rest_parameter<'a>(
 fn super_get_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(home) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(recv) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(raw_key) = args.get(2) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let home = args.get_handle(heap, 0);
+    let recv = args.get_handle(heap, 1);
+    let raw_key = args.get_handle(heap, 2);
     if recv
         .as_tagged(heap)
         .ptr_eq(heap.known().the_hole.as_tagged(heap).erase())
@@ -2359,29 +2247,16 @@ fn super_get_property<'a>(
 fn super_set_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(home) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(recv) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(raw_key) = args.get(2) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let Some(value) = args.get(3) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let semantics_flag = args
-        .get(4)
-        .map(|h| h.as_tagged(heap))
-        .and_then(|v| Smi::decode(v.raw()))
-        .map(|s| s.value() as u32)
-        .unwrap_or(0);
+    let home = args.get_handle(heap, 0);
+    let recv = args.get_handle(heap, 1);
+    let raw_key = args.get_handle(heap, 2);
+    let value = args.get_handle(heap, 3);
+    let semantics_flag = args.get(heap, 4).to_i64().map(|v| v as u32).unwrap_or(0);
     if recv
         .as_tagged(heap)
         .ptr_eq(heap.known().the_hole.as_tagged(heap).erase())

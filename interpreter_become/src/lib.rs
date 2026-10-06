@@ -5,7 +5,7 @@
 #![allow(unused_macros, unused_unsafe, unused_variables)]
 
 use bytecode::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode};
-use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe};
+use vm_core::ic::{CallHit, CallProbe, ElementHit, Hit, InlineCache, MonoProbe};
 use vm_core::proxy::Proxy;
 use vm_core::{
     Args, CallTarget, Callee, Coercion, Compare, Context, ContextState, Convert, Ctx, ExecuteFn,
@@ -2650,7 +2650,7 @@ extern "rust-preserve-none" fn op_call_runtime<'a, const STRIDE: usize>(
     let base = ops.signed::<1>();
     let count = ops.unsigned::<2>();
     let f = ctx.vm().runtime(RuntimeIndex(rt));
-    let args = ctx.stack().args(ctx.frame_base(), base, count);
+    let args = ctx.stack().window(ctx.frame_base(), base, count);
     let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
     let v = f(nctx, None, args);
     become resume(
@@ -3504,16 +3504,15 @@ fn dispatch_runtime_construct<'a>(
         }
     };
     let saved = stack.top();
-    let rooted = args.src + args.count;
-    let staged = rooted > saved;
-    if staged {
-        stack.set_top(rooted);
+    let bump = stack.rooting_top(args);
+    if let Some(top) = bump {
+        stack.set_top(top);
     }
     // new.target for the Construct opcode is the callee itself
     let new_target = Some(stack.reg_handle(ctx.frame_base(), callee_reg));
     let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-    let v = f(nctx, new_target, stack.slice(args));
-    if staged {
+    let v = f(nctx, new_target, args);
+    if bump.is_some() {
         stack.set_top(saved);
     }
     v
@@ -3579,8 +3578,8 @@ fn call_method_start<'a>(
     argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
-        vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
+    match InlineCache::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
+        CallProbe::Bytecode(CallHit {
             target,
             info,
             context,
@@ -3603,14 +3602,14 @@ fn call_method_start<'a>(
                 argc,
             )
         }
-        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
+        CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
             ctx,
             rt,
             Recv::Reg(recv),
             args,
             argc,
         ))),
-        vm_core::ic::CallProbe::Miss => {
+        CallProbe::Miss => {
             slow_call_method_miss(ctx, pc, size, callee_word, recv, args, argc, fb)
         }
     }
@@ -3626,8 +3625,8 @@ fn call_function_start<'a>(
     argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
-        vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
+    match InlineCache::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
+        CallProbe::Bytecode(CallHit {
             target,
             info,
             context,
@@ -3650,14 +3649,14 @@ fn call_function_start<'a>(
                 argc,
             )
         }
-        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
+        CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
             ctx,
             rt,
             Recv::Undefined,
             args,
             argc,
         ))),
-        vm_core::ic::CallProbe::Miss => {
+        CallProbe::Miss => {
             slow_call_function_miss(ctx, pc, size, callee_word, args, argc, fb)
         }
     }
@@ -3674,8 +3673,8 @@ fn call_start<'a>(
     count: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
-        vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
+    match InlineCache::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
+        CallProbe::Bytecode(CallHit {
             target,
             info,
             context,
@@ -3696,10 +3695,10 @@ fn call_start<'a>(
                 ctx.stack().window(ctx.frame_base(), base, count),
             )
         }
-        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(
+        CallProbe::Runtime(rt) => Ok(MethodCall::Value(
             ctx.call_runtime(rt, ctx.stack().window(ctx.frame_base(), base, count)),
         )),
-        vm_core::ic::CallProbe::Miss => slow_call_miss(ctx, pc, size, callee_word, base, count, fb),
+        CallProbe::Miss => slow_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
 }
 
@@ -3951,7 +3950,7 @@ fn enter<'a>(
         Some(CallTarget::Runtime(rt)) => {
             let f = vm.runtime(rt);
             let nctx = RuntimeContext::new(vm, heap, state);
-            Ok(f(nctx, new_target, args))
+            Ok(f(nctx, new_target, args.as_args()))
         }
         Some(CallTarget::Bytecode {
             target,

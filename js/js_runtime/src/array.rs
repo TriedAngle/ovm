@@ -3,8 +3,7 @@
 
 use vm_core::RuntimeContext;
 use vm_core::{
-    ContextState, Convert, DenseString, Handle, HandleSlice, Heap, Object, Smi, Tagged, VM, Value,
-    VmError,
+    Args, ContextState, Convert, DenseString, Handle, Heap, Object, Smi, Tagged, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -15,13 +14,13 @@ use vm_core::{raise_runtime, rt_try};
 pub fn array_constructor<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let argv: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).skip(1).collect();
+        let argv: Vec<Tagged<'_, Value>> = args.iter(heap).skip(1).collect();
         let single_len = match argv.as_slice() {
             [v] => match Smi::decode(v.raw()) {
                 Some(s) if s.value() >= 0 => Some(usize::try_from(s.value()).unwrap_or(usize::MAX)),
@@ -56,7 +55,7 @@ pub fn array_constructor<'a>(
 pub fn array_push<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -73,12 +72,12 @@ pub fn array_push<'a>(
 /// One argument, receiver already an array with spare capacity: append with
 /// no allocation and no handle scope. Returns `None` for anything else.
 #[inline(always)]
-fn array_push_fast<'a>(heap: &Heap, args: HandleSlice<'_>) -> Option<Tagged<'a, Value>> {
+fn array_push_fast<'a>(heap: &Heap, args: Args) -> Option<Tagged<'a, Value>> {
     if args.len() != 2 {
         return None;
     }
-    let receiver = args.get(0)?;
-    let arg = args.get(1)?;
+    let receiver = args.get_handle(heap, 0);
+    let arg = args.get_handle(heap, 1);
     let r = receiver.as_tagged(heap);
     let obj = r.as_heap_object()?;
     if !obj.as_ref().is_array(heap) {
@@ -102,11 +101,9 @@ fn array_push_impl<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
     state: &'a ContextState,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
-    let Some(receiver) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let receiver = args.get_handle(heap, 0);
     let mut len = {
         let r = receiver.as_tagged(heap);
         let Some(obj) = r.as_heap_object() else {
@@ -117,7 +114,8 @@ fn array_push_impl<'a>(
         }
         obj.as_ref().length()
     };
-    for arg in args.iter().skip(1) {
+    for i in 1..args.len() {
+        let arg = args.get_handle(heap, i);
         let in_place = {
             let r = receiver.as_tagged(heap);
             let obj = r.as_heap_object().expect("validated above");
@@ -171,15 +169,13 @@ fn array_push_grow<'a>(
 pub fn array_pop<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let receiver = args.get_handle(heap, 0);
         let Some(obj) = scope.cast::<Object>(receiver.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
@@ -215,17 +211,16 @@ pub fn array_pop<'a>(
 pub fn array_values<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     let (receiver, is_array) = {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let receiver = receiver.as_tagged(heap);
+        let receiver = args.get_handle(heap, 0);
+        let receiver = receiver;
         let is_array = receiver
+            .as_tagged(heap)
             .as_heap_object()
             .is_some_and(|o| o.as_ref().is_array(heap));
         (receiver.raw(), is_array)
@@ -250,14 +245,12 @@ pub fn array_values<'a>(
 pub fn array_iterator_next<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(receiver) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let receiver = args.get_handle(heap, 0);
     state.handle_scope(|scope| {
         let (array, index) = {
             let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
@@ -324,15 +317,16 @@ pub fn array_iterator_next<'a>(
 pub fn array_iterator_symbol_iterator<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _,
+        heap,
+        state: _,
+        ..
     } = nctx;
-    let Some(arg) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    arg.as_tagged(heap)
+    let arg = args.get(heap, 0);
+    arg
 }
 
 /// `Array.prototype.join(separator)` (ES 23.1.3.15): ToString each element
@@ -341,15 +335,14 @@ pub fn array_iterator_symbol_iterator<'a>(
 pub fn array_join<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(receiver) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    join_impl(vm, heap, state, receiver, args.get(1))
+    let receiver = args.get_handle(heap, 0);
+    let separator = (args.len() > 1).then(|| args.get_handle(heap, 1));
+    join_impl(vm, heap, state, receiver, separator)
 }
 
 /// `Array.prototype.toString` (ES 23.1.3.37): `join` with the default
@@ -357,14 +350,12 @@ pub fn array_join<'a>(
 pub fn array_to_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(receiver) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let receiver = args.get_handle(heap, 0);
     join_impl(vm, heap, state, receiver, None)
 }
 
@@ -446,7 +437,7 @@ fn join_impl<'a>(
 pub fn array_is_array<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm: _,
@@ -454,10 +445,7 @@ pub fn array_is_array<'a>(
         state: _,
         ..
     } = nctx;
-    let arg = args
-        .get(1)
-        .map(|h| h.as_tagged(heap))
-        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+    let arg = args.get(heap, 1);
     let is_array = arg
         .as_heap_object()
         .is_some_and(|o| o.as_ref().is_array(heap));
@@ -470,7 +458,7 @@ pub fn array_is_array<'a>(
 pub fn array_length_get<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm: _,
@@ -478,9 +466,7 @@ pub fn array_length_get<'a>(
         state: _,
         ..
     } = nctx;
-    let Some(receiver) = args.get(0) else {
-        return heap.known().undefined.as_tagged(heap).erase();
-    };
+    let receiver = args.get_handle(heap, 0);
     receiver
         .as_tagged(heap)
         .as_heap_object()
@@ -495,18 +481,14 @@ pub fn array_length_get<'a>(
 pub fn array_length_set<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let Some(value) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let receiver = args.get_handle(heap, 0);
+        let value = args.get(heap, 1);
         let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
@@ -514,7 +496,7 @@ pub fn array_length_set<'a>(
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         let obj = scope.handle(obj);
-        let value = scope.handle(value.as_tagged(heap));
+        let value = scope.handle(value);
         let n = match Object::to_numeric(vm, heap, state, value) {
             Ok(Some(n)) => n,
             Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
@@ -578,15 +560,13 @@ fn slice_bound(
 pub fn array_slice<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let receiver = args.get_handle(heap, 0);
         let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
@@ -596,12 +576,24 @@ pub fn array_slice<'a>(
         let obj = scope.handle(obj);
         let len = obj.as_tagged(heap).as_ref().length() as f64;
 
-        let start = match slice_bound(vm, heap, state, args.get(1), 0.0) {
+        let start = match slice_bound(
+            vm,
+            heap,
+            state,
+            (args.len() > 1).then(|| args.get_handle(heap, 1)),
+            0.0,
+        ) {
             Ok(Some(v)) => v,
             Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
             Err(err) => return raise_runtime(vm, heap, state, err),
         };
-        let end = match slice_bound(vm, heap, state, args.get(2), len) {
+        let end = match slice_bound(
+            vm,
+            heap,
+            state,
+            (args.len() > 2).then(|| args.get_handle(heap, 2)),
+            len,
+        ) {
             Ok(Some(v)) => v,
             Ok(None) => return heap.known().exception.as_tagged(heap).erase(),
             Err(err) => return raise_runtime(vm, heap, state, err),
@@ -649,15 +641,13 @@ pub fn array_slice<'a>(
 pub fn array_sort<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let receiver = args.get_handle(heap, 0);
         let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
@@ -666,14 +656,18 @@ pub fn array_sort<'a>(
         }
         let obj = scope.handle(obj);
         // an explicit `undefined` comparator means the default one
-        let cmpfn = match args.get(1) {
-            Some(c) if c.as_tagged(heap) != heap.known().undefined.as_tagged(heap) => {
-                if !Object::is_callable(heap, c.as_tagged(heap)) {
+        let cmpfn = if args.len() > 1 {
+            let c = args.get(heap, 1);
+            if c != heap.known().undefined.as_tagged(heap) {
+                if !Object::is_callable(heap, c) {
                     return raise_runtime(vm, heap, state, VmError::Type);
                 }
-                Some(scope.handle(c.as_tagged(heap)))
+                Some(scope.handle(c))
+            } else {
+                None
             }
-            _ => None,
+        } else {
+            None
         };
         let undefined = heap.known().undefined.as_tagged(heap).erase().raw();
         let exception = heap.known().exception.as_tagged(heap).erase().raw();

@@ -7,7 +7,8 @@
 //! frame header before resuming dispatch.
 
 use bytecode::Opcode;
-use vm_core::ic::CallRecord;
+use vm_core::ic::{CallRecord, InlineCache};
+use vm_core::interp::{unwind, Unwind};
 use vm_core::proxy::Proxy;
 use vm_core::{
     CallTarget, CallableInfoObject, Callee, Coercion, Context, ContextInit, ContextState, Convert,
@@ -19,6 +20,7 @@ use crate::{
     FloatReg, MethodCall, Ops, Regs, RootsArg, TableArg, base, dispatch_runtime_scattered,
     push_callee_frame, push_scattered_frame, read_signed, resume, slow_next_pc,
 };
+use vm_core::cold::{ add, bitwise, compare, construct, global_load, keyed_load, keyed_load_imm, keyed_store, named_load, negate, numeric, store_global, store_named, store_named_no_shadow };
 
 /// Define a become-interpreter slow-path handler (always `pub`). The
 /// expansion snapshots the faulting instruction's code-relative pc
@@ -92,7 +94,7 @@ slow_handler!(slow_box_sub_loc |ip, ops, regs, acc, ctx, float| {
 
 slow_handler!(slow_add |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
-    unsafe { vm_core::cold::add(ctx, lhs, acc) }
+    unsafe { add(ctx, lhs, acc) }
 });
 
 slow_handler!(slow_numeric |ip, ops, regs, acc, ctx, float| {
@@ -105,14 +107,14 @@ slow_handler!(slow_numeric |ip, ops, regs, acc, ctx, float| {
         Opcode::Exp => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    let v = unsafe { vm_core::cold::numeric(ctx, lhs, acc, f) };
+    let v = unsafe { numeric(ctx, lhs, acc, f) };
     v
 });
 
 slow_handler!(slow_add_immediate |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
     let imm = Smi::new(ops.signed::<1>() as i64).into_tagged();
-    unsafe { vm_core::cold::add(ctx, lhs, imm) }
+    unsafe { add(ctx, lhs, imm) }
 });
 
 slow_handler!(slow_numeric_immediate |ip, ops, regs, acc, ctx, float| {
@@ -126,11 +128,11 @@ slow_handler!(slow_numeric_immediate |ip, ops, regs, acc, ctx, float| {
         Opcode::ExpImmediate => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    unsafe { vm_core::cold::numeric(ctx, lhs, imm, f) }
+    unsafe { numeric(ctx, lhs, imm, f) }
 });
 
 slow_handler!(slow_negate |ip, ops, regs, acc, ctx, float| {
-    unsafe { vm_core::cold::negate(ctx, acc) }
+    unsafe { negate(ctx, acc) }
 });
 
 /// Map a bitwise/shift opcode to `cold::bitwise`'s kind index
@@ -149,14 +151,14 @@ fn bitwise_kind(op: Opcode) -> u8 {
 slow_handler!(slow_bitwise |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
     let kind = bitwise_kind(unsafe { ops.op() });
-    unsafe { vm_core::cold::bitwise(ctx, kind, lhs, acc) }
+    unsafe { bitwise(ctx, kind, lhs, acc) }
 });
 
 slow_handler!(slow_bitwise_immediate |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
     let imm = Smi::new(ops.signed::<1>() as i64).into_tagged();
     let kind = bitwise_kind(unsafe { ops.op() });
-    unsafe { vm_core::cold::bitwise(ctx, kind, lhs, imm) }
+    unsafe { bitwise(ctx, kind, lhs, imm) }
 });
 
 slow_handler!(slow_inc_loc |ip, ops, regs, acc, ctx, float| {
@@ -181,22 +183,22 @@ slow_handler!(slow_keyed_load_reg |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let key = regs.read(ops.signed::<1>(), ctx);
     let fb = ops.unsigned::<2>();
-    unsafe { vm_core::cold::keyed_load(ctx, recv, key, Some(fb)) }
+    unsafe { keyed_load(ctx, recv, key, Some(fb)) }
 });
 
 slow_handler!(slow_equal |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { vm_core::cold::compare(ctx, 0, acc, other) }
+    unsafe { compare(ctx, 0, acc, other) }
 });
 
 slow_handler!(slow_less_than |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { vm_core::cold::compare(ctx, 2, acc, other) }
+    unsafe { compare(ctx, 2, acc, other) }
 });
 
 slow_handler!(slow_greater_than |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { vm_core::cold::compare(ctx, 4, acc, other) }
+    unsafe { compare(ctx, 4, acc, other) }
 });
 
 #[cold]
@@ -232,7 +234,7 @@ pub extern "rust-preserve-none" fn slow_compare_jump<'a, const STRIDE: usize>(
             _ => a >= b,
         },
         _ => {
-            let v = unsafe { vm_core::cold::compare(ctx, cmp, acc, other) };
+            let v = unsafe { compare(ctx, cmp, acc, other) };
             if ctx.is_throw(v) {
                 become resume(
                     unsafe { ctx.code_ptr().add(pc) },
@@ -265,26 +267,26 @@ slow_handler!(slow_named_load |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let name_idx = ops.unsigned::<1>();
     let fb_slot = ops.unsigned::<2>();
-    unsafe { vm_core::cold::named_load(ctx, recv, name_idx, fb_slot) }
+    unsafe { named_load(ctx, recv, name_idx, fb_slot) }
 });
 
 slow_handler!(slow_keyed_load |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let fb = ops.unsigned::<1>();
-    unsafe { vm_core::cold::keyed_load(ctx, recv, acc, Some(fb)) }
+    unsafe { keyed_load(ctx, recv, acc, Some(fb)) }
 });
 
 slow_handler!(slow_keyed_load_imm |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let idx = ops.unsigned::<1>();
-    unsafe { vm_core::cold::keyed_load_imm(ctx, recv, idx) }
+    unsafe { keyed_load_imm(ctx, recv, idx) }
 });
 
 slow_handler!(slow_keyed_store |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let key = regs.read(ops.signed::<1>(), ctx);
     let fb = ops.unsigned::<2>();
-    unsafe { vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow) }
+    unsafe { keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow) }
 });
 
 slow_handler!(slow_keyed_store_no_shadow |ip, ops, regs, acc, ctx, float| {
@@ -292,28 +294,28 @@ slow_handler!(slow_keyed_store_no_shadow |ip, ops, regs, acc, ctx, float| {
     let key = regs.read(ops.signed::<1>(), ctx);
     let fb = ops.unsigned::<2>();
     unsafe {
-        vm_core::cold::keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
+        keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
     }
 });
 
 slow_handler!(slow_global_load |ip, ops, regs, acc, ctx, float| {
     let name_idx = ops.unsigned::<0>();
     let fb_slot = ops.unsigned::<1>();
-    unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, true) }
+    unsafe { global_load(ctx, name_idx, fb_slot, true) }
 });
 
 slow_handler!(slow_store_named |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let name_idx = ops.unsigned::<1>();
     let fb_slot = ops.unsigned::<2>();
-    unsafe { vm_core::cold::store_named(ctx, recv, name_idx, fb_slot, acc) }
+    unsafe { store_named(ctx, recv, name_idx, fb_slot, acc) }
 });
 
 slow_handler!(slow_construct |ip, ops, regs, acc, ctx, float| {
     let callee = regs.read(ops.signed::<0>(), ctx);
     let args_base = ops.signed::<1>();
     let count = ops.unsigned::<2>();
-    unsafe { vm_core::cold::construct(ctx, callee, args_base, count) }
+    unsafe { construct(ctx, callee, args_base, count) }
 });
 
 slow_handler!(slow_create_closure |ip, ops, regs, acc, ctx, float| {
@@ -358,24 +360,24 @@ slow_handler!(slow_create_block_context |ip, ops, regs, acc, ctx, float| {
 
 slow_handler!(slow_less_than_or_equal |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { vm_core::cold::compare(ctx, 3, acc, other) }
+    unsafe { compare(ctx, 3, acc, other) }
 });
 
 slow_handler!(slow_global_load_nothrow |ip, ops, regs, acc, ctx, float| {
     let name_idx = ops.unsigned::<0>();
     let fb_slot = ops.unsigned::<1>();
-    unsafe { vm_core::cold::global_load(ctx, name_idx, fb_slot, false) }
+    unsafe { global_load(ctx, name_idx, fb_slot, false) }
 });
 
 slow_handler!(slow_store_global |ip, ops, regs, acc, ctx, float| {
     let name_idx = ops.unsigned::<0>();
-    unsafe { vm_core::cold::store_global(ctx, name_idx, acc) }
+    unsafe { store_global(ctx, name_idx, acc) }
 });
 
 slow_handler!(slow_store_named_no_shadow |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let name_idx = ops.unsigned::<1>();
-    unsafe { vm_core::cold::store_named_no_shadow(ctx, recv, name_idx, acc) }
+    unsafe { store_named_no_shadow(ctx, recv, name_idx, acc) }
 });
 
 slow_handler!(slow_instance_of |ip, ops, regs, acc, ctx, float| {
@@ -385,7 +387,7 @@ slow_handler!(slow_instance_of |ip, ops, regs, acc, ctx, float| {
 
 slow_handler!(slow_greater_than_or_equal |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { vm_core::cold::compare(ctx, 5, acc, other) }
+    unsafe { compare(ctx, 5, acc, other) }
 });
 
 slow_handler!(slow_add_parent |ip, ops, regs, acc, ctx, float| {
@@ -589,7 +591,9 @@ pub fn proxy_apply_regs_slow<'a>(
         .stack()
         .stage_scattered(heap, base, Recv::Reg(recv), args, argc)?;
     let saved_top = ctx.stack().top();
-    ctx.stack().set_top(staged.src + staged.count);
+    if let Some(top) = ctx.stack().rooting_top(staged) {
+        ctx.stack().set_top(top);
+    }
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
         match Proxy::apply(vm, heap, state, callee, ctx.stack().slice(staged))? {
@@ -621,8 +625,8 @@ pub extern "rust-preserve-none" fn throw_dispatch<'a>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     let fault_pc = fault_ip as usize - ctx.code_ptr() as usize;
-    match unsafe { vm_core::interp::unwind(ctx, fault_pc) } {
-        vm_core::interp::Unwind::Caught { pc: handler_pc, ex } => {
+    match unsafe { unwind(ctx, fault_pc) } {
+        Unwind::Caught { pc: handler_pc, ex } => {
             // the walk itself never allocates, so the re-derived
             // pointers are stable
             let code = ctx.code_ptr();
@@ -631,7 +635,7 @@ pub extern "rust-preserve-none" fn throw_dispatch<'a>(
             let h = table.get(unsafe { *ip });
             become h(ip, regs, ex, ctx, table, roots, float)
         }
-        vm_core::interp::Unwind::Escaped => ctx.exception_word(),
+        Unwind::Escaped => ctx.exception_word(),
     }
 }
 
@@ -683,9 +687,9 @@ fn loc_op_slow<'a, const STRIDE: usize>(
     let lhs = regs.read(dst, ctx);
     let rhs = regs.read(src, ctx);
     let v = if sub {
-        unsafe { vm_core::cold::numeric(ctx, lhs, rhs, |a, b| a - b) }
+        unsafe { numeric(ctx, lhs, rhs, |a, b| a - b) }
     } else {
-        unsafe { vm_core::cold::add(ctx, lhs, rhs) }
+        unsafe { add(ctx, lhs, rhs) }
     };
     if !ctx.is_throw(v) {
         regs.write(dst, v);
@@ -709,7 +713,7 @@ pub fn slow_call_method_miss<'a>(
         None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(rt)) => {
-            vm_core::ic::call_update(
+            InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
@@ -733,7 +737,7 @@ pub fn slow_call_method_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            vm_core::ic::call_update(
+            InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
@@ -772,7 +776,7 @@ pub fn slow_call_function_miss<'a>(
         None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(rt)) => {
-            vm_core::ic::call_update(
+            InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
@@ -796,7 +800,7 @@ pub fn slow_call_function_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            vm_core::ic::call_update(
+            InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
@@ -835,7 +839,7 @@ pub fn slow_call_miss<'a>(
         None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(rt)) => {
-            vm_core::ic::call_update(
+            InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
@@ -856,7 +860,7 @@ pub fn slow_call_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            vm_core::ic::call_update(
+            InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
@@ -964,7 +968,9 @@ pub fn proxy_apply_function_slow<'a>(
         .stack()
         .stage_scattered(heap, base, Recv::Undefined, args, argc)?;
     let saved_top = ctx.stack().top();
-    ctx.stack().set_top(staged.src + staged.count);
+    if let Some(top) = ctx.stack().rooting_top(staged) {
+        ctx.stack().set_top(top);
+    }
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
         match Proxy::apply(vm, heap, state, callee, ctx.stack().slice(staged))? {

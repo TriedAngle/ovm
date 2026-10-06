@@ -4,8 +4,8 @@ use core::ptr::NonNull;
 use crate::errors::Errors;
 use crate::intrinsics::runtime_fn;
 use crate::{
-    ContextState, EdgeVisitable, Handle, HandleScope, HandleSlice, Heap, Object, Tagged, VM, Value,
-    VmError,
+    Args, ContextState, EdgeVisitable, Handle, HandleScope, HandleSlice, Heap, Object, Tagged, VM,
+    Value, VmError,
 };
 
 /// The interpreter entry: [[Call]]/[[Construct]] on a bytecode callable.
@@ -127,11 +127,8 @@ impl<'a> RuntimeContext<'a> {
 /// The runtime-call ABI (tier 1): a single tagged word in the first
 /// return register. Errors are the exception sentinel with the pending
 /// exception set — one error channel at the boundary. `Result` survives only above `execute`.
-pub type RuntimeCall = for<'a, 'nt, 'r> fn(
-    RuntimeContext<'a>,
-    Option<Handle<'nt, Value>>,
-    HandleSlice<'r>,
-) -> Tagged<'a, Value>;
+pub type RuntimeCall =
+    for<'a, 'nt> fn(RuntimeContext<'a>, Option<Handle<'nt, Value>>, Args) -> Tagged<'a, Value>;
 
 /// Materialize `err` as the pending exception and return the sentinel:
 /// the single-channel bridge for runtime bodies.

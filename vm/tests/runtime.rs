@@ -17,14 +17,14 @@ fn smi(v: i64) -> Value {
 fn smi_add<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     let (a, b) = match (
-        args.get(1).map(|h| h.as_tagged(heap)),
-        args.get(2).map(|h| h.as_tagged(heap)),
+        args.get(heap, 1).map(|h| h.as_tagged(heap)),
+        args.get(heap, 2).map(|h| h.as_tagged(heap)),
     ) {
         (Some(a), Some(b)) => (a.raw(), b.raw()),
         _ => return raise_runtime(vm, heap, state, VmError::Arity),
@@ -62,15 +62,15 @@ fn runtime_result_is_boxed_when_not_smi() {
     fn fadd<'a>(
         nctx: RuntimeContext<'a>,
         new_target: Option<Handle<'_, Value>>,
-        args: HandleSlice<'_>,
+        args: Args,
     ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = nctx;
         let sum = {
             let (a, b) = match (
-                args.get(1).map(|h| h.as_tagged(heap)),
-                args.get(2).map(|h| h.as_tagged(heap)),
+                args.get(heap, 1).map(|h| h.as_tagged(heap)),
+                args.get(heap, 2).map(|h| h.as_tagged(heap)),
             ) {
                 (Some(a), Some(b)) => (a, b),
                 _ => return raise_runtime(vm, heap, state, VmError::Arity),
@@ -162,14 +162,12 @@ fn register_runtime_appends_after_well_known() {
     fn double<'a>(
         nctx: RuntimeContext<'a>,
         new_target: Option<Handle<'_, Value>>,
-        args: HandleSlice<'_>,
+        args: Args,
     ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = nctx;
-        let Some(v) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let v = args.get(heap, 1);
         let Some(v) = Smi::decode(v.raw()) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };

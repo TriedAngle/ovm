@@ -1,8 +1,8 @@
 use vm_core::raise_runtime;
 use vm_core::runtime_api::install_method;
 use vm_core::{
-    DenseString, Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor, Runtime,
-    RuntimeContext, Tagged, VM, Value, VmError,
+    Args, DenseString, Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor,
+    Runtime, RuntimeContext, Tagged, VM, Value, VmError,
 };
 
 pub struct KetteRuntime;
@@ -46,15 +46,16 @@ impl Runtime for KetteRuntime {
 fn console_print<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(v) = args.get(1) else {
+    if args.len() < 2 {
         println!();
         return heap.known().undefined.as_tagged(heap).erase();
-    };
+    }
+    let v = args.get_handle(heap, 1);
     let text = match Object::to_string(vm, heap, state, v) {
         Ok(Some(t)) => {
             let word = t.raw();

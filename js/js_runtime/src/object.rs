@@ -7,8 +7,8 @@ use vm_core::proxy::Proxy;
 use vm_core::runtime::Coercion;
 
 use vm_core::{
-    ContextState, Convert, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor,
-    SlotName, Smi, Tagged, VM, Value, VmError,
+    Args, ContextState, Convert, Handle, HandleScope, HandleSlice, Heap, Object,
+    PropertyDescriptor, SlotName, Smi, Tagged, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -16,7 +16,7 @@ use vm_core::{raise_runtime, rt_try};
 pub fn object_to_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    _args: HandleSlice<'_>,
+    _args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -33,21 +33,17 @@ pub fn object_to_string<'a>(
 pub fn object_constructor<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let arg = args
-        .get(1)
-        .map(|h| h.raw())
-        .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).raw());
+    let arg = args.get_handle(heap, 1);
     if is_construct {
-        let arg = unsafe { Tagged::<Value>::from_value_unchecked(arg) };
-        if !Convert::is_primitive(heap, arg) {
+        if !Convert::is_primitive(heap, arg.as_tagged(heap)) {
             // `new Object(obj)` returns it unchanged (ES 20.1.1.1 step 3)
-            return arg;
+            return arg.as_tagged(heap);
         }
         // `new Object()` / primitive: allocate a fresh object
         return state.handle_scope(|scope| {
@@ -55,14 +51,11 @@ pub fn object_constructor<'a>(
                 .erase()
         });
     }
-    let cond_37 =
-        Convert::is_primitive(heap, unsafe { Tagged::<Value>::from_value_unchecked(arg) });
-    if cond_37 {
+    if Convert::is_primitive(heap, arg.as_tagged(heap)) {
         // TODO: box primitives (String/Symbol wrappers)
         return raise_runtime(vm, heap, state, VmError::Type);
     }
-    // Safety: fresh rooted-slot word, no allocation since the read.
-    unsafe { Tagged::from_value_unchecked(arg) }
+    arg.as_tagged(heap)
 }
 
 /// `Object.getPrototypeOf(o)`: the receiver's map prototype. Primitive
@@ -71,15 +64,13 @@ pub fn object_constructor<'a>(
 pub fn object_get_prototype_of<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(arg) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let arg = arg.as_tagged(heap);
+    let arg = args.get(heap, 1);
+    let arg = arg;
     let Some(obj) = arg.as_heap_object() else {
         return raise_runtime(vm, heap, state, VmError::Type);
     };
@@ -93,16 +84,14 @@ pub fn object_get_prototype_of<'a>(
 pub fn object_create<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(proto_arg) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let proto = scope.handle(proto_arg.as_tagged(heap));
+        let proto_arg = args.get(heap, 1);
+        let proto = scope.handle(proto_arg);
         // If Type(O) is neither Object nor Null, throw a TypeError
         let null = heap.known().null.as_tagged(heap).raw();
         let proto_ok = proto.as_tagged(heap).raw() == null
@@ -110,9 +99,10 @@ pub fn object_create<'a>(
         if !proto_ok {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
-        if let Some(props) = args.get(2) {
+        if args.len() > 2 {
+            let props = args.get(heap, 2);
             let undefined = heap.known().undefined.as_tagged(heap).raw();
-            if props.as_tagged(heap).raw() != undefined {
+            if props.raw() != undefined {
                 return raise_runtime(vm, heap, state, VmError::Type);
             }
         }
@@ -169,20 +159,16 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
 pub fn object_has_own_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let receiver = scope.handle(receiver.as_tagged(heap));
-        let Some(raw_key) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let raw_key = scope.handle(raw_key.as_tagged(heap));
+        let receiver = args.get(heap, 0);
+        let receiver = scope.handle(receiver);
+        let raw_key = args.get(heap, 1);
+        let raw_key = scope.handle(raw_key);
         // the key coercion allocates (float/wrapper keys intern or run
         // user code): the receiver must stay rooted across it
         let Some(key) = rt_try!(
@@ -218,20 +204,16 @@ pub fn object_has_own_property<'a>(
 pub fn object_property_is_enumerable<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let receiver = scope.handle(receiver.as_tagged(heap));
-        let Some(raw_key) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let raw_key = scope.handle(raw_key.as_tagged(heap));
+        let receiver = args.get(heap, 0);
+        let receiver = scope.handle(receiver);
+        let raw_key = args.get(heap, 1);
+        let raw_key = scope.handle(raw_key);
         // the key coercion allocates (float/wrapper keys intern or run
         // user code): the receiver must stay rooted across it
         let Some(key) = rt_try!(
@@ -276,15 +258,13 @@ pub fn object_property_is_enumerable<'a>(
 pub fn object_get_own_property_names<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _, heap, state, ..
     } = nctx;
-    let Some(target) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
-    let target = target.as_tagged(heap);
+    let target = args.get(heap, 1);
+    let target = target;
     // array `length` is a real (accessor) descriptor on the array map, so
     // `own_property_keys` already lists it
     let names: Vec<Value> = own_property_keys(heap, target);
@@ -326,7 +306,7 @@ pub fn plain_object<'a>(
 pub fn object_get_own_property_descriptor<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -334,14 +314,10 @@ pub fn object_get_own_property_descriptor<'a>(
     state.handle_scope(|scope| {
         // the key coercion allocates (Float keys intern a string): the
         // target must stay rooted across it
-        let Some(target) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let target = scope.handle(target.as_tagged(heap));
-        let Some(raw_key) = args.get(2) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let raw_key = scope.handle(raw_key.as_tagged(heap));
+        let target = args.get(heap, 1);
+        let target = scope.handle(target);
+        let raw_key = args.get(heap, 2);
+        let raw_key = scope.handle(raw_key);
         let Some(key) = rt_try!(
             vm,
             heap,
@@ -416,7 +392,7 @@ pub fn object_get_own_property_descriptor<'a>(
 pub fn object_define_property<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -425,18 +401,12 @@ pub fn object_define_property<'a>(
         // root the target, key, and descriptor: the key coercion and the
         // descriptor conversion below allocate (user getters run), which
         // would leave raw copies stale
-        let Some(target) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let target = scope.handle(target.as_tagged(heap));
-        let Some(attrs) = args.get(3) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let attrs = scope.handle(attrs.as_tagged(heap));
-        let Some(raw_key) = args.get(2) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let raw_key = scope.handle(raw_key.as_tagged(heap));
+        let target = args.get(heap, 1);
+        let target = scope.handle(target);
+        let attrs = args.get(heap, 3);
+        let attrs = scope.handle(attrs);
+        let raw_key = args.get(heap, 2);
+        let raw_key = scope.handle(raw_key);
         let Some(key) = rt_try!(
             vm,
             heap,
@@ -474,20 +444,16 @@ pub fn object_define_property<'a>(
 pub fn object_set_prototype_of<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(target) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let target = scope.handle(target.as_tagged(heap));
-        let Some(proto) = args.get(2) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let proto = scope.handle(proto.as_tagged(heap));
+        let target = args.get(heap, 1);
+        let target = scope.handle(target);
+        let proto = args.get(heap, 2);
+        let proto = scope.handle(proto);
         let (nullish, target_is_object, proto_ok) = {
             let null = heap.known().null.as_tagged(heap).raw();
             let undefined = heap.known().undefined.as_tagged(heap).raw();
@@ -527,16 +493,14 @@ pub fn object_set_prototype_of<'a>(
 pub fn object_prevent_extensions<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(target) = args.get(1) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
-        let target = scope.handle(target.as_tagged(heap));
+        let target = args.get(heap, 1);
+        let target = scope.handle(target);
         let nullish = {
             let null = heap.known().null.as_tagged(heap).raw();
             let undefined = heap.known().undefined.as_tagged(heap).raw();
@@ -554,13 +518,7 @@ pub fn object_prevent_extensions<'a>(
             vm,
             heap,
             state,
-            Proxy::prevent_extensions(
-                vm,
-                heap,
-                state,
-                // Safety: fresh rooted-slot word, consumed by the call.
-                unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) },
-            )
+            Proxy::prevent_extensions(vm, heap, state, target)
         ) {
             Coercion::Threw => None,
             Coercion::Value(v) => Some(v.raw()),
@@ -585,13 +543,13 @@ pub fn object_prevent_extensions<'a>(
 pub fn object_is_extensible<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let target = rt_try!(vm, heap, state, args.get(1).ok_or(VmError::Arity));
+        let target = args.get_handle(heap, 1);
         if !Proxy::is_js_receiver(heap, target.as_tagged(heap)) {
             return Convert::boolean(heap, false);
         }
@@ -684,23 +642,17 @@ pub fn set_integrity_flags(
 pub fn object_seal<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let target = rt_try!(
-        vm,
-        heap,
-        state,
-        args.get(1)
-            .map(|h| h.as_tagged(heap).raw())
-            .ok_or(VmError::Arity)
-    );
+    let target = args.get_handle(heap, 1);
     let nullish = {
+        let target = target.as_tagged(heap);
         let null = heap.known().null.as_tagged(heap).raw();
         let undefined = heap.known().undefined.as_tagged(heap).raw();
-        target == null || target == undefined
+        target.raw() == null || target.raw() == undefined
     };
     if nullish {
         return raise_runtime(vm, heap, state, VmError::Type);
@@ -708,7 +660,7 @@ pub fn object_seal<'a>(
     // traps run user code before the receiver is returned: keep it rooted
     state.handle_scope(|scope| {
         // Safety: fresh argument word, rooted before any allocation.
-        let target_handle = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(target) });
+        let target_handle = target;
         if !Proxy::is_js_receiver(heap, target_handle.as_tagged(heap)) {
             return target_handle.as_tagged(heap).erase();
         }
@@ -717,13 +669,7 @@ pub fn object_seal<'a>(
             vm,
             heap,
             state,
-            Proxy::prevent_extensions(
-                vm,
-                heap,
-                state,
-                // Safety: fresh rooted-slot word, consumed by the call.
-                unsafe { Tagged::<Value>::from_value_unchecked(target_handle.raw()) },
-            )
+            Proxy::prevent_extensions(vm, heap, state, target_handle)
         ) {
             Coercion::Threw => None,
             Coercion::Value(v) => Some(v.raw()),
@@ -755,23 +701,17 @@ pub fn object_seal<'a>(
 pub fn object_freeze<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let target = rt_try!(
-        vm,
-        heap,
-        state,
-        args.get(1)
-            .map(|h| h.as_tagged(heap).raw())
-            .ok_or(VmError::Arity)
-    );
+    let target = args.get_handle(heap, 1);
     let nullish = {
+        let target = target.as_tagged(heap);
         let null = heap.known().null.as_tagged(heap).raw();
         let undefined = heap.known().undefined.as_tagged(heap).raw();
-        target == null || target == undefined
+        target.raw() == null || target.raw() == undefined
     };
     if nullish {
         return raise_runtime(vm, heap, state, VmError::Type);
@@ -779,7 +719,7 @@ pub fn object_freeze<'a>(
     // traps run user code before the receiver is returned: keep it rooted
     state.handle_scope(|scope| {
         // Safety: fresh argument word, rooted before any allocation.
-        let target_handle = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(target) });
+        let target_handle = target;
         if !Proxy::is_js_receiver(heap, target_handle.as_tagged(heap)) {
             return target_handle.as_tagged(heap).erase();
         }
@@ -787,13 +727,7 @@ pub fn object_freeze<'a>(
             vm,
             heap,
             state,
-            Proxy::prevent_extensions(
-                vm,
-                heap,
-                state,
-                // Safety: fresh rooted-slot word, consumed by the call.
-                unsafe { Tagged::<Value>::from_value_unchecked(target_handle.raw()) },
-            )
+            Proxy::prevent_extensions(vm, heap, state, target_handle)
         ) {
             Coercion::Threw => None,
             Coercion::Value(v) => Some(v.raw()),

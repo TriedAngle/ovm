@@ -10,7 +10,7 @@ use vm_core::proxy::Proxy;
 use vm_core::raise_runtime;
 use vm_core::rt_try;
 use vm_core::runtime::Coercion;
-use vm_core::{Handle, HandleSlice, Tagged, Value, VmError};
+use vm_core::{Args, Handle, HandleSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
@@ -18,7 +18,7 @@ use vm_core::{Handle, HandleSlice, Tagged, Value, VmError};
 pub fn proxy_constructor<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let construct = new_target.is_some();
     let RuntimeContext {
@@ -27,9 +27,8 @@ pub fn proxy_constructor<'a>(
     if !construct {
         return raise_runtime(vm, heap, state, VmError::Message(Message::ProxyRequiresNew));
     }
-    let (Some(target), Some(handler)) = (args.get(1), args.get(2)) else {
-        return raise_runtime(vm, heap, state, VmError::Type);
-    };
+    let target = args.get_handle(heap, 1);
+    let handler = args.get_handle(heap, 2);
     let ok = Proxy::is_js_receiver(heap, target.as_tagged(heap))
         && Proxy::is_js_receiver(heap, handler.as_tagged(heap));
     if !ok {
@@ -58,14 +57,13 @@ pub fn proxy_constructor<'a>(
 pub fn proxy_revocable<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let (Some(target), Some(handler)) = (args.get(1), args.get(2)) else {
-        return raise_runtime(vm, heap, state, VmError::Type);
-    };
+    let target = args.get_handle(heap, 1);
+    let handler = args.get_handle(heap, 2);
     let ok = Proxy::is_js_receiver(heap, target.as_tagged(heap))
         && Proxy::is_js_receiver(heap, handler.as_tagged(heap));
     if !ok {
@@ -155,14 +153,15 @@ pub fn proxy_revocable<'a>(
 pub fn proxy_revoke<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
-        vm, heap, state, ..
+        vm: _,
+        heap,
+        state: _,
+        ..
     } = nctx;
-    let Some(proxy) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let proxy = args.get(heap, 1);
     let proxy = proxy.raw();
     Proxy::revoke(
         heap,

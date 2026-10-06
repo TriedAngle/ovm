@@ -3,14 +3,14 @@ use vm_core::RuntimeContext;
 use vm_core::runtime::Coercion;
 
 use vm_core::{
-    Convert, DenseString, Handle, HandleSlice, Object, PropertyDescriptor, Tagged, Value, VmError,
+    Args, Convert, DenseString, Handle, HandleSlice, Object, PropertyDescriptor, Tagged, Value,
 };
 use vm_core::{raise_runtime, rt_try};
 
 pub fn error_constructor<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     make_error(nctx, args, "Error")
 }
@@ -18,7 +18,7 @@ pub fn error_constructor<'a>(
 pub fn type_error_constructor<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     make_error(nctx, args, "TypeError")
 }
@@ -26,38 +26,31 @@ pub fn type_error_constructor<'a>(
 pub fn reference_error_constructor<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     make_error(nctx, args, "ReferenceError")
 }
 
-pub fn make_error<'a>(
-    nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
-    class: &str,
-) -> Tagged<'a, Value> {
+pub fn make_error<'a>(nctx: RuntimeContext<'a>, args: Args, class: &str) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         // root the message right away: the allocations below (new_object,
         // interning) would leave a raw copy stale
-        let message_word = args.get(1).map(|h| h.as_tagged(heap)).map(|v| v.raw());
-        let message = match message_word {
-            // Safety: fresh argument word, consumed before any allocation.
-            Some(v) => {
-                let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(v) });
-                scope.handle(match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
-                    Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-                    Err(err) => return raise_runtime(vm, heap, state, err),
-                })
-            }
-            None => scope.handle(
+        let message = if args.len() > 1 {
+            let v = scope.handle(args.get(heap, 1));
+            scope.handle(match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
+                Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+                Err(err) => return raise_runtime(vm, heap, state, err),
+            })
+        } else {
+            scope.handle(
                 vm.interner()
                     .intern_str(heap, &scope, "")
                     .as_tagged(heap)
                     .erase(),
-            ),
+            )
         };
         let map = match class {
             "TypeError" => heap.known().type_error_map,
@@ -92,13 +85,13 @@ pub fn make_error<'a>(
 pub fn error_to_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let receiver = rt_try!(vm, heap, state, args.get(0).ok_or(VmError::Arity));
+        let receiver = args.get_handle(heap, 0);
 
         let name_key = vm.interner().intern_str(heap, &scope, "name");
         let name = match rt_try!(

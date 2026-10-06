@@ -3,11 +3,11 @@
 //! `toGMTString`/`toString` are written to round-trip each other exactly.
 
 use vm_core::Handle;
-use vm_core::Heap;
 use vm_core::Object;
 use vm_core::RuntimeContext;
+use vm_core::{Args, Heap};
 use vm_core::{ContextState, VM};
-use vm_core::{Convert, DenseString, HandleSlice, Tagged, Value, VmError};
+use vm_core::{Convert, DenseString, Tagged, Value, VmError};
 use vm_core::{raise_runtime, rt_try};
 
 /// Milliseconds in a UTC day.
@@ -305,14 +305,12 @@ fn parse_loose(s: &str) -> Option<f64> {
 pub fn date_parse<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(arg) = args.get(1) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let arg = args.get_handle(heap, 1);
     let text = match Object::to_string(vm, heap, state, arg) {
         Ok(Some(s)) => {
             let word = s.raw();
@@ -337,15 +335,17 @@ pub fn date_parse<'a>(
 pub fn date_constructor<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let ms = match args.get(1) {
-        None => now_millis(),
-        Some(arg) => {
+    let ms = if args.len() < 2 {
+        now_millis()
+    } else {
+        let arg = args.get_handle(heap, 1);
+        {
             let ms = rt_try!(
                 vm,
                 heap,
@@ -386,7 +386,7 @@ pub fn date_constructor<'a>(
 pub fn date_now<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    _args: HandleSlice<'_>,
+    _args: Args,
 ) -> Tagged<'a, Value> {
     nctx.heap.new_number(now_millis())
 }
@@ -396,14 +396,12 @@ pub fn date_now<'a>(
 pub fn date_value_of<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(receiver) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let receiver = args.get(heap, 0);
     date_slot(
         vm,
         heap,
@@ -418,7 +416,7 @@ pub fn date_value_of<'a>(
 /// `None` asks for a TypeError (toISOString's RangeError approximation).
 fn format_with<'a>(
     nctx: RuntimeContext<'a>,
-    args: HandleSlice<'_>,
+    args: Args,
     format: fn(&Broken) -> String,
     invalid: Option<&'static str>,
 ) -> Tagged<'a, Value> {
@@ -426,9 +424,7 @@ fn format_with<'a>(
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let Some(receiver) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let receiver = args.get(heap, 0);
         let exception = heap.known().exception.as_tagged(heap).erase().raw();
         let word = date_slot(
             vm,
@@ -464,7 +460,7 @@ fn format_with<'a>(
 pub fn date_to_iso_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     format_with(nctx, args, format_iso, None)
 }
@@ -473,7 +469,7 @@ pub fn date_to_iso_string<'a>(
 pub fn date_to_gmt_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     format_with(nctx, args, format_gmt, Some("Invalid Date"))
 }
@@ -482,7 +478,7 @@ pub fn date_to_gmt_string<'a>(
 pub fn date_to_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     format_with(nctx, args, format_date_string, Some("Invalid Date"))
 }

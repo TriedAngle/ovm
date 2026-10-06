@@ -4,15 +4,15 @@ use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::materialize::Materialize;
 use vm_core::{
-    Context, ContextState, Convert, DenseString, Errors, Handle, HandleSlice, Heap, Smi, Tagged,
-    VM, Value, VmError,
+    Args, Context, ContextState, Convert, DenseString, Errors, Handle, HandleSlice, Heap, Smi,
+    Tagged, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
 pub fn eval_runtime<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -23,7 +23,7 @@ pub fn eval_runtime<'a>(
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let context = scope.handle(context);
-        let src = rt_try!(vm, heap, state, args.get(1).ok_or(VmError::Arity));
+        let src = scope.handle(args.get(heap, 1));
         let s = scope.handle(
             match Convert::to_string(heap, &scope, src).map(|v| v.raw()) {
                 Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
@@ -75,7 +75,7 @@ pub fn eval_runtime<'a>(
 pub fn is_nan<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -85,13 +85,7 @@ pub fn is_nan<'a>(
         heap,
         state,
         state.handle_scope(|scope| {
-            let arg = {
-                let v = args
-                    .get(1)
-                    .map(|h| h.as_tagged(heap))
-                    .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
-                scope.handle(v)
-            };
+            let arg = scope.handle(args.get(heap, 1));
             Object::to_numeric(vm, heap, state, arg)
         })
     );
@@ -107,15 +101,16 @@ pub fn is_nan<'a>(
 pub fn print<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(arg) = args.get(1) else {
+    if args.len() < 2 {
         println!();
         return heap.known().undefined.as_tagged(heap).erase();
-    };
+    }
+    let arg = args.get_handle(heap, 1);
     let text = match Object::to_string(vm, heap, state, arg) {
         Ok(Some(s)) => {
             let word = s.raw();
@@ -183,7 +178,7 @@ fn console_arg_cold(
 pub fn console_log<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -191,7 +186,7 @@ pub fn console_log<'a>(
     let mut parts: Vec<String> = Vec::with_capacity(args.len().saturating_sub(1));
     for i in 1..args.len() {
         // Safety: `i < args.len()`, so the slot exists.
-        let arg = args.get(i).expect("in-bounds console.log argument");
+        let arg = args.get_handle(heap, i);
         if let Some(text) = primitive_to_string(heap, arg.as_tagged(heap)) {
             parts.push(text);
             continue;
@@ -211,7 +206,7 @@ pub fn console_log<'a>(
 pub fn performance_now<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    _args: HandleSlice<'_>,
+    _args: Args,
 ) -> Tagged<'a, Value> {
     let ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

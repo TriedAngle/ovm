@@ -5,6 +5,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use crate::stack::Args;
 use crate::{
     EdgeVisitable, GcSlot, Global, HANDLE_BLOCK_SIZE, Header, Heap, HeapObject, HeapPtr, Map,
     RawCell, Register, Tagged, Value, Visitor,
@@ -435,6 +436,17 @@ impl<'a> HandleSlice<'a> {
     pub fn as_tagged(&self) -> &[Tagged<'_, Value>] {
         // Safety: Tagged<Value> is layout-identical to Value.
         unsafe { core::slice::from_raw_parts(self.raw.as_ptr().cast(), self.raw.len()) }
+    }
+
+    /// The same window without the lifetime tie: the caller holds the
+    /// rooting by convention.
+    #[inline]
+    pub fn as_args(&self) -> Args {
+        if self.raw.is_empty() {
+            return Args::EMPTY;
+        }
+        // Safety: the slice covers rooted handle-scope slots.
+        unsafe { Args::from_raw(core::ptr::NonNull::from(&self.raw[0]), self.raw.len()) }
     }
 
     /// The same rooted slots minus the first `n` elements.

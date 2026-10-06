@@ -3,13 +3,13 @@
 use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::runtime_api::wrapper_value;
-use vm_core::{Convert, DenseString, Handle, HandleSlice, Heap, Smi, Tagged, Value, VmError};
+use vm_core::{Args, Convert, DenseString, Handle, Heap, Smi, Tagged, Value, VmError};
 use vm_core::{raise_runtime, rt_try};
 
 pub fn number_constructor<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
     let RuntimeContext {
@@ -20,9 +20,10 @@ pub fn number_constructor<'a>(
         heap,
         state,
         state.handle_scope(|scope| {
-            let arg = match args.get(1).map(|h| h.as_tagged(heap)) {
-                Some(v) => scope.handle(v),
-                None => scope.handle(Smi::new(0).into_tagged()),
+            let arg = if args.len() > 1 {
+                scope.handle(args.get(heap, 1))
+            } else {
+                scope.handle(Smi::new(0).into_tagged())
             };
             Object::to_numeric(vm, heap, state, arg)
         })
@@ -45,14 +46,12 @@ pub fn number_constructor<'a>(
 pub fn number_value_of<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(arg) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let arg = args.get(heap, 0);
     match wrapper_value(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
@@ -68,16 +67,14 @@ pub fn number_value_of<'a>(
 pub fn number_to_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     let _ = vm;
     state.handle_scope(|scope| {
-        let Some(arg) = args.get(0) else {
-            return raise_runtime(vm, heap, state, VmError::Arity);
-        };
+        let arg = args.get(heap, 0);
         let v = match wrapper_value(
             heap,
             // Safety: fresh rooted-slot word, no allocation since the read.
@@ -97,13 +94,8 @@ pub fn number_to_string<'a>(
 }
 
 /// The numeric `this` of a Number.prototype method (receiver or wrapper).
-fn number_receiver(heap: &Heap, args: &HandleSlice<'_>) -> Result<f64, VmError> {
-    let v = wrapper_value(
-        heap,
-        args.get(0)
-            .map(|h| h.as_tagged(heap))
-            .ok_or(VmError::Arity)?,
-    )?;
+fn number_receiver(heap: &Heap, args: Args) -> Result<f64, VmError> {
+    let v = wrapper_value(heap, args.get(heap, 0))?;
     Convert::to_number(heap, v)
 }
 
@@ -112,14 +104,14 @@ fn number_receiver(heap: &Heap, args: &HandleSlice<'_>) -> Result<f64, VmError> 
 pub fn number_to_fixed<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let x = rt_try!(vm, heap, state, number_receiver(heap, &args));
-        let digits = match args.get(1).map(|h| h.as_tagged(heap)) {
+        let x = rt_try!(vm, heap, state, number_receiver(heap, args));
+        let digits = match (args.len() > 1).then(|| args.get(heap, 1)) {
             Some(d) if d != heap.known().undefined.as_tagged(heap) => {
                 scope.handle(d);
                 rt_try!(vm, heap, state, Convert::to_number(heap, d)) as i64
@@ -148,17 +140,14 @@ pub fn number_to_fixed<'a>(
 pub fn number_to_precision<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let x = rt_try!(vm, heap, state, number_receiver(heap, &args));
-        let arg = args
-            .get(1)
-            .map(|h| h.as_tagged(heap))
-            .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
+        let x = rt_try!(vm, heap, state, number_receiver(heap, args));
+        let arg = args.get(heap, 1);
         if arg == heap.known().undefined.as_tagged(heap) {
             let v = scope.handle(heap.new_number(x));
             return match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {

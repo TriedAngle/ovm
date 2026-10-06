@@ -533,12 +533,14 @@ impl Thread {
             let v = f(
                 nctx,
                 None,
-                scope.stage(
-                    &args
-                        .iter()
-                        .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
-                        .collect::<Vec<_>>(),
-                ),
+                scope
+                    .stage(
+                        &args
+                            .iter()
+                            .map(|v| unsafe { Tagged::<Value>::from_value_unchecked(*v) })
+                            .collect::<Vec<_>>(),
+                    )
+                    .as_args(),
             );
             // single channel at the ABI: the sentinel means the pending
             // exception is set — surface it as the Err half here (the

@@ -271,14 +271,14 @@ fn call_runtime_passes_receiver_and_args() {
     fn add<'a>(
         nctx: RuntimeContext<'a>,
         new_target: Option<Handle<'_, Value>>,
-        args: HandleSlice<'_>,
+        args: Args,
     ) -> Tagged<'a, Value> {
         let RuntimeContext {
             vm, heap, state, ..
         } = nctx;
         let (a, b) = match (
-            args.get(1).map(|h| h.as_tagged(heap)),
-            args.get(2).map(|h| h.as_tagged(heap)),
+            args.get(heap, 1).map(|h| h.as_tagged(heap)),
+            args.get(heap, 2).map(|h| h.as_tagged(heap)),
         ) {
             (Some(a), Some(b)) => (a.raw(), b.raw()),
             _ => return raise_runtime(vm, heap, state, VmError::Arity),
@@ -2141,7 +2141,7 @@ fn call_dispatches_to_runtime_function_object() {
 fn run_failing_inner<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    _args: HandleSlice<'_>,
+    _args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
@@ -4366,7 +4366,7 @@ fn construct_uses_prototype_receiver_and_prefers_object_result() {
 fn construct_probe<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    _args: HandleSlice<'_>,
+    _args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
     let RuntimeContext {

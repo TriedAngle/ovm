@@ -4,22 +4,19 @@ use vm_core::Object;
 use vm_core::RuntimeContext;
 use vm_core::raise_runtime;
 use vm_core::runtime_api::wrapper_value;
-use vm_core::{DenseString, Handle, HandleSlice, Symbol, Tagged, Value, VmError};
+use vm_core::{Args, DenseString, Handle, Symbol, Tagged, Value};
 
 pub fn string_constructor<'a>(
     nctx: RuntimeContext<'a>,
     new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
-        let arg = match args.get(1).map(|h| h.as_tagged(heap)) {
-            Some(v) => scope.handle(v),
-            None => scope.handle(heap.known().undefined.as_tagged(heap).erase()),
-        };
+        let arg = scope.handle(args.get(heap, 1));
         // `String(sym)` (call, not NewTarget) is SymbolDescriptiveString
         // (ES 22.1.1.1 step 2.a): "Symbol(" + [[Description]] + ")".
         if !is_construct {
@@ -48,14 +45,12 @@ pub fn string_constructor<'a>(
 pub fn string_value_of<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(arg) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let arg = args.get(heap, 0);
     match wrapper_value(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
@@ -71,14 +66,12 @@ pub fn string_value_of<'a>(
 pub fn string_to_string<'a>(
     nctx: RuntimeContext<'a>,
     _new_target: Option<Handle<'_, Value>>,
-    args: HandleSlice<'_>,
+    args: Args,
 ) -> Tagged<'a, Value> {
     let RuntimeContext {
         vm, heap, state, ..
     } = nctx;
-    let Some(arg) = args.get(0) else {
-        return raise_runtime(vm, heap, state, VmError::Arity);
-    };
+    let arg = args.get(heap, 0);
     match wrapper_value(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.

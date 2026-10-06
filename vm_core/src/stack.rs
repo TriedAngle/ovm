@@ -56,13 +56,92 @@ pub struct Callee<'a> {
     pub context: Tagged<'a, Value>,
 }
 
-/// A normalized argument window: `count` words starting at the
-/// absolute slot `src`; element 0 is the receiver.
+/// A rooted argument window: `count` words at `ptr`, element 0 the
+/// receiver. The words live in GC-visited slots (the stack arena or a
+/// handle scope) which the collector updates in place, so reads are
+/// always current across safepoints and the address is stable.
+///
+/// A missing argument reads as `undefined` (ES clause 18); the actual
+/// count rides [`Args::len`] for algorithms that must distinguish
+/// "not present".
 #[derive(Copy, Clone)]
 pub struct Args {
-    /// absolute slot index of element 0
-    pub src: usize,
-    pub count: usize,
+    ptr: core::ptr::NonNull<Value>,
+    count: usize,
+}
+
+impl Args {
+    pub const EMPTY: Args = Args {
+        ptr: core::ptr::NonNull::dangling(),
+        count: 0,
+    };
+
+    /// # Safety
+    /// `ptr..ptr+count` must point into GC-visited slots (the stack
+    /// arena or a handle scope) that stay rooted for as long as `self`
+    /// is used. The safe constructors on `Stack` and `HandleSlice`
+    /// uphold this by deriving the pointer from rooted memory.
+    #[inline(always)]
+    pub unsafe fn from_raw(ptr: core::ptr::NonNull<Value>, count: usize) -> Self {
+        debug_assert!(ptr.as_ptr().align_offset(core::mem::align_of::<Value>()) == 0);
+        Self { ptr, count }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// Element `i`; a missing argument reads as undefined. While the
+    /// returned `Tagged` is alive the shared heap borrow holds, so no
+    /// `&mut` — no safepoint — can intervene (the GcSlot rule).
+    #[inline(always)]
+    pub fn get<'h>(&self, heap: &'h Heap, i: usize) -> Tagged<'h, Value> {
+        if i >= self.count {
+            return heap.known().undefined.as_tagged(heap).erase();
+        }
+        // Safety: the slot is a rooted, GC-visited word.
+        unsafe { Tagged::from_value_unchecked(*self.ptr.as_ptr().add(i)) }
+    }
+
+    /// A rooting read: a handle to the argument's own slot in the
+    /// window — no scope-slot allocation, valid across safepoints (the
+    /// GC updates the window slot in place). Unlike [`Args::get`], the
+    /// handle borrows the window, not the heap: it may outlive further
+    /// `&mut Heap` calls. A missing argument resolves to the undefined
+    /// root handle.
+    #[inline(always)]
+    pub fn get_handle<'s>(&'s self, heap: &Heap, i: usize) -> Handle<'s, Value> {
+        if i >= self.count {
+            return heap.known().undefined.erase();
+        }
+        // Safety: the window slots are GC-visited for the call duration.
+        unsafe {
+            Handle::from_location(core::ptr::NonNull::new_unchecked(self.ptr.as_ptr().add(i)))
+        }
+    }
+
+    /// The same window minus its first `n` elements.
+    #[inline]
+    pub fn slice_from(&self, n: usize) -> Args {
+        if n >= self.count {
+            return Args::EMPTY;
+        }
+        Args {
+            ptr: unsafe { core::ptr::NonNull::new_unchecked(self.ptr.as_ptr().add(n)) },
+            count: self.count - n,
+        }
+    }
+
+    #[inline]
+    pub fn iter<'h>(self, heap: &'h Heap) -> impl Iterator<Item = Tagged<'h, Value>> + 'h {
+        (0..self.count).map(move |i| self.get(heap, i))
+    }
 }
 
 /// What a scattered call site stages at element 0.
@@ -250,7 +329,7 @@ impl Stack {
                 // params first: a staged source at the frame low would be
                 // clobbered by the register fill. Nothing allocates in
                 // between, so reading not-yet-rooted words here is sound.
-                stack.copy_params(anchor, args.src, count);
+                stack.copy_params(anchor, args.ptr, count);
             },
         )
     }
@@ -359,15 +438,32 @@ impl Stack {
         }
     }
 
-    /// Whole-word, overlap-safe copy between arena slots.
+    /// Whole-word, overlap-safe copy from an argument window into the
+    /// arena.
     #[inline(always)]
-    fn copy_params(&self, dst: usize, src: usize, count: usize) {
+    fn copy_params(&self, dst: usize, src: core::ptr::NonNull<Value>, count: usize) {
         unsafe {
             core::ptr::copy(
-                self.slots.as_ptr().add(src),
+                src.as_ptr().cast::<Register>(),
                 (self.slots.as_ptr() as *mut Register).add(dst),
                 count,
             );
+        }
+    }
+
+    /// An [`Args`] over `count` words starting at the absolute slot
+    /// `src` (rooted by this stack).
+    #[inline(always)]
+    fn args_at(&self, src: usize, count: usize) -> Args {
+        // Safety: derived from this stack's own rooted arena.
+        unsafe {
+            Args::from_raw(
+                core::ptr::NonNull::new(
+                    (self.slots.as_ptr() as *const Value).add(src) as *mut Value
+                )
+                .unwrap_unchecked(),
+                count,
+            )
         }
     }
 
@@ -406,7 +502,7 @@ impl Stack {
                 .as_raw()
                 .store_raw(self.slot_unchecked(src).raw().to_bits());
         }
-        Ok(Args { src: dst, count })
+        Ok(self.args_at(dst, count))
     }
 
     /// Stage `[receiver, window...]` at the incoming top (construct
@@ -426,12 +522,9 @@ impl Stack {
         self.slot_unchecked(dst).store(receiver);
         if count > 0 {
             let src = Self::slot_of(caller_base, base - count as i32 + 1);
-            self.copy_params(dst + 1, src, count);
+            self.copy_params(dst + 1, self.args_at(src, count).ptr, count);
         }
-        Ok(Args {
-            src: dst,
-            count: 1 + count,
-        })
+        Ok(self.args_at(dst, 1 + count))
     }
 
     /// Stage an external slice at the incoming top (execution entry).
@@ -442,10 +535,7 @@ impl Stack {
             return Err(VmError::StackOverflow);
         }
         self.write_params(dst, values);
-        Ok(Args {
-            src: dst,
-            count: values.len(),
-        })
+        Ok(self.args_at(dst, values.len()))
     }
 
     /// A handle over a caller register slot: rooted by the live frame
@@ -464,19 +554,33 @@ impl Stack {
     /// The caller's call window `[base-count+1 .. base]` as an [`Args`].
     #[inline]
     pub fn window(&self, caller_base: usize, base: i32, count: usize) -> Args {
-        Args {
-            src: Self::slot_of(caller_base, base - count as i32 + 1),
-            count,
-        }
+        self.args_at(Self::slot_of(caller_base, base - count as i32 + 1), count)
     }
 
-    /// A rooted slice view over a normalized argument window.
+    /// A rooted slice view over an argument window (the proxy/embedder
+    /// boundary).
     #[inline]
     pub fn slice(&self, args: Args) -> HandleSlice<'_> {
         if args.count == 0 {
             return HandleSlice::EMPTY;
         }
-        self.value_slice(args.src, args.count)
+        // Safety: `args` covers rooted arena slots for the borrow.
+        unsafe {
+            HandleSlice::from_slice(core::slice::from_raw_parts(args.ptr.as_ptr(), args.count))
+        }
+    }
+
+    /// The `top` the stack needs for `args` to sit inside the rooted
+    /// region; `None` when it already does (a window inside a frame).
+    #[inline]
+    pub fn rooting_top(&self, args: Args) -> Option<usize> {
+        if args.count == 0 {
+            return None;
+        }
+        let base = self.slots.as_ptr() as usize;
+        let end = args.ptr.as_ptr() as usize + args.count * core::mem::size_of::<Value>();
+        let needed = (end - base) / core::mem::size_of::<Register>();
+        (needed > self.top()).then_some(needed)
     }
 
     #[inline]
