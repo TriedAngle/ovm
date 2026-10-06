@@ -247,6 +247,32 @@ impl<'a> Ctx<'a> {
             self.exception_word()
         }
     }
+
+    /// Invoke runtime callee `rt` over a normalized argument window.
+    ///
+    /// `args` may be a window inside the caller's frame (already rooted)
+    /// or staged above `top` ([`Stack::stage_scattered`]): the latter is
+    /// covered by bumping `top` over it for the call's duration, so the
+    /// GC sees the words and a re-entrant execution pushes above them.
+    #[inline(always)]
+    pub fn call_runtime(&self, rt: crate::RuntimeIndex, args: crate::Args) -> Tagged<'a, Value> {
+        let f = self.vm().runtime(rt);
+        let stack = self.stack();
+        let saved = stack.top();
+        let rooted = args.src + args.count;
+        let staged = rooted > saved;
+        if staged {
+            stack.set_top(rooted);
+        }
+        // Safety: the heap parts carry Ctx's original borrows.
+        let nctx =
+            crate::RuntimeContext::new(self.vm(), unsafe { self.heap_mut() }, self.state());
+        let v = f(nctx, stack.slice(args));
+        if staged {
+            stack.set_top(saved);
+        }
+        v
+    }
 }
 
 /// The exception-dispatch result: a handler was found (its entry pc

@@ -56,34 +56,26 @@ pub struct Callee<'a> {
     pub context: Tagged<'a, Value>,
 }
 
-/// Where a pushed frame's parameters come from; element 0 is always
-/// the receiver. Copy by value: pushing never allocates, so a raw
-/// `Tagged` slice is safe — the words are copied into rooted arena
-/// slots before any collection could run.
-pub enum Params<'p> {
-    /// A slice of values: element 0 = receiver.
-    Slice(&'p [Tagged<'p, Value>]),
-    /// The caller's contiguous register window
-    /// `[base - count + 1 ..= base]`: element 0 (the receiver) rides
-    /// the window's lowest slot.
-    Window { base: i32, count: usize },
-    /// The scattered registers of `CallMethod0/1/2`: a receiver
-    /// register plus up to two argument registers.
-    MethodFast {
-        recv: i32,
-        args: [i32; 2],
-        argc: usize,
-    },
-    /// The scattered registers of `CallFunction0/1/2`: up to two
-    /// argument registers under an implicit `undefined` receiver.
-    FunctionFast { args: [i32; 2], argc: usize },
-    /// A synthesized receiver at the anchor followed by the caller's
-    /// window arguments (`[[Construct]]`).
-    Construct {
-        receiver: Tagged<'p, Value>,
-        base: i32,
-        count: usize,
-    },
+/// A normalized argument window in the arena: `count` words starting
+/// at the absolute slot `src`. Element 0 is always the receiver
+/// (parameter 0 for bytecode frames; runtime callees ignore it when
+/// they don't need it — the one calling ABI, V8-style).
+#[derive(Copy, Clone)]
+pub struct Args {
+    /// absolute slot index of element 0
+    pub src: usize,
+    pub count: usize,
+}
+
+/// What a scattered call site stages at element 0: the receiver
+/// register's word, or dispatcher-synthesized undefined for function
+/// call sites (V8's ConvertReceiverMode).
+#[derive(Copy, Clone)]
+pub enum Recv {
+    /// the receiver register's word (method call sites)
+    Reg(i32),
+    /// synthesized undefined (function call sites)
+    Undefined,
 }
 
 /// Frame layout
@@ -242,6 +234,12 @@ impl Stack {
     /// (padded to `formal_min` with undefined), write the parameters, and
     /// initialize the header — including the caller's suspended state.
     /// Entry is at pc 0; the accumulator slot is seeded undefined.
+    ///
+    /// `args` may point into the caller's frame (a call window) or at the
+    /// incoming top (scattered staging — see [`Stack::stage_scattered`]):
+    /// the param copy runs before the register-file fill so a source at
+    /// the frame low survives, and the reservation's bounds check covers
+    /// a staged window because it lies inside `[low, low + padded)`.
     #[inline(always)]
     pub fn push_frame(
         &self,
@@ -249,76 +247,89 @@ impl Stack {
         caller: FrameMeta,
         callee: Callee<'_>,
         new_target: Tagged<'_, Value>,
-        params: Params<'_>,
+        args: Args,
+    ) -> Result<FrameMeta, VmError> {
+        let count = args.count;
+        self.push_frame_with(heap, caller, callee, new_target, count, |stack, anchor, _| {
+            // params first: a staged source at the frame low would be
+            // clobbered by the register fill. Nothing allocates in
+            // between, so reading not-yet-rooted words here is sound.
+            stack.copy_params(anchor, args.src, count);
+        })
+    }
+
+    /// Push a callee frame from scattered call-site registers: the
+    /// parameters are written straight from the caller's operands — no
+    /// intermediate staging — making the hot ≤2-arg JS→JS path a single
+    /// copy per word.
+    #[inline(always)]
+    pub fn push_scattered_frame(
+        &self,
+        heap: &Heap,
+        caller: FrameMeta,
+        callee: Callee<'_>,
+        new_target: Tagged<'_, Value>,
+        recv: Recv,
+        sargs: [i32; 2],
+        argc: usize,
+    ) -> Result<FrameMeta, VmError> {
+        let count = 1 + argc;
+        self.push_frame_with(heap, caller, callee, new_target, count, |stack, anchor, base| {
+            match recv {
+                Recv::Reg(recv) => {
+                    let src = Self::slot_of(base, recv);
+                    stack
+                        .slot_unchecked(anchor)
+                        .as_raw()
+                        .store_raw(stack.slot_unchecked(src).raw().to_bits());
+                }
+                Recv::Undefined => {
+                    stack
+                        .slot_unchecked(anchor)
+                        .store(stack.undefined.get(heap));
+                }
+            }
+            for (i, &operand) in sargs.iter().enumerate().take(argc) {
+                let src = Self::slot_of(base, operand);
+                stack
+                    .slot_unchecked(anchor + 1 + i)
+                    .as_raw()
+                    .store_raw(stack.slot_unchecked(src).raw().to_bits());
+            }
+        })
+    }
+
+    /// The frame-push core shared by every entry point: one bounds
+    /// check, `write` fills `[anchor, anchor+count)` from the call
+    /// site's shape, then the formals pad, register-file fill and
+    /// header init run once for all of them.
+    #[inline(always)]
+    fn push_frame_with<P: FnOnce(&Self, usize, usize)>(
+        &self,
+        heap: &Heap,
+        caller: FrameMeta,
+        callee: Callee<'_>,
+        new_target: Tagged<'_, Value>,
+        count: usize,
+        write: P,
     ) -> Result<FrameMeta, VmError> {
         let (register_count, formal_min) = callee.info.as_ref().frame_facts();
-        let count = match &params {
-            Params::Slice(args) => args.len(),
-            Params::Window { count, .. } => *count,
-            Params::MethodFast { argc, .. } => 1 + argc,
-            Params::FunctionFast { argc, .. } => 1 + argc,
-            Params::Construct { count, .. } => 1 + count,
-        };
         let padded = count.max(formal_min);
-        let anchor = self.reserve(heap, register_count, padded)?;
-        let undefined = self.undefined.get(heap);
-        let param = |i: usize| self.slot_unchecked(anchor + i);
-        match &params {
-            Params::Slice(args) => {
-                self.write_params(anchor, args);
-                for i in args.len()..padded {
-                    param(i).store(undefined);
-                }
-            }
-            Params::Window { base, count } => {
-                // element 0 (receiver) sits at the window's lowest slot:
-                // the base operand minus count-1 — one forward copy
-                let src = Self::slot_of(caller.base, base - *count as i32 + 1);
-                self.copy_slots(anchor, src, *count);
-                for i in *count..padded {
-                    param(i).store(undefined);
-                }
-            }
-            Params::MethodFast { recv, args, argc } => {
-                let v = self
-                    .slot_unchecked(Self::slot_of(caller.base, *recv))
-                    .get(heap);
-                param(0).store(v);
-                for (i, &operand) in args.iter().enumerate().take(*argc) {
-                    let v = self
-                        .slot_unchecked(Self::slot_of(caller.base, operand))
-                        .get(heap);
-                    param(1 + i).store(v);
-                }
-                for i in (1 + argc)..padded {
-                    param(i).store(undefined);
-                }
-            }
-            Params::FunctionFast { args, argc } => {
-                param(0).store(undefined);
-                for (i, &operand) in args.iter().enumerate().take(*argc) {
-                    let v = self
-                        .slot_unchecked(Self::slot_of(caller.base, operand))
-                        .get(heap);
-                    param(1 + i).store(v);
-                }
-                for i in (1 + argc)..padded {
-                    param(i).store(undefined);
-                }
-            }
-            Params::Construct {
-                receiver,
-                base,
-                count,
-            } => {
-                param(0).store(*receiver);
-                let src = Self::slot_of(caller.base, base - *count as i32 + 1);
-                self.copy_slots(anchor + 1, src, *count);
-                for i in (1 + count)..padded {
-                    param(i).store(undefined);
-                }
-            }
+        let low = self.top();
+        if low + register_count + HEADER_SLOTS + padded > self.slots.len() {
+            return Err(VmError::StackOverflow);
         }
+        let anchor = low + register_count + HEADER_SLOTS;
+        write(self, anchor, caller.base);
+        let undefined = self.undefined.get(heap);
+        for i in count..padded {
+            self.slot_unchecked(anchor + i).store(undefined);
+        }
+        let fill = self.fill.get(heap);
+        for i in 0..register_count {
+            self.slot_unchecked(low + i).store(fill);
+        }
+        self.set_top(anchor + padded);
         Ok(self.init_frame_header(
             heap,
             anchor,
@@ -347,14 +358,13 @@ impl Stack {
         }
     }
 
-    /// Whole-word copy between arena slots; both sides are GC roots and
-    /// the ranges are disjoint by construction (the destination sits
-    /// above the pre-push top, the source inside the caller's frame).
+    /// Whole-word copy between arena slots. Overlap-safe: a staged
+    /// window at the incoming top can reach past a small register file
+    /// into the destination param region.
     #[inline(always)]
-    fn copy_slots(&self, dst: usize, src: usize, count: usize) {
-        debug_assert!(count == 0 || dst + count <= src || src + count <= dst);
+    fn copy_params(&self, dst: usize, src: usize, count: usize) {
         unsafe {
-            core::ptr::copy_nonoverlapping(
+            core::ptr::copy(
                 self.slots.as_ptr().add(src),
                 (self.slots.as_ptr() as *mut Register).add(dst),
                 count,
@@ -362,87 +372,106 @@ impl Stack {
         }
     }
 
-    /// Stage a construct argument window for a runtime constructor:
-    /// `[receiver(=undefined), args...]` — runtime fns index element 0 as
-    /// the receiver, constructs pass none.
-    pub fn stage_construct_args(
+    /// Stage scattered call operands into one contiguous window
+    /// `[receiver, args...]` at the incoming top WITHOUT bumping it, for
+    /// runtime callees and proxy traps. The words sit above `top` —
+    /// outside the GC's scan — until the consumer bumps `top` over them
+    /// (see `Ctx::call_runtime`); nothing may allocate in between.
+    /// Bytecode frames use `push_scattered_frame` instead (direct write,
+    /// no staging).
+    #[inline]
+    pub fn stage_scattered(
         &self,
         heap: &Heap,
-        args: HandleSlice<'_>,
-    ) -> Result<(usize, HandleSlice<'_>), VmError> {
-        let saved_top = self.top();
-        let size = 1 + args.len();
-        if saved_top + size > self.slots.len() {
+        caller_base: usize,
+        recv: Recv,
+        args: [i32; 2],
+        argc: usize,
+    ) -> Result<Args, VmError> {
+        let dst = self.top();
+        let count = 1 + argc;
+        if dst + count > self.slots.len() {
             return Err(VmError::StackOverflow);
         }
-        let dst = saved_top;
-        self.slot_unchecked(dst).store(self.undefined.get(heap));
-        if !args.is_empty() {
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    args.raw().as_ptr(),
-                    (self.slots.as_ptr() as *mut Value).add(dst + 1),
-                    args.len(),
-                )
+        match recv {
+            Recv::Undefined => {
+                self.slot_unchecked(dst).store(self.undefined.get(heap));
+            }
+            Recv::Reg(recv) => {
+                let src = Self::slot_of(caller_base, recv);
+                self.slot_unchecked(dst)
+                    .as_raw()
+                    .store_raw(self.slot_unchecked(src).raw().to_bits());
             }
         }
-        self.set_top(dst + size);
-        let staged = self.value_slice(dst, 1 + args.len());
-        Ok((saved_top, staged))
-    }
-
-    #[inline]
-    pub fn stage_args_regs<'s>(
-        &'s self,
-        caller_base: usize,
-        recv: i32,
-        args: [i32; 2],
-        argc: usize,
-    ) -> Result<(usize, HandleSlice<'s>), VmError> {
-        let saved_top = self.top();
-        let size = 1 + argc;
-        if saved_top + size > self.slots.len() {
-            return Err(VmError::StackOverflow);
-        }
-        let dst = saved_top;
-        let recv_regs = [recv, args[0], args[1]];
-        for (i, &operand) in recv_regs.iter().enumerate().take(1 + argc) {
-            let src = Self::slot_of(caller_base, operand);
-            self.slot_unchecked(dst + i)
-                .as_raw()
-                .store_raw(self.slot_unchecked(src).raw().to_bits());
-        }
-        self.set_top(dst + size);
-        // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
-        let staged = self.value_slice(dst, 1 + argc);
-        Ok((saved_top, staged))
-    }
-
-    #[inline]
-    pub fn stage_function_args<'s>(
-        &'s self,
-        heap: &Heap,
-        caller_base: usize,
-        args: [i32; 2],
-        argc: usize,
-    ) -> Result<(usize, HandleSlice<'s>), VmError> {
-        let saved_top = self.top();
-        let size = 1 + argc;
-        if saved_top + size > self.slots.len() {
-            return Err(VmError::StackOverflow);
-        }
-        let dst = saved_top;
-        self.slot_unchecked(dst).store(self.undefined.get(heap));
         for (i, &operand) in args.iter().enumerate().take(argc) {
             let src = Self::slot_of(caller_base, operand);
             self.slot_unchecked(dst + 1 + i)
                 .as_raw()
                 .store_raw(self.slot_unchecked(src).raw().to_bits());
         }
-        self.set_top(dst + size);
-        // SAFETY: the destination slots are GC roots (Stack is EdgeVisitable)
-        let staged = self.value_slice(dst, 1 + argc);
-        Ok((saved_top, staged))
+        Ok(Args { src: dst, count })
+    }
+
+    /// Stage `[receiver, window...]` at the incoming top (construct
+    /// pushes and method-flavor runtime constructors): the synthesized
+    /// receiver at element 0 followed by the caller's call window.
+    #[inline]
+    pub fn stage_construct(
+        &self,
+        caller_base: usize,
+        receiver: Tagged<'_, Value>,
+        base: i32,
+        count: usize,
+    ) -> Result<Args, VmError> {
+        let dst = self.top();
+        if dst + 1 + count > self.slots.len() {
+            return Err(VmError::StackOverflow);
+        }
+        self.slot_unchecked(dst).store(receiver);
+        if count > 0 {
+            let src = Self::slot_of(caller_base, base - count as i32 + 1);
+            self.copy_params(dst + 1, src, count);
+        }
+        Ok(Args {
+            src: dst,
+            count: 1 + count,
+        })
+    }
+
+    /// Stage an external slice at the incoming top (execution entry):
+    /// the following `push_frame` covers the region with its
+    /// reservation.
+    #[inline]
+    pub fn stage_slice(&self, values: &[Tagged<'_, Value>]) -> Result<Args, VmError> {
+        let dst = self.top();
+        if dst + values.len() > self.slots.len() {
+            return Err(VmError::StackOverflow);
+        }
+        self.write_params(dst, values);
+        Ok(Args {
+            src: dst,
+            count: values.len(),
+        })
+    }
+
+    /// The caller's contiguous call window `[base-count+1 .. base]` as a
+    /// normalized [`Args`]: element 0 (the receiver) at its lowest slot.
+    #[inline]
+    pub fn window(&self, caller_base: usize, base: i32, count: usize) -> Args {
+        Args {
+            src: Self::slot_of(caller_base, base - count as i32 + 1),
+            count,
+        }
+    }
+
+    /// A rooted slice view over a normalized argument window.
+    #[inline]
+    pub fn slice(&self, args: Args) -> HandleSlice<'_> {
+        if args.count == 0 {
+            return HandleSlice::EMPTY;
+        }
+        self.value_slice(args.src, args.count)
     }
 
     #[inline]
@@ -458,22 +487,6 @@ impl Stack {
             register_count: self.regcount(caller),
             handler_pc: read(SAVED_HANDLER_PC_OFFSET),
         }
-    }
-
-    #[inline(always)]
-    fn reserve(&self, heap: &Heap, register_count: usize, padded: usize) -> Result<usize, VmError> {
-        let low = self.top();
-        let size = register_count + HEADER_SLOTS + padded;
-        if low + size > self.slots.len() {
-            return Err(VmError::StackOverflow);
-        }
-        let anchor = low + register_count + HEADER_SLOTS;
-        let fill = self.fill.get(heap);
-        for i in 0..register_count {
-            self.slot_unchecked(low + i).store(fill);
-        }
-        self.set_top(low + size);
-        Ok(anchor)
     }
 
     #[allow(clippy::too_many_arguments)]

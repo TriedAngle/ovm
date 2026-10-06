@@ -1992,8 +1992,8 @@ fn store_new_accessor_property_defines_own_accessor() {
     assert_eq!(Smi::decode(result.unwrap()).unwrap().value(), 7);
 }
 
-/// A runtime function object: callable map with RUNTIME flag, slots[0] = the
-/// runtime registry index as a Smi.
+/// A runtime function object: callable map with RUNTIME flag, slots[0] =
+/// the packed runtime callee Smi (index + argument shape).
 fn runtime_function<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,

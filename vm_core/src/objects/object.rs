@@ -3,8 +3,8 @@ use core::alloc::Layout;
 use crate::{
     CallableInfoObject, Coercion, Context, ContextState, Convert, DenseString, EdgeVisitable,
     FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
-    HeapObject, Hint, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext, SlotName, Smi,
-    Symbol, Tagged, VM, Value, Visitor, VmError,
+    HeapObject, Hint, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext, RuntimeIndex,
+    SlotName, Smi, Symbol, Tagged, VM, Value, Visitor, VmError,
 };
 
 #[repr(C)]
@@ -54,14 +54,13 @@ impl Object {
 
     /// The RUNTIME-kind slot-0 Smi decoded to a call target half: the
     /// value is the callee's registry runtime index.
-    /// TODO: make this better
     #[inline]
     pub fn runtime_call_target<'a>(&'a self, heap: &'a Heap) -> Option<CallTarget<'a>> {
         if !self.header.map.get(heap).kind().is_runtime() {
             return None;
         }
         let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
-        Some(CallTarget::Runtime(usize::try_from(idx).ok()?))
+        Some(CallTarget::Runtime(RuntimeIndex(usize::try_from(idx).ok()?)))
     }
 
     #[inline(always)]
@@ -157,7 +156,7 @@ pub enum CallTarget<'a> {
         context: Tagged<'a, Context>,
         kind: FunctionKind,
     },
-    Runtime(usize),
+    Runtime(RuntimeIndex),
     /// A callable proxy: `[[Call]]` dispatches through the `apply` trap.
     Proxy(Tagged<'a, Object>),
 }

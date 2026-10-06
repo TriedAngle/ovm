@@ -6,45 +6,17 @@ use crate::{
 };
 use crate::{RuntimeContext, RuntimeIndex};
 
-/// A runtime function object: `CALLABLE | CONSTRUCTOR | RUNTIME`, slots[0] =
-/// runtime index, slots[1] = empty context, [[Prototype]] = Function.prototype.
+/// A runtime function object: `CALLABLE | CONSTRUCTOR | RUNTIME`, slots[0]
+/// = runtime index, slots[1] = empty context, [[Prototype]] =
+/// Function.prototype. Every callee takes the call receiver as element 0
+/// of its argument window (the uniform ABI); callees that don't need it
+/// simply ignore it.
 pub fn make_runtime_function<'s>(
     thread: &mut Thread,
     scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
 ) -> Result<Handle<'s, Object>, VmError> {
-    make_runtime_function_in(thread.heap(), scope, index)
-}
-
-pub fn make_runtime_function_in<'s>(
-    heap: &mut Heap,
-    scope: &'s HandleScope<'_>,
-    index: RuntimeIndex,
-) -> Result<Handle<'s, Object>, VmError> {
-    let kind = MapKind::OBJECT
-        .union(MapKind::CALLABLE)
-        .union(MapKind::CONSTRUCTOR)
-        .union(MapKind::RUNTIME)
-        .union(MapKind::EXTENDABLE);
-    let map = heap.allocate_handle::<Map>(
-        MapInit {
-            kind,
-            value_slot_count: 2,
-            descriptors: &[],
-            prototype: heap.known().function_prototype.erase(),
-        },
-        scope,
-    );
-    let empty_context = heap.known().empty_context;
-    let obj = heap.new_object(
-        scope,
-        map,
-        scope.stage(&[
-            Smi::new(index.0 as i64).into_tagged(),
-            empty_context.as_tagged(heap).erase(),
-        ]),
-    );
-    Ok(scope.handle(obj))
+    make_runtime_object(thread.heap(), scope, index, true)
 }
 
 /// A non-constructor runtime function (`Proxy.revocable`-style statics).
@@ -53,18 +25,22 @@ pub fn make_runtime_plain_function<'s>(
     scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
 ) -> Result<Handle<'s, Object>, VmError> {
-    make_runtime_plain_function_in(thread.heap(), scope, index)
+    make_runtime_object(thread.heap(), scope, index, false)
 }
 
-pub fn make_runtime_plain_function_in<'s>(
+fn make_runtime_object<'s>(
     heap: &mut Heap,
     scope: &'s HandleScope<'_>,
     index: RuntimeIndex,
+    constructor: bool,
 ) -> Result<Handle<'s, Object>, VmError> {
-    let kind = MapKind::OBJECT
+    let mut kind = MapKind::OBJECT
         .union(MapKind::CALLABLE)
         .union(MapKind::RUNTIME)
         .union(MapKind::EXTENDABLE);
+    if constructor {
+        kind = kind.union(MapKind::CONSTRUCTOR);
+    }
     let map = heap.allocate_handle::<Map>(
         MapInit {
             kind,
@@ -84,6 +60,14 @@ pub fn make_runtime_plain_function_in<'s>(
         ]),
     );
     Ok(scope.handle(obj))
+}
+
+pub fn make_runtime_plain_function_in<'s>(
+    heap: &mut Heap,
+    scope: &'s HandleScope<'_>,
+    index: RuntimeIndex,
+) -> Result<Handle<'s, Object>, VmError> {
+    make_runtime_object(heap, scope, index, false)
 }
 
 /// Compile and run a prelude once at install time (BIND_PRELUDE,

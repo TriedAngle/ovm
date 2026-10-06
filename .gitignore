@@ -7,3 +7,4 @@ tmp/
 # Local benchmark results (regenerated per run)
 benchmarks/BENCHMARKS.md
 .vscode
+.DS_Store

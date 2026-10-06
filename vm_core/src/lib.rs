@@ -64,7 +64,7 @@ pub use runtime::{
     Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Runtime, RuntimeCall,
     RuntimeContext, RuntimeIndex, RuntimeRegistry, raise_runtime, spread_apply_args,
 };
-pub use stack::{Callee, FrameMeta, Params, STACK_SLOTS, Stack};
+pub use stack::{Args, Callee, FrameMeta, Recv, STACK_SLOTS, Stack};
 pub use tools::{KetteTools, Termination};
 pub use transition::{
     Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,

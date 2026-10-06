@@ -8,8 +8,8 @@ use bytecode::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode};
 use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe};
 use vm_core::proxy::Proxy;
 use vm_core::{
-    CallTarget, Callee, Coercion, Compare, Context, ContextState, Convert, Ctx, ExecuteFn,
-    FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter, Object, Params,
+    Args, CallTarget, Callee, Coercion, Compare, Context, ContextState, Convert, Ctx, ExecuteFn,
+    FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter, Object, Recv,
     Register, RuntimeContext, RuntimeIndex, Smi, Tagged, VM, Value, VmError,
 };
 
@@ -3075,12 +3075,8 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
         Some(CallTarget::Proxy(_)) => {
             become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
-        Some(CallTarget::Runtime(idx)) => {
-            let f = ctx.vm().runtime(RuntimeIndex(idx));
-            let base = ctx.frame_base();
-            let args = ctx.stack().args(base, base_r, count);
-            let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-            let v = f(nctx, args);
+        Some(CallTarget::Runtime(rt)) => {
+            let v = ctx.call_runtime(rt, ctx.stack().window(ctx.frame_base(), base_r, count));
             become resume(
                 unsafe { ctx.code_ptr().add(pc) },
                 regs,
@@ -3111,10 +3107,7 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
                     context: context.erase(),
                 },
                 heap.known().undefined.as_tagged(heap).erase(),
-                Params::Window {
-                    base: base_r,
-                    count,
-                },
+                ctx.stack().window(ctx.frame_base(), base_r, count),
             ) {
                 Ok(frame) => frame,
                 Err(err) => return unsafe { ctx.raise_tag(err) },
@@ -3173,8 +3166,8 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
                 float,
             )
         }
-        ConstructStart::Runtime(idx) => {
-            let v = dispatch_runtime_construct(ctx, idx, callee, base_r, count);
+        ConstructStart::Runtime(rt) => {
+            let v = dispatch_runtime_construct(ctx, rt, callee, base_r, count);
             become resume(
                 unsafe { ctx.code_ptr().add(pc) },
                 regs,
@@ -3221,7 +3214,7 @@ enum ConstructStart {
     /// receiver synthesis threw; the pending exception is set
     Threw(()),
     /// a runtime constructor: call it directly with `new_target` set
-    Runtime(usize),
+    Runtime(RuntimeIndex),
     /// not an ordinary function constructor: fall back to `slow_construct`
     Slow,
 }
@@ -3248,7 +3241,7 @@ fn construct_start<'a>(
         return Ok(ConstructStart::Slow);
     }
     let kind = match Object::call_target(ctx.heap(), callee_word) {
-        Some(CallTarget::Runtime(idx)) => return Ok(ConstructStart::Runtime(idx)),
+        Some(CallTarget::Runtime(rt)) => return Ok(ConstructStart::Runtime(rt)),
         Some(CallTarget::Bytecode { kind, .. }) => kind,
         _ => return Ok(ConstructStart::Slow),
     };
@@ -3286,6 +3279,9 @@ fn construct_start<'a>(
         return Ok(ConstructStart::Slow);
     }
     let heap = unsafe { ctx.heap_mut() };
+    let staged =
+        ctx.stack()
+            .stage_construct(ctx.frame_base(), receiver, base, count)?;
     let frame = ctx.stack().push_frame(
         heap,
         ctx.caller_meta(pc + size, pc),
@@ -3295,11 +3291,7 @@ fn construct_start<'a>(
             context: context.erase(),
         },
         callee_word,
-        Params::Construct {
-            receiver,
-            base,
-            count,
-        },
+        staged,
     )?;
     ctx.set_frame_base(frame.base);
     Ok(ConstructStart::Frame)
@@ -3471,74 +3463,57 @@ enum MethodCall<'a> {
     Proxy,
 }
 
+/// Invoke a runtime callee over scattered call-site registers: stage the
+/// `[receiver, args...]` window and call (the receiver rides element 0,
+/// exactly as for a bytecode frame).
 #[inline(always)]
-fn dispatch_runtime_method<'a>(
+fn dispatch_runtime_scattered<'a>(
     ctx: &Ctx<'a>,
-    idx: usize,
-    recv: i32,
+    rt: RuntimeIndex,
+    recv: Recv,
     args: [i32; 2],
     argc: usize,
 ) -> Tagged<'a, Value> {
-    let f = ctx.vm().runtime(RuntimeIndex(idx));
-    let base = ctx.frame_base();
-    let (saved_top, args) = match ctx.stack().stage_args_regs(base, recv, args, argc) {
-        Ok(staged) => staged,
+    match ctx
+        .stack()
+        .stage_scattered(ctx.heap(), ctx.frame_base(), recv, args, argc)
+    {
+        Ok(a) => ctx.call_runtime(rt, a),
         Err(err) => {
             let _ = unsafe { ctx.raise(err) };
-            return ctx.exception_word();
+            ctx.exception_word()
         }
-    };
-    let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-    let v = f(nctx, args);
-    ctx.stack().set_top(saved_top);
-    v
+    }
 }
 
-#[inline(always)]
-fn dispatch_runtime_function<'a>(
-    ctx: &Ctx<'a>,
-    idx: usize,
-    args: [i32; 2],
-    argc: usize,
-) -> Tagged<'a, Value> {
-    let f = ctx.vm().runtime(RuntimeIndex(idx));
-    let base = ctx.frame_base();
-    let (saved_top, staged) =
-        match ctx
-            .stack()
-            .stage_function_args(ctx.heap(), ctx.frame_base(), args, argc)
-        {
-            Ok(staged) => staged,
-            Err(err) => {
-                let _ = unsafe { ctx.raise(err) };
-                return ctx.exception_word();
-            }
-        };
-    let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-    let v = f(nctx, staged);
-    ctx.stack().set_top(saved_top);
-    v
-}
-
+/// Invoke a runtime constructor: the construct window carries no
+/// receiver, so undefined is synthesized at element 0 (the uniform ABI)
+/// and `new_target` rides the context.
 #[inline(always)]
 fn dispatch_runtime_construct<'a>(
     ctx: &Ctx<'a>,
-    idx: usize,
+    rt: RuntimeIndex,
     callee_reg: i32,
     base: i32,
     count: usize,
 ) -> Tagged<'a, Value> {
-    let f = ctx.vm().runtime(RuntimeIndex(idx));
-    let args = ctx.stack().args(ctx.frame_base(), base, count);
-    let (saved_top, staged) = match ctx.stack().stage_construct_args(ctx.heap(), args) {
-        Ok(staged) => staged,
+    let f = ctx.vm().runtime(rt);
+    let stack = ctx.stack();
+    let undefined = stack.undefined_word(ctx.heap());
+    let args = match stack.stage_construct(ctx.frame_base(), undefined, base, count) {
+        Ok(a) => a,
         Err(err) => {
             let _ = unsafe { ctx.raise(err) };
             return ctx.exception_word();
         }
     };
-    // Safety: fresh register word, no allocation since the read.
-    let callee = ctx.stack().reg(ctx.heap(), ctx.frame_base(), callee_reg);
+    let saved = stack.top();
+    let rooted = args.src + args.count;
+    let staged = rooted > saved;
+    if staged {
+        stack.set_top(rooted);
+    }
+    let callee = stack.reg(ctx.heap(), ctx.frame_base(), callee_reg);
     let raw = ctx.state().handle_scope(|scope| -> Value {
         let new_target = scope.handle(callee);
         let nctx = RuntimeContext::with_new_target(
@@ -3547,23 +3522,13 @@ fn dispatch_runtime_construct<'a>(
             ctx.state(),
             Some(new_target),
         );
-        f(nctx, staged).raw()
+        f(nctx, stack.slice(args)).raw()
     });
-    ctx.stack().set_top(saved_top);
+    if staged {
+        stack.set_top(saved);
+    }
     // Safety: fresh result word, consumed before any allocation.
     unsafe { Tagged::<Value>::from_value_unchecked(raw) }
-}
-
-fn dispatch_runtime_contiguous<'a>(
-    ctx: &Ctx<'a>,
-    idx: usize,
-    base: i32,
-    count: usize,
-) -> Tagged<'a, Value> {
-    let f = ctx.vm().runtime(RuntimeIndex(idx));
-    let args = ctx.stack().args(ctx.frame_base(), base, count);
-    let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
-    f(nctx, args)
 }
 
 /// Push a callee frame (facts from a `CallTarget::Bytecode` destructure
@@ -3575,7 +3540,7 @@ fn push_callee_frame<'a>(
     pc: usize,
     size: usize,
     callee: Callee<'_>,
-    params: Params<'_>,
+    args: Args,
 ) -> Result<MethodCall<'a>, VmError> {
     let heap = unsafe { ctx.heap_mut() };
     let frame = ctx.stack().push_frame(
@@ -3583,7 +3548,34 @@ fn push_callee_frame<'a>(
         ctx.caller_meta(pc + size, pc),
         callee,
         heap.known().undefined.as_tagged(heap).erase(),
-        params,
+        args,
+    )?;
+    ctx.set_frame_base(frame.base);
+    Ok(MethodCall::Frame(frame))
+}
+
+/// Push a callee frame from scattered call-site registers: the
+/// parameters are written straight from the caller's operands (one copy
+/// per word, no intermediate staging).
+#[inline(always)]
+fn push_scattered_frame<'a>(
+    ctx: &Ctx<'a>,
+    pc: usize,
+    size: usize,
+    callee: Callee<'_>,
+    recv: Recv,
+    args: [i32; 2],
+    argc: usize,
+) -> Result<MethodCall<'a>, VmError> {
+    let heap = unsafe { ctx.heap_mut() };
+    let frame = ctx.stack().push_scattered_frame(
+        heap,
+        ctx.caller_meta(pc + size, pc),
+        callee,
+        heap.known().undefined.as_tagged(heap).erase(),
+        recv,
+        args,
+        argc,
     )?;
     ctx.set_frame_base(frame.base);
     Ok(MethodCall::Frame(frame))
@@ -3600,9 +3592,7 @@ fn call_method_start<'a>(
     argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match unsafe {
-        vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word)
-    } {
+    match vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
         vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
             target,
             info,
@@ -3612,7 +3602,7 @@ fn call_method_start<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            push_callee_frame(
+            push_scattered_frame(
                 ctx,
                 pc,
                 size,
@@ -3621,11 +3611,13 @@ fn call_method_start<'a>(
                     info,
                     context: context.erase(),
                 },
-                Params::MethodFast { recv, args, argc },
+                Recv::Reg(recv),
+                args,
+                argc,
             )
         }
-        vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_method(
-            ctx, idx, recv, args, argc,
+        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
+            ctx, rt, Recv::Reg(recv), args, argc,
         ))),
         vm_core::ic::CallProbe::Miss => {
             slow_call_method_miss(ctx, pc, size, callee_word, recv, args, argc, fb)
@@ -3643,9 +3635,7 @@ fn call_function_start<'a>(
     argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match unsafe {
-        vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word)
-    } {
+    match vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
         vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
             target,
             info,
@@ -3655,20 +3645,22 @@ fn call_function_start<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            push_callee_frame(
+            push_scattered_frame(
                 ctx,
                 pc,
                 size,
                 Callee {
                     callable: target.erase(),
-                    info: info,
+                    info,
                     context: context.erase(),
                 },
-                Params::FunctionFast { args, argc },
+                Recv::Undefined,
+                args,
+                argc,
             )
         }
-        vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_function(
-            ctx, idx, args, argc,
+        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
+            ctx, rt, Recv::Undefined, args, argc,
         ))),
         vm_core::ic::CallProbe::Miss => {
             slow_call_function_miss(ctx, pc, size, callee_word, args, argc, fb)
@@ -3687,9 +3679,7 @@ fn call_start<'a>(
     count: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match unsafe {
-        vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word)
-    } {
+    match vm_core::ic::call_probe(ctx.heap(), ctx.feedback_ref(ctx.heap()), fb, callee_word) {
         vm_core::ic::CallProbe::Bytecode(vm_core::ic::CallHit {
             target,
             info,
@@ -3708,11 +3698,12 @@ fn call_start<'a>(
                     info,
                     context: context.erase(),
                 },
-                Params::Window { base, count },
+                ctx.stack().window(ctx.frame_base(), base, count),
             )
         }
-        vm_core::ic::CallProbe::Runtime(idx) => Ok(MethodCall::Value(dispatch_runtime_contiguous(
-            ctx, idx, base, count,
+        vm_core::ic::CallProbe::Runtime(rt) => Ok(MethodCall::Value(ctx.call_runtime(
+            rt,
+            ctx.stack().window(ctx.frame_base(), base, count),
         ))),
         vm_core::ic::CallProbe::Miss => slow_call_miss(ctx, pc, size, callee_word, base, count, fb),
     }
@@ -3963,8 +3954,8 @@ fn enter<'a>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
-        Some(CallTarget::Runtime(idx)) => {
-            let f = vm.runtime(RuntimeIndex(idx));
+        Some(CallTarget::Runtime(rt)) => {
+            let f = vm.runtime(rt);
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
             Ok(f(nctx, args))
         }
@@ -3985,6 +3976,7 @@ fn enter<'a>(
                     Some(nt) => nt.as_tagged(heap).erase(),
                     None => heap.known().undefined.as_tagged(heap).erase(),
                 };
+                let staged = stack.stage_slice(args.as_tagged())?;
                 stack.push_frame(
                     heap,
                     FrameMeta::ROOT,
@@ -3994,7 +3986,7 @@ fn enter<'a>(
                         context: context.erase(),
                     },
                     new_target_value,
-                    Params::Slice(args.as_tagged()),
+                    staged,
                 )?
             };
             state.set_frame_base(frame.base);

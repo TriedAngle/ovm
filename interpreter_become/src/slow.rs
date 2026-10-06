@@ -7,17 +7,17 @@
 //! frame header before resuming dispatch.
 
 use bytecode::Opcode;
+use vm_core::ic::CallRecord;
 use vm_core::proxy::Proxy;
 use vm_core::{
     CallTarget, CallableInfoObject, Callee, Coercion, Context, ContextInit, ContextState, Convert,
-    Ctx, FixedArray, HandleSlice, Heap, Object, Params, ScopeInfo, Smi, StoreSemantics, Tagged,
+    Ctx, FixedArray, HandleSlice, Heap, Object, Recv, ScopeInfo, Smi, StoreSemantics, Tagged,
     Value, VmError,
 };
 
 use crate::{
-    FloatReg, MethodCall, Ops, Regs, RootsArg, TableArg, base, dispatch_runtime_contiguous,
-    dispatch_runtime_function, dispatch_runtime_method, push_callee_frame, read_signed, resume,
-    slow_next_pc,
+    FloatReg, MethodCall, Ops, Regs, RootsArg, TableArg, base, dispatch_runtime_scattered,
+    push_callee_frame, push_scattered_frame, read_signed, resume, slow_next_pc,
 };
 
 /// Define a become-interpreter slow-path handler (always `pub`). The
@@ -585,10 +585,14 @@ pub fn proxy_apply_regs_slow<'a>(
     let state = ctx.state();
     let base = ctx.frame_base();
     let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_args_regs(base, recv, args, argc)?;
+    let staged = ctx
+        .stack()
+        .stage_scattered(heap, base, Recv::Reg(recv), args, argc)?;
+    let saved_top = ctx.stack().top();
+    ctx.stack().set_top(staged.src + staged.count);
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
-        match Proxy::apply(vm, heap, state, callee, staged)? {
+        match Proxy::apply(vm, heap, state, callee, ctx.stack().slice(staged))? {
             Coercion::Threw => Ok(ctx.exception_word()),
             Coercion::Value(v) => Ok(v),
         }
@@ -704,18 +708,20 @@ pub fn slow_call_method_miss<'a>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(idx)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Value(dispatch_runtime_method(
-                ctx, idx, recv, args, argc,
+        Some(CallTarget::Runtime(rt)) => {
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                CallRecord::Runtime(rt),
+            );
+            Ok(MethodCall::Value(dispatch_runtime_scattered(
+                ctx,
+                rt,
+                Recv::Reg(recv),
+                args,
+                argc,
             )))
         }
         Some(CallTarget::Bytecode {
@@ -727,16 +733,14 @@ pub fn slow_call_method_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    Some(info),
-                )
-            };
-            push_callee_frame(
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                CallRecord::Bytecode(info),
+            );
+            push_scattered_frame(
                 ctx,
                 pc,
                 size,
@@ -745,7 +749,9 @@ pub fn slow_call_method_miss<'a>(
                     info: info,
                     context: context.erase(),
                 },
-                Params::MethodFast { recv, args, argc },
+                Recv::Reg(recv),
+                args,
+                argc,
             )
         }
     }
@@ -765,18 +771,20 @@ pub fn slow_call_function_miss<'a>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(idx)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Value(dispatch_runtime_function(
-                ctx, idx, args, argc,
+        Some(CallTarget::Runtime(rt)) => {
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                CallRecord::Runtime(rt),
+            );
+            Ok(MethodCall::Value(dispatch_runtime_scattered(
+                ctx,
+                rt,
+                Recv::Undefined,
+                args,
+                argc,
             )))
         }
         Some(CallTarget::Bytecode {
@@ -788,16 +796,14 @@ pub fn slow_call_function_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    Some(info),
-                )
-            };
-            push_callee_frame(
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                CallRecord::Bytecode(info),
+            );
+            push_scattered_frame(
                 ctx,
                 pc,
                 size,
@@ -806,7 +812,9 @@ pub fn slow_call_function_miss<'a>(
                     info: info,
                     context: context.erase(),
                 },
-                Params::FunctionFast { args, argc },
+                Recv::Undefined,
+                args,
+                argc,
             )
         }
     }
@@ -826,18 +834,17 @@ pub fn slow_call_miss<'a>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(idx)) => {
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    None,
-                )
-            };
-            Ok(MethodCall::Value(dispatch_runtime_contiguous(
-                ctx, idx, base, count,
+        Some(CallTarget::Runtime(rt)) => {
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                CallRecord::Runtime(rt),
+            );
+            Ok(MethodCall::Value(ctx.call_runtime(
+                rt,
+                ctx.stack().window(ctx.frame_base(), base, count),
             )))
         }
         Some(CallTarget::Bytecode {
@@ -849,15 +856,13 @@ pub fn slow_call_miss<'a>(
             if kind.is_class_constructor() {
                 return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
             }
-            unsafe {
-                vm_core::ic::call_update(
-                    ctx.heap(),
-                    ctx.feedback_ref(ctx.heap()),
-                    fb,
-                    callee_word,
-                    Some(info),
-                )
-            };
+            vm_core::ic::call_update(
+                ctx.heap(),
+                ctx.feedback_ref(ctx.heap()),
+                fb,
+                callee_word,
+                CallRecord::Bytecode(info),
+            );
             push_callee_frame(
                 ctx,
                 pc,
@@ -867,10 +872,7 @@ pub fn slow_call_miss<'a>(
                     info: info,
                     context: context.erase(),
                 },
-                Params::Window {
-                    base: base,
-                    count: count,
-                },
+                ctx.stack().window(ctx.frame_base(), base, count),
             )
         }
     }
@@ -958,10 +960,14 @@ pub fn proxy_apply_function_slow<'a>(
     let state = ctx.state();
     let base = ctx.frame_base();
     let heap = unsafe { ctx.heap_mut() };
-    let (saved_top, staged) = ctx.stack().stage_function_args(heap, base, args, argc)?;
+    let staged = ctx
+        .stack()
+        .stage_scattered(heap, base, Recv::Undefined, args, argc)?;
+    let saved_top = ctx.stack().top();
+    ctx.stack().set_top(staged.src + staged.count);
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
-        match Proxy::apply(vm, heap, state, callee, staged)? {
+        match Proxy::apply(vm, heap, state, callee, ctx.stack().slice(staged))? {
             Coercion::Threw => Ok(ctx.exception_word()),
             Coercion::Value(v) => Ok(v),
         }

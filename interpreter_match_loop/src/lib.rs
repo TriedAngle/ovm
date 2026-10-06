@@ -3,12 +3,12 @@
 use bytecode::{Opcode, Operands, decode, jump_target};
 use vm_core::proxy::Proxy;
 
-use vm_core::ic::{ElementHit, Hit, InlineCache, MonoProbe, StoreHit};
+use vm_core::ic::{CallRecord, ElementHit, Hit, InlineCache, MonoProbe, StoreHit};
 use vm_core::interp::{Ctx, Unwind};
 use vm_core::{
     CallTarget, CallableInfoObject, Callee, Coercion, Compare, Context, ContextInit, ContextState,
     Convert, FixedArray, FixedByteArray, FrameMeta, Handle, HandleSlice, Heap, Key, LoadOutcome,
-    Lookup, Object, Params, Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi,
+    Lookup, Object, Recv, Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi,
     StoreSemantics, Tagged, Termination, VM, Value, VmError,
 };
 
@@ -117,8 +117,8 @@ fn start<'b>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
-        Some(CallTarget::Runtime(idx)) => {
-            let f = vm.runtime(RuntimeIndex(idx));
+        Some(CallTarget::Runtime(rt)) => {
+            let f = vm.runtime(rt);
             let nctx = RuntimeContext::with_new_target(vm, heap, state, new_target);
             Ok(f(nctx, args))
         }
@@ -152,7 +152,7 @@ fn start<'b>(
                         context: context.erase(),
                     },
                     new_target_value,
-                    Params::Slice(args.as_tagged()),
+                    stack.stage_slice(args.as_tagged())?,
                 )?
             };
             state.set_frame_base(frame.base);
@@ -958,9 +958,7 @@ unsafe fn step<'a>(
             // classification entirely (the become interpreter's fast path)
             let callee_word = stack.reg(heap, frame_base, callee_reg);
             if !Proxy::is_proxy(heap, callee_word) {
-                match unsafe {
-                    vm_core::ic::call_probe(heap, ctx.feedback_ref(heap), fb, callee_word)
-                } {
+                match vm_core::ic::call_probe(heap, ctx.feedback_ref(heap), fb, callee_word) {
                     vm_core::ic::CallProbe::Bytecode(hit) => {
                         if hit.kind.is_class_constructor() {
                             throw_err!(ctx, VmError::Type);
@@ -979,10 +977,7 @@ unsafe fn step<'a>(
                                     context: hit.context.erase(),
                                 },
                                 heap.known().undefined.as_tagged(heap).erase(),
-                                Params::Window {
-                                    base: args_base,
-                                    count,
-                                },
+                                stack.window(frame_base, args_base, count),
                             )
                         );
                         ctx.set_frame_base(frame.base);
@@ -992,11 +987,9 @@ unsafe fn step<'a>(
                         }
                         return Flow::Sync;
                     }
-                    vm_core::ic::CallProbe::Runtime(idx) => {
-                        let f = vm.runtime(RuntimeIndex(idx));
+                    vm_core::ic::CallProbe::Runtime(rt) => {
                         let exception = heap.known().exception.as_tagged(heap).raw();
-                        let nctx = RuntimeContext::new(vm, heap, state);
-                        let v = f(nctx, stack.args(frame_base, args_base, count));
+                        let v = ctx.call_runtime(rt, stack.window(frame_base, args_base, count));
                         // Safety: old-gen singleton word.
                         return if v.raw() == exception {
                             Flow::Threw
@@ -1030,25 +1023,21 @@ unsafe fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(idx)) => {
-                    let f = vm.runtime(RuntimeIndex(idx));
+                Some(CallTarget::Runtime(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
-                    let nctx = RuntimeContext::new(vm, heap, state);
-                    let v = f(nctx, stack.args(frame_base, args_base, count));
+                    let v = ctx.call_runtime(rt, stack.window(frame_base, args_base, count));
                     // Safety: old-gen singleton word.
                     if v.raw() == exception {
                         return Flow::Threw;
                     }
                     acc.store(v);
-                    unsafe {
-                        vm_core::ic::call_update(
-                            heap,
-                            ctx.feedback_ref(heap),
-                            fb,
-                            stack.reg(heap, frame_base, callee_reg),
-                            None,
-                        );
-                    }
+                    vm_core::ic::call_update(
+                        heap,
+                        ctx.feedback_ref(heap),
+                        fb,
+                        stack.reg(heap, frame_base, callee_reg),
+                        CallRecord::Runtime(rt),
+                    );
                     Flow::Sync
                 }
                 Some(CallTarget::Bytecode {
@@ -1077,24 +1066,19 @@ unsafe fn step<'a>(
                                     context,
                                 },
                                 undefined,
-                                Params::Window {
-                                    base: args_base,
-                                    count,
-                                },
+                                stack.window(frame_base, args_base, count),
                             )
                         )
                     };
                     // record the site before the callee runs (the
                     // become interpreter's miss-path ordering)
-                    unsafe {
-                        vm_core::ic::call_update(
-                            heap,
-                            ctx.feedback_ref(heap),
-                            fb,
-                            stack.reg(heap, frame_base, callee_reg),
-                            Some(info),
-                        );
-                    }
+                    vm_core::ic::call_update(
+                        heap,
+                        ctx.feedback_ref(heap),
+                        fb,
+                        stack.reg(heap, frame_base, callee_reg),
+                        CallRecord::Bytecode(info),
+                    );
                     ctx.set_frame_base(frame.base);
                     // blocking call: run the callee to completion; its
                     // value becomes the caller's accumulator
@@ -1133,11 +1117,9 @@ unsafe fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(idx)) => {
-                    let f = vm.runtime(RuntimeIndex(idx));
+                Some(CallTarget::Runtime(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
-                    let nctx = RuntimeContext::new(vm, heap, state);
-                    let v = f(nctx, stack.args(frame_base, args_base, count));
+                    let v = ctx.call_runtime(rt, stack.window(frame_base, args_base, count));
                     // Safety: old-gen singleton word.
                     if v.raw() == exception {
                         Flow::Threw
@@ -1172,10 +1154,7 @@ unsafe fn step<'a>(
                                     context,
                                 },
                                 undefined,
-                                Params::Window {
-                                    base: args_base,
-                                    count,
-                                },
+                                stack.window(frame_base, args_base, count),
                             )
                         )
                     };
@@ -1208,16 +1187,14 @@ unsafe fn step<'a>(
             // classification entirely (the become interpreter's fast path)
             let callee_word = stack.reg(heap, frame_base, callee_reg);
             if !Proxy::is_proxy(heap, callee_word) {
-                match unsafe {
-                    vm_core::ic::call_probe(heap, ctx.feedback_ref(heap), fb, callee_word)
-                } {
+                match vm_core::ic::call_probe(heap, ctx.feedback_ref(heap), fb, callee_word) {
                     vm_core::ic::CallProbe::Bytecode(hit) => {
                         if hit.kind.is_class_constructor() {
                             throw_err!(ctx, VmError::Type);
                         }
                         let frame = fold!(
                             ctx,
-                            stack.push_frame(
+                            stack.push_scattered_frame(
                                 heap,
                                 ctx.caller_meta(next_pc, pc),
                                 Callee {
@@ -1226,11 +1203,9 @@ unsafe fn step<'a>(
                                     context: hit.context.erase(),
                                 },
                                 heap.known().undefined.as_tagged(heap).erase(),
-                                Params::MethodFast {
-                                    recv: srcs.0,
-                                    args: srcs.1,
-                                    argc: srcs.2,
-                                },
+                                Recv::Reg(srcs.0),
+                                srcs.1,
+                                srcs.2
                             )
                         );
                         ctx.set_frame_base(frame.base);
@@ -1240,16 +1215,19 @@ unsafe fn step<'a>(
                         }
                         return Flow::Sync;
                     }
-                    vm_core::ic::CallProbe::Runtime(idx) => {
-                        let f = vm.runtime(RuntimeIndex(idx));
+                    vm_core::ic::CallProbe::Runtime(rt) => {
                         let exception = heap.known().exception.as_tagged(heap).raw();
-                        let (saved_top, staged) = fold!(
+                        let staged = fold!(
                             ctx,
-                            stack.stage_args_regs(frame_base, srcs.0, srcs.1, srcs.2)
+                            stack.stage_scattered(
+                                heap,
+                                frame_base,
+                                Recv::Reg(srcs.0),
+                                srcs.1,
+                                srcs.2
+                            )
                         );
-                        let nctx = RuntimeContext::new(vm, heap, state);
-                        let v = f(nctx, staged);
-                        stack.set_top(saved_top);
+                        let v = ctx.call_runtime(rt, staged);
                         // Safety: old-gen singleton word.
                         return if v.raw() == exception {
                             Flow::Threw
@@ -1263,13 +1241,21 @@ unsafe fn step<'a>(
             }
 
             if Proxy::is_proxy(heap, stack.reg(heap, frame_base, callee_reg)) {
-                let (saved_top, staged) = fold!(
+                let staged = fold!(
                     ctx,
-                    stack.stage_args_regs(frame_base, srcs.0, srcs.1, srcs.2)
+                    stack.stage_scattered(
+                        heap,
+                        frame_base,
+                        Recv::Reg(srcs.0),
+                        srcs.1,
+                        srcs.2
+                    )
                 );
+                let saved_top = stack.top();
+                stack.set_top(staged.src + staged.count);
                 let result = state.handle_scope(|scope| {
                     let callee = scope.handle(stack.reg(heap, frame_base, callee_reg));
-                    Proxy::apply(vm, heap, state, callee, staged)
+                    Proxy::apply(vm, heap, state, callee, stack.slice(staged))
                 });
                 stack.set_top(saved_top);
                 return match result {
@@ -1284,16 +1270,26 @@ unsafe fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(idx)) => {
-                    let f = vm.runtime(RuntimeIndex(idx));
+                Some(CallTarget::Runtime(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
-                    let (saved_top, staged) = fold!(
+                    let staged = fold!(
                         ctx,
-                        stack.stage_args_regs(frame_base, srcs.0, srcs.1, srcs.2)
+                        stack.stage_scattered(
+                            heap,
+                            frame_base,
+                            Recv::Reg(srcs.0),
+                            srcs.1,
+                            srcs.2
+                        )
                     );
-                    let nctx = RuntimeContext::new(vm, heap, state);
-                    let v = f(nctx, staged);
-                    stack.set_top(saved_top);
+                    let v = ctx.call_runtime(rt, staged);
+                    vm_core::ic::call_update(
+                        heap,
+                        ctx.feedback_ref(heap),
+                        fb,
+                        stack.reg(heap, frame_base, callee_reg),
+                        CallRecord::Runtime(rt),
+                    );
                     if v.raw() == exception {
                         Flow::Threw
                     } else {
@@ -1311,38 +1307,29 @@ unsafe fn step<'a>(
                     if kind.is_class_constructor() {
                         throw_err!(ctx, VmError::Type);
                     }
-                    let frame = {
-                        let context = context.erase();
-                        let callee = callee.erase();
-                        let undefined = heap.known().undefined.as_tagged(heap).erase();
-                        fold!(
-                            ctx,
-                            stack.push_frame(
-                                heap,
-                                ctx.caller_meta(next_pc, pc),
-                                Callee {
-                                    callable: callee,
-                                    info,
-                                    context,
-                                },
-                                undefined,
-                                Params::MethodFast {
-                                    recv: srcs.0,
-                                    args: srcs.1,
-                                    argc: srcs.2,
-                                },
-                            )
-                        )
-                    };
-                    unsafe {
-                        vm_core::ic::call_update(
+                    let frame = fold!(
+                        ctx,
+                        stack.push_scattered_frame(
                             heap,
-                            ctx.feedback_ref(heap),
-                            fb,
-                            stack.reg(heap, frame_base, callee_reg),
-                            Some(info),
-                        );
-                    }
+                            ctx.caller_meta(next_pc, pc),
+                            Callee {
+                                callable: callee.erase(),
+                                info,
+                                context: context.erase(),
+                            },
+                            heap.known().undefined.as_tagged(heap).erase(),
+                            Recv::Reg(srcs.0),
+                            srcs.1,
+                            srcs.2
+                        )
+                    );
+                    vm_core::ic::call_update(
+                        heap,
+                        ctx.feedback_ref(heap),
+                        fb,
+                        stack.reg(heap, frame_base, callee_reg),
+                        CallRecord::Bytecode(info),
+                    );
                     ctx.set_frame_base(frame.base);
                     // blocking call: run the callee to completion; its
                     // value becomes the caller's accumulator
@@ -1372,16 +1359,14 @@ unsafe fn step<'a>(
             // classification entirely (the become interpreter's fast path)
             let callee_word = stack.reg(heap, frame_base, callee_reg);
             if !Proxy::is_proxy(heap, callee_word) {
-                match unsafe {
-                    vm_core::ic::call_probe(heap, ctx.feedback_ref(heap), fb, callee_word)
-                } {
+                match vm_core::ic::call_probe(heap, ctx.feedback_ref(heap), fb, callee_word) {
                     vm_core::ic::CallProbe::Bytecode(hit) => {
                         if hit.kind.is_class_constructor() {
                             throw_err!(ctx, VmError::Type);
                         }
                         let frame = fold!(
                             ctx,
-                            stack.push_frame(
+                            stack.push_scattered_frame(
                                 heap,
                                 ctx.caller_meta(next_pc, pc),
                                 Callee {
@@ -1390,10 +1375,9 @@ unsafe fn step<'a>(
                                     context: hit.context.erase(),
                                 },
                                 heap.known().undefined.as_tagged(heap).erase(),
-                                Params::FunctionFast {
-                                    args: args.0,
-                                    argc: args.1,
-                                },
+                                Recv::Undefined,
+                                args.0,
+                                args.1
                             )
                         );
                         ctx.set_frame_base(frame.base);
@@ -1403,16 +1387,13 @@ unsafe fn step<'a>(
                         }
                         return Flow::Sync;
                     }
-                    vm_core::ic::CallProbe::Runtime(idx) => {
-                        let f = vm.runtime(RuntimeIndex(idx));
+                    vm_core::ic::CallProbe::Runtime(rt) => {
                         let exception = heap.known().exception.as_tagged(heap).raw();
-                        let (saved_top, staged) = fold!(
+                        let staged = fold!(
                             ctx,
-                            stack.stage_function_args(heap, frame_base, args.0, args.1)
+                            stack.stage_scattered(heap, frame_base, Recv::Undefined, args.0, args.1)
                         );
-                        let nctx = RuntimeContext::new(vm, heap, state);
-                        let v = f(nctx, staged);
-                        stack.set_top(saved_top);
+                        let v = ctx.call_runtime(rt, staged);
                         // Safety: old-gen singleton word.
                         return if v.raw() == exception {
                             Flow::Threw
@@ -1426,13 +1407,15 @@ unsafe fn step<'a>(
             }
 
             if Proxy::is_proxy(heap, stack.reg(heap, frame_base, callee_reg)) {
-                let (saved_top, staged) = fold!(
+                let staged = fold!(
                     ctx,
-                    stack.stage_function_args(heap, frame_base, args.0, args.1)
+                    stack.stage_scattered(heap, frame_base, Recv::Undefined, args.0, args.1)
                 );
+                let saved_top = stack.top();
+                stack.set_top(staged.src + staged.count);
                 let result = state.handle_scope(|scope| {
                     let callee = scope.handle(stack.reg(heap, frame_base, callee_reg));
-                    Proxy::apply(vm, heap, state, callee, staged)
+                    Proxy::apply(vm, heap, state, callee, stack.slice(staged))
                 });
                 stack.set_top(saved_top);
                 return match result {
@@ -1447,16 +1430,20 @@ unsafe fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(idx)) => {
-                    let f = vm.runtime(RuntimeIndex(idx));
+                Some(CallTarget::Runtime(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
-                    let (saved_top, staged) = fold!(
+                    let staged = fold!(
                         ctx,
-                        stack.stage_function_args(heap, frame_base, args.0, args.1)
+                        stack.stage_scattered(heap, frame_base, Recv::Undefined, args.0, args.1)
                     );
-                    let nctx = RuntimeContext::new(vm, heap, state);
-                    let v = f(nctx, staged);
-                    stack.set_top(saved_top);
+                    let v = ctx.call_runtime(rt, staged);
+                    vm_core::ic::call_update(
+                        heap,
+                        ctx.feedback_ref(heap),
+                        fb,
+                        stack.reg(heap, frame_base, callee_reg),
+                        CallRecord::Runtime(rt),
+                    );
                     if v.raw() == exception {
                         Flow::Threw
                     } else {
@@ -1474,37 +1461,29 @@ unsafe fn step<'a>(
                     if kind.is_class_constructor() {
                         throw_err!(ctx, VmError::Type);
                     }
-                    let frame = {
-                        let context = context.erase();
-                        let callee = callee.erase();
-                        let undefined = heap.known().undefined.as_tagged(heap).erase();
-                        fold!(
-                            ctx,
-                            stack.push_frame(
-                                heap,
-                                ctx.caller_meta(next_pc, pc),
-                                Callee {
-                                    callable: callee,
-                                    info,
-                                    context,
-                                },
-                                undefined,
-                                Params::FunctionFast {
-                                    args: args.0,
-                                    argc: args.1,
-                                },
-                            )
-                        )
-                    };
-                    unsafe {
-                        vm_core::ic::call_update(
+                    let frame = fold!(
+                        ctx,
+                        stack.push_scattered_frame(
                             heap,
-                            ctx.feedback_ref(heap),
-                            fb,
-                            stack.reg(heap, frame_base, callee_reg),
-                            Some(info),
-                        );
-                    }
+                            ctx.caller_meta(next_pc, pc),
+                            Callee {
+                                callable: callee.erase(),
+                                info,
+                                context: context.erase(),
+                            },
+                            heap.known().undefined.as_tagged(heap).erase(),
+                            Recv::Undefined,
+                            args.0,
+                            args.1
+                        )
+                    );
+                    vm_core::ic::call_update(
+                        heap,
+                        ctx.feedback_ref(heap),
+                        fb,
+                        stack.reg(heap, frame_base, callee_reg),
+                        CallRecord::Bytecode(info),
+                    );
                     ctx.set_frame_base(frame.base);
                     // blocking call: run the callee to completion; its
                     // value becomes the caller's accumulator
@@ -1525,8 +1504,7 @@ unsafe fn step<'a>(
             let count = ops.reg_count(2);
             let exception = heap.known().exception.as_tagged(heap).raw();
             let nctx = RuntimeContext::new(vm, heap, state);
-            let v = f(nctx, stack.args(frame_base, args_base, count));
-            // Safety: old-gen singleton word.
+            let v = f(nctx, stack.args(frame_base, args_base, count));            // Safety: old-gen singleton word.
             if v.raw() == exception {
                 Flow::Threw
             } else {
