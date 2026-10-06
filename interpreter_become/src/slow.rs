@@ -67,7 +67,7 @@ macro_rules! slow_try {
             Ok(v) => v,
             // the sentinel VALUE flows on to the caller's `become resume`,
             // which routes it into `throw_dispatch`
-            Err(err) => unsafe { $ctx.raise_tag(err) },
+            Err(err) => $ctx.raise_tag(err),
         }
     };
 }
@@ -94,7 +94,7 @@ slow_handler!(slow_box_sub_loc |ip, ops, regs, acc, ctx, float| {
 
 slow_handler!(slow_add |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
-    unsafe { add(ctx, lhs, acc) }
+    add(ctx, lhs, acc)
 });
 
 slow_handler!(slow_numeric |ip, ops, regs, acc, ctx, float| {
@@ -107,14 +107,14 @@ slow_handler!(slow_numeric |ip, ops, regs, acc, ctx, float| {
         Opcode::Exp => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    let v = unsafe { numeric(ctx, lhs, acc, f) };
+    let v = numeric(ctx, lhs, acc, f);
     v
 });
 
 slow_handler!(slow_add_immediate |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
     let imm = Smi::new(ops.signed::<1>() as i64).into_tagged();
-    unsafe { add(ctx, lhs, imm) }
+    add(ctx, lhs, imm)
 });
 
 slow_handler!(slow_numeric_immediate |ip, ops, regs, acc, ctx, float| {
@@ -128,11 +128,11 @@ slow_handler!(slow_numeric_immediate |ip, ops, regs, acc, ctx, float| {
         Opcode::ExpImmediate => |a, b| a.powf(b),
         _ => |a, b| a / b,
     };
-    unsafe { numeric(ctx, lhs, imm, f) }
+    numeric(ctx, lhs, imm, f)
 });
 
 slow_handler!(slow_negate |ip, ops, regs, acc, ctx, float| {
-    unsafe { negate(ctx, acc) }
+    negate(ctx, acc)
 });
 
 /// Map a bitwise/shift opcode to `cold::bitwise`'s kind index
@@ -151,14 +151,14 @@ fn bitwise_kind(op: Opcode) -> u8 {
 slow_handler!(slow_bitwise |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
     let kind = bitwise_kind(unsafe { ops.op() });
-    unsafe { bitwise(ctx, kind, lhs, acc) }
+    bitwise(ctx, kind, lhs, acc)
 });
 
 slow_handler!(slow_bitwise_immediate |ip, ops, regs, acc, ctx, float| {
     let lhs = regs.read(ops.signed::<0>(), ctx);
     let imm = Smi::new(ops.signed::<1>() as i64).into_tagged();
     let kind = bitwise_kind(unsafe { ops.op() });
-    unsafe { bitwise(ctx, kind, lhs, imm) }
+    bitwise(ctx, kind, lhs, imm)
 });
 
 slow_handler!(slow_inc_loc |ip, ops, regs, acc, ctx, float| {
@@ -183,22 +183,22 @@ slow_handler!(slow_keyed_load_reg |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let key = regs.read(ops.signed::<1>(), ctx);
     let fb = ops.unsigned::<2>();
-    unsafe { keyed_load(ctx, recv, key, Some(fb)) }
+    keyed_load(ctx, recv, key, Some(fb))
 });
 
 slow_handler!(slow_equal |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { compare(ctx, 0, acc, other) }
+    compare(ctx, 0, acc, other)
 });
 
 slow_handler!(slow_less_than |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { compare(ctx, 2, acc, other) }
+    compare(ctx, 2, acc, other)
 });
 
 slow_handler!(slow_greater_than |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { compare(ctx, 4, acc, other) }
+    compare(ctx, 4, acc, other)
 });
 
 #[cold]
@@ -234,7 +234,7 @@ pub extern "rust-preserve-none" fn slow_compare_jump<'a, const STRIDE: usize>(
             _ => a >= b,
         },
         _ => {
-            let v = unsafe { compare(ctx, cmp, acc, other) };
+            let v = compare(ctx, cmp, acc, other);
             if ctx.is_throw(v) {
                 become resume(
                     unsafe { ctx.code_ptr().add(pc) },
@@ -267,55 +267,53 @@ slow_handler!(slow_named_load |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let name_idx = ops.unsigned::<1>();
     let fb_slot = ops.unsigned::<2>();
-    unsafe { named_load(ctx, recv, name_idx, fb_slot) }
+    named_load(ctx, recv, name_idx, fb_slot)
 });
 
 slow_handler!(slow_keyed_load |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let fb = ops.unsigned::<1>();
-    unsafe { keyed_load(ctx, recv, acc, Some(fb)) }
+    keyed_load(ctx, recv, acc, Some(fb))
 });
 
 slow_handler!(slow_keyed_load_imm |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let idx = ops.unsigned::<1>();
-    unsafe { keyed_load_imm(ctx, recv, idx) }
+    keyed_load_imm(ctx, recv, idx)
 });
 
 slow_handler!(slow_keyed_store |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let key = regs.read(ops.signed::<1>(), ctx);
     let fb = ops.unsigned::<2>();
-    unsafe { keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow) }
+    keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::Shadow)
 });
 
 slow_handler!(slow_keyed_store_no_shadow |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let key = regs.read(ops.signed::<1>(), ctx);
     let fb = ops.unsigned::<2>();
-    unsafe {
-        keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
-    }
+    keyed_store(ctx, recv, key, acc, Some(fb), StoreSemantics::WriteThrough)
 });
 
 slow_handler!(slow_global_load |ip, ops, regs, acc, ctx, float| {
     let name_idx = ops.unsigned::<0>();
     let fb_slot = ops.unsigned::<1>();
-    unsafe { global_load(ctx, name_idx, fb_slot, true) }
+    global_load(ctx, name_idx, fb_slot, true)
 });
 
 slow_handler!(slow_store_named |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let name_idx = ops.unsigned::<1>();
     let fb_slot = ops.unsigned::<2>();
-    unsafe { store_named(ctx, recv, name_idx, fb_slot, acc) }
+    store_named(ctx, recv, name_idx, fb_slot, acc)
 });
 
 slow_handler!(slow_construct |ip, ops, regs, acc, ctx, float| {
     let callee = regs.read(ops.signed::<0>(), ctx);
     let args_base = ops.signed::<1>();
     let count = ops.unsigned::<2>();
-    unsafe { construct(ctx, callee, args_base, count) }
+    construct(ctx, callee, args_base, count)
 });
 
 slow_handler!(slow_create_closure |ip, ops, regs, acc, ctx, float| {
@@ -360,24 +358,24 @@ slow_handler!(slow_create_block_context |ip, ops, regs, acc, ctx, float| {
 
 slow_handler!(slow_less_than_or_equal |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { compare(ctx, 3, acc, other) }
+    compare(ctx, 3, acc, other)
 });
 
 slow_handler!(slow_global_load_nothrow |ip, ops, regs, acc, ctx, float| {
     let name_idx = ops.unsigned::<0>();
     let fb_slot = ops.unsigned::<1>();
-    unsafe { global_load(ctx, name_idx, fb_slot, false) }
+    global_load(ctx, name_idx, fb_slot, false)
 });
 
 slow_handler!(slow_store_global |ip, ops, regs, acc, ctx, float| {
     let name_idx = ops.unsigned::<0>();
-    unsafe { store_global(ctx, name_idx, acc) }
+    store_global(ctx, name_idx, acc)
 });
 
 slow_handler!(slow_store_named_no_shadow |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let name_idx = ops.unsigned::<1>();
-    unsafe { store_named_no_shadow(ctx, recv, name_idx, acc) }
+    store_named_no_shadow(ctx, recv, name_idx, acc)
 });
 
 slow_handler!(slow_instance_of |ip, ops, regs, acc, ctx, float| {
@@ -387,7 +385,7 @@ slow_handler!(slow_instance_of |ip, ops, regs, acc, ctx, float| {
 
 slow_handler!(slow_greater_than_or_equal |ip, ops, regs, acc, ctx, float| {
     let other = regs.read(ops.signed::<0>(), ctx);
-    unsafe { compare(ctx, 5, acc, other) }
+    compare(ctx, 5, acc, other)
 });
 
 slow_handler!(slow_add_parent |ip, ops, regs, acc, ctx, float| {
@@ -687,9 +685,9 @@ fn loc_op_slow<'a, const STRIDE: usize>(
     let lhs = regs.read(dst, ctx);
     let rhs = regs.read(src, ctx);
     let v = if sub {
-        unsafe { numeric(ctx, lhs, rhs, |a, b| a - b) }
+        numeric(ctx, lhs, rhs, |a, b| a - b)
     } else {
-        unsafe { add(ctx, lhs, rhs) }
+        add(ctx, lhs, rhs)
     };
     if !ctx.is_throw(v) {
         regs.write(dst, v);
@@ -710,7 +708,7 @@ pub fn slow_call_method_miss<'a>(
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), callee_word) {
-        None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
+        None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(rt)) => {
             InlineCache::call_update(
@@ -735,7 +733,7 @@ pub fn slow_call_method_miss<'a>(
             kind,
         }) => {
             if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
+                return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             InlineCache::call_update(
                 ctx.heap(),
@@ -773,7 +771,7 @@ pub fn slow_call_function_miss<'a>(
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), callee_word) {
-        None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
+        None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(rt)) => {
             InlineCache::call_update(
@@ -798,7 +796,7 @@ pub fn slow_call_function_miss<'a>(
             kind,
         }) => {
             if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
+                return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             InlineCache::call_update(
                 ctx.heap(),
@@ -836,7 +834,7 @@ pub fn slow_call_miss<'a>(
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
     match Object::call_target(ctx.heap(), callee_word) {
-        None => Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) })),
+        None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Runtime(rt)) => {
             InlineCache::call_update(
@@ -858,7 +856,7 @@ pub fn slow_call_miss<'a>(
             kind,
         }) => {
             if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
+                return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             InlineCache::call_update(
                 ctx.heap(),

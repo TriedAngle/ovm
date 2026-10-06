@@ -3,7 +3,6 @@
 //! failure is the exception sentinel (the pending exception is set);
 //! `Result<VmError>` survives only *inside* primitive helpers and is
 //! folded to a sentinel (`Ctx::raise_tag`) at the first Tagged boundary.
-#![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::convert::Convert;
 use crate::handle::{Handle, HandleScope};
@@ -21,13 +20,13 @@ use crate::{Compare, Errors, VmError};
 
 /// `Add` cold body: ToPrimitive both operands, string concatenation when
 /// either side is a string, numeric addition otherwise (ES 13.15.3).
-pub unsafe fn add<'a>(
+pub fn add<'a>(
     ctx: &Ctx<'a>,
     lhs: Tagged<'_, Value>,
     rhs: Tagged<'_, Value>,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let lhs = scope.handle(lhs);
@@ -80,14 +79,14 @@ pub unsafe fn add<'a>(
 }
 
 /// `Sub`/`Mul`/`Div`/`Mod` cold body: full `numeric_op` semantics.
-pub unsafe fn numeric<'a>(
+pub fn numeric<'a>(
     ctx: &Ctx<'a>,
     lhs: Tagged<'_, Value>,
     rhs: Tagged<'_, Value>,
     f: fn(f64, f64) -> f64,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let a = scope.handle(lhs);
@@ -101,9 +100,9 @@ pub unsafe fn numeric<'a>(
 }
 
 /// `Negate` cold body: ToNumeric and flip (with `-0`).
-pub unsafe fn negate<'a>(ctx: &Ctx<'a>, v: Tagged<'_, Value>) -> Tagged<'a, Value> {
+pub fn negate<'a>(ctx: &Ctx<'a>, v: Tagged<'_, Value>) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let v = scope.handle(v);
@@ -118,14 +117,14 @@ pub unsafe fn negate<'a>(ctx: &Ctx<'a>, v: Tagged<'_, Value>) -> Tagged<'a, Valu
 /// `Bitwise*`/`Shift*` cold body: ToInt32/ToUint32 both operands and apply
 /// the op. `kind`: 0 = `|`, 1 = `^`, 2 = `&`, 3 = `<<`, 4 = `>>`,
 /// 5 = `>>>`.
-pub unsafe fn bitwise<'a>(
+pub fn bitwise<'a>(
     ctx: &Ctx<'a>,
     kind: u8,
     lhs: Tagged<'_, Value>,
     rhs: Tagged<'_, Value>,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let lhs = scope.handle(lhs);
@@ -157,14 +156,14 @@ pub unsafe fn bitwise<'a>(
 /// The compare cold body: `cmp` selects the relation (0 = loose `==`,
 /// 1 = strict `===`, 2 = `<`, 3 = `<=`, 4 = `>`, 5 = `>=`). Returns the
 /// boolean result value or the sentinel (a coercion threw).
-pub unsafe fn compare<'a>(
+pub fn compare<'a>(
     ctx: &Ctx<'a>,
     cmp: u8,
     lhs: Tagged<'_, Value>,
     rhs: Tagged<'_, Value>,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let x = scope.handle(lhs);
@@ -219,14 +218,14 @@ pub unsafe fn compare<'a>(
 
 /// `LoadNamedProperty*` cold body: proxy trap, lookup, IC fill only for
 /// plain values (getters are never cached).
-pub unsafe fn named_load<'a>(
+pub fn named_load<'a>(
     ctx: &Ctx<'a>,
     recv: Tagged<'_, Value>,
     name_idx: usize,
     fb_slot: usize,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
@@ -279,14 +278,14 @@ pub unsafe fn named_load<'a>(
 
 /// `LoadKeyedProperty`/`LoadKeyedPropertyReg` cold body: property-key
 /// coercion, proxies, string receivers, getters.
-pub unsafe fn keyed_load<'a>(
+pub fn keyed_load<'a>(
     ctx: &Ctx<'a>,
     recv: Tagged<'_, Value>,
     key: Tagged<'_, Value>,
     fb_slot: Option<usize>,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
@@ -343,13 +342,13 @@ pub unsafe fn keyed_load<'a>(
 
 /// `LoadElementImm` cold body: the keyed-load tail with the constant
 /// index as the key (string receivers, proxies, named fallback).
-pub unsafe fn keyed_load_imm<'a>(
+pub fn keyed_load_imm<'a>(
     ctx: &Ctx<'a>,
     recv: Tagged<'_, Value>,
     idx: usize,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
@@ -385,7 +384,7 @@ pub unsafe fn keyed_load_imm<'a>(
 /// `StoreKeyedProperty` cold body: proxy traps first, then key coercion,
 /// element growth with the store-element IC fill, and named-property
 /// transitions.
-pub unsafe fn keyed_store<'a>(
+pub fn keyed_store<'a>(
     ctx: &Ctx<'a>,
     recv: Tagged<'_, Value>,
     key: Tagged<'_, Value>,
@@ -394,7 +393,7 @@ pub unsafe fn keyed_store<'a>(
     semantics: StoreSemantics,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
@@ -464,14 +463,14 @@ pub unsafe fn keyed_store<'a>(
 /// `LoadGlobal*` cold body: straight to the global lookup (no
 /// second-tier IC re-probe), IC fill only for plain data properties
 /// (getters and absent globals are never cached).
-pub unsafe fn global_load<'a>(
+pub fn global_load<'a>(
     ctx: &Ctx<'a>,
     name_idx: usize,
     fb_slot: usize,
     throws: bool,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let global = heap.known().global_object;
@@ -527,7 +526,7 @@ pub unsafe fn global_load<'a>(
 
 /// `StoreNamedProperty` cold body: the store IC, transitions and setter
 /// invocation (Shadow semantics).
-pub unsafe fn store_named<'a>(
+pub fn store_named<'a>(
     ctx: &Ctx<'a>,
     recv: Tagged<'_, Value>,
     name_idx: usize,
@@ -535,7 +534,7 @@ pub unsafe fn store_named<'a>(
     value: Tagged<'_, Value>,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
@@ -593,13 +592,13 @@ pub unsafe fn store_named<'a>(
 /// `StoreNamedPropertyNoShadow` cold body: the named-store tail without
 /// the IC (WriteThrough stores into parent-pair arrays that no map
 /// describes).
-pub unsafe fn store_named_no_shadow<'a>(
+pub fn store_named_no_shadow<'a>(
     ctx: &Ctx<'a>,
     recv: Tagged<'_, Value>,
     name_idx: usize,
     value: Tagged<'_, Value>,
 ) -> Tagged<'a, Value> {
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let recv = scope.handle(recv);
@@ -611,12 +610,12 @@ pub unsafe fn store_named_no_shadow<'a>(
 
 /// `StoreGlobal` cold body: the named-store tail against the global
 /// object (WriteThrough, no IC).
-pub unsafe fn store_global<'a>(
+pub fn store_global<'a>(
     ctx: &Ctx<'a>,
     name_idx: usize,
     value: Tagged<'_, Value>,
 ) -> Tagged<'a, Value> {
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let value = scope.handle(value);
@@ -630,7 +629,7 @@ pub unsafe fn store_global<'a>(
 /// application, then the IC fill (the become interpreter's ordering: a
 /// transition is cached against the map the store produced, a setter ran
 /// before the fill).
-unsafe fn store_named_tail<'a>(
+fn store_named_tail<'a>(
     ctx: &Ctx<'a>,
     recv: Handle<'_, Value>,
     name: Handle<'_, SlotName>,
@@ -644,7 +643,7 @@ unsafe fn store_named_tail<'a>(
     })
 }
 
-unsafe fn store_named_tail_scoped<'a>(
+fn store_named_tail_scoped<'a>(
     ctx: &Ctx<'a>,
     scope: HandleScope<'_>,
     recv: Handle<'_, Value>,
@@ -653,7 +652,7 @@ unsafe fn store_named_tail_scoped<'a>(
     fb_slot: Option<usize>,
     semantics: StoreSemantics,
 ) -> Tagged<'a, Value> {
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     // the receiver's map before the store: the state key when
     // the outcome transitions it
     let prev = recv
@@ -696,14 +695,14 @@ unsafe fn store_named_tail_scoped<'a>(
 /// Apply a store outcome: transitions define the own property, setters
 /// run as a blocking call (their return value is ignored; the
 /// accumulator keeps the stored value). `Err(())` = threw (pending set).
-pub unsafe fn apply_store_outcome(
+pub fn apply_store_outcome(
     ctx: &Ctx<'_>,
     receiver: Handle<'_, Value>,
     outcome: StoreOutcome<'_>,
     value: Handle<'_, Value>,
 ) -> Result<(), ()> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     match outcome {
         StoreOutcome::Transition {
@@ -747,14 +746,14 @@ pub unsafe fn apply_store_outcome(
 
 /// `Construct` cold body: [[Construct]] with receiver synthesis,
 /// derived-class handling and proxy traps (ES 9.2.2).
-pub unsafe fn construct<'a>(
+pub fn construct<'a>(
     ctx: &Ctx<'a>,
     callee: Tagged<'_, Value>,
     args_base: i32,
     count: usize,
 ) -> Tagged<'a, Value> {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     state.handle_scope(|scope| {
         let callee = scope.handle(callee);

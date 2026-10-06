@@ -333,9 +333,7 @@ macro_rules! reenter {
 
 macro_rules! bail {
     ($acc:expr, $ip:expr, $r:expr, $x:expr, $t:ident, $k:ident, $f:ident, $e:expr) => {{
-        unsafe {
-            let _ = $x.raise_tag($e);
-        }
+        let _ = $x.raise_tag($e);
         become throw_dispatch($ip, $r, $acc, $x, $t, $k, $f)
     }};
 }
@@ -373,9 +371,7 @@ macro_rules! slow_start {
         match $e {
             Ok(m) => m,
             Err(err) => {
-                unsafe {
-                    let _ = $ctx.raise_tag(err);
-                }
+                let _ = $ctx.raise_tag(err);
                 become throw_dispatch($ip, $regs, $acc, $ctx, $t, $k, $f)
             }
         }
@@ -3110,7 +3106,7 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
                 ctx.stack().window(ctx.frame_base(), base_r, count),
             ) {
                 Ok(frame) => frame,
-                Err(err) => return unsafe { ctx.raise_tag(err) },
+                Err(err) => return ctx.raise_tag(err),
             };
             ctx.set_frame_base(frame.base);
             // a pushed frame is entered at pc 0 with the accumulator
@@ -3407,7 +3403,7 @@ extern "rust-preserve-none" fn construct_trampoline<'a>(
     ctx.set_frame_base(caller.base);
     let v = if Convert::is_primitive(ctx.heap(), acc) {
         if this_val == ctx.heap().known().the_hole.as_tagged(ctx.heap()).erase() {
-            let _ = unsafe { ctx.raise_tag(VmError::Type) };
+            let _ = ctx.raise_tag(VmError::Type);
             let caller_code = ctx.code_ptr();
             become throw_dispatch(
                 unsafe { caller_code.add(caller.pc) },
@@ -3586,7 +3582,7 @@ fn call_method_start<'a>(
             kind,
         }) => {
             if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
+                return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             push_scattered_frame(
                 ctx,
@@ -3633,7 +3629,7 @@ fn call_function_start<'a>(
             kind,
         }) => {
             if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
+                return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             push_scattered_frame(
                 ctx,
@@ -3681,7 +3677,7 @@ fn call_start<'a>(
             kind,
         }) => {
             if kind.is_class_constructor() {
-                return Ok(MethodCall::Value(unsafe { ctx.raise_tag(VmError::Type) }));
+                return Ok(MethodCall::Value(ctx.raise_tag(VmError::Type)));
             }
             push_callee_frame(
                 ctx,

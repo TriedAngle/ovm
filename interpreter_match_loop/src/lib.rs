@@ -1,4 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
 
 use bytecode::{Opcode, Operands, decode, jump_target};
 use vm_core::proxy::Proxy;
@@ -43,7 +42,7 @@ macro_rules! fold {
         match $e {
             Ok(v) => v,
             Err(e) => {
-                unsafe { $ctx.raise_tag(e) };
+                $ctx.raise_tag(e);
                 return Flow::Threw;
             }
         }
@@ -52,7 +51,7 @@ macro_rules! fold {
 
 macro_rules! throw_err {
     ($ctx:expr, $e:expr) => {{
-        unsafe { $ctx.raise_tag($e) };
+        $ctx.raise_tag($e);
         return Flow::Threw;
     }};
 }
@@ -214,7 +213,7 @@ fn dispatch<'a>(ctx: &Ctx<'a>) -> Result<Tagged<'a, Value>, VmError> {
 
     loop {
         let (op, ops, next_pc) = decode(code, pc);
-        let result = unsafe { step(ctx, pc, next_pc, frame_base, acc, ops, op) };
+        let result = step(ctx, pc, next_pc, frame_base, acc, ops, op);
         match result {
             Flow::Next => pc = next_pc,
             Flow::Jump(target) => pc = target,
@@ -229,7 +228,7 @@ fn dispatch<'a>(ctx: &Ctx<'a>) -> Result<Tagged<'a, Value>, VmError> {
                 acc.store(ctx.undefined_word());
             }
             Flow::Return => return Ok(acc.get(ctx.heap())),
-            Flow::Threw => match unsafe { unwind(ctx, pc) } {
+            Flow::Threw => match unwind(ctx, pc) {
                 Unwind::Caught { pc: handler, ex } => {
                     acc.store(ex);
                     frame_base = ctx.frame_base();
@@ -261,7 +260,7 @@ fn code_bytes(ctx: &Ctx<'_>) -> &'static [u8] {
 }
 
 #[inline(always)]
-unsafe fn step<'a>(
+fn step<'a>(
     ctx: &Ctx<'a>,
     pc: usize,
     next_pc: usize,
@@ -271,7 +270,7 @@ unsafe fn step<'a>(
     op: Opcode,
 ) -> Flow {
     let vm = ctx.vm();
-    let heap = ctx.heap_mut();
+    let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
     let stack = ctx.stack();
 
@@ -640,7 +639,7 @@ unsafe fn step<'a>(
                 );
                 let receiver = scope.handle(stack.reg(heap, frame_base, recv_reg));
                 // `Err(())` = threw (the pending exception is set)
-                if unsafe { apply_store_outcome(ctx, receiver, outcome, value) }.is_err() {
+                if apply_store_outcome(ctx, receiver, outcome, value).is_err() {
                     return Flow::Threw;
                 }
                 Flow::Sync

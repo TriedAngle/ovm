@@ -231,8 +231,8 @@ impl<'a> Ctx<'a> {
     /// helpers).
     #[cold]
     #[inline(never)]
-    pub unsafe fn raise(&self, err: VmError) -> Result<Tagged<'a, Value>, VmError> {
-        unsafe { Ok(self.raise_tag(err)) }
+    pub fn raise(&self, err: VmError) -> Result<Tagged<'a, Value>, VmError> {
+        Ok(self.raise_tag(err))
     }
 
     /// The single-channel raise for Tagged-returning interpreter fns:
@@ -240,7 +240,8 @@ impl<'a> Ctx<'a> {
     /// word.
     #[cold]
     #[inline(never)]
-    pub unsafe fn raise_tag(&self, err: VmError) -> Tagged<'a, Value> {
+    pub fn raise_tag(&self, err: VmError) -> Tagged<'a, Value> {
+        // Safety: contained — the Ctx borrows are valid for the call.
         unsafe {
             let heap = self.heap_mut();
             let state = self.state();
@@ -286,7 +287,7 @@ pub enum Unwind<'a> {
 /// and the current frame is the handler's.
 #[cold]
 #[inline(never)]
-pub unsafe fn unwind<'a>(ctx: &Ctx<'a>, fault_pc: usize) -> Unwind<'a> {
+pub fn unwind<'a>(ctx: &Ctx<'a>, fault_pc: usize) -> Unwind<'a> {
     let mut pc = fault_pc;
     loop {
         let base = ctx.frame_base();
