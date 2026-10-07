@@ -46,10 +46,11 @@ fn pred_word(thread: &mut Thread, map: Value) -> Option<Value> {
 
 fn root_word(thread: &mut Thread, map: Value) -> Value {
     let heap = &*thread.heap();
-    let map = unsafe { map.assume_valid(heap) }
-        .get_as::<Map>(heap)
-        .expect("map");
-    map.root_map(heap).raw()
+    let mut current: Tagged<'_, Map> = unsafe { Tagged::from_value_unchecked(map) };
+    while let Some(pred) = current.pred(heap) {
+        current = pred;
+    }
+    current.raw()
 }
 
 fn add_prop(
@@ -228,14 +229,18 @@ fn live_transition_subtree_survives_gc() {
             transition_target(heap, root, name_a.as_tagged(heap)).is_some(),
             "root -> {{a}} must survive while an object uses {{a, b}}"
         );
-        let map_ab = unsafe { map_ab.assume_valid(heap) }
-            .get_as::<Map>(heap)
-            .expect("map");
+        let mut current: Tagged<'_, Map> = unsafe { Tagged::from_value_unchecked(map_ab) };
+        while let Some(pred) = current.pred(heap) {
+            current = pred;
+        }
         assert_eq!(
-            map_ab.root_map(heap).raw(),
+            current.raw(),
             root.raw(),
             "the pred chain must still reach the root"
         );
+        let map_ab = unsafe { map_ab.assume_valid(heap) }
+            .get_as::<Map>(heap)
+            .expect("map");
         let map_a = map_ab.pred(heap).expect("intermediate map alive");
         assert!(
             transition_target(heap, map_a, name_b.as_tagged(heap)).is_some(),

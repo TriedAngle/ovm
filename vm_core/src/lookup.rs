@@ -372,7 +372,7 @@ impl Lookup<'_> {
         stack: &Stack,
         base: usize,
     ) -> Option<Tagged<'a, Value>> {
-        let callable = stack.callable_slot(base).get(heap);
+        let callable = stack.frame_header(base).callable_slot().get(heap);
         let obj = callable.as_heap_object()?;
         let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
         // must be a real constructor

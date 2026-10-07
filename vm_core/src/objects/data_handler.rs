@@ -28,16 +28,12 @@ impl DataHandler {
             .0
     }
 
-    fn raw_map(&self) -> &Map {
+    pub fn data_len(&self) -> usize {
         // Safety: layout/visit callbacks run without a heap borrow, so
         // the map word is promoted unsafely; the map cannot move under
         // the GC callback.
-        let map = self.header.map.raw();
-        unsafe { Tagged::<Map>::from_value_unchecked(map) }.as_ref()
-    }
-
-    pub fn data_len(&self) -> usize {
-        self.raw_map().value_slot_count()
+        let map = unsafe { Tagged::<Map>::from_value_unchecked(self.header.map.raw()) };
+        map.value_slot_count()
     }
 
     pub fn smi_handler<'a>(&self, heap: &'a Heap) -> Tagged<'a, Smi> {

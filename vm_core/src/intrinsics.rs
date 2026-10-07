@@ -1310,7 +1310,10 @@ fn frame_super_parts<'a>(
     let Some(callee) = Lookup::super_constructor(heap, &state.stack, base) else {
         return Err(VmError::Type);
     };
-    Ok((callee, state.stack.new_target_slot(base).get(heap)))
+    Ok((
+        callee,
+        state.stack.frame_header(base).new_target_slot().get(heap),
+    ))
 }
 
 // ---- store outcomes ---------------------------------------------------------

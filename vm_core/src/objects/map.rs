@@ -55,14 +55,6 @@ impl Map {
         self.pred.get(heap)
     }
 
-    pub fn root_map<'a>(&'a self, heap: &'a Heap) -> Tagged<'a, Map> {
-        let mut current: Tagged<'a, Map> = unsafe { Tagged::from_value_unchecked(self.erase()) };
-        while let Some(pred) = current.pred(heap) {
-            current = pred;
-        }
-        current
-    }
-
     pub fn kind(&self) -> MapKind {
         MapKind::new(self.kind.to_smi_unchecked().value() as u64)
     }

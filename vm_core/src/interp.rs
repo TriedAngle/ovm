@@ -8,11 +8,10 @@ use core::marker::PhantomData;
 
 use crate::errors::Errors;
 use crate::heap::{Heap, Register};
-use crate::stack::{CODE_OFFSET, CONSTANTS_OFFSET, FEEDBACK_OFFSET, FrameMeta, Stack};
+use crate::stack::{FrameMeta, Stack};
 use crate::value::{Tagged, Value};
 use crate::{
-    Args, ContextState, FeedbackVector, FixedArray, FixedByteArray, RuntimeContext, RuntimeIndex,
-    VM, VmError,
+    Args, ContextState, FeedbackVector, FixedArray, RuntimeContext, RuntimeIndex, VM, VmError,
 };
 
 /// Loop back-edge ticks between safepoint polls.
@@ -136,15 +135,11 @@ impl<'a> Ctx<'a> {
 
     #[inline(always)]
     pub fn code_ptr(&self) -> *const u8 {
-        // Safety: only `init_frame_header` writes this slot, always the
-        // frame's bytecode: the kind re-check is redundant.
-        let arr = unsafe {
-            self.stack()
-                .header_slot(self.frame_base(), CODE_OFFSET)
-                .get(self.heap())
-                .cast::<FixedByteArray>()
-        };
-        arr.as_ref().as_ptr()
+        self.stack()
+            .frame_header(self.frame_base())
+            .code(self.heap())
+            .as_ref()
+            .as_ptr()
     }
 
     #[inline(always)]
@@ -153,27 +148,14 @@ impl<'a> Ctx<'a> {
             self.state().is_frame_active(),
             "constants read without a frame"
         );
-        // Safety: only `init_frame_header` writes this slot, always the
-        // constant pool.
-        unsafe {
-            self.stack()
-                .header_slot(self.frame_base(), CONSTANTS_OFFSET)
-                .get(heap)
-                .cast()
-        }
+        self.stack().frame_header(self.frame_base()).constants(heap)
     }
 
     /// The current frame's feedback vector, or `None` for functions
     /// without feedback slots.
     #[inline(always)]
     pub fn feedback_ref<'h>(&self, heap: &'h Heap) -> Option<Tagged<'h, FeedbackVector>> {
-        // Safety: only `init_frame_header` writes this slot: it is always
-        // a `FeedbackVector` or the hole.
-        let word = self
-            .stack()
-            .header_slot(self.frame_base(), FEEDBACK_OFFSET)
-            .get(heap);
-        (word.raw() != heap.known().the_hole.raw()).then(|| unsafe { word.cast() })
+        self.stack().frame_header(self.frame_base()).feedback(heap)
     }
 
     /// The accumulator cell.
@@ -296,7 +278,11 @@ pub fn unwind<'a>(ctx: &Ctx<'a>, fault_pc: usize) -> Unwind<'a> {
             // finally in any frame) may observe or intercept it.
             None
         } else {
-            let callable = ctx.stack().callable_slot(base).get(ctx.heap());
+            let callable = ctx
+                .stack()
+                .frame_header(base)
+                .callable_slot()
+                .get(ctx.heap());
             callable
                 .as_heap_object()
                 .and_then(|obj| obj.as_ref().callable_info(ctx.heap()))

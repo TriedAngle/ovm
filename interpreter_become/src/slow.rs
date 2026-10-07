@@ -506,7 +506,7 @@ fn create_closure_slow<'a>(ctx: &Ctx<'a>, info_idx: usize) -> Result<Tagged<'a, 
             return Err(VmError::Type);
         };
         let context = scope
-            .cast::<Context>(heap, ctx.stack().context_slot(base).get(heap))
+            .cast::<Context>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
             .expect("frame context slot holds a Context");
         let obj = Object::create_closure(heap, &scope, info, context)?;
         Ok(obj.erase())
@@ -524,7 +524,7 @@ fn create_function_context_slow<'a>(
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(heap, ctx.stack().context_slot(base).get(heap))
+            .cast::<Context>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
             .expect("frame context slot holds a Context");
         let count = ctx
             .constants_ref(heap)
@@ -594,7 +594,7 @@ pub fn proxy_apply_regs_slow<'a>(
     }
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
-        match Proxy::apply(vm, heap, state, callee, ctx.stack().slice(staged))? {
+        match Proxy::apply(vm, heap, state, callee, staged)? {
             Coercion::Threw => Ok(ctx.exception_word()),
             Coercion::Value(v) => Ok(v),
         }
@@ -891,7 +891,7 @@ fn create_block_context_slow<'a>(
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(heap, ctx.stack().context_slot(base).get(heap))
+            .cast::<Context>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
             .expect("frame context slot holds a Context");
         let slots = if count == 0 {
             heap.known().empty_fixed_array
@@ -971,7 +971,7 @@ pub fn proxy_apply_function_slow<'a>(
     }
     let result = state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let callee = scope.handle(callee);
-        match Proxy::apply(vm, heap, state, callee, ctx.stack().slice(staged))? {
+        match Proxy::apply(vm, heap, state, callee, staged)? {
             Coercion::Threw => Ok(ctx.exception_word()),
             Coercion::Value(v) => Ok(v),
         }

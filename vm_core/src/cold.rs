@@ -791,7 +791,7 @@ pub fn construct<'a>(
         };
         let mut staged: Vec<Tagged<'_, Value>> = Vec::with_capacity(count + 1);
         staged.push(receiver.as_tagged(heap).erase());
-        staged.extend(args.iter().map(|h| h.as_tagged(heap)));
+        staged.extend(args.iter(heap));
         let staged = scope.stage(&staged);
         let result = match RuntimeContext::call(
             vm,

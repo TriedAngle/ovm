@@ -2062,7 +2062,7 @@ extern "rust-preserve-none" fn op_load_context_slot<'a, const STRIDE: usize>(
     let base = ctx.frame_base();
     if depth == 0 {
         let heap = ctx.heap();
-        let context_word = ctx.stack().context_slot(base).get(heap);
+        let context_word = ctx.stack().frame_header(base).context_slot().get(heap);
         let context = unsafe { context_word.cast::<Context>() };
         let slots = context.as_ref().slots.get(heap);
         let slots = unsafe { slots.cast::<FixedArray>() };
@@ -2071,7 +2071,7 @@ extern "rust-preserve-none" fn op_load_context_slot<'a, const STRIDE: usize>(
     }
     let v = {
         let heap = ctx.heap();
-        let Some(mut context) = ctx.stack().context_slot(base).get(heap).get_as::<Context>(heap) else {
+        let Some(mut context) = ctx.stack().frame_header(base).context_slot().get(heap).get_as::<Context>(heap) else {
             bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
         };
         for _ in 0..depth {
@@ -2105,7 +2105,7 @@ extern "rust-preserve-none" fn op_store_context_slot<'a, const STRIDE: usize>(
     let depth = ops.unsigned::<1>();
     let base = ctx.frame_base();
     let heap = ctx.heap();
-    let Some(mut context) = ctx.stack().context_slot(base).get(heap).get_as::<Context>(heap) else {
+    let Some(mut context) = ctx.stack().frame_header(base).context_slot().get(heap).get_as::<Context>(heap) else {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     };
     for _ in 0..depth {
@@ -2137,12 +2137,12 @@ extern "rust-preserve-none" fn op_push_context<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::PushContext);
     let r = ops.signed::<0>();
     let base = ctx.frame_base();
-    let old = ctx.stack().context_slot(base).get(ctx.heap());
+    let old = ctx.stack().frame_header(base).context_slot().get(ctx.heap());
     regs.write(r, old);
     if acc.get_as::<Context>(ctx.heap()).is_none() {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     }
-    ctx.stack().context_slot(base).store(acc);
+    ctx.stack().frame_header(base).context_slot().store(acc);
     next!(PushContext, ip, regs, ctx, table, roots, float, acc)
 }
 
@@ -2163,7 +2163,7 @@ extern "rust-preserve-none" fn op_pop_context<'a, const STRIDE: usize>(
     if context.get_as::<Context>(ctx.heap()).is_none() {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     }
-    ctx.stack().context_slot(base).store(context);
+    ctx.stack().frame_header(base).context_slot().store(context);
     next!(PopContext, ip, regs, ctx, table, roots, float, acc)
 }
 
@@ -2238,7 +2238,8 @@ extern "rust-preserve-none" fn op_load_new_target<'a, const STRIDE: usize>(
     Ops::<STRIDE>::new(ip, Opcode::LoadNewTarget);
     let v = ctx
         .stack()
-        .new_target_slot(ctx.frame_base())
+        .frame_header(ctx.frame_base())
+        .new_target_slot()
         .get(ctx.heap());
     next!(LoadNewTarget, ip, regs, ctx, table, roots, float, v)
 }
@@ -2254,7 +2255,11 @@ extern "rust-preserve-none" fn op_load_context<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::LoadContext);
-    let v = ctx.stack().context_slot(ctx.frame_base()).get(ctx.heap());
+    let v = ctx
+        .stack()
+        .frame_header(ctx.frame_base())
+        .context_slot()
+        .get(ctx.heap());
     next!(LoadContext, ip, regs, ctx, table, roots, float, v)
 }
 
@@ -2572,7 +2577,11 @@ extern "rust-preserve-none" fn op_load_current_closure<'a, const STRIDE: usize>(
     float: FloatReg,
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::LoadCurrentClosure);
-    let v = ctx.stack().callable_slot(ctx.frame_base()).get(ctx.heap());
+    let v = ctx
+        .stack()
+        .frame_header(ctx.frame_base())
+        .callable_slot()
+        .get(ctx.heap());
     next!(LoadCurrentClosure, ip, regs, ctx, table, roots, float, v)
 }
 
@@ -3925,14 +3934,17 @@ fn enter<'a>(
 ) -> Result<Tagged<'a, Value>, VmError> {
     if Proxy::is_proxy(heap, callable.as_tagged(heap).erase()) {
         return state.handle_scope(|scope| {
+            let args = args.as_args();
             let result = match new_target {
                 None => Proxy::apply(vm, heap, state, callable.erase(), args),
-                Some(nt) => {
-                    let real: Vec<Tagged<'_, Value>> =
-                        args.iter().map(|h| h.as_tagged(heap)).skip(1).collect();
-                    let staged = scope.stage(&real);
-                    Proxy::construct(vm, heap, state, callable.erase(), staged, nt)
-                }
+                Some(nt) => Proxy::construct(
+                    vm,
+                    heap,
+                    state,
+                    callable.erase(),
+                    args.slice_from(1),
+                    nt,
+                ),
             };
             match result {
                 Ok(Coercion::Value(v)) => Ok(scope.handle(v).as_tagged(heap).erase()),

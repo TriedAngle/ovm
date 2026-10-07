@@ -3,7 +3,7 @@ use core::alloc::Layout;
 use crate::error::Message;
 use crate::runtime::Coercion;
 use crate::{
-    Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
+    Args, Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
     Header, Heap, HeapObject, Key, Lookup, Map, Object, ObjectKind, PartialDescriptor,
     PropertyDescriptor, Prototype, RuntimeContext, SlotName, Tagged, Transition, VM, Value,
     Visitor, VmError,
@@ -1315,10 +1315,11 @@ impl Proxy {
         heap: &'a mut Heap,
         state: &ContextState,
         proxy: Handle<'_, Value>,
-        args: HandleSlice<'_>,
+        args: Args,
     ) -> Result<Coercion<'a>, VmError> {
         state.handle_scope(|scope| {
-            let args: Vec<Handle<'_, Value>> = args.iter().collect();
+            let args: Vec<Handle<'_, Value>> =
+                (0..args.len()).map(|i| args.get_handle(heap, i)).collect();
             apply_h(vm, heap, state, &scope, &proxy, &args)
         })
     }
@@ -1331,11 +1332,12 @@ impl Proxy {
         heap: &'a mut Heap,
         state: &ContextState,
         proxy: Handle<'_, Value>,
-        args: HandleSlice<'_>,
+        args: Args,
         new_target: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
         state.handle_scope(|scope| {
-            let args: Vec<Handle<'_, Value>> = args.iter().collect();
+            let args: Vec<Handle<'_, Value>> =
+                (0..args.len()).map(|i| args.get_handle(heap, i)).collect();
             construct_h(vm, heap, state, &scope, &proxy, &args, &new_target)
         })
     }

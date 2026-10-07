@@ -1,8 +1,8 @@
 use core::cell::Cell;
 
 use crate::{
-    CallableInfoObject, EdgeVisitable, Handle, HandleSlice, Heap, Object, Register, Smi, Tagged,
-    Value, Visitor,
+    CallableInfoObject, EdgeVisitable, FeedbackVector, FixedArray, FixedByteArray, Handle,
+    HandleSlice, Heap, Object, Register, Smi, Tagged, Value, Visitor,
 };
 
 use crate::VmError;
@@ -12,40 +12,11 @@ pub const STACK_SLOTS: usize = 16 * 1024;
 
 /// Fixed header slots between the register file and the parameter region
 pub const HEADER_SLOTS: usize = 11;
-/// Header slots sit directly below the anchor at these (negative) offsets.
-pub const CALLABLE_OFFSET: isize = -1;
-pub const ARGC_OFFSET: isize = -2;
-/// The frame's current context (the chain LoadContextSlot walks); unlike
-/// the function object's closure-context slot it is per-frame, so
-/// recursion cannot clobber a suspended frame's context.
-pub const CONTEXT_OFFSET: isize = -3;
-/// new.target of the active [[Construct]] (ES 9.2.2): the constructor, or
-/// undefined when the function was called. `super()` forwards this value.
-pub const NEW_TARGET_OFFSET: isize = -4;
-/// The frame's own bytecode: dispatch state lives in the frame
-pub const CODE_OFFSET: isize = -5;
-/// The frame's own constant pool.
-pub const CONSTANTS_OFFSET: isize = -6;
-/// The frame's own feedback vector (or the hole when absent).
-pub const FEEDBACK_OFFSET: isize = -7;
-/// The suspended caller's anchor (its frame pointer): returning to a frame
-/// is a header read, not a side-table lookup.
-pub const SAVED_BASE_OFFSET: isize = -8;
-/// The caller's resume pc (the instruction after its call).
-pub const SAVED_PC_OFFSET: isize = -9;
-/// The caller's exception handler lookup pc (its call site).
-pub const SAVED_HANDLER_PC_OFFSET: isize = -10;
-/// The frame's own register-file size (its frame low is derived from it).
-pub const REGCOUNT_OFFSET: isize = -11;
 
 const _: () = assert!(
     -bytecode::REGISTER_FILE_START as usize == HEADER_SLOTS + 1,
     "the bytecode register file start must sit directly below the header"
 );
-
-fn offset_slot(base: usize, offset: isize) -> usize {
-    (base as isize + offset) as usize
-}
 
 /// The pushed frame's function facts (from a `CallTarget::Bytecode`
 /// destructure or a call-IC hit); the frame facts (`register_count`,
@@ -153,6 +124,119 @@ pub enum Recv {
     Undefined,
 }
 
+/// The fixed frame header: `HEADER_SLOTS` contiguous slots directly below
+/// the anchor. Fields are declared in ascending address order, so the
+/// struct starts at `anchor - HEADER_SLOTS` and `callable` lands at
+/// `anchor - 1`.
+#[repr(C)]
+pub struct FrameHeader {
+    regcount: Register,
+    saved_handler_pc: Register,
+    saved_pc: Register,
+    saved_base: Register,
+    feedback: Register,
+    constants: Register,
+    code: Register,
+    new_target: Register,
+    context: Register,
+    argc: Register,
+    callable: Register,
+}
+
+const _: () = assert!(
+    core::mem::size_of::<FrameHeader>() == HEADER_SLOTS * core::mem::size_of::<Register>(),
+    "the frame header must cover exactly the reserved header slots"
+);
+
+impl FrameHeader {
+    /// The callable slot, for in-place reads/writes by callers that
+    /// cannot route through [`Self::callable`].
+    #[inline(always)]
+    pub fn callable_slot(&self) -> &Register {
+        &self.callable
+    }
+
+    /// The context slot, for in-place reads/writes by callers that
+    /// cannot route through [`Self::context`].
+    #[inline(always)]
+    pub fn context_slot(&self) -> &Register {
+        &self.context
+    }
+
+    /// The `new.target` slot, for in-place reads/writes by callers that
+    /// cannot route through [`Self::new_target`].
+    #[inline(always)]
+    pub fn new_target_slot(&self) -> &Register {
+        &self.new_target
+    }
+
+    /// The frame's callable.
+    #[inline(always)]
+    pub fn callable<'h>(&self, heap: &'h Heap) -> Tagged<'h, Object> {
+        // Safety: the header slot always holds the frame's callable.
+        unsafe { self.callable.get(heap).cast::<Object>() }
+    }
+
+    /// The frame's current context.
+    #[inline(always)]
+    pub fn context<'h>(&self, heap: &'h Heap) -> Tagged<'h, Value> {
+        self.context.get(heap)
+    }
+
+    /// The active `[[Construct]]` new.target.
+    #[inline(always)]
+    pub fn new_target<'h>(&self, heap: &'h Heap) -> Tagged<'h, Value> {
+        self.new_target.get(heap)
+    }
+
+    /// Actual argument count, receiver included.
+    #[inline(always)]
+    pub fn argc(&self) -> usize {
+        self.argc.read_smi().value() as usize
+    }
+
+    /// Register-file size.
+    #[inline(always)]
+    pub fn regcount(&self) -> usize {
+        self.regcount.read_smi().value() as usize
+    }
+
+    /// The frame's own bytecode.
+    #[inline(always)]
+    pub fn code<'h>(&self, heap: &'h Heap) -> Tagged<'h, FixedByteArray> {
+        // Safety: only `init_frame_header` writes this slot, always the
+        // frame's bytecode.
+        unsafe { self.code.get(heap).cast() }
+    }
+
+    /// The frame's own constant pool.
+    #[inline(always)]
+    pub fn constants<'h>(&self, heap: &'h Heap) -> Tagged<'h, FixedArray> {
+        // Safety: only `init_frame_header` writes this slot, always the
+        // constant pool.
+        unsafe { self.constants.get(heap).cast() }
+    }
+
+    /// The frame's feedback vector, or `None` when absent (the hole).
+    #[inline(always)]
+    pub fn feedback<'h>(&self, heap: &'h Heap) -> Option<Tagged<'h, FeedbackVector>> {
+        // Safety: only `init_frame_header` writes this slot: it is always
+        // a `FeedbackVector` or the hole.
+        let word = self.feedback.get(heap);
+        (word.raw() != heap.known().the_hole.raw()).then(|| unsafe { word.cast() })
+    }
+
+    /// The suspended caller's anchor, resume pc and handler pc.
+    #[inline(always)]
+    pub fn saved(&self) -> (usize, usize, usize) {
+        (
+            self.saved_base.read_smi().value() as usize,
+            self.saved_pc.read_smi().value() as usize,
+            self.saved_handler_pc.read_smi().value() as usize,
+        )
+    }
+}
+
 /// Frame layout
 /// index                     content
 /// base-HEADER-rc .. base-12 register file (r0 at base-12 = directly below
@@ -222,61 +306,50 @@ impl Stack {
         self.slots.as_ptr() as *mut Register
     }
 
-    #[inline]
-    pub fn value_slice(&self, base: usize, count: usize) -> HandleSlice<'_> {
-        let slots = &self.slots[base..base + count];
-        // Safety: stack slots are GC-visited, so the words stay current for
-        // as long as the returned slice is alive.
+    /// The frame header of the live frame anchored at `base`.
+    #[inline(always)]
+    pub fn frame_header(&self, base: usize) -> &FrameHeader {
+        // Safety: `base` anchors a live frame, whose header occupies the
+        // reserved slots directly below it.
+        unsafe { &*self.frame_header_ptr(base) }
+    }
+
+    /// # Safety
+    /// `base` must anchor a live frame (`base >= HEADER_SLOTS`).
+    #[inline(always)]
+    unsafe fn frame_header_ptr(&self, base: usize) -> *mut FrameHeader {
+        debug_assert!(base >= HEADER_SLOTS);
         unsafe {
-            HandleSlice::from_slice(core::slice::from_raw_parts(
-                slots.as_ptr() as *const Value,
-                count,
-            ))
+            (self.slots.as_ptr() as *mut Register)
+                .add(base - HEADER_SLOTS)
+                .cast::<FrameHeader>()
         }
     }
 
     /// The frame's callable, re-read under a heap borrow.
     pub fn callable<'a>(&self, heap: &'a Heap, base: usize) -> Tagged<'a, Object> {
-        // Safety: frame callable slots hold strong object pointers.
-        unsafe { self.callable_slot(base).get(heap).cast::<Object>() }
-    }
-
-    pub fn callable_slot(&self, base: usize) -> &Register {
-        self.header_slot(base, CALLABLE_OFFSET)
+        self.frame_header(base).callable(heap)
     }
 
     /// The frame's current context, re-read under a heap borrow.
     pub fn context<'a>(&self, heap: &'a Heap, base: usize) -> Tagged<'a, Value> {
-        self.context_slot(base).get(heap)
-    }
-
-    #[inline(always)]
-    pub fn header_slot(&self, base: usize, offset: isize) -> &Register {
-        self.slot_unchecked(offset_slot(base, offset))
-    }
-
-    pub fn context_slot(&self, base: usize) -> &Register {
-        self.header_slot(base, CONTEXT_OFFSET)
+        self.frame_header(base).context(heap)
     }
 
     /// The frame's `new.target`, re-read under a heap borrow.
     pub fn new_target<'a>(&self, heap: &'a Heap, base: usize) -> Tagged<'a, Value> {
-        self.new_target_slot(base).get(heap)
-    }
-
-    pub fn new_target_slot(&self, base: usize) -> &Register {
-        self.header_slot(base, NEW_TARGET_OFFSET)
+        self.frame_header(base).new_target(heap)
     }
 
     /// The frame's actual argument count, receiver included.
     pub fn argc(&self, base: usize) -> usize {
-        self.header_slot(base, ARGC_OFFSET).read_smi().value() as usize
+        self.frame_header(base).argc()
     }
 
     /// The frame's register-file size.
     #[inline(always)]
     pub fn regcount(&self, base: usize) -> usize {
-        self.header_slot(base, REGCOUNT_OFFSET).read_smi().value() as usize
+        self.frame_header(base).regcount()
     }
 
     /// The operand is the anchor-relative slot offset
@@ -296,13 +369,13 @@ impl Stack {
 
     /// The call-argument window `[reg_base .. reg_base+count)`: element 0
     /// (the receiver) is the base register's window slot at
-    /// `reg_base - count + 1`, so the ascending slice is element-ordered.
+    /// `reg_base - count + 1`, so the ascending window is element-ordered.
     #[inline]
-    pub fn args(&self, base: usize, reg_base: i32, count: usize) -> HandleSlice<'_> {
+    pub fn args(&self, base: usize, reg_base: i32, count: usize) -> Args {
         if count == 0 {
-            return HandleSlice::EMPTY;
+            return Args::EMPTY;
         }
-        self.value_slice(Self::slot_of(base, reg_base - count as i32 + 1), count)
+        self.args_at(Self::slot_of(base, reg_base - count as i32 + 1), count)
     }
 
     /// Push a frame: reserve its register file and parameter region
@@ -585,16 +658,16 @@ impl Stack {
 
     #[inline]
     pub fn pop_frame(&self, base: usize) -> FrameMeta {
-        self.set_top(base - HEADER_SLOTS - self.regcount(base));
-        let read = |offset: isize| self.header_slot(base, offset).read_smi().value() as usize;
-        let caller = read(SAVED_BASE_OFFSET);
+        let header = self.frame_header(base);
+        self.set_top(base - HEADER_SLOTS - header.regcount());
+        let (caller, pc, handler_pc) = header.saved();
         // the caller's own header carries its register count: no saved
         // copy rides in this frame
         FrameMeta {
             base: caller,
-            pc: read(SAVED_PC_OFFSET),
+            pc,
             register_count: self.regcount(caller),
-            handler_pc: read(SAVED_HANDLER_PC_OFFSET),
+            handler_pc,
         }
     }
 
@@ -617,31 +690,26 @@ impl Stack {
             .feedback
             .get(heap)
             .map_or_else(|| heap.known().the_hole.as_tagged(heap).raw(), |v| v.raw());
-        let saved = [
-            (CALLABLE_OFFSET, callee.callable.raw()),
-            (ARGC_OFFSET, Smi::new(argc as i64).encode()),
-            (CONTEXT_OFFSET, callee.context.raw()),
-            (NEW_TARGET_OFFSET, new_target.raw()),
-            (CODE_OFFSET, bytecode),
-            (CONSTANTS_OFFSET, constants),
-            (FEEDBACK_OFFSET, feedback),
-            (SAVED_BASE_OFFSET, Smi::new(caller.base as i64).encode()),
-            (SAVED_PC_OFFSET, Smi::new(caller.pc as i64).encode()),
-            (
-                SAVED_HANDLER_PC_OFFSET,
-                Smi::new(caller.handler_pc as i64).encode(),
-            ),
-            (REGCOUNT_OFFSET, Smi::new(register_count as i64).encode()),
-        ];
-        // the fixed header words sit contiguously below the anchor
-        // (offsets -1..=-11): plain offset writes through one held base
-        // instead of re-deriving the slot address through `self` per field
-        unsafe {
-            let base = (self.slots.as_ptr() as *mut Value).add(anchor);
-            for (offset, word) in saved {
-                *base.offset(offset) = word;
+        let smi = |v: usize| Smi::new(v as i64).encode();
+        // Safety: every header word is a Smi or a strong value; the header
+        // region is initialized arena space reserved by `push_frame_with`.
+        let header = unsafe {
+            FrameHeader {
+                regcount: Register::from_value(smi(register_count)),
+                saved_handler_pc: Register::from_value(smi(caller.handler_pc)),
+                saved_pc: Register::from_value(smi(caller.pc)),
+                saved_base: Register::from_value(smi(caller.base)),
+                feedback: Register::from_value(feedback),
+                constants: Register::from_value(constants),
+                code: Register::from_value(bytecode),
+                new_target: Register::from_value(new_target.raw()),
+                context: Register::from_value(callee.context.raw()),
+                argc: Register::from_value(smi(argc)),
+                callable: Register::from_value(callee.callable.raw()),
             }
-        }
+        };
+        // Safety: one contiguous write over the reserved header slots.
+        unsafe { self.frame_header_ptr(anchor).write(header) };
         FrameMeta {
             base: anchor,
             pc: 0,

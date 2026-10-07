@@ -8,12 +8,11 @@ use vm_core::cold::{
 use vm_core::ic::StoreOutcomeKind;
 use vm_core::ic::{CallProbe, CallRecord, ElementHit, Hit, InlineCache, MonoProbe, StoreHit};
 use vm_core::interp::{Ctx, Unwind, unwind};
-use vm_core::stack::CODE_OFFSET;
 use vm_core::{
     CallTarget, CallableInfoObject, Callee, Coercion, Compare, Context, ContextInit, ContextState,
-    Convert, FixedArray, FixedByteArray, FrameMeta, Handle, HandleSlice, Heap, Key, LoadOutcome,
-    Lookup, Object, Recv, Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi,
-    StoreSemantics, Tagged, Termination, VM, Value, VmError,
+    Convert, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Key, LoadOutcome, Lookup, Object,
+    Recv, Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi, StoreSemantics, Tagged,
+    Termination, VM, Value, VmError,
 };
 
 /// The per-instruction control flow of the dispatch loop (the error
@@ -100,13 +99,11 @@ fn start<'b>(
 ) -> Result<Tagged<'b, Value>, VmError> {
     if Proxy::is_proxy(heap, callable.as_tagged(heap).erase()) {
         return state.handle_scope(|scope| {
+            let args = args.as_args();
             let result = match new_target {
                 None => Proxy::apply(vm, heap, state, callable.erase(), args),
                 Some(nt) => {
-                    let real: Vec<Tagged<'_, Value>> =
-                        args.iter().map(|h| h.as_tagged(heap)).skip(1).collect();
-                    let staged = scope.stage(&real);
-                    Proxy::construct(vm, heap, state, callable.erase(), staged, nt)
+                    Proxy::construct(vm, heap, state, callable.erase(), args.slice_from(1), nt)
                 }
             };
             match result {
@@ -242,15 +239,9 @@ fn dispatch<'a>(ctx: &Ctx<'a>) -> Result<Tagged<'a, Value>, VmError> {
 
 fn code_bytes(ctx: &Ctx<'_>) -> &'static [u8] {
     let (ptr, len) = {
-        // Safety: only `init_frame_header` writes this slot, always the
-        // frame's bytecode; the slice is re-derived after every event
-        // that can move it (allocation, nested run).
-        let arr = unsafe {
-            ctx.stack()
-                .header_slot(ctx.frame_base(), CODE_OFFSET)
-                .get(ctx.heap())
-                .cast::<FixedByteArray>()
-        };
+        // the slice is re-derived after every event that can move it
+        // (allocation, nested run)
+        let arr = ctx.stack().frame_header(ctx.frame_base()).code(ctx.heap());
         let bytes = arr.as_slice();
         (bytes.as_ptr(), bytes.len())
     };
@@ -463,7 +454,7 @@ fn step<'a>(
             Flow::Sync
         }
         Opcode::LoadNewTarget => {
-            acc.store(stack.new_target_slot(frame_base).get(heap));
+            acc.store(stack.frame_header(frame_base).new_target_slot().get(heap));
             Flow::Next
         }
         Opcode::Store => {
@@ -831,7 +822,8 @@ fn step<'a>(
             let depth = ops.uimm(1);
             let v = {
                 let mut context = match stack
-                    .context_slot(frame_base)
+                    .frame_header(frame_base)
+                    .context_slot()
                     .get(heap)
                     .get_as::<Context>(heap)
                 {
@@ -856,7 +848,8 @@ fn step<'a>(
         }
         Opcode::StoreContextSlot => {
             let mut context = match stack
-                .context_slot(frame_base)
+                .frame_header(frame_base)
+                .context_slot()
                 .get(heap)
                 .get_as::<Context>(heap)
             {
@@ -892,7 +885,10 @@ fn step<'a>(
             });
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(heap, stack.context_slot(frame_base).get(heap))
+                    .cast::<Context>(
+                        heap,
+                        stack.frame_header(frame_base).context_slot().get(heap),
+                    )
                     .expect("frame context slot holds a Context");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
@@ -913,7 +909,10 @@ fn step<'a>(
             let count = ops.uimm(0) as usize;
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(heap, stack.context_slot(frame_base).get(heap))
+                    .cast::<Context>(
+                        heap,
+                        stack.frame_header(frame_base).context_slot().get(heap),
+                    )
                     .expect("frame context slot holds a Context");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
@@ -928,13 +927,13 @@ fn step<'a>(
             Flow::Sync
         }
         Opcode::PushContext => {
-            let old = stack.context_slot(frame_base).get(heap);
+            let old = stack.frame_header(frame_base).context_slot().get(heap);
             stack.set_reg(frame_base, ops.reg(0), old);
             let context = acc.get(heap);
             if context.get_as::<Context>(heap).is_none() {
                 throw_err!(ctx, VmError::Type);
             }
-            stack.context_slot(frame_base).store(context);
+            stack.frame_header(frame_base).context_slot().store(context);
             Flow::Next
         }
         Opcode::PopContext => {
@@ -942,7 +941,7 @@ fn step<'a>(
             if context.get_as::<Context>(heap).is_none() {
                 throw_err!(ctx, VmError::Type);
             }
-            stack.context_slot(frame_base).store(context);
+            stack.frame_header(frame_base).context_slot().store(context);
             Flow::Next
         }
         Opcode::ThrowReferenceErrorIfHole => {
@@ -952,7 +951,7 @@ fn step<'a>(
             Flow::Sync
         }
         Opcode::LoadContext => {
-            acc.store(stack.context_slot(frame_base).get(heap));
+            acc.store(stack.frame_header(frame_base).context_slot().get(heap));
             Flow::Sync
         }
         // TODO: feedback vectors and separation once they are there
@@ -1261,7 +1260,7 @@ fn step<'a>(
                 }
                 let result = state.handle_scope(|scope| {
                     let callee = scope.handle(stack.reg(heap, frame_base, callee_reg));
-                    Proxy::apply(vm, heap, state, callee, stack.slice(staged))
+                    Proxy::apply(vm, heap, state, callee, staged)
                 });
                 stack.set_top(saved_top);
                 return match result {
@@ -1423,7 +1422,7 @@ fn step<'a>(
                 }
                 let result = state.handle_scope(|scope| {
                     let callee = scope.handle(stack.reg(heap, frame_base, callee_reg));
-                    Proxy::apply(vm, heap, state, callee, stack.slice(staged))
+                    Proxy::apply(vm, heap, state, callee, staged)
                 });
                 stack.set_top(saved_top);
                 return match result {
@@ -1567,7 +1566,10 @@ fn step<'a>(
                     throw_err!(ctx, VmError::Type);
                 };
                 let context = scope
-                    .cast::<Context>(heap, stack.context_slot(frame_base).get(heap))
+                    .cast::<Context>(
+                        heap,
+                        stack.frame_header(frame_base).context_slot().get(heap),
+                    )
                     .expect("frame context slot holds a Context");
                 let obj = fold!(ctx, Object::create_closure(heap, &scope, info, context));
                 acc.store(obj.erase());
@@ -1575,7 +1577,7 @@ fn step<'a>(
             })
         }
         Opcode::LoadCurrentClosure => {
-            acc.store(stack.callable_slot(frame_base).get(heap));
+            acc.store(stack.frame_header(frame_base).callable_slot().get(heap));
             Flow::Next
         }
         Opcode::Add => {
