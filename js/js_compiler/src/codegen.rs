@@ -8,8 +8,8 @@ use oxc_syntax::scope::{ScopeFlags, ScopeId};
 use oxc_syntax::symbol::{SymbolFlags, SymbolId};
 
 use bytecode::{
-    CallableKind, ConstIdx, Constant, FnBuilder, FunctionId, FunctionMeta, Label, Opcode, Program,
-    PropertyFlags, Reg, RegList, RtArg, RuntimeFn,
+    BuiltinFn, CallableKind, ConstIdx, Constant, FnBuilder, FunctionId, FunctionMeta, Label,
+    Opcode, Program, PropertyFlags, Reg, RegList, RtArg,
 };
 
 use crate::analysis::{ClassIdx, Facts, Fid, FnBody, FnKind, Home, MemberKind, Mode, Special};
@@ -606,7 +606,7 @@ impl<'a, 'p> Compiler<'a, 'p> {
         }
     }
 
-    /// Context hops from the use site's scope to the context hosting
+    /// ContextObject hops from the use site's scope to the context hosting
     /// `decl_scope`'s slots (the use site's own context-creating
     /// ancestor is depth 0).
     fn depth_to(&self, use_scope: ScopeId, decl_scope: ScopeId) -> u32 {
@@ -860,7 +860,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
     fn emit_this_initialized_check(&mut self) {
         self.b
-            .call_runtime_staged(RuntimeFn::ThrowSuperNotCalledIfHole, &[RtArg::Acc]);
+            .call_runtime_staged(BuiltinFn::ThrowSuperNotCalledIfHole, &[RtArg::Acc]);
     }
 
     fn name_constant(&mut self, key: &PropertyKey<'_>) -> Result<ConstIdx, CompileError> {
@@ -887,14 +887,14 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
     fn emit_set_name_by_const(&mut self, idx: ConstIdx) {
         self.b.call_runtime_staged(
-            RuntimeFn::SetFunctionName,
+            BuiltinFn::SetFunctionName,
             &[RtArg::Acc, RtArg::Const(idx), RtArg::Smi(0)],
         );
     }
 
     fn emit_set_name_by_reg(&mut self, key: Reg, prefix: u32) {
         self.b.call_runtime_staged(
-            RuntimeFn::SetFunctionName,
+            BuiltinFn::SetFunctionName,
             &[RtArg::Acc, RtArg::Reg(key), RtArg::Smi(prefix)],
         );
     }
@@ -945,7 +945,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             IdRes::Dynamic => {
                 let idx = self.b.name(ident.name.as_bytes());
                 self.b.call_runtime_staged(
-                    RuntimeFn::StoreDynamicName,
+                    BuiltinFn::StoreDynamicName,
                     &[RtArg::Acc, RtArg::Const(idx)],
                 );
             }
@@ -974,7 +974,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             IdRes::Dynamic => {
                 let idx = self.b.name(ident.name.as_bytes());
                 self.b
-                    .call_runtime_staged(RuntimeFn::LoadDynamicName, &[RtArg::Const(idx)]);
+                    .call_runtime_staged(BuiltinFn::LoadDynamicName, &[RtArg::Const(idx)]);
             }
             IdRes::Slot(slot, depth) => match slot {
                 Slot::Param { index, hole_check } => {
@@ -1234,7 +1234,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.expr(&p.right)?;
                 self.b.store(base);
                 self.b
-                    .call_runtime(RuntimeFn::PrivateIn, RegList::new(base, 2));
+                    .call_runtime(BuiltinFn::PrivateIn, RegList::new(base, 2));
                 self.b.drop_temps(mark);
                 Ok(())
             }
@@ -1311,7 +1311,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 };
                 self.release_store(&store);
                 self.b.call_runtime(
-                    RuntimeFn::DeleteSuperProperty,
+                    BuiltinFn::DeleteSuperProperty,
                     RegList::new(self.b.this_reg(), 0),
                 );
                 Ok(())
@@ -1342,9 +1342,9 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 }
                 self.b.store(base);
                 let runtime_fn = if self.c.facts.functions[self.fid.0 as usize].strict {
-                    RuntimeFn::DeletePropertyStrict
+                    BuiltinFn::DeletePropertyStrict
                 } else {
-                    RuntimeFn::DeletePropertySloppy
+                    BuiltinFn::DeletePropertySloppy
                 };
                 self.b.call_runtime(runtime_fn, RegList::new(base, 2));
                 self.b.drop_temps(mark);
@@ -1360,7 +1360,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         self.b.load_constant(idx);
                         let name = self.b.stage_acc();
                         self.b
-                            .call_runtime(RuntimeFn::DeleteIdentifierSloppy, RegList::new(name, 1));
+                            .call_runtime(BuiltinFn::DeleteIdentifierSloppy, RegList::new(name, 1));
                         self.b.drop_temp();
                     }
                     _ => self.b.load_false(),
@@ -1407,7 +1407,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.expr(&b.right)?;
                 self.b.store(base);
                 self.b
-                    .call_runtime(RuntimeFn::HasProperty, RegList::new(base, 2));
+                    .call_runtime(BuiltinFn::HasProperty, RegList::new(base, 2));
                 self.b.drop_temps(mark);
                 Ok(())
             }
@@ -1869,7 +1869,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     ) -> Result<(), CompileError> {
         // RequireObjectCoercible runs even for the empty pattern
         self.b.call_runtime(
-            RuntimeFn::RequireObjectCoercible,
+            BuiltinFn::RequireObjectCoercible,
             RegList::new(value_reg, 1),
         );
         self.b.store(value_reg);
@@ -1925,7 +1925,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     self.b.load(Reg::new(base.index() + excluded as i32 + 1));
                     self.b.store(w);
                     self.b
-                        .call_runtime(RuntimeFn::CopyDataProperties, RegList::new(w, count));
+                        .call_runtime(BuiltinFn::CopyDataProperties, RegList::new(w, count));
                     self.b.drop_temps(mark2);
                     self.b.store(rest_obj);
                     self.emit_pattern_leaf(*target, rest_obj, binding)?;
@@ -1999,7 +1999,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     ) -> Result<(), CompileError> {
         // iterator = GetIterator(value)
         self.b
-            .call_runtime(RuntimeFn::GetIterator, RegList::new(value_reg, 1));
+            .call_runtime(BuiltinFn::GetIterator, RegList::new(value_reg, 1));
         let iter = self.b.stage_acc();
         // done flag (ES 8.5.9: once done, later elements read undefined
         // without calling next again)
@@ -2014,7 +2014,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     let skip = self.b.new_label();
                     self.b.jump_if_truthy(skip);
                     self.b
-                        .call_runtime(RuntimeFn::IteratorNext, RegList::new(iter, 1));
+                        .call_runtime(BuiltinFn::IteratorNext, RegList::new(iter, 1));
                     self.b.bind(skip);
                 }
                 PatElement::Rest(target) => {
@@ -2037,10 +2037,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             let exit = self.b.new_label();
             self.b.jump_if_truthy(exit);
             self.b
-                .call_runtime(RuntimeFn::IteratorNext, RegList::new(iter, 1));
+                .call_runtime(BuiltinFn::IteratorNext, RegList::new(iter, 1));
             let result = self.b.stage_acc();
             self.b
-                .call_runtime(RuntimeFn::IteratorDone, RegList::new(result, 1));
+                .call_runtime(BuiltinFn::IteratorDone, RegList::new(result, 1));
             let have = self.b.new_label();
             self.b.jump_if_falsy(have);
             self.b.load_smi(1);
@@ -2049,7 +2049,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.b.jump(after);
             self.b.bind(have);
             self.b
-                .call_runtime(RuntimeFn::IteratorValue, RegList::new(result, 1));
+                .call_runtime(BuiltinFn::IteratorValue, RegList::new(result, 1));
             let feedback = self.b.new_feedback();
             self.b.store_keyed_property_no_shadow(arr, idx, feedback);
             self.b.raw(Opcode::AddImmediate, &[idx.operand(), 1]); // acc = idx + 1
@@ -2119,10 +2119,10 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         let skip_next = self.b.new_label();
         self.b.jump_if_truthy(skip_next);
         self.b
-            .call_runtime(RuntimeFn::IteratorNext, RegList::new(iter, 1));
+            .call_runtime(BuiltinFn::IteratorNext, RegList::new(iter, 1));
         let result = self.b.stage_acc();
         self.b
-            .call_runtime(RuntimeFn::IteratorDone, RegList::new(result, 1));
+            .call_runtime(BuiltinFn::IteratorDone, RegList::new(result, 1));
         let have = self.b.new_label();
         self.b.jump_if_falsy(have);
         self.b.load_smi(1);
@@ -2131,7 +2131,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         self.b.jump(after);
         self.b.bind(have);
         self.b
-            .call_runtime(RuntimeFn::IteratorValue, RegList::new(result, 1));
+            .call_runtime(BuiltinFn::IteratorValue, RegList::new(result, 1));
         self.b.store(v);
         self.b.bind(after);
         self.b.drop_temp(); // result
@@ -2288,7 +2288,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.b.load(*obj);
                 self.b.store(Reg::new(base.index() + 2));
                 self.b
-                    .call_runtime(RuntimeFn::PrivateSet, RegList::new(base, 3));
+                    .call_runtime(BuiltinFn::PrivateSet, RegList::new(base, 3));
                 self.b.drop_temps(mark);
             }
             // runtime(home, recv, key, value = acc, semantics: shadow)
@@ -2298,7 +2298,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 name_idx,
             } => {
                 self.b.call_runtime_staged(
-                    RuntimeFn::SuperSetProperty,
+                    BuiltinFn::SuperSetProperty,
                     &[
                         RtArg::Reg(*home),
                         RtArg::Reg(*recv),
@@ -2310,7 +2310,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             StoreTarget::SuperKeyed { recv, home, key } => {
                 self.b.call_runtime_staged(
-                    RuntimeFn::SuperSetProperty,
+                    BuiltinFn::SuperSetProperty,
                     &[
                         RtArg::Reg(*home),
                         RtArg::Reg(*recv),
@@ -2344,7 +2344,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.b.load(*obj);
                 self.b.store(Reg::new(base.index() + 1));
                 self.b
-                    .call_runtime(RuntimeFn::PrivateGet, RegList::new(base, 2));
+                    .call_runtime(BuiltinFn::PrivateGet, RegList::new(base, 2));
                 self.b.drop_temps(mark);
             }
             // runtime(home, recv, key) -> value
@@ -2354,7 +2354,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 name_idx,
             } => {
                 self.b.call_runtime_staged(
-                    RuntimeFn::SuperGetProperty,
+                    BuiltinFn::SuperGetProperty,
                     &[
                         RtArg::Reg(*home),
                         RtArg::Reg(*recv),
@@ -2364,7 +2364,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             StoreTarget::SuperKeyed { recv, home, key } => {
                 self.b.call_runtime_staged(
-                    RuntimeFn::SuperGetProperty,
+                    BuiltinFn::SuperGetProperty,
                     &[RtArg::Reg(*home), RtArg::Reg(*recv), RtArg::Reg(*key)],
                 );
             }
@@ -2500,7 +2500,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 self.expr(&p.object)?;
                 self.b.store(Reg::new(base.index() + 1));
                 self.b
-                    .call_runtime(RuntimeFn::PrivateGet, RegList::new(base, 2));
+                    .call_runtime(BuiltinFn::PrivateGet, RegList::new(base, 2));
                 self.b.drop_temps(mark);
                 Ok(())
             }
@@ -2853,7 +2853,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         }
         if direct {
             self.b
-                .call_runtime(RuntimeFn::ConstructSuper, RegList::new(arg_base, argc));
+                .call_runtime(BuiltinFn::ConstructSuper, RegList::new(arg_base, argc));
         } else {
             // .this_function and .new.target of the owning constructor
             // (runtime ABI: (args..., closure, new_target))
@@ -2873,7 +2873,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.b.load_context_slot(new_target_slot, owner_depth);
             self.b.store(new_target_reg);
             self.b.call_runtime(
-                RuntimeFn::ConstructSuperVia,
+                BuiltinFn::ConstructSuperVia,
                 RegList::new(arg_base, argc + 2),
             );
         }
@@ -2886,7 +2886,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             let mark = g.b.temp_depth();
             let t = g.b.stage_acc();
             g.b.call_runtime(
-                RuntimeFn::ThrowSuperAlreadyCalledIfNotHole,
+                BuiltinFn::ThrowSuperAlreadyCalledIfNotHole,
                 RegList::new(t, 1),
             );
             g.b.drop_temps(mark);
@@ -2926,7 +2926,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             }
             self.b.store(ctor);
             self.b
-                .call_runtime(RuntimeFn::InitInstanceFields, RegList::new(instance, 2));
+                .call_runtime(BuiltinFn::InitInstanceFields, RegList::new(instance, 2));
             self.b.drop_temp(); // ctor
             self.b.drop_temp(); // instance
         }
@@ -2973,7 +2973,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.b.load_constant(desc);
             let desc_reg = self.b.stage_acc();
             self.b
-                .call_runtime(RuntimeFn::CreatePrivateName, RegList::new(desc_reg, 1));
+                .call_runtime(BuiltinFn::CreatePrivateName, RegList::new(desc_reg, 1));
             self.b.drop_temp();
             self.b.store_context_slot(*slot, 0);
         }
@@ -2983,7 +2983,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.expr(sup)?;
             let sup = self.b.stage_acc();
             self.b
-                .call_runtime_staged(RuntimeFn::ThrowIfNotConstructorOrNull, &[RtArg::Reg(sup)]);
+                .call_runtime_staged(BuiltinFn::ThrowIfNotConstructorOrNull, &[RtArg::Reg(sup)]);
             Some(sup)
         } else {
             None
@@ -3009,7 +3009,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.b.load_named_property(sup, proto_name, feedback);
             self.b.store(pp);
             self.b
-                .call_runtime_staged(RuntimeFn::ThrowIfNotObjectOrNull, &[RtArg::Reg(pp)]);
+                .call_runtime_staged(BuiltinFn::ThrowIfNotObjectOrNull, &[RtArg::Reg(pp)]);
             self.b.load(sup);
             self.b.store(cp);
             let done = self.b.new_label();
@@ -3024,7 +3024,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         self.b.create_empty_object_literal();
         let proto = self.b.stage_acc();
         self.b.call_runtime_staged(
-            RuntimeFn::SetPrototype,
+            BuiltinFn::SetPrototype,
             &[RtArg::Reg(proto), RtArg::Reg(pp)],
         );
 
@@ -3040,7 +3040,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // proto.constructor → the class {w+, e−, c+}
         let ctor_name = self.b.name(b"constructor");
         self.b.call_runtime_staged(
-            RuntimeFn::DefineOwnProperty,
+            BuiltinFn::DefineOwnProperty,
             &[
                 RtArg::Reg(proto),
                 RtArg::Const(ctor_name),
@@ -3051,7 +3051,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // ctor.prototype → the prototype {w+, e−, c−}
         let proto_name = self.b.name(b"prototype");
         self.b.call_runtime_staged(
-            RuntimeFn::DefineOwnProperty,
+            BuiltinFn::DefineOwnProperty,
             &[
                 RtArg::Reg(ctor),
                 RtArg::Const(proto_name),
@@ -3061,7 +3061,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         );
         // the class itself inherits from the superclass constructor
         self.b
-            .call_runtime_staged(RuntimeFn::SetPrototype, &[RtArg::Reg(ctor), RtArg::Reg(cp)]);
+            .call_runtime_staged(BuiltinFn::SetPrototype, &[RtArg::Reg(ctor), RtArg::Reg(cp)]);
 
         // instance field list: a JS array [key0, init0, key1, init1, ...]
         // attached to the constructor (its hidden fields slot)
@@ -3163,7 +3163,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         None => RtArg::Const(name_idx.unwrap()),
                     };
                     self.b.call_runtime_staged(
-                        RuntimeFn::DefineOwnProperty,
+                        BuiltinFn::DefineOwnProperty,
                         &[
                             RtArg::Reg(target),
                             key,
@@ -3184,7 +3184,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         None => RtArg::Const(name_idx.unwrap()),
                     };
                     self.b.call_runtime_staged(
-                        RuntimeFn::InstallAccessor,
+                        BuiltinFn::InstallAccessor,
                         &[RtArg::Reg(target), key, RtArg::Acc, RtArg::Smi(flags)],
                     );
                 }
@@ -3226,7 +3226,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 (None, None) => unreachable!("static field keys are reg or const"),
             };
             self.b.call_runtime_staged(
-                RuntimeFn::DefineOwnProperty,
+                BuiltinFn::DefineOwnProperty,
                 &[RtArg::Reg(ctor), key, RtArg::Acc, RtArg::Smi(0)],
             );
         }
@@ -3247,7 +3247,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             self.b.load(ctor);
             self.b.store(ctor_reg);
             self.b
-                .call_runtime(RuntimeFn::SetClassFields, RegList::new(arr_reg, 2));
+                .call_runtime(BuiltinFn::SetClassFields, RegList::new(arr_reg, 2));
             self.b.drop_temp(); // ctor copy
             self.b.drop_temp(); // arr copy
             self.b.drop_temp(); // the fields array itself
@@ -3402,7 +3402,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                         None => RtArg::Const(name_idx.unwrap()),
                     };
                     self.b.call_runtime_staged(
-                        RuntimeFn::InstallAccessor,
+                        BuiltinFn::InstallAccessor,
                         &[RtArg::Reg(obj), key, RtArg::Acc, RtArg::Smi(flags)],
                     );
                 }
@@ -3669,7 +3669,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
             // ForInNext(undefined) is immediately done)
             g.expr(&s.right)?;
             let subject = g.b.stage_acc();
-            g.b.call_runtime(RuntimeFn::ForInEnumerate, RegList::new(subject, 1));
+            g.b.call_runtime(BuiltinFn::ForInEnumerate, RegList::new(subject, 1));
             g.b.drop_temp(); // the call consumed the subject; acc = enumerator
             let enumerator = g.b.stage_acc();
 
@@ -3684,7 +3684,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 continues: Some(continues),
                 unwind_ctx: ctx_save,
             });
-            g.b.call_runtime(RuntimeFn::ForInNext, RegList::new(enumerator, 1));
+            g.b.call_runtime(BuiltinFn::ForInNext, RegList::new(enumerator, 1));
             let have_key = g.b.new_label();
             g.b.jump_if_not_undefined(have_key);
             g.b.jump(breaks);
@@ -4257,7 +4257,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 if *rest {
                     let i = i as u32;
                     self.b
-                        .call_runtime_staged(RuntimeFn::CreateRestParameter, &[RtArg::Smi(i)]);
+                        .call_runtime_staged(BuiltinFn::CreateRestParameter, &[RtArg::Smi(i)]);
                     self.b.store(Reg::new(staged_base.index() + i as i32));
                 }
             }
@@ -4351,7 +4351,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
         // argument to super() and returns the bound this (ES 15.7.13)
         if kind == FnKind::DefaultDerivedCtor {
             self.b.call_runtime(
-                RuntimeFn::ConstructSuperAllArgs,
+                BuiltinFn::ConstructSuperAllArgs,
                 RegList::new(self.b.this_reg(), 0),
             );
             self.b.store(self.b.this_reg());
@@ -4365,7 +4365,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                     g.b.load_current_closure();
                     let ctor = g.b.temp();
                     g.b.store(ctor);
-                    g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(instance, 2));
+                    g.b.call_runtime(BuiltinFn::InitInstanceFields, RegList::new(instance, 2));
                     Ok(())
                 })?;
             }
@@ -4385,7 +4385,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
                 g.b.load_current_closure();
                 let ctor = g.b.temp();
                 g.b.store(ctor);
-                g.b.call_runtime(RuntimeFn::InitInstanceFields, RegList::new(instance, 2));
+                g.b.call_runtime(BuiltinFn::InitInstanceFields, RegList::new(instance, 2));
                 Ok(())
             })?;
         }
@@ -4430,7 +4430,7 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
 
         // lexical declarations start in their TDZ: the frame is filled with
         // `undefined`, so register-resident `let`/`const`/class
-        // bindings get an explicit hole. Context-allocated lexicals are born
+        // bindings get an explicit hole. ContextObject-allocated lexicals are born
         // the hole when their context is materialized.
         self.emit_lexical_hole_fills()?;
 

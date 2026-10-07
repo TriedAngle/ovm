@@ -1,6 +1,6 @@
+use vm_core::Coercion;
+use vm_core::HostCtx;
 use vm_core::Lookup;
-use vm_core::RuntimeContext;
-use vm_core::runtime::Coercion;
 
 use vm_core::{
     Args, Convert, DenseString, Handle, HandleSlice, Object, PropertyDescriptor, Tagged, Value,
@@ -8,7 +8,7 @@ use vm_core::{
 use vm_core::{raise_runtime, rt_try};
 
 pub fn error_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -16,7 +16,7 @@ pub fn error_constructor<'a>(
 }
 
 pub fn type_error_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -24,15 +24,15 @@ pub fn type_error_constructor<'a>(
 }
 
 pub fn reference_error_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     make_error(nctx, args, "ReferenceError")
 }
 
-pub fn make_error<'a>(nctx: RuntimeContext<'a>, args: Args, class: &str) -> Tagged<'a, Value> {
-    let RuntimeContext {
+pub fn make_error<'a>(nctx: HostCtx<'a>, args: Args, class: &str) -> Tagged<'a, Value> {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -83,11 +83,11 @@ pub fn make_error<'a>(nctx: RuntimeContext<'a>, args: Args, class: &str) -> Tagg
 }
 
 pub fn error_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {

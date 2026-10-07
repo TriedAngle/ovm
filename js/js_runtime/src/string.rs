@@ -1,18 +1,17 @@
 //! ES 22.1: the String constructor and prototype methods.
 
+use vm_core::HostCtx;
 use vm_core::Object;
-use vm_core::RuntimeContext;
 use vm_core::raise_runtime;
-use vm_core::runtime_api::wrapper_value;
 use vm_core::{Args, DenseString, Handle, Symbol, Tagged, Value};
 
 pub fn string_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -43,15 +42,15 @@ pub fn string_constructor<'a>(
 }
 
 pub fn string_value_of<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
-    match wrapper_value(
+    match Object::wrapper_value(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
         unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
@@ -64,15 +63,15 @@ pub fn string_value_of<'a>(
 }
 
 pub fn string_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
-    match wrapper_value(
+    match Object::wrapper_value(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
         unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },

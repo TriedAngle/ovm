@@ -1,17 +1,16 @@
 //! ES 20.3: the Boolean constructor and prototype methods.
 
-use vm_core::RuntimeContext;
+use vm_core::HostCtx;
 use vm_core::raise_runtime;
-use vm_core::runtime_api::wrapper_value;
-use vm_core::{Args, Convert, Handle, Tagged, Value};
+use vm_core::{Args, Convert, Handle, Object, Tagged, Value};
 
 pub fn boolean_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
-    let RuntimeContext {
+    let HostCtx {
         vm: _, heap, state, ..
     } = nctx;
     if !is_construct {
@@ -28,15 +27,15 @@ pub fn boolean_constructor<'a>(
 }
 
 pub fn boolean_value_of<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
-    match wrapper_value(
+    match Object::wrapper_value(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
         unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
@@ -49,16 +48,16 @@ pub fn boolean_value_of<'a>(
 }
 
 pub fn boolean_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
         let arg = args.get(heap, 0);
-        let v = match wrapper_value(
+        let v = match Object::wrapper_value(
             heap,
             // Safety: fresh rooted-slot word, no allocation since the read.
             unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },

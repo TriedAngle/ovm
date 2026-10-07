@@ -1,8 +1,7 @@
 use vm_core::raise_runtime;
-use vm_core::runtime_api::install_method;
 use vm_core::{
-    Args, DenseString, Handle, HandleSlice, Map, MapInit, MapKind, Object, PropertyDescriptor,
-    Runtime, RuntimeContext, Tagged, VM, Value, VmError,
+    Args, DenseString, Handle, HandleSlice, HostCtx, Map, MapInit, MapKind, Object,
+    PropertyDescriptor, Runtime, Tagged, VM, Value, VmError,
 };
 
 pub struct KetteRuntime;
@@ -25,12 +24,12 @@ impl Runtime for KetteRuntime {
                 &scope,
             );
             let console = scope.handle(thread.heap().new_object(&scope, map, HandleSlice::EMPTY));
-            install_method(thread, &scope, console, "print", print)?;
+            Object::install_method(thread, &scope, console, "print", print)?;
             let console_name = thread.intern(&scope, "Console");
             let console_name = scope.handle(console_name.as_tagged(&*thread.heap()));
             let global = thread.heap().known().global_object;
             // a bare global `print(x)`, same native as `Console.print`
-            install_method(thread, &scope, global, "print", print)?;
+            Object::install_method(thread, &scope, global, "print", print)?;
             Object::define_own_property(
                 thread.heap(),
                 &scope,
@@ -44,11 +43,11 @@ impl Runtime for KetteRuntime {
 }
 
 fn console_print<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     if args.len() < 2 {

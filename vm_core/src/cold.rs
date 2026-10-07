@@ -7,15 +7,15 @@
 use crate::convert::Convert;
 use crate::handle::{Handle, HandleScope};
 use crate::ic::{InlineCache, StoreHit, StoreOutcomeKind};
-use crate::interp::Ctx;
+use crate::interpreter::Ctx;
 use crate::lookup::{Key, LoadOutcome, Lookup};
 use crate::objects::map::SlotName;
 use crate::objects::object::Object;
 use crate::objects::proxy::Proxy;
 use crate::objects::string::DenseString;
-use crate::runtime::{Coercion, Hint, RuntimeContext};
 use crate::transition::{PropertyDescriptor, StoreOutcome, StoreSemantics};
 use crate::value::{Smi, Tagged, Value};
+use crate::{Coercion, Hint, HostCtx};
 use crate::{Compare, Errors, VmError};
 
 /// `Add` cold body: ToPrimitive both operands, string concatenation when
@@ -261,7 +261,7 @@ pub fn named_load<'a>(
             Ok(LoadOutcome::Getter(getter)) => {
                 let getter = scope.handle(getter);
                 let args = scope.stage(&[recv.as_tagged(heap).erase()]);
-                match RuntimeContext::call(vm, heap, state, getter, args, None) {
+                match HostCtx::enter(vm, heap, state, getter, args, None) {
                     Ok(v) => scope.handle(v),
                     Err(e) => return ctx.raise_tag(e),
                 }
@@ -325,7 +325,7 @@ pub fn keyed_load<'a>(
             Ok(LoadOutcome::Getter(getter)) => {
                 let getter = scope.handle(getter);
                 let args = scope.stage(&[recv.as_tagged(heap).erase()]);
-                match RuntimeContext::call(vm, heap, state, getter, args, None) {
+                match HostCtx::enter(vm, heap, state, getter, args, None) {
                     Ok(v) => scope.handle(v),
                     Err(e) => return ctx.raise_tag(e),
                 }
@@ -362,7 +362,7 @@ pub fn keyed_load_imm<'a>(ctx: &Ctx<'a>, recv: Tagged<'_, Value>, idx: usize) ->
             Ok(LoadOutcome::Getter(getter)) => {
                 let getter = scope.handle(getter);
                 let args = scope.stage(&[recv.as_tagged(heap).erase()]);
-                match RuntimeContext::call(vm, heap, state, getter, args, None) {
+                match HostCtx::enter(vm, heap, state, getter, args, None) {
                     Ok(v) => scope.handle(v),
                     Err(e) => return ctx.raise_tag(e),
                 }
@@ -488,7 +488,7 @@ pub fn global_load<'a>(
                     return ctx.undefined_word();
                 }
                 let args = scope.stage(&[global.as_tagged(heap).erase()]);
-                match RuntimeContext::call(vm, heap, state, getter, args, None) {
+                match HostCtx::enter(vm, heap, state, getter, args, None) {
                     Ok(v) => scope.handle(v),
                     Err(e) => return ctx.raise_tag(e),
                 }
@@ -561,7 +561,7 @@ pub fn store_named<'a>(
                     // the setter's return value is ignored (store result
                     // semantics: the accumulator keeps the stored value);
                     // a throwing setter routes the sentinel to the caller
-                    let v = match RuntimeContext::call(vm, heap, state, setter, args, None) {
+                    let v = match HostCtx::enter(vm, heap, state, setter, args, None) {
                         Ok(v) => scope.handle(v),
                         Err(e) => return ctx.raise_tag(e),
                     };
@@ -720,7 +720,7 @@ pub fn apply_store_outcome(
         }),
         StoreOutcome::CallSetter { setter } => state.handle_scope(|scope| {
             let args = scope.stage(&[receiver.as_tagged(heap).erase(), value.as_tagged(heap)]);
-            match RuntimeContext::call(vm, heap, state, setter, args, None) {
+            match HostCtx::enter(vm, heap, state, setter, args, None) {
                 Ok(v) => {
                     // the setter's return value is ignored: the stored
                     // value stays the expression's result
@@ -793,7 +793,7 @@ pub fn construct<'a>(
         staged.push(receiver.as_tagged(heap).erase());
         staged.extend(args.iter(heap));
         let staged = scope.stage(&staged);
-        let result = match RuntimeContext::call(
+        let result = match HostCtx::enter(
             vm,
             heap,
             state,

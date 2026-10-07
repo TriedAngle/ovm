@@ -1,24 +1,25 @@
 //! ES 20.2: the Function constructor, Function.prototype
 //! toString/call/apply/bind, and the bind-closure prelude.
 
+use vm_core::Coercion;
+use vm_core::HostCtx;
 use vm_core::Lookup;
 use vm_core::Object;
-use vm_core::RuntimeContext;
 use vm_core::materialize::Materialize;
-use vm_core::runtime::Coercion;
 use vm_core::{
-    Args, Context, Convert, DenseString, Errors, Handle, HandleSlice, Tagged, Value, VmError,
+    Args, ContextObject, Convert, DenseString, Errors, Handle, HandleSlice, Heap, Smi, Tagged,
+    Value, VmError,
 };
-use vm_core::{raise_runtime, rt_try, spread_apply_args};
+use vm_core::{raise_runtime, rt_try};
 
 /// Stub: `Function.prototype.toString` returns a stable marker string
 /// (test262 A2.2 compares it against itself, not against real source).
 pub fn function_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     _args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -34,11 +35,11 @@ pub fn function_to_string<'a>(
 /// receiver (args[0], per the receiver-first runtime calling convention)
 /// with `thisArg` as `this`.
 pub fn function_call<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let f = args.get_handle(heap, 0);
@@ -46,7 +47,7 @@ pub fn function_call<'a>(
         return raise_runtime(vm, heap, state, VmError::Type);
     }
     let fwd = nctx.state.stack().slice(args.slice_from(1));
-    match RuntimeContext::call(vm, heap, state, f, fwd, None).map(|v| v.raw()) {
+    match HostCtx::enter(vm, heap, state, f, fwd, None).map(|v| v.raw()) {
         Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
         Err(err) => raise_runtime(vm, heap, state, err),
     }
@@ -56,11 +57,11 @@ pub fn function_call<'a>(
 /// the receiver with `thisArg` as `this` and the array-like spread as
 /// arguments.
 pub fn function_apply<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let f = args.get_handle(heap, 0);
@@ -76,7 +77,7 @@ pub fn function_apply<'a>(
             this_arg.as_tagged(heap),
             array.map(|a| a.as_tagged(heap)),
         ));
-        match RuntimeContext::call(vm, heap, state, f, staged, None).map(|v| v.raw()) {
+        match HostCtx::enter(vm, heap, state, f, staged, None).map(|v| v.raw()) {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => raise_runtime(vm, heap, state, err),
         }
@@ -87,11 +88,11 @@ pub fn function_apply<'a>(
 /// bound function is the JS closure template installed by BIND_PRELUDE,
 /// called with (target, thisArg, prepend-array).
 pub fn function_bind<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let raw_f = {
@@ -147,7 +148,7 @@ pub fn function_bind<'a>(
             this_arg.as_tagged(heap).erase(),
             array.as_tagged(heap).erase(),
         ]);
-        match RuntimeContext::call(vm, heap, state, make_bound, staged, None).map(|v| v.raw()) {
+        match HostCtx::enter(vm, heap, state, make_bound, staged, None).map(|v| v.raw()) {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => return raise_runtime(vm, heap, state, err),
         }
@@ -174,11 +175,11 @@ Function.prototype.__makeBound = function (f, t, p) {
 /// scope (approximated with the caller's context; the direct-eval pipeline
 /// provides the parsing).
 pub fn function_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let argv: Vec<_> = (1..args.len()).map(|i| args.get_handle(heap, i)).collect();
@@ -221,7 +222,7 @@ pub fn function_constructor<'a>(
                 return heap.known().exception.as_tagged(heap).erase();
             }
         };
-        let Some(context) = scope.cast::<Context>(heap, context.as_tagged(heap)) else {
+        let Some(context) = scope.cast::<ContextObject>(heap, context.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let closure = rt_try!(
@@ -230,11 +231,48 @@ pub fn function_constructor<'a>(
             state,
             Materialize::closure_vm(vm, heap, state, &scope, &program, context)
         );
-        match RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
+        match HostCtx::enter(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
             .map(|v| v.raw())
         {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => return raise_runtime(vm, heap, state, err),
         }
     })
+}
+
+/// Spread the `apply` argument window: `[thisArg, elements...]` read
+/// array-like from `array` (holes and out-of-range indices read as
+/// undefined; a missing/nullish array yields just the receiver).
+fn spread_apply_args<'a>(
+    heap: &'a Heap,
+    this_arg: Tagged<'a, Value>,
+    array: Option<Tagged<'a, Value>>,
+) -> Vec<Tagged<'a, Value>> {
+    let mut out = vec![this_arg];
+    let Some(array) = array else {
+        return out;
+    };
+    let undefined = heap.known().undefined.as_tagged(heap).erase();
+    if array == undefined || array == heap.known().null.as_tagged(heap) {
+        return out;
+    }
+    let len = array
+        .as_heap_object()
+        .map(|o| {
+            o.as_ref()
+                .array_length(heap, heap.known().strings.length.as_tagged(heap))
+                .and_then(|v| Smi::decode(v.raw()).map(|s| s.value() as usize))
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    out.reserve(len);
+    for i in 0..len {
+        out.push(
+            array
+                .as_heap_object()
+                .and_then(|o| o.as_ref().element_value(heap, i))
+                .unwrap_or(undefined),
+        );
+    }
+    out
 }

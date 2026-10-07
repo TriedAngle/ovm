@@ -1,9 +1,9 @@
 //! ES 23.1 + 23.1.5: the Array constructor, Array.isArray,
 //! Array.prototype.values/[@@iterator], and the array iterator.
 
-use vm_core::RuntimeContext;
+use vm_core::HostCtx;
 use vm_core::{
-    Args, ContextState, Convert, DenseString, Handle, Heap, Object, Smi, Tagged, VM, Value, VmError,
+    Args, Convert, DenseString, Handle, Heap, Object, Smi, Tagged, ThreadState, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -12,11 +12,11 @@ use vm_core::{raise_runtime, rt_try};
 /// non-integer numbers are a RangeError); otherwise the arguments are the
 /// elements.
 pub fn array_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -53,11 +53,11 @@ pub fn array_constructor<'a>(
 /// `Array.prototype.push` (ES 23.1.3.21): append the arguments in order,
 /// growing the elements store; returns the new length.
 pub fn array_push<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     // The overwhelmingly common shape — `a.push(x)` where `a` has headroom —
@@ -100,7 +100,7 @@ fn array_push_fast<'a>(heap: &Heap, args: Args) -> Option<Tagged<'a, Value>> {
 fn array_push_impl<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
-    state: &'a ContextState,
+    state: &'a ThreadState,
     args: Args,
 ) -> Tagged<'a, Value> {
     let receiver = args.get_handle(heap, 0);
@@ -150,7 +150,7 @@ fn array_push_impl<'a>(
 #[inline(never)]
 fn array_push_grow<'a>(
     heap: &'a mut Heap,
-    state: &'a ContextState,
+    state: &'a ThreadState,
     receiver: &Handle<'_, Value>,
     len: usize,
     arg: &Handle<'_, Value>,
@@ -167,11 +167,11 @@ fn array_push_grow<'a>(
 /// `Array.prototype.pop` (ES 23.1.3.20): remove the last element, shorten
 /// `length`, and punch a hole so the store releases the value.
 pub fn array_pop<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -209,11 +209,11 @@ pub fn array_pop<'a>(
 /// `Array.prototype.values` / `Array.prototype[@@iterator]` (ES 23.1.3.41):
 /// returns a fresh array-iterator over the receiver (CreateArrayIterator).
 pub fn array_values<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let (receiver, is_array) = {
@@ -243,11 +243,11 @@ pub fn array_values<'a>(
 /// `%ArrayIteratorPrototype%.next` (ES 23.1.5.2.1): one step over the
 /// iterated array, producing `{ value, done }`.
 pub fn array_iterator_next<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let receiver = args.get_handle(heap, 0);
@@ -315,11 +315,11 @@ pub fn array_iterator_next<'a>(
 
 /// `%ArrayIteratorPrototype%[@@iterator]`: returns the receiver.
 pub fn array_iterator_symbol_iterator<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm: _,
         heap,
         state: _,
@@ -333,11 +333,11 @@ pub fn array_iterator_symbol_iterator<'a>(
 /// in index order, separated by `separator` (default `","`). Holes,
 /// `undefined`, and `null` render as the empty string.
 pub fn array_join<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let receiver = args.get_handle(heap, 0);
@@ -348,11 +348,11 @@ pub fn array_join<'a>(
 /// `Array.prototype.toString` (ES 23.1.3.37): `join` with the default
 /// separator; any arguments are ignored.
 pub fn array_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let receiver = args.get_handle(heap, 0);
@@ -362,7 +362,7 @@ pub fn array_to_string<'a>(
 fn join_impl<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
-    state: &'a ContextState,
+    state: &'a ThreadState,
     receiver: Handle<'_, Value>,
     separator: Option<Handle<'_, Value>>,
 ) -> Tagged<'a, Value> {
@@ -436,11 +436,11 @@ fn join_impl<'a>(
 
 /// `Array.isArray(arg)` (ES 24.1.2.1).
 pub fn array_is_array<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm: _,
         heap,
         state: _,
@@ -457,11 +457,11 @@ pub fn array_is_array<'a>(
 /// descriptor exists so the generic lookup finds `length`; the fast load
 /// path never reaches this).
 pub fn array_length_get<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm: _,
         heap,
         state: _,
@@ -480,11 +480,11 @@ pub fn array_length_get<'a>(
 /// RangeError — approximated by `OutOfBounds`); shrinking punches holes
 /// in the dropped elements.
 pub fn array_length_set<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -534,7 +534,7 @@ pub fn array_length_set<'a>(
 fn slice_bound(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     arg: Option<Handle<'_, Value>>,
     default: f64,
 ) -> Result<Option<f64>, VmError> {
@@ -559,11 +559,11 @@ fn slice_bound(
 /// is the fast path (no coercion; `slice()` clones the whole backing
 /// store).
 pub fn array_slice<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -640,11 +640,11 @@ pub fn array_slice<'a>(
 /// the default comparator is the elements' `ToString` order. Returns the
 /// receiver.
 pub fn array_sort<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -741,7 +741,7 @@ pub fn array_sort<'a>(
                             x,
                             y,
                         ]);
-                        let v = match RuntimeContext::call(vm, heap, state, *cmp, call_args, None) {
+                        let v = match HostCtx::enter(vm, heap, state, *cmp, call_args, None) {
                             Ok(v) => v,
                             Err(_) => {
                                 threw.set(true);

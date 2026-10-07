@@ -10,9 +10,7 @@ use crate::errors::Errors;
 use crate::heap::{Heap, Register};
 use crate::stack::{FrameMeta, Stack};
 use crate::value::{Tagged, Value};
-use crate::{
-    Args, ContextState, FeedbackVector, FixedArray, RuntimeContext, RuntimeIndex, VM, VmError,
-};
+use crate::{Args, FeedbackVector, FixedArray, HostCtx, NativeIndex, ThreadState, VM, VmError};
 
 /// Loop back-edge ticks between safepoint polls.
 pub const SAFEPOINT_INTERVAL: u32 = 1 << 12;
@@ -20,7 +18,7 @@ pub const SAFEPOINT_INTERVAL: u32 = 1 << 12;
 pub struct Ctx<'a> {
     vm: *const VM,
     heap: *mut Heap,
-    state: *const ContextState,
+    state: *const ThreadState,
     /// Anchor of the frame `execute` entered: a return at this anchor ends
     /// the execution instead of unwinding into a caller.
     base_anchor: usize,
@@ -42,14 +40,14 @@ impl<'a> Ctx<'a> {
     pub unsafe fn new(
         vm: &'a VM,
         heap: &'a mut Heap,
-        state: &'a ContextState,
+        state: &'a ThreadState,
         base_anchor: usize,
         stack_limit: usize,
     ) -> Self {
         Ctx {
             vm: vm as *const VM,
             heap: heap as *mut Heap,
-            state: state as *const ContextState,
+            state: state as *const ThreadState,
             base_anchor,
             safepoints: Cell::new(SAFEPOINT_INTERVAL),
             stack_limit,
@@ -91,7 +89,7 @@ impl<'a> Ctx<'a> {
     }
 
     #[inline(always)]
-    pub fn state(&self) -> &'a ContextState {
+    pub fn state(&self) -> &'a ThreadState {
         unsafe { &*self.state }
     }
 
@@ -237,7 +235,7 @@ impl<'a> Ctx<'a> {
     /// Invoke a runtime callee over a normalized window: one staged
     /// above `top` is rooted by bumping `top` for the call's duration.
     #[inline(always)]
-    pub fn call_runtime(&self, rt: RuntimeIndex, args: Args) -> Tagged<'a, Value> {
+    pub fn call_runtime(&self, rt: NativeIndex, args: Args) -> Tagged<'a, Value> {
         let f = self.vm().runtime(rt);
         let stack = self.stack();
         let saved = stack.top();
@@ -246,7 +244,7 @@ impl<'a> Ctx<'a> {
             stack.set_top(top);
         }
         // Safety: the heap parts carry Ctx's original borrows.
-        let nctx = RuntimeContext::new(self.vm(), unsafe { self.heap_mut() }, self.state());
+        let nctx = HostCtx::new(self.vm(), unsafe { self.heap_mut() }, self.state());
         let v = f(nctx, None, args);
         if bump.is_some() {
             stack.set_top(saved);

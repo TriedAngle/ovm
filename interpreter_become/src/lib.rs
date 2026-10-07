@@ -8,9 +8,9 @@ use bytecode::{OPERAND_SIZES_NARROW, OPERAND_SIZES_WIDE, Opcode};
 use vm_core::ic::{CallHit, CallProbe, ElementHit, Hit, InlineCache, MonoProbe};
 use vm_core::proxy::Proxy;
 use vm_core::{
-    Args, CallTarget, Callee, Coercion, Compare, Context, ContextState, Convert, Ctx, ExecuteFn,
+    Args, CallTarget, Callee, Coercion, Compare, ContextObject, ThreadState, Convert, Ctx, EntryFn,
     FixedArray, FrameMeta, FunctionKind, Handle, HandleSlice, Heap, Interpreter, Object, Recv,
-    Register, RuntimeContext, RuntimeIndex, Smi, Tagged, VM, Value, VmError,
+    Register, HostCtx, NativeIndex, Smi, Tagged, VM, Value, VmError,
 };
 
 pub struct BecomeInterpreter;
@@ -2063,7 +2063,7 @@ extern "rust-preserve-none" fn op_load_context_slot<'a, const STRIDE: usize>(
     if depth == 0 {
         let heap = ctx.heap();
         let context_word = ctx.stack().frame_header(base).context_slot().get(heap);
-        let context = unsafe { context_word.cast::<Context>() };
+        let context = unsafe { context_word.cast::<ContextObject>() };
         let slots = context.as_ref().slots.get(heap);
         let slots = unsafe { slots.cast::<FixedArray>() };
         let v = slots.as_ref().element_slot(slot).get(heap);
@@ -2071,7 +2071,7 @@ extern "rust-preserve-none" fn op_load_context_slot<'a, const STRIDE: usize>(
     }
     let v = {
         let heap = ctx.heap();
-        let Some(mut context) = ctx.stack().frame_header(base).context_slot().get(heap).get_as::<Context>(heap) else {
+        let Some(mut context) = ctx.stack().frame_header(base).context_slot().get(heap).get_as::<ContextObject>(heap) else {
             bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
         };
         for _ in 0..depth {
@@ -2105,7 +2105,7 @@ extern "rust-preserve-none" fn op_store_context_slot<'a, const STRIDE: usize>(
     let depth = ops.unsigned::<1>();
     let base = ctx.frame_base();
     let heap = ctx.heap();
-    let Some(mut context) = ctx.stack().frame_header(base).context_slot().get(heap).get_as::<Context>(heap) else {
+    let Some(mut context) = ctx.stack().frame_header(base).context_slot().get(heap).get_as::<ContextObject>(heap) else {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     };
     for _ in 0..depth {
@@ -2139,7 +2139,7 @@ extern "rust-preserve-none" fn op_push_context<'a, const STRIDE: usize>(
     let base = ctx.frame_base();
     let old = ctx.stack().frame_header(base).context_slot().get(ctx.heap());
     regs.write(r, old);
-    if acc.get_as::<Context>(ctx.heap()).is_none() {
+    if acc.get_as::<ContextObject>(ctx.heap()).is_none() {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     }
     ctx.stack().frame_header(base).context_slot().store(acc);
@@ -2160,7 +2160,7 @@ extern "rust-preserve-none" fn op_pop_context<'a, const STRIDE: usize>(
     let r = ops.signed::<0>();
     let base = ctx.frame_base();
     let context = regs.read(r, ctx);
-    if context.get_as::<Context>(ctx.heap()).is_none() {
+    if context.get_as::<ContextObject>(ctx.heap()).is_none() {
         bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type);
     }
     ctx.stack().frame_header(base).context_slot().store(context);
@@ -2654,9 +2654,9 @@ extern "rust-preserve-none" fn op_call_runtime<'a, const STRIDE: usize>(
     let rt = ops.unsigned::<0>();
     let base = ops.signed::<1>();
     let count = ops.unsigned::<2>();
-    let f = ctx.vm().runtime(RuntimeIndex(rt));
+    let f = ctx.vm().runtime(NativeIndex(rt));
     let args = ctx.stack().window(ctx.frame_base(), base, count);
-    let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
+    let nctx = HostCtx::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
     let v = f(nctx, None, args);
     become resume(
         unsafe { ctx.code_ptr().add(pc) },
@@ -3080,7 +3080,7 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
         Some(CallTarget::Proxy(_)) => {
             become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
         }
-        Some(CallTarget::Runtime(rt)) => {
+        Some(CallTarget::Native(rt)) => {
             let v = ctx.call_runtime(rt, ctx.stack().window(ctx.frame_base(), base_r, count));
             become resume(
                 unsafe { ctx.code_ptr().add(pc) },
@@ -3171,7 +3171,7 @@ extern "rust-preserve-none" fn op_construct<'a, const STRIDE: usize>(
                 float,
             )
         }
-        ConstructStart::Runtime(rt) => {
+        ConstructStart::Native(rt) => {
             let v = dispatch_runtime_construct(ctx, rt, callee, base_r, count);
             become resume(
                 unsafe { ctx.code_ptr().add(pc) },
@@ -3218,8 +3218,8 @@ enum ConstructStart {
     Frame,
     /// receiver synthesis threw; the pending exception is set
     Threw(()),
-    /// a runtime constructor: call it directly with `new_target` set
-    Runtime(RuntimeIndex),
+    /// a native constructor: call it directly with `new_target` set
+    Native(NativeIndex),
     /// not an ordinary function constructor: fall back to `slow_construct`
     Slow,
 }
@@ -3246,7 +3246,7 @@ fn construct_start<'a>(
         return Ok(ConstructStart::Slow);
     }
     let kind = match Object::call_target(ctx.heap(), callee_word) {
-        Some(CallTarget::Runtime(rt)) => return Ok(ConstructStart::Runtime(rt)),
+        Some(CallTarget::Native(rt)) => return Ok(ConstructStart::Native(rt)),
         Some(CallTarget::Bytecode { kind, .. }) => kind,
         _ => return Ok(ConstructStart::Slow),
     };
@@ -3474,7 +3474,7 @@ enum MethodCall<'a> {
 #[inline(always)]
 fn dispatch_runtime_scattered<'a>(
     ctx: &Ctx<'a>,
-    rt: RuntimeIndex,
+    rt: NativeIndex,
     recv: Recv,
     args: [i32; 2],
     argc: usize,
@@ -3496,7 +3496,7 @@ fn dispatch_runtime_scattered<'a>(
 #[inline(always)]
 fn dispatch_runtime_construct<'a>(
     ctx: &Ctx<'a>,
-    rt: RuntimeIndex,
+    rt: NativeIndex,
     callee_reg: i32,
     base: i32,
     count: usize,
@@ -3518,7 +3518,7 @@ fn dispatch_runtime_construct<'a>(
     }
     // new.target for the Construct opcode is the callee itself
     let new_target = Some(stack.reg_handle(ctx.frame_base(), callee_reg));
-    let nctx = RuntimeContext::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
+    let nctx = HostCtx::new(ctx.vm(), unsafe { ctx.heap_mut() }, ctx.state());
     let v = f(nctx, new_target, args);
     if bump.is_some() {
         stack.set_top(saved);
@@ -3610,7 +3610,7 @@ fn call_method_start<'a>(
                 argc,
             )
         }
-        CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
+        CallProbe::Native(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
             ctx,
             rt,
             Recv::Reg(recv),
@@ -3657,7 +3657,7 @@ fn call_function_start<'a>(
                 argc,
             )
         }
-        CallProbe::Runtime(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
+        CallProbe::Native(rt) => Ok(MethodCall::Value(dispatch_runtime_scattered(
             ctx,
             rt,
             Recv::Undefined,
@@ -3703,7 +3703,7 @@ fn call_start<'a>(
                 ctx.stack().window(ctx.frame_base(), base, count),
             )
         }
-        CallProbe::Runtime(rt) => Ok(MethodCall::Value(
+        CallProbe::Native(rt) => Ok(MethodCall::Value(
             ctx.call_runtime(rt, ctx.stack().window(ctx.frame_base(), base, count)),
         )),
         CallProbe::Miss => slow_call_miss(ctx, pc, size, callee_word, base, count, fb),
@@ -3927,7 +3927,7 @@ static TABLE_WIDE: HandlerTable = HandlerTable(table_wide());
 fn enter<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
-    state: &'a ContextState,
+    state: &'a ThreadState,
     callable: Handle<'_, Object>,
     args: HandleSlice<'_>,
     new_target: Option<Handle<'a, Value>>,
@@ -3958,9 +3958,9 @@ fn enter<'a>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
-        Some(CallTarget::Runtime(rt)) => {
+        Some(CallTarget::Native(rt)) => {
             let f = vm.runtime(rt);
-            let nctx = RuntimeContext::new(vm, heap, state);
+            let nctx = HostCtx::new(vm, heap, state);
             Ok(f(nctx, new_target, args.as_args()))
         }
         Some(CallTarget::Bytecode {
@@ -4016,7 +4016,7 @@ fn enter<'a>(
 pub fn execute<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     callable: Handle<'_, Object>,
     args: HandleSlice<'_>,
     new_target: Option<Handle<'_, Value>>,
@@ -4042,5 +4042,5 @@ pub fn execute<'a>(
 }
 
 impl Interpreter for BecomeInterpreter {
-    const EXECUTE: ExecuteFn = execute;
+    const EXECUTE: EntryFn = execute;
 }

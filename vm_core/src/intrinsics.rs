@@ -1,12 +1,13 @@
-//! The CallRuntime runtimes: one implementation per `bytecode::RuntimeFn`,
-//! plus the `runtime_fn` table the runtime registry seeds its fixed
+//! The CallRuntime runtimes: one implementation per `bytecode::BuiltinFn`,
+//! plus the `native_fn` table the runtime registry seeds its fixed
 //! 0..COUNT range with. These are compiled-language semantics (each cites
 //! its ES section), not JS-visible library functions.
 
 use crate::{
-    AccessorPair, Args, Context, Convert, DenseString, FixedArray, Handle, HandleSlice, Heap, Key,
-    LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor, SlotName, Smi, StoreOutcome,
-    StoreSemantics, StringData, Symbol, Tagged, Transition, Value, VmError, runtime::Coercion,
+    AccessorPair, Args, Coercion, ContextObject, Convert, DenseString, FixedArray, Handle,
+    HandleSlice, Heap, Key, LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor,
+    SlotName, Smi, StoreOutcome, StoreSemantics, StringData, Symbol, Tagged, Transition, Value,
+    VmError,
 };
 
 use crate::Float;
@@ -16,57 +17,57 @@ use crate::PartialDescriptor;
 use crate::proxy::Flow;
 use crate::proxy::Proxy;
 use crate::tools::KetteTools;
-use crate::{ContextState, VM};
-use crate::{RuntimeCall, RuntimeContext, raise_runtime, rt_try};
+use crate::{HostCtx, NativeFn, raise_runtime, rt_try};
+use crate::{ThreadState, VM};
 
 /// The fixed runtime-helper table: one implementation per
-/// `bytecode::RuntimeFn`. The exhaustive match is the compile-time link
+/// `bytecode::BuiltinFn`. The exhaustive match is the compile-time link
 /// between the ABI ids and their implementations — adding a variant
-/// without an entry here is a compile error, and `RuntimeRegistry::new`
-/// registers them in `RuntimeFn::ALL` order so registry indices equal
+/// without an entry here is a compile error, and `NativeRegistry::new`
+/// registers them in `BuiltinFn::ALL` order so registry indices equal
 /// discriminants.
-pub fn runtime_fn(id: bytecode::RuntimeFn) -> RuntimeCall {
+pub fn native_fn(id: bytecode::BuiltinFn) -> NativeFn {
     match id {
-        bytecode::RuntimeFn::GetIterator => get_iterator,
-        bytecode::RuntimeFn::IteratorNext => iterator_next,
-        bytecode::RuntimeFn::IteratorDone => iterator_done,
-        bytecode::RuntimeFn::IteratorValue => iterator_value,
-        bytecode::RuntimeFn::HasProperty => has_property,
-        bytecode::RuntimeFn::CopyDataProperties => copy_data_properties,
-        bytecode::RuntimeFn::CreatePrivateName => create_private_name,
-        bytecode::RuntimeFn::PrivateGet => private_get,
-        bytecode::RuntimeFn::PrivateSet => private_set,
-        bytecode::RuntimeFn::PrivateIn => private_in,
-        bytecode::RuntimeFn::SetClassFields => set_class_fields,
-        bytecode::RuntimeFn::InitInstanceFields => init_instance_fields,
-        bytecode::RuntimeFn::RequireObjectCoercible => require_object_coercible,
-        bytecode::RuntimeFn::DeletePropertySloppy => delete_property_sloppy,
-        bytecode::RuntimeFn::DeletePropertyStrict => delete_property_strict,
-        bytecode::RuntimeFn::DeleteIdentifierSloppy => delete_identifier_sloppy,
-        bytecode::RuntimeFn::DeleteSuperProperty => delete_super_property,
-        bytecode::RuntimeFn::ForInEnumerate => for_in_enumerate,
-        bytecode::RuntimeFn::ForInNext => for_in_next,
-        bytecode::RuntimeFn::SetFunctionName => set_function_name,
-        bytecode::RuntimeFn::InstallAccessor => install_accessor,
-        bytecode::RuntimeFn::DefineOwnProperty => define_own_property,
-        bytecode::RuntimeFn::SetPrototype => set_prototype,
-        bytecode::RuntimeFn::ThrowIfNotConstructorOrNull => throw_if_not_constructor_or_null,
-        bytecode::RuntimeFn::ThrowIfNotObjectOrNull => throw_if_not_object_or_null,
-        bytecode::RuntimeFn::ThrowSuperNotCalledIfHole => throw_super_not_called_if_hole,
-        bytecode::RuntimeFn::ThrowSuperAlreadyCalledIfNotHole => {
+        bytecode::BuiltinFn::GetIterator => get_iterator,
+        bytecode::BuiltinFn::IteratorNext => iterator_next,
+        bytecode::BuiltinFn::IteratorDone => iterator_done,
+        bytecode::BuiltinFn::IteratorValue => iterator_value,
+        bytecode::BuiltinFn::HasProperty => has_property,
+        bytecode::BuiltinFn::CopyDataProperties => copy_data_properties,
+        bytecode::BuiltinFn::CreatePrivateName => create_private_name,
+        bytecode::BuiltinFn::PrivateGet => private_get,
+        bytecode::BuiltinFn::PrivateSet => private_set,
+        bytecode::BuiltinFn::PrivateIn => private_in,
+        bytecode::BuiltinFn::SetClassFields => set_class_fields,
+        bytecode::BuiltinFn::InitInstanceFields => init_instance_fields,
+        bytecode::BuiltinFn::RequireObjectCoercible => require_object_coercible,
+        bytecode::BuiltinFn::DeletePropertySloppy => delete_property_sloppy,
+        bytecode::BuiltinFn::DeletePropertyStrict => delete_property_strict,
+        bytecode::BuiltinFn::DeleteIdentifierSloppy => delete_identifier_sloppy,
+        bytecode::BuiltinFn::DeleteSuperProperty => delete_super_property,
+        bytecode::BuiltinFn::ForInEnumerate => for_in_enumerate,
+        bytecode::BuiltinFn::ForInNext => for_in_next,
+        bytecode::BuiltinFn::SetFunctionName => set_function_name,
+        bytecode::BuiltinFn::InstallAccessor => install_accessor,
+        bytecode::BuiltinFn::DefineOwnProperty => define_own_property,
+        bytecode::BuiltinFn::SetPrototype => set_prototype,
+        bytecode::BuiltinFn::ThrowIfNotConstructorOrNull => throw_if_not_constructor_or_null,
+        bytecode::BuiltinFn::ThrowIfNotObjectOrNull => throw_if_not_object_or_null,
+        bytecode::BuiltinFn::ThrowSuperNotCalledIfHole => throw_super_not_called_if_hole,
+        bytecode::BuiltinFn::ThrowSuperAlreadyCalledIfNotHole => {
             throw_super_already_called_if_not_hole
         }
-        bytecode::RuntimeFn::ConstructSuper => construct_super,
-        bytecode::RuntimeFn::ConstructSuperAllArgs => construct_super_all_args,
-        bytecode::RuntimeFn::ConstructSuperVia => construct_super_via,
-        bytecode::RuntimeFn::LoadDynamicName => load_dynamic_name,
-        bytecode::RuntimeFn::StoreDynamicName => store_dynamic_name,
-        bytecode::RuntimeFn::CreateRestParameter => create_rest_parameter,
-        bytecode::RuntimeFn::SuperGetProperty => super_get_property,
-        bytecode::RuntimeFn::SuperSetProperty => super_set_property,
-        bytecode::RuntimeFn::ForceMinorGc => KetteTools::force_minor_gc,
-        bytecode::RuntimeFn::ForceMajorGc => KetteTools::force_major_gc,
-        bytecode::RuntimeFn::ShutdownVm => KetteTools::shutdown,
+        bytecode::BuiltinFn::ConstructSuper => construct_super,
+        bytecode::BuiltinFn::ConstructSuperAllArgs => construct_super_all_args,
+        bytecode::BuiltinFn::ConstructSuperVia => construct_super_via,
+        bytecode::BuiltinFn::LoadDynamicName => load_dynamic_name,
+        bytecode::BuiltinFn::StoreDynamicName => store_dynamic_name,
+        bytecode::BuiltinFn::CreateRestParameter => create_rest_parameter,
+        bytecode::BuiltinFn::SuperGetProperty => super_get_property,
+        bytecode::BuiltinFn::SuperSetProperty => super_set_property,
+        bytecode::BuiltinFn::ForceMinorGc => KetteTools::force_minor_gc,
+        bytecode::BuiltinFn::ForceMajorGc => KetteTools::force_major_gc,
+        bytecode::BuiltinFn::ShutdownVm => KetteTools::shutdown,
     }
 }
 
@@ -75,13 +76,13 @@ pub fn runtime_fn(id: bytecode::RuntimeFn) -> RuntimeCall {
 /// RequireObjectCoercible (ES 7.2.2): (value) -> value, TypeError on
 /// null/undefined (object destructuring sources).
 fn require_object_coercible<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     // internal-runtime convention: the register list IS the argument list
     // (no receiver slot)
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
@@ -99,7 +100,7 @@ fn require_object_coercible<'a>(
 
 /// `delete obj.key` in sloppy code: (obj, key) -> bool.
 fn delete_property_sloppy<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -109,7 +110,7 @@ fn delete_property_sloppy<'a>(
 /// `delete obj.key` in strict code: (obj, key) -> bool, TypeError when
 /// the delete fails (ES 13.5.1.2 step 4.h).
 fn delete_property_strict<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -117,12 +118,12 @@ fn delete_property_strict<'a>(
 }
 
 fn delete_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
     strict: bool,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     // the reference's key is coerced before the base is touched (ES
@@ -226,11 +227,11 @@ fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Val
 /// bindings resolve statically and compile to `false`; only global-object
 /// properties reach here, and sloppy references never throw on failure.
 fn delete_identifier_sloppy<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let ok = rt_try!(
@@ -251,11 +252,11 @@ fn delete_identifier_sloppy<'a>(
 /// the uninitialized-`this` check and the key expression); the key is
 /// never coerced — delete-super fails before any ToPropertyKey.
 fn delete_super_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     _args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     raise_runtime(vm, heap, state, VmError::Reference)
@@ -295,11 +296,11 @@ fn stage_handles<'s>(
 /// chain walk. Other primitives' prototypes are not walked yet (their
 /// own properties are none, so they enumerate empty).
 fn for_in_enumerate<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let subject = args.get_handle(heap, 0);
@@ -477,11 +478,11 @@ fn for_in_level_keys<'s>(
 /// survivors are yielded at most once. When a level's snapshot runs
 /// dry, the walk advances to the live prototype and snapshots it.
 fn for_in_next<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let enumerator = args.get_handle(heap, 0);
@@ -721,11 +722,11 @@ fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value
 
 /// GetIterator (ES 8.5.4): (obj) -> iterator.
 fn get_iterator<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -751,7 +752,7 @@ fn get_iterator<'a>(
             return raise_runtime(vm, heap, state, VmError::Type); // "obj is not iterable"
         }
         let call_args = stage_handles(heap, &scope, &[obj]);
-        match RuntimeContext::call(vm, heap, state, method, call_args, None).map(|v| v.raw()) {
+        match HostCtx::enter(vm, heap, state, method, call_args, None).map(|v| v.raw()) {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => return raise_runtime(vm, heap, state, err),
         }
@@ -760,11 +761,11 @@ fn get_iterator<'a>(
 
 /// IteratorNext (ES 8.5.6): (iterator) -> result object.
 fn iterator_next<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -784,7 +785,7 @@ fn iterator_next<'a>(
         };
         let call_args = stage_handles(heap, &scope, &[iter]);
         let result = scope.handle(
-            match RuntimeContext::call(vm, heap, state, next, call_args, None).map(|v| v.raw()) {
+            match HostCtx::enter(vm, heap, state, next, call_args, None).map(|v| v.raw()) {
                 Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
                 Err(err) => return raise_runtime(vm, heap, state, err),
             },
@@ -804,11 +805,11 @@ fn iterator_next<'a>(
 
 /// IteratorComplete (ES 8.5.7): (result) -> bool.
 fn iterator_done<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -830,11 +831,11 @@ fn iterator_done<'a>(
 
 /// IteratorValue (ES 8.5.8): (result) -> value.
 fn iterator_value<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -856,11 +857,11 @@ fn iterator_value<'a>(
 /// The `in` operator (ES 14.11.2): (key, obj) -> bool. Proxy receivers
 /// run their `has` trap (ES 20.2.5.9).
 fn has_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let key = args.get_handle(heap, 0);
@@ -899,11 +900,11 @@ fn has_property<'a>(
 /// CopyDataProperties (ES 8.5.1) with an exclusion list (object rest):
 /// (excluded..., target, source); `excluded` has count−2 entries.
 fn copy_data_properties<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let n = args.len();
@@ -1013,11 +1014,11 @@ fn copy_data_properties<'a>(
 
 /// A fresh private name: (description) -> Symbol.
 fn create_private_name<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm: _, heap, state, ..
     } = nctx;
     let text = args
@@ -1033,11 +1034,11 @@ fn create_private_name<'a>(
 
 /// PrivateGet (ES 7.3.30): (obj, key) -> value, TypeError when absent.
 fn private_get<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let obj = args.get(heap, 0);
@@ -1050,11 +1051,11 @@ fn private_get<'a>(
 
 /// PrivateSet (ES 7.3.31): (obj, key, value), TypeError when absent.
 fn private_set<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let obj = args.get(heap, 0);
@@ -1083,11 +1084,11 @@ fn private_set<'a>(
 
 /// `#x in obj`: (key, obj) -> bool (own private presence only).
 fn private_in<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm: _,
         heap,
         state: _,
@@ -1102,11 +1103,11 @@ fn private_in<'a>(
 /// Attach the instance-field array to the class constructor:
 /// (ctor, fields).
 fn set_class_fields<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let ctor = args.get_handle(heap, 0);
@@ -1140,11 +1141,11 @@ fn set_class_fields<'a>(
 /// Runs each field initializer with the instance as receiver and defines
 /// the result onto it ({w+, e+, c+}).
 fn init_instance_fields<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let ctor = args.get_handle(heap, 0);
@@ -1201,7 +1202,7 @@ fn init_instance_fields<'a>(
                 vm,
                 heap,
                 state,
-                RuntimeContext::call(vm, heap, state, scope.handle(init), call_args, None,)
+                HostCtx::enter(vm, heap, state, scope.handle(init), call_args, None,)
             ));
             if value
                 .as_tagged(heap)
@@ -1243,7 +1244,7 @@ fn init_instance_fields<'a>(
 /// The current (calling) frame's context: `CallRuntime` runs in place, so
 /// the interpreter's cache still holds the frame executing the call.
 fn frame_context_value<'a>(
-    state: &ContextState,
+    state: &ThreadState,
     heap: &'a Heap,
 ) -> Result<Tagged<'a, Value>, VmError> {
     if !state.is_frame_active() {
@@ -1256,7 +1257,7 @@ fn frame_context_value<'a>(
 /// the slot cell, or Reference when no context in the chain has the name.
 fn dynamic_slot<'a>(
     heap: &'a Heap,
-    context: &mut Tagged<'a, Context>,
+    context: &mut Tagged<'a, ContextObject>,
     name: Tagged<'a, Value>,
 ) -> Result<&'a GcSlot, VmError> {
     // both sides are interned (constant pool / ScopeInfo names), so
@@ -1283,12 +1284,12 @@ fn dynamic_slot<'a>(
 /// `scope` so callers may allocate before inspecting it.
 fn dynamic_lookup_frame<'s>(
     heap: &Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &'s HandleScope<'_>,
     name: Handle<'_, Value>,
 ) -> Result<Option<Handle<'s, Value>>, VmError> {
     let context = frame_context_value(state, heap)?;
-    let mut context = context.get_as::<Context>(heap).ok_or(VmError::Type)?;
+    let mut context = context.get_as::<ContextObject>(heap).ok_or(VmError::Type)?;
     match dynamic_slot(heap, &mut context, name.as_tagged(heap)) {
         Ok(slot) => Ok(Some(scope.handle(slot.get(heap)))),
         Err(VmError::Reference) => Ok(None),
@@ -1301,7 +1302,7 @@ fn dynamic_lookup_frame<'s>(
 /// be a constructor.
 fn frame_super_parts<'a>(
     heap: &'a Heap,
-    state: &ContextState,
+    state: &ThreadState,
 ) -> Result<(Tagged<'a, Value>, Tagged<'a, Value>), VmError> {
     if !state.is_frame_active() {
         return Err(VmError::Type);
@@ -1325,7 +1326,7 @@ fn frame_super_parts<'a>(
 fn apply_store_outcome(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     receiver: Handle<'_, Value>,
     outcome: StoreOutcome<'_>,
     value: Handle<'_, Value>,
@@ -1348,7 +1349,7 @@ fn apply_store_outcome(
                 let val = value.as_tagged(heap);
                 scope.stage(&[recv, val])
             };
-            let result = RuntimeContext::call(vm, heap, state, setter, call_args, None)?;
+            let result = HostCtx::enter(vm, heap, state, setter, call_args, None)?;
             let word = result.raw();
             Ok(word == heap.known().exception.as_tagged(heap).erase().raw())
         }),
@@ -1359,11 +1360,11 @@ fn apply_store_outcome(
 /// A full [[Get]] that treats non-callable getters (an absent half of an
 /// accessor pair) as undefined instead of throwing.
 fn get_property_lenient<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     receiver: Handle<'_, Value>,
     name: Handle<'_, Value>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -1396,7 +1397,7 @@ fn get_property_lenient<'a>(
             let recv = receiver.as_tagged(heap);
             scope.stage(&[recv])
         };
-        match RuntimeContext::call(vm, heap, state, getter, call_args, None).map(|v| v.raw()) {
+        match HostCtx::enter(vm, heap, state, getter, call_args, None).map(|v| v.raw()) {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => return raise_runtime(vm, heap, state, err),
         }
@@ -1412,11 +1413,11 @@ fn get_property_lenient<'a>(
 /// explicitly defined `name` wins (ES 15.7.14: SetFunctionName happens
 /// before element installation).
 fn set_function_name<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let fn_value = args.get_handle(heap, 0);
@@ -1505,11 +1506,11 @@ fn set_function_name<'a>(
 /// the same key; flags bit 0 marks the getter half, PropertyFlags bits
 /// carry enumerability.
 fn install_accessor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let target = args.get_handle(heap, 0);
@@ -1595,11 +1596,11 @@ fn install_accessor<'a>(
 /// strict-mode code: a rejected define throws a TypeError. flags are
 /// PropertyFlags bits (the Accessor bit: the value is an AccessorPair).
 fn define_own_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let receiver = args.get_handle(heap, 0);
@@ -1722,11 +1723,11 @@ fn define_own_property<'a>(
 
 /// [[SetPrototypeOf]] (class prototype wiring): (obj, proto) -> obj.
 fn set_prototype<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -1748,11 +1749,11 @@ fn set_prototype<'a>(
 /// Class extends validation (ES 15.7.14 step 15.e): (value) -> value,
 /// TypeError unless the superclass is null or a constructor.
 fn throw_if_not_constructor_or_null<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let v = args.get(heap, 0);
@@ -1773,11 +1774,11 @@ fn throw_if_not_constructor_or_null<'a>(
 /// superCtor.prototype validation: (value) -> value, TypeError unless the
 /// value is an Object or null.
 fn throw_if_not_object_or_null<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let v = args.get(heap, 0);
@@ -1795,11 +1796,11 @@ fn throw_if_not_object_or_null<'a>(
 /// [[ThisBindingStatus]] guard of derived constructors (ES 10.2.2):
 /// (value) -> value, ReferenceError when `this` is still the hole.
 fn throw_super_not_called_if_hole<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let v = args.get(heap, 0);
@@ -1815,11 +1816,11 @@ fn throw_super_not_called_if_hole<'a>(
 /// InitializeThisBinding guard (ES 10.2.2): (value) -> value,
 /// ReferenceError unless `this` is still the hole (super() runs once).
 fn throw_super_already_called_if_not_hole<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let v = args.get(heap, 0);
@@ -1838,12 +1839,12 @@ fn throw_super_already_called_if_not_hole<'a>(
 /// giving derived parents the hole receiver. The instance lands in the
 /// return value; the exception sentinel escapes when user code threw.
 fn construct_super_construct<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     callee: Handle<'_, Value>,
     new_target: Handle<'_, Value>,
     args: &[Handle<'_, Value>],
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -1889,7 +1890,7 @@ fn construct_super_construct<'a>(
             vm,
             heap,
             state,
-            RuntimeContext::call(
+            HostCtx::enter(
                 vm,
                 heap,
                 state,
@@ -1921,11 +1922,11 @@ fn construct_super_construct<'a>(
 /// super(...): (args...) -> instance. Resolves the super constructor and
 /// new.target from the executing frame.
 fn construct_super<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -1935,7 +1936,7 @@ fn construct_super<'a>(
         let new_target = scope.handle(new_target);
         let arg_words: Vec<Handle<'_, Value>> = args.iter(heap).map(|t| scope.handle(t)).collect();
         construct_super_construct(
-            RuntimeContext::new(vm, heap, state),
+            HostCtx::new(vm, heap, state),
             callee,
             new_target,
             &arg_words,
@@ -1946,11 +1947,11 @@ fn construct_super<'a>(
 /// super() forwarding the frame's full argument list (synthesized default
 /// derived constructors, ES 15.7.13): () -> instance.
 fn construct_super_all_args<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     _args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -1968,7 +1969,7 @@ fn construct_super_all_args<'a>(
             .map(|j| scope.handle(state.stack.reg(heap, base, j as i32)))
             .collect();
         construct_super_construct(
-            RuntimeContext::new(vm, heap, state),
+            HostCtx::new(vm, heap, state),
             callee,
             new_target,
             &arg_words,
@@ -1980,11 +1981,11 @@ fn construct_super_all_args<'a>(
 /// The constructor closure and its new.target ride the tail of the
 /// argument window (threaded through .this_function).
 fn construct_super_via<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let n = args.len();
@@ -2017,7 +2018,7 @@ fn construct_super_via<'a>(
         let arg_words: Vec<Handle<'_, Value>> =
             (0..n - 2).map(|i| args.get_handle(heap, i)).collect();
         construct_super_construct(
-            RuntimeContext::new(vm, heap, state),
+            HostCtx::new(vm, heap, state),
             callee,
             new_target,
             &arg_words,
@@ -2030,11 +2031,11 @@ fn construct_super_via<'a>(
 /// Direct-eval name load: (name) -> value. Walks the frame context chain
 /// by name; unresolved names fall back to the global object.
 fn load_dynamic_name<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let name = args.get_handle(heap, 0);
@@ -2051,7 +2052,7 @@ fn load_dynamic_name<'a>(
             None => {
                 // unresolved: fall back to a global object property
                 let global = heap.known().global_object.erase();
-                get_property_lenient(RuntimeContext::new(vm, heap, state), global, name)
+                get_property_lenient(HostCtx::new(vm, heap, state), global, name)
             }
         }
     })
@@ -2060,11 +2061,11 @@ fn load_dynamic_name<'a>(
 /// Direct-eval name store: (value, name) -> value. Writes through to the
 /// context-chain slot; unresolved names store on the global object.
 fn store_dynamic_name<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let value = args.get_handle(heap, 0);
@@ -2084,7 +2085,7 @@ fn store_dynamic_name<'a>(
                     vm,
                     heap,
                     state,
-                    context.get_as::<Context>(heap).ok_or(VmError::Type)
+                    context.get_as::<ContextObject>(heap).ok_or(VmError::Type)
                 );
                 let target = rt_try!(
                     vm,
@@ -2128,11 +2129,11 @@ fn is_the_hole(heap: &Heap, v: Tagged<'_, Value>) -> bool {
 /// A fresh array of the frame's arguments from formal index `first`:
 /// (first) -> array.
 fn create_rest_parameter<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let first = args.get(heap, 0).to_i64().map(|v| v as usize).unwrap_or(0);
@@ -2169,11 +2170,11 @@ fn create_rest_parameter<'a>(
 /// after the parent link is resolved (user toString must not change the
 /// chain searched).
 fn super_get_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let home = args.get_handle(heap, 0);
@@ -2236,7 +2237,7 @@ fn super_get_property<'a>(
             let r = recv.as_tagged(heap);
             scope.stage(&[r])
         };
-        match RuntimeContext::call(vm, heap, state, getter, call_args, None).map(|v| v.raw()) {
+        match HostCtx::enter(vm, heap, state, getter, call_args, None).map(|v| v.raw()) {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => return raise_runtime(vm, heap, state, err),
         }
@@ -2248,11 +2249,11 @@ fn super_get_property<'a>(
 /// semantics flag is set; the parent link is resolved before any user key
 /// coercion runs.
 fn super_set_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let home = args.get_handle(heap, 0);

@@ -1,24 +1,24 @@
 //! ES 20.1: the Object constructor, statics, and prototype methods.
+use vm_core::Coercion;
+use vm_core::HostCtx;
 use vm_core::Key;
 use vm_core::Lookup;
-use vm_core::RuntimeContext;
 use vm_core::proxy::Flow;
 use vm_core::proxy::Proxy;
-use vm_core::runtime::Coercion;
 
 use vm_core::{
-    Args, ContextState, Convert, Handle, HandleScope, HandleSlice, Heap, Object,
-    PropertyDescriptor, SlotName, Smi, Tagged, VM, Value, VmError,
+    Args, Convert, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor, SlotName,
+    Smi, Tagged, ThreadState, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
 /// Stub: `Object.prototype.toString` returns "[object Object]".
 pub fn object_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     _args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -31,12 +31,12 @@ pub fn object_to_string<'a>(
 /// implemented yet); `new Object()`: the interpreter prepends the fresh
 /// receiver, so [[Construct]] just returns it.
 pub fn object_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get_handle(heap, 1);
@@ -62,11 +62,11 @@ pub fn object_constructor<'a>(
 /// arguments are a TypeError until ToObject boxing exists (ES5 behavior;
 /// ES2015+ boxes them).
 pub fn object_get_prototype_of<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 1);
@@ -82,11 +82,11 @@ pub fn object_get_prototype_of<'a>(
 /// The `Properties` argument is accepted only as `undefined` (property
 /// descriptors are not implemented for it yet).
 pub fn object_create<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -157,11 +157,11 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
 /// `Object.prototype.hasOwnProperty(key)` (ES 20.4.3.2, own properties
 /// only).
 pub fn object_has_own_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -202,11 +202,11 @@ pub fn object_has_own_property<'a>(
 
 /// `Object.prototype.propertyIsEnumerable(key)` (ES 20.4.3.5).
 pub fn object_property_is_enumerable<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -256,11 +256,11 @@ pub fn object_property_is_enumerable<'a>(
 
 /// `Object.getOwnPropertyNames(O)` (ES 20.1.2.7).
 pub fn object_get_own_property_names<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm: _, heap, state, ..
     } = nctx;
     let target = args.get(heap, 1);
@@ -283,7 +283,7 @@ pub fn object_get_own_property_names<'a>(
 pub fn plain_object<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
-    state: &'a ContextState,
+    state: &'a ThreadState,
     fields: &[(&'static str, Handle<'_, Value>)],
 ) -> Result<Tagged<'a, Value>, VmError> {
     state.handle_scope(|scope| {
@@ -304,11 +304,11 @@ pub fn plain_object<'a>(
 /// raw descriptor reader (`Lookup::ordinary_own_descriptor`) converted
 /// to a descriptor object via FromPropertyDescriptor semantics.
 pub fn object_get_own_property_descriptor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -390,11 +390,11 @@ pub fn object_get_own_property_descriptor<'a>(
 /// ToPropertyDescriptor + [[DefineOwnProperty]] (through the
 /// `defineProperty` trap for proxy receivers, ES 20.2.5.6).
 pub fn object_define_property<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -442,11 +442,11 @@ pub fn object_define_property<'a>(
 }
 
 pub fn object_set_prototype_of<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -491,11 +491,11 @@ pub fn object_set_prototype_of<'a>(
 /// `Object.preventExtensions(O)` (ES 20.1.2.16): through the
 /// `preventExtensions` trap for proxies (ES 20.2.5.3).
 pub fn object_prevent_extensions<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -541,11 +541,11 @@ pub fn object_prevent_extensions<'a>(
 /// `Object.isExtensible(O)` (ES 20.1.2.14): primitives are `false`;
 /// proxies run the `isExtensible` trap with its must-match invariant.
 pub fn object_is_extensible<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -640,11 +640,11 @@ pub fn set_integrity_flags(
 
 /// `Object.seal(O)` (ES 20.1.2.17).
 pub fn object_seal<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let target = args.get_handle(heap, 1);
@@ -699,11 +699,11 @@ pub fn object_seal<'a>(
 
 /// `Object.freeze(O)` (ES 20.1.2.9).
 pub fn object_freeze<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let target = args.get_handle(heap, 1);

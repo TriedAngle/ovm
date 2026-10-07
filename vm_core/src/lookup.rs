@@ -1,9 +1,8 @@
 use crate::proxy::Proxy;
 use crate::{
-    AccessorPair, Coercion, ContextState, Convert, DenseString, FixedArray, Float, GcSlot, Handle,
-    HandleScope, Heap, HeapObject, Map, Object, PartialDescriptor, PropertyDescriptor,
-    RuntimeContext, SlotFlags, SlotName, Smi, Stack, StringData, Symbol, Tagged, VM, Value,
-    VmError,
+    AccessorPair, Coercion, Convert, DenseString, FixedArray, Float, GcSlot, Handle, HandleScope,
+    Heap, HeapObject, HostCtx, Map, Object, PartialDescriptor, PropertyDescriptor, SlotFlags,
+    SlotName, Smi, Stack, StringData, Symbol, Tagged, ThreadState, VM, Value, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -414,7 +413,7 @@ impl Lookup<'_> {
     pub fn get_property_on<'a>(
         vm: &'a VM,
         heap: &'a mut Heap,
-        state: &'a ContextState,
+        state: &'a ThreadState,
         holder: Handle<'_, Value>,
         receiver: Handle<'_, Value>,
         name: Handle<'_, Value>,
@@ -423,7 +422,7 @@ impl Lookup<'_> {
         if cond_3 {
             return Proxy::get(vm, heap, state, holder, receiver, name);
         }
-        RuntimeContext::new(vm, heap, state).handle_scope(
+        HostCtx::new(vm, heap, state).handle_scope(
             |vm, heap, state, scope| -> Result<Coercion<'a>, VmError> {
                 let exception = heap.known().exception.as_tagged(heap).raw();
                 let loaded = {
@@ -442,9 +441,8 @@ impl Lookup<'_> {
                     LoadOutcome::Getter(getter) => {
                         let getter = scope.handle(getter);
                         let args = scope.stage(&[receiver.as_tagged(&*heap).erase()]);
-                        let result = scope.handle(RuntimeContext::call(
-                            vm, &mut *heap, state, getter, args, None,
-                        )?);
+                        let result = scope
+                            .handle(HostCtx::enter(vm, &mut *heap, state, getter, args, None)?);
                         if result.as_tagged(heap).raw() == exception {
                             Ok(Coercion::Threw)
                         } else {
@@ -459,7 +457,7 @@ impl Lookup<'_> {
     pub fn to_property_descriptor<'s>(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         scope: &'s HandleScope<'_>,
         attrs: Handle<'_, Value>,
     ) -> Result<Option<PartialDescriptor<'s>>, VmError> {

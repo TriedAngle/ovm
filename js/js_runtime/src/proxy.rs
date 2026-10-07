@@ -1,27 +1,27 @@
 //! ES 28.2: the Proxy constructor, Proxy.revocable, and the
 //! revoke-closure prelude.
 
+use vm_core::Coercion;
+use vm_core::HostCtx;
 use vm_core::Lookup;
 use vm_core::Object;
 use vm_core::PropertyDescriptor;
-use vm_core::RuntimeContext;
 use vm_core::error::Message;
 use vm_core::proxy::Proxy;
 use vm_core::raise_runtime;
 use vm_core::rt_try;
-use vm_core::runtime::Coercion;
 use vm_core::{Args, Handle, HandleSlice, Tagged, Value, VmError};
 
 /// `new Proxy(target, handler)` (ES 20.2.1.1): both must be JSReceivers;
 /// the map's capability bits mirror the target's so callability is
 /// observable (`typeof`, future `Call`/`Construct` dispatch).
 pub fn proxy_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     let construct = new_target.is_some();
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     if !construct {
@@ -55,11 +55,11 @@ pub fn proxy_constructor<'a>(
 /// by REVOKE_PRELUDE (it keeps the idempotence flag and calls the
 /// hidden `__revokeProxy` runtime).
 pub fn proxy_revocable<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let target = args.get_handle(heap, 1);
@@ -113,7 +113,7 @@ pub fn proxy_revocable<'a>(
                 vm,
                 heap,
                 state,
-                RuntimeContext::call(vm, &mut *heap, state, make_revoke, staged, None)
+                HostCtx::enter(vm, &mut *heap, state, make_revoke, staged, None)
             );
             if r.raw() == exception {
                 return heap.known().exception.as_tagged(heap).erase();
@@ -151,11 +151,11 @@ pub fn proxy_revocable<'a>(
 /// (idempotent — a null handler already means revoked). Called only by
 /// the REVOKE_PRELUDE closure, which guards it with a done-flag.
 pub fn proxy_revoke<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm: _,
         heap,
         state: _,

@@ -3,11 +3,11 @@
 //! `toGMTString`/`toString` are written to round-trip each other exactly.
 
 use vm_core::Handle;
+use vm_core::HostCtx;
 use vm_core::Object;
-use vm_core::RuntimeContext;
 use vm_core::{Args, Heap};
-use vm_core::{ContextState, VM};
 use vm_core::{Convert, DenseString, Tagged, Value, VmError};
+use vm_core::{ThreadState, VM};
 use vm_core::{raise_runtime, rt_try};
 
 /// Milliseconds in a UTC day.
@@ -303,11 +303,11 @@ fn parse_loose(s: &str) -> Option<f64> {
 /// `Date.parse(string)` (ES 21.4.2.2): the ISO form plus the formats our
 /// `toGMTString`/`toString` emit. Unparseable input is NaN.
 pub fn date_parse<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get_handle(heap, 1);
@@ -333,12 +333,12 @@ pub fn date_parse<'a>(
 /// argument → that many epoch milliseconds; anything richer stays
 /// unimplemented.
 pub fn date_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let ms = if args.len() < 2 {
@@ -384,7 +384,7 @@ pub fn date_constructor<'a>(
 
 /// `Date.now()` (ES 21.4.2.2): epoch milliseconds as a Number.
 pub fn date_now<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     _args: Args,
 ) -> Tagged<'a, Value> {
@@ -394,11 +394,11 @@ pub fn date_now<'a>(
 /// `Date.prototype.valueOf` (ES 21.4.4.40): the wrapped epoch
 /// milliseconds. Only real Date instances qualify.
 pub fn date_value_of<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let receiver = args.get(heap, 0);
@@ -415,12 +415,12 @@ pub fn date_value_of<'a>(
 /// down and apply `format`. `invalid` is the NaN text ("Invalid Date");
 /// `None` asks for a TypeError (toISOString's RangeError approximation).
 fn format_with<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     args: Args,
     format: fn(&Broken) -> String,
     invalid: Option<&'static str>,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -459,7 +459,7 @@ fn format_with<'a>(
 /// `Date.prototype.toISOString` (ES 21.4.4.36): NaN is a RangeError
 /// (approximated here as a TypeError).
 pub fn date_to_iso_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -468,7 +468,7 @@ pub fn date_to_iso_string<'a>(
 
 /// `Date.prototype.toGMTString` / `toUTCString` (ES 21.4.4.43).
 pub fn date_to_gmt_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -477,7 +477,7 @@ pub fn date_to_gmt_string<'a>(
 
 /// `Date.prototype.toString` (ES 21.4.4.41; UTC-formatted).
 pub fn date_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -488,7 +488,7 @@ pub fn date_to_string<'a>(
 fn date_slot<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     receiver: Tagged<'a, Value>,
 ) -> Tagged<'a, Value> {
     let Some(obj) = receiver.as_heap_object() else {

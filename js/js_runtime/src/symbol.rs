@@ -1,6 +1,6 @@
 //! ES 20.4: the Symbol constructor (minimal surface).
 
-use vm_core::RuntimeContext;
+use vm_core::HostCtx;
 use vm_core::raise_runtime;
 use vm_core::{Args, DenseString, Handle, Object, Symbol, Tagged, Value};
 
@@ -11,11 +11,11 @@ use vm_core::{Args, DenseString, Handle, Object, Symbol, Tagged, Value};
 /// iterables (`obj[Symbol.iterator] = ...`); `Symbol.iterator` is the
 /// well-known one.
 pub fn symbol_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {

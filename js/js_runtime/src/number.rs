@@ -1,18 +1,17 @@
 //! ES 21.1: the Number constructor and prototype methods.
 
+use vm_core::HostCtx;
 use vm_core::Object;
-use vm_core::RuntimeContext;
-use vm_core::runtime_api::wrapper_value;
 use vm_core::{Args, Convert, DenseString, Handle, Heap, Smi, Tagged, Value, VmError};
 use vm_core::{raise_runtime, rt_try};
 
 pub fn number_constructor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
     let is_construct = new_target.is_some();
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let n = rt_try!(
@@ -44,15 +43,15 @@ pub fn number_constructor<'a>(
 }
 
 pub fn number_value_of<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
-    match wrapper_value(
+    match Object::wrapper_value(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
         unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
@@ -65,17 +64,17 @@ pub fn number_value_of<'a>(
 }
 
 pub fn number_to_string<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let _ = vm;
     state.handle_scope(|scope| {
         let arg = args.get(heap, 0);
-        let v = match wrapper_value(
+        let v = match Object::wrapper_value(
             heap,
             // Safety: fresh rooted-slot word, no allocation since the read.
             unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
@@ -95,18 +94,18 @@ pub fn number_to_string<'a>(
 
 /// The numeric `this` of a Number.prototype method (receiver or wrapper).
 fn number_receiver(heap: &Heap, args: Args) -> Result<f64, VmError> {
-    let v = wrapper_value(heap, args.get(heap, 0))?;
+    let v = Object::wrapper_value(heap, args.get(heap, 0))?;
     Convert::to_number(heap, v)
 }
 
 /// `Number.prototype.toFixed(fractionDigits?)` (ES 21.1.3.3): fixed-point
 /// notation with `fractionDigits` digits after the decimal point.
 pub fn number_to_fixed<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -138,11 +137,11 @@ pub fn number_to_fixed<'a>(
 /// `Number.prototype.toPrecision(precision?)` (ES 21.1.3.6): `precision`
 /// significant digits, fixed or exponential per the magnitude.
 pub fn number_to_precision<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {

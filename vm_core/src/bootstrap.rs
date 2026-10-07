@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
 use crate::{
-    CallableInfoInit, CallableInfoObject, Cell, CellInit, Context, ContextInit, FixedArray,
+    CallableInfoInit, CallableInfoObject, Cell, CellInit, ContextInit, ContextObject, FixedArray,
     FixedByteArray, Global, Handle, HandleData, HandleScope, HandleSlice, Heap, Map, MapInit,
     MapKind, Object, ObjectInit, RootHandles, ScopeInfo, ScopeInfoInit, SlotName, Smi,
     StringInterner, Symbol, Tagged, Value,
@@ -21,7 +21,7 @@ pub struct WellKnown {
     /// place; the first property store swaps in a fresh array).
     pub empty_fixed_array: Global<FixedArray>,
     /// TODO: Placeholder for now
-    pub empty_context: Global<Context>,
+    pub empty_context: Global<ContextObject>,
     pub smi_map: Global<Map>,
     pub float_map: Global<Map>,
     pub array_map: Global<Map>,
@@ -226,7 +226,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
     let map = unsafe { smi_handle::<Map>(roots) };
     let obj = unsafe { smi_handle::<Object>(roots) };
     let array = unsafe { smi_handle::<FixedArray>(roots) };
-    let context = unsafe { smi_handle::<Context>(roots) };
+    let context = unsafe { smi_handle::<ContextObject>(roots) };
     let scope_info = unsafe { smi_handle::<ScopeInfo>(roots) };
     let symbol = unsafe { smi_handle::<Symbol>(roots) };
     let cell = unsafe { smi_handle::<Cell>(roots) };
@@ -636,7 +636,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
 
     let empty_scope_info =
         roots.create_handle(heap.allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots }));
-    let empty_context = roots.create_handle(heap.allocate::<Context>(ContextInit {
+    let empty_context = roots.create_handle(heap.allocate::<ContextObject>(ContextInit {
         outer: None,
         slots: empty_slots,
         scope_info: empty_scope_info,

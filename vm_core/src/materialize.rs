@@ -9,7 +9,7 @@
 //! function table and knows nothing about the language that produced it.
 
 use crate::{
-    CallableInfoInit, CallableInfoObject, Context, FixedArray, FixedByteArray, FunctionKind,
+    CallableInfoInit, CallableInfoObject, ContextObject, FixedArray, FixedByteArray, FunctionKind,
     Handle, HandleScope, HandlerEntryInit, HandlerTable, HandlerTableInit, Heap, Object, ScopeInfo,
     ScopeInfoInit, Tagged, Value, VmError, decode_wtf8, new_feedback_vector,
 };
@@ -19,7 +19,7 @@ use bytecode::{CallableKind, Constant, FunctionId, Program};
 use crate::DenseString;
 use crate::Smi;
 use crate::StringData;
-use crate::{ContextState, Thread, VM};
+use crate::{Thread, ThreadState, VM};
 
 /// Namespace for turning compiled programs into VM heap objects.
 pub struct Materialize;
@@ -40,7 +40,7 @@ impl Materialize {
         thread: &mut Thread,
         scope: &'s HandleScope<'_>,
         program: &Program,
-        context: Handle<'c, Context>,
+        context: Handle<'c, ContextObject>,
     ) -> Result<Handle<'s, Object>, VmError>
     where
         'c: 's,
@@ -52,10 +52,10 @@ impl Materialize {
     pub fn closure_vm<'s>(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         scope: &'s HandleScope<'_>,
         program: &Program,
-        context: Handle<'s, Context>,
+        context: Handle<'s, ContextObject>,
     ) -> Result<Handle<'s, Object>, VmError> {
         let _span = trace::info_span!("vm::materialize").entered();
         let mut infos: Vec<Option<Handle<'s, CallableInfoObject>>> =
@@ -83,7 +83,7 @@ impl Materialize {
 fn materialize_function<'s>(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &'s HandleScope<'_>,
     program: &Program,
     infos: &mut [Option<Handle<'s, CallableInfoObject>>],
@@ -180,7 +180,7 @@ fn materialize_function<'s>(
 
 fn intern<'s>(
     heap: &mut Heap,
-    _state: &ContextState,
+    _state: &ThreadState,
     scope: &'s HandleScope<'_>,
     vm: &VM,
     s: &[u8],

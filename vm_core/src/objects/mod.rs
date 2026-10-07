@@ -6,6 +6,7 @@ pub mod context;
 pub mod data_handler;
 pub mod feedback;
 pub mod float;
+mod helpers;
 pub mod map;
 pub mod object;
 pub mod prototype_info;
@@ -18,7 +19,7 @@ pub use byte_array::FixedByteArray;
 pub use callable::{CallableInfoInit, CallableInfoObject, FunctionKind};
 pub use cell::{Cell, CellInit};
 pub use context::{
-    Context, ContextInit, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit,
+    ContextInit, ContextObject, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit,
     ScopeInfo, ScopeInfoInit,
 };
 pub use data_handler::{DataHandler, DataHandlerInit};
@@ -102,7 +103,7 @@ pub enum ObjectKind {
     Float = 7,
     Symbol = 8,
     HandlerTable = 9,
-    Context = 10,
+    ContextObject = 10,
     ScopeInfo = 11,
     FeedbackVector = 12,
     BuiltinEnd = 13,
@@ -166,7 +167,7 @@ pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
             ObjectKind::Float => (*addr.cast::<Float>().as_ptr()).layout(),
             ObjectKind::Symbol => (*addr.cast::<Symbol>().as_ptr()).layout(),
             ObjectKind::HandlerTable => (*addr.cast::<HandlerTable>().as_ptr()).layout(),
-            ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).layout(),
+            ObjectKind::ContextObject => (*addr.cast::<ContextObject>().as_ptr()).layout(),
             ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).layout(),
             ObjectKind::FeedbackVector => (*addr.cast::<FeedbackVector>().as_ptr()).layout(),
             ObjectKind::Cell => (*addr.cast::<Cell>().as_ptr()).layout(),
@@ -206,7 +207,9 @@ pub unsafe fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
             ObjectKind::HandlerTable => {
                 (*addr.cast::<HandlerTable>().as_ptr()).visit_edges(visitor)
             }
-            ObjectKind::Context => (*addr.cast::<Context>().as_ptr()).visit_edges(visitor),
+            ObjectKind::ContextObject => {
+                (*addr.cast::<ContextObject>().as_ptr()).visit_edges(visitor)
+            }
             ObjectKind::ScopeInfo => (*addr.cast::<ScopeInfo>().as_ptr()).visit_edges(visitor),
             ObjectKind::FeedbackVector => {
                 (*addr.cast::<FeedbackVector>().as_ptr()).visit_edges(visitor)

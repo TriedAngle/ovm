@@ -1,12 +1,12 @@
 use core::alloc::Layout;
 
+use crate::Coercion;
 use crate::error::Message;
-use crate::runtime::Coercion;
 use crate::{
-    Args, Compare, ContextState, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
-    Header, Heap, HeapObject, Key, Lookup, Map, Object, ObjectKind, PartialDescriptor,
-    PropertyDescriptor, Prototype, RuntimeContext, SlotName, Tagged, Transition, VM, Value,
-    Visitor, VmError,
+    Args, Compare, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
+    HeapObject, HostCtx, Key, Lookup, Map, Object, ObjectKind, PartialDescriptor,
+    PropertyDescriptor, Prototype, SlotName, Tagged, ThreadState, Transition, VM, Value, Visitor,
+    VmError,
 };
 
 pub struct Proxy;
@@ -141,7 +141,7 @@ enum TrapLookup<'s> {
 fn get_trap<'s>(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &'s HandleScope<'_>,
     handler: &Handle<'_, Value>,
     trap: Trap,
@@ -165,7 +165,7 @@ fn get_trap<'s>(
 fn call_trap<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     trap: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
@@ -175,9 +175,7 @@ fn call_trap<'a>(
     }
     let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
     let staged = scope.stage(&words);
-    let result = scope.handle(RuntimeContext::call(
-        vm, &mut *heap, state, *trap, staged, None,
-    )?);
+    let result = scope.handle(HostCtx::enter(vm, &mut *heap, state, *trap, staged, None)?);
     let exception = heap.known().exception.as_tagged(heap);
     if result.as_tagged(heap) == exception {
         Ok(Coercion::Threw)
@@ -223,7 +221,7 @@ fn revoked_error(trap: Trap) -> VmError {
 fn own_descriptor_h<'s>(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &'s HandleScope<'_>,
     obj: &Handle<'_, Value>,
     key: &Handle<'_, Value>,
@@ -274,7 +272,7 @@ fn own_descriptor_h<'s>(
 fn is_extensible_h(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
 ) -> Result<Flow<bool>, VmError> {
@@ -373,7 +371,7 @@ fn descriptor_object<'s>(
 fn define_internal_h<'s>(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &'s HandleScope<'_>,
     obj: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
@@ -426,7 +424,7 @@ fn define_internal_h<'s>(
 fn ordinary_set_forward<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     target: &Handle<'_, Value>,
     receiver: &Handle<'_, Value>,
@@ -488,9 +486,7 @@ fn ordinary_set_forward<'a>(
                 value.as_tagged(heap).erase(),
             ];
             let staged = scope.stage(&words);
-            let result = scope.handle(RuntimeContext::call(
-                vm, &mut *heap, state, setter, staged, None,
-            )?);
+            let result = scope.handle(HostCtx::enter(vm, &mut *heap, state, setter, staged, None)?);
             let exception = heap.known().exception.as_tagged(heap);
             if result.as_tagged(heap) == exception {
                 Ok(Coercion::Threw)
@@ -513,7 +509,7 @@ fn define_flow_to_coercion<'a>(heap: &'a Heap, flow: Flow<bool>) -> Result<Coerc
 fn get_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     receiver: &Handle<'_, Value>,
@@ -584,7 +580,7 @@ fn get_h<'a>(
 fn set_h<'a, 's>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &'s HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
@@ -654,7 +650,7 @@ fn set_h<'a, 's>(
 fn has_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
@@ -711,7 +707,7 @@ fn has_h<'a>(
 fn delete_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     key: &Handle<'_, Value>,
@@ -767,7 +763,7 @@ fn delete_h<'a>(
 fn proxy_define_h(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     name: &Handle<'_, Value>,
@@ -845,7 +841,7 @@ fn proxy_define_h(
 fn apply_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
@@ -864,9 +860,7 @@ fn apply_h<'a>(
                 all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
-            let result = scope.handle(RuntimeContext::call(
-                vm, &mut *heap, state, target, staged, None,
-            )?);
+            let result = scope.handle(HostCtx::enter(vm, &mut *heap, state, target, staged, None)?);
             let exception = heap.known().exception.as_tagged(heap);
             if result.as_tagged(heap) == exception {
                 Ok(Coercion::Threw)
@@ -898,7 +892,7 @@ fn apply_h<'a>(
 fn construct_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     proxy: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
@@ -941,7 +935,7 @@ fn construct_h<'a>(
                 all.push(h.as_tagged(heap).erase());
             }
             let staged = scope.stage(&all);
-            let result = scope.handle(RuntimeContext::call(
+            let result = scope.handle(HostCtx::enter(
                 vm,
                 heap,
                 state,
@@ -1036,7 +1030,7 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
 fn prevent_extensions_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
 ) -> Result<Coercion<'a>, VmError> {
@@ -1084,7 +1078,7 @@ fn prevent_extensions_h<'a>(
 fn is_extensible_entry_h<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &HandleScope<'_>,
     obj: &Handle<'_, Value>,
 ) -> Result<Coercion<'a>, VmError> {
@@ -1201,7 +1195,7 @@ impl Proxy {
     pub fn internal_own_descriptor<'s>(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         scope: &'s HandleScope<'_>,
         obj: Tagged<'_, Value>,
         key: Tagged<'_, Value>,
@@ -1217,7 +1211,7 @@ impl Proxy {
     pub fn internal_is_extensible(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         obj: Tagged<'_, Value>,
     ) -> Result<Flow<bool>, VmError> {
         state.handle_scope(|scope| {
@@ -1233,7 +1227,7 @@ impl Proxy {
     pub fn define_internal<'s>(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         scope: &'s HandleScope<'_>,
         obj: Handle<'_, Value>,
         name: Handle<'_, Value>,
@@ -1248,7 +1242,7 @@ impl Proxy {
     pub fn get<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         proxy: Handle<'_, Value>,
         receiver: Handle<'_, Value>,
         name: Handle<'_, Value>,
@@ -1260,7 +1254,7 @@ impl Proxy {
     pub fn set<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         proxy: Handle<'_, Value>,
         name: Handle<'_, Value>,
         value: Handle<'_, Value>,
@@ -1273,7 +1267,7 @@ impl Proxy {
     pub fn has<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         proxy: Handle<'_, Value>,
         name: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
@@ -1285,7 +1279,7 @@ impl Proxy {
     pub fn delete<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         proxy: Handle<'_, Value>,
         key: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
@@ -1296,7 +1290,7 @@ impl Proxy {
     pub fn proxy_define(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         proxy: Tagged<'_, Value>,
         name: Tagged<'_, Value>,
         partial: PartialDescriptor,
@@ -1313,7 +1307,7 @@ impl Proxy {
     pub fn apply<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         proxy: Handle<'_, Value>,
         args: Args,
     ) -> Result<Coercion<'a>, VmError> {
@@ -1330,7 +1324,7 @@ impl Proxy {
     pub fn construct<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         proxy: Handle<'_, Value>,
         args: Args,
         new_target: Handle<'_, Value>,
@@ -1347,7 +1341,7 @@ impl Proxy {
     pub fn prevent_extensions<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         obj: Handle<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
         state.handle_scope(|scope| prevent_extensions_h(vm, heap, state, &scope, &obj))
@@ -1358,7 +1352,7 @@ impl Proxy {
     pub fn is_extensible<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         obj: Tagged<'_, Value>,
     ) -> Result<Coercion<'a>, VmError> {
         state.handle_scope(|scope| {

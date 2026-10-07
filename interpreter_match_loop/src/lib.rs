@@ -7,12 +7,12 @@ use vm_core::cold::{
 };
 use vm_core::ic::StoreOutcomeKind;
 use vm_core::ic::{CallProbe, CallRecord, ElementHit, Hit, InlineCache, MonoProbe, StoreHit};
-use vm_core::interp::{Ctx, Unwind, unwind};
+use vm_core::interpreter::{Ctx, Unwind, unwind};
 use vm_core::{
-    CallTarget, CallableInfoObject, Callee, Coercion, Compare, Context, ContextInit, ContextState,
-    Convert, FixedArray, FrameMeta, Handle, HandleSlice, Heap, Key, LoadOutcome, Lookup, Object,
-    Recv, Register, RuntimeContext, RuntimeIndex, ScopeInfo, SlotName, Smi, StoreSemantics, Tagged,
-    Termination, VM, Value, VmError,
+    CallTarget, CallableInfoObject, Callee, Coercion, Compare, ContextInit, ContextObject, Convert,
+    FixedArray, FrameMeta, Handle, HandleSlice, Heap, HostCtx, Key, LoadOutcome, Lookup,
+    NativeIndex, Object, Recv, Register, ScopeInfo, SlotName, Smi, StoreSemantics, Tagged,
+    Termination, ThreadState, VM, Value, VmError,
 };
 
 /// The per-instruction control flow of the dispatch loop (the error
@@ -57,7 +57,7 @@ macro_rules! throw_err {
 pub fn execute<'a>(
     vm: &VM,
     heap: &'a mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     callable: Handle<'_, Object>,
     args: HandleSlice<'_>,
     new_target: Option<Handle<'_, Value>>,
@@ -91,7 +91,7 @@ pub fn execute<'a>(
 fn start<'b>(
     vm: &'b VM,
     heap: &'b mut Heap,
-    state: &'b ContextState,
+    state: &'b ThreadState,
     callable: Handle<'_, Object>,
     args: HandleSlice<'_>,
     new_target: Option<Handle<'b, Value>>,
@@ -118,9 +118,9 @@ fn start<'b>(
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
-        Some(CallTarget::Runtime(rt)) => {
+        Some(CallTarget::Native(rt)) => {
             let f = vm.runtime(rt);
-            let nctx = RuntimeContext::new(vm, heap, state);
+            let nctx = HostCtx::new(vm, heap, state);
             Ok(f(nctx, new_target, args.as_args()))
         }
         Some(CallTarget::Bytecode {
@@ -192,7 +192,7 @@ fn run_callee<'a>(ctx: &Ctx<'a>) -> Result<Tagged<'a, Value>, VmError> {
 }
 
 /// The text of an interned `SlotName` (empty for non-string names).
-fn begin_termination(heap: &Heap, state: &ContextState) -> Flow {
+fn begin_termination(heap: &Heap, state: &ThreadState) -> Flow {
     state.set_termination(Termination::Shutdown);
     let undefined = heap.known().undefined.as_tagged(heap);
     state.set_pending_exception(undefined);
@@ -825,7 +825,7 @@ fn step<'a>(
                     .frame_header(frame_base)
                     .context_slot()
                     .get(heap)
-                    .get_as::<Context>(heap)
+                    .get_as::<ContextObject>(heap)
                 {
                     Some(context) => context,
                     None => throw_err!(ctx, VmError::Type),
@@ -851,7 +851,7 @@ fn step<'a>(
                 .frame_header(frame_base)
                 .context_slot()
                 .get(heap)
-                .get_as::<Context>(heap)
+                .get_as::<ContextObject>(heap)
             {
                 Some(context) => context,
                 None => throw_err!(ctx, VmError::Type),
@@ -885,18 +885,18 @@ fn step<'a>(
             });
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(
+                    .cast::<ContextObject>(
                         heap,
                         stack.frame_header(frame_base).context_slot().get(heap),
                     )
-                    .expect("frame context slot holds a Context");
+                    .expect("frame context slot holds a ContextObject");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
                 let scope_info = scope
                     .cast::<ScopeInfo>(heap, ctx.constants_ref(heap).at(heap, scope_idx))
                     .expect("constants slot holds a ScopeInfo");
                 let slots = heap.allocate_handle::<FixedArray>(values, &scope);
-                heap.allocate::<Context>(ContextInit {
+                heap.allocate::<ContextObject>(ContextInit {
                     outer: Some(outer),
                     slots,
                     scope_info,
@@ -909,15 +909,15 @@ fn step<'a>(
             let count = ops.uimm(0) as usize;
             let ctx = state.handle_scope(|scope| {
                 let outer = scope
-                    .cast::<Context>(
+                    .cast::<ContextObject>(
                         heap,
                         stack.frame_header(frame_base).context_slot().get(heap),
                     )
-                    .expect("frame context slot holds a Context");
+                    .expect("frame context slot holds a ContextObject");
                 let values =
                     scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
                 let slots = heap.allocate_handle::<FixedArray>(values, &scope);
-                heap.allocate::<Context>(ContextInit {
+                heap.allocate::<ContextObject>(ContextInit {
                     outer: Some(outer),
                     slots,
                     scope_info: heap.known().empty_scope_info,
@@ -930,7 +930,7 @@ fn step<'a>(
             let old = stack.frame_header(frame_base).context_slot().get(heap);
             stack.set_reg(frame_base, ops.reg(0), old);
             let context = acc.get(heap);
-            if context.get_as::<Context>(heap).is_none() {
+            if context.get_as::<ContextObject>(heap).is_none() {
                 throw_err!(ctx, VmError::Type);
             }
             stack.frame_header(frame_base).context_slot().store(context);
@@ -938,7 +938,7 @@ fn step<'a>(
         }
         Opcode::PopContext => {
             let context = stack.reg(heap, frame_base, ops.reg(0));
-            if context.get_as::<Context>(heap).is_none() {
+            if context.get_as::<ContextObject>(heap).is_none() {
                 throw_err!(ctx, VmError::Type);
             }
             stack.frame_header(frame_base).context_slot().store(context);
@@ -996,7 +996,7 @@ fn step<'a>(
                         }
                         return Flow::Sync;
                     }
-                    CallProbe::Runtime(rt) => {
+                    CallProbe::Native(rt) => {
                         let exception = heap.known().exception.as_tagged(heap).raw();
                         let v = ctx.call_runtime(rt, stack.window(frame_base, args_base, count));
                         // Safety: old-gen singleton word.
@@ -1032,7 +1032,7 @@ fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(rt)) => {
+                Some(CallTarget::Native(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let v = ctx.call_runtime(rt, stack.window(frame_base, args_base, count));
                     // Safety: old-gen singleton word.
@@ -1045,7 +1045,7 @@ fn step<'a>(
                         ctx.feedback_ref(heap),
                         fb,
                         stack.reg(heap, frame_base, callee_reg),
-                        CallRecord::Runtime(rt),
+                        CallRecord::Native(rt),
                     );
                     Flow::Sync
                 }
@@ -1126,7 +1126,7 @@ fn step<'a>(
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(rt)) => {
+                Some(CallTarget::Native(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let v = ctx.call_runtime(rt, stack.window(frame_base, args_base, count));
                     // Safety: old-gen singleton word.
@@ -1224,7 +1224,7 @@ fn step<'a>(
                         }
                         return Flow::Sync;
                     }
-                    CallProbe::Runtime(rt) => {
+                    CallProbe::Native(rt) => {
                         let exception = heap.known().exception.as_tagged(heap).raw();
                         let staged = fold!(
                             ctx,
@@ -1275,7 +1275,7 @@ fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(rt)) => {
+                Some(CallTarget::Native(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let staged = fold!(
                         ctx,
@@ -1287,7 +1287,7 @@ fn step<'a>(
                         ctx.feedback_ref(heap),
                         fb,
                         stack.reg(heap, frame_base, callee_reg),
-                        CallRecord::Runtime(rt),
+                        CallRecord::Native(rt),
                     );
                     if v.raw() == exception {
                         Flow::Threw
@@ -1386,7 +1386,7 @@ fn step<'a>(
                         }
                         return Flow::Sync;
                     }
-                    CallProbe::Runtime(rt) => {
+                    CallProbe::Native(rt) => {
                         let exception = heap.known().exception.as_tagged(heap).raw();
                         let staged = fold!(
                             ctx,
@@ -1437,7 +1437,7 @@ fn step<'a>(
             match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
-                Some(CallTarget::Runtime(rt)) => {
+                Some(CallTarget::Native(rt)) => {
                     let exception = heap.known().exception.as_tagged(heap).raw();
                     let staged = fold!(
                         ctx,
@@ -1449,7 +1449,7 @@ fn step<'a>(
                         ctx.feedback_ref(heap),
                         fb,
                         stack.reg(heap, frame_base, callee_reg),
-                        CallRecord::Runtime(rt),
+                        CallRecord::Native(rt),
                     );
                     if v.raw() == exception {
                         Flow::Threw
@@ -1503,14 +1503,14 @@ fn step<'a>(
             }
         }
         Opcode::CallRuntime => {
-            // operand 0 is a RuntimeFn discriminant: the fixed
+            // operand 0 is a BuiltinFn discriminant: the fixed
             // runtime-helper table (vm::runtime_fn) registered at
-            // indices 0..RuntimeFn::COUNT
-            let f = vm.runtime(RuntimeIndex(ops.idx(0)));
+            // indices 0..BuiltinFn::COUNT
+            let f = vm.runtime(NativeIndex(ops.idx(0)));
             let args_base = ops.reg_list(1);
             let count = ops.reg_count(2);
             let exception = heap.known().exception.as_tagged(heap).raw();
-            let nctx = RuntimeContext::new(vm, heap, state);
+            let nctx = HostCtx::new(vm, heap, state);
             let v = f(nctx, None, stack.window(frame_base, args_base, count));
             // Safety: old-gen singleton word.
             if v.raw() == exception {
@@ -1566,11 +1566,11 @@ fn step<'a>(
                     throw_err!(ctx, VmError::Type);
                 };
                 let context = scope
-                    .cast::<Context>(
+                    .cast::<ContextObject>(
                         heap,
                         stack.frame_header(frame_base).context_slot().get(heap),
                     )
-                    .expect("frame context slot holds a Context");
+                    .expect("frame context slot holds a ContextObject");
                 let obj = fold!(ctx, Object::create_closure(heap, &scope, info, context));
                 acc.store(obj.erase());
                 Flow::Sync
@@ -2256,10 +2256,10 @@ fn step<'a>(
     }
 }
 
-pub use vm_core::{ExecuteFn, Interpreter};
+pub use vm_core::{EntryFn, Interpreter};
 
 pub struct MatchLoopInterpreter;
 
 impl Interpreter for MatchLoopInterpreter {
-    const EXECUTE: ExecuteFn = execute;
+    const EXECUTE: EntryFn = execute;
 }

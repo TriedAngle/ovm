@@ -2,10 +2,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use vm_core::HostCtx;
 use vm_core::Object;
-use vm_core::RuntimeContext;
 use vm_core::rt_try;
-use vm_core::{Args, ContextState, Convert, Handle, Heap, Tagged, VM, Value, VmError};
+use vm_core::{Args, Convert, Handle, Heap, Tagged, ThreadState, VM, Value, VmError};
 
 /// TODO: better distribution
 /// xorshift64
@@ -35,7 +35,7 @@ fn number_arg(heap: &Heap, args: Args, i: usize) -> Option<f64> {
 fn numeric_arg_cold(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     args: Args,
     i: usize,
 ) -> Result<Option<f64>, VmError> {
@@ -51,7 +51,7 @@ fn numeric_arg_cold(
 fn arg_as_f64(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     args: Args,
     i: usize,
 ) -> Result<Option<f64>, VmError> {
@@ -67,7 +67,7 @@ fn arg_as_f64(
 fn math_unary<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
-    state: &'a ContextState,
+    state: &'a ThreadState,
     args: Args,
     f: impl Fn(f64) -> f64,
 ) -> Tagged<'a, Value> {
@@ -84,7 +84,7 @@ fn math_unary<'a>(
 fn math_integral<'a>(
     vm: &'a VM,
     heap: &'a mut Heap,
-    state: &'a ContextState,
+    state: &'a ThreadState,
     args: Args,
     f: impl Fn(f64) -> f64,
 ) -> Tagged<'a, Value> {
@@ -97,11 +97,11 @@ fn math_integral<'a>(
 /// `Math.sqrt(x)` (ES 22.1.2.29): ToNumber, then the IEEE-754 square root
 /// (NaN/negative input → NaN, ±0 → ±0).
 pub fn math_sqrt<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     math_unary(vm, heap, state, args, f64::sqrt)
@@ -109,11 +109,11 @@ pub fn math_sqrt<'a>(
 
 /// `Math.log(x)` (ES 22.1.2.15): natural logarithm.
 pub fn math_log<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     math_unary(vm, heap, state, args, f64::ln)
@@ -121,11 +121,11 @@ pub fn math_log<'a>(
 
 /// `Math.pow(base, exponent)` (ES 22.1.2.20).
 pub fn math_pow<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let Some(base) = rt_try!(vm, heap, state, arg_as_f64(vm, heap, state, args, 1)) else {
@@ -151,11 +151,11 @@ fn js_round(x: f64) -> f64 {
 
 /// `Math.abs(x)` (ES 22.1.2.1).
 pub fn math_abs<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     math_unary(vm, heap, state, args, f64::abs)
@@ -163,11 +163,11 @@ pub fn math_abs<'a>(
 
 /// `Math.floor(x)` (ES 22.1.2.11).
 pub fn math_floor<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     math_integral(vm, heap, state, args, f64::floor)
@@ -175,11 +175,11 @@ pub fn math_floor<'a>(
 
 /// `Math.ceil(x)` (ES 22.1.2.2).
 pub fn math_ceil<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     math_integral(vm, heap, state, args, f64::ceil)
@@ -187,11 +187,11 @@ pub fn math_ceil<'a>(
 
 /// `Math.trunc(x)` (ES 22.1.2.31).
 pub fn math_trunc<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     math_integral(vm, heap, state, args, f64::trunc)
@@ -199,11 +199,11 @@ pub fn math_trunc<'a>(
 
 /// `Math.round(x)` (ES 22.1.2.24).
 pub fn math_round<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     math_integral(vm, heap, state, args, js_round)
@@ -212,8 +212,8 @@ pub fn math_round<'a>(
 /// Shared body of `Math.min`/`Math.max`: ToNumber every argument; any NaN
 /// argument (or no argument at all) decides the result per spec.
 #[inline]
-fn math_minmax<'a>(nctx: RuntimeContext<'a>, args: Args, min: bool) -> Tagged<'a, Value> {
-    let RuntimeContext {
+fn math_minmax<'a>(nctx: HostCtx<'a>, args: Args, min: bool) -> Tagged<'a, Value> {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let mut result = if min {
@@ -242,7 +242,7 @@ fn math_minmax<'a>(nctx: RuntimeContext<'a>, args: Args, min: bool) -> Tagged<'a
 
 /// `Math.min(...args)` (ES 22.1.2.14).
 pub fn math_min<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -251,7 +251,7 @@ pub fn math_min<'a>(
 
 /// `Math.max(...args)` (ES 22.1.2.13).
 pub fn math_max<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
@@ -261,7 +261,7 @@ pub fn math_max<'a>(
 /// `Math.random()` (ES 22.1.2.22): a number in `[0, 1)` built from the top
 /// 53 random bits.
 pub fn math_random<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     _args: Args,
 ) -> Tagged<'a, Value> {

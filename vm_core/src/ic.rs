@@ -1,8 +1,8 @@
 use crate::{
-    AccessorPair, CallTarget, CallableInfoObject, Cell, Context, DataHandler, DataHandlerInit,
-    DenseString, FeedbackVector, FixedArray, FunctionKind, Handle, HandleScope, Heap, Map,
-    MaybeWeak, Object, Prototype, RuntimeIndex, SlotName, Smi, Tagged, Value, WeakFixedArray,
-    WeakFixedArrayInit,
+    AccessorPair, CallTarget, CallableInfoObject, Cell, ContextObject, DataHandler,
+    DataHandlerInit, DenseString, FeedbackVector, FixedArray, FunctionKind, Handle, HandleScope,
+    Heap, Map, MaybeWeak, NativeIndex, Object, Prototype, SlotName, Smi, Tagged, Value,
+    WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Beyond this many live (map, handler) pairs a site goes megamorphic.
@@ -173,20 +173,20 @@ enum StoreAction<'s> {
 pub struct CallHit<'a> {
     pub target: Tagged<'a, Object>,
     pub info: Tagged<'a, CallableInfoObject>,
-    pub context: Tagged<'a, Context>,
+    pub context: Tagged<'a, ContextObject>,
     pub kind: FunctionKind,
 }
 
 pub enum CallProbe<'a> {
     Bytecode(CallHit<'a>),
-    Runtime(RuntimeIndex),
+    Native(NativeIndex),
     Miss,
 }
 
 /// What the generic path resolved a call site's callee to.
 pub enum CallRecord<'a> {
     Bytecode(Tagged<'a, CallableInfoObject>),
-    Runtime(RuntimeIndex),
+    Native(NativeIndex),
 }
 
 pub struct InlineCache;
@@ -1362,16 +1362,16 @@ fn update_poly(
         .set_poly(heap, slot, arr.as_tagged(heap));
 }
 
-pub const CALL_TAG_RUNTIME: i64 = 1;
+pub const CALL_TAG_NATIVE: i64 = 1;
 
 #[inline]
-fn encode_runtime_payload(index: RuntimeIndex) -> i64 {
-    CALL_TAG_RUNTIME | ((index.0 as i64) << 1)
+fn encode_runtime_payload(index: NativeIndex) -> i64 {
+    CALL_TAG_NATIVE | ((index.0 as i64) << 1)
 }
 
 #[inline]
-fn decode_runtime_payload(raw: i64) -> Option<RuntimeIndex> {
-    (raw & CALL_TAG_RUNTIME != 0).then_some(RuntimeIndex((raw >> 1) as usize))
+fn decode_runtime_payload(raw: i64) -> Option<NativeIndex> {
+    (raw & CALL_TAG_NATIVE != 0).then_some(NativeIndex((raw >> 1) as usize))
 }
 
 /// Decode the packed callable descriptor: `register_count | formal_min<<16
@@ -1405,7 +1405,7 @@ impl InlineCache {
             if state.is_strong_ptr() && !state.ptr_eq(heap.known().the_hole.as_tagged(heap).erase())
             {
                 return match Object::call_target(heap, callee) {
-                    Some(CallTarget::Runtime(rt)) => CallProbe::Runtime(rt),
+                    Some(CallTarget::Native(rt)) => CallProbe::Native(rt),
                     Some(CallTarget::Bytecode {
                         target,
                         info,
@@ -1430,7 +1430,7 @@ impl InlineCache {
             // runtime callee: index and shape come straight from the
             // payload — no object decode needed
             return match decode_runtime_payload(tag) {
-                Some(rt) => CallProbe::Runtime(rt),
+                Some(rt) => CallProbe::Native(rt),
                 None => CallProbe::Miss,
             };
         }
@@ -1445,7 +1445,7 @@ impl InlineCache {
         let Some(target) = callee.as_heap_object() else {
             return CallProbe::Miss;
         };
-        let Some(context) = target.slot(heap, 1).get(heap).get_as::<Context>(heap) else {
+        let Some(context) = target.slot(heap, 1).get(heap).get_as::<ContextObject>(heap) else {
             return CallProbe::Miss;
         };
         CallProbe::Bytecode(CallHit {
@@ -1506,7 +1506,7 @@ impl InlineCache {
             // bytecode: the payload IS the resolved info
             CallRecord::Bytecode(info) => tag_slot.set_strong(heap, host, info.erase()),
             // runtime: index and argument shape packed into the payload
-            CallRecord::Runtime(rt) => tag_slot.set(
+            CallRecord::Native(rt) => tag_slot.set(
                 heap,
                 host,
                 Smi::new(encode_runtime_payload(rt))

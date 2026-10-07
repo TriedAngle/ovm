@@ -2,7 +2,7 @@ use crate::{
     DenseString, Handle, HandleSlice, Heap, Object, PropertyDescriptor, Tagged, Value, VmError,
 };
 
-use crate::{ContextState, VM};
+use crate::{ThreadState, VM};
 
 /// Namespace for materializing VM errors as ECMAScript error objects.
 pub struct Errors;
@@ -18,7 +18,7 @@ impl Errors {
     pub fn from_vm_error<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         err: VmError,
     ) -> Result<Tagged<'a, Value>, VmError> {
         Self::with_message(vm, heap, state, err.name(), err.message())
@@ -31,7 +31,7 @@ impl Errors {
     pub fn not_defined<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         name: &str,
     ) -> Result<Tagged<'a, Value>, VmError> {
         Self::with_message(
@@ -52,7 +52,7 @@ impl Errors {
     pub fn with_message<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         class: &str,
         message: &str,
     ) -> Result<Tagged<'a, Value>, VmError> {

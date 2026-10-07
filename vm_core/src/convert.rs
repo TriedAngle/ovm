@@ -2,6 +2,22 @@ use crate::{
     DenseString, Float, Handle, HandleScope, Heap, Smi, StringData, Symbol, Tagged, Value, VmError,
 };
 
+/// ToPrimitive hint (ES 7.1.1).
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum Hint {
+    Default,
+    Number,
+    String,
+}
+
+/// A coerced value anchored at the heap borrow that produced it (so it can
+/// be consumed, stored, or rooted before the next allocation), or a pending
+/// exception.
+pub enum Coercion<'a> {
+    Value(Tagged<'a, Value>),
+    Threw,
+}
+
 pub struct Convert;
 
 impl Convert {

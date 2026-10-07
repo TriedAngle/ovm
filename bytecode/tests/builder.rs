@@ -3,8 +3,8 @@
 //! handler ranges, accumulator elision, and validation.
 
 use bytecode::{
-    BuildError, CallableKind, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode, Operand,
-    Program, REGISTER_FILE_START, Reg, RegList, RtArg, RuntimeFn, ValidationError, try_decode,
+    BuildError, BuiltinFn, CallableKind, Constant, FnBuilder, FunctionId, FunctionMeta, Opcode,
+    Operand, Program, REGISTER_FILE_START, Reg, RegList, RtArg, ValidationError, try_decode,
     validate, validate_function,
 };
 
@@ -139,7 +139,7 @@ fn staged_runtime_calls_lay_out_the_window_in_order() {
     let obj = b.stage_acc();
     let name = b.name(b"key");
     b.call_runtime_staged(
-        RuntimeFn::SetFunctionName,
+        BuiltinFn::SetFunctionName,
         &[RtArg::Acc, RtArg::Const(name), RtArg::Smi(2)],
     );
     b.load(obj);

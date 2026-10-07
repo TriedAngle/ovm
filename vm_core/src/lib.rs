@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 use core::cell::Cell as StdCell;
 use core::ptr::NonNull;
 
+pub mod api;
 pub mod bootstrap;
 pub mod cold;
 pub mod compare;
@@ -15,14 +16,13 @@ pub mod handle;
 pub mod heap;
 pub mod ic;
 pub mod interner;
-pub mod interp;
+pub mod interpreter;
 pub mod intrinsics;
 pub mod lookup;
 pub mod materialize;
+pub mod native;
 pub mod objects;
 pub mod prototype;
-pub mod runtime;
-pub mod runtime_api;
 pub mod stack;
 pub mod tools;
 pub mod transition;
@@ -31,12 +31,13 @@ pub mod value;
 pub use objects::proxy;
 pub use objects::string;
 
+pub use api::{EntryFn, ErasedRuntimeState, Interpreter, Runtime};
 pub use bootstrap::{
     KnownCell, WellKnown, WellKnownStrings, bootstrap_basics, bootstrap_well_known,
     intern_well_known_strings,
 };
 pub use compare::Compare;
-pub use convert::Convert;
+pub use convert::{Coercion, Convert, Hint};
 pub use error::VmError;
 pub use errors::Errors;
 pub use handle::{
@@ -47,11 +48,12 @@ pub use heap::{
     MaybeWeakGcSlot, OptionGcSlot, Register, WordType,
 };
 pub use interner::StringInterner;
-pub use interp::{Ctx, Unwind};
+pub use interpreter::{Ctx, Unwind};
 pub use lookup::{Key, LoadOutcome, Lookup};
+pub use native::{HostCtx, NativeFn, NativeIndex, NativeRegistry, raise_runtime};
 pub use objects::{
-    AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Cell, CellInit, Context,
-    ContextInit, DataHandler, DataHandlerInit, DenseString, Encoding, FeedbackVector,
+    AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Cell, CellInit, ContextInit,
+    ContextObject, DataHandler, DataHandlerInit, DenseString, Encoding, FeedbackVector,
     FeedbackVectorInit, FixedArray, FixedByteArray, Float, FunctionKind, HandlerEntry,
     HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map, MapInit, MapKind,
     Object, ObjectInit, ObjectKind, ObjectSlotsInit, PrototypeInfo, PrototypeInfoInit, ProxyInit,
@@ -60,10 +62,6 @@ pub use objects::{
     object_layout, string_content_hash, visit_object,
 };
 pub use prototype::{Prototype, PrototypeRegistry};
-pub use runtime::{
-    Coercion, ErasedRuntimeState, ExecuteFn, Hint, Interpreter, Runtime, RuntimeCall,
-    RuntimeContext, RuntimeIndex, RuntimeRegistry, raise_runtime, spread_apply_args,
-};
 pub use stack::{Args, Callee, FrameMeta, Recv, STACK_SLOTS, Stack};
 pub use tools::{KetteTools, Termination};
 pub use transition::{
@@ -115,10 +113,10 @@ pub struct SharedVM {
     roots: RootHandles,
     known: KnownCell,
     // TODO: investiage if Mutex is fine, maybe a lock-free mechanism exists
-    threads: Mutex<Vec<Weak<ContextState>>>,
+    threads: Mutex<Vec<Weak<ThreadState>>>,
     interner: StringInterner,
     prototype_registry: PrototypeRegistry,
-    runtimes: RuntimeRegistry,
+    runtimes: NativeRegistry,
     states: Mutex<Vec<(TypeId, Box<dyn ErasedRuntimeState>)>>,
     /// Weak slots the GC clears when their targets die; used for tests and
     /// the seed of a weak-registry feature.
@@ -129,14 +127,14 @@ pub struct SharedVM {
     shutdown_requested: AtomicBool,
     /// Interpreter entry ([[Call]]/[[Construct]] on bytecode callables);
     /// set once at construction from the `I: Interpreter` type parameter.
-    execute: ExecuteFn,
+    execute: EntryFn,
 }
 
 pub struct VM {
     shared: Arc<SharedVM>,
 }
 
-pub struct ContextState {
+pub struct ThreadState {
     handles: HandleData,
     stack: Stack,
     /// The current (innermost) interpreter frame's anchor. Frames are
@@ -165,7 +163,7 @@ pub struct ContextState {
     construct_cache: Register,
 }
 
-impl ContextState {
+impl ThreadState {
     pub fn stack(&self) -> &Stack {
         &self.stack
     }
@@ -372,11 +370,11 @@ impl ContextState {
     }
 }
 
-unsafe impl Send for ContextState {}
+unsafe impl Send for ThreadState {}
 // TODO: can we get rid of this somehow?
 // in practice we seem to need Sync because Heap needs access,
 // in theory full isolation (and passing?) should be possible
-unsafe impl Sync for ContextState {}
+unsafe impl Sync for ThreadState {}
 
 impl SharedVM {
     fn visit_roots(&self, visitor: &mut dyn Visitor) {
@@ -429,7 +427,7 @@ fn host_visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
     unsafe { visit_object(addr, visitor) }
 }
 
-impl EdgeVisitable for ContextState {
+impl EdgeVisitable for ThreadState {
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
         self.handles.visit_edges(visitor);
         self.stack.visit_edges(visitor);
@@ -442,7 +440,7 @@ impl EdgeVisitable for ContextState {
 pub struct Thread {
     vm: VM,
     heap: Heap,
-    state: Arc<ContextState>,
+    state: Arc<ThreadState>,
 }
 
 impl Thread {
@@ -455,11 +453,11 @@ impl Thread {
     }
 
     /// Split the thread into its parts (multi-borrow calls).
-    pub fn split(&mut self) -> (&VM, &mut Heap, &ContextState) {
+    pub fn split(&mut self) -> (&VM, &mut Heap, &ThreadState) {
         (&self.vm, &mut self.heap, &self.state)
     }
 
-    pub fn state(&self) -> &ContextState {
+    pub fn state(&self) -> &ThreadState {
         &self.state
     }
 
@@ -523,9 +521,9 @@ impl Thread {
         Errors::from_vm_error(&self.vm, &mut self.heap, &self.state, err).map(|v| v.raw())
     }
 
-    pub fn run_runtime(&mut self, f: RuntimeCall, args: &[Value]) -> Result<Value, VmError> {
+    pub fn run_runtime(&mut self, f: NativeFn, args: &[Value]) -> Result<Value, VmError> {
         let exception = self.heap.known().exception.as_tagged(&self.heap).raw();
-        let nctx = RuntimeContext::new(&self.vm, &mut self.heap, &self.state);
+        let nctx = HostCtx::new(&self.vm, &mut self.heap, &self.state);
         // stage a rooted copy: the runtime may keep reading it across its
         // own allocations
         // Safety: caller-owned words staged before any allocation.
@@ -625,7 +623,7 @@ impl VM {
             threads: Mutex::new(Vec::new()),
             interner,
             prototype_registry: PrototypeRegistry::new(),
-            runtimes: RuntimeRegistry::new(),
+            runtimes: NativeRegistry::new(),
             states: Mutex::new(Vec::new()),
             weak_slots: Mutex::new(Vec::new()),
             shutdown_requested: AtomicBool::new(false),
@@ -664,19 +662,19 @@ impl VM {
         &self.shared.interner
     }
 
-    pub fn runtimes(&self) -> &RuntimeRegistry {
+    pub fn runtimes(&self) -> &NativeRegistry {
         &self.shared.runtimes
     }
 
     #[inline]
-    pub fn runtime(&self, index: RuntimeIndex) -> RuntimeCall {
+    pub fn runtime(&self, index: NativeIndex) -> NativeFn {
         self.shared
             .runtimes
             .get(index)
             .expect("unknown runtime index")
     }
 
-    pub fn register_runtime(&mut self, f: RuntimeCall) -> RuntimeIndex {
+    pub fn register_runtime(&mut self, f: NativeFn) -> NativeIndex {
         Arc::get_mut(&mut self.shared)
             .expect("cannot register runtimes on a shared VM")
             .runtimes
@@ -711,7 +709,7 @@ impl VM {
         // Safety: root-slot reads stored straight into rooted fill cells.
         let the_hole = heap.known().the_hole.raw();
         let undefined = heap.known().undefined.raw();
-        let state = Arc::new(ContextState {
+        let state = Arc::new(ThreadState {
             handles: HandleData::new(the_hole),
             stack: Stack::new(STACK_SLOTS, undefined, undefined),
             frame_base: StdCell::new(0),

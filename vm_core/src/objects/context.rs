@@ -50,21 +50,21 @@ impl EdgeVisitable for ScopeInfo {
 }
 
 #[repr(C)]
-pub struct Context {
+pub struct ContextObject {
     pub header: Header,
-    pub outer: OptionGcSlot<Context>,
+    pub outer: OptionGcSlot<ContextObject>,
     pub slots: GcSlot<FixedArray>,
     pub scope_info: GcSlot<ScopeInfo>,
 }
 
 pub struct ContextInit<'a> {
-    pub outer: Option<Handle<'a, Context>>,
+    pub outer: Option<Handle<'a, ContextObject>>,
     pub slots: Handle<'a, FixedArray>,
     pub scope_info: Handle<'a, ScopeInfo>,
 }
 
-impl HeapObject for Context {
-    const KIND: ObjectKind = ObjectKind::Context;
+impl HeapObject for ContextObject {
+    const KIND: ObjectKind = ObjectKind::ContextObject;
     type Init<'a> = ContextInit<'a>;
 
     fn layout_for(_config: &Self::Init<'_>) -> Layout {
@@ -94,7 +94,7 @@ impl HeapObject for Context {
     }
 }
 
-impl EdgeVisitable for Context {
+impl EdgeVisitable for ContextObject {
     fn visit_edges(&self, visitor: &mut dyn Visitor) {
         visitor.visit(self.header.map.as_raw());
         visitor.visit(self.outer.as_raw());

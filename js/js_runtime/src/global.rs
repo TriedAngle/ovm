@@ -1,20 +1,20 @@
 //! ES 19: function properties of the global object (eval, isNaN).
 
+use vm_core::HostCtx;
 use vm_core::Object;
-use vm_core::RuntimeContext;
 use vm_core::materialize::Materialize;
 use vm_core::{
-    Args, Context, ContextState, Convert, DenseString, Errors, Handle, HandleSlice, Heap, Smi,
-    Tagged, VM, Value, VmError,
+    Args, ContextObject, Convert, DenseString, Errors, Handle, HandleSlice, Heap, Smi, Tagged,
+    ThreadState, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
 pub fn eval_runtime<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     state.handle_scope(|scope| {
@@ -53,7 +53,7 @@ pub fn eval_runtime<'a>(
             }
         };
 
-        let Some(context) = scope.cast::<Context>(heap, context.as_tagged(heap)) else {
+        let Some(context) = scope.cast::<ContextObject>(heap, context.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
         let closure = rt_try!(
@@ -62,7 +62,7 @@ pub fn eval_runtime<'a>(
             state,
             Materialize::closure_vm(vm, heap, state, &scope, &program, context)
         );
-        match RuntimeContext::call(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
+        match HostCtx::enter(vm, heap, state, closure.erase(), HandleSlice::EMPTY, None)
             .map(|v| v.raw())
         {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
@@ -73,11 +73,11 @@ pub fn eval_runtime<'a>(
 
 /// `isNaN(x)`: ToNumber(x) is NaN.
 pub fn is_nan<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let n = rt_try!(
@@ -99,11 +99,11 @@ pub fn is_nan<'a>(
 /// `print(x)`: ToString(x) to stdout followed by a newline (a shell
 /// convenience, not an ES builtin; the Octane runner reports through it).
 pub fn print<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     if args.len() < 2 {
@@ -158,7 +158,7 @@ fn primitive_to_string(heap: &Heap, v: Tagged<'_, Value>) -> Option<String> {
 fn console_arg_cold(
     vm: &VM,
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     arg: Handle<'_, Value>,
 ) -> Result<Option<String>, VmError> {
     let Some(s) = Object::to_string(vm, heap, state, arg)? else {
@@ -177,11 +177,11 @@ fn console_arg_cold(
 /// spaces, and write the result to stdout followed by a newline (Node's
 /// single-line formatting; a shell convenience, not an ES builtin).
 pub fn console_log<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let RuntimeContext {
+    let HostCtx {
         vm, heap, state, ..
     } = nctx;
     let mut parts: Vec<String> = Vec::with_capacity(args.len().saturating_sub(1));
@@ -205,7 +205,7 @@ pub fn console_log<'a>(
 /// `performance.now()`: fractional milliseconds since the Unix epoch
 /// (shell timing convenience mirroring the browser API).
 pub fn performance_now<'a>(
-    nctx: RuntimeContext<'a>,
+    nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
     _args: Args,
 ) -> Tagged<'a, Value> {

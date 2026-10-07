@@ -22,7 +22,7 @@ impl FnBuilder {
     /// stages the accumulator into window slot 0 (the lowest address,
     /// `base + len - 1`), `obj` into slot 1, and the pooled constant into
     /// slot 2, then calls.
-    pub fn call_runtime_staged(&mut self, f: crate::RuntimeFn, args: &[RtArg]) {
+    pub fn call_runtime_staged(&mut self, f: crate::BuiltinFn, args: &[RtArg]) {
         let mark = self.temp_depth();
         let base = self.reserve_temps(args.len() as u32);
         let slot = |i: usize| Reg::new(base.index() + (args.len() - 1 - i) as i32);
@@ -825,7 +825,7 @@ impl FnBuilder {
         );
     }
 
-    pub fn call_runtime(&mut self, f: crate::RuntimeFn, args: RegList) {
+    pub fn call_runtime(&mut self, f: crate::BuiltinFn, args: RegList) {
         let [base, count] = args.operands();
         self.emit_tracked(Opcode::CallRuntime, &[f as u32, base, count]);
     }

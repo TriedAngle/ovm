@@ -1,7 +1,6 @@
-use crate::runtime_api::make_runtime_plain_function_in;
 use crate::{
-    Args, Handle, HandleScope, HandleSlice, Heap, Map, MapInit, MapKind, Object,
-    PropertyDescriptor, RuntimeContext, RuntimeIndex, StringInterner, Tagged, Value, VmError,
+    Args, Handle, HandleScope, HandleSlice, Heap, HostCtx, Map, MapInit, MapKind, NativeIndex,
+    Object, PropertyDescriptor, StringInterner, Tagged, Value, VmError,
 };
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -13,31 +12,31 @@ pub struct KetteTools;
 
 impl KetteTools {
     pub fn force_minor_gc<'a>(
-        ctx: RuntimeContext<'a>,
+        ctx: HostCtx<'a>,
         _new_target: Option<Handle<'_, Value>>,
         _args: Args,
     ) -> Tagged<'a, Value> {
-        let RuntimeContext { heap, .. } = ctx;
+        let HostCtx { heap, .. } = ctx;
         heap.collect_minor();
         heap.known().undefined.as_tagged(heap).erase()
     }
 
     pub fn force_major_gc<'a>(
-        ctx: RuntimeContext<'a>,
+        ctx: HostCtx<'a>,
         _new_target: Option<Handle<'_, Value>>,
         _args: Args,
     ) -> Tagged<'a, Value> {
-        let RuntimeContext { heap, .. } = ctx;
+        let HostCtx { heap, .. } = ctx;
         heap.collect();
         heap.known().undefined.as_tagged(heap).erase()
     }
 
     pub fn shutdown<'a>(
-        ctx: RuntimeContext<'a>,
+        ctx: HostCtx<'a>,
         _new_target: Option<Handle<'_, Value>>,
         _args: Args,
     ) -> Tagged<'a, Value> {
-        let RuntimeContext {
+        let HostCtx {
             vm, heap, state, ..
         } = ctx;
         heap.cancel_executions(&|| {});
@@ -66,22 +65,22 @@ impl KetteTools {
             scope.handle(heap.new_object(scope, map, HandleSlice::EMPTY))
         };
 
-        let methods: &[(&str, RuntimeIndex)] = &[
+        let methods: &[(&str, NativeIndex)] = &[
             (
                 "forceMinorGC",
-                RuntimeIndex(bytecode::RuntimeFn::ForceMinorGc as usize),
+                NativeIndex(bytecode::BuiltinFn::ForceMinorGc as usize),
             ),
             (
                 "forceMajorGC",
-                RuntimeIndex(bytecode::RuntimeFn::ForceMajorGc as usize),
+                NativeIndex(bytecode::BuiltinFn::ForceMajorGc as usize),
             ),
             (
                 "shutdown",
-                RuntimeIndex(bytecode::RuntimeFn::ShutdownVm as usize),
+                NativeIndex(bytecode::BuiltinFn::ShutdownVm as usize),
             ),
         ];
         for (name, index) in methods {
-            let method = make_runtime_plain_function_in(heap, scope, *index)?;
+            let method = Object::native_plain_function(heap, scope, *index)?;
             let name_str = interner.intern_str(heap, scope, name);
             let method_name = scope.handle(name_str.as_tagged(heap));
             Object::define_own_property(

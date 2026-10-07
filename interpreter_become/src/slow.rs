@@ -8,10 +8,10 @@
 
 use bytecode::Opcode;
 use vm_core::ic::{CallRecord, InlineCache};
-use vm_core::interp::{unwind, Unwind};
+use vm_core::interpreter::{unwind, Unwind};
 use vm_core::proxy::Proxy;
 use vm_core::{
-    CallTarget, CallableInfoObject, Callee, Coercion, Context, ContextInit, ContextState, Convert,
+    CallTarget, CallableInfoObject, Callee, Coercion, ContextObject, ContextInit, ThreadState, Convert,
     Ctx, FixedArray, HandleSlice, Heap, Object, Recv, ScopeInfo, Smi, StoreSemantics, Tagged,
     Value, VmError,
 };
@@ -447,7 +447,7 @@ slow_handler!(slow_call_function_proxy |ip, ops, regs, acc, ctx, float| {
 #[inline(never)]
 pub fn construct_cache_record(
     heap: &mut Heap,
-    state: &ContextState,
+    state: &ThreadState,
     scope: &vm_core::HandleScope,
     callee: vm_core::Handle<'_, Object>,
     obj: vm_core::Handle<'_, Object>,
@@ -506,8 +506,8 @@ fn create_closure_slow<'a>(ctx: &Ctx<'a>, info_idx: usize) -> Result<Tagged<'a, 
             return Err(VmError::Type);
         };
         let context = scope
-            .cast::<Context>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
-            .expect("frame context slot holds a Context");
+            .cast::<ContextObject>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
+            .expect("frame context slot holds a ContextObject");
         let obj = Object::create_closure(heap, &scope, info, context)?;
         Ok(obj.erase())
     })
@@ -524,8 +524,8 @@ fn create_function_context_slow<'a>(
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
-            .expect("frame context slot holds a Context");
+            .cast::<ContextObject>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
+            .expect("frame context slot holds a ContextObject");
         let count = ctx
             .constants_ref(heap)
             .at(heap, scope_idx)
@@ -541,7 +541,7 @@ fn create_function_context_slow<'a>(
             let values = scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
             heap.allocate_handle::<FixedArray>(values, &scope)
         };
-        let ctx_obj = heap.allocate::<Context>(ContextInit {
+        let ctx_obj = heap.allocate::<ContextObject>(ContextInit {
             outer: Some(outer),
             slots,
             scope_info,
@@ -710,13 +710,13 @@ pub fn slow_call_method_miss<'a>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(rt)) => {
+        Some(CallTarget::Native(rt)) => {
             InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
                 callee_word,
-                CallRecord::Runtime(rt),
+                CallRecord::Native(rt),
             );
             Ok(MethodCall::Value(dispatch_runtime_scattered(
                 ctx,
@@ -773,13 +773,13 @@ pub fn slow_call_function_miss<'a>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(rt)) => {
+        Some(CallTarget::Native(rt)) => {
             InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
                 callee_word,
-                CallRecord::Runtime(rt),
+                CallRecord::Native(rt),
             );
             Ok(MethodCall::Value(dispatch_runtime_scattered(
                 ctx,
@@ -836,13 +836,13 @@ pub fn slow_call_miss<'a>(
     match Object::call_target(ctx.heap(), callee_word) {
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
-        Some(CallTarget::Runtime(rt)) => {
+        Some(CallTarget::Native(rt)) => {
             InlineCache::call_update(
                 ctx.heap(),
                 ctx.feedback_ref(ctx.heap()),
                 fb,
                 callee_word,
-                CallRecord::Runtime(rt),
+                CallRecord::Native(rt),
             );
             Ok(MethodCall::Value(ctx.call_runtime(
                 rt,
@@ -891,15 +891,15 @@ fn create_block_context_slow<'a>(
     state.handle_scope(|scope| -> Result<Tagged<'a, Value>, VmError> {
         let base = ctx.frame_base();
         let outer = scope
-            .cast::<Context>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
-            .expect("frame context slot holds a Context");
+            .cast::<ContextObject>(heap, ctx.stack().frame_header(base).context_slot().get(heap))
+            .expect("frame context slot holds a ContextObject");
         let slots = if count == 0 {
             heap.known().empty_fixed_array
         } else {
             let values = scope.stage(&vec![heap.known().the_hole.as_tagged(heap).erase(); count]);
             heap.allocate_handle::<FixedArray>(values, &scope)
         };
-        let ctx_obj = heap.allocate::<Context>(ContextInit {
+        let ctx_obj = heap.allocate::<ContextObject>(ContextInit {
             outer: Some(outer),
             slots,
             scope_info: heap.known().empty_scope_info,

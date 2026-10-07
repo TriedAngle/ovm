@@ -55,7 +55,7 @@ pub const SUPER_STORE_WRITE_THROUGH: u32 = 1;
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RuntimeFn {
+pub enum BuiltinFn {
     /// (obj) -> iterator — GetProperty(obj, @@iterator) + Call (ES 8.5.4)
     GetIterator,
     /// (iterator) -> result object — Call(GetProperty(iter, "next"), iter)
@@ -177,7 +177,7 @@ pub enum RuntimeFn {
     ShutdownVm,
 }
 
-impl RuntimeFn {
+impl BuiltinFn {
     /// All variants in discriminant order. The array length is the
     /// variant count (type-checked), and the VM registers its table in
     /// this order so registry indices equal discriminants.

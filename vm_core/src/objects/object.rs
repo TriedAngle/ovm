@@ -1,10 +1,10 @@
 use core::alloc::Layout;
 
 use crate::{
-    CallableInfoObject, Coercion, Context, ContextState, Convert, DenseString, EdgeVisitable,
-    FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
-    HeapObject, Hint, Lookup, Map, ObjectKind, PropertyDescriptor, RuntimeContext, RuntimeIndex,
-    SlotName, Smi, Symbol, Tagged, VM, Value, Visitor, VmError,
+    CallableInfoObject, Coercion, ContextObject, Convert, DenseString, EdgeVisitable, FixedArray,
+    Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap, HeapObject, Hint,
+    HostCtx, Lookup, Map, NativeIndex, ObjectKind, PropertyDescriptor, SlotName, Smi, Symbol,
+    Tagged, ThreadState, VM, Value, Visitor, VmError,
 };
 
 #[repr(C)]
@@ -29,11 +29,14 @@ impl Object {
         Some(unsafe { info.cast() })
     }
 
-    pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, Context>> {
+    pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, ContextObject>> {
         if !self.header.map.get(heap).kind().is_callable() {
             return None;
         }
-        self.slots.get(heap).at(heap, 1).get_as::<Context>(heap)
+        self.slots
+            .get(heap)
+            .at(heap, 1)
+            .get_as::<ContextObject>(heap)
     }
 
     /// The `idx`-th entry of the callable's constant pool, as a slot name.
@@ -45,24 +48,22 @@ impl Object {
 
     #[inline]
     pub fn runtime_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
-        if !self.header.map.get(heap).kind().is_runtime() {
+        if !self.header.map.get(heap).kind().is_native() {
             return None;
         }
         let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
         usize::try_from(idx).ok()
     }
 
-    /// The RUNTIME-kind slot-0 Smi decoded to a call target half: the
+    /// The NATIVE-kind slot-0 Smi decoded to a call target half: the
     /// value is the callee's registry runtime index.
     #[inline]
     pub fn runtime_call_target<'a>(&'a self, heap: &'a Heap) -> Option<CallTarget<'a>> {
-        if !self.header.map.get(heap).kind().is_runtime() {
+        if !self.header.map.get(heap).kind().is_native() {
             return None;
         }
         let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
-        Some(CallTarget::Runtime(RuntimeIndex(
-            usize::try_from(idx).ok()?,
-        )))
+        Some(CallTarget::Native(NativeIndex(usize::try_from(idx).ok()?)))
     }
 
     #[inline(always)]
@@ -155,10 +156,10 @@ pub enum CallTarget<'a> {
     Bytecode {
         target: Tagged<'a, Object>,
         info: Tagged<'a, CallableInfoObject>,
-        context: Tagged<'a, Context>,
+        context: Tagged<'a, ContextObject>,
         kind: FunctionKind,
     },
-    Runtime(RuntimeIndex),
+    Native(NativeIndex),
     /// A callable proxy: `[[Call]]` dispatches through the `apply` trap.
     Proxy(Tagged<'a, Object>),
 }
@@ -174,14 +175,14 @@ impl Object {
         if !kind.is_callable() {
             return None;
         }
-        if kind.is_runtime() {
+        if kind.is_native() {
             return obj.as_ref().runtime_call_target(heap);
         }
         // every non-runtime callable object is laid out with
         // `[callable info, context]` in its first two slots
         let slots = obj.as_ref().slots.get(heap);
         let info = unsafe { slots.at(heap, 0).cast::<CallableInfoObject>() };
-        let context = unsafe { slots.at(heap, 1).cast::<Context>() };
+        let context = unsafe { slots.at(heap, 1).cast::<ContextObject>() };
         let descriptor = info.descriptor.to_smi_unchecked().value() as u64;
         let register_count = (descriptor & 0xffff) as usize;
         let formal_min = ((descriptor >> 16) & 0xffff) as usize;
@@ -205,7 +206,7 @@ impl Object {
         let obj = f.as_heap_object()?;
         let slots = obj.as_ref().slots.get(heap);
         let info = unsafe { slots.at(heap, 0).cast::<CallableInfoObject>() };
-        let context = unsafe { slots.at(heap, 1).cast::<Context>() };
+        let context = unsafe { slots.at(heap, 1).cast::<ContextObject>() };
         let descriptor = info.descriptor.to_smi_unchecked().value() as u64;
         Some(CallTarget::Bytecode {
             target: obj,
@@ -381,7 +382,7 @@ impl Object {
         heap: &'a mut Heap,
         scope: &HandleScope<'_>,
         info: Handle<'_, CallableInfoObject>,
-        context: Handle<'_, Context>,
+        context: Handle<'_, ContextObject>,
     ) -> Result<Tagged<'a, Object>, VmError> {
         let info_ref = info.as_tagged(heap);
         let kind = info_ref.function_kind();
@@ -489,7 +490,7 @@ impl Object {
     pub fn to_primitive<'a>(
         vm: &'a VM,
         heap: &'a mut Heap,
-        state: &'a ContextState,
+        state: &'a ThreadState,
         value: Handle<'_, Value>,
         hint: Hint,
     ) -> Result<Coercion<'a>, VmError> {
@@ -499,7 +500,7 @@ impl Object {
         // the receiver stays rooted throughout: method lookups and calls
         // below run user code (getters, valueOf/toString), which allocates
         // and would leave a raw copy dangling
-        RuntimeContext::new(vm, heap, state).handle_scope(|vm, heap, state, scope| {
+        HostCtx::new(vm, heap, state).handle_scope(|vm, heap, state, scope| {
             // 1. exotic @@toPrimitive (GetMethod)
             let exotic = match Lookup::get_property_on(
                 vm,
@@ -528,9 +529,8 @@ impl Object {
                     }
                 };
                 let args = scope.stage(&[hint_string]);
-                let result = scope.handle(RuntimeContext::call(
-                    vm, &mut *heap, state, exotic, args, None,
-                )?);
+                let result =
+                    scope.handle(HostCtx::enter(vm, &mut *heap, state, exotic, args, None)?);
                 if result.as_tagged(heap) == heap.known().exception.as_tagged(heap) {
                     return Ok(Coercion::Threw);
                 }
@@ -559,9 +559,8 @@ impl Object {
                     continue;
                 }
                 let args = scope.stage(&[value.as_tagged(heap)]);
-                let result = scope.handle(RuntimeContext::call(
-                    vm, &mut *heap, state, method, args, None,
-                )?);
+                let result =
+                    scope.handle(HostCtx::enter(vm, &mut *heap, state, method, args, None)?);
                 if result.as_tagged(heap) == heap.known().exception.as_tagged(heap) {
                     return Ok(Coercion::Threw);
                 }
@@ -579,7 +578,7 @@ impl Object {
     pub fn to_numeric(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         value: Handle<'_, Value>,
     ) -> Result<Option<f64>, VmError> {
         state.handle_scope(|scope| {
@@ -601,7 +600,7 @@ impl Object {
     pub fn to_string<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         value: Handle<'_, Value>,
     ) -> Result<Option<Tagged<'a, Value>>, VmError> {
         state.handle_scope(|scope| {
@@ -621,7 +620,7 @@ impl Object {
     pub fn numeric_op<'a>(
         vm: &'a VM,
         heap: &'a mut Heap,
-        state: &'a ContextState,
+        state: &'a ThreadState,
         a: Handle<'_, Value>,
         b: Handle<'_, Value>,
         op: fn(f64, f64) -> f64,
@@ -652,7 +651,7 @@ impl Object {
     pub fn to_property_key<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         v: Handle<'_, Value>,
     ) -> Result<Option<Tagged<'a, SlotName>>, VmError> {
         // Smis are pointer-free: valid at any lifetime, no rooting needed.
@@ -722,7 +721,7 @@ impl Object {
     pub fn instance_of(
         vm: &VM,
         heap: &mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         object: Handle<'_, Value>,
         callable: Handle<'_, Value>,
     ) -> Result<Option<bool>, VmError> {
@@ -787,7 +786,7 @@ impl Object {
     pub fn create_construct_receiver_value<'a>(
         vm: &VM,
         heap: &'a mut Heap,
-        state: &ContextState,
+        state: &ThreadState,
         new_target: Handle<'_, Value>,
     ) -> Result<Option<Tagged<'a, Value>>, VmError> {
         state.handle_scope(|scope| {

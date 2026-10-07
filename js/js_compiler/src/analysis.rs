@@ -1485,7 +1485,7 @@ impl<'a, 'p, 'f> Deriver<'a, 'p, 'f> {
         Fid(0)
     }
 
-    /// Context hops for every resolved reference: the hosting context's
+    /// ContextObject hops for every resolved reference: the hosting context's
     /// node (owning function, class, or lexical for-head) found by scope
     /// walk, the depth counted over the use site's node ancestors.
     fn compute_reference_depths(&mut self) {
