@@ -1,9 +1,18 @@
 use core::{alloc::Layout, cell::UnsafeCell, cmp::Ordering};
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, Map, MapKind, ObjectKind,
-    Smi, Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, Key, Lookup, Map, MapKind,
+    ObjectKind, PropertyDescriptor, SlotName, Smi, Tagged, Value, Visitor,
 };
+
+/// A String exotic own key (ES 10.4.3.4 StringGetOwnProperty): `length` or
+/// an in-range code-unit index. The one-code-unit value is materialized by
+/// the caller that has an allocation scope.
+#[derive(Copy, Clone)]
+pub enum StringOwn {
+    Length(usize),
+    Index(usize),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
@@ -146,6 +155,95 @@ pub struct DenseString {
 }
 
 impl DenseString {
+    /// The backing string of a String primitive or String wrapper (slot 0 of
+    /// a `PRIMITIVE_WRAPPER` whose value is a string); `None` otherwise.
+    /// The single entry point for String exotic own properties.
+    #[inline]
+    pub fn from_receiver<'a>(
+        heap: &'a Heap,
+        receiver: Tagged<'a, Value>,
+    ) -> Option<Tagged<'a, DenseString>> {
+        let obj = receiver.as_heap_object()?;
+        let kind = obj.as_ref().header.map.get(heap).kind();
+        if kind.contains(MapKind::PRIMITIVE_WRAPPER) {
+            return obj
+                .as_ref()
+                .slots
+                .get(heap)
+                .at(heap, 0)
+                .get_as::<DenseString>(heap);
+        }
+        if kind.kind() == ObjectKind::DenseString {
+            // Safety: the map kind is DenseString, so the view is exact.
+            return Some(unsafe { obj.cast::<DenseString>() });
+        }
+        None
+    }
+
+    /// Classify `name` as a String exotic own key (ES 10.4.3.4): `length` or
+    /// an in-range code-unit index. The interned `"length"` name makes the
+    /// common check a single pointer compare.
+    #[inline]
+    pub fn own_key<'a>(&self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Option<StringOwn> {
+        if name
+            .erase()
+            .ptr_eq(heap.known().strings.length.as_tagged(heap))
+        {
+            return Some(StringOwn::Length(self.len()));
+        }
+        match Lookup::classify_key(heap, name.erase()) {
+            Ok(Key::Element(i)) if i < self.len() => Some(StringOwn::Index(i)),
+            _ => None,
+        }
+    }
+
+    /// ES 10.4.3.4 StringGetOwnProperty for a String primitive or wrapper:
+    /// `"length"` and in-range indices as full descriptors. The one-unit
+    /// value allocation happens after the string borrow is dropped.
+    pub fn own_descriptor<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        receiver: Tagged<'_, Value>,
+        key: Tagged<'_, Value>,
+    ) -> Option<PropertyDescriptor<'s>> {
+        let s = Self::from_receiver(heap, receiver)?;
+        match s.as_ref().own_key(heap, key.as_name())? {
+            StringOwn::Length(len) => Some(PropertyDescriptor::Data {
+                value: scope.handle(Smi::new(len as i64).into_tagged()),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            }),
+            StringOwn::Index(i) => {
+                let unit = s.as_ref().code_unit(heap, i);
+                let value = DenseString::from_units(heap, scope, &[unit]).erase();
+                Some(PropertyDescriptor::Data {
+                    value,
+                    writable: false,
+                    enumerable: true,
+                    configurable: false,
+                })
+            }
+        }
+    }
+
+    /// The one-unit string an index load on a String primitive or wrapper
+    /// yields (ES 5.4.3.1): `"ab"[1]` is "b". `None` for out-of-range keys
+    /// and non-string receivers, which fall through to the ordinary path.
+    pub fn index_element<'a>(
+        heap: &'a mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: Handle<'_, Value>,
+        key: Handle<'_, SlotName>,
+    ) -> Option<Tagged<'a, Value>> {
+        let Ok(Key::Element(i)) = Lookup::classify_key(heap, key.as_tagged(heap).erase()) else {
+            return None;
+        };
+        let s = Self::from_receiver(heap, receiver.as_tagged(heap))?;
+        let unit = (i < s.as_ref().len()).then(|| s.as_ref().code_unit(heap, i))?;
+        Some(Self::from_units(heap, scope, &[unit]).as_tagged(heap).erase())
+    }
+
     fn data_ptr(&self) -> *mut u8 {
         UnsafeCell::raw_get(self.data.as_ptr())
     }
@@ -219,24 +317,6 @@ impl DenseString {
             Encoding::Latin1 => unsafe { *self.data_ptr().add(i) as u16 },
             Encoding::Utf16 => unsafe { *self.data_ptr().cast::<u16>().add(i) },
         }
-    }
-
-    /// The one-code-unit string at index `i`, freshly allocated (string
-    /// comparisons are by content, so identity never shows). `None` when
-    /// the receiver is not a string or `i` is out of range (ES 6.1.4:
-    /// string indices are code units).
-    pub fn char_at<'s>(
-        heap: &mut Heap,
-        scope: &'s HandleScope<'_>,
-        receiver: Handle<'_, Value>,
-        i: usize,
-    ) -> Option<Handle<'s, DenseString>> {
-        let unit = receiver
-            .as_tagged(heap)
-            .get_as::<DenseString>(heap)
-            .filter(|s| i < s.len())
-            .map(|s| s.code_unit(heap, i))?;
-        Some(Self::from_units(heap, scope, &[unit]))
     }
 
     pub fn to_rust_string(&self, heap: &Heap) -> String {

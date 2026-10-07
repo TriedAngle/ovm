@@ -8,7 +8,7 @@ use vm_core::proxy::Proxy;
 
 use vm_core::{
     Args, Convert, DenseString, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor,
-    SlotName, Smi, Tagged, ThreadState, VM, Value, VmError,
+    SlotName, Smi, StringOwn, Tagged, ThreadState, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -139,15 +139,14 @@ pub fn object_create<'a>(
 /// descriptors array is insertion-ordered).
 pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
     let mut keys = Vec::new();
-    // String primitive: ToObject exposes index keys then the "length" key
-    // (ES 10.4.3.5 StringOwnPropertyKeys, deferred string keys last).
-    if let Some(s) = target.get_as::<DenseString>(heap) {
+    // String exotic own keys: indices then the non-enumerable "length"
+    // (ES 10.4.3.5). Wrappers may also carry ordinary own descriptors.
+    if let Some(s) = DenseString::from_receiver(heap, target) {
         keys.reserve(s.len() + 1);
         for i in 0..s.len() {
             keys.push(Smi::new(i as i64).encode());
         }
         keys.push(heap.known().strings.length.raw());
-        return keys;
     }
     let Some(obj) = target.as_heap_object() else {
         return keys;
@@ -201,16 +200,8 @@ pub fn object_has_own_property<'a>(
         let key = scope.handle(key);
         let has = 'has: {
             let key = key.as_tagged(heap);
-            if let Some(s) = receiver.as_tagged(heap).get_as::<DenseString>(heap) {
-                // String exotic own properties: "length" plus index code units
-                let key = key.erase();
-                if key.ptr_eq(heap.known().strings.length.as_tagged(heap).erase()) {
-                    break 'has true;
-                }
-                break 'has matches!(
-                    Lookup::classify_key(heap, key),
-                    Ok(Key::Element(i)) if i < s.len()
-                );
+            if let Some(s) = DenseString::from_receiver(heap, receiver.as_tagged(heap)) {
+                break 'has s.as_ref().own_key(heap, key).is_some();
             }
             if let Key::Element(i) =
                 Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
@@ -257,15 +248,11 @@ pub fn object_property_is_enumerable<'a>(
         let key = scope.handle(key);
         let enumerable = 'enumerable: {
             let key = key.as_tagged(heap);
-            if let Some(s) = receiver.as_tagged(heap).get_as::<DenseString>(heap) {
+            if let Some(s) = DenseString::from_receiver(heap, receiver.as_tagged(heap)) {
                 // String indices are enumerable; "length" is not
-                let key = key.erase();
-                if key.ptr_eq(heap.known().strings.length.as_tagged(heap).erase()) {
-                    break 'enumerable false;
-                }
                 break 'enumerable matches!(
-                    Lookup::classify_key(heap, key),
-                    Ok(Key::Element(i)) if i < s.len()
+                    s.as_ref().own_key(heap, key),
+                    Some(StringOwn::Index(_))
                 );
             }
             if let Key::Element(i) =
@@ -372,9 +359,9 @@ pub fn object_get_own_property_descriptor<'a>(
         // the &mut heap borrow below does not overlap the target/key reads.
         let target_v = unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) };
         let key_v = unsafe { Tagged::<Value>::from_value_unchecked(key.raw()) };
-        let desc = if target_v.get_as::<DenseString>(heap).is_some() {
-            // String primitive: ToObject exposes `length` and index own props
-            DenseString::own_property_descriptor(heap, &scope, target_v, key_v)
+        let desc = if DenseString::from_receiver(heap, target_v).is_some() {
+            // String exotic: ToObject exposes `length` and index own props
+            DenseString::own_descriptor(heap, &scope, target_v, key_v)
         } else {
             Lookup::ordinary_own_descriptor(heap, &scope, target_v, key_v)
         };

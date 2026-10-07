@@ -83,10 +83,27 @@ impl Object {
         if !self.is_array(heap) {
             return None;
         }
-        let s = name.erase().get_as::<DenseString>(heap)?.as_ref();
-        s.data(heap)
-            .matches_ascii(b"length")
+        name.erase()
+            .ptr_eq(heap.known().strings.length.as_tagged(heap))
             .then(|| self.length.get(heap).erase())
+    }
+
+    /// ES 7.3.26 PrivateElementFind restricted to fields: an own data
+    /// descriptor matching the private Symbol key (no prototype walk — private
+    /// elements live only on the instance itself).
+    pub fn private_find<'a>(
+        heap: &'a Heap,
+        obj: Tagged<'a, Value>,
+        key: Tagged<'a, Value>,
+    ) -> Option<&'a GcSlot> {
+        let o = obj.as_heap_object()?;
+        let map = o.as_ref().header.map.get(heap);
+        for d in map.descriptors() {
+            if d.name(heap).ptr_eq(key.as_name()) && !d.flags().is_accessor() {
+                return Some(o.as_ref().slot(heap, d.offset()));
+            }
+        }
+        None
     }
 
     /// The object's map (shape).

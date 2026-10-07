@@ -2,7 +2,7 @@ use crate::proxy::Proxy;
 use crate::{
     AccessorPair, Coercion, Convert, DenseString, FixedArray, Float, GcSlot, Handle, HandleScope,
     Heap, HeapObject, HostCtx, Map, Object, PartialDescriptor, PropertyDescriptor, SlotFlags,
-    SlotName, Smi, Stack, StringData, Symbol, Tagged, ThreadState, VM, Value, VmError,
+    SlotName, Smi, StringData, StringOwn, Symbol, Tagged, ThreadState, VM, Value, VmError,
 };
 
 pub enum Lookup<'a> {
@@ -106,17 +106,13 @@ impl Lookup<'_> {
         {
             return Ok(LoadOutcome::Value(v));
         }
-        // string primitives expose `length` (UTF-16 code units) as an own
-        // property without boxing (ES 5.4.3.1); index loads need a fresh
-        // one-character string and stay unsupported here
-        if let Some(s) = holder.get_as::<DenseString>(heap)
-            && name
-                .erase()
-                .get_as::<DenseString>(heap)
-                .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
+        // String exotic own properties (`length` is allocation-free); index
+        // values are materialized by the keyed cold path, which has an
+        // allocation scope.
+        if let Some(s) = DenseString::from_receiver(heap, holder)
+            && let Some(StringOwn::Length(len)) = s.as_ref().own_key(heap, name)
         {
-            let len = s.len() as i64;
-            return Ok(LoadOutcome::Value(Smi::new(len).into_tagged()));
+            return Ok(LoadOutcome::Value(Smi::new(len as i64).into_tagged()));
         }
         // unboxed primitive receivers: property lookup continues on the
         // primitive's prototype (ES 7.3.8 GetV). Own exotic properties
@@ -251,6 +247,12 @@ impl Lookup<'_> {
         receiver: Tagged<'a, Value>,
         name: Tagged<'a, SlotName>,
     ) -> bool {
+        // String exotics own `length` and in-range indices
+        if let Some(s) = DenseString::from_receiver(heap, receiver)
+            && s.as_ref().own_key(heap, name).is_some()
+        {
+            return true;
+        }
         let name = match Lookup::classify_key(heap, name.erase()) {
             Ok(Key::Element(i)) => {
                 // non-array receivers keep index keys as Smi-named
@@ -271,8 +273,7 @@ impl Lookup<'_> {
         // "length" may live in an array's internal slot at any chain level
         if name
             .erase()
-            .get_as::<DenseString>(heap)
-            .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
+            .ptr_eq(heap.known().strings.length.as_tagged(heap))
         {
             return array_length_in_chain(heap, receiver);
         }
@@ -360,51 +361,6 @@ impl Lookup<'_> {
                 heap.known().undefined.as_tagged(heap).erase(),
             )),
         }
-    }
-
-    /// The super constructor of the frame's running function: its own
-    /// [[Prototype]] (ES 10.2.2.2 GetSuperConstructor). `None` when the
-    /// prototype is absent or not a constructor. (Multiple prototypes are not
-    /// supported here: construction is not a property lookup.)
-    pub fn super_constructor<'a>(
-        heap: &'a Heap,
-        stack: &Stack,
-        base: usize,
-    ) -> Option<Tagged<'a, Value>> {
-        let callable = stack.frame_header(base).callable_slot().get(heap);
-        let obj = callable.as_heap_object()?;
-        let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
-        // must be a real constructor
-        let proto_obj = proto.as_heap_object()?;
-        if !proto_obj
-            .as_ref()
-            .header
-            .map
-            .get(heap)
-            .kind()
-            .is_constructor()
-        {
-            return None;
-        }
-        Some(proto)
-    }
-
-    /// ES 7.3.26 PrivateElementFind restricted to fields: an own data
-    /// descriptor matching the private Symbol key (no prototype walk — private
-    /// elements live only on the instance itself).
-    pub fn private_find<'a>(
-        heap: &'a Heap,
-        obj: Tagged<'a, Value>,
-        key: Tagged<'a, Value>,
-    ) -> Option<&'a GcSlot> {
-        let o = obj.as_heap_object()?;
-        let map = o.as_ref().header.map.get(heap);
-        for d in map.descriptors() {
-            if d.name(heap).ptr_eq(key.as_name()) && !d.flags().is_accessor() {
-                return Some(o.as_ref().slot(heap, d.offset()));
-            }
-        }
-        None
     }
 
     /// Same, with the lookup start (`holder`) split from the getter
@@ -546,9 +502,6 @@ fn super_start_from_proto<'a>(heap: &'a Heap, proto: Option<Tagged<'a, Value>>) 
     SuperStart::Object(proto)
 }
 
-/// Whether any object in `receiver`'s prototype chain (receiver
-/// included) is an array — its `length` is an own non-configurable
-/// property invisible to the descriptor walk.
 fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> bool {
     let mut current = receiver;
     loop {
@@ -577,63 +530,8 @@ fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> boo
     }
 }
 
-impl DenseString {
-    /// ES 10.4.3.4 StringGetOwnProperty for a String exotic (or primitive)
-    /// receiver: the non-writable, non-enumerable, non-configurable
-    /// `"length"`, plus each in-range index as a one-code-unit, enumerable
-    /// value. `None` for any other key. The one-code-unit value allocation
-    /// happens only after the string borrow is dropped.
-    pub fn own_property_descriptor<'s>(
-        heap: &mut Heap,
-        scope: &'s HandleScope<'_>,
-        receiver: Tagged<'_, Value>,
-        key: Tagged<'_, Value>,
-    ) -> Option<PropertyDescriptor<'s>> {
-        let s = receiver.get_as::<DenseString>(heap)?;
-        if key
-            .get_as::<DenseString>(heap)
-            .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
-        {
-            let len = s.len();
-            return Some(PropertyDescriptor::Data {
-                value: scope.handle(Smi::new(len as i64).into_tagged()),
-                writable: false,
-                enumerable: false,
-                configurable: false,
-            });
-        }
-        let unit = match Lookup::classify_key(heap, key) {
-            Ok(Key::Element(i)) if i < s.len() => s.code_unit(heap, i),
-            _ => return None,
-        };
-        // `s` is no longer read past here, so the allocation may borrow
-        let value = DenseString::from_units(heap, scope, &[unit]).erase();
-        Some(PropertyDescriptor::Data {
-            value,
-            writable: false,
-            enumerable: true,
-            configurable: false,
-        })
-    }
-
-    /// The one-unit string an index load on a string primitive yields
-    /// (ES 5.4.3.1): `"ab"[1]` is "b". `None` for out-of-range keys and
-    /// non-string receivers, which fall through to the ordinary property
-    /// path.
-    pub fn index_element<'a>(
-        heap: &'a mut Heap,
-        scope: &HandleScope<'_>,
-        receiver: Handle<'_, Value>,
-        key: Handle<'_, SlotName>,
-    ) -> Option<Tagged<'a, Value>> {
-        let Ok(Key::Element(i)) = Lookup::classify_key(heap, key.as_tagged(heap).erase()) else {
-            return None;
-        };
-        DenseString::char_at(heap, scope, receiver, i).map(|s| s.as_tagged(heap).erase())
-    }
-}
-
 impl<'a, T> Tagged<'a, T> {
+    #[inline(always)]
     pub fn lookup(self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
         let Some(obj) = self.erase().as_heap_object() else {
             return Lookup::NotFound;
@@ -643,6 +541,7 @@ impl<'a, T> Tagged<'a, T> {
 }
 
 impl<'s, T> Handle<'s, T> {
+    #[inline(always)]
     pub fn lookup<'a>(self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a>
     where
         T: 'a,

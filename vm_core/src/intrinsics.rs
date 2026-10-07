@@ -6,8 +6,8 @@
 use crate::{
     AccessorPair, Args, Coercion, ContextObject, Convert, DenseString, FixedArray, Handle,
     HandleSlice, Heap, Key, LoadOutcome, Lookup, Object, ObjectSlotsInit, PropertyDescriptor,
-    SlotName, Smi, StoreOutcome, StoreSemantics, StringData, Symbol, Tagged, Transition, Value,
-    VmError,
+    SlotName, Smi, StoreOutcome, StoreSemantics, StringData, StringOwn, Symbol, Tagged, Transition,
+    Value, VmError,
 };
 
 use crate::Float;
@@ -191,35 +191,23 @@ fn delete_property_core(
     if nullish {
         return Err(VmError::Type);
     }
-    // primitives: ToObject creates a fresh wrapper whose only own
-    // properties are a string's non-configurable length/indices
+    // String exotic own properties ("length"/indices) are non-configurable,
+    // for primitives and String wrappers alike (ES 10.4.3.4); every other
+    // primitive property deletes as absent (true).
+    if let Some(s) = DenseString::from_receiver(heap, target.as_tagged(heap))
+        && s.as_ref()
+            .own_key(heap, key.as_tagged(heap).as_name())
+            .is_some()
+    {
+        return Ok(false);
+    }
     if Convert::is_primitive(heap, target.as_tagged(heap)) {
-        let owned = string_exotic_own(heap, target.as_tagged(heap), key.as_tagged(heap));
-        return Ok(!owned);
+        return Ok(true);
     }
     let receiver = scope
         .cast::<Object>(heap, target.as_tagged(heap))
         .expect("non-primitive receivers are objects");
     Object::delete_own_property(heap, scope, receiver, key)
-}
-
-/// Whether a ToObject'd primitive owns `key` non-configurably: only
-/// String wrappers own anything — "length" and their indices (ES
-/// 10.4.3.3/4 StringGetOwnProperty). Deleting those yields false; every
-/// other primitive property deletes as absent (true).
-fn string_exotic_own(heap: &Heap, target: Tagged<'_, Value>, key: Tagged<'_, Value>) -> bool {
-    let Some(s) = target.get_as::<DenseString>(heap) else {
-        return false;
-    };
-    if let Some(idx) = Smi::decode(key.raw()) {
-        let i = idx.value();
-        return i >= 0 && (i as u64) < s.len() as u64;
-    }
-    let Some(name) = key.get_as::<DenseString>(heap) else {
-        return false; // symbols own nothing on primitives
-    };
-    let data = name.as_ref().data(heap);
-    data.matches_ascii(b"length") || Lookup::canonical_index(data).is_some_and(|i| i < s.len())
 }
 
 /// Sloppy `delete x` on an unresolved name (ES 13.5.1.2 step 5 →
@@ -348,7 +336,7 @@ fn for_in_initial_level<'a>(
     heap: &'a Heap,
     subject: Tagged<'a, Value>,
 ) -> Option<Tagged<'a, Value>> {
-    if subject.get_as::<DenseString>(heap).is_some() {
+    if DenseString::from_receiver(heap, subject).is_some() {
         return Some(subject);
     }
     if !Convert::is_primitive(heap, subject) {
@@ -401,12 +389,10 @@ fn for_in_level_keys<'s>(
         let level = level.as_tagged(heap);
         let mut indices: Vec<i64> = Vec::new();
         let mut names: Vec<Handle<'s, Value>> = Vec::new();
-        if let Some(s) = level.get_as::<DenseString>(heap) {
-            // string exotic: the only own string keys are the indices
-            // ("length" is non-enumerable; the wrapper's own "length"
-            // shadowing String.prototype additions is not modeled)
+        // string exotic: indices first; wrappers may also carry ordinary
+        // descriptors, so this does not break out
+        if let Some(s) = DenseString::from_receiver(heap, level) {
             indices.extend(0..s.len() as i64);
-            break 'keys (indices, names);
         }
         let Some(obj) = level.as_heap_object() else {
             break 'keys (indices, names);
@@ -688,7 +674,7 @@ fn for_in_next_level<'s>(
 fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value>) -> Option<bool> {
     match Lookup::classify_key(heap, key).ok()? {
         Key::Element(i) => {
-            if let Some(s) = level.get_as::<DenseString>(heap) {
+            if let Some(s) = DenseString::from_receiver(heap, level) {
                 // string indices are enumerable own properties
                 return Some((i as u64) < s.len() as u64);
             }
@@ -706,6 +692,12 @@ fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value
                 .map(|d| d.flags().is_enumerable())
         }
         Key::Name(name) => {
+            // string exotics: indices are enumerable, "length" is not
+            if let Some(s) = DenseString::from_receiver(heap, level)
+                && let Some(own) = s.as_ref().own_key(heap, name)
+            {
+                return Some(matches!(own, StringOwn::Index(_)));
+            }
             let obj = level.as_heap_object()?;
             let obj = obj.as_ref();
 
@@ -925,7 +917,7 @@ fn copy_data_properties<'a>(
         if source_tagged.ptr_eq(heap.known().null.as_tagged(heap))
             || source_tagged.ptr_eq(heap.known().undefined.as_tagged(heap))
             || (Convert::is_primitive(heap, source_tagged)
-                && source_tagged.get_as::<DenseString>(heap).is_none())
+                && DenseString::from_receiver(heap, source_tagged).is_none())
         {
             return target.as_tagged(heap);
         }
@@ -947,55 +939,52 @@ fn copy_data_properties<'a>(
         // named descriptors in insertion order; collected AFTER the
         // exclusion canonicalization so no allocation can stale them
         let keys: Vec<Handle<'_, Value>> = {
-            // String primitive source: ToObject fronts the code units as
-            // own enumerable index properties (ES 10.4.3.4); `length` is
+            let mut keys = Vec::new();
+            // String primitive or wrapper: ToObject exposes the code units
+            // as own enumerable index properties (ES 10.4.3.4); `length` is
             // non-enumerable, so it is not copied.
-            if let Some(s) = source.as_tagged(heap).get_as::<DenseString>(heap) {
-                let len = s.len();
-                let mut keys = Vec::with_capacity(len);
-                for i in 0..len {
+            if let Some(s) = DenseString::from_receiver(heap, source.as_tagged(heap)) {
+                keys.reserve(s.len());
+                for i in 0..s.len() {
                     keys.push(scope.handle(Smi::new(i as i64)));
                 }
-                keys
-            } else {
-                let Some(obj) = source.as_tagged(heap).as_heap_object() else {
-                    return target.as_tagged(heap);
-                };
-                let obj = obj.as_ref();
-                let mut keys = Vec::new();
-                if obj.is_array(heap) {
-                    let len = obj
-                        .length()
-                        .min(obj.elements_array(heap).map(|e| e.len()).unwrap_or(0));
-                    for i in 0..len {
-                        if obj.element_value(heap, i).is_some() {
-                            keys.push(scope.handle(Smi::new(i as i64)));
-                        }
-                    }
-                }
-                for d in obj.header.map.get(heap).descriptors() {
-                    if d.flags().is_enumerable() {
-                        keys.push(scope.handle(d.name(heap).erase()));
-                    }
-                }
-                keys
             }
+            let Some(obj) = source.as_tagged(heap).as_heap_object() else {
+                return target.as_tagged(heap);
+            };
+            let obj = obj.as_ref();
+            if obj.is_array(heap) {
+                let len = obj
+                    .length()
+                    .min(obj.elements_array(heap).map(|e| e.len()).unwrap_or(0));
+                for i in 0..len {
+                    if obj.element_value(heap, i).is_some() {
+                        keys.push(scope.handle(Smi::new(i as i64)));
+                    }
+                }
+            }
+            for d in obj.header.map.get(heap).descriptors() {
+                if d.flags().is_enumerable() {
+                    keys.push(scope.handle(d.name(heap).erase()));
+                }
+            }
+            keys
         };
-        let string_source = source.as_tagged(heap).get_as::<DenseString>(heap).is_some();
         for key in keys {
             let key_name = key.as_tagged(heap).as_name();
             if excluded.iter().any(|e| e.as_tagged(heap).ptr_eq(key_name)) {
                 continue;
             }
-            let value = if string_source {
-                // one code unit at the index (fresh string, as required)
-                let Some(i) = key.as_tagged(heap).raw().to_i64() else {
-                    continue;
-                };
-                match DenseString::char_at(heap, &scope, source, i as usize) {
-                    Some(c) => scope.handle(c.as_tagged(heap).erase()),
-                    None => continue,
-                }
+            // the one code unit at a string index (fresh string, as required)
+            let string_char = match (
+                DenseString::from_receiver(heap, source.as_tagged(heap)),
+                key.as_tagged(heap).raw().to_i64(),
+            ) {
+                (Some(s), Some(i)) if (i as usize) < s.len() => Some(s.code_unit(heap, i as usize)),
+                _ => None,
+            };
+            let value = if let Some(unit) = string_char {
+                DenseString::from_units(heap, &scope, &[unit]).erase()
             } else {
                 // full [[Get]] (getters may run)
                 match rt_try!(
@@ -1070,7 +1059,7 @@ fn private_get<'a>(
     } = nctx;
     let obj = args.get(heap, 0);
     let key = args.get(heap, 1);
-    match Lookup::private_find(heap, obj, key) {
+    match Object::private_find(heap, obj, key) {
         Some(s) => s.get(heap),
         None => raise_runtime(vm, heap, state, VmError::Type),
     }
@@ -1091,7 +1080,7 @@ fn private_set<'a>(
     let value = value.raw();
     let obj_tagged = obj.raw();
     // Safety: fresh rooted words above; `private_find` allocates nothing.
-    match Lookup::private_find(
+    match Object::private_find(
         heap,
         unsafe { Tagged::<Value>::from_value_unchecked(obj_tagged) },
         key,
@@ -1123,7 +1112,7 @@ fn private_in<'a>(
     } = nctx;
     let key = args.get_handle(heap, 0);
     let obj = args.get_handle(heap, 1);
-    let has = Lookup::private_find(heap, obj.as_tagged(heap), key.as_tagged(heap)).is_some();
+    let has = Object::private_find(heap, obj.as_tagged(heap), key.as_tagged(heap)).is_some();
     Convert::boolean(heap, has)
 }
 
@@ -1335,7 +1324,7 @@ fn frame_super_parts<'a>(
         return Err(VmError::Type);
     }
     let base = state.frame_base();
-    let Some(callee) = Lookup::super_constructor(heap, &state.stack, base) else {
+    let Some(callee) = state.stack.super_constructor(heap, base) else {
         return Err(VmError::Type);
     };
     Ok((

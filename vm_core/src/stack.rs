@@ -331,6 +331,30 @@ impl Stack {
         self.frame_header(base).callable(heap)
     }
 
+    /// The super constructor of the frame's running function: its own
+    /// [[Prototype]] (ES 10.2.2.2 GetSuperConstructor). `None` when the
+    /// prototype is absent or not a constructor. (Multiple prototypes are
+    /// not supported here: construction is not a property lookup.)
+    pub fn super_constructor<'a>(
+        &self,
+        heap: &'a Heap,
+        base: usize,
+    ) -> Option<Tagged<'a, Value>> {
+        let callable = self.frame_header(base).callable_slot().get(heap);
+        let obj = callable.as_heap_object()?;
+        let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
+        // must be a real constructor
+        let proto_obj = proto.as_heap_object()?;
+        proto_obj
+            .as_ref()
+            .header
+            .map
+            .get(heap)
+            .kind()
+            .is_constructor()
+            .then_some(proto)
+    }
+
     /// The frame's current context, re-read under a heap borrow.
     pub fn context<'a>(&self, heap: &'a Heap, base: usize) -> Tagged<'a, Value> {
         self.frame_header(base).context(heap)

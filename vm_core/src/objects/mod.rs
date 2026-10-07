@@ -30,7 +30,7 @@ pub use map::{AccessorPair, Map, MapInit, MapKind, SlotDescriptor, SlotFlags, Sl
 pub use object::{CallTarget, Object, ObjectInit, ObjectSlotsInit};
 pub use prototype_info::{PrototypeInfo, PrototypeInfoInit};
 pub use proxy::{ProxyInit, ProxyObject};
-pub use string::{DenseString, Encoding, StringData, decode_wtf8, string_content_hash};
+pub use string::{DenseString, Encoding, StringData, StringOwn, decode_wtf8, string_content_hash};
 pub use symbol::Symbol;
 
 use core::{alloc::Layout, ptr::NonNull};
