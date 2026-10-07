@@ -2,7 +2,7 @@
 
 use vm_core::HostCtx;
 use vm_core::Object;
-use vm_core::{Args, Convert, DenseString, Handle, Heap, Smi, Tagged, Value, VmError};
+use vm_core::{Args, Convert, DenseString, Handle, Heap, Smi, Tagged, Value, VmError, WrapperKind};
 use vm_core::{raise_runtime, rt_try};
 
 pub fn number_constructor<'a>(
@@ -47,20 +47,16 @@ pub fn number_value_of<'a>(
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let HostCtx {
-        vm, heap, state, ..
-    } = nctx;
-    let arg = args.get(heap, 0);
-    match Object::wrapper_value(
-        heap,
-        // Safety: fresh rooted-slot word, no allocation since the read.
-        unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
-    )
-    .map(|v| v.raw())
-    {
-        Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
-        Err(err) => return raise_runtime(vm, heap, state, err),
-    }
+    // The result crosses this call boundary, so root it: `wrapper_value`
+    // borrows the heap immutably, and a handle releases that borrow before
+    // the `TypeError` path needs the heap mutably.
+    nctx.handle_scope(|vm, heap, state, scope| {
+        let v = match Object::wrapper_value(heap, args.get(heap, 0), WrapperKind::Number) {
+            Ok(v) => scope.handle(v),
+            Err(err) => return raise_runtime(vm, heap, state, err),
+        };
+        v.as_tagged(heap).erase()
+    })
 }
 
 pub fn number_to_string<'a>(
@@ -68,33 +64,23 @@ pub fn number_to_string<'a>(
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let HostCtx {
-        vm, heap, state, ..
-    } = nctx;
-    let _ = vm;
-    state.handle_scope(|scope| {
-        let arg = args.get(heap, 0);
-        let v = match Object::wrapper_value(
-            heap,
-            // Safety: fresh rooted-slot word, no allocation since the read.
-            unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
-        )
-        .map(|v| v.raw())
-        {
-            Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+    nctx.handle_scope(|vm, heap, state, scope| {
+        // root the receiver: `Convert::to_string` allocates a fresh string
+        let v = match Object::wrapper_value(heap, args.get(heap, 0), WrapperKind::Number) {
+            Ok(v) => scope.handle(v),
             Err(err) => return raise_runtime(vm, heap, state, err),
         };
-        let v = scope.handle(v);
-        match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
-            Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+        let s = match Convert::to_string(heap, &scope, v) {
+            Ok(v) => scope.handle(v),
             Err(err) => return raise_runtime(vm, heap, state, err),
-        }
+        };
+        s.as_tagged(heap).erase()
     })
 }
 
 /// The numeric `this` of a Number.prototype method (receiver or wrapper).
 fn number_receiver(heap: &Heap, args: Args) -> Result<f64, VmError> {
-    let v = Object::wrapper_value(heap, args.get(heap, 0))?;
+    let v = Object::wrapper_value(heap, args.get(heap, 0), WrapperKind::Number)?;
     Convert::to_number(heap, v)
 }
 
@@ -105,10 +91,7 @@ pub fn number_to_fixed<'a>(
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let HostCtx {
-        vm, heap, state, ..
-    } = nctx;
-    state.handle_scope(|scope| {
+    nctx.handle_scope(|vm, heap, state, scope| {
         let x = rt_try!(vm, heap, state, number_receiver(heap, args));
         let digits = match (args.len() > 1).then(|| args.get(heap, 1)) {
             Some(d) if d != heap.known().undefined.as_tagged(heap) => {
@@ -116,8 +99,7 @@ pub fn number_to_fixed<'a>(
                 rt_try!(vm, heap, state, Convert::to_number(heap, d)) as i64
             }
             _ => 0,
-        };
-        if !(0..=100).contains(&digits) {
+        };        if !(0..=100).contains(&digits) {
             return raise_runtime(vm, heap, state, VmError::OutOfBounds);
         }
         let text = if x.is_nan() {
@@ -141,18 +123,16 @@ pub fn number_to_precision<'a>(
     _new_target: Option<Handle<'_, Value>>,
     args: Args,
 ) -> Tagged<'a, Value> {
-    let HostCtx {
-        vm, heap, state, ..
-    } = nctx;
-    state.handle_scope(|scope| {
+    nctx.handle_scope(|vm, heap, state, scope| {
         let x = rt_try!(vm, heap, state, number_receiver(heap, args));
         let arg = args.get(heap, 1);
         if arg == heap.known().undefined.as_tagged(heap) {
             let v = scope.handle(heap.new_number(x));
-            return match Convert::to_string(heap, &scope, v).map(|v| v.raw()) {
-                Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
+            let s = match Convert::to_string(heap, &scope, v) {
+                Ok(v) => scope.handle(v),
                 Err(err) => return raise_runtime(vm, heap, state, err),
             };
+            return s.as_tagged(heap).erase();
         }
         let p = rt_try!(vm, heap, state, Convert::to_number(heap, arg)) as i64;
         if !(1..=100).contains(&p) {

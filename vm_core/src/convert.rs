@@ -193,6 +193,27 @@ impl Convert {
             || v.get_as::<Symbol>(heap).is_some()
     }
 
+    /// ES 7.1.13 ToObject for the primitive kinds that expose a distinct
+    /// prototype: the prototype of a number/string/boolean primitive is the
+    /// matching builtin prototype (symbols have no exposed prototype in this
+    /// VM). `None` for objects and for the no-prototype primitives.
+    #[inline]
+    pub fn primitive_prototype<'a>(
+        heap: &'a Heap,
+        v: Tagged<'a, Value>,
+    ) -> Option<Tagged<'a, Value>> {
+        let known = heap.known();
+        if v.is_smi() || v.get_as::<Float>(heap).is_some() {
+            Some(known.number_prototype.as_tagged(heap).erase())
+        } else if v.get_as::<DenseString>(heap).is_some() {
+            Some(known.string_prototype.as_tagged(heap).erase())
+        } else if v == known.true_object.as_tagged(heap) || v == known.false_object.as_tagged(heap) {
+            Some(known.boolean_prototype.as_tagged(heap).erase())
+        } else {
+            None
+        }
+    }
+
     /// ES ToString on a primitive (no ToPrimitive recursion: the input is
     /// already primitive). Numbers allocate a fresh string, symbols are a
     /// TypeError. The oddball identity strings come from the string table.
@@ -203,66 +224,54 @@ impl Convert {
         scope: &HandleScope<'_>,
         v: Handle<'_, Value>,
     ) -> Result<Tagged<'a, Value>, VmError> {
-        enum PrimitiveString {
-            Smi(i64),
-            IsString,
-            Float(f64),
-            Undefined,
-            Null,
-            True,
-            False,
-            Other,
+        // `word` is a plain copy; the handle stays rooted across the
+        // allocations below, and no heap borrow spans an allocation.
+        let word = v.raw();
+        // Smis allocate a fresh string.
+        if let Some(smi) = Smi::decode(word) {
+            let s = DenseString::from_utf8(heap, scope, &smi.value().to_string());
+            return Ok(s.as_tagged(heap).erase());
         }
-        let kind = {
-            let vt = v.as_tagged(heap);
+        // The singletons map to interned identity strings, no allocation.
+        {
             let known = heap.known();
-            let word = vt.raw();
-            if let Some(smi) = Smi::decode(word) {
-                PrimitiveString::Smi(smi.value())
-            } else if word == known.undefined.as_tagged(heap) {
-                PrimitiveString::Undefined
+            let identity = if word == known.undefined.as_tagged(heap) {
+                Some(known.strings.undefined)
             } else if word == known.null.as_tagged(heap) {
-                PrimitiveString::Null
+                Some(known.strings.null)
             } else if word == known.true_object.as_tagged(heap) {
-                PrimitiveString::True
+                Some(known.strings.true_)
             } else if word == known.false_object.as_tagged(heap) {
-                PrimitiveString::False
-            } else if vt.get_as::<DenseString>(heap).is_some() {
-                PrimitiveString::IsString
-            } else if let Some(f) = vt.get_as::<Float>(heap) {
-                PrimitiveString::Float(f.value.get())
+                Some(known.strings.false_)
             } else {
-                PrimitiveString::Other
+                None
+            };
+            if let Some(name) = identity {
+                return Ok(name.as_tagged(heap).erase());
             }
-        };
-        match kind {
-            PrimitiveString::Smi(n) => {
-                let s = DenseString::from_utf8(heap, scope, &n.to_string());
-                Ok(s.as_tagged(heap).erase())
-            }
-            // strings are their own stringification
-            PrimitiveString::IsString => Ok(v.as_tagged(heap)),
-            PrimitiveString::Undefined => {
-                Ok(heap.known().strings.undefined.as_tagged(heap).erase())
-            }
-            PrimitiveString::Null => Ok(heap.known().strings.null.as_tagged(heap).erase()),
-            PrimitiveString::True => Ok(heap.known().strings.true_.as_tagged(heap).erase()),
-            PrimitiveString::False => Ok(heap.known().strings.false_.as_tagged(heap).erase()),
-            PrimitiveString::Float(x) => {
-                let text = if x.is_nan() {
-                    "NaN".to_string()
-                } else if x == f64::INFINITY {
-                    "Infinity".to_string()
-                } else if x == f64::NEG_INFINITY {
-                    "-Infinity".to_string()
-                } else {
-                    format!("{x}")
-                };
-                let s = DenseString::from_utf8(heap, scope, &text);
-                Ok(s.as_tagged(heap).erase())
-            }
-            // symbols (and anything else reaching this point) are a TypeError
-            PrimitiveString::Other => Err(VmError::Type),
         }
+        // Strings are their own stringification.
+        if v.as_tagged(heap).get_as::<DenseString>(heap).is_some() {
+            return Ok(v.as_tagged(heap));
+        }
+        // Floats allocate a fresh string; the tagged view is copied out
+        // before the allocation so its heap borrow is released.
+        let float = v.as_tagged(heap).get_as::<Float>(heap);
+        if let Some(f) = float {
+            let x = f.value.get();
+            let text = if x.is_nan() {
+                "NaN".to_string()
+            } else if x == f64::INFINITY {
+                "Infinity".to_string()
+            } else if x == f64::NEG_INFINITY {
+                "-Infinity".to_string()
+            } else {
+                format!("{x}")
+            };
+            let s = DenseString::from_utf8(heap, scope, &text);
+            return Ok(s.as_tagged(heap).erase());
+        }
+        // Symbols (and anything else reaching this point) are a TypeError.
+        Err(VmError::Type)
     }
 }

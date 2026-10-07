@@ -170,7 +170,7 @@ impl HandleDataImpl {
 }
 
 impl HandleData {
-    pub fn new(fill: Value) -> Self {
+    pub fn new(fill: Tagged<'_, Value>) -> Self {
         let mut inner = HandleDataImpl {
             blocks: Vec::new(),
             next: std::ptr::null_mut(),

@@ -918,11 +918,14 @@ fn copy_data_properties<'a>(
     let excluded: Vec<Handle<'_, Value>> = (0..n - 2).map(|i| args.get_handle(heap, i)).collect();
     {
         let source_tagged = source.as_tagged(heap);
-        // null/undefined and other primitives contribute nothing (string
-        // sources would need boxing)
+        // null/undefined contribute nothing; so do the primitives whose
+        // ToObject wrapper has no own enumerable properties. Strings are
+        // the exception: their indices are own enumerable properties, so
+        // they fall through to the string branch below.
         if source_tagged.ptr_eq(heap.known().null.as_tagged(heap))
             || source_tagged.ptr_eq(heap.known().undefined.as_tagged(heap))
-            || Convert::is_primitive(heap, source_tagged)
+            || (Convert::is_primitive(heap, source_tagged)
+                && source_tagged.get_as::<DenseString>(heap).is_none())
         {
             return target.as_tagged(heap);
         }
@@ -944,42 +947,66 @@ fn copy_data_properties<'a>(
         // named descriptors in insertion order; collected AFTER the
         // exclusion canonicalization so no allocation can stale them
         let keys: Vec<Handle<'_, Value>> = {
-            let Some(obj) = source.as_tagged(heap).as_heap_object() else {
-                return target.as_tagged(heap);
-            };
-            let obj = obj.as_ref();
-            let mut keys = Vec::new();
-            if obj.is_array(heap) {
-                let len = obj
-                    .length()
-                    .min(obj.elements_array(heap).map(|e| e.len()).unwrap_or(0));
+            // String primitive source: ToObject fronts the code units as
+            // own enumerable index properties (ES 10.4.3.4); `length` is
+            // non-enumerable, so it is not copied.
+            if let Some(s) = source.as_tagged(heap).get_as::<DenseString>(heap) {
+                let len = s.len();
+                let mut keys = Vec::with_capacity(len);
                 for i in 0..len {
-                    if obj.element_value(heap, i).is_some() {
-                        keys.push(scope.handle(Smi::new(i as i64)));
+                    keys.push(scope.handle(Smi::new(i as i64)));
+                }
+                keys
+            } else {
+                let Some(obj) = source.as_tagged(heap).as_heap_object() else {
+                    return target.as_tagged(heap);
+                };
+                let obj = obj.as_ref();
+                let mut keys = Vec::new();
+                if obj.is_array(heap) {
+                    let len = obj
+                        .length()
+                        .min(obj.elements_array(heap).map(|e| e.len()).unwrap_or(0));
+                    for i in 0..len {
+                        if obj.element_value(heap, i).is_some() {
+                            keys.push(scope.handle(Smi::new(i as i64)));
+                        }
                     }
                 }
-            }
-            for d in obj.header.map.get(heap).descriptors() {
-                if d.flags().is_enumerable() {
-                    keys.push(scope.handle(d.name(heap).erase()));
+                for d in obj.header.map.get(heap).descriptors() {
+                    if d.flags().is_enumerable() {
+                        keys.push(scope.handle(d.name(heap).erase()));
+                    }
                 }
+                keys
             }
-            keys
         };
+        let string_source = source.as_tagged(heap).get_as::<DenseString>(heap).is_some();
         for key in keys {
             let key_name = key.as_tagged(heap).as_name();
             if excluded.iter().any(|e| e.as_tagged(heap).ptr_eq(key_name)) {
                 continue;
             }
-            // full [[Get]] (getters may run)
-            let value = match rt_try!(
-                vm,
-                heap,
-                state,
-                Lookup::get_property_on(vm, heap, state, source, source, key)
-            ) {
-                Coercion::Threw => return heap.known().exception.as_tagged(heap).erase(),
-                Coercion::Value(v) => scope.handle(v),
+            let value = if string_source {
+                // one code unit at the index (fresh string, as required)
+                let Some(i) = key.as_tagged(heap).raw().to_i64() else {
+                    continue;
+                };
+                match DenseString::char_at(heap, &scope, source, i as usize) {
+                    Some(c) => scope.handle(c.as_tagged(heap).erase()),
+                    None => continue,
+                }
+            } else {
+                // full [[Get]] (getters may run)
+                match rt_try!(
+                    vm,
+                    heap,
+                    state,
+                    Lookup::get_property_on(vm, heap, state, source, source, key)
+                ) {
+                    Coercion::Threw => return heap.known().exception.as_tagged(heap).erase(),
+                    Coercion::Value(v) => scope.handle(v),
+                }
             };
             // CreateDataProperty: skipped when already present
             let exists = !matches!(
@@ -1532,7 +1559,8 @@ fn install_accessor<'a>(
         let key = scope.handle(key);
         let is_getter = flags & 1 != 0;
         let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
-        if target.as_tagged(heap).as_heap_object().is_none() {
+        // ES 7.3.5 ToPropertyDescriptor target: Type(O) must be Object
+        if Convert::is_primitive(heap, target.as_tagged(heap)) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         let name = match rt_try!(
@@ -1665,7 +1693,8 @@ fn define_own_property<'a>(
                 Flow::Value(true) => receiver.as_tagged(heap),
             };
         }
-        if receiver.as_tagged(heap).as_heap_object().is_none() {
+        // Type(O) must be Object (ES 20.1.2.4 [[DefineOwnProperty]])
+        if Convert::is_primitive(heap, receiver.as_tagged(heap)) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         let name = match rt_try!(

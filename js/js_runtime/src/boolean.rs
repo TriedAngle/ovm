@@ -2,7 +2,7 @@
 
 use vm_core::HostCtx;
 use vm_core::raise_runtime;
-use vm_core::{Args, Convert, Handle, Object, Tagged, Value};
+use vm_core::{Args, Convert, Handle, Object, Tagged, Value, WrapperKind};
 
 pub fn boolean_constructor<'a>(
     nctx: HostCtx<'a>,
@@ -39,6 +39,7 @@ pub fn boolean_value_of<'a>(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
         unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
+        WrapperKind::Boolean,
     )
     .map(|v| v.raw())
     {
@@ -61,6 +62,7 @@ pub fn boolean_to_string<'a>(
             heap,
             // Safety: fresh rooted-slot word, no allocation since the read.
             unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
+            WrapperKind::Boolean,
         )
         .map(|v| v.raw())
         {

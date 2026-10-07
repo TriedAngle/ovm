@@ -1,4 +1,4 @@
-use crate::{Convert, DenseString, Float, Heap, Smi, Symbol, Tagged, Value, VmError};
+use crate::{Convert, DenseString, Float, Heap, Smi, Tagged, Value, VmError};
 
 pub struct Compare;
 
@@ -7,24 +7,7 @@ impl Compare {
     /// table coerces. Heap-resident primitives (strings, symbols, Floats)
     /// and the boolean/nullish singletons are not.
     pub fn is_object_operand<'a>(heap: &Heap, v: Tagged<'a, Value>) -> bool {
-        if v.is_smi() {
-            return false;
-        }
-        let known = heap.known();
-        if v == known.null.as_tagged(heap)
-            || v == known.undefined.as_tagged(heap)
-            || v == known.true_object.as_tagged(heap)
-            || v == known.false_object.as_tagged(heap)
-        {
-            return false;
-        }
-        if v.get_as::<DenseString>(heap).is_some()
-            || v.get_as::<Float>(heap).is_some()
-            || v.get_as::<Symbol>(heap).is_some()
-        {
-            return false;
-        }
-        v.as_heap_object().is_some()
+        !Convert::is_primitive(heap, v)
     }
 
     pub fn strict_equal<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {

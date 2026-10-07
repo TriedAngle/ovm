@@ -578,6 +578,44 @@ fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> boo
 }
 
 impl DenseString {
+    /// ES 10.4.3.4 StringGetOwnProperty for a String exotic (or primitive)
+    /// receiver: the non-writable, non-enumerable, non-configurable
+    /// `"length"`, plus each in-range index as a one-code-unit, enumerable
+    /// value. `None` for any other key. The one-code-unit value allocation
+    /// happens only after the string borrow is dropped.
+    pub fn own_property_descriptor<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        receiver: Tagged<'_, Value>,
+        key: Tagged<'_, Value>,
+    ) -> Option<PropertyDescriptor<'s>> {
+        let s = receiver.get_as::<DenseString>(heap)?;
+        if key
+            .get_as::<DenseString>(heap)
+            .is_some_and(|n| n.as_ref().data(heap).matches_ascii(b"length"))
+        {
+            let len = s.len();
+            return Some(PropertyDescriptor::Data {
+                value: scope.handle(Smi::new(len as i64).into_tagged()),
+                writable: false,
+                enumerable: false,
+                configurable: false,
+            });
+        }
+        let unit = match Lookup::classify_key(heap, key) {
+            Ok(Key::Element(i)) if i < s.len() => s.code_unit(heap, i),
+            _ => return None,
+        };
+        // `s` is no longer read past here, so the allocation may borrow
+        let value = DenseString::from_units(heap, scope, &[unit]).erase();
+        Some(PropertyDescriptor::Data {
+            value,
+            writable: false,
+            enumerable: true,
+            configurable: false,
+        })
+    }
+
     /// The one-unit string an index load on a string primitive yields
     /// (ES 5.4.3.1): `"ab"[1]` is "b". `None` for out-of-range keys and
     /// non-string receivers, which fall through to the ordinary property

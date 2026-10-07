@@ -4,10 +4,29 @@ use crate::{
     NativeIndex, Object, PropertyDescriptor, Smi, Tagged, Thread, Value, VmError,
 };
 
+
+#[derive(Copy, Clone)]
+pub enum WrapperKind {
+    Number,
+    Boolean,
+    String,
+}
+
+impl WrapperKind {
+    #[inline]
+    fn matches(self, heap: &Heap, v: Tagged<'_, Value>) -> bool {
+        match self {
+            WrapperKind::Number => v.is_smi() || v.get_as::<Float>(heap).is_some(),
+            WrapperKind::Boolean => {
+                let known = heap.known();
+                v == known.true_object.as_tagged(heap) || v == known.false_object.as_tagged(heap)
+            }
+            WrapperKind::String => v.get_as::<DenseString>(heap).is_some(),
+        }
+    }
+}
+
 impl Object {
-    /// A native function object: `CALLABLE | CONSTRUCTOR | NATIVE`,
-    /// slots[0] = native index, slots[1] = empty context, [[Prototype]] =
-    /// Function.prototype.
     pub fn native_function<'s>(
         heap: &mut Heap,
         scope: &'s HandleScope<'_>,
@@ -16,7 +35,6 @@ impl Object {
         Self::make_native_object(heap, scope, index, true)
     }
 
-    /// A non-constructor native function (`Proxy.revocable`-style statics).
     pub fn native_plain_function<'s>(
         heap: &mut Heap,
         scope: &'s HandleScope<'_>,
@@ -59,8 +77,8 @@ impl Object {
         Ok(scope.handle(obj))
     }
 
-    /// Compile and run a prelude once at install time (BIND_PRELUDE,
-    /// REVOKE_PRELUDE): its top-level assignments install hidden helpers.
+
+    // TODO: get rid of this.
     pub fn run_prelude(
         thread: &mut Thread,
         scope: &HandleScope<'_>,
@@ -96,8 +114,7 @@ impl Object {
         Ok(())
     }
 
-    /// A constructor function + its prototype object (with `.constructor`),
-    /// the function installed on the global object under `name`.
+
     pub fn install_constructor<'s>(
         thread: &mut Thread,
         scope: &'s HandleScope<'_>,
@@ -202,23 +219,18 @@ impl Object {
     }
 
     /// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver — or the receiver
-    /// itself when it is an unboxed primitive: builtin `this`-values are
-    /// never auto-boxed (ES 5.2.3), so `Number.prototype.toString` and
-    /// friends must accept raw Smi/Float/string/boolean receivers.
+    /// itself when it is the matching unboxed primitive: builtin `this`-values
+    /// are never auto-boxed (ES 5.2.3), so `Number.prototype.toString` and
+    /// friends must accept raw Smi/Float/string/boolean receivers. A receiver
+    /// of the wrong primitive type (and any symbol/null/undefined) is a
+    /// TypeError.
     pub fn wrapper_value<'a>(
         heap: &'a Heap,
         receiver: Tagged<'a, Value>,
+        kind: WrapperKind,
     ) -> Result<Tagged<'a, Value>, VmError> {
-        {
-            let known = heap.known();
-            let is_primitive = receiver.as_heap_object().is_none()
-                || receiver.get_as::<Float>(heap).is_some()
-                || receiver.get_as::<DenseString>(heap).is_some()
-                || receiver == known.true_object.as_tagged(heap)
-                || receiver == known.false_object.as_tagged(heap);
-            if is_primitive {
-                return Ok(receiver);
-            }
+        if kind.matches(heap, receiver) {
+            return Ok(receiver);
         }
         let Some(obj) = receiver.as_heap_object() else {
             return Err(VmError::Type);
@@ -227,6 +239,11 @@ impl Object {
         if !map.kind().contains(MapKind::PRIMITIVE_WRAPPER) {
             return Err(VmError::Type);
         }
-        Ok(obj.as_ref().slots.get(heap).at(heap, 0))
+        let value = obj.as_ref().slots.get(heap).at(heap, 0);
+        if kind.matches(heap, value) {
+            Ok(value)
+        } else {
+            Err(VmError::Type)
+        }
     }
 }

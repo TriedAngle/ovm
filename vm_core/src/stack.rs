@@ -270,7 +270,7 @@ pub struct Stack {
 }
 
 impl Stack {
-    pub fn new(capacity: usize, fill: Value, undefined: Value) -> Self {
+    pub fn new(capacity: usize, fill: Tagged<'_, Value>, undefined: Tagged<'_, Value>) -> Self {
         Self {
             slots: (0..capacity)
                 .map(|_| unsafe { Register::from_value(fill) })
@@ -684,13 +684,13 @@ impl Stack {
         register_count: usize,
     ) -> FrameMeta {
         let info = callee.info.as_ref();
-        let bytecode = info.bytecode.get(heap).raw();
-        let constants = info.constants.get(heap).raw();
+        let bytecode = info.bytecode.get(heap);
+        let constants = info.constants.get(heap);
         let feedback = info
             .feedback
             .get(heap)
-            .map_or_else(|| heap.known().the_hole.as_tagged(heap).raw(), |v| v.raw());
-        let smi = |v: usize| Smi::new(v as i64).encode();
+            .map_or_else(|| heap.known().the_hole.as_tagged(heap).erase(), |v| v.erase());
+        let smi = |v: usize| Smi::new(v as i64).into_tagged();
         // Safety: every header word is a Smi or a strong value; the header
         // region is initialized arena space reserved by `push_frame_with`.
         let header = unsafe {
@@ -700,12 +700,12 @@ impl Stack {
                 saved_pc: Register::from_value(smi(caller.pc)),
                 saved_base: Register::from_value(smi(caller.base)),
                 feedback: Register::from_value(feedback),
-                constants: Register::from_value(constants),
-                code: Register::from_value(bytecode),
-                new_target: Register::from_value(new_target.raw()),
-                context: Register::from_value(callee.context.raw()),
+                constants: Register::from_value(constants.erase()),
+                code: Register::from_value(bytecode.erase()),
+                new_target: Register::from_value(new_target),
+                context: Register::from_value(callee.context),
                 argc: Register::from_value(smi(argc)),
-                callable: Register::from_value(callee.callable.raw()),
+                callable: Register::from_value(callee.callable),
             }
         };
         // Safety: one contiguous write over the reserved header slots.

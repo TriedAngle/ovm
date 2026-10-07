@@ -59,6 +59,7 @@ impl Value {
         self.0 & TAG_MASK == STRONG_PTR
     }
 
+    #[inline(always)]
     pub const fn is_weak_ptr(self) -> bool {
         self.0 & TAG_MASK == WEAK_PTR
     }
@@ -283,15 +284,11 @@ impl<'a, T> Tagged<'a, T> {
         self.raw.raw_address_word() == other.raw.raw_address_word()
     }
 
-    /// True when `self` is exactly `other` with the weak tag bit set — the
-    /// word a weak slot stores for `other`. One OR+compare: unlike
-    /// [`ptr_eq`] it does not run `raw_address_word`'s `is_ptr` branches.
     #[inline(always)]
     pub fn is_weak_ref_to<U>(self, other: Tagged<'a, U>) -> bool {
         self.raw.to_bits() == (other.raw.to_bits() | WEAK_PTR)
     }
 
-    /// The Smi payload as an `i64`; `None` for pointers (incl. weak).
     pub fn to_i64(self) -> Option<i64> {
         self.raw.to_i64()
     }

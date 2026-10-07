@@ -381,6 +381,11 @@ fn define_internal_h<'s>(
     if cond_13 {
         return proxy_define_h(vm, heap, state, scope, obj, name, partial);
     }
+    // [[DefineOwnProperty]] requires an Object target (ES 10.1.6): a
+    // primitive (including String/Symbol/Float) is a TypeError.
+    if Convert::is_primitive(heap, obj.as_tagged(heap)) {
+        return Err(VmError::Type);
+    }
     let undefined = scope.handle(heap.known().undefined.as_tagged(heap).erase());
     // dense array elements: element defines land in the backing
     // store, not as descriptors

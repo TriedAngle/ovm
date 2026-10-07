@@ -7,8 +7,8 @@ use vm_core::proxy::Flow;
 use vm_core::proxy::Proxy;
 
 use vm_core::{
-    Args, Convert, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor, SlotName,
-    Smi, Tagged, ThreadState, VM, Value, VmError,
+    Args, Convert, DenseString, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor,
+    SlotName, Smi, Tagged, ThreadState, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -58,9 +58,9 @@ pub fn object_constructor<'a>(
     arg.as_tagged(heap)
 }
 
-/// `Object.getPrototypeOf(o)`: the receiver's map prototype. Primitive
-/// arguments are a TypeError until ToObject boxing exists (ES5 behavior;
-/// ES2015+ boxes them).
+/// `Object.getPrototypeOf(o)` (ES 20.1.2.21): `O = ToObject(O)`, then
+/// `O.[[GetPrototypeOf]]()`. Primitives expose the matching builtin
+/// prototype (number → Number.prototype, etc.); null/undefined throw.
 pub fn object_get_prototype_of<'a>(
     nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
@@ -69,12 +69,20 @@ pub fn object_get_prototype_of<'a>(
     let HostCtx {
         vm, heap, state, ..
     } = nctx;
-    let arg = args.get(heap, 1);
-    let arg = arg;
-    let Some(obj) = arg.as_heap_object() else {
-        return raise_runtime(vm, heap, state, VmError::Type);
-    };
-    obj.as_ref().header.map.get(heap).prototype.get(heap)
+    state.handle_scope(|scope| {
+        let rooted = scope.handle(args.get(heap, 1));
+        // Safety: rooted in `scope`, no allocation/GC since the read.
+        let value = unsafe { Tagged::<Value>::from_value_unchecked(rooted.raw()) };
+        if let Some(proto) = Convert::primitive_prototype(heap, value) {
+            // Safety: builtin prototype handle, rooted for the heap's life.
+            return unsafe { Tagged::from_value_unchecked(proto.raw()) };
+        }
+        let Some(obj) = value.as_heap_object() else {
+            // null / undefined: ToObject throws
+            return raise_runtime(vm, heap, state, VmError::Type);
+        };
+        obj.as_ref().header.map.get(heap).prototype.get(heap)
+    })
 }
 
 /// `Object.create(O [, Properties])` (ES 20.1.2.2): a fresh extensible
@@ -131,6 +139,16 @@ pub fn object_create<'a>(
 /// descriptors array is insertion-ordered).
 pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
     let mut keys = Vec::new();
+    // String primitive: ToObject exposes index keys then the "length" key
+    // (ES 10.4.3.5 StringOwnPropertyKeys, deferred string keys last).
+    if let Some(s) = target.get_as::<DenseString>(heap) {
+        keys.reserve(s.len() + 1);
+        for i in 0..s.len() {
+            keys.push(Smi::new(i as i64).encode());
+        }
+        keys.push(heap.known().strings.length.raw());
+        return keys;
+    }
     let Some(obj) = target.as_heap_object() else {
         return keys;
     };
@@ -183,6 +201,17 @@ pub fn object_has_own_property<'a>(
         let key = scope.handle(key);
         let has = 'has: {
             let key = key.as_tagged(heap);
+            if let Some(s) = receiver.as_tagged(heap).get_as::<DenseString>(heap) {
+                // String exotic own properties: "length" plus index code units
+                let key = key.erase();
+                if key.ptr_eq(heap.known().strings.length.as_tagged(heap).erase()) {
+                    break 'has true;
+                }
+                break 'has matches!(
+                    Lookup::classify_key(heap, key),
+                    Ok(Key::Element(i)) if i < s.len()
+                );
+            }
             if let Key::Element(i) =
                 Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
@@ -228,6 +257,17 @@ pub fn object_property_is_enumerable<'a>(
         let key = scope.handle(key);
         let enumerable = 'enumerable: {
             let key = key.as_tagged(heap);
+            if let Some(s) = receiver.as_tagged(heap).get_as::<DenseString>(heap) {
+                // String indices are enumerable; "length" is not
+                let key = key.erase();
+                if key.ptr_eq(heap.known().strings.length.as_tagged(heap).erase()) {
+                    break 'enumerable false;
+                }
+                break 'enumerable matches!(
+                    Lookup::classify_key(heap, key),
+                    Ok(Key::Element(i)) if i < s.len()
+                );
+            }
             if let Key::Element(i) =
                 Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
@@ -328,12 +368,16 @@ pub fn object_get_own_property_descriptor<'a>(
         };
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
-        let desc = Lookup::ordinary_own_descriptor(
-            heap,
-            &scope,
-            target.as_tagged(heap),
-            key.as_tagged(heap).erase(),
-        );
+        // Safety: both are rooted in `scope`; the values are re-anchored so
+        // the &mut heap borrow below does not overlap the target/key reads.
+        let target_v = unsafe { Tagged::<Value>::from_value_unchecked(target.raw()) };
+        let key_v = unsafe { Tagged::<Value>::from_value_unchecked(key.raw()) };
+        let desc = if target_v.get_as::<DenseString>(heap).is_some() {
+            // String primitive: ToObject exposes `length` and index own props
+            DenseString::own_property_descriptor(heap, &scope, target_v, key_v)
+        } else {
+            Lookup::ordinary_own_descriptor(heap, &scope, target_v, key_v)
+        };
         // root the oddball singletons once for the descriptor fields
         let true_v = scope.handle(heap.known().true_object.as_tagged(heap).erase());
         let false_v = scope.handle(heap.known().false_object.as_tagged(heap).erase());
@@ -464,16 +508,18 @@ pub fn object_set_prototype_of<'a>(
                     || !Convert::is_primitive(heap, proto.as_tagged(heap)),
             )
         };
-        // RequireObjectCoercible(O)
+        // RequireObjectCoercible(O) (ES 20.1.2.20 step 1)
         if nullish {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
-        // primitives are returned unchanged
-        if !target_is_object {
-            return target.as_tagged(heap).erase();
-        }
+        // proto must be Object or Null *before* a primitive O is returned
+        // (step 2 precedes step 3)
         if !proto_ok {
             return raise_runtime(vm, heap, state, VmError::Type);
+        }
+        // primitives are returned unchanged (step 3)
+        if !target_is_object {
+            return target.as_tagged(heap).erase();
         }
         let target_obj = scope
             .cast::<Object>(heap, target.as_tagged(heap))

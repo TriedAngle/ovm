@@ -3,7 +3,7 @@
 use vm_core::HostCtx;
 use vm_core::Object;
 use vm_core::raise_runtime;
-use vm_core::{Args, DenseString, Handle, Symbol, Tagged, Value};
+use vm_core::{Args, DenseString, Handle, Symbol, Tagged, Value, WrapperKind};
 
 pub fn string_constructor<'a>(
     nctx: HostCtx<'a>,
@@ -54,6 +54,7 @@ pub fn string_value_of<'a>(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
         unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
+        WrapperKind::String,
     )
     .map(|v| v.raw())
     {
@@ -75,6 +76,7 @@ pub fn string_to_string<'a>(
         heap,
         // Safety: fresh rooted-slot word, no allocation since the read.
         unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
+        WrapperKind::String,
     )
     .map(|v| v.raw())
     {

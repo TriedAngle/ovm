@@ -527,8 +527,8 @@ impl<T> AtomicOptionGcSlot<T> {
 pub struct Register(RawCell);
 
 impl Register {
-    pub unsafe fn from_value(v: Value) -> Self {
-        Self(unsafe { RawCell::from_word(v.to_bits()) })
+    pub unsafe fn from_value(v: Tagged<'_, Value>) -> Self {
+        Self(unsafe { RawCell::from_word(v.raw().to_bits()) })
     }
 
     pub fn get<'a>(&self, _heap: &'a Heap) -> Tagged<'a, Value> {
@@ -556,9 +556,8 @@ impl Register {
     }
 
     pub fn store<'x, T: 'x>(&self, v: Tagged<'x, T>) {
-        let raw = v.raw();
-        debug_assert!(!raw.is_weak_ptr(), "weak value stored into a strong slot");
-        self.0.store_raw(raw.to_bits());
+        debug_assert!(!v.is_weak_ptr(), "weak value stored into a strong slot");
+        self.0.store_raw(v.raw().to_bits());
     }
 
     pub fn as_raw(&self) -> &RawCell {

@@ -58,7 +58,7 @@ pub use objects::{
     HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map, MapInit, MapKind,
     Object, ObjectInit, ObjectKind, ObjectSlotsInit, PrototypeInfo, PrototypeInfoInit, ProxyInit,
     ProxyObject, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, Symbol,
-    WeakFixedArray, WeakFixedArrayInit, decode_wtf8, new_feedback_vector, object_kind,
+    WeakFixedArray, WeakFixedArrayInit, WrapperKind, decode_wtf8, new_feedback_vector, object_kind,
     object_layout, string_content_hash, visit_object,
 };
 pub use prototype::{Prototype, PrototypeRegistry};
@@ -406,7 +406,7 @@ impl SharedVM {
     /// stack handle scope; the installed object stays reachable through
     /// the global object after it dies.
     fn install_tools(&self, local: &mut Heap) {
-        let data = HandleData::new(local.known().the_hole.raw());
+        let data = HandleData::new(local.known().the_hole.as_tagged(local).erase());
         // Safety: `data` outlives every use of the scope below.
         let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
         KetteTools::install(local, &self.interner, &scope)
@@ -707,11 +707,11 @@ impl VM {
             .heap
             .new_local(&self.shared.known, &self.shared.prototype_registry);
         // Safety: root-slot reads stored straight into rooted fill cells.
-        let the_hole = heap.known().the_hole.raw();
-        let undefined = heap.known().undefined.raw();
+        let the_hole = heap.known().the_hole.as_tagged(&heap).erase();
+        let undefined = heap.known().undefined.as_tagged(&heap).erase();
         let state = Arc::new(ThreadState {
             handles: HandleData::new(the_hole),
-            stack: Stack::new(STACK_SLOTS, undefined, undefined),
+            stack: Stack::new(STACK_SLOTS, the_hole, undefined),
             frame_base: StdCell::new(0),
             frame_active: StdCell::new(false),
             acc: unsafe { Register::from_value(undefined) },

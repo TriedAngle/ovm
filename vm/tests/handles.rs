@@ -40,7 +40,7 @@ fn smi_handle(scope: &HandleScope<'_>, heap: &Heap, v: i64) -> i64 {
 
 #[test]
 fn handles_read_back_their_values() {
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let (_vm, mut thread) = anchor();
     let heap = thread.heap();
     let scope = handle_scope(&data);
@@ -56,7 +56,7 @@ fn handles_read_back_their_values() {
 
 #[test]
 fn scope_tracks_nesting_level() {
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     assert_eq!(data.level(), 0);
     let outer = handle_scope(&data);
     assert_eq!(data.level(), 1);
@@ -71,7 +71,7 @@ fn scope_tracks_nesting_level() {
 
 #[test]
 fn closed_scope_unroots_its_handles() {
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let (_vm, mut thread) = anchor();
     let outer = handle_scope(&data);
     let keep = outer.handle(Tagged::smi(1).unwrap());
@@ -90,7 +90,7 @@ fn closed_scope_unroots_its_handles() {
 
 #[test]
 fn reclaimed_slots_are_reused() {
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let (_vm, mut thread) = anchor();
     {
         let scope = handle_scope(&data);
@@ -112,7 +112,7 @@ fn reclaimed_slots_are_reused() {
 
 #[test]
 fn blocks_extend_when_full() {
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let (_vm, mut thread) = anchor();
     let heap = thread.heap();
     let scope = handle_scope(&data);
@@ -130,7 +130,7 @@ fn blocks_extend_when_full() {
 
 #[test]
 fn escaped_handle_survives_inner_scope() {
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let (_vm, mut thread) = anchor();
     let mut outer = handle_scope(&data);
     let keep = outer.handle(Tagged::smi(1).unwrap());
@@ -149,7 +149,7 @@ fn escaped_handle_survives_inner_scope() {
 
 #[test]
 fn escapable_scope_closed_without_escape_reclaims() {
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let (_vm, mut thread) = anchor();
     let mut outer = handle_scope(&data);
     let keep = outer.handle(Tagged::smi(1).unwrap());
@@ -167,7 +167,7 @@ fn escapable_scope_closed_without_escape_reclaims() {
 fn strong_handles_are_infallible() {
     use vm::{Object, Tagged};
 
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let (_vm, mut thread) = anchor();
     let scope = handle_scope(&data);
 
@@ -185,7 +185,7 @@ fn strong_handles_are_infallible() {
 fn weak_bits_rejected_by_the_type_system() {
     use vm::{Object, Tagged, Value, WEAK_PTR};
 
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let scope = handle_scope(&data);
     // Safety: bit-level test; the value is never dereferenced.
     let weak = Value::from_bits(0x1000 | WEAK_PTR);

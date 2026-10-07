@@ -379,7 +379,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.map_map = map_map;
     heap.set_known(known);
 
-    let data = HandleData::new(Smi::new(0).encode());
+    let data = HandleData::new(Smi::new(0).into_tagged());
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
     let the_hole_map = roots.create_handle(heap.allocate::<Map>(MapInit {
@@ -536,11 +536,11 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     let mut known = *heap.known();
     let the_hole = known.the_hole;
     debug_assert!(
-        !the_hole.raw().is_smi(),
+        !the_hole.as_tagged(heap).is_smi(),
         "bootstrap_basics must run before bootstrap_well_known"
     );
 
-    let data = HandleData::new(the_hole.raw());
+    let data = HandleData::new(the_hole.as_tagged(heap).erase());
     let scope = unsafe { HandleScope::from_raw(NonNull::from(&data)) };
 
     let object_prototype_map = alloc_map(heap, roots, MapKind::OBJECT.union(MapKind::EXTENDABLE));
