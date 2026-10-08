@@ -1,8 +1,8 @@
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Cell, CellInit, FixedArray, Handle, HandleScope, Heap, Map, MaybeWeak, Object, PrototypeInfo,
-    PrototypeInfoInit, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
+    Cell, CellInit, FixedArray, Handle, HandleScope, Heap, Lookup, Map, MaybeWeak, Object,
+    PrototypeInfo, PrototypeInfoInit, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
 };
 
 pub struct PrototypeRegistry {
@@ -212,6 +212,52 @@ impl Prototype {
         }
         invalidate_prototype_chains(heap, old_map);
     }
+
+    #[inline]
+    pub fn element_mutated(heap: &Heap, obj: Tagged<'_, Object>) {
+        let map = obj.as_ref().map_ref(heap);
+        if !map.as_ref().kind().is_prototype() {
+            return;
+        }
+        invalidate_prototype_chains(heap, map);
+    }
+
+    /// Whether an indexed store into `receiver` (map `map`) may skip the
+    /// prototype chain
+    pub fn indexed_store_chain_ok<'s>(
+        heap: &mut Heap,
+        scope: &'s HandleScope<'_>,
+        receiver: &Handle<'_, Value>,
+        map: &Handle<'s, Map>,
+        index: usize,
+    ) -> bool {
+        if map
+            .as_tagged(heap)
+            .as_ref()
+            .published_validity_cell(heap)
+            .is_some_and(|cell| cell.as_ref().is_valid(heap))
+        {
+            return true;
+        }
+        let holds = {
+            let heap_ref: &Heap = heap;
+            Lookup::chain_holds_index_name(heap_ref, receiver.as_tagged(heap_ref), index)
+        };
+        if holds {
+            return false;
+        }
+        // only cacheable when the chain holds no integer-named
+        // descriptors at all: otherwise cleanliness depends on the index
+        let any_index = {
+            let heap_ref: &Heap = heap;
+            Lookup::chain_holds_any_index_name(heap_ref, receiver.as_tagged(heap_ref))
+        };
+        if any_index {
+            return true;
+        }
+        Self::ensure_store_transition_validity_cell(heap, scope, *map);
+        true
+    }
 }
 
 fn trackable_prototype<'a>(heap: &'a Heap, value: Tagged<'a, Value>) -> Option<Tagged<'a, Object>> {
@@ -355,14 +401,14 @@ fn append_prototype_child<'s, T: 's>(
             if len == 0 {
                 Plan::Init
             } else {
-                let mut empty_slot = smi_value(array.element_slot(0).get(heap)).unwrap_or(0);
+                let mut empty_slot = array.element_slot(0).get(heap).to_i64().unwrap_or(0);
                 if empty_slot == 0 && len > 1 {
                     for i in 1..len {
                         if array.element_slot(i).is_cleared() {
                             mark_slot_empty(heap, array, i);
                         }
                     }
-                    empty_slot = smi_value(array.element_slot(0).get(heap)).unwrap_or(0);
+                    empty_slot = array.element_slot(0).get(heap).to_i64().unwrap_or(0);
                 }
                 if empty_slot > 0 && (empty_slot as usize) < len {
                     Plan::Reuse(empty_slot as usize)
@@ -381,16 +427,19 @@ fn append_prototype_child<'s, T: 's>(
                 .prototype_users(heap)
                 .expect("planned against an existing registry");
             let array = array.as_ref();
-            let next = smi_value(array.element_slot(slot).get(heap)).unwrap_or(0);
+            let next = array.element_slot(slot).get(heap).to_i64().unwrap_or(0);
             array.set_weak(heap, slot, child.as_tagged(heap).erase());
-            array.set(heap, 0, smi_word(next));
+            array.set(heap, 0, Smi::new(next).into_tagged().as_maybe_weak());
             slot as i64
         }
         Plan::Init => {
             let array = heap.allocate_token_enter_heap(
                 WeakFixedArray::<Value>::layout_for(2),
                 |token, heap| {
-                    let values = [smi_word(0), child.as_tagged(heap).erase().as_weak()];
+                    let values = [
+                        Smi::new(0).into_tagged().as_maybe_weak(),
+                        child.as_tagged(heap).erase().as_weak(),
+                    ];
                     token
                         .allocate::<WeakFixedArray>(WeakFixedArrayInit { values: &values })
                         .as_handle(scope)
@@ -433,21 +482,17 @@ fn append_prototype_child<'s, T: 's>(
     }
 }
 
-fn smi_value(word: Tagged<'_, MaybeWeak<Value>>) -> Option<i64> {
-    Smi::decode(word.raw()).map(|smi| smi.value())
-}
-
-fn smi_word(value: i64) -> Tagged<'static, MaybeWeak<Value>> {
-    unsafe { Tagged::from_maybe_weak_unchecked(Smi::new(value).encode()) }
-}
-
 fn mark_slot_empty(heap: &Heap, array: &WeakFixedArray, index: usize) {
     let previous = array.element_slot(0).get(heap);
     array.set(heap, index, previous);
-    array.set(heap, 0, smi_word(index as i64));
+    array.set(
+        heap,
+        0,
+        Smi::new(index as i64).into_tagged().as_maybe_weak(),
+    );
 }
 
-fn invalidate_one_prototype_validity_cell_internal(heap: &Heap, map: Tagged<'_, Map>) {
+fn invalidate_one_prototype_validity_cell(heap: &Heap, map: Tagged<'_, Map>) {
     if let Some(cell) = map.as_ref().published_validity_cell(heap) {
         let cell = cell.as_ref();
         if cell.is_valid(heap) {
@@ -456,11 +501,11 @@ fn invalidate_one_prototype_validity_cell_internal(heap: &Heap, map: Tagged<'_, 
     }
 }
 
-fn invalidate_prototype_chains_internal(heap: &Heap, map: Tagged<'_, Map>) {
+fn invalidate_prototype_chains(heap: &Heap, map: Tagged<'_, Map>) {
     let mut current = Some(map);
     let mut next: Option<Tagged<'_, Map>> = None;
     while let Some(m) = current {
-        invalidate_one_prototype_validity_cell_internal(heap, m);
+        invalidate_one_prototype_validity_cell(heap, m);
 
         let Some(info) = m.as_ref().try_get_prototype_info(heap) else {
             return;
@@ -487,13 +532,9 @@ fn invalidate_prototype_chains_internal(heap: &Heap, map: Tagged<'_, Map>) {
             if next.is_none() {
                 next = Some(user_map);
             } else {
-                invalidate_prototype_chains_internal(heap, user_map);
+                invalidate_prototype_chains(heap, user_map);
             }
         }
         current = next.take();
     }
-}
-
-fn invalidate_prototype_chains(heap: &Heap, map: Tagged<'_, Map>) {
-    invalidate_prototype_chains_internal(heap, map);
 }

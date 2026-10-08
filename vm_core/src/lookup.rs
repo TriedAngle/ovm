@@ -153,33 +153,120 @@ impl Lookup<'_> {
         Self::load_outcome_on(heap, receiver, name)
     }
 
-    /// [[Get]] for a keyed load: an element key consults dense array
-    /// elements first (falling back to its canonical Smi name), a name
-    /// takes the ordinary path. Getters are returned for the caller to
-    /// invoke.
+    pub fn chain_holds_index_name(heap: &Heap, receiver: Tagged<'_, Value>, i: usize) -> bool {
+        let smi_name: Tagged<'_, SlotName> = Tagged::from(Smi::new(i as i64));
+        Self::chain_holds_name(heap, receiver, |name| name.ptr_eq(smi_name))
+    }
+
+    /// Whether any prototype hop holds ANY integer-named descriptor: such
+    /// chains are never cacheably clean — the answer depends on the
+    /// stored index.
+    pub fn chain_holds_any_index_name(heap: &Heap, receiver: Tagged<'_, Value>) -> bool {
+        Self::chain_holds_name(heap, receiver, |name| {
+            Smi::decode(name.erase().raw()).is_some()
+        })
+    }
+
+    fn chain_holds_name(
+        heap: &Heap,
+        receiver: Tagged<'_, Value>,
+        matches: impl Fn(Tagged<'_, SlotName>) -> bool,
+    ) -> bool {
+        let mut hop = receiver;
+        while let Some(obj) = hop.as_heap_object() {
+            let map = obj.as_ref().map_ref(heap);
+            let proto = map.as_ref().prototype.get(heap);
+            if proto.get_as::<FixedArray>(heap).is_some() {
+                return true;
+            }
+            let known = heap.known();
+            if !proto.is_strong_ptr()
+                || proto == known.null.as_tagged(heap).erase()
+                || proto == known.the_hole.as_tagged(heap).erase()
+                || proto == known.undefined.as_tagged(heap).erase()
+            {
+                return false;
+            }
+            let Some(next) = proto.get_as::<Object>(heap) else {
+                return false;
+            };
+            if next.as_ref().map_ref(heap).as_ref().kind().is_proxy() {
+                return true;
+            }
+            let next_map = next.as_ref().map_ref(heap);
+            if next_map
+                .as_ref()
+                .descriptors()
+                .iter()
+                .any(|d| matches(d.name(heap)))
+            {
+                return true;
+            }
+            hop = next.erase();
+        }
+        false
+    }
+
     pub fn load_outcome_keyed<'a>(
         heap: &'a Heap,
         receiver: Tagged<'a, Value>,
         key: Tagged<'a, SlotName>,
     ) -> Result<LoadOutcome<'a>, VmError> {
         match Lookup::classify_key(heap, key.erase())? {
-            Key::Element(i) => match receiver
-                .as_heap_object()
-                .and_then(|obj| obj.as_ref().element_value(heap, i))
-            {
-                Some(v) => Ok(LoadOutcome::Value(v)),
-                // past the end, a hole, or a non-array receiver: ordinary lookup
-                None => Lookup::load_outcome(heap, receiver, Tagged::from(Smi::new(i as i64))),
-            },
+            Key::Element(i) => {
+                let smi_name: Tagged<'a, SlotName> = Tagged::from(Smi::new(i as i64));
+                if let Some(v) = receiver
+                    .as_heap_object()
+                    .and_then(|obj| obj.as_ref().element_value(heap, i))
+                {
+                    return Ok(LoadOutcome::Value(v));
+                }
+                let mut hop = receiver;
+                loop {
+                    let Some(obj) = hop.as_heap_object() else {
+                        break;
+                    };
+                    let map = obj.as_ref().map_ref(heap);
+                    let proto = map.as_ref().prototype.get(heap);
+                    // Self-style multi-parent chains and exotic hops take
+                    // the ordinary named walk
+                    if proto.get_as::<FixedArray>(heap).is_some() {
+                        break;
+                    }
+                    let known = heap.known();
+                    if !proto.is_strong_ptr()
+                        || proto == known.null.as_tagged(heap).erase()
+                        || proto == known.the_hole.as_tagged(heap).erase()
+                        || proto == known.undefined.as_tagged(heap).erase()
+                    {
+                        break;
+                    }
+                    let Some(next) = proto.get_as::<Object>(heap) else {
+                        break;
+                    };
+                    if next.as_ref().map_ref(heap).as_ref().kind().is_proxy() {
+                        break;
+                    }
+                    if let Some(v) = next.as_ref().element_value(heap, i) {
+                        return Ok(LoadOutcome::Value(v));
+                    }
+                    let next_map = next.as_ref().map_ref(heap);
+                    if next_map
+                        .as_ref()
+                        .descriptors()
+                        .iter()
+                        .any(|d| d.name(heap).ptr_eq(smi_name))
+                    {
+                        return Lookup::load_outcome_on(heap, next.erase(), smi_name);
+                    }
+                    hop = next.erase();
+                }
+                Lookup::load_outcome(heap, receiver, smi_name)
+            }
             Key::Name(name) => Lookup::load_outcome(heap, receiver, name),
         }
     }
 
-    /// Ordinary [[GetOwnProperty]] as a full descriptor (ES 10.1.5): dense
-    /// array elements, the JSArray `length` slot, and map descriptor rows.
-    /// The single reader both `Object.getOwnPropertyDescriptor` and the
-    /// proxy invariant checks build on. The returned descriptor is rooted in
-    /// `scope`, so it survives GC safepoints.
     pub fn ordinary_own_descriptor<'a, 's>(
         heap: &'a Heap,
         scope: &'s HandleScope<'_>,
@@ -236,12 +323,6 @@ impl Lookup<'_> {
         None
     }
 
-    /// ES 7.3.11 HasProperty (the `in` operator): walks the prototype chain
-    /// without invoking anything. Element indices consult the array elements
-    /// (including their backing-store holes); canonical index strings are
-    /// classified first so `"2" in o` and `2 in o` agree. Arrays anywhere in
-    /// the chain own `"length"` through their internal slot (ES 10.4.2.1),
-    /// which the descriptor walk cannot see.
     pub fn has_property<'a>(
         heap: &'a Heap,
         receiver: Tagged<'a, Value>,
@@ -267,17 +348,7 @@ impl Lookup<'_> {
             }
             _ => name,
         };
-        if !matches!(receiver.lookup(heap, name), Lookup::NotFound) {
-            return true;
-        }
-        // "length" may live in an array's internal slot at any chain level
-        if name
-            .erase()
-            .ptr_eq(heap.known().strings.length.as_tagged(heap))
-        {
-            return array_length_in_chain(heap, receiver);
-        }
-        false
+        !matches!(receiver.lookup(heap, name), Lookup::NotFound)
     }
 
     pub fn lookup_in_parents<'a>(
@@ -500,34 +571,6 @@ fn super_start_from_proto<'a>(heap: &'a Heap, proto: Option<Tagged<'a, Value>>) 
         return SuperStart::Parents(parents);
     }
     SuperStart::Object(proto)
-}
-
-fn array_length_in_chain<'a>(heap: &'a Heap, receiver: Tagged<'a, Value>) -> bool {
-    let mut current = receiver;
-    loop {
-        let Some(obj) = current.as_heap_object() else {
-            return false;
-        };
-        if obj.as_ref().is_array(heap) {
-            return true;
-        }
-        let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
-        if proto == heap.known().null.as_tagged(heap) || !proto.is_strong_ptr() {
-            return false;
-        }
-        if let Some(pairs) = proto.get_as::<FixedArray>(heap) {
-            // Self-style parent pairs: stride over the parent values
-            let mut i = 1;
-            while i < pairs.len() {
-                if array_length_in_chain(heap, pairs.at(heap, i)) {
-                    return true;
-                }
-                i += 2;
-            }
-            return false;
-        }
-        current = proto;
-    }
 }
 
 impl<'a, T> Tagged<'a, T> {

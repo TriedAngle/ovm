@@ -1,10 +1,11 @@
 use core::alloc::Layout;
 
 use crate::{
-    CallableInfoObject, Coercion, ContextObject, Convert, DenseString, EdgeVisitable, FixedArray,
-    Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap, HeapObject, Hint,
-    HostCtx, Lookup, Map, NativeIndex, ObjectKind, PropertyDescriptor, SiblingChange, SlotName,
-    Smi, Symbol, Tagged, ThreadState, Transition, VM, Value, Visitor, VmError,
+    CallableInfoObject, Coercion, ContextObject, Convert, DenseString, EdgeVisitable, ElementsKind,
+    FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
+    HeapObject, Hint, HostCtx, Lookup, Map, NativeIndex, ObjectKind, PropertyDescriptor, Prototype,
+    SiblingChange, SlotName, Smi, Symbol, Tagged, ThreadState, Transition, VM, Value, Visitor,
+    VmError,
 };
 
 #[repr(C)]
@@ -138,11 +139,16 @@ impl Object {
         let map = {
             let obj = receiver.as_tagged(heap);
             let map = obj.as_ref().map_ref(heap);
-            if map.as_ref().kind().is_holey() {
+            // one-way lattice: only packed maps promote; holey and
+            // dictionary maps are already past this rung
+            if map.as_ref().kind().elements() != ElementsKind::Packed {
                 return;
             }
             scope.handle(map)
         };
+        // the map swap must invalidate chains keyed on the old map:
+        // later shape changes fire on the new map lineage only
+        Prototype::shape_changed(heap, map.as_tagged(heap));
         let target =
             Transition::sibling_target(heap, scope, |h| map.as_tagged(h), SiblingChange::Holey);
         let obj = receiver.as_tagged(heap);
@@ -152,35 +158,30 @@ impl Object {
             .set(heap, obj.erase(), target.as_tagged(heap));
     }
 
-    /// Fast element read for array objects: `None` if `self` is not an
-    /// array, the index is past the end, or the slot is a hole — the
-    /// caller must fall back to a named property lookup. A packed (non
-    /// holey) map skips both the hole compare and the backing-store bound.
     #[inline]
     pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
         let kind = self.header.map.get(heap).as_ref().kind();
-        if !kind.is_array() || i >= self.length() {
+        if !kind.is_array() || !kind.is_dense_elements() || i >= self.length() {
             return None;
         }
         let elements = self.elements.get(heap);
-        if !elements.is_strong_ptr() {
-            return None;
-        }
-        if i >= elements.as_ref().len() {
+        if kind.is_holey() {
             // `length` can exceed the backing store: those indices are holes
-            return None;
+            if i >= elements.as_ref().len() {
+                return None;
+            }
+            let v = elements.as_ref().at(heap, i);
+            if v == heap.known().the_hole.as_tagged(heap) {
+                return None;
+            }
+            Some(v)
+        } else {
+            // packed: capacity covers `length`, and no slot is a hole
+            Some(elements.as_ref().at(heap, i))
         }
-        let v = elements.as_ref().at(heap, i);
-        if kind.is_holey() && v == heap.known().the_hole.as_tagged(heap) {
-            return None;
-        }
-        Some(v)
     }
 }
 
-/// What kind of callable a value refers to. The bytecode form carries
-/// everything a frame push needs, gathered from one map-kind check and
-/// one callable-info read.
 pub enum CallTarget<'a> {
     Bytecode {
         target: Tagged<'a, Object>,
@@ -302,6 +303,7 @@ impl Object {
             obj.elements
                 .set(heap, obj.erase(), elements.as_tagged(heap));
             obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
+            Prototype::element_mutated(heap, obj);
         } else {
             let obj = receiver.as_tagged(heap);
             let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
@@ -311,6 +313,7 @@ impl Object {
             if i >= obj.as_ref().length() {
                 obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
             }
+            Prototype::element_mutated(heap, obj);
         }
         Ok(())
     }
@@ -329,7 +332,7 @@ impl Object {
             return Err(VmError::Type);
         };
         let kind = obj.as_ref().header.map.get(heap).as_ref().kind();
-        if !kind.is_array() || i >= obj.as_ref().length() {
+        if !kind.is_array() || !kind.is_dense_elements() || i >= obj.as_ref().length() {
             return Err(VmError::OutOfBounds);
         }
         let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
@@ -340,6 +343,7 @@ impl Object {
             return Err(VmError::OutOfBounds);
         }
         elements.set(heap, i, value);
+        Prototype::element_mutated(heap, obj);
         Ok(())
     }
 }
@@ -510,9 +514,6 @@ impl Object {
         Ok(function.as_tagged(heap))
     }
 
-    /// ES 7.1.1 ToPrimitive. Primitives pass through untouched. `value` is a
-    /// rooted handle; the result is anchored at the `&mut Heap` borrow, so the
-    /// caller must consume or root it before the next allocation.
     pub fn to_primitive<'a>(
         vm: &'a VM,
         heap: &'a mut Heap,
@@ -523,9 +524,6 @@ impl Object {
         if Convert::is_primitive(heap, value.as_tagged(heap)) {
             return Ok(Coercion::Value(value.as_tagged(heap)));
         }
-        // the receiver stays rooted throughout: method lookups and calls
-        // below run user code (getters, valueOf/toString), which allocates
-        // and would leave a raw copy dangling
         HostCtx::new(vm, heap, state).handle_scope(|vm, heap, state, scope| {
             // 1. exotic @@toPrimitive (GetMethod)
             let exotic = match Lookup::get_property_on(
@@ -599,8 +597,6 @@ impl Object {
         })
     }
 
-    /// ToNumeric (ES 7.1.3): ToPrimitive with hint Number, then ToNumber.
-    /// `None` means user code threw (pending exception holds it).
     pub fn to_numeric(
         vm: &VM,
         heap: &mut Heap,
@@ -619,10 +615,6 @@ impl Object {
         })
     }
 
-    /// ToString (ES 7.1.17): primitives stringify directly; an object is
-    /// first ToPrimitive'd with hint String (`toString`, then `valueOf`),
-    /// then the resulting primitive is stringified. `None` means user code
-    /// threw (pending exception holds it); a Symbol argument is a TypeError.
     pub fn to_string<'a>(
         vm: &VM,
         heap: &'a mut Heap,
@@ -669,11 +661,6 @@ impl Object {
         obj.as_ref().header.map.get(heap).kind().is_callable()
     }
 
-    /// ES 7.1.18 ToPropertyKey: smis and symbols pass through, everything
-    /// else is coerced to its interned canonical string. The returned
-    /// name is anchored at the `&mut Heap` borrow; callers store the word
-    /// (or root it) before the next allocation. `None` means user code
-    /// threw (the pending exception holds it).
     pub fn to_property_key<'a>(
         vm: &VM,
         heap: &'a mut Heap,
@@ -710,13 +697,20 @@ impl Object {
                 // ToString of a symbol primitive throws (ES 6.1.7.1)
                 None => return Err(VmError::Type),
             };
+            let word = interned.as_tagged(heap);
+            // canonical index strings name the same property as their
+            // numeric form (ES 6.1.7): canonicalize to the Smi spelling
+            // exactly once here, so every downstream bits-compare is sound
+            if let Some(i) = Lookup::canonical_index(word.as_ref().data(heap))
+                && i < u32::MAX as usize
+            {
+                return Ok(Some(Tagged::from(Smi::new(i as i64))));
+            }
             // fresh anchored re-read of the rooted interned word
-            Ok(Some(interned.as_tagged(heap).into()))
+            Ok(Some(word.into()))
         })
     }
 
-    /// ES 13.5.3 typeof: the well-known type string for a value. `null`
-    /// reports `"object"`; callables report `"function"`.
     pub fn type_of<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> Tagged<'a, Value> {
         let known = heap.known();
         let s = known.strings;
@@ -741,9 +735,6 @@ impl Object {
         type_name.as_tagged(heap).erase()
     }
 
-    /// ES 13.10.2 instanceof / 7.3.20 OrdinaryHasInstance: `Get(C, "prototype")`
-    /// must yield an object (else TypeError), then walk the object's prototype
-    /// chain for it. `None` means user code threw.
     pub fn instance_of(
         vm: &VM,
         heap: &mut Heap,
@@ -780,7 +771,6 @@ impl Object {
         })
     }
 
-    /// OrdinaryHasInstance step 6: walk the prototype chain of `object`.
     pub fn has_proto_in_chain<'a>(
         heap: &'a Heap,
         object: Tagged<'a, Value>,
@@ -807,8 +797,6 @@ impl Object {
         Self::has_proto_in_chain(heap, proto, target)
     }
 
-    /// Same, for `new.target` values that may be exotic (a constructor
-    /// proxy): only `Get(new.target, "prototype")` is observed.
     pub fn create_construct_receiver_value<'a>(
         vm: &VM,
         heap: &'a mut Heap,

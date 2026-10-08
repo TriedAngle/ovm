@@ -721,7 +721,20 @@ pub fn install_builtins(vm: &mut VM, idx: &BuiltinIndices) -> Result<(), VmError
             thread.heap().set_known(known);
         }
 
-        // ---- Date -----------------------------------------------------------------
+        let zero = scope.handle(Smi::new(0));
+        Object::define_own_property(
+            thread.heap(),
+            &scope,
+            array_prototype,
+            wks.length,
+            PropertyDescriptor::Data {
+                value: zero,
+                writable: true,
+                enumerable: false,
+                configurable: false,
+            },
+        )?;
+
         let date_fn = Object::native_function(thread.heap(), &scope, idx.date)?;
         let date_prototype = thread.heap().known().date_prototype;
         Object::define_own_property(

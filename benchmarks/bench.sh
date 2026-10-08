@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Wall-time benchmark harness for the OVM interpreters and QuickJS.
 #
-#   benchmarks/bench.sh <match-binary> <become-binary> [quickjs-binary]
+#   benchmarks/bench.sh <match-binary> <become-binary> [quickjs-binary] [node-binary]
+#
+# The node binary runs jitless (--jitless) with a print->console.log shim
+# for the Octane runner's print().
 #
 # - fannkuch / nbody: the SunSpider files are top-level scripts far too
 #   short to time directly, so the harness wraps the vendored source in a
@@ -21,9 +24,10 @@
 
 set -euo pipefail
 
-MATCH="${1:?usage: bench.sh <match-binary> <become-binary> [quickjs-binary]}"
-BECOME="${2:?usage: bench.sh <match-binary> <become-binary> [quickjs-binary]}"
+MATCH="${1:?usage: bench.sh <match-binary> <become-binary> [quickjs-binary] [node-binary]}"
+BECOME="${2:?usage: bench.sh <match-binary> <become-binary> [quickjs-binary] [node-binary]}"
 QJS="${3:-}"
+NODE="${4:-}"
 
 RUNS=7
 AMPLIFY=50
@@ -46,8 +50,8 @@ make_runner() { # src outfile
   } > "$2"
 }
 
-fan_file="$(mktemp -t fannkuch).js"
-nb_file="$(mktemp -t nbody).js"
+fan_file="$(mktemp -t fannkuch.XXXXXX).js"
+nb_file="$(mktemp -t nbody.XXXXXX).js"
 trap 'rm -f "$fan_file" "$nb_file"' EXIT
 make_runner "$fan_js" "$fan_file"
 make_runner "$nb_js" "$nb_file"
@@ -89,11 +93,30 @@ ratio()  { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.2f", a / b }'; }
 declare -a BINS=("$MATCH" "$BECOME")
 declare -a NAMES=("match_loop" "become")
 if [[ -n "$QJS" ]]; then BINS+=("$QJS"); NAMES+=("quickjs"); fi
+if [[ -n "$NODE" ]]; then
+  # node runs exactly one script file per invocation: the shim plus the
+  # three deltablue files are joined into one script
+  node_all="$(mktemp -t node_all.XXXXXX).js"
+  { echo "globalThis.print = console.log;"; cat "${db_js[@]}"; } > "$node_all"
+  node_wrap="$(mktemp -t node_wrap.XXXXXX)"
+  { echo "#!/bin/sh"; echo "exec '$NODE' --jitless '$node_all'"; } > "$node_wrap"
+  chmod +x "$node_wrap"
+  node_run="$(mktemp -t node_run.XXXXXX)"
+  { echo "#!/bin/sh"; echo "exec '$NODE' --jitless \"\$1\""; } > "$node_run"
+  chmod +x "$node_run"
+  trap 'rm -f "$fan_file" "$nb_file" "$node_all" "$node_wrap" "$node_run"' EXIT
+  BINS+=("$node_wrap"); NAMES+=("node_jitless")
+fi
 
 fan=(); nb=(); db=()
-for b in "${BINS[@]}"; do
-  fan+=("$(time_median_us "$b" "$fan_file")")
-  nb+=("$(time_median_us "$b" "$nb_file")")
+for i in "${!BINS[@]}"; do
+  b="${BINS[$i]}"
+  runner="$b"
+  if [[ -n "$NODE" && "$b" == "$node_wrap" ]]; then
+    runner="$node_run"
+  fi
+  fan+=("$(time_median_us "$runner" "$fan_file")")
+  nb+=("$(time_median_us "$runner" "$nb_file")")
   if [[ "$b" == *qjs* ]]; then
     db+=("$(score_median "$b" -I "${db_js[0]}" -I "${db_js[1]}" "${db_js[2]}")")
   else

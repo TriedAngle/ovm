@@ -3,7 +3,8 @@
 
 use vm_core::HostCtx;
 use vm_core::{
-    Args, Convert, DenseString, Handle, Heap, Object, Smi, Tagged, ThreadState, VM, Value, VmError,
+    Args, Convert, DenseString, Handle, Heap, Object, Prototype, Smi, Tagged, ThreadState, VM,
+    Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -91,6 +92,7 @@ fn array_push_fast<'a>(heap: &Heap, args: Args) -> Option<Tagged<'a, Value>> {
     obj.as_ref()
         .length
         .set(heap, r.erase(), Smi::new((len + 1) as i64));
+    Prototype::element_mutated(heap, obj);
     Some(Smi::new((len + 1) as i64).into_tagged())
 }
 
@@ -124,6 +126,7 @@ fn array_push_impl<'a>(
                     obj.as_ref()
                         .length
                         .set(heap, r.erase(), Smi::new((len + 1) as i64));
+                    Prototype::element_mutated(heap, obj);
                     true
                 }
                 _ => false,
@@ -201,6 +204,7 @@ pub fn array_pop<'a>(
         this.as_ref()
             .length
             .set(heap, this.erase(), Smi::new(last as i64));
+        Prototype::element_mutated(heap, this);
         value
     })
 }
@@ -518,6 +522,11 @@ pub fn array_length_set<'a>(
             }
             // a later length grow re-exposes the punched holes
             Object::promote_holey(heap, &scope, &obj);
+            Prototype::element_mutated(heap, obj.as_tagged(heap));
+        } else if new_len > old_len {
+            // the indices [old_len, new_len) are holes: the map must stop
+            // promising packed elements (and packed capacity covers length)
+            Object::promote_holey(heap, &scope, &obj);
         }
         let obj_t = obj.as_tagged(heap);
         obj_t
@@ -830,6 +839,7 @@ pub fn array_sort<'a>(
             }
             Object::promote_holey(heap, &scope, &obj);
         }
+        Prototype::element_mutated(heap, obj.as_tagged(heap));
         obj.as_tagged(heap).erase()
     })
 }

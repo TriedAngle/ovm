@@ -279,7 +279,8 @@ slow_handler!(slow_keyed_load |ip, ops, regs, acc, ctx, float| {
 slow_handler!(slow_keyed_load_imm |ip, ops, regs, acc, ctx, float| {
     let recv = regs.read(ops.signed::<0>(), ctx);
     let idx = ops.unsigned::<1>();
-    keyed_load_imm(ctx, recv, idx)
+    let fb = ops.unsigned::<2>();
+    keyed_load_imm(ctx, recv, idx, Some(fb as usize))
 });
 
 slow_handler!(slow_keyed_store |ip, ops, regs, acc, ctx, float| {
@@ -328,6 +329,15 @@ slow_handler!(slow_create_empty_array |ip, ops, regs, acc, ctx, float| {
         let map = heap.known().js_array_map;
         heap.new_object(&scope, map, HandleSlice::EMPTY).erase()
     });
+    obj
+});
+
+slow_handler!(slow_create_sized_array |ip, ops, regs, acc, ctx, float| {
+    let capacity = ops.unsigned::<0>() as usize;
+    let heap = unsafe { ctx.heap_mut() };
+    let state = ctx.state();
+    let obj = state
+        .handle_scope(|scope| heap.new_array_with_capacity(&scope, capacity).erase());
     obj
 });
 

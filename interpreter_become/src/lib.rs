@@ -1974,10 +1974,20 @@ extern "rust-preserve-none" fn op_load_element_imm<'a, const STRIDE: usize>(
     let ops = Ops::<STRIDE>::new(ip, Opcode::LoadElementImm);
     let r = ops.signed::<0>();
     let idx = ops.unsigned::<1>();
+    let fb = ops.unsigned::<2>();
     let recv = regs.read(r, ctx);
     if let Some(obj) = recv.as_heap_object()
         && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx)
     {
+        next!(LoadElementImm, ip, regs, ctx, table, roots, float, v)
+    }
+    if let Some(ElementHit::Value(v)) = InlineCache::try_load_element(
+        ctx.heap(),
+        ctx.feedback_ref(ctx.heap()),
+        fb as usize,
+        recv,
+        idx as usize,
+    ) {
         next!(LoadElementImm, ip, regs, ctx, table, roots, float, v)
     }
     become slow_keyed_load_imm::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -2209,6 +2219,20 @@ extern "rust-preserve-none" fn op_create_empty_array<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     Ops::<STRIDE>::new(ip, Opcode::CreateEmptyArrayLiteral);
     become slow_create_empty_array::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
+}
+
+#[rustc_align(32)]
+extern "rust-preserve-none" fn op_create_sized_array<'a, const STRIDE: usize>(
+    ip: *const u8,
+    regs: Regs,
+    acc: Tagged<'a, Value>,
+    ctx: &Ctx<'a>,
+    table: TableArg<'a>,
+    roots: RootsArg<'a>,
+    float: FloatReg,
+) -> Tagged<'a, Value> {
+    Ops::<STRIDE>::new(ip, Opcode::CreateSizedArrayLiteral);
+    become slow_create_sized_array::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
 }
 
 #[rustc_align(32)]
@@ -3778,6 +3802,7 @@ const fn table_narrow() -> [Handler; 256] {
     t[Opcode::CreateFunctionContext as usize] = op_create_function_context::<1> as Handler;
     t[Opcode::CreateClosure as usize] = op_create_closure::<1> as Handler;
     t[Opcode::CreateEmptyArrayLiteral as usize] = op_create_empty_array::<1> as Handler;
+    t[Opcode::CreateSizedArrayLiteral as usize] = op_create_sized_array::<1> as Handler;
     t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object::<1> as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime::<1> as Handler;
     t[Opcode::Call as usize] = op_call_ic::<1> as Handler;
@@ -3884,6 +3909,7 @@ const fn table_wide() -> [Handler; 256] {
     t[Opcode::CreateFunctionContext as usize] = op_create_function_context::<2> as Handler;
     t[Opcode::CreateClosure as usize] = op_create_closure::<2> as Handler;
     t[Opcode::CreateEmptyArrayLiteral as usize] = op_create_empty_array::<2> as Handler;
+    t[Opcode::CreateSizedArrayLiteral as usize] = op_create_sized_array::<2> as Handler;
     t[Opcode::CreateEmptyObjectLiteral as usize] = op_create_empty_object::<2> as Handler;
     t[Opcode::CallRuntime as usize] = op_call_runtime::<2> as Handler;
     t[Opcode::Call as usize] = op_call_ic::<2> as Handler;

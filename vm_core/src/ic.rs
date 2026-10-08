@@ -1,7 +1,7 @@
 use crate::{
     AccessorPair, CallTarget, CallableInfoObject, Cell, ContextObject, DataHandler,
     DataHandlerInit, DenseString, FeedbackVector, FixedArray, FunctionKind, Handle, HandleScope,
-    Heap, Map, MaybeWeak, NativeIndex, Object, Prototype, SlotName, Smi, Tagged, Value,
+    Heap, Map, MaybeWeak, NativeIndex, Object, ObjectKind, Prototype, SlotName, Smi, Tagged, Value,
     WeakFixedArray, WeakFixedArrayInit,
 };
 
@@ -40,6 +40,10 @@ const ELEMENT_ALLOW_OOB: i64 = 1 << 1;
 /// Element-store payload flags.
 const STORE_HOLEY: i64 = 1 << 0;
 const STORE_GROW: i64 = 1 << 1;
+/// The prototype chain was verified element-free at install time and
+/// the handler is guarded by its validity cell: stores into holes and
+/// appends past `length` may proceed without consulting the chain.
+const STORE_CHAIN_CLEAN: i64 = 1 << 2;
 
 /// Result of the inlined monomorphic probe (see [`InlineCache::probe_mono`]).
 pub enum MonoProbe<'a> {
@@ -249,16 +253,41 @@ fn probe_element_smi<'a>(
     vector: Option<Tagged<'a, FeedbackVector>>,
     slot: usize,
     receiver: Tagged<'a, Value>,
-) -> Option<(Tagged<'a, Object>, i64, i64)> {
+) -> Option<(Tagged<'a, Object>, Tagged<'a, Map>, i64, i64)> {
     let vector = vector?;
     let obj = receiver.as_heap_object()?;
-    vector.site(slot)?;
-    let handler = probe(heap, vector, slot, obj.map_ref(heap))?;
+    let map = obj.map_ref(heap);
+    let handler = probe(heap, vector, slot, map)?;
     if handler.is_ptr() {
         return None;
     }
     let (kind, payload) = decode_handler_smi(handler)?;
-    Some((obj, kind, payload))
+    Some((obj, map, kind, payload))
+}
+
+/// Whether `map`'s published chain validity cell is still valid — the
+/// guard for handler payload bits that promise a chain property (holes
+/// resolve to `undefined`, hole stores are plain).
+#[inline(always)]
+fn map_chain_cell_valid(heap: &Heap, map: Tagged<'_, Map>) -> bool {
+    map.as_ref()
+        .published_validity_cell(heap)
+        .is_some_and(|cell| cell.as_ref().is_valid(heap))
+}
+
+/// Publish the chain validity cell on `map` so hit paths can guard a
+/// chain-dependent payload bit with two loads off the receiver map.
+/// `false` when the chain cannot be tracked.
+fn attach_chain_cell(heap: &mut Heap, scope: &HandleScope<'_>, map: &Handle<'_, Map>) -> bool {
+    match Prototype::get_or_create_prototype_chain_validity_cell(heap, scope, *map) {
+        Some(cell) => {
+            map.as_tagged(heap)
+                .as_ref()
+                .set_validity_cell(heap, cell.as_tagged(heap));
+            true
+        }
+        None => false,
+    }
 }
 
 impl Handler<'_> {
@@ -401,6 +430,68 @@ fn has_parents(heap: &Heap, map: Tagged<'_, Map>) -> bool {
     !(proto.ptr_eq(known.null.as_tagged(heap).erase())
         || proto.ptr_eq(known.undefined.as_tagged(heap).erase())
         || proto.ptr_eq(known.the_hole.as_tagged(heap).erase()))
+}
+
+/// Whether a prototype-chain object contributes no index-keyed lookups:
+/// no integer-named descriptors and (for arrays) no non-hole elements.
+fn chain_object_elements_clean(heap: &Heap, word: Tagged<'_, Value>) -> bool {
+    let Some(obj) = word.get_as::<Object>(heap) else {
+        return false;
+    };
+    let map = obj.as_ref().map_ref(heap);
+    let kind = map.as_ref().kind();
+    if kind.is_proxy() || !matches!(kind.kind(), ObjectKind::Object | ObjectKind::Array) {
+        return false;
+    }
+    for d in map.as_ref().descriptors() {
+        if Smi::decode(d.name(heap).erase().raw()).is_some() {
+            return false;
+        }
+    }
+    if kind.is_array() {
+        let elements = obj.as_ref().elements.get(heap);
+        if elements.is_strong_ptr() {
+            let hole = heap.known().the_hole.as_tagged(heap);
+            let elements = elements.as_ref();
+            for i in 0..elements.len() {
+                if elements.at(heap, i) != hole {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Whether the prototype chain starting at `map`'s parents holds no
+/// index-keyed properties, so element misses may resolve to
+/// `undefined` without walking it. Install-time decision; staleness is
+/// guarded by the chain validity cell attached to the handler.
+fn chain_elements_clean(heap: &Heap, map: Tagged<'_, Map>) -> bool {
+    let mut current = map;
+    loop {
+        let proto = current.prototype.get(heap);
+        if let Some(pairs) = proto.get_as::<FixedArray>(heap) {
+            let mut i = 1;
+            while i < pairs.len() {
+                if !chain_object_elements_clean(heap, pairs.at(heap, i)) {
+                    return false;
+                }
+                i += 2;
+            }
+            return true;
+        }
+        if !has_parents(heap, current) {
+            return true;
+        }
+        if !chain_object_elements_clean(heap, proto) {
+            return false;
+        }
+        let Some(obj) = proto.get_as::<Object>(heap) else {
+            return false;
+        };
+        current = obj.as_ref().map_ref(heap);
+    }
 }
 
 impl<'s> Plan<'s> {
@@ -616,16 +707,18 @@ fn apply_load_handler<'a>(
 }
 
 /// Execute a dense-array element load handler.
+#[inline]
 fn apply_element_load<'a>(
     heap: &'a Heap,
     obj: Tagged<'a, Object>,
+    map: Tagged<'a, Map>,
     index: usize,
     payload: i64,
 ) -> Option<ElementHit<'a>> {
     let holey = payload & ELEMENT_HOLEY != 0;
     let allow_oob = payload & ELEMENT_ALLOW_OOB != 0;
     let oob = |heap: &'a Heap| {
-        (allow_oob && heap.indexed_props_valid())
+        (allow_oob && map_chain_cell_valid(heap, map))
             .then(|| ElementHit::Value(heap.known().undefined.as_tagged(heap).erase()))
     };
     let len = obj.length();
@@ -633,18 +726,20 @@ fn apply_element_load<'a>(
         return oob(heap);
     }
     let elements = obj.elements.get(heap);
-    if !elements.is_strong_ptr() {
-        return None;
+    if holey {
+        // `length` can exceed the backing store: those indices are holes
+        if index >= elements.as_ref().len() {
+            return oob(heap);
+        }
+        let v = elements.at(heap, index);
+        if v == heap.known().the_hole.as_tagged(heap) {
+            return oob(heap);
+        }
+        Some(ElementHit::Value(v))
+    } else {
+        // packed: capacity covers `length`, and no slot is a hole
+        Some(ElementHit::Value(elements.at(heap, index)))
     }
-    if index >= elements.len() {
-        // `length` past the backing store: the index is a hole
-        return oob(heap);
-    }
-    let v = elements.at(heap, index);
-    if holey && v == heap.known().the_hole.as_tagged(heap) {
-        return oob(heap);
-    }
-    Some(ElementHit::Value(v))
 }
 
 /// Execute an indexed-string load handler.
@@ -656,7 +751,11 @@ fn apply_indexed_string<'a>(
 ) -> Option<ElementHit<'a>> {
     let s = receiver.get_as::<DenseString>(heap)?;
     if index >= s.len() {
-        if payload & ELEMENT_ALLOW_OOB != 0 && heap.indexed_props_valid() {
+        if payload & ELEMENT_ALLOW_OOB != 0
+            && receiver
+                .as_heap_object()
+                .is_some_and(|h| map_chain_cell_valid(heap, h.as_ref().map_ref(heap)))
+        {
             return Some(ElementHit::Value(
                 heap.known().undefined.as_tagged(heap).erase(),
             ));
@@ -870,9 +969,9 @@ impl InlineCache {
         receiver: Tagged<'a, Value>,
         index: usize,
     ) -> Option<ElementHit<'a>> {
-        let (obj, kind, payload) = probe_element_smi(heap, vector, slot, receiver)?;
+        let (obj, map, kind, payload) = probe_element_smi(heap, vector, slot, receiver)?;
         match kind {
-            KIND_ELEMENT => apply_element_load(heap, obj, index, payload),
+            KIND_ELEMENT => apply_element_load(heap, obj, map, index, payload),
             KIND_INDEXED_STRING => apply_indexed_string(heap, receiver, index, payload),
             _ => None,
         }
@@ -887,28 +986,46 @@ impl InlineCache {
         index: usize,
         value: Tagged<'a, Value>,
     ) -> Option<Tagged<'a, Value>> {
-        let (obj, kind, payload) = probe_element_smi(heap, vector, slot, receiver)?;
+        let (obj, map, kind, payload) = probe_element_smi(heap, vector, slot, receiver)?;
         if kind != KIND_ELEMENT_STORE {
             return None;
         }
-        let len = obj.length();
-        if index > len || (index == len && payload & STORE_GROW == 0) {
+        let holey = payload & STORE_HOLEY != 0;
+        let append = index == obj.length();
+        if index > obj.length() || (append && payload & STORE_GROW == 0) {
             return None;
         }
         let elements = obj.elements.get(heap);
-        if !elements.is_strong_ptr() || index >= elements.len() {
-            return None;
+        let clean = payload & STORE_CHAIN_CLEAN != 0;
+        if holey && !append {
+            if index >= elements.as_ref().len() {
+                return None;
+            }
+            if !clean {
+                if elements.at(heap, index) == heap.known().the_hole.as_tagged(heap) {
+                    return None;
+                }
+            } else if !map_chain_cell_valid(heap, map) {
+                return None;
+            }
+        } else if append {
+            // appends create a property: the chain must be clean
+            if !clean || !map_chain_cell_valid(heap, map) {
+                return None;
+            }
+            if index >= elements.as_ref().len() {
+                // no headroom: the slow path reallocates
+                return None;
+            }
         }
-        if index < len
-            && payload & STORE_HOLEY != 0
-            && elements.at(heap, index) == heap.known().the_hole.as_tagged(heap)
-        {
-            return None;
-        }
+        // packed in-bounds: an own writable element, no chain consult
         elements.set(heap, index, value);
-        if index == len {
+        if append {
             obj.length
                 .set(heap, obj.erase(), Smi::new((index + 1) as i64));
+        }
+        if map.as_ref().kind().is_prototype() {
+            Prototype::shape_changed(heap, map);
         }
         Some(value)
     }
@@ -937,12 +1054,23 @@ impl InlineCache {
             if index < s.len() && s.code_unit(heap, index) > 0xFF {
                 return;
             }
-            if index >= s.len() && !heap.indexed_props_valid() {
+            let string_prototype = heap.known().string_prototype.as_tagged(heap);
+            let proto_map = scope.handle(string_prototype.as_ref().map_ref(heap));
+            let clean = chain_elements_clean(heap, proto_map.as_tagged(heap));
+            if index >= s.len() && !clean {
                 return;
             }
             let mut payload = 0;
-            if heap.indexed_props_valid() {
-                payload |= ELEMENT_ALLOW_OOB;
+            if clean {
+                proto_map.as_tagged(heap).as_ref().mark_prototype(heap);
+                if let Some(cell) =
+                    Prototype::get_or_create_prototype_chain_validity_cell(heap, scope, proto_map)
+                {
+                    map.as_tagged(heap)
+                        .as_ref()
+                        .set_validity_cell(heap, cell.as_tagged(heap));
+                    payload |= ELEMENT_ALLOW_OOB;
+                }
             }
             Handler::Smi(kind_smi(KIND_INDEXED_STRING, payload))
         } else if obj.is_array(heap) {
@@ -950,7 +1078,19 @@ impl InlineCache {
             if map.as_tagged(heap).kind().is_holey() {
                 payload |= ELEMENT_HOLEY;
             }
-            if heap.indexed_props_valid() {
+            // the miss index tells what the handler must handle: in-bounds
+            // non-hole reads never install (the interpreter's direct read
+            // covers them); hole/OOB misses add the guarded OOB bit
+            let len = obj.as_ref().length();
+            let hole_miss = payload & ELEMENT_HOLEY != 0 && {
+                let elements = obj.as_ref().elements.get(heap);
+                index < elements.as_ref().len()
+                    && elements.as_ref().at(heap, index) == heap.known().the_hole.as_tagged(heap)
+            };
+            if (index >= len || hole_miss)
+                && chain_elements_clean(heap, map.as_tagged(heap))
+                && attach_chain_cell(heap, scope, &map)
+            {
                 payload |= ELEMENT_ALLOW_OOB;
             }
             Handler::Smi(kind_smi(KIND_ELEMENT, payload))
@@ -985,8 +1125,11 @@ impl InlineCache {
         if map.as_tagged(heap).kind().is_holey() {
             payload |= STORE_HOLEY;
         }
-        if grew {
-            payload |= STORE_GROW;
+        if chain_elements_clean(heap, map.as_tagged(heap)) && attach_chain_cell(heap, scope, &map) {
+            payload |= STORE_CHAIN_CLEAN;
+            if grew {
+                payload |= STORE_GROW;
+            }
         }
         let handler = Handler::Smi(kind_smi(KIND_ELEMENT_STORE, payload));
         update_site(heap, scope, vector, slot, &map, &handler);

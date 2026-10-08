@@ -26,7 +26,9 @@ pub use data_handler::{DataHandler, DataHandlerInit};
 pub use feedback::{FeedbackVector, FeedbackVectorInit, new_feedback_vector};
 pub use float::Float;
 pub use helpers::WrapperKind;
-pub use map::{AccessorPair, Map, MapInit, MapKind, SlotDescriptor, SlotFlags, SlotName};
+pub use map::{
+    AccessorPair, ElementsKind, Map, MapInit, MapKind, SlotDescriptor, SlotFlags, SlotName,
+};
 pub use object::{CallTarget, Object, ObjectInit, ObjectSlotsInit};
 pub use prototype_info::{PrototypeInfo, PrototypeInfoInit};
 pub use proxy::{ProxyInit, ProxyObject};
@@ -111,7 +113,7 @@ pub enum ObjectKind {
 
     /// `elements` points to the well-known `empty_fixed_array`, `len` is 0
     Object = 14,
-    /// `elements` points to a `FixedArray`.
+    /// `elements` points to a `FixedArray`
     Array = 15,
     /// `elements` points to a `FixedByteArray`.
     ByteArray = 16,

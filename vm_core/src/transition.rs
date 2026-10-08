@@ -2,9 +2,9 @@ use core::alloc::Layout;
 
 use crate::proxy::Proxy;
 use crate::{
-    AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, Key,
-    Lookup, Map, MapInit, MapKind, MaybeWeak, Object, Prototype, SlotFlags, SlotName, Smi, Symbol,
-    Tagged, Value, VmError, WeakFixedArray, WeakFixedArrayInit,
+    AccessorPair, AllocToken, Compare, ElementsKind, FixedArray, Handle, HandleScope, Heap,
+    HeapObject, Key, Lookup, Map, MapInit, MapKind, MaybeWeak, Object, Prototype, SlotFlags,
+    SlotName, Smi, Symbol, Tagged, Value, VmError, WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Store semantics:
@@ -37,7 +37,7 @@ impl<'s> SiblingChange<'s> {
     fn kind(&self, kind: MapKind) -> MapKind {
         match self {
             Self::Prototype(_) => kind,
-            Self::Holey => kind.union(MapKind::HOLEY),
+            Self::Holey => kind.with_elements(ElementsKind::Holey),
         }
     }
 
@@ -1107,11 +1107,18 @@ impl Object {
                     if obj.as_ref().is_array(heap) {
                         // indices at/past `length` were never own properties
                         if i < obj.as_ref().length()
+                            && obj
+                                .as_ref()
+                                .map_ref(heap)
+                                .as_ref()
+                                .kind()
+                                .is_dense_elements()
                             && let Some(elements) = obj.as_ref().elements_array(heap)
                             && i < elements.len()
                         {
                             elements.set(heap, i, heap.known().the_hole.as_tagged(heap).erase());
                             Object::promote_holey(heap, scope, &receiver);
+                            Prototype::element_mutated(heap, receiver.as_tagged(heap));
                         }
                         break 'name None;
                     }

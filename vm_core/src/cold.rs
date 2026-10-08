@@ -13,6 +13,7 @@ use crate::objects::map::SlotName;
 use crate::objects::object::Object;
 use crate::objects::proxy::Proxy;
 use crate::objects::string::DenseString;
+use crate::prototype::Prototype;
 use crate::transition::{PropertyDescriptor, StoreOutcome, StoreSemantics};
 use crate::value::{Smi, Tagged, Value};
 use crate::{Coercion, Hint, HostCtx};
@@ -337,8 +338,14 @@ pub fn keyed_load<'a>(
 }
 
 /// `LoadElementImm` cold body: the keyed-load tail with the constant
-/// index as the key (string receivers, proxies, named fallback).
-pub fn keyed_load_imm<'a>(ctx: &Ctx<'a>, recv: Tagged<'_, Value>, idx: usize) -> Tagged<'a, Value> {
+/// index as the key (string receivers, proxies, named fallback), plus
+/// the element-IC fill from the miss.
+pub fn keyed_load_imm<'a>(
+    ctx: &Ctx<'a>,
+    recv: Tagged<'_, Value>,
+    idx: usize,
+    fb_slot: Option<usize>,
+) -> Tagged<'a, Value> {
     let vm = ctx.vm();
     let heap = unsafe { ctx.heap_mut() };
     let state = ctx.state();
@@ -346,6 +353,16 @@ pub fn keyed_load_imm<'a>(ctx: &Ctx<'a>, recv: Tagged<'_, Value>, idx: usize) ->
         let recv = scope.handle(recv);
         let smi = Smi::new(idx as i64).into_tagged();
         let key: Handle<'_, SlotName> = scope.handle(smi.as_name());
+        if let Some(fb) = fb_slot {
+            InlineCache::update_load_element(
+                heap,
+                &scope,
+                ctx.feedback_ref(heap).map(|v| scope.handle(v)),
+                fb,
+                Some(recv),
+                idx,
+            );
+        }
         if let Some(unit) = DenseString::index_element(heap, &scope, recv, key) {
             return scope.handle(unit).as_tagged(heap).erase();
         }
@@ -406,11 +423,26 @@ pub fn keyed_store<'a>(
         let name: Handle<'_, SlotName> =
             match Lookup::classify_key(heap, key.as_tagged(heap).erase()) {
                 Ok(Key::Element(i)) => {
-                    if recv
-                        .as_tagged(heap)
-                        .as_heap_object()
-                        .is_some_and(|obj| obj.as_ref().is_array(heap))
+                    let mut direct = false;
+                    if let Some(hobj) = recv.as_tagged(heap).as_heap_object()
+                        && hobj.as_ref().is_array(heap)
                     {
+                        let map = hobj.as_ref().map_ref(heap);
+                        if map
+                            .as_ref()
+                            .published_validity_cell(heap)
+                            .is_some_and(|cell| cell.as_ref().is_valid(heap))
+                        {
+                            direct = true;
+                        } else {
+                            let map = scope.handle(map);
+                            direct =
+                                Prototype::indexed_store_chain_ok(heap, &scope, &recv, &map, i);
+                        }
+                    }
+                    if !direct {
+                        scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
+                    } else {
                         let obj = scope
                             .cast::<Object>(heap, recv.as_tagged(heap))
                             .expect("array receiver is an object");
@@ -430,7 +462,6 @@ pub fn keyed_store<'a>(
                         }
                         return value.as_tagged(heap).erase();
                     }
-                    scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
                 }
                 Ok(Key::Name(key)) => scope.handle(key),
                 Err(e) => return ctx.raise_tag(e),

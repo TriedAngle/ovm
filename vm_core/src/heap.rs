@@ -579,9 +579,6 @@ pub struct Heap {
     tlab: Tlab,
     known: *const KnownCell,
     prototype_registry: *const PrototypeRegistry,
-    /// True while no object owns an integer-named (non-element) property:
-    /// element misses may then return `undefined` without a chain walk.
-    indexed_props: Cell<bool>,
     #[cfg(feature = "stress-minor-gc")]
     stress_armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
@@ -623,18 +620,6 @@ impl Heap {
 
     pub fn prototype_registry(&self) -> &'static PrototypeRegistry {
         unsafe { &*self.prototype_registry }
-    }
-
-    /// Whether no object owns an integer-named property (see
-    /// [`Heap::invalidate_indexed_props`]).
-    pub fn indexed_props_valid(&self) -> bool {
-        self.indexed_props.get()
-    }
-
-    /// An object acquired an integer-named own property, so an element
-    /// miss can no longer assume the prototype chain lacks the index.
-    pub fn invalidate_indexed_props(&self) {
-        self.indexed_props.set(false);
     }
 
     pub fn set_known(&self, known: WellKnown) {
@@ -900,6 +885,26 @@ impl Heap {
         )
     }
 
+    /// A fresh packed array whose elements backing store is pre-sized to
+    /// `capacity` (hole filler) with `length` 0: literal element stores
+    /// append within headroom instead of reallocating.
+    pub fn new_array_with_capacity(
+        &mut self,
+        scope: &HandleScope<'_>,
+        capacity: usize,
+    ) -> Tagged<'_, Object> {
+        let elements = self.allocate_hole_array(capacity).as_handle(scope);
+        self.allocate_object(
+            scope,
+            ObjectSlotsInit {
+                map: self.known().js_array_map,
+                values: HandleSlice::EMPTY,
+                elements,
+                length: 0,
+            },
+        )
+    }
+
     pub fn allocate_token(&mut self, total: Layout) -> AllocToken<'_> {
         let layout =
             Layout::from_size_align(total.size(), total.align().max(16)).expect("token layout");
@@ -963,7 +968,6 @@ impl GlobalHeap {
             tlab: Tlab::empty(),
             known: known as *const KnownCell,
             prototype_registry: prototype_registry as *const PrototypeRegistry,
-            indexed_props: Cell::new(true),
             #[cfg(feature = "stress-minor-gc")]
             stress_armed: std::sync::Arc::clone(&self.stress_armed),
         }

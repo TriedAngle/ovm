@@ -608,15 +608,14 @@ impl FnBuilder {
 
     /// Keyed load: the key is in the accumulator, the result replaces it.
     /// A directly preceding `LoadSmi` with an in-range non-negative value
-    /// fuses into [`Opcode::LoadElementImm`] (the feedback pair the
-    /// caller reserved stays simply unused).
+    /// fuses into [`Opcode::LoadElementImm`].
     pub fn load_keyed_property(&mut self, obj: Reg, fb: Feedback) {
         if let LastOp::LoadSmi { at, imm } = self.last
             && (0..=u16::MAX as i32).contains(&imm)
         {
             self.code.truncate(at);
             self.last = LastOp::None;
-            self.emit_tracked(Opcode::LoadElementImm, &[obj.operand(), imm as u32]);
+            self.emit_tracked(Opcode::LoadElementImm, &[obj.operand(), imm as u32, fb.0]);
             return;
         }
         self.emit_tracked(Opcode::LoadKeyedProperty, &[obj.operand(), fb.0]);
@@ -697,14 +696,15 @@ impl FnBuilder {
 
     /// Plain keyed load: the key is in the accumulator, the result
     /// replaces it. A directly preceding `LoadSmi` with an in-range
-    /// non-negative value fuses into [`Opcode::LoadElementImm`].
+    /// non-negative value fuses into [`Opcode::LoadElementImm`] (fast
+    /// code has no feedback vector: slot 0 is never consulted).
     pub fn load_keyed_property_fast(&mut self, obj: Reg) {
         if let LastOp::LoadSmi { at, imm } = self.last
             && (0..=u16::MAX as i32).contains(&imm)
         {
             self.code.truncate(at);
             self.last = LastOp::None;
-            self.emit_tracked(Opcode::LoadElementImm, &[obj.operand(), imm as u32]);
+            self.emit_tracked(Opcode::LoadElementImm, &[obj.operand(), imm as u32, 0]);
             return;
         }
         self.emit_tracked(Opcode::LoadKeyedPropertyFast, &[obj.operand()]);
@@ -837,6 +837,10 @@ impl FnBuilder {
 
     acc_void!(create_empty_object_literal, CreateEmptyObjectLiteral);
     acc_void!(create_empty_array_literal, CreateEmptyArrayLiteral);
+
+    pub fn create_sized_array_literal(&mut self, capacity: u32) {
+        self.emit_tracked(Opcode::CreateSizedArrayLiteral, &[capacity]);
+    }
     acc_void!(create_bare_object_literal, CreateBareObjectLiteral);
 
     /// Create a closure from a [`Constant::Callable`] template in the pool.

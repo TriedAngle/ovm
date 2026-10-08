@@ -266,6 +266,10 @@ define_opcodes! {
     // -- literals and closures --------------------------------------------
     CreateEmptyObjectLiteral { operands: [], acc: writes, indices: [] }, // -> acc (object_initial_map, no slots)
     CreateEmptyArrayLiteral { operands: [], acc: writes, indices: [] },  // -> acc (js_array_map, empty elements)
+    /// `acc = []` with the elements backing store pre-sized to the
+    /// operand capacity (filled with holes, `length` 0): literal element
+    /// stores then append within headroom instead of reallocating.
+    CreateSizedArrayLiteral { operands: [UImmediate], acc: writes, indices: [Unchecked] },
     /// -> acc (plain_object_map: extensible, no [[Prototype]]):
     /// Self-style (Kette) objects, whose parents are pair-encoded
     CreateBareObjectLiteral { operands: [], acc: writes, indices: [] },
@@ -333,8 +337,9 @@ define_opcodes! {
     /// the kind operand (`cmp * 2 + jump_if_falsy`). cmp: 0 `==`, 1 `===`,
     /// 2 `<`, 3 `<=`, 4 `>`, 5 `>=`.
     CompareJump { operands: [Register, UImmediate, Immediate], acc: reads_writes, indices: [Unchecked, Unchecked, Unchecked] },
-    /// Fused load-immediate + keyed element read: `acc = reg[idx]`.
-    LoadElementImm { operands: [Register, UImmediate], acc: writes, indices: [Unchecked, Unchecked] },
+    /// Fused load-immediate + keyed element read: `acc = reg[idx]`, with
+    /// the element-IC feedback slot.
+    LoadElementImm { operands: [Register, UImmediate, Index], acc: writes, indices: [Unchecked, Unchecked, Feedback] },
 
     // exception handling
     Throw { operands: [], acc: reads, indices: [] },   // acc -> pending exception

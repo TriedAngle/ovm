@@ -1549,6 +1549,12 @@ fn step<'a>(
             acc.store(obj.erase());
             Flow::Sync
         }
+        Opcode::CreateSizedArrayLiteral => {
+            let capacity = ops.uimm(0) as usize;
+            let obj = state.handle_scope(|scope| heap.new_array_with_capacity(&scope, capacity));
+            acc.store(obj.erase());
+            Flow::Sync
+        }
         Opcode::CreateBareObjectLiteral => {
             let obj = state.handle_scope(|scope| {
                 let map = heap.known().plain_object_map;
@@ -2235,13 +2241,24 @@ fn step<'a>(
         }
         Opcode::LoadElementImm => {
             let idx = ops.uimm(1) as usize;
+            let fb = ops.idx(2);
             if let Some(recv) = stack.reg(heap, frame_base, ops.reg(0)).as_heap_object()
                 && let Some(v) = recv.as_ref().element_value(heap, idx)
             {
                 acc.store(v);
                 return Flow::Sync;
             }
-            let v = keyed_load_imm(ctx, stack.reg(heap, frame_base, ops.reg(0)), idx);
+            if let Some(ElementHit::Value(v)) = InlineCache::try_load_element(
+                heap,
+                ctx.feedback_ref(heap),
+                fb,
+                stack.reg(heap, frame_base, ops.reg(0)),
+                idx,
+            ) {
+                acc.store(v);
+                return Flow::Sync;
+            }
+            let v = keyed_load_imm(ctx, stack.reg(heap, frame_base, ops.reg(0)), idx, Some(fb));
             if ctx.is_throw(v) {
                 return Flow::Threw;
             }

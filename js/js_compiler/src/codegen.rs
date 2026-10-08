@@ -3280,7 +3280,16 @@ impl<'c, 'a, 'p> FunctionGen<'c, 'a, 'p> {
     // -- literals -----------------------------------------------------------------
 
     fn emit_array_literal(&mut self, a: &ArrayExpression<'_>) -> Result<(), CompileError> {
-        self.b.create_empty_array_literal();
+        if a.elements.is_empty() {
+            self.b.create_empty_array_literal();
+        } else {
+            // pre-size the backing store with the store-growth policy's
+            // slack: element stores then append within headroom
+            // (IC-fast, no reallocation)
+            let len = a.elements.len();
+            let capacity = len + (len >> 1) + 8;
+            self.b.create_sized_array_literal(capacity as u32);
+        }
         let arr = self.b.stage_acc();
         let mut i = 0u32;
         for el in &a.elements {

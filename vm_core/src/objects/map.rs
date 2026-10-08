@@ -96,9 +96,6 @@ impl Map {
         }
     }
 
-    /// Publish a freshly created validity cell into this map. The caller
-    /// (prototype registration) holds the registry lock, so a plain strong
-    /// store with a write barrier suffices.
     pub fn set_validity_cell(&self, heap: &Heap, cell: Tagged<'_, Cell>) {
         let host = self.tagged(heap);
         self.prototype_validity_cell.set_strong(heap, host, cell);
@@ -300,11 +297,6 @@ impl HeapObject for Map {
         self.prototype_info.clear(heap);
         for (i, (name, flags, value)) in config.descriptors.iter().enumerate() {
             let name_word = name.as_tagged(heap);
-            // integer-named own properties make element misses observable
-            // on the prototype chain
-            if Smi::decode(name_word.raw()).is_some() {
-                heap.invalidate_indexed_props();
-            }
             let d = self.descriptor(i);
             d.name.set(heap, host, name_word);
             d.flags.set(heap, host, Smi::new(flags.bits() as i64));
@@ -336,11 +328,47 @@ impl EdgeVisitable for Map {
     }
 }
 
-/// Low byte: the `ObjectKind`. Higher bytes: capability flags
-/// (extendable, callable, constructor, native) and representation flags
-/// (Latin1 string payloads). Constructor implies callable.
-/// NATIVE is only valid together with CALLABLE and means slots[0] of the
-/// object is a Smi native registry index instead of a `CallableInfoObject`.
+/// The storage kind of an object's indexed elements: what the `elements`
+/// slot points at and how element accesses dispatch. Only meaningful on
+/// `Array` maps; all other kinds leave it at `Packed`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ElementsKind {
+    /// Dense `FixedArray` backing, no holes
+    Packed = 0,
+    /// `FixedArray` backing with `the_hole` gaps.
+    Holey = 1,
+    /// TODO: unboxed double backing.
+    PackedDouble = 2,
+    /// TODO: unboxed double backing with hole gaps.
+    HoleyDouble = 3,
+    /// TODO: `NumberDictionary` backing for sparse arrays.
+    Dictionary = 4,
+}
+
+impl ElementsKind {
+    #[inline]
+    pub const fn is_holey(self) -> bool {
+        (self as u8) & 1 == 1
+    }
+
+    /// Dense `FixedArray` backing: direct indexing, no lookup dispatch.
+    #[inline]
+    pub const fn is_dense(self) -> bool {
+        (self as u8) < Self::Dictionary as u8
+    }
+}
+
+/// Per-map metadata, one word laid out in byte lanes:
+///
+/// - byte 0 (bits 0..7): the `ObjectKind` instance type
+/// - byte 1 (bits 8..15): capability flags (see below)
+/// - byte 2 (bits 16..23): the `ElementsKind` storage kind
+/// - bit 24: named-properties mode
+///
+/// Constructor implies callable. NATIVE is only valid together with
+/// CALLABLE and means slots[0] of the object is a Smi native registry
+/// index instead of a `CallableInfoObject`.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct MapKind(u64);
@@ -348,21 +376,23 @@ pub struct MapKind(u64);
 impl MapKind {
     pub const KIND_MASK: u64 = 0xff;
 
+    // byte 1: capability flags
     pub const EXTENDABLE: MapKind = MapKind(1 << 8);
     pub const CALLABLE: MapKind = MapKind(1 << 9);
     pub const CONSTRUCTOR: MapKind = MapKind(1 << 10);
     pub const NATIVE: MapKind = MapKind(1 << 11);
     pub const PRIMITIVE_WRAPPER: MapKind = MapKind(1 << 12);
     pub const CLASS_CONSTRUCTOR: MapKind = MapKind(1 << 13);
-    /// Dense-string payload encoding: set = one Latin-1 byte per code
-    /// unit, clear = one UTF-16 code unit. Only meaningful (and always
-    /// accurate) on `DENSE_STRING` maps — future string representations
-    /// get their own kinds/flags.
+
     pub const LATIN1: MapKind = MapKind(1 << 14);
+    pub const PROTOTYPE: MapKind = MapKind(1 << 15);
 
-    pub const HOLEY: MapKind = MapKind(1 << 15);
+    // byte 2: elements storage kind
+    pub const ELEMENTS_SHIFT: u32 = 16;
+    pub const ELEMENTS_MASK: u64 = 0xff << Self::ELEMENTS_SHIFT;
 
-    pub const PROTOTYPE: MapKind = MapKind(1 << 16);
+    // bit 24+: named-properties mode
+    pub const PROPERTIES_DICTIONARY: MapKind = MapKind(1 << 24);
 
     pub const MAP: MapKind = MapKind(ObjectKind::Map as u64);
     pub const FIXED_ARRAY: MapKind = MapKind(ObjectKind::FixedArray as u64);
@@ -460,9 +490,42 @@ impl MapKind {
         self.0 & Self::KIND_MASK == ObjectKind::Proxy as u64
     }
 
-    /// Whether this array map may hold holes (see [`MapKind::HOLEY`]).
+    /// The indexed-elements storage kind.
+    #[inline]
+    pub const fn elements(self) -> ElementsKind {
+        match ((self.0 & Self::ELEMENTS_MASK) >> Self::ELEMENTS_SHIFT) as u8 {
+            0 => ElementsKind::Packed,
+            1 => ElementsKind::Holey,
+            2 => ElementsKind::PackedDouble,
+            3 => ElementsKind::HoleyDouble,
+            4 => ElementsKind::Dictionary,
+            _ => panic!("invalid elements kind"),
+        }
+    }
+
+    #[inline]
+    pub const fn with_elements(self, elements: ElementsKind) -> Self {
+        Self((self.0 & !Self::ELEMENTS_MASK) | ((elements as u64) << Self::ELEMENTS_SHIFT))
+    }
+
+    #[inline]
     pub const fn is_holey(self) -> bool {
-        self.0 & Self::HOLEY.0 != 0
+        self.elements().is_holey()
+    }
+
+    #[inline]
+    pub const fn is_dictionary_elements(self) -> bool {
+        self.elements() as u8 == ElementsKind::Dictionary as u8
+    }
+
+    #[inline]
+    pub const fn is_dense_elements(self) -> bool {
+        self.elements().is_dense()
+    }
+
+    #[inline]
+    pub const fn is_properties_dictionary(self) -> bool {
+        self.0 & Self::PROPERTIES_DICTIONARY.0 != 0
     }
 
     pub const fn is_prototype(self) -> bool {

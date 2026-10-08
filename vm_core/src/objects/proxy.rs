@@ -404,14 +404,22 @@ fn define_internal_h<'s>(
     };
     if let Some(i) = element {
         let completed = partial.complete_against(undefined, None);
-        let PropertyDescriptor::Data { value, .. } = completed else {
-            return Err(VmError::Type);
-        };
-        let array = scope
-            .cast::<Object>(heap, obj.as_tagged(heap))
-            .expect("array checked above");
-        Object::store_array_element(heap, scope, &array, i, &value)?;
-        return Ok(Flow::Value(true));
+        // plain data defines with default attributes land in the backing
+        // store; accessors and non-default attributes at index keys
+        // become the canonical Smi-named descriptor instead
+        if let PropertyDescriptor::Data {
+            value,
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        } = completed
+        {
+            let array = scope
+                .cast::<Object>(heap, obj.as_tagged(heap))
+                .expect("array checked above");
+            Object::store_array_element(heap, scope, &array, i, &value)?;
+            return Ok(Flow::Value(true));
+        }
     }
     let current =
         Lookup::ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap));
