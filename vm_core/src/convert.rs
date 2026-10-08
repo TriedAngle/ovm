@@ -207,7 +207,8 @@ impl Convert {
             Some(known.number_prototype.as_tagged(heap).erase())
         } else if v.get_as::<DenseString>(heap).is_some() {
             Some(known.string_prototype.as_tagged(heap).erase())
-        } else if v == known.true_object.as_tagged(heap) || v == known.false_object.as_tagged(heap) {
+        } else if v == known.true_object.as_tagged(heap) || v == known.false_object.as_tagged(heap)
+        {
             Some(known.boolean_prototype.as_tagged(heap).erase())
         } else {
             None

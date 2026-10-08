@@ -43,8 +43,7 @@ pub fn array_constructor<'a>(
         let array = heap.new_array(&scope, staged).as_handle(&scope);
         if single_len.is_some() {
             // `Array(n)` is a hole-filled array: retire the packed promise
-            let obj = array.as_tagged(heap);
-            obj.as_ref().mark_holey(heap);
+            Object::promote_holey(heap, &scope, &array);
         }
         array.as_tagged(heap).erase()
     })
@@ -509,17 +508,18 @@ pub fn array_length_set<'a>(
             return raise_runtime(vm, heap, state, VmError::OutOfBounds);
         }
         let new_len = new_len as usize;
-        let obj_t = obj.as_tagged(heap);
-        let old_len = obj_t.as_ref().length();
+        let old_len = obj.as_tagged(heap).as_ref().length();
         if new_len < old_len {
             let hole = heap.known().the_hole.as_tagged(heap).erase();
-            if let Some(elements) = obj_t.as_ref().elements_array(heap) {
+            if let Some(elements) = obj.as_tagged(heap).as_ref().elements_array(heap) {
                 for i in new_len..old_len.min(elements.len()) {
                     elements.as_ref().set(heap, i, hole);
                 }
             }
-            obj_t.as_ref().mark_holey(heap);
+            // a later length grow re-exposes the punched holes
+            Object::promote_holey(heap, &scope, &obj);
         }
+        let obj_t = obj.as_tagged(heap);
         obj_t
             .as_ref()
             .length
@@ -629,7 +629,7 @@ pub fn array_slice<'a>(
         let staged = scope.stage(&values);
         let arr = heap.new_array(&scope, staged).as_handle(&scope);
         if has_hole {
-            arr.as_tagged(heap).as_ref().mark_holey(heap);
+            Object::promote_holey(heap, &scope, &arr);
         }
         arr.as_tagged(heap).erase()
     })
@@ -828,7 +828,7 @@ pub fn array_sort<'a>(
                     });
                 }
             }
-            obj.as_tagged(heap).as_ref().mark_holey(heap);
+            Object::promote_holey(heap, &scope, &obj);
         }
         obj.as_tagged(heap).erase()
     })

@@ -65,7 +65,8 @@ pub use prototype::{Prototype, PrototypeRegistry};
 pub use stack::{Args, Callee, FrameMeta, Recv, STACK_SLOTS, Stack};
 pub use tools::{KetteTools, Termination};
 pub use transition::{
-    Change, PartialDescriptor, PropertyDescriptor, StoreOutcome, StoreSemantics, Transition,
+    Change, PartialDescriptor, PropertyDescriptor, SiblingChange, StoreOutcome, StoreSemantics,
+    Transition,
 };
 pub use value::{
     MaybeWeak, PTR_BIT, STRONG_PTR, Smi, TAG_MASK, TAG_SMI, Tagged, Value, WEAK_BIT, WEAK_PTR,

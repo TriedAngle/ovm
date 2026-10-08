@@ -1,8 +1,8 @@
 use core::{alloc::Layout, cell::UnsafeCell, cmp::Ordering};
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, Key, Lookup, Map, MapKind,
-    ObjectKind, PropertyDescriptor, SlotName, Smi, Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, Key, Lookup, Map,
+    MapKind, ObjectKind, PropertyDescriptor, SlotName, Smi, Tagged, Value, Visitor,
 };
 
 /// A String exotic own key (ES 10.4.3.4 StringGetOwnProperty): `length` or
@@ -241,7 +241,11 @@ impl DenseString {
         };
         let s = Self::from_receiver(heap, receiver.as_tagged(heap))?;
         let unit = (i < s.as_ref().len()).then(|| s.as_ref().code_unit(heap, i))?;
-        Some(Self::from_units(heap, scope, &[unit]).as_tagged(heap).erase())
+        Some(
+            Self::from_units(heap, scope, &[unit])
+                .as_tagged(heap)
+                .erase(),
+        )
     }
 
     fn data_ptr(&self) -> *mut u8 {

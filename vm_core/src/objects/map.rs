@@ -211,16 +211,12 @@ impl Map {
         None
     }
 
-    /// The map produced by changing this map's prototype to `proto`, if a
-    /// previous `set_prototype` published one. Prototype edges share the
-    /// property transition table, keyed by a private sentinel symbol and
-    /// disambiguated by the child's prototype.
-    pub fn find_prototype_transition<'a>(
+    fn find_special_transition<'a>(
         &self,
         heap: &'a Heap,
-        proto: Tagged<'a, Value>,
+        sentinel: Tagged<'a, Symbol>,
+        matches: impl Fn(Tagged<'a, Map>) -> bool,
     ) -> Option<Tagged<'a, Map>> {
-        let sentinel = heap.known().prototype_transition_symbol.as_tagged(heap);
         let array = self.transitions.load(heap)?;
         let pairs = array.as_slice();
         for entry in pairs.as_chunks::<2>().0 {
@@ -233,11 +229,27 @@ impl Map {
             let Some(target) = target.get_as::<Map>(heap) else {
                 continue;
             };
-            if target.prototype.get(heap).ptr_eq(proto) {
+            if matches(target) {
                 return Some(target);
             }
         }
         None
+    }
+
+    pub fn find_prototype_transition<'a>(
+        &self,
+        heap: &'a Heap,
+        proto: Tagged<'a, Value>,
+    ) -> Option<Tagged<'a, Map>> {
+        let sentinel = heap.known().prototype_transition_symbol.as_tagged(heap);
+        self.find_special_transition(heap, sentinel, |target| {
+            target.prototype.get(heap).ptr_eq(proto)
+        })
+    }
+
+    pub fn find_holey_transition<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Map>> {
+        let sentinel = heap.known().holey_transition_symbol.as_tagged(heap);
+        self.find_special_transition(heap, sentinel, |_| true)
     }
 }
 pub struct MapInit<'a> {
@@ -348,9 +360,6 @@ impl MapKind {
     /// get their own kinds/flags.
     pub const LATIN1: MapKind = MapKind(1 << 14);
 
-    /// Array elements may contain holes or extend past the backing store;
-    /// only meaningful on `ARRAY` maps. Once set it is never cleared (the
-    /// promotion is conservative for every array sharing the map).
     pub const HOLEY: MapKind = MapKind(1 << 15);
 
     pub const PROTOTYPE: MapKind = MapKind(1 << 16);

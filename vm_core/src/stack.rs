@@ -335,11 +335,7 @@ impl Stack {
     /// [[Prototype]] (ES 10.2.2.2 GetSuperConstructor). `None` when the
     /// prototype is absent or not a constructor. (Multiple prototypes are
     /// not supported here: construction is not a property lookup.)
-    pub fn super_constructor<'a>(
-        &self,
-        heap: &'a Heap,
-        base: usize,
-    ) -> Option<Tagged<'a, Value>> {
+    pub fn super_constructor<'a>(&self, heap: &'a Heap, base: usize) -> Option<Tagged<'a, Value>> {
         let callable = self.frame_header(base).callable_slot().get(heap);
         let obj = callable.as_heap_object()?;
         let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
@@ -710,10 +706,10 @@ impl Stack {
         let info = callee.info.as_ref();
         let bytecode = info.bytecode.get(heap);
         let constants = info.constants.get(heap);
-        let feedback = info
-            .feedback
-            .get(heap)
-            .map_or_else(|| heap.known().the_hole.as_tagged(heap).erase(), |v| v.erase());
+        let feedback = info.feedback.get(heap).map_or_else(
+            || heap.known().the_hole.as_tagged(heap).erase(),
+            |v| v.erase(),
+        );
         let smi = |v: usize| Smi::new(v as i64).into_tagged();
         // Safety: every header word is a Smi or a strong value; the header
         // region is initialized arena space reserved by `push_frame_with`.

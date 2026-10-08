@@ -3,8 +3,8 @@ use core::alloc::Layout;
 use crate::proxy::Proxy;
 use crate::{
     AccessorPair, AllocToken, Compare, FixedArray, Handle, HandleScope, Heap, HeapObject, Key,
-    Lookup, Map, MapInit, MaybeWeak, Object, Prototype, SlotFlags, SlotName, Smi, Tagged, Value,
-    VmError, WeakFixedArray, WeakFixedArrayInit,
+    Lookup, Map, MapInit, MapKind, MaybeWeak, Object, Prototype, SlotFlags, SlotName, Smi, Symbol,
+    Tagged, Value, VmError, WeakFixedArray, WeakFixedArrayInit,
 };
 
 /// Store semantics:
@@ -26,6 +26,46 @@ pub enum StoreOutcome<'s> {
     CallSetter {
         setter: Handle<'s, Value>,
     },
+}
+
+pub enum SiblingChange<'s> {
+    Prototype(Handle<'s, Value>),
+    Holey,
+}
+
+impl<'s> SiblingChange<'s> {
+    fn kind(&self, kind: MapKind) -> MapKind {
+        match self {
+            Self::Prototype(_) => kind,
+            Self::Holey => kind.union(MapKind::HOLEY),
+        }
+    }
+
+    fn prototype(
+        &self,
+        heap: &Heap,
+        scope: &'s HandleScope<'_>,
+        parent: Tagged<'_, Map>,
+    ) -> Handle<'s, Value> {
+        match self {
+            Self::Prototype(proto) => *proto,
+            Self::Holey => scope.handle(parent.prototype.get(heap)),
+        }
+    }
+
+    fn find<'a>(&self, heap: &'a Heap, parent: Tagged<'a, Map>) -> Option<Tagged<'a, Map>> {
+        match self {
+            Self::Prototype(proto) => parent.find_prototype_transition(heap, proto.as_tagged(heap)),
+            Self::Holey => parent.find_holey_transition(heap),
+        }
+    }
+
+    fn sentinel<'a>(&self, heap: &'a Heap) -> Tagged<'a, Symbol> {
+        match self {
+            Self::Prototype(_) => heap.known().prototype_transition_symbol.as_tagged(heap),
+            Self::Holey => heap.known().holey_transition_symbol.as_tagged(heap),
+        }
+    }
 }
 
 impl<'a> Tagged<'a, Value> {
@@ -157,13 +197,6 @@ impl<'a> Tagged<'a, Value> {
     }
 }
 
-/// OrdinarySet's final receiver step (ES 9.1.9.2 step 3): the parent walk
-/// resolved to a writable data property (or exhausted the chain, which
-/// implies the default writable descriptor), so the write lands on the
-/// receiver — a writable data property the receiver already owns is
-/// overwritten in place, and only a true miss defines a fresh own
-/// property. An own accessor (or non-writable own data property)
-/// rejects the `{value}` define: a TypeError at these strict sites.
 fn super_store_on_receiver<'a, 's>(
     heap: &'a Heap,
     scope: &'s HandleScope<'_>,
@@ -341,28 +374,22 @@ impl Transition {
         }
     }
 
-    /// The shared target of a prototype change on `parent`: looked up
-    /// through the transition tree (keyed by the private sentinel
-    /// symbol, matched by the child's prototype), created and published
-    /// on first use. Same descriptors, kind and slot count as the
-    /// parent — only the prototype differs.
-    pub fn prototype_target<'s>(
+    pub fn sibling_target<'s>(
         heap: &mut Heap,
         scope: &'s HandleScope<'_>,
         parent: impl for<'a> Fn(&'a Heap) -> Tagged<'a, Map>,
-        proto: Handle<'_, Value>,
+        change: SiblingChange<'s>,
     ) -> Handle<'s, Map> {
         loop {
-            if let Some(target) =
-                parent(heap).find_prototype_transition(heap, proto.as_tagged(heap))
-            {
+            if let Some(target) = change.find(heap, parent(heap)) {
                 return target.as_handle(scope);
             }
 
             let parent_ref = parent(heap);
-            let kind = parent_ref.kind();
+            let kind = change.kind(parent_ref.kind());
             let descriptor_count = parent_ref.descriptor_count();
             let value_slot_count = parent_ref.value_slot_count();
+            let prototype = change.prototype(heap, scope, parent_ref);
             let pairs_len = parent_ref.transitions.load(heap).map_or(0, |a| a.len());
 
             let map_layout = Map::layout_for(descriptor_count);
@@ -394,11 +421,11 @@ impl Transition {
                     kind,
                     value_slot_count,
                     descriptors: &descriptors,
-                    prototype: proto,
+                    prototype,
                 });
                 child.pred.set(heap, child.erase(), parent_ref);
 
-                let sentinel = heap.known().prototype_transition_symbol.as_tagged(heap);
+                let sentinel = change.sentinel(heap);
                 let mut pairs: Vec<Tagged<'_, MaybeWeak<Value>>> =
                     Vec::with_capacity(pairs_len + 2);
                 if let Some(old) = old {
@@ -530,18 +557,6 @@ impl Transition {
         );
     }
 
-    /// Remove the own configurable property `name` (OrdinaryDelete
-    /// step 4, ES 10.1.10.1): `receiver` migrates to a child map that
-    /// lacks the descriptor and its slots compact. The child is shared
-    /// through the transition tree like adds and redefines, so
-    /// same-shaped deletions converge on one map.
-    ///
-    /// Slots below the descriptors' region survive untouched (they are
-    /// structural: function info and context); slots orphaned by
-    /// data→accessor redefines — no descriptor references them anymore —
-    /// are dropped.
-    ///
-    /// The caller has verified the descriptor exists and is configurable.
     pub fn remove_property(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
@@ -1001,7 +1016,7 @@ impl Object {
         if Smi::decode(name.as_tagged(heap).raw()).is_some()
             && receiver.as_tagged(heap).as_ref().is_array(heap)
         {
-            receiver.as_tagged(heap).as_ref().mark_holey(heap);
+            Object::promote_holey(heap, scope, &receiver);
         }
         Transition::define(heap, scope, receiver, name, desc, Change::Append);
         Ok(true)
@@ -1067,25 +1082,18 @@ impl Object {
         if Smi::decode(name.as_tagged(heap).raw()).is_some()
             && receiver.as_tagged(heap).as_ref().is_array(heap)
         {
-            receiver.as_tagged(heap).as_ref().mark_holey(heap);
+            Object::promote_holey(heap, scope, &receiver);
         }
         Self::apply_define(heap, scope, receiver, name, index, action);
         Ok(true)
     }
 
-    /// `[[Delete]]` for ordinary and array-exotic objects (ES 10.1.10.1
-    /// OrdinaryDelete): absent properties and punched holes delete as
-    /// `true`, non-configurable ones as `false`, configurable ones are
-    /// removed. The caller has performed ToObject/ToPropertyKey.
     pub fn delete_own_property(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
         receiver: Handle<Object>,
         key: Handle<'_, Value>,
     ) -> Result<bool, VmError> {
-        // classification and the array-element fast path share one
-        // non-allocating region; the Tagged name cannot escape it, so it
-        // is rooted inside
         let name = 'name: {
             let key = match Lookup::classify_key(heap, key.as_tagged(heap)) {
                 Ok(key) => key,
@@ -1103,7 +1111,7 @@ impl Object {
                             && i < elements.len()
                         {
                             elements.set(heap, i, heap.known().the_hole.as_tagged(heap).erase());
-                            obj.as_ref().mark_holey(heap);
+                            Object::promote_holey(heap, scope, &receiver);
                         }
                         break 'name None;
                     }
@@ -1249,14 +1257,11 @@ impl Object {
             Ok(())
         }?;
 
-        // The shared map for (current map, proto) — one transition edge
-        // per distinct prototype instead of a fresh map per call, so ICs
-        // see stable receiver maps across constructions.
-        let target = Transition::prototype_target(
+        let target = Transition::sibling_target(
             heap,
             scope,
             |heap| receiver.as_tagged(heap).map_ref(heap),
-            proto,
+            SiblingChange::Prototype(proto),
         );
         let host = receiver.as_tagged(heap).erase();
         Prototype::shape_changed(heap, receiver.as_tagged(heap).map_ref(heap));

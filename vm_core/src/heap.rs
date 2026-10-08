@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::{
     AllocError, FixedArray, Float, GcHost, Handle, HandleScope, HandleSet, HandleSlice,
-    HeapBackend, HeapObject, HeapStats, LocalHeap, Map, MapKind, MaybeWeak, Object, ObjectInit,
+    HeapBackend, HeapObject, HeapStats, LocalHeap, Map, MaybeWeak, Object, ObjectInit,
     ObjectSlotsInit, PrototypeRegistry, RawCell, STRONG_PTR, SharedHeap, Smi, Tagged, Tlab, Value,
     Visitor, WeakFixedArray, Word,
 };
@@ -579,9 +579,6 @@ pub struct Heap {
     tlab: Tlab,
     known: *const KnownCell,
     prototype_registry: *const PrototypeRegistry,
-    /// Bumped whenever an array map gains the holey flag: packed element
-    /// inline caches recorded under an older epoch must re-record.
-    holey_epoch: Cell<u32>,
     /// True while no object owns an integer-named (non-element) property:
     /// element misses may then return `undefined` without a chain walk.
     indexed_props: Cell<bool>,
@@ -628,11 +625,6 @@ impl Heap {
         unsafe { &*self.prototype_registry }
     }
 
-    /// The current holey-map epoch (see [`Heap::promote_holey`]).
-    pub fn holey_epoch(&self) -> u32 {
-        self.holey_epoch.get()
-    }
-
     /// Whether no object owns an integer-named property (see
     /// [`Heap::invalidate_indexed_props`]).
     pub fn indexed_props_valid(&self) -> bool {
@@ -643,21 +635,6 @@ impl Heap {
     /// miss can no longer assume the prototype chain lacks the index.
     pub fn invalidate_indexed_props(&self) {
         self.indexed_props.set(false);
-    }
-
-    /// Mark an array map holey in place. Conservative for every array
-    /// sharing the map; the epoch bump invalidates packed element caches.
-    pub fn promote_holey(&self, map: Tagged<'_, Map>) {
-        let kind = map.as_ref().kind();
-        if kind.contains(MapKind::HOLEY) {
-            return;
-        }
-        map.as_ref().kind.set(
-            self,
-            map.erase(),
-            Smi::new(kind.union(MapKind::HOLEY).bits() as i64),
-        );
-        self.holey_epoch.set(self.holey_epoch.get().wrapping_add(1));
     }
 
     pub fn set_known(&self, known: WellKnown) {
@@ -986,7 +963,6 @@ impl GlobalHeap {
             tlab: Tlab::empty(),
             known: known as *const KnownCell,
             prototype_registry: prototype_registry as *const PrototypeRegistry,
-            holey_epoch: Cell::new(0),
             indexed_props: Cell::new(true),
             #[cfg(feature = "stress-minor-gc")]
             stress_armed: std::sync::Arc::clone(&self.stress_armed),

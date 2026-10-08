@@ -99,7 +99,8 @@ pub fn number_to_fixed<'a>(
                 rt_try!(vm, heap, state, Convert::to_number(heap, d)) as i64
             }
             _ => 0,
-        };        if !(0..=100).contains(&digits) {
+        };
+        if !(0..=100).contains(&digits) {
             return raise_runtime(vm, heap, state, VmError::OutOfBounds);
         }
         let text = if x.is_nan() {

@@ -10,8 +10,9 @@ pub const MAX_POLYMORPHIC_ENTRIES: usize = 4;
 
 const KIND_FIELD: i64 = 0;
 const KIND_SLOW: i64 = 1;
-/// Dense array element load; payload = flags + (when packed) the holey
-/// epoch the handler was recorded under.
+/// Dense array element load; payload = flags (holeyness is pinned by the
+/// map check in the probe: a packed handler can only ever run against
+/// the packed map it was recorded for).
 const KIND_ELEMENT: i64 = 2;
 /// Dense array element store; payload = flags.
 const KIND_ELEMENT_STORE: i64 = 3;
@@ -35,7 +36,6 @@ const KIND_PARENT: i64 = 9;
 /// Element-load payload flags.
 const ELEMENT_HOLEY: i64 = 1 << 0;
 const ELEMENT_ALLOW_OOB: i64 = 1 << 1;
-const ELEMENT_EPOCH_SHIFT: i64 = 2;
 
 /// Element-store payload flags.
 const STORE_HOLEY: i64 = 1 << 0;
@@ -641,17 +641,8 @@ fn apply_element_load<'a>(
         return oob(heap);
     }
     let v = elements.at(heap, index);
-    if holey {
-        if v == heap.known().the_hole.as_tagged(heap) {
-            return oob(heap);
-        }
-        return Some(ElementHit::Value(v));
-    }
-    // packed promise: only valid while no array promoted its map since
-    // this handler was recorded
-    let epoch = (payload >> ELEMENT_EPOCH_SHIFT) as u32;
-    if epoch != heap.holey_epoch() {
-        return None;
+    if holey && v == heap.known().the_hole.as_tagged(heap) {
+        return oob(heap);
     }
     Some(ElementHit::Value(v))
 }
@@ -961,9 +952,6 @@ impl InlineCache {
             }
             if heap.indexed_props_valid() {
                 payload |= ELEMENT_ALLOW_OOB;
-            }
-            if payload & ELEMENT_HOLEY == 0 {
-                payload |= (heap.holey_epoch() as i64) << ELEMENT_EPOCH_SHIFT;
             }
             Handler::Smi(kind_smi(KIND_ELEMENT, payload))
         } else {

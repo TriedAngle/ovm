@@ -113,6 +113,7 @@ pub struct WellKnown {
     /// Transition-tree key for prototype changes (never user-visible):
     /// a `set_prototype` edge, disambiguated by the child's prototype
     pub prototype_transition_symbol: Global<Symbol>,
+    pub holey_transition_symbol: Global<Symbol>,
     /// Map of array-iterator objects (slots: [iterated array, next index])
     pub array_iterator_map: Global<Map>,
     /// %ArrayIteratorPrototype% (holds `next` and @@iterator)
@@ -292,6 +293,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         iterator_symbol: symbol,
         megamorphic_symbol: symbol,
         prototype_transition_symbol: symbol,
+        holey_transition_symbol: symbol,
         array_iterator_map: map,
         array_iterator_prototype: obj,
         iterator_result_map: map,
@@ -633,6 +635,8 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     // transition-tree key for prototype changes (never user-visible)
     let prototype_transition_symbol =
         roots.create_handle(Symbol::new(heap, &scope, b"<set-prototype>").as_tagged(heap));
+    let holey_transition_symbol =
+        roots.create_handle(Symbol::new(heap, &scope, b"<promote-holey>").as_tagged(heap));
 
     let empty_scope_info =
         roots.create_handle(heap.allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots }));
@@ -686,6 +690,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.iterator_symbol = iterator_symbol;
     known.megamorphic_symbol = megamorphic_symbol;
     known.prototype_transition_symbol = prototype_transition_symbol;
+    known.holey_transition_symbol = holey_transition_symbol;
     known.object_prototype = object_prototype;
     known.array_prototype = array_prototype;
     known.date_prototype = date_prototype;
@@ -693,9 +698,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.error_prototype = error_prototype;
     known.function_prototype = function_prototype;
     known.error_map = error_map;
-    // the per-class error maps and wrapper maps are placeholders until the
-    // builtins bootstrap installs their prototypes (they start pointing at
-    // the plain error map so no allocation ever reads a garbage map)
+
     known.type_error_map = error_map;
     known.reference_error_map = error_map;
     known.range_error_map = error_map;

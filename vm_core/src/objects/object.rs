@@ -3,8 +3,8 @@ use core::alloc::Layout;
 use crate::{
     CallableInfoObject, Coercion, ContextObject, Convert, DenseString, EdgeVisitable, FixedArray,
     Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap, HeapObject, Hint,
-    HostCtx, Lookup, Map, NativeIndex, ObjectKind, PropertyDescriptor, SlotName, Smi, Symbol,
-    Tagged, ThreadState, VM, Value, Visitor, VmError,
+    HostCtx, Lookup, Map, NativeIndex, ObjectKind, PropertyDescriptor, SiblingChange, SlotName,
+    Smi, Symbol, Tagged, ThreadState, Transition, VM, Value, Visitor, VmError,
 };
 
 #[repr(C)]
@@ -134,10 +134,22 @@ impl Object {
         elements.is_strong_ptr().then_some(elements)
     }
 
-    /// Mark the array's map holey: future element reads must expect holes
-    /// (and future element caches must re-record).
-    pub fn mark_holey(&self, heap: &Heap) {
-        heap.promote_holey(self.header.map.get(heap));
+    pub fn promote_holey(heap: &mut Heap, scope: &HandleScope<'_>, receiver: &Handle<'_, Object>) {
+        let map = {
+            let obj = receiver.as_tagged(heap);
+            let map = obj.as_ref().map_ref(heap);
+            if map.as_ref().kind().is_holey() {
+                return;
+            }
+            scope.handle(map)
+        };
+        let target =
+            Transition::sibling_target(heap, scope, |h| map.as_tagged(h), SiblingChange::Holey);
+        let obj = receiver.as_tagged(heap);
+        obj.as_ref()
+            .header
+            .map
+            .set(heap, obj.erase(), target.as_tagged(heap));
     }
 
     /// Fast element read for array objects: `None` if `self` is not an
@@ -233,9 +245,6 @@ impl Object {
         })
     }
 
-    /// Store `value` at element index `i` of an array object, growing the
-    /// elements backing store and updating `length` when `i` is past the end.
-    /// Both arguments are rooted handles, so the grow path may allocate.
     pub fn store_array_element(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
@@ -264,7 +273,7 @@ impl Object {
         // writing past the end leaves holes behind: the map must stop
         // promising packed elements
         if i > old_len {
-            receiver.as_tagged(heap).as_ref().mark_holey(heap);
+            Self::promote_holey(heap, scope, receiver);
         }
 
         if grows {

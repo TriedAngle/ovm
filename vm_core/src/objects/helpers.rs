@@ -4,7 +4,6 @@ use crate::{
     NativeIndex, Object, PropertyDescriptor, Smi, Tagged, Thread, Value, VmError,
 };
 
-
 #[derive(Copy, Clone)]
 pub enum WrapperKind {
     Number,
@@ -77,7 +76,6 @@ impl Object {
         Ok(scope.handle(obj))
     }
 
-
     // TODO: get rid of this.
     pub fn run_prelude(
         thread: &mut Thread,
@@ -113,7 +111,6 @@ impl Object {
         }
         Ok(())
     }
-
 
     pub fn install_constructor<'s>(
         thread: &mut Thread,
