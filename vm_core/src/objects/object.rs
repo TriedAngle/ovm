@@ -192,21 +192,15 @@ impl Object {
             .set(heap, obj.erase(), target.as_tagged(heap));
     }
 
-    #[inline]
-    pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
+    #[inline(always)]
+    pub fn element_value_dense<'a>(
+        &'a self,
+        heap: &'a Heap,
+        i: usize,
+    ) -> Option<Tagged<'a, Value>> {
         let kind = self.header.map.get(heap).as_ref().kind();
-        if !kind.is_array() || i >= self.length() {
+        if !kind.is_array() || !kind.is_dense_elements() || i >= self.length() {
             return None;
-        }
-        if !kind.is_dense_elements() {
-            // sparse: probe the dictionary. Accessor entries are not
-            // plain values — the keyed cold path dispatches getters.
-            let dict = self.element_dictionary(heap)?;
-            let entry = dict.as_ref().find(heap, i)?;
-            if dict.as_ref().is_accessor_at(heap, entry) {
-                return None;
-            }
-            return Some(dict.as_ref().value_at(heap, entry));
         }
         let elements = self.elements.get(heap);
         if kind.is_holey() {
@@ -223,6 +217,24 @@ impl Object {
             // packed: capacity covers `length`, and no slot is a hole
             Some(elements.as_ref().at(heap, i))
         }
+    }
+
+    #[inline]
+    pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
+        if let Some(v) = self.element_value_dense(heap, i) {
+            return Some(v);
+        }
+
+        let kind = self.header.map.get(heap).as_ref().kind();
+        if !kind.is_array() || i >= self.length() {
+            return None;
+        }
+        let dict = self.element_dictionary(heap)?;
+        let entry = dict.as_ref().find(heap, i)?;
+        if dict.as_ref().is_accessor_at(heap, entry) {
+            return None;
+        }
+        Some(dict.as_ref().value_at(heap, entry))
     }
 }
 
@@ -566,7 +578,7 @@ impl Object {
             return Err(VmError::OutOfBounds);
         }
         elements.set(heap, i, value);
-        Prototype::element_mutated(heap, obj);
+        Prototype::element_mutated_kind(heap, obj, kind);
         Ok(())
     }
 }

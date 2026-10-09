@@ -388,7 +388,7 @@ fn step<'a>(
             {
                 let recv = stack.reg(heap, frame_base, ops.reg(0));
                 if let Some(obj) = recv.as_heap_object()
-                    && let Some(v) = obj.as_ref().element_value(heap, idx as usize)
+                    && let Some(v) = obj.as_ref().element_value_dense(heap, idx as usize)
                 {
                     acc.store(v);
                     return Flow::Next;
@@ -424,7 +424,7 @@ fn step<'a>(
             {
                 let recv = stack.reg(heap, frame_base, ops.reg(0));
                 if let Some(obj) = recv.as_heap_object()
-                    && let Some(v) = obj.as_ref().element_value(heap, idx as usize)
+                    && let Some(v) = obj.as_ref().element_value_dense(heap, idx as usize)
                 {
                     acc.store(v);
                     return Flow::Next;
@@ -657,7 +657,9 @@ fn step<'a>(
             if let Some(idx) = Smi::decode(acc.get(heap).raw())
                 && idx.value() >= 0
                 && let Some(recv) = stack.reg(heap, frame_base, ops.reg(0)).as_heap_object()
-                && let Some(v) = recv.as_ref().element_value(heap, idx.value() as usize)
+                && let Some(v) = recv
+                    .as_ref()
+                    .element_value_dense(heap, idx.value() as usize)
             {
                 acc.store(v);
                 return Flow::Next;
@@ -2243,7 +2245,7 @@ fn step<'a>(
             let idx = ops.uimm(1) as usize;
             let fb = ops.idx(2);
             if let Some(recv) = stack.reg(heap, frame_base, ops.reg(0)).as_heap_object()
-                && let Some(v) = recv.as_ref().element_value(heap, idx)
+                && let Some(v) = recv.as_ref().element_value_dense(heap, idx)
             {
                 acc.store(v);
                 return Flow::Sync;

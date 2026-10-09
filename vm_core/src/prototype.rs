@@ -1,7 +1,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Cell, CellInit, FixedArray, Handle, HandleScope, Heap, Lookup, Map, MaybeWeak, Object,
+    Cell, CellInit, FixedArray, Handle, HandleScope, Heap, Lookup, Map, MapKind, MaybeWeak, Object,
     PrototypeInfo, PrototypeInfoInit, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
 };
 
@@ -217,6 +217,16 @@ impl Prototype {
             return;
         }
         invalidate_prototype_chains(heap, map);
+    }
+
+    /// `element_mutated` for callers that already hold the receiver's
+    /// decoded map kind: skips the map/kind reload on the hot store path.
+    #[inline]
+    pub fn element_mutated_kind(heap: &Heap, obj: Tagged<'_, Object>, kind: MapKind) {
+        if !kind.is_prototype() {
+            return;
+        }
+        invalidate_prototype_chains(heap, obj.as_ref().map_ref(heap));
     }
 
     /// Whether an indexed store into `receiver` (map `map`) may skip the

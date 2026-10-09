@@ -1525,6 +1525,25 @@ fn decode_runtime_payload(raw: i64) -> Option<NativeIndex> {
     (raw & CALL_TAG_NATIVE != 0).then_some(NativeIndex((raw >> 1) as usize))
 }
 
+#[inline]
+fn call_probe_strong<'a>(heap: &'a Heap, callee: Tagged<'a, Value>) -> CallProbe<'a> {
+    match Object::call_target(heap, callee) {
+        Some(CallTarget::Native(rt)) => CallProbe::Native(rt),
+        Some(CallTarget::Bytecode {
+            target,
+            info,
+            context,
+            kind,
+        }) => CallProbe::Bytecode(CallHit {
+            target,
+            info,
+            context,
+            kind,
+        }),
+        _ => CallProbe::Miss,
+    }
+}
+
 /// Decode the packed callable descriptor: `register_count | formal_min<<16
 /// | kind<<32` (mirrors `Object::call_target`).
 #[inline(always)]
@@ -1555,21 +1574,8 @@ impl InlineCache {
         if !state.is_weak_ptr() {
             if state.is_strong_ptr() && !state.ptr_eq(heap.known().the_hole.as_tagged(heap).erase())
             {
-                return match Object::call_target(heap, callee) {
-                    Some(CallTarget::Native(rt)) => CallProbe::Native(rt),
-                    Some(CallTarget::Bytecode {
-                        target,
-                        info,
-                        context,
-                        kind,
-                    }) => CallProbe::Bytecode(CallHit {
-                        target,
-                        info,
-                        context,
-                        kind,
-                    }),
-                    _ => CallProbe::Miss,
-                };
+                // megamorphic site: decode the callee on every execution
+                return call_probe_strong(heap, callee);
             }
             return CallProbe::Miss;
         }
@@ -1586,19 +1592,18 @@ impl InlineCache {
             };
         }
 
-        let Some(info) = payload
-            .as_strong()
-            .and_then(|p| p.get_as::<CallableInfoObject>(heap))
-        else {
+        let Some(info_word) = payload.as_strong() else {
             return CallProbe::Miss;
         };
-        let (_, _, kind) = decode_descriptor(info.descriptor.to_smi_unchecked().value());
+        let info: Tagged<'a, CallableInfoObject> = unsafe { info_word.cast() };
+        debug_assert!(info_word.get_as::<CallableInfoObject>(heap).is_some());
+        let (_, _, kind) = decode_descriptor(info.as_ref().descriptor.to_smi_unchecked().value());
         let Some(target) = callee.as_heap_object() else {
             return CallProbe::Miss;
         };
-        let Some(context) = target.slot(heap, 1).get(heap).get_as::<ContextObject>(heap) else {
-            return CallProbe::Miss;
-        };
+        let context_word = target.as_ref().slot(heap, 1).get(heap);
+        debug_assert!(context_word.get_as::<ContextObject>(heap).is_some());
+        let context: Tagged<'a, ContextObject> = unsafe { context_word.cast() };
         CallProbe::Bytecode(CallHit {
             target,
             info,

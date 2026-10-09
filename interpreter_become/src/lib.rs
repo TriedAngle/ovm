@@ -1781,7 +1781,7 @@ extern "rust-preserve-none" fn op_load_keyed_reg<'a, const STRIDE: usize>(
         && idx >= 0
     {
         if let Some(obj) = recv.as_heap_object()
-            && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx as usize)
+            && let Some(v) = obj.as_ref().element_value_dense(ctx.heap(), idx as usize)
         {
             next!(LoadKeyedPropertyReg, ip, regs, ctx, table, roots, float, v)
         }
@@ -1944,7 +1944,7 @@ extern "rust-preserve-none" fn op_load_keyed<'a, const STRIDE: usize>(
         && idx >= 0
     {
         if let Some(obj) = recv.as_heap_object()
-            && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx as usize)
+            && let Some(v) = obj.as_ref().element_value_dense(ctx.heap(), idx as usize)
         {
             next!(LoadKeyedProperty, ip, regs, ctx, table, roots, float, v)
         }
@@ -1977,7 +1977,7 @@ extern "rust-preserve-none" fn op_load_element_imm<'a, const STRIDE: usize>(
     let fb = ops.unsigned::<2>();
     let recv = regs.read(r, ctx);
     if let Some(obj) = recv.as_heap_object()
-        && let Some(v) = obj.as_ref().element_value(ctx.heap(), idx)
+        && let Some(v) = obj.as_ref().element_value_dense(ctx.heap(), idx)
     {
         next!(LoadElementImm, ip, regs, ctx, table, roots, float, v)
     }

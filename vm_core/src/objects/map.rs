@@ -504,8 +504,7 @@ impl MapKind {
             1 => ElementsKind::Holey,
             2 => ElementsKind::PackedDouble,
             3 => ElementsKind::HoleyDouble,
-            4 => ElementsKind::Dictionary,
-            _ => panic!("invalid elements kind"),
+            _ => ElementsKind::Dictionary,
         }
     }
 
