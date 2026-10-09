@@ -270,6 +270,11 @@ impl<'a, T> Tagged<'a, T> {
     }
 
     #[inline(always)]
+    /// The raw address bits — the identity key for dedup sets.
+    pub const fn raw_addr(self) -> Word {
+        self.raw.raw_addr()
+    }
+
     pub fn is_strong_ptr(self) -> bool {
         self.raw.is_strong_ptr()
     }
@@ -416,6 +421,13 @@ impl<'a, T: HeapObject> Tagged<'a, T> {
         // Safety: `ptr` is a strong heap pointer re-anchored at a live
         // borrow of the heap — no GC can have run since it was obtained.
         unsafe { Self::from_raw_ptr(ptr) }
+    }
+
+    /// The typed word for a reference observed under a heap borrow: the
+    /// shared borrow keeps the collector away for its whole lifetime, so
+    /// the address is stable until the borrow ends.
+    pub fn anchored(heap: &'a Heap, r: &T) -> Self {
+        Self::from_ptr(heap, NonNull::from(r))
     }
 
     pub fn as_ref(self) -> &'a T {

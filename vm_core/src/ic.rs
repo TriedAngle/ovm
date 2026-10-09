@@ -318,6 +318,13 @@ fn walk<'s>(
     name: Tagged<'_, SlotName>,
 ) -> Option<Found<'s>> {
     let map = obj.map_ref(heap);
+    // accessor entries in a sparse hop act like accessor descriptors
+    if let Some(pair) = obj.as_ref().dictionary_accessor(heap, name.as_index()) {
+        return Some(Found::Accessor {
+            pair: scope.handle(pair),
+            holder: scope.handle(obj),
+        });
+    }
     for d in map.descriptors() {
         if !d.name(heap).ptr_eq(name) {
             continue;
@@ -444,11 +451,15 @@ fn chain_object_elements_clean(heap: &Heap, word: Tagged<'_, Value>) -> bool {
         return false;
     }
     for d in map.as_ref().descriptors() {
-        if Smi::decode(d.name(heap).erase().raw()).is_some() {
+        if d.name(heap).to_i64().is_some() {
             return false;
         }
     }
     if kind.is_array() {
+        if !kind.is_dense_elements() {
+            // a dictionary-backed hop may hold elements
+            return false;
+        }
         let elements = obj.as_ref().elements.get(heap);
         if elements.is_strong_ptr() {
             let hole = heap.known().the_hole.as_tagged(heap);
@@ -1074,6 +1085,11 @@ impl InlineCache {
             }
             Handler::Smi(kind_smi(KIND_INDEXED_STRING, payload))
         } else if obj.is_array(heap) {
+            // element handlers are dense-only: dictionary arrays take
+            // the generic path
+            if !map.as_tagged(heap).kind().is_dense_elements() {
+                return;
+            }
             let mut payload = 0;
             if map.as_tagged(heap).kind().is_holey() {
                 payload |= ELEMENT_HOLEY;
@@ -1121,6 +1137,10 @@ impl InlineCache {
             return;
         }
         let map = scope.handle(obj.map_ref(heap));
+        // element store handlers are dense-only
+        if !map.as_tagged(heap).kind().is_dense_elements() {
+            return;
+        }
         let mut payload = 0;
         if map.as_tagged(heap).kind().is_holey() {
             payload |= STORE_HOLEY;

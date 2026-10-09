@@ -1,5 +1,5 @@
 use crate::{
-    DenseString, Float, Handle, HandleScope, Heap, Smi, StringData, Symbol, Tagged, Value, VmError,
+    DenseString, Float, Handle, HandleScope, Heap, StringData, Symbol, Tagged, Value, VmError,
 };
 
 /// ToPrimitive hint (ES 7.1.1).
@@ -24,8 +24,8 @@ impl Convert {
     /// The numeric value of a value that already IS a number
     #[inline]
     pub fn as_number(heap: &Heap, v: Tagged<'_, Value>) -> Option<f64> {
-        if let Some(smi) = Smi::decode(v.raw()) {
-            return Some(smi.value() as f64);
+        if let Some(i) = v.to_i64() {
+            return Some(i as f64);
         }
         v.get_as::<Float>(heap).map(|f| f.value.get())
     }
@@ -35,8 +35,8 @@ impl Convert {
     #[inline]
     pub fn is_truthy(heap: &Heap, v: Tagged<'_, Value>) -> bool {
         let known = heap.known();
-        if let Some(smi) = Smi::decode(v.raw()) {
-            return smi.value() != 0;
+        if let Some(i) = v.to_i64() {
+            return i != 0;
         }
         if v == known.false_object.as_tagged(heap)
             || v == known.undefined.as_tagged(heap)
@@ -61,8 +61,8 @@ impl Convert {
 
     pub fn to_number(heap: &Heap, v: Tagged<'_, Value>) -> Result<f64, VmError> {
         let known = heap.known();
-        if let Some(smi) = Smi::decode(v.raw()) {
-            return Ok(smi.value() as f64);
+        if let Some(i) = v.to_i64() {
+            return Ok(i as f64);
         }
         if v == known.undefined.as_tagged(heap) || v == known.the_hole.as_tagged(heap) {
             return Ok(f64::NAN);
@@ -225,31 +225,27 @@ impl Convert {
         scope: &HandleScope<'_>,
         v: Handle<'_, Value>,
     ) -> Result<Tagged<'a, Value>, VmError> {
-        // `word` is a plain copy; the handle stays rooted across the
-        // allocations below, and no heap borrow spans an allocation.
-        let word = v.raw();
         // Smis allocate a fresh string.
-        if let Some(smi) = Smi::decode(word) {
-            let s = DenseString::from_utf8(heap, scope, &smi.value().to_string());
+        if let Some(i) = v.as_tagged(heap).to_i64() {
+            let s = DenseString::from_utf8(heap, scope, &i.to_string());
             return Ok(s.as_tagged(heap).erase());
         }
-        // The singletons map to interned identity strings, no allocation.
-        {
-            let known = heap.known();
-            let identity = if word == known.undefined.as_tagged(heap) {
-                Some(known.strings.undefined)
-            } else if word == known.null.as_tagged(heap) {
-                Some(known.strings.null)
-            } else if word == known.true_object.as_tagged(heap) {
-                Some(known.strings.true_)
-            } else if word == known.false_object.as_tagged(heap) {
-                Some(known.strings.false_)
-            } else {
-                None
-            };
-            if let Some(name) = identity {
-                return Ok(name.as_tagged(heap).erase());
-            }
+
+        let known = heap.known();
+        let val = v.as_tagged(heap);
+        let identity = if val == known.undefined.as_tagged(heap) {
+            Some(known.strings.undefined)
+        } else if val == known.null.as_tagged(heap) {
+            Some(known.strings.null)
+        } else if val == known.true_object.as_tagged(heap) {
+            Some(known.strings.true_)
+        } else if val == known.false_object.as_tagged(heap) {
+            Some(known.strings.false_)
+        } else {
+            None
+        };
+        if let Some(name) = identity {
+            return Ok(name.as_tagged(heap).erase());
         }
         // Strings are their own stringification.
         if v.as_tagged(heap).get_as::<DenseString>(heap).is_some() {

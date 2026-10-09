@@ -4,6 +4,7 @@ pub mod callable;
 pub mod cell;
 pub mod context;
 pub mod data_handler;
+pub mod dictionary;
 pub mod feedback;
 pub mod float;
 mod helpers;
@@ -23,6 +24,10 @@ pub use context::{
     ScopeInfo, ScopeInfoInit,
 };
 pub use data_handler::{DataHandler, DataHandlerInit};
+pub use dictionary::{
+    DETAILS_ACCESSOR, DETAILS_CONFIGURABLE, DETAILS_DATA, DETAILS_ENUMERABLE, DETAILS_WRITABLE,
+    EntryClass, NumberDictionary, NumberDictionaryInit,
+};
 pub use feedback::{FeedbackVector, FeedbackVectorInit, new_feedback_vector};
 pub use float::Float;
 pub use helpers::WrapperKind;
@@ -127,6 +132,8 @@ pub enum ObjectKind {
     Cell = 20,
     PrototypeInfo = 21,
     DataHandler = 22,
+    /// Sparse-array elements backing store (internal, never a receiver)
+    NumberDictionary = 23,
 }
 
 impl ObjectKind {
@@ -176,6 +183,7 @@ pub unsafe fn object_layout(addr: NonNull<()>) -> Layout {
             ObjectKind::Cell => (*addr.cast::<Cell>().as_ptr()).layout(),
             ObjectKind::PrototypeInfo => (*addr.cast::<PrototypeInfo>().as_ptr()).layout(),
             ObjectKind::DataHandler => (*addr.cast::<DataHandler>().as_ptr()).layout(),
+            ObjectKind::NumberDictionary => (*addr.cast::<NumberDictionary>().as_ptr()).layout(),
             ObjectKind::Object
             | ObjectKind::Array
             | ObjectKind::ByteArray
@@ -222,6 +230,9 @@ pub unsafe fn visit_object(addr: NonNull<()>, visitor: &mut dyn Visitor) {
                 (*addr.cast::<PrototypeInfo>().as_ptr()).visit_edges(visitor)
             }
             ObjectKind::DataHandler => (*addr.cast::<DataHandler>().as_ptr()).visit_edges(visitor),
+            ObjectKind::NumberDictionary => {
+                (*addr.cast::<NumberDictionary>().as_ptr()).visit_edges(visitor)
+            }
             ObjectKind::Object
             | ObjectKind::Array
             | ObjectKind::ByteArray

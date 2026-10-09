@@ -21,7 +21,7 @@ impl Compare {
             }
             let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>(heap) {
                 Some(f) => f.value.get(),
-                None => v.raw().to_i64().unwrap() as f64,
+                None => v.to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);
@@ -111,7 +111,7 @@ impl Compare {
         if x_num && y_num {
             let number_value = |v: Tagged<'_, Value>| match v.get_as::<Float>(heap) {
                 Some(f) => f.value.get(),
-                None => v.raw().to_i64().unwrap() as f64,
+                None => v.to_i64().unwrap() as f64,
             };
             let a = number_value(x);
             let b = number_value(y);

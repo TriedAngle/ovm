@@ -400,12 +400,21 @@ fn for_in_level_keys<'s>(
         let obj = obj.as_ref();
         // array elements: non-hole indices ascending
         if obj.is_array(heap) {
-            let len = obj
-                .length()
-                .min(obj.elements_array(heap).map(|e| e.len()).unwrap_or(0));
-            for i in 0..len {
-                if obj.element_value(heap, i).is_some() {
-                    indices.push(i as i64);
+            if let Some(dict) = obj.element_dictionary(heap) {
+                // sparse: collect the live keys, then sort
+                let mut keys: Vec<i64> = Vec::new();
+                dict.as_ref()
+                    .for_each_entry(heap, |k, _, _| keys.push(k as i64));
+                keys.sort_unstable();
+                indices.extend(keys);
+            } else {
+                let len = obj
+                    .length()
+                    .min(obj.elements_array(heap).map(|e| e.len()).unwrap_or(0));
+                for i in 0..len {
+                    if obj.element_value(heap, i).is_some() {
+                        indices.push(i as i64);
+                    }
                 }
             }
         }
@@ -413,15 +422,13 @@ fn for_in_level_keys<'s>(
         for d in obj.map_ref(heap).descriptors() {
             let name = d.name(heap);
 
-            if let Some(smi) = Smi::decode(name.raw()) {
-                let v = smi.value();
-                // array-index-range Smi names are index keys; anything
-                // else (negative, ≥ 2^32−1) keeps insertion order
-                if (0..u32::MAX as i64).contains(&v) {
-                    indices.push(v);
-                } else {
-                    names.push(scope.handle(name.erase()));
-                }
+            if let Some(index) = name.as_index() {
+                indices.push(index as i64);
+                continue;
+            }
+            if name.erase().raw().is_smi() {
+                // out-of-range Smi names keep insertion order
+                names.push(scope.handle(name.erase()));
                 continue;
             }
             if name.erase().get_as::<Symbol>(heap).is_some() {

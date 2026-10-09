@@ -126,6 +126,12 @@ impl<T> GcSlot<T> {
         Value::from_bits(self.cell.load())
     }
 
+    /// The Smi payload if the slot holds one; `None` for pointers. The
+    /// heap-free read for slots whose value may be a Smi.
+    pub fn try_smi(&self) -> Option<i64> {
+        self.raw().to_i64()
+    }
+
     /// The anchored referent, valid for the heap borrow.
     pub fn as_ref<'a>(&self, heap: &'a Heap) -> &'a T
     where

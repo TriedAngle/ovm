@@ -31,6 +31,7 @@ pub enum StoreOutcome<'s> {
 pub enum SiblingChange<'s> {
     Prototype(Handle<'s, Value>),
     Holey,
+    Dictionary,
 }
 
 impl<'s> SiblingChange<'s> {
@@ -38,6 +39,7 @@ impl<'s> SiblingChange<'s> {
         match self {
             Self::Prototype(_) => kind,
             Self::Holey => kind.with_elements(ElementsKind::Holey),
+            Self::Dictionary => kind.with_elements(ElementsKind::Dictionary),
         }
     }
 
@@ -49,7 +51,7 @@ impl<'s> SiblingChange<'s> {
     ) -> Handle<'s, Value> {
         match self {
             Self::Prototype(proto) => *proto,
-            Self::Holey => scope.handle(parent.prototype.get(heap)),
+            Self::Holey | Self::Dictionary => scope.handle(parent.prototype.get(heap)),
         }
     }
 
@@ -57,6 +59,7 @@ impl<'s> SiblingChange<'s> {
         match self {
             Self::Prototype(proto) => parent.find_prototype_transition(heap, proto.as_tagged(heap)),
             Self::Holey => parent.find_holey_transition(heap),
+            Self::Dictionary => parent.find_dictionary_transition(heap),
         }
     }
 
@@ -64,6 +67,7 @@ impl<'s> SiblingChange<'s> {
         match self {
             Self::Prototype(_) => heap.known().prototype_transition_symbol.as_tagged(heap),
             Self::Holey => heap.known().holey_transition_symbol.as_tagged(heap),
+            Self::Dictionary => heap.known().dictionary_transition_symbol.as_tagged(heap),
         }
     }
 }
@@ -267,7 +271,7 @@ impl Transition {
                 Change::Replace { index } => {
                     let d = &parent_ref.descriptors()[index];
                     let offset = (!d.flags().is_accessor())
-                        .then(|| Smi::decode(d.value.get(heap).raw()).expect("data row offset"));
+                        .then(|| d.value.try_smi().expect("data row offset"));
                     Some((d.flags(), offset))
                 }
             };
@@ -283,12 +287,9 @@ impl Transition {
                     Change::Replace { .. } => old_row.expect("replace row").0.is_accessor(),
                 };
             let row_offset = match change {
-                Change::Replace { .. } if !grow && !flags.is_accessor() => old_row
-                    .expect("replace row")
-                    .1
-                    .expect("data row offset")
-                    .value()
-                    as usize,
+                Change::Replace { .. } if !grow && !flags.is_accessor() => {
+                    old_row.expect("replace row").1.expect("data row offset") as usize
+                }
                 _ => value_slot_count,
             };
             let appends = usize::from(matches!(change, Change::Append));
@@ -773,15 +774,6 @@ impl Transition {
         }
     }
 
-    /// `super.x = v` (ES 15.4.4 PutValue on a super reference): the store
-    /// walks the chain starting at the pre-resolved parent link (read
-    /// before ToPropertyKey; any of the three prototype shapes) but the
-    /// receiver is `this`:
-    /// - `Shadow` (JS): inherited writable data properties create an own
-    ///   property on the receiver (OrdinarySet's receiver != O path),
-    ///   setters run with the receiver, misses define on the receiver
-    /// - `WriteThrough` (Self-style): inherited writable data properties
-    ///   are written at the holder instead of shadowing
     pub fn super_store_lookup<'a, 's>(
         heap: &'a Heap,
         scope: &'s HandleScope<'_>,
@@ -1013,7 +1005,7 @@ impl Object {
             return Ok(false);
         }
         // an integer-named own property can shadow an element hole
-        if Smi::decode(name.as_tagged(heap).raw()).is_some()
+        if name.as_tagged(heap).to_i64().is_some()
             && receiver.as_tagged(heap).as_ref().is_array(heap)
         {
             Object::promote_holey(heap, scope, &receiver);
@@ -1079,7 +1071,7 @@ impl Object {
             return Ok(false);
         };
         // an integer-named own property can shadow an element hole
-        if Smi::decode(name.as_tagged(heap).raw()).is_some()
+        if name.as_tagged(heap).to_i64().is_some()
             && receiver.as_tagged(heap).as_ref().is_array(heap)
         {
             Object::promote_holey(heap, scope, &receiver);
@@ -1101,10 +1093,13 @@ impl Object {
             };
             match key {
                 Key::Element(i) => {
-                    // array elements live in the elements backing store,
-                    // outside the descriptors: delete punches a hole
                     let obj = receiver.as_tagged(heap);
                     if obj.as_ref().is_array(heap) {
+                        if let Some(dict) = obj.as_ref().element_dictionary(heap) {
+                            dict.as_ref().delete(heap, i);
+                            Prototype::element_mutated(heap, obj);
+                            break 'name None;
+                        }
                         // indices at/past `length` were never own properties
                         if i < obj.as_ref().length()
                             && obj
@@ -1141,20 +1136,6 @@ impl Object {
         receiver: Handle<Object>,
         name: Handle<SlotName>,
     ) -> Result<bool, VmError> {
-        // array `length` lives in a dedicated slot outside the
-        // descriptors and is non-configurable (ES 10.4.2)
-        {
-            let cond_8 = receiver
-                .as_tagged(heap)
-                .as_ref()
-                .array_length(heap, name.as_tagged(heap))
-                .is_some();
-            if cond_8 {
-                return Ok(false);
-            }
-        }
-        // OrdinaryDelete: absent → true, non-configurable → false,
-        // configurable → remove
         let configurable = receiver
             .as_tagged(heap)
             .map_ref(heap)
@@ -1343,9 +1324,10 @@ fn validate_define<'a, 's>(
                 return None;
             }
 
-            let offset = Smi::decode(cur_desc_value.as_tagged(heap).raw())
-                .expect("data row offset")
-                .value() as usize;
+            let offset = cur_desc_value
+                .as_tagged(heap)
+                .to_i64()
+                .expect("data row offset") as usize;
             if !Compare::same_value(
                 heap,
                 value.as_tagged(heap),

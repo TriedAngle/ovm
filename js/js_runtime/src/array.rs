@@ -3,8 +3,8 @@
 
 use vm_core::HostCtx;
 use vm_core::{
-    Args, Convert, DenseString, Handle, Heap, Object, Prototype, Smi, Tagged, ThreadState, VM,
-    Value, VmError,
+    Args, Convert, DETAILS_CONFIGURABLE, DenseString, Handle, Heap, Object, Prototype, Smi, Tagged,
+    ThreadState, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -195,11 +195,15 @@ pub fn array_pop<'a>(
             .as_ref()
             .element_value(heap, last)
             .unwrap_or_else(|| heap.known().undefined.as_tagged(heap).erase());
-        let elements = this.as_ref().elements.get(heap);
-        if elements.is_strong_ptr() && last < elements.as_ref().len() {
-            elements
-                .as_ref()
-                .set(heap, last, heap.known().the_hole.as_tagged(heap).erase());
+        if let Some(dict) = this.as_ref().element_dictionary(heap) {
+            dict.as_ref().delete(heap, last);
+        } else {
+            let elements = this.as_ref().elements.get(heap);
+            if elements.is_strong_ptr() && last < elements.as_ref().len() {
+                elements
+                    .as_ref()
+                    .set(heap, last, heap.known().the_hole.as_tagged(heap).erase());
+            }
         }
         this.as_ref()
             .length
@@ -437,7 +441,6 @@ fn join_impl<'a>(
     })
 }
 
-/// `Array.isArray(arg)` (ES 24.1.2.1).
 pub fn array_is_array<'a>(
     nctx: HostCtx<'a>,
     _new_target: Option<Handle<'_, Value>>,
@@ -512,6 +515,50 @@ pub fn array_length_set<'a>(
             return raise_runtime(vm, heap, state, VmError::OutOfBounds);
         }
         let new_len = new_len as usize;
+        if new_len > 32 * 1024 * 1024
+            && obj
+                .as_tagged(heap)
+                .as_ref()
+                .map_ref(heap)
+                .as_ref()
+                .kind()
+                .is_dense_elements()
+        {
+            Object::normalize_elements(heap, &scope, &obj);
+        }
+        if let Some(dict) = obj.as_tagged(heap).as_ref().element_dictionary(heap) {
+            let old_len = obj.as_tagged(heap).as_ref().length();
+            if new_len < old_len {
+                // non-configurable entries clamp the shrink
+                let mut effective = new_len;
+                let mut doomed: Vec<usize> = Vec::new();
+                dict.as_ref().for_each_entry(heap, |k, _, details| {
+                    if k >= new_len {
+                        if details & DETAILS_CONFIGURABLE == 0 {
+                            effective = effective.max(k + 1);
+                        } else {
+                            doomed.push(k);
+                        }
+                    }
+                });
+                for k in doomed {
+                    dict.as_ref().delete(heap, k);
+                }
+                Prototype::element_mutated(heap, obj.as_tagged(heap));
+                let obj_t = obj.as_tagged(heap);
+                obj_t
+                    .as_ref()
+                    .length
+                    .set(heap, obj_t.erase(), Smi::new(effective as i64));
+                return heap.known().undefined.as_tagged(heap).erase();
+            }
+            let obj_t = obj.as_tagged(heap);
+            obj_t
+                .as_ref()
+                .length
+                .set(heap, obj_t.erase(), Smi::new(new_len as i64));
+            return heap.known().undefined.as_tagged(heap).erase();
+        }
         let old_len = obj.as_tagged(heap).as_ref().length();
         if new_len < old_len {
             let hole = heap.known().the_hole.as_tagged(heap).erase();
@@ -826,18 +873,30 @@ pub fn array_sort<'a>(
                 }
             }
         }
-        // the remainder become holes
+        // the remainder become holes (or removed dictionary entries)
         if total < len {
-            let hole = heap.known().the_hole.as_tagged(heap).erase().raw();
-            if let Some(elements) = obj.as_tagged(heap).as_ref().elements_array(heap) {
-                for j in total..len.min(elements.len()) {
-                    // Safety: old-gen singleton word.
-                    elements.as_ref().set(heap, j, unsafe {
-                        Tagged::<Value>::from_value_unchecked(hole)
-                    });
+            if let Some(dict) = obj.as_tagged(heap).as_ref().element_dictionary(heap) {
+                let mut doomed: Vec<usize> = Vec::new();
+                dict.as_ref().for_each_entry(heap, |k, _, _| {
+                    if k >= total {
+                        doomed.push(k);
+                    }
+                });
+                for k in doomed {
+                    dict.as_ref().delete(heap, k);
                 }
+            } else {
+                let hole = heap.known().the_hole.as_tagged(heap).erase().raw();
+                if let Some(elements) = obj.as_tagged(heap).as_ref().elements_array(heap) {
+                    for j in total..len.min(elements.len()) {
+                        // Safety: old-gen singleton word.
+                        elements.as_ref().set(heap, j, unsafe {
+                            Tagged::<Value>::from_value_unchecked(hole)
+                        });
+                    }
+                }
+                Object::promote_holey(heap, &scope, &obj);
             }
-            Object::promote_holey(heap, &scope, &obj);
         }
         Prototype::element_mutated(heap, obj.as_tagged(heap));
         obj.as_tagged(heap).erase()

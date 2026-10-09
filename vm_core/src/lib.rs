@@ -53,14 +53,15 @@ pub use lookup::{Key, LoadOutcome, Lookup};
 pub use native::{HostCtx, NativeFn, NativeIndex, NativeRegistry, raise_runtime};
 pub use objects::{
     AccessorPair, CallTarget, CallableInfoInit, CallableInfoObject, Cell, CellInit, ContextInit,
-    ContextObject, DataHandler, DataHandlerInit, DenseString, ElementsKind, Encoding,
-    FeedbackVector, FeedbackVectorInit, FixedArray, FixedByteArray, Float, FunctionKind,
-    HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit, Header, HeapObject, Map,
-    MapInit, MapKind, Object, ObjectInit, ObjectKind, ObjectSlotsInit, PrototypeInfo,
-    PrototypeInfoInit, ProxyInit, ProxyObject, ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags,
-    SlotName, StringData, StringOwn, Symbol, WeakFixedArray, WeakFixedArrayInit, WrapperKind,
-    decode_wtf8, new_feedback_vector, object_kind, object_layout, string_content_hash,
-    visit_object,
+    ContextObject, DETAILS_ACCESSOR, DETAILS_CONFIGURABLE, DETAILS_DATA, DETAILS_ENUMERABLE,
+    DETAILS_WRITABLE, DataHandler, DataHandlerInit, DenseString, ElementsKind, Encoding,
+    EntryClass, FeedbackVector, FeedbackVectorInit, FixedArray, FixedByteArray, Float,
+    FunctionKind, HandlerEntry, HandlerEntryInit, HandlerTable, HandlerTableInit, Header,
+    HeapObject, Map, MapInit, MapKind, NumberDictionary, NumberDictionaryInit, Object, ObjectInit,
+    ObjectKind, ObjectSlotsInit, PrototypeInfo, PrototypeInfoInit, ProxyInit, ProxyObject,
+    ScopeInfo, ScopeInfoInit, SlotDescriptor, SlotFlags, SlotName, StringData, StringOwn, Symbol,
+    WeakFixedArray, WeakFixedArrayInit, WrapperKind, decode_wtf8, new_feedback_vector, object_kind,
+    object_layout, string_content_hash, visit_object,
 };
 pub use prototype::{Prototype, PrototypeRegistry};
 pub use stack::{Args, Callee, FrameMeta, Recv, STACK_SLOTS, Stack};
@@ -93,6 +94,21 @@ pub trait Compiler {
 
 /// Number of slots per handle block.
 pub const HANDLE_BLOCK_SIZE: usize = 1024;
+
+/// Re-anchor a tagged word at the enclosing function and return
+/// immediately: the anchor is in **forced tail position**, so no code
+/// in the enclosing function runs after it.
+#[macro_export]
+macro_rules! reanchor {
+    ($tagged:expr, $heap:expr, $f:expr) => {{
+        let word = ($tagged).raw();
+        let heap_ref: &$crate::Heap = &*$heap;
+        // Safety: forced return
+        return $f(heap_ref, unsafe {
+            $crate::Tagged::<$crate::Value>::from_value_unchecked(word)
+        });
+    }};
+}
 
 const _: () = {
     use core::mem::size_of;

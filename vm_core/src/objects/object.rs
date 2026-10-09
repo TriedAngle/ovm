@@ -1,12 +1,23 @@
 use core::alloc::Layout;
 
 use crate::{
-    CallableInfoObject, Coercion, ContextObject, Convert, DenseString, EdgeVisitable, ElementsKind,
-    FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
-    HeapObject, Hint, HostCtx, Lookup, Map, NativeIndex, ObjectKind, PropertyDescriptor, Prototype,
-    SiblingChange, SlotName, Smi, Symbol, Tagged, ThreadState, Transition, VM, Value, Visitor,
-    VmError,
+    CallableInfoObject, Coercion, ContextObject, Convert, DETAILS_DATA, DenseString, EdgeVisitable,
+    ElementsKind, EntryClass, FixedArray, Float, FunctionKind, GcSlot, Handle, HandleScope,
+    HandleSlice, Header, Heap, HeapObject, Hint, HostCtx, Lookup, Map, NativeIndex,
+    NumberDictionary, ObjectKind, PropertyDescriptor, Prototype, SiblingChange, SlotName, Smi,
+    Symbol, Tagged, ThreadState, Transition, VM, Value, Visitor, VmError,
 };
+
+/// The elements slot is typed `FixedArray` but holds a
+/// `NumberDictionary` in dictionary mode; the map's elements kind is
+/// the authority for interpreting it.
+///
+/// # Safety
+/// The word must be a NumberDictionary; only reachable while the
+/// receiver's map says `ElementsKind::Dictionary`.
+unsafe fn as_elements_word<'a>(dict: Tagged<'a, NumberDictionary>) -> Tagged<'a, FixedArray> {
+    unsafe { Tagged::from_value_unchecked(dict.erase().raw()) }
+}
 
 #[repr(C)]
 pub struct Object {
@@ -131,8 +142,31 @@ impl Object {
 
     #[inline(always)]
     pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, FixedArray>> {
+        let kind = self.header.map.get(heap).as_ref().kind();
+        if kind.is_array() && !kind.is_dense_elements() {
+            // dictionary-backed: not a FixedArray
+            return None;
+        }
         let elements = self.elements.get(heap);
         elements.is_strong_ptr().then_some(elements)
+    }
+
+    /// The sparse-elements backing store, when this array is in
+    /// dictionary mode.
+    #[inline]
+    pub fn element_dictionary<'a>(
+        &'a self,
+        heap: &'a Heap,
+    ) -> Option<Tagged<'a, NumberDictionary>> {
+        let kind = self.header.map.get(heap).as_ref().kind();
+        if !kind.is_array() || !kind.is_dictionary_elements() {
+            return None;
+        }
+        let elements = self.elements.get(heap);
+        if !elements.is_strong_ptr() {
+            return None;
+        }
+        elements.erase().get_as::<NumberDictionary>(heap)
     }
 
     pub fn promote_holey(heap: &mut Heap, scope: &HandleScope<'_>, receiver: &Handle<'_, Object>) {
@@ -161,8 +195,18 @@ impl Object {
     #[inline]
     pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
         let kind = self.header.map.get(heap).as_ref().kind();
-        if !kind.is_array() || !kind.is_dense_elements() || i >= self.length() {
+        if !kind.is_array() || i >= self.length() {
             return None;
+        }
+        if !kind.is_dense_elements() {
+            // sparse: probe the dictionary. Accessor entries are not
+            // plain values — the keyed cold path dispatches getters.
+            let dict = self.element_dictionary(heap)?;
+            let entry = dict.as_ref().find(heap, i)?;
+            if dict.as_ref().is_accessor_at(heap, entry) {
+                return None;
+            }
+            return Some(dict.as_ref().value_at(heap, entry));
         }
         let elements = self.elements.get(heap);
         if kind.is_holey() {
@@ -255,39 +299,63 @@ impl Object {
     ) -> Result<(), VmError> {
         let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
 
-        let (grows, old_len) = {
+        let (grows, old_len, dictionary) = {
             let obj = receiver.as_tagged(heap);
             if !obj.as_ref().is_array(heap) {
                 return Err(VmError::Type);
             }
-            // grow only when the store index is past the physical backing
-            // store (its capacity), not the logical length: sequential appends
-            // with headroom must not reallocate every time
+            let dictionary = obj.as_ref().element_dictionary(heap).is_some();
             let capacity = obj
                 .as_ref()
                 .elements_array(heap)
                 .map(|e| e.len())
                 .unwrap_or(0);
-            (i >= capacity, obj.as_ref().length())
+            (i >= capacity, obj.as_ref().length(), dictionary)
         };
 
-        // writing past the end leaves holes behind: the map must stop
-        // promising packed elements
+        if dictionary {
+            return Self::store_dictionary_element(heap, scope, receiver, i, value);
+        }
+
         if i > old_len {
             Self::promote_holey(heap, scope, receiver);
         }
 
         if grows {
-            let (capacity, keep) = {
+            let (normalize, capacity) = {
                 let heap_ref: &Heap = heap;
                 let obj = receiver.as_tagged(heap_ref);
                 let elements = obj.as_ref().elements_array(heap_ref).ok_or(VmError::Type)?;
-                let keep = obj.as_ref().length().min(elements.len());
-                let capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
-                (capacity, keep)
+                let new_capacity = (new_len + (new_len >> 1) + 16).max(elements.len());
+                if i - elements.len() >= 1024 {
+                    (true, new_capacity)
+                } else if new_capacity > 1000 {
+                    let mut used = 0usize;
+                    for k in 0..elements.len() {
+                        if elements.at(heap_ref, k) != heap_ref.known().the_hole.as_tagged(heap) {
+                            used += 1;
+                        }
+                    }
+                    let dict_words =
+                        NumberDictionary::compute_capacity(used) * NumberDictionary::ENTRY_SIZE;
+                    (3 * dict_words <= new_capacity, new_capacity)
+                } else {
+                    (false, new_capacity)
+                }
             };
-            // one allocation, one copy: the old elements go straight into
-            // the fresh backing store (no intermediate Vec or staging block)
+            if normalize {
+                Self::normalize_elements(heap, scope, receiver);
+                return Self::store_dictionary_element(heap, scope, receiver, i, value);
+            }
+            let keep = old_len.min({
+                let heap_ref: &Heap = heap;
+                receiver
+                    .as_tagged(heap_ref)
+                    .as_ref()
+                    .elements_array(heap_ref)
+                    .map(|e| e.len())
+                    .unwrap_or(0)
+            });
             let elements = heap.allocate_hole_array(capacity).as_handle(scope);
             {
                 let heap_ref: &Heap = heap;
@@ -316,6 +384,161 @@ impl Object {
             Prototype::element_mutated(heap, obj);
         }
         Ok(())
+    }
+
+    /// Plain element store into a dictionary-mode array. Accessor and
+    /// read-only entries are the keyed cold path's business; reaching
+    /// them here (builtin callers), the store is a spec-ignored no-op.
+    fn store_dictionary_element(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: &Handle<'_, Object>,
+        i: usize,
+        value: &Handle<'_, Value>,
+    ) -> Result<(), VmError> {
+        let new_len = i.checked_add(1).ok_or(VmError::OutOfBounds)?;
+        let (dict, length) = {
+            let obj = receiver.as_tagged(heap);
+            let dict = obj.as_ref().element_dictionary(heap).ok_or(VmError::Type)?;
+            (scope.handle(dict), obj.as_ref().length())
+        };
+        match dict.as_tagged(heap).as_ref().classify(heap, i) {
+            EntryClass::ReadOnly | EntryClass::Accessor => return Ok(()),
+            EntryClass::Data | EntryClass::Absent => {}
+        }
+        if matches!(
+            dict.as_tagged(heap).as_ref().classify(heap, i),
+            EntryClass::Absent
+        ) {
+            let cap_words = dict.as_tagged(heap).as_ref().capacity() * NumberDictionary::ENTRY_SIZE;
+            let needed = new_len.max(length);
+            if !dict.as_tagged(heap).as_ref().requires_slow_elements()
+                && needed <= cap_words * 2
+                && needed < (1 << 26)
+            {
+                Self::densify_elements(heap, scope, receiver, needed);
+                return Self::store_array_element(heap, scope, receiver, i, value);
+            }
+        }
+        let value_word = value.as_tagged(heap).raw();
+        let table = NumberDictionary::insert(
+            heap,
+            scope,
+            &dict,
+            i,
+            unsafe { Tagged::from_value_unchecked(value_word) },
+            DETAILS_DATA,
+        );
+        let obj = receiver.as_tagged(heap);
+        if table.as_tagged(heap) != dict.as_tagged(heap) {
+            obj.elements.set(heap, obj.erase(), unsafe {
+                as_elements_word(table.as_tagged(heap))
+            });
+        }
+        if i >= length {
+            obj.length.set(heap, obj.erase(), Smi::new(new_len as i64));
+        }
+        Prototype::element_mutated(heap, obj);
+        Ok(())
+    }
+
+    pub fn normalize_elements(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: &Handle<'_, Object>,
+    ) {
+        let map = {
+            let obj = receiver.as_tagged(heap);
+            let map = obj.as_ref().map_ref(heap);
+            if map.as_ref().kind().is_dictionary_elements() {
+                return;
+            }
+            scope.handle(map)
+        };
+        let mut entries: Vec<(usize, Handle<'_, Value>)> = Vec::new();
+        {
+            let obj = receiver.as_tagged(heap);
+            if let Some(elements) = obj.as_ref().elements_array(heap) {
+                for k in 0..elements.len() {
+                    let v = elements.at(heap, k);
+                    if v != heap.known().the_hole.as_tagged(heap) {
+                        entries.push((k, scope.handle(v)));
+                    }
+                }
+            }
+        }
+        let mut dict = NumberDictionary::new(heap, scope, entries.len());
+        for (k, v) in &entries {
+            let word = v.as_tagged(heap).raw();
+            dict = NumberDictionary::insert(
+                heap,
+                scope,
+                &dict,
+                *k,
+                unsafe { Tagged::from_value_unchecked(word) },
+                DETAILS_DATA,
+            );
+        }
+        // the map swap must invalidate chains keyed on the old map
+        Prototype::shape_changed(heap, map.as_tagged(heap));
+        let target = Transition::sibling_target(
+            heap,
+            scope,
+            |h| map.as_tagged(h),
+            SiblingChange::Dictionary,
+        );
+        let obj = receiver.as_tagged(heap);
+        obj.elements.set(heap, obj.erase(), unsafe {
+            as_elements_word(dict.as_tagged(heap))
+        });
+        obj.as_ref()
+            .header
+            .map
+            .set(heap, obj.erase(), target.as_tagged(heap));
+    }
+
+    fn densify_elements(
+        heap: &mut Heap,
+        scope: &HandleScope<'_>,
+        receiver: &Handle<'_, Object>,
+        capacity: usize,
+    ) {
+        let map = {
+            let obj = receiver.as_tagged(heap);
+            let map = obj.as_ref().map_ref(heap);
+            if !map.as_ref().kind().is_dictionary_elements() {
+                return;
+            }
+            scope.handle(map)
+        };
+        let mut entries: Vec<(usize, Handle<'_, Value>)> = Vec::new();
+        {
+            let obj = receiver.as_tagged(heap);
+            if let Some(dict) = obj.as_ref().element_dictionary(heap) {
+                dict.as_ref().for_each_entry(heap, |k, v, _| {
+                    if k < capacity {
+                        entries.push((k, scope.handle(v)));
+                    }
+                });
+            }
+        }
+        let elements = heap.allocate_hole_array(capacity).as_handle(scope);
+        for (k, v) in &entries {
+            elements
+                .as_tagged(heap)
+                .as_ref()
+                .set(heap, *k, v.as_tagged(heap));
+        }
+        Prototype::shape_changed(heap, map.as_tagged(heap));
+        let target =
+            Transition::sibling_target(heap, scope, |h| map.as_tagged(h), SiblingChange::Holey);
+        let obj = receiver.as_tagged(heap);
+        obj.elements
+            .set(heap, obj.erase(), elements.as_tagged(heap));
+        obj.as_ref()
+            .header
+            .map
+            .set(heap, obj.erase(), target.as_tagged(heap));
     }
 
     /// Write an existing element slot in place: never allocates, never

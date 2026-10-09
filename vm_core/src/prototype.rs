@@ -121,7 +121,7 @@ impl Prototype {
         while i < parents.len() {
             let parent = parents[i];
             i += 1;
-            let id = parent.as_tagged(heap).raw().raw_addr() as usize;
+            let id = parent.as_tagged(heap).raw_addr() as usize;
             if visited.contains(&id) {
                 continue;
             }
@@ -173,10 +173,7 @@ impl Prototype {
         }
         loop {
             let expected = map.as_tagged(heap).as_ref().prototype_info.load_word(heap);
-            if Value::from_bits(expected) != heap.known().the_hole.raw()
-                && let Some(winner) = map.as_tagged(heap).as_ref().prototype_info.load(heap)
-                && winner.raw().is_strong_ptr()
-            {
+            if let Some(winner) = map.as_tagged(heap).as_ref().prototype_info.load(heap) {
                 return winner.as_handle(scope);
             }
             let info = heap.allocate_handle::<PrototypeInfo>(PrototypeInfoInit::default(), scope);
@@ -261,7 +258,7 @@ impl Prototype {
 }
 
 fn trackable_prototype<'a>(heap: &'a Heap, value: Tagged<'a, Value>) -> Option<Tagged<'a, Object>> {
-    if !value.raw().is_strong_ptr() {
+    if !value.is_strong_ptr() {
         return None;
     }
     if value.ptr_eq(heap.known().null.as_tagged(heap).erase())

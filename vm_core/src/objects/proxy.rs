@@ -3,10 +3,11 @@ use core::alloc::Layout;
 use crate::Coercion;
 use crate::error::Message;
 use crate::{
-    Args, Compare, Convert, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice, Header, Heap,
-    HeapObject, HostCtx, Key, Lookup, Map, Object, ObjectKind, PartialDescriptor,
-    PropertyDescriptor, Prototype, SlotName, Tagged, ThreadState, Transition, VM, Value, Visitor,
-    VmError,
+    AccessorPair, Args, Compare, Convert, DETAILS_ACCESSOR, DETAILS_CONFIGURABLE,
+    DETAILS_ENUMERABLE, DETAILS_WRITABLE, EdgeVisitable, GcSlot, Handle, HandleScope, HandleSlice,
+    Header, Heap, HeapObject, HostCtx, Key, Lookup, Map, NumberDictionary, Object, ObjectKind,
+    PartialDescriptor, PropertyDescriptor, Prototype, SlotName, Smi, Tagged, ThreadState,
+    Transition, VM, Value, Visitor, VmError,
 };
 
 pub struct Proxy;
@@ -406,7 +407,7 @@ fn define_internal_h<'s>(
         let completed = partial.complete_against(undefined, None);
         // plain data defines with default attributes land in the backing
         // store; accessors and non-default attributes at index keys
-        // become the canonical Smi-named descriptor instead
+        // become dictionary entries carrying their details
         if let PropertyDescriptor::Data {
             value,
             writable: true,
@@ -420,6 +421,83 @@ fn define_internal_h<'s>(
             Object::store_array_element(heap, scope, &array, i, &value)?;
             return Ok(Flow::Value(true));
         }
+        let array = scope
+            .cast::<Object>(heap, obj.as_tagged(heap))
+            .expect("array checked above");
+        if array
+            .as_tagged(heap)
+            .as_ref()
+            .map_ref(heap)
+            .as_ref()
+            .kind()
+            .is_dense_elements()
+        {
+            Object::normalize_elements(heap, scope, &array);
+        }
+        let dict = scope.handle(
+            array
+                .as_tagged(heap)
+                .as_ref()
+                .element_dictionary(heap)
+                .ok_or(VmError::Type)?,
+        );
+        let (value_word, details, accessor) = match completed {
+            PropertyDescriptor::Data {
+                value,
+                writable,
+                enumerable,
+                configurable,
+            } => (
+                value.as_tagged(heap).raw(),
+                DETAILS_WRITABLE * writable as i64
+                    | DETAILS_ENUMERABLE * enumerable as i64
+                    | DETAILS_CONFIGURABLE * configurable as i64,
+                false,
+            ),
+            PropertyDescriptor::Accessor {
+                get,
+                set,
+                enumerable,
+                configurable,
+            } => {
+                let pair = heap.allocate_handle::<AccessorPair>((get, set), scope);
+                (
+                    pair.as_tagged(heap).raw(),
+                    DETAILS_ACCESSOR
+                        | DETAILS_ENUMERABLE * enumerable as i64
+                        | DETAILS_CONFIGURABLE * configurable as i64,
+                    true,
+                )
+            }
+        };
+        let table = NumberDictionary::insert(
+            heap,
+            scope,
+            &dict,
+            i,
+            // Safety: fresh word, no allocation since the read.
+            unsafe { Tagged::from_value_unchecked(value_word) },
+            details,
+        );
+        if accessor {
+            table.as_tagged(heap).as_ref().require_slow(heap);
+        }
+        let array_ref = array.as_tagged(heap);
+        let host = array_ref.erase();
+        array_ref.as_ref().elements.set(
+            heap,
+            host,
+            // Safety: dictionary mode was established above.
+            unsafe { Tagged::from_value_unchecked(table.as_tagged(heap).erase().raw()) },
+        );
+        if i >= array_ref.as_ref().length() {
+            array_ref
+                .as_ref()
+                .length
+                .set(heap, host, Smi::new((i + 1) as i64));
+        }
+        Prototype::element_mutated(heap, array_ref);
+        return Ok(Flow::Value(true));
     }
     let current =
         Lookup::ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap));

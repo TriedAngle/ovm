@@ -248,6 +248,11 @@ impl Map {
         let sentinel = heap.known().holey_transition_symbol.as_tagged(heap);
         self.find_special_transition(heap, sentinel, |_| true)
     }
+
+    pub fn find_dictionary_transition<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, Map>> {
+        let sentinel = heap.known().dictionary_transition_symbol.as_tagged(heap);
+        self.find_special_transition(heap, sentinel, |_| true)
+    }
 }
 pub struct MapInit<'a> {
     pub kind: MapKind,
@@ -415,6 +420,7 @@ impl MapKind {
     pub const CELL: MapKind = MapKind(ObjectKind::Cell as u64);
     pub const PROTOTYPE_INFO: MapKind = MapKind(ObjectKind::PrototypeInfo as u64);
     pub const DATA_HANDLER: MapKind = MapKind(ObjectKind::DataHandler as u64);
+    pub const NUMBER_DICTIONARY: MapKind = MapKind(ObjectKind::NumberDictionary as u64);
 
     pub const fn new(bits: u64) -> Self {
         Self(bits)
@@ -610,7 +616,8 @@ impl SlotDescriptor {
     }
 
     pub fn offset(&self) -> usize {
-        Smi::decode(self.value.raw()).expect("slot offset").value() as usize
+        // the slot holds the Smi offset for data rows
+        self.value.try_smi().expect("slot offset") as usize
     }
 }
 
@@ -618,6 +625,17 @@ impl SlotDescriptor {
 /// convention — names compare by pointer), a symbol, or a smi index.
 #[repr(transparent)]
 pub struct SlotName(Value);
+
+impl<'a> Tagged<'a, SlotName> {
+    /// The array index when this name is a Smi key in the canonical
+    /// index domain (`0..2^32-1`); `None` for string/symbol names and
+    /// out-of-range Smis.
+    #[inline]
+    pub fn as_index(self) -> Option<usize> {
+        let v = self.to_i64()?;
+        (0..u32::MAX as i64).contains(&v).then_some(v as usize)
+    }
+}
 
 impl SlotName {
     /// The erased name word.

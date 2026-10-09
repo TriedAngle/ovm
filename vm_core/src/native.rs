@@ -1,11 +1,10 @@
-use core::ptr::NonNull;
-
 use crate::api::Runtime;
 use crate::errors::Errors;
 use crate::intrinsics::native_fn;
 use crate::{
     Args, Handle, HandleScope, HandleSlice, Heap, Object, Tagged, ThreadState, VM, Value, VmError,
 };
+use core::ptr::NonNull;
 
 // -- native calling convention --
 

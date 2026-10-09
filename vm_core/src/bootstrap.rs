@@ -114,6 +114,8 @@ pub struct WellKnown {
     /// a `set_prototype` edge, disambiguated by the child's prototype
     pub prototype_transition_symbol: Global<Symbol>,
     pub holey_transition_symbol: Global<Symbol>,
+    pub dictionary_transition_symbol: Global<Symbol>,
+    pub number_dictionary_map: Global<Map>,
     /// Map of array-iterator objects (slots: [iterated array, next index])
     pub array_iterator_map: Global<Map>,
     /// %ArrayIteratorPrototype% (holds `next` and @@iterator)
@@ -253,6 +255,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         feedback_vector_map: map,
         cell_map: map,
         prototype_info_map: map,
+        number_dictionary_map: map,
         handler_map_0: map,
         handler_map_1: map,
         handler_map_2: map,
@@ -294,6 +297,7 @@ fn uninited_wellknown(roots: &RootHandles) -> WellKnown {
         megamorphic_symbol: symbol,
         prototype_transition_symbol: symbol,
         holey_transition_symbol: symbol,
+        dictionary_transition_symbol: symbol,
         array_iterator_map: map,
         array_iterator_prototype: obj,
         iterator_result_map: map,
@@ -467,6 +471,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     let handler_map_1 = alloc_map_with_slots(heap, roots, MapKind::DATA_HANDLER, 1);
     let handler_map_2 = alloc_map_with_slots(heap, roots, MapKind::DATA_HANDLER, 2);
     let handler_map_3 = alloc_map_with_slots(heap, roots, MapKind::DATA_HANDLER, 3);
+    let number_dictionary_map = alloc_map(heap, roots, MapKind::NUMBER_DICTIONARY);
 
     let function_map = roots.create_handle(
         heap.allocate::<Map>(MapInit {
@@ -518,6 +523,7 @@ pub fn bootstrap_basics(heap: &mut Heap, roots: &RootHandles) {
     known.scope_info_map = scope_info_map;
     known.feedback_vector_map = feedback_vector_map;
     known.handler_map_0 = handler_map_0;
+    known.number_dictionary_map = number_dictionary_map;
     known.handler_map_1 = handler_map_1;
     known.handler_map_2 = handler_map_2;
     known.handler_map_3 = handler_map_3;
@@ -637,6 +643,9 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
         roots.create_handle(Symbol::new(heap, &scope, b"<set-prototype>").as_tagged(heap));
     let holey_transition_symbol =
         roots.create_handle(Symbol::new(heap, &scope, b"<promote-holey>").as_tagged(heap));
+    // transition-tree key for sparse-array normalization (never user-visible)
+    let dictionary_transition_symbol =
+        roots.create_handle(Symbol::new(heap, &scope, b"<normalize-dictionary>").as_tagged(heap));
 
     let empty_scope_info =
         roots.create_handle(heap.allocate::<ScopeInfo>(ScopeInfoInit { names: empty_slots }));
@@ -691,6 +700,7 @@ pub fn bootstrap_well_known(heap: &mut Heap, roots: &RootHandles) {
     known.megamorphic_symbol = megamorphic_symbol;
     known.prototype_transition_symbol = prototype_transition_symbol;
     known.holey_transition_symbol = holey_transition_symbol;
+    known.dictionary_transition_symbol = dictionary_transition_symbol;
     known.object_prototype = object_prototype;
     known.array_prototype = array_prototype;
     known.date_prototype = date_prototype;
