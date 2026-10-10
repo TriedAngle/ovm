@@ -338,7 +338,7 @@ impl Stack {
     pub fn super_constructor<'a>(&self, heap: &'a Heap, base: usize) -> Option<Tagged<'a, Value>> {
         let callable = self.frame_header(base).callable_slot().get(heap);
         let obj = callable.as_heap_object()?;
-        let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
+        let proto = obj.as_ref().prototype(heap);
         // must be a real constructor
         let proto_obj = proto.as_heap_object()?;
         proto_obj

@@ -114,7 +114,7 @@ fn start<'b>(
         });
     }
 
-    match Object::call_target(heap, callable.as_tagged(heap).erase()) {
+    match callable.as_tagged(heap).erase().call_target(heap) {
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),
@@ -524,7 +524,8 @@ fn step<'a>(
                 && idx >= 0
             {
                 let recv = stack.reg(heap, frame_base, ops.reg(0));
-                if Object::store_array_element_in_place(heap, recv, idx as usize, acc.get(heap))
+                if recv
+                    .store_array_element_in_place(heap, idx as usize, acc.get(heap))
                     .is_ok()
                 {
                     return Flow::Next;
@@ -585,19 +586,18 @@ fn step<'a>(
                 }
 
                 let name: Handle<'_, SlotName> =
-                    match fold!(ctx, Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+                    match fold!(ctx, key.as_tagged(heap).erase().classify_key(heap)) {
                         Key::Element(i) => {
                             let Some(obj) = scope.cast::<Object>(heap, receiver.as_tagged(heap))
                             else {
                                 throw_err!(ctx, VmError::Type);
                             };
-                            if obj.as_tagged(heap).as_ref().is_array(heap) {
+                            if obj.as_tagged(heap).is_array(heap) {
                                 let value = scope.handle(acc.get(heap));
                                 fold!(
                                     ctx,
-                                    Object::store_array_element_in_place(
+                                    obj.as_tagged(heap).erase().store_array_element_in_place(
                                         heap,
-                                        obj.as_tagged(heap).erase(),
                                         i,
                                         value.as_tagged(heap)
                                     )
@@ -670,7 +670,7 @@ fn step<'a>(
             );
             let receiver = stack.reg(heap, frame_base, ops.reg(0));
             let key = acc.get(heap).as_name();
-            match fold!(ctx, Lookup::load_outcome_keyed(heap, receiver, key)) {
+            match fold!(ctx, receiver.load_outcome_keyed(heap, key)) {
                 LoadOutcome::Value(v) => acc.store(v),
                 LoadOutcome::Getter(_) => {
                     debug_assert!(false, "fast load on an accessor property");
@@ -716,7 +716,7 @@ fn step<'a>(
                 }
 
                 let prev = receiver.as_tagged(heap).as_heap_object().map(|o| {
-                    let map = o.as_ref().map_ref(heap);
+                    let map = o.as_ref().map(heap);
                     scope.handle(map)
                 });
                 let written = fold!(
@@ -751,20 +751,17 @@ fn step<'a>(
         Opcode::StoreKeyedPropertyFast => {
             if let Some(idx) = Smi::decode(stack.reg(heap, frame_base, ops.reg(1)).raw())
                 && idx.value() >= 0
-                && Object::store_array_element_in_place(
-                    heap,
-                    stack.reg(heap, frame_base, ops.reg(0)),
-                    idx.value() as usize,
-                    acc.get(heap),
-                )
-                .is_ok()
+                && stack
+                    .reg(heap, frame_base, ops.reg(0))
+                    .store_array_element_in_place(heap, idx.value() as usize, acc.get(heap))
+                    .is_ok()
             {
                 return Flow::Next;
             }
             state.handle_scope(|scope| -> Flow {
                 let receiver = scope.handle(stack.reg(heap, frame_base, ops.reg(0)));
                 let key = scope.handle(stack.reg(heap, frame_base, ops.reg(1)));
-                match fold!(ctx, Lookup::classify_key(heap, key.as_tagged(heap).erase())) {
+                match fold!(ctx, key.as_tagged(heap).erase().classify_key(heap)) {
                     Key::Element(i) => {
                         if receiver
                             .as_tagged(heap)
@@ -1030,7 +1027,7 @@ fn step<'a>(
                     Err(err) => throw_err!(ctx, err),
                 };
             }
-            match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
+            match stack.reg(heap, frame_base, callee_reg).call_target(heap) {
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
@@ -1124,7 +1121,7 @@ fn step<'a>(
                     Err(err) => throw_err!(ctx, err),
                 };
             }
-            match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
+            match stack.reg(heap, frame_base, callee_reg).call_target(heap) {
                 None => throw_err!(ctx, VmError::Type),
                 // the proxy dispatch above already intercepted these
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
@@ -1274,7 +1271,7 @@ fn step<'a>(
                     Err(err) => throw_err!(ctx, err),
                 };
             }
-            match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
+            match stack.reg(heap, frame_base, callee_reg).call_target(heap) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Native(rt)) => {
@@ -1436,7 +1433,7 @@ fn step<'a>(
                     Err(err) => throw_err!(ctx, err),
                 };
             }
-            match Object::call_target(heap, stack.reg(heap, frame_base, callee_reg)) {
+            match stack.reg(heap, frame_base, callee_reg).call_target(heap) {
                 None => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Proxy(_)) => throw_err!(ctx, VmError::Type),
                 Some(CallTarget::Native(rt)) => {
@@ -1597,10 +1594,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, lhs),
-                Convert::as_number(heap, acc.get(heap)),
-            ) {
+            if let (Some(a), Some(b)) = (lhs.as_number(heap), acc.get(heap).as_number(heap)) {
                 acc.store(heap.new_number(a + b));
                 return Flow::Next;
             }
@@ -1629,9 +1623,7 @@ fn step<'a>(
                     return Flow::Next;
                 }
             }
-            if let (Some(a), Some(b)) =
-                (Convert::as_number(heap, lhs), Convert::as_number(heap, rhs))
-            {
+            if let (Some(a), Some(b)) = (lhs.as_number(heap), rhs.as_number(heap)) {
                 let r = if op == Opcode::AddLoc { a + b } else { a - b };
                 let v = heap.new_number(r);
                 stack.set_reg(frame_base, dst, v);
@@ -1668,10 +1660,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, lhs),
-                Convert::as_number(heap, acc.get(heap)),
-            ) {
+            if let (Some(a), Some(b)) = (lhs.as_number(heap), acc.get(heap).as_number(heap)) {
                 acc.store(heap.new_number(a - b));
                 return Flow::Next;
             }
@@ -1733,10 +1722,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, lhs),
-                Convert::as_number(heap, acc.get(heap)),
-            ) {
+            if let (Some(a), Some(b)) = (lhs.as_number(heap), acc.get(heap).as_number(heap)) {
                 acc.store(heap.new_number(a * b));
                 return Flow::Next;
             }
@@ -1764,10 +1750,7 @@ fn step<'a>(
                 acc.store(Smi::new(r).into_tagged());
                 return Flow::Next;
             }
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, lhs),
-                Convert::as_number(heap, acc.get(heap)),
-            ) {
+            if let (Some(a), Some(b)) = (lhs.as_number(heap), acc.get(heap).as_number(heap)) {
                 acc.store(heap.new_number(a / b));
                 return Flow::Next;
             }
@@ -1920,13 +1903,13 @@ fn step<'a>(
             Flow::Jump(jump_target(pc, offset))
         }
         Opcode::JumpIfTruthy => {
-            if Convert::is_truthy(heap, acc.get(heap)) {
+            if acc.get(heap).is_truthy(heap) {
                 return Flow::Jump(jump_target(pc, ops.imm(0)));
             }
             Flow::Next
         }
         Opcode::JumpIfFalsy => {
-            if !Convert::is_truthy(heap, acc.get(heap)) {
+            if !acc.get(heap).is_truthy(heap) {
                 return Flow::Jump(jump_target(pc, ops.imm(0)));
             }
             Flow::Next
@@ -1953,7 +1936,7 @@ fn step<'a>(
         }
         Opcode::Negate => {
             let acc_word = acc.get(heap);
-            if let Some(n) = Convert::as_number(heap, acc.get(heap)) {
+            if let Some(n) = acc.get(heap).as_number(heap) {
                 // `new_number` keeps -0.0 boxed and folds everything else
                 acc.store(heap.new_number(-n));
             } else if let Some(v) = acc_word.to_i64() {
@@ -2001,10 +1984,7 @@ fn step<'a>(
         }
         Opcode::Equal => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, acc.get(heap)),
-                Convert::as_number(heap, other),
-            ) {
+            if let (Some(a), Some(b)) = (acc.get(heap).as_number(heap), other.as_number(heap)) {
                 acc.store(Convert::boolean(heap, a == b));
                 return Flow::Next;
             }
@@ -2022,10 +2002,7 @@ fn step<'a>(
         }
         Opcode::LessThan => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, acc.get(heap)),
-                Convert::as_number(heap, other),
-            ) {
+            if let (Some(a), Some(b)) = (acc.get(heap).as_number(heap), other.as_number(heap)) {
                 acc.store(Convert::boolean(heap, a < b));
                 return Flow::Next;
             }
@@ -2043,10 +2020,7 @@ fn step<'a>(
         }
         Opcode::LessThanOrEqual => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, acc.get(heap)),
-                Convert::as_number(heap, other),
-            ) {
+            if let (Some(a), Some(b)) = (acc.get(heap).as_number(heap), other.as_number(heap)) {
                 acc.store(Convert::boolean(heap, a <= b));
                 return Flow::Next;
             }
@@ -2064,10 +2038,7 @@ fn step<'a>(
         }
         Opcode::GreaterThan => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, acc.get(heap)),
-                Convert::as_number(heap, other),
-            ) {
+            if let (Some(a), Some(b)) = (acc.get(heap).as_number(heap), other.as_number(heap)) {
                 acc.store(Convert::boolean(heap, a > b));
                 return Flow::Next;
             }
@@ -2085,10 +2056,7 @@ fn step<'a>(
         }
         Opcode::GreaterThanOrEqual => {
             let other = stack.reg(heap, frame_base, ops.reg(0));
-            if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, acc.get(heap)),
-                Convert::as_number(heap, other),
-            ) {
+            if let (Some(a), Some(b)) = (acc.get(heap).as_number(heap), other.as_number(heap)) {
                 acc.store(Convert::boolean(heap, a >= b));
                 return Flow::Next;
             }
@@ -2111,10 +2079,9 @@ fn step<'a>(
             let cmp = (ops.uimm(1) / 2) as u8;
             let falsy_jump = ops.uimm(1) % 2 == 1;
             let offset = ops.imm(2);
-            let b = if let (Some(a), Some(b)) = (
-                Convert::as_number(heap, acc.get(heap)),
-                Convert::as_number(heap, other),
-            ) {
+            let b = if let (Some(a), Some(b)) =
+                (acc.get(heap).as_number(heap), other.as_number(heap))
+            {
                 match cmp {
                     0 | 1 => a == b,
                     2 => a < b,
@@ -2127,7 +2094,7 @@ fn step<'a>(
                 if ctx.is_throw(v) {
                     return Flow::Threw;
                 }
-                Convert::is_truthy(heap, v)
+                v.is_truthy(heap)
             };
             acc.store(Convert::boolean(heap, b));
             if b != falsy_jump {

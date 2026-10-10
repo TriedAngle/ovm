@@ -1,4 +1,4 @@
-use crate::{Convert, DenseString, Float, Heap, Smi, Tagged, Value, VmError};
+use crate::{DenseString, Float, Heap, Smi, Tagged, Value, VmError};
 
 pub struct Compare;
 
@@ -7,7 +7,7 @@ impl Compare {
     /// table coerces. Heap-resident primitives (strings, symbols, Floats)
     /// and the boolean/nullish singletons are not.
     pub fn is_object_operand<'a>(heap: &Heap, v: Tagged<'a, Value>) -> bool {
-        !Convert::is_primitive(heap, v)
+        !v.is_primitive(heap)
     }
 
     pub fn strict_equal<'a>(heap: &'a Heap, x: Tagged<'a, Value>, y: Tagged<'a, Value>) -> bool {
@@ -64,10 +64,10 @@ impl Compare {
         let is_number = |v: Tagged<'_, Value>| v.is_smi() || v.get_as::<Float>(heap).is_some();
         // number ↔ string: the string parses as a number
         if is_number(x) && is_string(y) {
-            return Ok(Convert::to_number(heap, x)? == Convert::to_number(heap, y)?);
+            return Ok(x.to_number(heap)? == y.to_number(heap)?);
         }
         if is_string(x) && is_number(y) {
-            return Ok(Convert::to_number(heap, x)? == Convert::to_number(heap, y)?);
+            return Ok(x.to_number(heap)? == y.to_number(heap)?);
         }
         // booleans become numbers (exactly representable as smis, no allocation)
         if is_bool(x) {
@@ -151,8 +151,8 @@ impl Compare {
         if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord == core::cmp::Ordering::Less);
         }
-        let a = Convert::to_number(heap, x)?;
-        let b = Convert::to_number(heap, y)?;
+        let a = x.to_number(heap)?;
+        let b = y.to_number(heap)?;
         Ok(a < b)
     }
 
@@ -164,8 +164,8 @@ impl Compare {
         if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord != core::cmp::Ordering::Greater);
         }
-        let a = Convert::to_number(heap, x)?;
-        let b = Convert::to_number(heap, y)?;
+        let a = x.to_number(heap)?;
+        let b = y.to_number(heap)?;
         Ok(a <= b)
     }
 
@@ -177,8 +177,8 @@ impl Compare {
         if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord == core::cmp::Ordering::Greater);
         }
-        let a = Convert::to_number(heap, x)?;
-        let b = Convert::to_number(heap, y)?;
+        let a = x.to_number(heap)?;
+        let b = y.to_number(heap)?;
         Ok(a > b)
     }
 
@@ -190,8 +190,8 @@ impl Compare {
         if let Some(ord) = Self::string_cmp(heap, x, y) {
             return Ok(ord != core::cmp::Ordering::Less);
         }
-        let a = Convert::to_number(heap, x)?;
-        let b = Convert::to_number(heap, y)?;
+        let a = x.to_number(heap)?;
+        let b = y.to_number(heap)?;
         Ok(a >= b)
     }
 }

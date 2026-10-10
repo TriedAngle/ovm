@@ -1,7 +1,7 @@
 use std::sync::{Mutex, MutexGuard};
 
 use crate::{
-    Cell, CellInit, FixedArray, Handle, HandleScope, Heap, Lookup, Map, MapKind, MaybeWeak, Object,
+    Cell, CellInit, FixedArray, Handle, HandleScope, Heap, Map, MapKind, MaybeWeak, Object,
     PrototypeInfo, PrototypeInfoInit, Smi, Tagged, Value, WeakFixedArray, WeakFixedArrayInit,
 };
 
@@ -41,7 +41,7 @@ impl Prototype {
         }
         let proto = map.as_ref().prototype.get(heap);
         let object = trackable_prototype(heap, proto)?;
-        Some(object.as_ref().map_ref(heap))
+        Some(object.as_ref().map(heap))
     }
 
     pub fn get_or_create_prototype_chain_validity_cell<'s>(
@@ -63,7 +63,7 @@ impl Prototype {
         }
         let holder = Self::try_get_validity_cell_holder_map(heap, map.as_tagged(heap))?;
         let holder = scope.handle(holder);
-        holder.as_tagged(heap).as_ref().mark_prototype(heap);
+        holder.as_tagged(heap).mark_prototype(heap);
 
         let _guard = heap.prototype_registry().lock();
         lazy_register_prototype_user_locked(heap, scope, holder);
@@ -126,7 +126,7 @@ impl Prototype {
                 continue;
             }
             visited.push(id);
-            parent.as_tagged(heap).as_ref().mark_prototype(heap);
+            parent.as_tagged(heap).mark_prototype(heap);
             let info = Self::get_or_create_prototype_info(heap, scope, parent);
             append_prototype_child(heap, scope, info, cell);
             if !collect_parent_maps(heap, scope, parent.as_tagged(heap), &mut parents) {
@@ -168,17 +168,17 @@ impl Prototype {
         scope: &'s HandleScope<'_>,
         map: Handle<'s, Map>,
     ) -> Handle<'s, PrototypeInfo> {
-        if let Some(info) = map.as_tagged(heap).as_ref().try_get_prototype_info(heap) {
+        if let Some(info) = map.as_tagged(heap).try_get_prototype_info(heap) {
             return info.as_handle(scope);
         }
         loop {
-            let expected = map.as_tagged(heap).as_ref().prototype_info.load_word(heap);
-            if let Some(winner) = map.as_tagged(heap).as_ref().prototype_info.load(heap) {
+            let expected = map.as_tagged(heap).prototype_info.load_word(heap);
+            if let Some(winner) = map.as_tagged(heap).prototype_info.load(heap) {
                 return winner.as_handle(scope);
             }
             let info = heap.allocate_handle::<PrototypeInfo>(PrototypeInfoInit::default(), scope);
             let host = map.as_tagged(heap).erase();
-            match map.as_tagged(heap).as_ref().prototype_info.publish(
+            match map.as_tagged(heap).prototype_info.publish(
                 heap,
                 host,
                 expected,
@@ -199,12 +199,8 @@ impl Prototype {
         lazy_register_prototype_user_locked(heap, scope, user);
     }
 
-    pub fn notify_map_change(heap: &Heap, old_map: Tagged<'_, Map>, _new_map: Tagged<'_, Map>) {
-        Self::shape_changed(heap, old_map);
-    }
-
     pub fn shape_changed(heap: &Heap, old_map: Tagged<'_, Map>) {
-        if !old_map.as_ref().is_prototype() {
+        if !old_map.is_prototype() {
             return;
         }
         invalidate_prototype_chains(heap, old_map);
@@ -212,8 +208,8 @@ impl Prototype {
 
     #[inline]
     pub fn element_mutated(heap: &Heap, obj: Tagged<'_, Object>) {
-        let map = obj.as_ref().map_ref(heap);
-        if !map.as_ref().kind().is_prototype() {
+        let map = obj.map(heap);
+        if !map.kind().is_prototype() {
             return;
         }
         invalidate_prototype_chains(heap, map);
@@ -226,7 +222,7 @@ impl Prototype {
         if !kind.is_prototype() {
             return;
         }
-        invalidate_prototype_chains(heap, obj.as_ref().map_ref(heap));
+        invalidate_prototype_chains(heap, obj.map(heap));
     }
 
     /// Whether an indexed store into `receiver` (map `map`) may skip the
@@ -246,19 +242,13 @@ impl Prototype {
         {
             return true;
         }
-        let holds = {
-            let heap_ref: &Heap = heap;
-            Lookup::chain_holds_index_name(heap_ref, receiver.as_tagged(heap_ref), index)
-        };
+        let holds = { receiver.as_tagged(heap).chain_holds_index_name(heap, index) };
         if holds {
             return false;
         }
         // only cacheable when the chain holds no integer-named
         // descriptors at all: otherwise cleanliness depends on the index
-        let any_index = {
-            let heap_ref: &Heap = heap;
-            Lookup::chain_holds_any_index_name(heap_ref, receiver.as_tagged(heap_ref))
-        };
+        let any_index = { receiver.as_tagged(heap).chain_holds_any_index_name(heap) };
         if any_index {
             return true;
         }
@@ -278,7 +268,7 @@ fn trackable_prototype<'a>(heap: &'a Heap, value: Tagged<'a, Value>) -> Option<T
         return None;
     }
     let object = value.get_as::<Object>(heap)?;
-    if !object.as_ref().map_ref(heap).kind().kind().is_js_receiver() {
+    if !object.as_ref().map(heap).kind().kind().is_js_receiver() {
         return None;
     }
     Some(object)
@@ -337,11 +327,11 @@ fn push_parent_map<'s>(
     let Some(obj) = word.as_heap_object() else {
         return false;
     };
-    let kind = obj.map_ref(heap).kind();
+    let kind = obj.map(heap).kind();
     if kind.is_proxy() || !kind.kind().is_js_receiver() {
         return false;
     }
-    out.push(scope.handle(obj.map_ref(heap)));
+    out.push(scope.handle(obj.map(heap)));
     true
 }
 
@@ -352,18 +342,18 @@ fn lazy_register_prototype_user_locked<'s>(
 ) {
     let mut current = user;
     loop {
-        let proto_word = current.as_tagged(heap).as_ref().prototype.get(heap);
+        let proto_word = current.as_tagged(heap).prototype.get(heap);
         let Some(proto) = trackable_prototype(heap, proto_word) else {
             break;
         };
-        let proto_map = scope.handle(proto.as_ref().map_ref(heap));
-        proto_map.as_tagged(heap).as_ref().mark_prototype(heap);
+        let proto_map = scope.handle(proto.as_ref().map(heap));
+        proto_map.as_tagged(heap).mark_prototype(heap);
         let proto_info = Prototype::get_or_create_prototype_info(heap, scope, proto_map);
         let current_info = Prototype::get_or_create_prototype_info(heap, scope, current);
 
-        let slot = current_info.as_tagged(heap).as_ref().registry_slot();
+        let slot = current_info.as_tagged(heap).registry_slot();
         let registered = slot >= 1 && {
-            let users = proto_info.as_tagged(heap).as_ref().prototype_users(heap);
+            let users = proto_info.as_tagged(heap).prototype_users(heap);
             users.is_some_and(|users| {
                 let users = users.as_ref();
                 (slot as usize) < users.len()
@@ -376,7 +366,7 @@ fn lazy_register_prototype_user_locked<'s>(
         };
         if !registered {
             let assigned = append_prototype_child(heap, scope, proto_info, current);
-            current_info.as_tagged(heap).as_ref().set_registry_slot(
+            current_info.as_tagged(heap).set_registry_slot(
                 heap,
                 current_info.as_tagged(heap).erase(),
                 assigned,
@@ -400,7 +390,7 @@ fn append_prototype_child<'s, T: 's>(
         Grow(usize),
     }
 
-    let plan = match info.as_tagged(heap).as_ref().prototype_users(heap) {
+    let plan = match info.as_tagged(heap).prototype_users(heap) {
         None => Plan::Init,
         Some(array) => {
             let array = array.as_ref();

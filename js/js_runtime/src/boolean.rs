@@ -2,7 +2,7 @@
 
 use vm_core::HostCtx;
 use vm_core::raise_runtime;
-use vm_core::{Args, Convert, Handle, Object, Tagged, Value, WrapperKind};
+use vm_core::{Args, Convert, Handle, Tagged, Value, WrapperKind};
 
 pub fn boolean_constructor<'a>(
     nctx: HostCtx<'a>,
@@ -15,11 +15,11 @@ pub fn boolean_constructor<'a>(
     } = nctx;
     if !is_construct {
         let arg = args.get(heap, 1);
-        return Convert::boolean(heap, Convert::is_truthy(heap, arg));
+        return Convert::boolean(heap, arg.is_truthy(heap));
     }
     state.handle_scope(|scope| {
         let arg = args.get(heap, 1);
-        let value = scope.handle(Convert::boolean(heap, Convert::is_truthy(heap, arg)));
+        let value = scope.handle(Convert::boolean(heap, arg.is_truthy(heap)));
         let map = heap.known().boolean_wrapper_map;
         heap.new_object(&scope, map, scope.stage(&[value.as_tagged(heap).erase()]))
             .erase()
@@ -35,13 +35,9 @@ pub fn boolean_value_of<'a>(
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
-    match Object::wrapper_value(
-        heap,
-        // Safety: fresh rooted-slot word, no allocation since the read.
-        unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
-        WrapperKind::Boolean,
-    )
-    .map(|v| v.raw())
+    match unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) }
+        .wrapper_value(heap, WrapperKind::Boolean)
+        .map(|v| v.raw())
     {
         Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
         Err(err) => return raise_runtime(vm, heap, state, err),
@@ -58,13 +54,9 @@ pub fn boolean_to_string<'a>(
     } = nctx;
     state.handle_scope(|scope| {
         let arg = args.get(heap, 0);
-        let v = match Object::wrapper_value(
-            heap,
-            // Safety: fresh rooted-slot word, no allocation since the read.
-            unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
-            WrapperKind::Boolean,
-        )
-        .map(|v| v.raw())
+        let v = match unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) }
+            .wrapper_value(heap, WrapperKind::Boolean)
+            .map(|v| v.raw())
         {
             Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
             Err(err) => return raise_runtime(vm, heap, state, err),

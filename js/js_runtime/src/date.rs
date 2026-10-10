@@ -6,7 +6,7 @@ use vm_core::Handle;
 use vm_core::HostCtx;
 use vm_core::Object;
 use vm_core::{Args, Heap};
-use vm_core::{Convert, DenseString, Tagged, Value, VmError};
+use vm_core::{DenseString, Tagged, Value, VmError};
 use vm_core::{ThreadState, VM};
 use vm_core::{raise_runtime, rt_try};
 
@@ -439,8 +439,7 @@ fn format_with<'a>(
             return unsafe { Tagged::<Value>::from_value_unchecked(word) };
         }
         // Safety: fresh slot word, no allocation since the read.
-        let Some(ms) =
-            Convert::as_number(heap, unsafe { Tagged::<Value>::from_value_unchecked(word) })
+        let Some(ms) = unsafe { Tagged::<Value>::from_value_unchecked(word) }.as_number(heap)
         else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
@@ -494,9 +493,9 @@ fn date_slot<'a>(
     let Some(obj) = receiver.as_heap_object() else {
         return raise_runtime(vm, heap, state, VmError::Type);
     };
-    let map = obj.as_ref().header.map.get(heap);
+    let map = obj.as_ref().map(heap);
     if map != heap.known().date_instance_map.as_tagged(heap) {
         return raise_runtime(vm, heap, state, VmError::Type);
     }
-    obj.as_ref().slots.get(heap).at(heap, 0)
+    obj.as_ref().slots(heap).at(heap, 0)
 }

@@ -32,13 +32,10 @@ impl Regs {
 
     /// Safe by the register-file invariant: slots hold strong, valid
     /// values from frame setup until the frame pops (the collector
-    /// updates them in place). The heap argument anchors the returned
+    /// updates them in place). The `Ctx` argument anchors the returned
     /// value to the GC epoch, like `Register::get(heap)`.
     #[inline(always)]
-    pub fn read<'h, H>(&self, i: i32, _heap: H) -> Tagged<'h, Value>
-    where
-        H: AsHeap<'h>,
-    {
+    pub fn read<'h>(&self, i: i32, _ctx: &Ctx<'h>) -> Tagged<'h, Value> {
         // Safety: the invariant above.
         unsafe { Tagged::from_value_unchecked((*self.0.offset(i as isize)).raw()) }
     }
@@ -49,26 +46,6 @@ impl Regs {
         unsafe {
             (*self.0.offset(i as isize)).store(v);
         }
-    }
-}
-
-/// Witness conversion for epoch-anchored register reads: anything that
-/// can lend the current heap.
-pub trait AsHeap<'h> {
-    fn as_heap(self) -> &'h Heap;
-}
-
-impl<'h> AsHeap<'h> for &'h Heap {
-    #[inline(always)]
-    fn as_heap(self) -> &'h Heap {
-        self
-    }
-}
-
-impl<'h, 'x> AsHeap<'h> for &'x Ctx<'h> {
-    #[inline(always)]
-    fn as_heap(self) -> &'h Heap {
-        self.heap()
     }
 }
 
@@ -612,7 +589,7 @@ extern "rust-preserve-none" fn op_add<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(sum)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
+    if let (Some(a), Some(b)) = (lhs.as_number(ctx.heap()), acc.as_number(ctx.heap())) {
         let sum = a + b;
         if let Some(s) = Smi::from_f64(sum) {
             next!(Add, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -652,7 +629,7 @@ extern "rust-preserve-none" fn op_sub<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(diff)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
+    if let (Some(a), Some(b)) = (lhs.as_number(ctx.heap()), acc.as_number(ctx.heap())) {
         let diff = a - b;
         if let Some(s) = Smi::from_f64(diff) {
             next!(Sub, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -692,7 +669,7 @@ extern "rust-preserve-none" fn op_mul<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(product)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
+    if let (Some(a), Some(b)) = (lhs.as_number(ctx.heap()), acc.as_number(ctx.heap())) {
         let product = a * b;
         if let Some(s) = Smi::from_f64(product) {
             next!(Mul, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -786,7 +763,7 @@ extern "rust-preserve-none" fn op_inc_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(IncLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let Some(n) = Convert::as_number(ctx.heap(), v) {
+    if let Some(n) = v.as_number(ctx.heap()) {
         let new = n + 1.0;
         if let Some(s) = Smi::from_f64(new) {
             regs.write(r, s.into_tagged());
@@ -819,7 +796,7 @@ extern "rust-preserve-none" fn op_dec_loc<'a, const STRIDE: usize>(
         regs.write(r, Tagged::from_smi_bits(new));
         next!(DecLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let Some(n) = Convert::as_number(ctx.heap(), v) {
+    if let Some(n) = v.as_number(ctx.heap()) {
         let new = n - 1.0;
         if let Some(s) = Smi::from_f64(new) {
             regs.write(r, s.into_tagged());
@@ -944,7 +921,7 @@ extern "rust-preserve-none" fn op_jump_if_truthy<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::JumpIfTruthy);
     let off = ops.signed::<0>();
-    if Convert::is_truthy(ctx.heap(), acc) {
+    if acc.is_truthy(ctx.heap()) {
         jump!(ip, off, acc, regs, ctx, table, roots, float)
     }
     next!(JumpIfTruthy, ip, regs, ctx, table, roots, float, acc)
@@ -962,7 +939,7 @@ extern "rust-preserve-none" fn op_jump_if_falsy<'a, const STRIDE: usize>(
 ) -> Tagged<'a, Value> {
     let ops = Ops::<STRIDE>::new(ip, Opcode::JumpIfFalsy);
     let off = ops.signed::<0>();
-    if !Convert::is_truthy(ctx.heap(), acc) {
+    if !acc.is_truthy(ctx.heap()) {
         jump!(ip, off, acc, regs, ctx, table, roots, float)
     }
     next!(JumpIfFalsy, ip, regs, ctx, table, roots, float, acc)
@@ -1371,7 +1348,7 @@ extern "rust-preserve-none" fn op_div<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(encoded)
         )
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), acc)) {
+    if let (Some(a), Some(b)) = (lhs.as_number(ctx.heap()), acc.as_number(ctx.heap())) {
         let quotient = a / b;
         if let Some(s) = Smi::from_f64(quotient) {
             next!(Div, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -1554,7 +1531,7 @@ extern "rust-preserve-none" fn op_negate<'a, const STRIDE: usize>(
             Tagged::from_smi_bits(neg)
         )
     }
-    if let Some(a) = Convert::as_number(ctx.heap(), acc) {
+    if let Some(a) = acc.as_number(ctx.heap()) {
         let neg = -a;
         if let Some(s) = Smi::from_f64(neg) {
             next!(Negate, ip, regs, ctx, table, roots, float, s.into_tagged())
@@ -1669,7 +1646,7 @@ extern "rust-preserve-none" fn op_add_loc<'a, const STRIDE: usize>(
         regs.write(dst, v);
         next!(AddLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), rhs)) {
+    if let (Some(a), Some(b)) = (lhs.as_number(ctx.heap()), rhs.as_number(ctx.heap())) {
         let sum = a + b;
         if let Some(s) = Smi::from_f64(sum) {
             let v = s.into_tagged();
@@ -1707,7 +1684,7 @@ extern "rust-preserve-none" fn op_sub_loc<'a, const STRIDE: usize>(
         regs.write(dst, v);
         next!(SubLoc, ip, regs, ctx, table, roots, float, v)
     }
-    if let (Some(a), Some(b)) = (Convert::as_number(ctx.heap(), lhs), Convert::as_number(ctx.heap(), rhs)) {
+    if let (Some(a), Some(b)) = (lhs.as_number(ctx.heap()), rhs.as_number(ctx.heap())) {
         let diff = a - b;
         if let Some(s) = Smi::from_f64(diff) {
             let v = s.into_tagged();
@@ -1817,7 +1794,7 @@ extern "rust-preserve-none" fn op_store_keyed<'a, const STRIDE: usize>(
     if let Some(idx) = key_w.to_i64()
         && idx >= 0
     {
-        if Object::store_array_element_in_place(ctx.heap(), recv_w, idx as usize, acc).is_ok() {
+        if recv_w.store_array_element_in_place(ctx.heap(), idx as usize, acc).is_ok() {
             next!(StoreKeyedProperty, ip, regs, ctx, table, roots, float, acc)
         }
         if let Some(v) = InlineCache::try_store_element(
@@ -1853,7 +1830,7 @@ extern "rust-preserve-none" fn op_store_keyed_no_shadow<'a, const STRIDE: usize>
     if let Some(idx) = key_w.to_i64()
         && idx >= 0
     {
-        if Object::store_array_element_in_place(ctx.heap(), recv_w, idx as usize, acc).is_ok() {
+        if recv_w.store_array_element_in_place(ctx.heap(), idx as usize, acc).is_ok() {
             next!(
                 StoreKeyedPropertyNoShadow,
                 ip,
@@ -2074,7 +2051,7 @@ extern "rust-preserve-none" fn op_load_context_slot<'a, const STRIDE: usize>(
         let heap = ctx.heap();
         let context_word = ctx.stack().frame_header(base).context_slot().get(heap);
         let context = unsafe { context_word.cast::<ContextObject>() };
-        let slots = context.as_ref().slots.get(heap);
+        let slots = context.as_ref().slots(heap);
         let slots = unsafe { slots.cast::<FixedArray>() };
         let v = slots.as_ref().element_slot(slot).get(heap);
         next!(LoadContextSlot, ip, regs, ctx, table, roots, float, v)
@@ -3099,7 +3076,7 @@ extern "rust-preserve-none" fn op_call<'a, const STRIDE: usize>(
     let base_r = ops.signed::<1>();
     let count = ops.unsigned::<2>();
     let callee_word = regs.read(callee, ctx);
-    match Object::call_target(ctx.heap(), callee_word) {
+    match callee_word.call_target(ctx.heap()) {
         None => bail!(acc, ip, regs, ctx, table, roots, float, VmError::Type),
         Some(CallTarget::Proxy(_)) => {
             become slow_proxy_apply::<STRIDE>(ip, regs, acc, ctx, table, roots, float)
@@ -3269,7 +3246,7 @@ fn construct_start<'a>(
     if !constructible {
         return Ok(ConstructStart::Slow);
     }
-    let kind = match Object::call_target(ctx.heap(), callee_word) {
+    let kind = match callee_word.call_target(ctx.heap()) {
         Some(CallTarget::Native(rt)) => return Ok(ConstructStart::Native(rt)),
         Some(CallTarget::Bytecode { kind, .. }) => kind,
         _ => return Ok(ConstructStart::Slow),
@@ -3296,7 +3273,7 @@ fn construct_start<'a>(
         context,
         kind,
         ..
-    }) = Object::call_target(ctx.heap(), callee_word)
+    }) = callee_word.call_target(ctx.heap())
     else {
         return Ok(ConstructStart::Slow);
     };
@@ -3437,7 +3414,7 @@ extern "rust-preserve-none" fn construct_trampoline<'a>(
     let this_val = regs.read(0, ctx.heap());
     let caller = ctx.stack().pop_frame(frame_base);
     ctx.set_frame_base(caller.base);
-    let v = if Convert::is_primitive(ctx.heap(), acc) {
+    let v = if acc.is_primitive(ctx.heap()) {
         if this_val == ctx.heap().known().the_hole.as_tagged(ctx.heap()).erase() {
             let _ = ctx.raise_tag(VmError::Type);
             let caller_code = ctx.code_ptr();
@@ -3980,7 +3957,7 @@ fn enter<'a>(
         });
     }
 
-    match Object::call_target(heap, callable.as_tagged(heap).erase()) {
+    match callable.as_tagged(heap).erase().call_target(heap) {
         None => Err(VmError::Type),
         // the proxy dispatch above already intercepted these
         Some(CallTarget::Proxy(_)) => Err(VmError::Type),

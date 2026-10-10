@@ -4,7 +4,6 @@
 use vm_core::Coercion;
 use vm_core::HostCtx;
 use vm_core::Lookup;
-use vm_core::Object;
 use vm_core::materialize::Materialize;
 use vm_core::{
     Args, ContextObject, Convert, DenseString, Errors, Handle, HandleSlice, Heap, Smi, Tagged,
@@ -43,7 +42,7 @@ pub fn function_call<'a>(
         vm, heap, state, ..
     } = nctx;
     let f = args.get_handle(heap, 0);
-    if !Object::is_callable(heap, f.as_tagged(heap)) {
+    if !f.as_tagged(heap).is_callable(heap) {
         return raise_runtime(vm, heap, state, VmError::Type);
     }
     let fwd = nctx.state.stack().slice(args.slice_from(1));
@@ -65,7 +64,7 @@ pub fn function_apply<'a>(
         vm, heap, state, ..
     } = nctx;
     let f = args.get_handle(heap, 0);
-    if !Object::is_callable(heap, f.as_tagged(heap)) {
+    if !f.as_tagged(heap).is_callable(heap) {
         return raise_runtime(vm, heap, state, VmError::Type);
     }
     // the args window is rooted for the call; re-read at the point of use
@@ -98,7 +97,7 @@ pub fn function_bind<'a>(
     let raw_f = {
         let f = args.get(heap, 0);
         let f = f;
-        if !Object::is_callable(heap, f) {
+        if !f.is_callable(heap) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         f.raw()

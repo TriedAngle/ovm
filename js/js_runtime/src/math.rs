@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use vm_core::HostCtx;
 use vm_core::Object;
 use vm_core::rt_try;
-use vm_core::{Args, Convert, Handle, Heap, Tagged, ThreadState, VM, Value, VmError};
+use vm_core::{Args, Handle, Heap, Tagged, ThreadState, VM, Value, VmError};
 
 /// TODO: better distribution
 /// xorshift64
@@ -24,7 +24,7 @@ fn random_bits() -> u64 {
 /// (a Smi, or a boxed `Float`) needs no ToPrimitive/ToNumber round-trip.
 #[inline]
 fn number_arg(heap: &Heap, args: Args, i: usize) -> Option<f64> {
-    Convert::as_number(heap, args.get(heap, i))
+    args.get(heap, i).as_number(heap)
 }
 
 /// The cold half of an argument read: full ToNumeric for strings, objects,

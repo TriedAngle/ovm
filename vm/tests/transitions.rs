@@ -27,13 +27,13 @@ fn map_handle<'s>(
     obj: Handle<'_, Object>,
 ) -> Handle<'s, Map> {
     let heap = &*thread.heap();
-    let map = obj.as_tagged(heap).as_ref().header.map.get(heap);
+    let map = obj.as_tagged(heap).map(heap);
     scope.handle(map)
 }
 
 fn object_map_word(thread: &mut Thread, obj: Handle<'_, Object>) -> Value {
     let heap = &*thread.heap();
-    obj.as_tagged(heap).as_ref().header.map.get(heap).raw()
+    obj.as_tagged(heap).map(heap).raw()
 }
 
 fn pred_word(thread: &mut Thread, map: Value) -> Option<Value> {

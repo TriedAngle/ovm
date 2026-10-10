@@ -225,7 +225,7 @@ pub extern "rust-preserve-none" fn slow_compare_jump<'a, const STRIDE: usize>(
     let jump_pc = (pc as isize + off as isize) as usize;
     let other = regs.read(r, ctx);
     let cmp = (kind / 2) as u8;
-    let b = match (Convert::as_number(ctx.heap(), acc), Convert::as_number(ctx.heap(), other)) {
+    let b = match (acc.as_number(ctx.heap()), other.as_number(ctx.heap())) {
         (Some(a), Some(b)) => match cmp {
             0 | 1 => a == b,
             2 => a < b,
@@ -246,7 +246,7 @@ pub extern "rust-preserve-none" fn slow_compare_jump<'a, const STRIDE: usize>(
                     float,
                 )
             }
-            Convert::is_truthy(ctx.heap(), v)
+            v.is_truthy(ctx.heap())
         }
     };
     let boolean = Convert::boolean(ctx.heap(), b);
@@ -469,11 +469,11 @@ pub fn construct_cache_record(
     // Safety: fresh synthesized-receiver word; read before any allocation
     // below, and no collection can run until then.
     let map: Tagged<vm_core::Map> = unsafe {
-        Tagged::from_value_unchecked(obj.as_tagged(heap).as_ref().header.map.get(heap).raw())
+        Tagged::from_value_unchecked(obj.as_tagged(heap).map(heap).raw())
     };
     // find the closure's `.prototype` data-property slot
     let proto_name = heap.known().strings.prototype.as_tagged(heap);
-    let closure_map = callee.as_tagged(heap).as_ref().header.map.get(heap);
+    let closure_map = callee.as_tagged(heap).map(heap);
     let mut found = None;
     for d in closure_map.as_ref().descriptors() {
         if d.name(heap).raw() == proto_name.raw() && !d.flags().is_accessor() {
@@ -717,7 +717,7 @@ pub fn slow_call_method_miss<'a>(
     argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), callee_word) {
+    match callee_word.call_target(ctx.heap()) {
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Native(rt)) => {
@@ -780,7 +780,7 @@ pub fn slow_call_function_miss<'a>(
     argc: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), callee_word) {
+    match callee_word.call_target(ctx.heap()) {
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Native(rt)) => {
@@ -843,7 +843,7 @@ pub fn slow_call_miss<'a>(
     count: usize,
     fb: usize,
 ) -> Result<MethodCall<'a>, VmError> {
-    match Object::call_target(ctx.heap(), callee_word) {
+    match callee_word.call_target(ctx.heap()) {
         None => Ok(MethodCall::Value(ctx.raise_tag(VmError::Type))),
         Some(CallTarget::Proxy(_)) => Ok(MethodCall::Proxy),
         Some(CallTarget::Native(rt)) => {

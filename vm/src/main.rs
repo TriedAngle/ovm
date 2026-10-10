@@ -4,9 +4,7 @@ use std::path::Path;
 use kette_compiler::KetteCompiler;
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{Compiler, DefaultInterpreter, JSRuntime, KetteRuntime, Thread, VM};
-use vm::{
-    DenseString, Float, Heap, JavascriptCompiler, LoadOutcome, Lookup, SlotName, Smi, Tagged, Value,
-};
+use vm::{DenseString, Float, Heap, JavascriptCompiler, LoadOutcome, SlotName, Smi, Tagged, Value};
 
 fn main() {
     trace::init();
@@ -218,7 +216,7 @@ fn error_property<'a>(
     v: Tagged<'a, Value>,
     name: Tagged<'a, SlotName>,
 ) -> Option<String> {
-    match Lookup::load_outcome_on(heap, v, name) {
+    match v.load_outcome_on(heap, name) {
         Ok(LoadOutcome::Value(x)) => x
             .get_as::<DenseString>(heap)
             .map(|s| s.to_rust_string(heap)),

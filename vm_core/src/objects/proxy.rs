@@ -171,7 +171,7 @@ fn call_trap<'a>(
     trap: &Handle<'_, Value>,
     args: &[Handle<'_, Value>],
 ) -> Result<Coercion<'a>, VmError> {
-    if !Object::is_callable(heap, trap.as_tagged(heap)) {
+    if !trap.as_tagged(heap).is_callable(heap) {
         return Err(VmError::Message(Message::ProxyTrapNotFunction));
     }
     let words: Vec<Tagged<'_, Value>> = args.iter().map(|h| h.as_tagged(heap)).collect();
@@ -229,8 +229,9 @@ fn own_descriptor_h<'s>(
 ) -> Result<Flow<Option<PartialDescriptor<'s>>>, VmError> {
     let cond_11 = Proxy::is_proxy(heap, obj.as_tagged(heap));
     if !cond_11 {
-        let desc =
-            Lookup::ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), key.as_tagged(heap));
+        let desc = obj
+            .as_tagged(heap)
+            .ordinary_own_descriptor(heap, scope, key.as_tagged(heap));
         return Ok(Flow::Value(desc.as_ref().map(PartialDescriptor::from)));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
@@ -282,7 +283,7 @@ fn is_extensible_h(
         return Ok(Flow::Value({
             obj.as_tagged(heap)
                 .as_heap_object()
-                .is_some_and(|o| o.as_ref().map_ref(heap).kind().is_extendable())
+                .is_some_and(|o| o.as_ref().map(heap).kind().is_extendable())
         }));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
@@ -301,9 +302,7 @@ fn is_extensible_h(
                 Coercion::Threw => return Ok(Flow::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            Ok(Flow::Value({
-                Convert::is_truthy(heap, result.as_tagged(heap))
-            }))
+            Ok(Flow::Value({ result.as_tagged(heap).is_truthy(heap) }))
         }
     }
 }
@@ -384,7 +383,7 @@ fn define_internal_h<'s>(
     }
     // [[DefineOwnProperty]] requires an Object target (ES 10.1.6): a
     // primitive (including String/Symbol/Float) is a TypeError.
-    if Convert::is_primitive(heap, obj.as_tagged(heap)) {
+    if obj.as_tagged(heap).is_primitive(heap) {
         return Err(VmError::Type);
     }
     let undefined = scope.handle(heap.known().undefined.as_tagged(heap).erase());
@@ -398,7 +397,7 @@ fn define_internal_h<'s>(
         if !on_array {
             break 'element None;
         }
-        match Lookup::classify_key(heap, name.as_tagged(heap)) {
+        match name.as_tagged(heap).classify_key(heap) {
             Ok(Key::Element(i)) => Some(i),
             _ => None,
         }
@@ -427,7 +426,7 @@ fn define_internal_h<'s>(
         if array
             .as_tagged(heap)
             .as_ref()
-            .map_ref(heap)
+            .map(heap)
             .as_ref()
             .kind()
             .is_dense_elements()
@@ -480,7 +479,7 @@ fn define_internal_h<'s>(
             details,
         );
         if accessor {
-            table.as_tagged(heap).as_ref().require_slow(heap);
+            table.as_tagged(heap).require_slow(heap);
         }
         let array_ref = array.as_tagged(heap);
         let host = array_ref.erase();
@@ -499,8 +498,9 @@ fn define_internal_h<'s>(
         Prototype::element_mutated(heap, array_ref);
         return Ok(Flow::Value(true));
     }
-    let current =
-        Lookup::ordinary_own_descriptor(heap, scope, obj.as_tagged(heap), name.as_tagged(heap));
+    let current = obj
+        .as_tagged(heap)
+        .ordinary_own_descriptor(heap, scope, name.as_tagged(heap));
     let full = partial.complete_against(undefined, current.as_ref());
     let obj_ref = scope
         .cast::<Object>(heap, obj.as_tagged(heap))
@@ -525,10 +525,7 @@ fn ordinary_set_forward<'a>(
     // array element keys on arrays route through the define path
     // (which stores into the backing store)
     let classified = (
-        matches!(
-            Lookup::classify_key(heap, name.as_tagged(heap)),
-            Ok(Key::Element(_))
-        ),
+        matches!(name.as_tagged(heap).classify_key(heap), Ok(Key::Element(_))),
         target
             .as_tagged(heap)
             .as_heap_object()
@@ -702,7 +699,7 @@ fn set_h<'a, 's>(
                 Coercion::Threw => return Ok(Coercion::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let truthy = Convert::is_truthy(heap, result.as_tagged(heap));
+            let truthy = result.as_tagged(heap).is_truthy(heap);
             if !truthy {
                 // [[Set]] returned false; sloppy stores ignore it
                 return Ok(Coercion::Value(Convert::boolean(heap, false)));
@@ -754,11 +751,9 @@ fn has_h<'a>(
             if cond_15 {
                 has_h(vm, heap, state, scope, &target, name)
             } else {
-                let found = Lookup::has_property(
-                    heap,
-                    target.as_tagged(heap),
-                    name.as_tagged(heap).as_name(),
-                );
+                let found = target
+                    .as_tagged(heap)
+                    .has_property(heap, name.as_tagged(heap).as_name());
                 Ok(Coercion::Value(Convert::boolean(heap, found)))
             }
         }
@@ -768,7 +763,7 @@ fn has_h<'a>(
                 Coercion::Threw => return Ok(Coercion::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let truthy = Convert::is_truthy(heap, result.as_tagged(heap));
+            let truthy = result.as_tagged(heap).is_truthy(heap);
             if truthy {
                 return Ok(Coercion::Value(Convert::boolean(heap, true)));
             }
@@ -824,7 +819,7 @@ fn delete_h<'a>(
                 Coercion::Threw => return Ok(Coercion::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let truthy = Convert::is_truthy(heap, result.as_tagged(heap));
+            let truthy = result.as_tagged(heap).is_truthy(heap);
             if !truthy {
                 return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
@@ -879,7 +874,7 @@ fn proxy_define_h(
                 Coercion::Threw => return Ok(Flow::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let cond_17 = Convert::is_truthy(heap, result.as_tagged(heap));
+            let cond_17 = result.as_tagged(heap).is_truthy(heap);
             if !cond_17 {
                 return Ok(Flow::Value(false));
             }
@@ -1038,7 +1033,7 @@ fn construct_h<'a>(
             if result.as_tagged(heap) == exception {
                 return Ok(Coercion::Threw);
             }
-            let cond_18 = Convert::is_primitive(heap, result.as_tagged(heap));
+            let cond_18 = result.as_tagged(heap).is_primitive(heap);
             if cond_18 {
                 if derived {
                     // a derived constructor may only return objects
@@ -1069,7 +1064,7 @@ fn construct_h<'a>(
             };
             // invariant: the trap must return an object
             {
-                let cond_19 = Convert::is_primitive(heap, result.as_tagged(heap));
+                let cond_19 = result.as_tagged(heap).is_primitive(heap);
                 if cond_19 {
                     return Err(VmError::Message(Message::ProxyConstructNotObject));
                 }
@@ -1084,7 +1079,7 @@ fn construct_h<'a>(
 fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Handle<'_, Object>) {
     use crate::{MapInit, MapKind};
     let (kind, prototype, rows) = {
-        let map = obj.as_tagged(heap).map_ref(heap);
+        let map = obj.as_tagged(heap).map(heap);
         (
             map.kind(),
             scope.handle(map.prototype.get(heap)),
@@ -1109,11 +1104,11 @@ fn ordinary_prevent_extensions(heap: &mut Heap, scope: &HandleScope<'_>, obj: Ha
         let obj_ref = obj.as_tagged(heap);
         let new_map = token.allocate::<Map>(MapInit {
             kind: MapKind::new(kind.bits() & !MapKind::EXTENDABLE.bits()),
-            value_slot_count: obj_ref.map_ref(heap).value_slot_count(),
+            value_slot_count: obj_ref.map(heap).value_slot_count(),
             descriptors: &rows,
             prototype,
         });
-        Prototype::shape_changed(heap, obj_ref.map_ref(heap));
+        Prototype::shape_changed(heap, obj_ref.map(heap));
         obj_ref.header.map.set(heap, obj_ref.erase(), new_map);
     });
 }
@@ -1149,7 +1144,7 @@ fn prevent_extensions_h<'a>(
                 Coercion::Threw => return Ok(Coercion::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let cond_21 = Convert::is_truthy(heap, result.as_tagged(heap));
+            let cond_21 = result.as_tagged(heap).is_truthy(heap);
             if !cond_21 {
                 return Ok(Coercion::Value(Convert::boolean(heap, false)));
             }
@@ -1178,7 +1173,7 @@ fn is_extensible_entry_h<'a>(
         let extensible = obj
             .as_tagged(heap)
             .as_heap_object()
-            .is_some_and(|o| o.as_ref().map_ref(heap).kind().is_extendable());
+            .is_some_and(|o| o.as_ref().map(heap).kind().is_extendable());
         return Ok(Coercion::Value(Convert::boolean(heap, extensible)));
     }
     let (target, handler) = parts(heap, obj.as_tagged(heap)).expect("checked proxy above");
@@ -1197,7 +1192,7 @@ fn is_extensible_entry_h<'a>(
                 Coercion::Threw => return Ok(Coercion::Threw),
                 Coercion::Value(v) => scope.handle(v),
             };
-            let trap_bool = Convert::is_truthy(heap, result.as_tagged(heap));
+            let trap_bool = result.as_tagged(heap).is_truthy(heap);
             let target_bool = is_extensible_h(vm, heap, state, scope, &target)?;
             let Flow::Value(target_bool) = target_bool else {
                 return Ok(Coercion::Threw);
@@ -1216,7 +1211,7 @@ impl Proxy {
     pub fn is_proxy<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
         // bit test on the already-loaded map kind, no kind decode/match
         v.as_heap_object()
-            .is_some_and(|obj| obj.as_ref().header.map.get(heap).kind().is_proxy())
+            .is_some_and(|obj| obj.as_ref().map(heap).kind().is_proxy())
     }
 
     /// Whether `v` is a valid ECMAScript receiver ([[ProxyTarget]] /

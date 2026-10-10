@@ -157,7 +157,7 @@ fn delete_property<'a>(
                 }
                 Coercion::Value(v) => {
                     let v = scope.handle(v);
-                    Convert::is_truthy(heap, v.as_tagged(heap))
+                    v.as_tagged(heap).is_truthy(heap)
                 }
             }
         } else {
@@ -201,7 +201,7 @@ fn delete_property_core(
     {
         return Ok(false);
     }
-    if Convert::is_primitive(heap, target.as_tagged(heap)) {
+    if target.as_tagged(heap).is_primitive(heap) {
         return Ok(true);
     }
     let receiver = scope
@@ -339,7 +339,7 @@ fn for_in_initial_level<'a>(
     if DenseString::from_receiver(heap, subject).is_some() {
         return Some(subject);
     }
-    if !Convert::is_primitive(heap, subject) {
+    if !subject.is_primitive(heap) {
         return Some(subject);
     }
     let ctor_name = if Smi::decode(subject.raw()).is_some() {
@@ -362,11 +362,18 @@ fn for_in_initial_level<'a>(
         "Boolean" => strings.boolean_ctor,
         _ => strings.symbol_ctor,
     };
-    let ctor = match Lookup::load_outcome(heap, global.erase(), ctor_handle.as_tagged(heap)).ok()? {
+    let ctor = match global
+        .erase()
+        .load_outcome(heap, ctor_handle.as_tagged(heap))
+        .ok()?
+    {
         LoadOutcome::Value(v) if v.is_strong_ptr() => v,
         _ => return None,
     };
-    match Lookup::load_outcome(heap, ctor, heap.known().strings.prototype.as_tagged(heap)).ok()? {
+    match ctor
+        .load_outcome(heap, heap.known().strings.prototype.as_tagged(heap))
+        .ok()?
+    {
         LoadOutcome::Value(p) if p.is_strong_ptr() => Some(p),
         _ => None,
     }
@@ -419,7 +426,7 @@ fn for_in_level_keys<'s>(
             }
         }
 
-        for d in obj.map_ref(heap).descriptors() {
+        for d in obj.map(heap).descriptors() {
             let name = d.name(heap);
 
             if let Some(index) = name.as_index() {
@@ -440,7 +447,7 @@ fn for_in_level_keys<'s>(
             let index = name
                 .erase()
                 .get_as::<DenseString>(heap)
-                .and_then(|s| Lookup::canonical_index(s.as_ref().data(heap)))
+                .and_then(|s| s.as_ref().data(heap).canonical_index())
                 .filter(|i| *i < u32::MAX as usize);
             match index {
                 Some(i) => indices.push(i as i64),
@@ -494,7 +501,7 @@ fn for_in_next<'a>(
                 let Some(obj) = enumerator.as_tagged(heap).as_heap_object() else {
                     return raise_runtime(vm, heap, state, VmError::Type);
                 };
-                let slots = obj.as_ref().slots.get(heap);
+                let slots = obj.as_ref().slots(heap);
                 let keys = rt_try!(
                     vm,
                     heap,
@@ -523,7 +530,7 @@ fn for_in_next<'a>(
                     let Some(obj) = enumerator.as_tagged(heap).as_heap_object() else {
                         return raise_runtime(vm, heap, state, VmError::Type);
                     };
-                    scope.handle(obj.as_ref().slots.get(heap).at(heap, FOR_IN_LEVEL))
+                    scope.handle(obj.as_ref().slots(heap).at(heap, FOR_IN_LEVEL))
                 };
                 let Some(proto) = rt_try!(vm, heap, state, for_in_next_level(heap, &scope, level))
                 else {
@@ -535,7 +542,7 @@ fn for_in_next<'a>(
                 let Some(obj) = enumerator.as_tagged(heap).as_heap_object() else {
                     return raise_runtime(vm, heap, state, VmError::Type);
                 };
-                let slots = obj.as_ref().slots.get(heap);
+                let slots = obj.as_ref().slots(heap);
                 slots.set(heap, FOR_IN_LEVEL, proto.as_tagged(heap).erase());
                 slots.set(heap, FOR_IN_KEYS, keys.as_tagged(heap).erase());
                 slots.set(heap, FOR_IN_INDEX, Smi::new(0).into_tagged());
@@ -547,7 +554,7 @@ fn for_in_next<'a>(
                 let Some(obj) = enumerator.as_tagged(heap).as_heap_object() else {
                     return raise_runtime(vm, heap, state, VmError::Type);
                 };
-                obj.as_ref().slots.get(heap).at(heap, FOR_IN_LEVEL)
+                obj.as_ref().slots(heap).at(heap, FOR_IN_LEVEL)
             };
             let own = for_in_own_state(heap, level, key.as_tagged(heap));
             let Some(enumerable) = own else {
@@ -606,11 +613,9 @@ fn for_in_next<'a>(
                 let Some(obj) = enumerator.as_tagged(heap).as_heap_object() else {
                     return raise_runtime(vm, heap, state, VmError::Type);
                 };
-                obj.as_ref().slots.get(heap).set(
-                    heap,
-                    FOR_IN_VISITED,
-                    visited.as_tagged(heap).erase(),
-                );
+                obj.as_ref()
+                    .slots(heap)
+                    .set(heap, FOR_IN_VISITED, visited.as_tagged(heap).erase());
             }
             if !enumerable {
                 continue;
@@ -634,34 +639,30 @@ fn for_in_next_level<'s>(
         // String.prototype via the global object (both plain data
         // lookups; no user code can run)
         let global = heap.known().global_object.as_tagged(heap);
-        let Some(string_ctor) = Lookup::load_outcome(
-            heap,
-            global.erase(),
-            heap.known().strings.string.as_tagged(heap),
-        )
-        .ok()
-        .and_then(|o| match o {
-            LoadOutcome::Value(v) => Some(v),
-            LoadOutcome::Getter(_) => None,
-        }) else {
+        let Some(string_ctor) = global
+            .erase()
+            .load_outcome(heap, heap.known().strings.string.as_tagged(heap))
+            .ok()
+            .and_then(|o| match o {
+                LoadOutcome::Value(v) => Some(v),
+                LoadOutcome::Getter(_) => None,
+            })
+        else {
             return Ok(None);
         };
-        let proto = Lookup::load_outcome(
-            heap,
-            string_ctor,
-            heap.known().strings.prototype.as_tagged(heap),
-        )
-        .ok()
-        .and_then(|o| match o {
-            LoadOutcome::Value(v) => Some(v),
-            LoadOutcome::Getter(_) => None,
-        });
+        let proto = string_ctor
+            .load_outcome(heap, heap.known().strings.prototype.as_tagged(heap))
+            .ok()
+            .and_then(|o| match o {
+                LoadOutcome::Value(v) => Some(v),
+                LoadOutcome::Getter(_) => None,
+            });
         return Ok(proto.filter(|p| p.is_strong_ptr()).map(|p| scope.handle(p)));
     }
     let Some(obj) = level.as_heap_object() else {
         return Ok(None);
     };
-    let proto = obj.as_ref().map_ref(heap).prototype.get(heap);
+    let proto = obj.as_ref().prototype(heap);
     let hole = heap.known().the_hole.as_tagged(heap);
     if proto.ptr_eq(hole) || proto.ptr_eq(heap.known().null.as_tagged(heap)) {
         return Ok(None);
@@ -679,7 +680,7 @@ fn for_in_next_level<'s>(
 /// [[Enumerable]]. Own-only — the shadow check against other levels is
 /// the visited set's job.
 fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value>) -> Option<bool> {
-    match Lookup::classify_key(heap, key).ok()? {
+    match key.classify_key(heap).ok()? {
         Key::Element(i) => {
             if let Some(s) = DenseString::from_receiver(heap, level) {
                 // string indices are enumerable own properties
@@ -692,7 +693,7 @@ fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value
             }
             // plain objects keep index keys as Smi-named descriptors
             let name = Tagged::<SlotName>::from(Smi::new(i as i64));
-            obj.map_ref(heap)
+            obj.map(heap)
                 .descriptors()
                 .iter()
                 .find(|d| d.name(heap).ptr_eq(name))
@@ -710,7 +711,7 @@ fn for_in_own_state(heap: &Heap, level: Tagged<'_, Value>, key: Tagged<'_, Value
 
             // arrays hold "length" outside the descriptors (never a
             // snapshot key) — any other name lives in them
-            obj.map_ref(heap)
+            obj.map(heap)
                 .descriptors()
                 .iter()
                 .find(|d| d.name(heap).ptr_eq(name))
@@ -746,7 +747,7 @@ fn get_iterator<'a>(
         let method_tagged = method.as_tagged(heap);
         if method_tagged.ptr_eq(heap.known().undefined.as_tagged(heap))
             || method_tagged.ptr_eq(heap.known().null.as_tagged(heap))
-            || !Object::is_callable(heap, method_tagged)
+            || !method_tagged.is_callable(heap)
         {
             return raise_runtime(vm, heap, state, VmError::Type); // "obj is not iterable"
         }
@@ -795,7 +796,7 @@ fn iterator_next<'a>(
         {
             return result.as_tagged(heap);
         }
-        if Convert::is_primitive(heap, result.as_tagged(heap)) {
+        if result.as_tagged(heap).is_primitive(heap) {
             return raise_runtime(vm, heap, state, VmError::Type); // IteratorNext result must be an Object
         }
         result.as_tagged(heap)
@@ -823,7 +824,7 @@ fn iterator_done<'a>(
             Coercion::Threw => return heap.known().exception.as_tagged(heap).erase(),
             Coercion::Value(v) => scope.handle(v),
         };
-        let truthy = Convert::is_truthy(heap, v.as_tagged(heap));
+        let truthy = v.as_tagged(heap).is_truthy(heap);
         Convert::boolean(heap, truthy)
     })
 }
@@ -891,7 +892,7 @@ fn has_property<'a>(
             return has.as_tagged(heap);
         }
         // lookup::has_property covers array `length` slots along the chain
-        let has = Lookup::has_property(heap, obj.as_tagged(heap), key.as_tagged(heap));
+        let has = obj.as_tagged(heap).has_property(heap, key.as_tagged(heap));
         Convert::boolean(heap, has)
     })
 }
@@ -923,7 +924,7 @@ fn copy_data_properties<'a>(
         // they fall through to the string branch below.
         if source_tagged.ptr_eq(heap.known().null.as_tagged(heap))
             || source_tagged.ptr_eq(heap.known().undefined.as_tagged(heap))
-            || (Convert::is_primitive(heap, source_tagged)
+            || (source_tagged.is_primitive(heap)
                 && DenseString::from_receiver(heap, source_tagged).is_none())
         {
             return target.as_tagged(heap);
@@ -970,7 +971,7 @@ fn copy_data_properties<'a>(
                     }
                 }
             }
-            for d in obj.header.map.get(heap).descriptors() {
+            for d in obj.map(heap).descriptors() {
                 if d.flags().is_enumerable() {
                     keys.push(scope.handle(d.name(heap).erase()));
                 }
@@ -1066,7 +1067,7 @@ fn private_get<'a>(
     } = nctx;
     let obj = args.get(heap, 0);
     let key = args.get(heap, 1);
-    match Object::private_find(heap, obj, key) {
+    match obj.private_find(heap, key) {
         Some(s) => s.get(heap),
         None => raise_runtime(vm, heap, state, VmError::Type),
     }
@@ -1087,11 +1088,7 @@ fn private_set<'a>(
     let value = value.raw();
     let obj_tagged = obj.raw();
     // Safety: fresh rooted words above; `private_find` allocates nothing.
-    match Object::private_find(
-        heap,
-        unsafe { Tagged::<Value>::from_value_unchecked(obj_tagged) },
-        key,
-    ) {
+    match unsafe { Tagged::<Value>::from_value_unchecked(obj_tagged) }.private_find(heap, key) {
         Some(slot) => {
             slot.set(
                 heap,
@@ -1119,7 +1116,10 @@ fn private_in<'a>(
     } = nctx;
     let key = args.get_handle(heap, 0);
     let obj = args.get_handle(heap, 1);
-    let has = Object::private_find(heap, obj.as_tagged(heap), key.as_tagged(heap)).is_some();
+    let has = obj
+        .as_tagged(heap)
+        .private_find(heap, key.as_tagged(heap))
+        .is_some();
     Convert::boolean(heap, has)
 }
 
@@ -1137,7 +1137,7 @@ fn set_class_fields<'a>(
     let fields = args.get_handle(heap, 1);
     let mut ok = false;
     if let Some(obj) = ctor.as_tagged(heap).as_heap_object() {
-        let slots = obj.as_ref().slots.get(heap);
+        let slots = obj.as_ref().slots(heap);
         if obj
             .as_ref()
             .header
@@ -1178,7 +1178,7 @@ fn init_instance_fields<'a>(
             let Some(obj) = ctor.as_tagged(heap).as_heap_object() else {
                 return raise_runtime(vm, heap, state, VmError::Type);
             };
-            let slots = obj.as_ref().slots.get(heap);
+            let slots = obj.as_ref().slots(heap);
             if slots.len() < 3 {
                 return raise_runtime(vm, heap, state, VmError::Type);
             }
@@ -1395,11 +1395,9 @@ fn get_property_lenient<'a>(
             vm,
             heap,
             state,
-            Lookup::load_outcome(
-                heap,
-                receiver.as_tagged(heap),
-                name.as_tagged(heap).as_name(),
-            )
+            receiver
+                .as_tagged(heap)
+                .load_outcome(heap, name.as_tagged(heap).as_name())
         ) {
             LoadOutcome::Value(v) => (Some(scope.handle(v)), None),
             LoadOutcome::Getter(g) => (None, Some(scope.handle(g))),
@@ -1411,7 +1409,7 @@ fn get_property_lenient<'a>(
         let skip = {
             let getter_tagged = getter.as_tagged(heap);
             getter_tagged.ptr_eq(heap.known().undefined.as_tagged(heap).erase())
-                || !Object::is_callable(heap, getter_tagged)
+                || !getter_tagged.is_callable(heap)
         };
         if skip {
             return heap.known().undefined.as_tagged(heap).erase();
@@ -1556,14 +1554,14 @@ fn install_accessor<'a>(
         let is_getter = flags & 1 != 0;
         let enumerable = flags & bytecode::PropertyFlags::DontEnum.bits() == 0;
         // ES 7.3.5 ToPropertyDescriptor target: Type(O) must be Object
-        if Convert::is_primitive(heap, target.as_tagged(heap)) {
+        if target.as_tagged(heap).is_primitive(heap) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         let name = match rt_try!(
             vm,
             heap,
             state,
-            Lookup::classify_key(heap, key.as_tagged(heap).erase())
+            key.as_tagged(heap).erase().classify_key(heap)
         ) {
             Key::Element(i) => Tagged::from(Smi::new(i as i64)),
             Key::Name(name) => name,
@@ -1572,7 +1570,7 @@ fn install_accessor<'a>(
         let mut get = heap.known().undefined.as_tagged(heap).erase();
         let mut set = get;
         if let Some(obj) = target.as_tagged(heap).as_heap_object() {
-            for d in obj.as_ref().header.map.get(heap).descriptors() {
+            for d in obj.as_ref().map(heap).descriptors() {
                 if d.name(heap).ptr_eq(name) && d.flags().is_accessor() {
                     let pair = d
                         .value
@@ -1690,14 +1688,14 @@ fn define_own_property<'a>(
             };
         }
         // Type(O) must be Object (ES 20.1.2.4 [[DefineOwnProperty]])
-        if Convert::is_primitive(heap, receiver.as_tagged(heap)) {
+        if receiver.as_tagged(heap).is_primitive(heap) {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         let name = match rt_try!(
             vm,
             heap,
             state,
-            Lookup::classify_key(heap, key.as_tagged(heap).erase())
+            key.as_tagged(heap).erase().classify_key(heap)
         ) {
             Key::Element(i) => Tagged::from(Smi::new(i as i64)),
             Key::Name(name) => name,
@@ -1789,7 +1787,7 @@ fn throw_if_not_constructor_or_null<'a>(
     let ok = v_raw == null
         || unsafe { Tagged::<Value>::from_value_unchecked(v_raw) }
             .as_heap_object()
-            .is_some_and(|obj| obj.as_ref().header.map.get(heap).kind().is_constructor());
+            .is_some_and(|obj| obj.as_ref().map(heap).kind().is_constructor());
     if !ok {
         return raise_runtime(vm, heap, state, VmError::Type);
     }
@@ -1810,8 +1808,8 @@ fn throw_if_not_object_or_null<'a>(
     let raw = v.raw();
     let null = heap.known().null.as_tagged(heap).raw();
     // Safety: rooted-slot word, fresh at both uses below.
-    let ok = raw == null
-        || !Convert::is_primitive(heap, unsafe { Tagged::<Value>::from_value_unchecked(raw) });
+    let ok =
+        raw == null || unsafe { Tagged::<Value>::from_value_unchecked(raw) }.is_primitive(heap);
     if !ok {
         return raise_runtime(vm, heap, state, VmError::Type);
     }
@@ -1930,7 +1928,7 @@ fn construct_super_construct<'a>(
         {
             return result.as_tagged(heap);
         }
-        if Convert::is_primitive(heap, result.as_tagged(heap)) {
+        if result.as_tagged(heap).is_primitive(heap) {
             if allocated {
                 receiver.as_tagged(heap)
             } else {
@@ -2024,7 +2022,7 @@ fn construct_super_via<'a>(
             let Some(obj) = closure.as_tagged(heap).as_heap_object() else {
                 return raise_runtime(vm, heap, state, VmError::Type);
             };
-            let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
+            let proto = obj.as_ref().prototype(heap);
             let Some(proto_obj) = proto.as_heap_object() else {
                 return raise_runtime(vm, heap, state, VmError::Type);
             };
@@ -2226,12 +2224,12 @@ fn super_get_property<'a>(
         // root the name: the tagged result anchors the `&mut` borrow
         let key = scope.handle(key);
         let outcome = {
-            let proto = Lookup::home_proto(heap, home.as_tagged(heap));
+            let proto = home.as_tagged(heap).home_proto(heap);
             let name = match rt_try!(
                 vm,
                 heap,
                 state,
-                Lookup::classify_key(heap, key.as_tagged(heap).erase())
+                key.as_tagged(heap).erase().classify_key(heap)
             ) {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,
@@ -2253,7 +2251,7 @@ fn super_get_property<'a>(
         let skip = {
             let getter_tagged = getter.as_tagged(heap);
             getter_tagged.ptr_eq(heap.known().undefined.as_tagged(heap).erase())
-                || !Object::is_callable(heap, getter_tagged)
+                || !getter_tagged.is_callable(heap)
         };
         if skip {
             return heap.known().undefined.as_tagged(heap).erase();
@@ -2311,12 +2309,12 @@ fn super_set_property<'a>(
             StoreSemantics::Shadow
         };
         let outcome = {
-            let proto = Lookup::home_proto(heap, home.as_tagged(heap));
+            let proto = home.as_tagged(heap).home_proto(heap);
             let name = match rt_try!(
                 vm,
                 heap,
                 state,
-                Lookup::classify_key(heap, key.as_tagged(heap).erase())
+                key.as_tagged(heap).erase().classify_key(heap)
             ) {
                 Key::Element(i) => Tagged::from(Smi::new(i as i64)),
                 Key::Name(name) => name,

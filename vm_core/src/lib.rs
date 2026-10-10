@@ -236,7 +236,7 @@ impl ThreadState {
                     let fn_map = t.get(heap, base + 1);
                     let proto = t.get(heap, base + 2);
                     let offset = Smi::decode(t.get(heap, base + 3).raw())?.value() as usize;
-                    let map_now = closure.as_ref().header.map.get(heap);
+                    let map_now = closure.as_ref().map(heap);
                     if fn_map.raw() != map_now.raw() {
                         return None;
                     }
@@ -299,7 +299,7 @@ impl ThreadState {
                 unsafe { Tagged::from_value_unchecked(self.construct_cache.get(heap).raw()) };
             let t = table.as_ref();
             let mask = t.len() / 5 - 1;
-            let fn_map = closure.as_tagged(heap).as_ref().header.map.get(heap);
+            let fn_map = closure.as_tagged(heap).map(heap);
             let mut i = ((closure.as_tagged(heap).raw().to_bits() >> 5) as usize) & mask;
             for _ in 0..=mask {
                 let base = i * 5;

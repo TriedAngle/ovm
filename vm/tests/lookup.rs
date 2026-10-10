@@ -1,7 +1,7 @@
 use mark_sweep::{MarkSweep, MarkSweepConfig};
 use vm::{
-    FixedArray, HandleSlice, Heap, LoadOutcome, Lookup, Object, PropertyDescriptor, SlotName, Smi,
-    Tagged, Thread, VM, Value,
+    FixedArray, HandleSlice, Heap, LoadOutcome, Object, PropertyDescriptor, SlotName, Smi, Tagged,
+    Thread, VM, Value,
 };
 
 fn smi(v: i64) -> Value {
@@ -107,7 +107,7 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     {
         let heap = &*thread.heap();
         assert!(matches!(
-            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
+            unsafe { anchored(heap, home) }.super_lookup(heap, x).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(7)
         ));
     };
@@ -117,7 +117,7 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     {
         let heap = &*thread.heap();
         assert!(matches!(
-            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, x).unwrap(),
+            unsafe { anchored(heap, home) }.super_lookup(heap, x).unwrap(),
             LoadOutcome::Value(v) if v.raw() == heap.known().undefined.as_tagged(heap).raw()
         ));
     };
@@ -132,11 +132,11 @@ fn super_lookup_dispatches_all_three_prototype_shapes() {
     {
         let heap = &*thread.heap();
         assert!(matches!(
-            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, a).unwrap(),
+            unsafe { anchored(heap, home) }.super_lookup(heap, a).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(1)
         ));
         assert!(matches!(
-            Lookup::super_lookup(heap, unsafe { anchored(heap, home) }, b).unwrap(),
+            unsafe { anchored(heap, home) }.super_lookup(heap, b).unwrap(),
             LoadOutcome::Value(v) if v.raw() == smi(3)
         ));
     };
@@ -156,24 +156,24 @@ fn lookup_in_parents_respects_priority_order() {
     {
         let heap = &*thread.heap();
         // "a" exists on both parents: the first in priority order wins
-        match Lookup::lookup_in_parents(heap, unsafe { anchored(heap, protos) }, a) {
+        match unsafe { anchored(heap, protos) }.lookup_in_parents(heap, a) {
             vm::Lookup::Data { slot, .. } => {
                 assert_eq!(slot.get(heap).raw(), smi(1));
             }
             _ => panic!("a must resolve through the first parent"),
         }
         // "b" only exists on the second parent
-        match Lookup::lookup_in_parents(heap, unsafe { anchored(heap, protos) }, b) {
+        match unsafe { anchored(heap, protos) }.lookup_in_parents(heap, b) {
             vm::Lookup::Data { slot, .. } => assert_eq!(slot.get(heap).raw(), smi(3)),
             _ => panic!("b must resolve through the second parent"),
         }
         assert!(matches!(
-            Lookup::lookup_in_parents(heap, unsafe { anchored(heap, protos) }, missing),
+            unsafe { anchored(heap, protos) }.lookup_in_parents(heap, missing),
             vm::Lookup::NotFound
         ));
         // null terminates the chain
         assert!(matches!(
-            Lookup::lookup_in_parents(heap, unsafe { anchored(heap, null) }, a),
+            unsafe { anchored(heap, null) }.lookup_in_parents(heap, a),
             vm::Lookup::NotFound
         ));
     };

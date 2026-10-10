@@ -51,7 +51,7 @@ pub fn number_value_of<'a>(
     // borrows the heap immutably, and a handle releases that borrow before
     // the `TypeError` path needs the heap mutably.
     nctx.handle_scope(|vm, heap, state, scope| {
-        let v = match Object::wrapper_value(heap, args.get(heap, 0), WrapperKind::Number) {
+        let v = match args.get(heap, 0).wrapper_value(heap, WrapperKind::Number) {
             Ok(v) => scope.handle(v),
             Err(err) => return raise_runtime(vm, heap, state, err),
         };
@@ -66,7 +66,7 @@ pub fn number_to_string<'a>(
 ) -> Tagged<'a, Value> {
     nctx.handle_scope(|vm, heap, state, scope| {
         // root the receiver: `Convert::to_string` allocates a fresh string
-        let v = match Object::wrapper_value(heap, args.get(heap, 0), WrapperKind::Number) {
+        let v = match args.get(heap, 0).wrapper_value(heap, WrapperKind::Number) {
             Ok(v) => scope.handle(v),
             Err(err) => return raise_runtime(vm, heap, state, err),
         };
@@ -80,8 +80,8 @@ pub fn number_to_string<'a>(
 
 /// The numeric `this` of a Number.prototype method (receiver or wrapper).
 fn number_receiver(heap: &Heap, args: Args) -> Result<f64, VmError> {
-    let v = Object::wrapper_value(heap, args.get(heap, 0), WrapperKind::Number)?;
-    Convert::to_number(heap, v)
+    let v = args.get(heap, 0).wrapper_value(heap, WrapperKind::Number)?;
+    v.to_number(heap)
 }
 
 /// `Number.prototype.toFixed(fractionDigits?)` (ES 21.1.3.3): fixed-point
@@ -96,7 +96,7 @@ pub fn number_to_fixed<'a>(
         let digits = match (args.len() > 1).then(|| args.get(heap, 1)) {
             Some(d) if d != heap.known().undefined.as_tagged(heap) => {
                 scope.handle(d);
-                rt_try!(vm, heap, state, Convert::to_number(heap, d)) as i64
+                rt_try!(vm, heap, state, d.to_number(heap)) as i64
             }
             _ => 0,
         };
@@ -135,7 +135,7 @@ pub fn number_to_precision<'a>(
             };
             return s.as_tagged(heap).erase();
         }
-        let p = rt_try!(vm, heap, state, Convert::to_number(heap, arg)) as i64;
+        let p = rt_try!(vm, heap, state, arg.to_number(heap)) as i64;
         if !(1..=100).contains(&p) {
             return raise_runtime(vm, heap, state, VmError::OutOfBounds);
         }

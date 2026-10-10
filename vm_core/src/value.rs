@@ -354,7 +354,7 @@ impl<'a> Tagged<'a, Value> {
         // strong-pointer witness; every heap object is header-prefixed,
         // so the map slot is readable under the anchor
         let obj = self.as_heap_object()?;
-        let kind = obj.as_ref().header.map.get(heap).as_ref().kind();
+        let kind = obj.map(heap).kind();
         // exact-kind fast path: one mask + compare, no decode match
         if kind.bits() & MapKind::KIND_MASK == T::KIND as u64 || T::matches_kind(kind.kind()) {
             // Safety: the map-kind check above is the type witness.

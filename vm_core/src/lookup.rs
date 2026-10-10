@@ -1,7 +1,7 @@
 use crate::proxy::Proxy;
 use crate::reanchor;
 use crate::{
-    AccessorPair, Coercion, Convert, DETAILS_ACCESSOR, DETAILS_CONFIGURABLE, DETAILS_ENUMERABLE,
+    AccessorPair, Coercion, DETAILS_ACCESSOR, DETAILS_CONFIGURABLE, DETAILS_ENUMERABLE,
     DETAILS_WRITABLE, DenseString, FixedArray, Float, GcSlot, Handle, HandleScope, Heap, HostCtx,
     Map, NumberDictionary, Object, PartialDescriptor, PropertyDescriptor, SlotFlags, SlotName, Smi,
     StringData, StringOwn, Symbol, Tagged, ThreadState, VM, Value, VmError,
@@ -35,9 +35,9 @@ pub enum LoadOutcome<'a> {
     Getter(Tagged<'a, Value>),
 }
 
-impl Lookup<'_> {
-    pub fn classify_key<'a>(heap: &'a Heap, key: Tagged<'a, Value>) -> Result<Key<'a>, VmError> {
-        if let Some(v) = key.to_i64() {
+impl<'a> Tagged<'a, Value> {
+    pub fn classify_key(self, heap: &'a Heap) -> Result<Key<'a>, VmError> {
+        if let Some(v) = self.to_i64() {
             if (0..u32::MAX as i64).contains(&v) {
                 return usize::try_from(v)
                     .map(Key::Element)
@@ -45,67 +45,49 @@ impl Lookup<'_> {
             }
             return Ok(Key::Name(Tagged::from(Smi::new(v))));
         }
-        if let Some(s) = key.get_as::<DenseString>(heap) {
-            if let Some(i) = Self::canonical_index(s.as_ref().data(heap))
+        if let Some(s) = self.get_as::<DenseString>(heap) {
+            if let Some(i) = s.as_ref().data(heap).canonical_index()
                 && i < u32::MAX as usize
             {
                 return Ok(Key::Element(i));
             }
             return Ok(Key::Name(s.into()));
         }
-        if let Some(s) = key.get_as::<Symbol>(heap) {
+        if let Some(s) = self.get_as::<Symbol>(heap) {
             return Ok(Key::Name(s.into()));
         }
         Err(VmError::Type)
     }
 
-    pub fn canonical_index(data: StringData<'_>) -> Option<usize> {
-        if data.is_empty() || data.len() > 10 {
-            return None;
-        }
-        if data.code_unit(0) == b'0' as u16 {
-            return (data.len() == 1).then_some(0);
-        }
-        let mut n: usize = 0;
-        for i in 0..data.len() {
-            let c = data.code_unit(i);
-            if !(b'0' as u16..=b'9' as u16).contains(&c) {
-                return None;
-            }
-            n = n.checked_mul(10)?.checked_add((c - b'0' as u16) as usize)?;
-        }
-        Some(n)
-    }
-
-    pub fn load_outcome_on<'a>(
+    pub fn load_outcome_on(
+        self,
         heap: &'a Heap,
-        holder: Tagged<'a, Value>,
         name: Tagged<'a, SlotName>,
     ) -> Result<LoadOutcome<'a>, VmError> {
         let known = heap.known();
-        if holder == known.null.as_tagged(heap) || holder == known.undefined.as_tagged(heap) {
+        if self == known.null.as_tagged(heap) || self == known.undefined.as_tagged(heap) {
             return Err(VmError::Type);
         }
-        if let Some(obj) = holder.as_heap_object()
+        if let Some(obj) = self.as_heap_object()
             && let Some(v) = obj.as_ref().array_length(heap, name)
         {
             return Ok(LoadOutcome::Value(v));
         }
-        if let Some(s) = DenseString::from_receiver(heap, holder)
+        if let Some(s) = DenseString::from_receiver(heap, self)
             && let Some(StringOwn::Length(len)) = s.as_ref().own_key(heap, name)
         {
             return Ok(LoadOutcome::Value(Smi::new(len as i64).into_tagged()));
         }
-        let holder = if holder.to_i64().is_some() || holder.get_as::<Float>(heap).is_some() {
+        let holder = if self.to_i64().is_some() || self.get_as::<Float>(heap).is_some() {
             known.number_prototype.as_tagged(heap).erase()
-        } else if holder.get_as::<DenseString>(heap).is_some() {
+        } else if self.get_as::<DenseString>(heap).is_some() {
             known.string_prototype.as_tagged(heap).erase()
-        } else if holder == known.true_object.as_tagged(heap)
-            || holder == known.false_object.as_tagged(heap)
+        } else if self == known.true_object.as_tagged(heap)
+            || self == known.false_object.as_tagged(heap)
         {
             known.boolean_prototype.as_tagged(heap).erase()
         } else {
-            holder
+            self
         };
         match holder.lookup(heap, name) {
             Lookup::Data { slot, .. } => Ok(LoadOutcome::Value(slot.get(heap))),
@@ -121,23 +103,23 @@ impl Lookup<'_> {
         }
     }
 
-    pub fn load_outcome<'a>(
+    pub fn load_outcome(
+        self,
         heap: &'a Heap,
-        receiver: Tagged<'a, Value>,
         name: Tagged<'a, SlotName>,
     ) -> Result<LoadOutcome<'a>, VmError> {
-        Self::load_outcome_on(heap, receiver, name)
+        self.load_outcome_on(heap, name)
     }
 
-    pub fn chain_holds_index_name(heap: &Heap, receiver: Tagged<'_, Value>, i: usize) -> bool {
-        Self::chain_holds_name(heap, receiver, ChainQuery::Index(i))
+    pub fn chain_holds_index_name(self, heap: &Heap, i: usize) -> bool {
+        self.chain_holds_name(heap, ChainQuery::Index(i))
     }
 
-    pub fn chain_holds_any_index_name(heap: &Heap, receiver: Tagged<'_, Value>) -> bool {
-        Self::chain_holds_name(heap, receiver, ChainQuery::AnyIndex)
+    pub fn chain_holds_any_index_name(self, heap: &Heap) -> bool {
+        self.chain_holds_name(heap, ChainQuery::AnyIndex)
     }
 
-    fn chain_holds_name(heap: &Heap, receiver: Tagged<'_, Value>, query: ChainQuery) -> bool {
+    fn chain_holds_name(self, heap: &Heap, query: ChainQuery) -> bool {
         let matches = |name: Tagged<'_, SlotName>| match query {
             ChainQuery::Index(i) => {
                 let smi_name: Tagged<'_, SlotName> = Tagged::from(Smi::new(i as i64));
@@ -145,9 +127,9 @@ impl Lookup<'_> {
             }
             ChainQuery::AnyIndex => name.to_i64().is_some(),
         };
-        let mut hop = receiver;
+        let mut hop = self;
         while let Some(obj) = hop.as_heap_object() {
-            let map = obj.as_ref().map_ref(heap);
+            let map = obj.as_ref().map(heap);
             let proto = map.as_ref().prototype.get(heap);
             if proto.get_as::<FixedArray>(heap).is_some() {
                 return true;
@@ -163,10 +145,10 @@ impl Lookup<'_> {
             let Some(next) = proto.get_as::<Object>(heap) else {
                 return false;
             };
-            if next.as_ref().map_ref(heap).as_ref().kind().is_proxy() {
+            if next.as_ref().map(heap).kind().is_proxy() {
                 return true;
             }
-            let next_map = next.as_ref().map_ref(heap);
+            let next_map = next.as_ref().map(heap);
             if next_map
                 .as_ref()
                 .descriptors()
@@ -206,34 +188,34 @@ impl Lookup<'_> {
         false
     }
 
-    pub fn load_outcome_keyed<'a>(
+    pub fn load_outcome_keyed(
+        self,
         heap: &'a Heap,
-        receiver: Tagged<'a, Value>,
         key: Tagged<'a, SlotName>,
     ) -> Result<LoadOutcome<'a>, VmError> {
-        match Lookup::classify_key(heap, key.erase())? {
+        match key.erase().classify_key(heap)? {
             Key::Element(i) => {
                 let smi_name: Tagged<'a, SlotName> = Tagged::from(Smi::new(i as i64));
-                if let Some(v) = receiver
+                if let Some(v) = self
                     .as_heap_object()
                     .and_then(|obj| obj.as_ref().element_value(heap, i))
                 {
                     return Ok(LoadOutcome::Value(v));
                 }
-                // accessor entries in a sparse receiver are own getters
-                if let Some(outcome) = receiver
+                // accessor entries in a sparse self are own getters
+                if let Some(outcome) = self
                     .as_heap_object()
                     .and_then(|obj| obj.as_ref().element_dictionary(heap))
                     .and_then(|dict| dictionary_accessor_outcome(heap, dict, i))
                 {
                     return Ok(outcome);
                 }
-                let mut hop = receiver;
+                let mut hop = self;
                 loop {
                     let Some(obj) = hop.as_heap_object() else {
                         break;
                     };
-                    let map = obj.as_ref().map_ref(heap);
+                    let map = obj.as_ref().map(heap);
                     let proto = map.as_ref().prototype.get(heap);
                     // Self-style multi-parent chains and exotic hops take
                     // the ordinary named walk
@@ -251,7 +233,7 @@ impl Lookup<'_> {
                     let Some(next) = proto.get_as::<Object>(heap) else {
                         break;
                     };
-                    if next.as_ref().map_ref(heap).as_ref().kind().is_proxy() {
+                    if next.as_ref().map(heap).kind().is_proxy() {
                         break;
                     }
                     if let Some(v) = next.as_ref().element_value(heap, i) {
@@ -264,31 +246,31 @@ impl Lookup<'_> {
                     {
                         return Ok(outcome);
                     }
-                    let next_map = next.as_ref().map_ref(heap);
+                    let next_map = next.as_ref().map(heap);
                     if next_map
                         .as_ref()
                         .descriptors()
                         .iter()
                         .any(|d| d.name(heap).ptr_eq(smi_name))
                     {
-                        return Lookup::load_outcome_on(heap, next.erase(), smi_name);
+                        return next.erase().load_outcome_on(heap, smi_name);
                     }
                     hop = next.erase();
                 }
-                Lookup::load_outcome(heap, receiver, smi_name)
+                self.load_outcome(heap, smi_name)
             }
-            Key::Name(name) => Lookup::load_outcome(heap, receiver, name),
+            Key::Name(name) => self.load_outcome(heap, name),
         }
     }
 
-    pub fn ordinary_own_descriptor<'a, 's>(
+    pub fn ordinary_own_descriptor<'s>(
+        self,
         heap: &'a Heap,
         scope: &'s HandleScope<'_>,
-        obj: Tagged<'a, Value>,
         key: Tagged<'a, Value>,
     ) -> Option<PropertyDescriptor<'s>> {
-        if let Ok(Key::Element(i)) = Lookup::classify_key(heap, key)
-            && let Some(o) = obj.as_heap_object()
+        if let Ok(Key::Element(i)) = key.classify_key(heap)
+            && let Some(o) = self.as_heap_object()
             && let Some(dict) = o.as_ref().element_dictionary(heap)
             && let Some(entry) = dict.as_ref().find(heap, i)
         {
@@ -312,8 +294,8 @@ impl Lookup<'_> {
                 configurable: details & DETAILS_CONFIGURABLE != 0,
             });
         }
-        if let Ok(Key::Element(i)) = Lookup::classify_key(heap, key)
-            && let Some(o) = obj.as_heap_object()
+        if let Ok(Key::Element(i)) = key.classify_key(heap)
+            && let Some(o) = self.as_heap_object()
             && let Some(v) = o.as_ref().element_value(heap, i)
         {
             return Some(PropertyDescriptor::Data {
@@ -324,7 +306,7 @@ impl Lookup<'_> {
             });
         }
         let name = key.as_name();
-        let o = obj.as_heap_object()?;
+        let o = self.as_heap_object()?;
         if let Some(v) = o.as_ref().array_length(heap, name) {
             return Some(PropertyDescriptor::Data {
                 value: scope.handle(v),
@@ -333,7 +315,7 @@ impl Lookup<'_> {
                 configurable: false,
             });
         }
-        let map = o.as_ref().map_ref(heap);
+        let map = o.as_ref().map(heap);
         for d in map.descriptors() {
             if !d.name(heap).ptr_eq(name) {
                 continue;
@@ -362,23 +344,19 @@ impl Lookup<'_> {
         None
     }
 
-    pub fn has_property<'a>(
-        heap: &'a Heap,
-        receiver: Tagged<'a, Value>,
-        name: Tagged<'a, SlotName>,
-    ) -> bool {
+    pub fn has_property(self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> bool {
         // String exotics own `length` and in-range indices
-        if let Some(s) = DenseString::from_receiver(heap, receiver)
+        if let Some(s) = DenseString::from_receiver(heap, self)
             && s.as_ref().own_key(heap, name).is_some()
         {
             return true;
         }
-        let name = match Lookup::classify_key(heap, name.erase()) {
+        let name = match name.erase().classify_key(heap) {
             Ok(Key::Element(i)) => {
                 // non-array receivers keep index keys as Smi-named
                 // descriptors; canonicalize so the named walk finds them
                 let smi_name: Tagged<'a, SlotName> = Tagged::from(Smi::new(i as i64));
-                if let Some(obj) = receiver.as_heap_object()
+                if let Some(obj) = self.as_heap_object()
                     && (obj.as_ref().element_value(heap, i).is_some()
                         || obj
                             .as_ref()
@@ -391,18 +369,14 @@ impl Lookup<'_> {
             }
             _ => name,
         };
-        !matches!(receiver.lookup(heap, name), Lookup::NotFound)
+        !matches!(self.lookup(heap, name), Lookup::NotFound)
     }
 
-    pub fn lookup_in_parents<'a>(
-        heap: &'a Heap,
-        proto: Tagged<'a, Value>,
-        name: Tagged<'a, SlotName>,
-    ) -> Lookup<'a> {
-        if proto == heap.known().null.as_tagged(heap) {
+    pub fn lookup_in_parents(self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
+        if self == heap.known().null.as_tagged(heap) {
             return Lookup::NotFound;
         }
-        if let Some(pairs) = proto.get_as::<FixedArray>(heap) {
+        if let Some(pairs) = self.get_as::<FixedArray>(heap) {
             // look *inside* the parents: the pair names are slots of the child
             let mut i = 1;
             while i < pairs.len() {
@@ -414,27 +388,29 @@ impl Lookup<'_> {
             }
             return Lookup::NotFound;
         }
-        proto.lookup(heap, name)
+        self.lookup(heap, name)
     }
 
     /// The home object's [[Prototype]] slot, raw (null / object / FixedArray
     /// of parents / unset). Extracted before ToPropertyKey so key coercion
     /// cannot observe a different chain than the lookup uses (ES 15.4.2:
     /// GetSuperBase happens first).
-    pub fn home_proto<'a>(heap: &'a Heap, value: Tagged<'a, Value>) -> Option<Tagged<'a, Value>> {
-        let obj = value.as_heap_object()?;
-        Some(obj.as_ref().header.map.get(heap).prototype.get(heap))
+    pub fn home_proto(self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
+        let obj = self.as_heap_object()?;
+        Some(obj.as_ref().prototype(heap))
     }
 
-    pub fn super_lookup<'a>(
+    pub fn super_lookup(
+        self,
         heap: &'a Heap,
-        value: Tagged<'a, Value>,
         name: Tagged<'a, SlotName>,
     ) -> Result<LoadOutcome<'a>, VmError> {
-        let proto = Self::home_proto(heap, value);
-        Self::super_lookup_from_proto(heap, proto, name)
+        let proto = self.home_proto(heap);
+        Lookup::super_lookup_from_proto(heap, proto, name)
     }
+}
 
+impl Lookup<'_> {
     /// Super lookup with a pre-resolved prototype link (ES 15.4.2): the
     /// prototype is read before the key is coerced, so user `toString` cannot
     /// change which chain is searched.
@@ -445,7 +421,7 @@ impl Lookup<'_> {
     ) -> Result<LoadOutcome<'a>, VmError> {
         match super_start_from_proto(heap, proto) {
             // single parent: full load semantics
-            SuperStart::Object(start) => Lookup::load_outcome(heap, start, name),
+            SuperStart::Object(start) => start.load_outcome(heap, name),
             SuperStart::Parents(parents) => {
                 let mut i = 1;
                 while i < parents.len() {
@@ -476,7 +452,31 @@ impl Lookup<'_> {
             )),
         }
     }
+}
 
+impl StringData<'_> {
+    /// Canonical array-index form: decimal digits, no leading zero, no
+    /// overflow past `u32::MAX`-worthy lengths.
+    pub fn canonical_index(&self) -> Option<usize> {
+        if self.is_empty() || self.len() > 10 {
+            return None;
+        }
+        if self.code_unit(0) == b'0' as u16 {
+            return (self.len() == 1).then_some(0);
+        }
+        let mut n: usize = 0;
+        for i in 0..self.len() {
+            let c = self.code_unit(i);
+            if !(b'0' as u16..=b'9' as u16).contains(&c) {
+                return None;
+            }
+            n = n.checked_mul(10)?.checked_add((c - b'0' as u16) as usize)?;
+        }
+        Some(n)
+    }
+}
+
+impl Lookup<'_> {
     /// Same, with the lookup start (`holder`) split from the getter
     /// receiver — the proxy forward shape: lookup on the target,
     /// `this` = the proxy.
@@ -494,11 +494,9 @@ impl Lookup<'_> {
         state.handle_scope(|scope| -> Result<Coercion<'a>, VmError> {
             let loaded = {
                 let heap_ref: &Heap = heap;
-                Self::load_outcome_on(
-                    heap_ref,
-                    holder.as_tagged(heap_ref),
-                    name.as_tagged(heap_ref).as_name(),
-                )?
+                holder
+                    .as_tagged(heap_ref)
+                    .load_outcome_on(heap_ref, name.as_tagged(heap_ref).as_name())?
             };
             match loaded {
                 LoadOutcome::Value(v) => {
@@ -532,7 +530,7 @@ impl Lookup<'_> {
         scope: &'s HandleScope<'_>,
         attrs: Handle<'_, Value>,
     ) -> Result<Option<PartialDescriptor<'s>>, VmError> {
-        let cond_4 = Convert::is_primitive(heap, attrs.as_tagged(heap));
+        let cond_4 = attrs.as_tagged(heap).is_primitive(heap);
         if cond_4 {
             return Err(VmError::Type);
         }
@@ -568,9 +566,9 @@ impl Lookup<'_> {
                 !reads[5].as_tagged(heap).ptr_eq(undef),
             ];
             let truthy = [
-                Convert::is_truthy(heap, reads[3].as_tagged(heap)),
-                Convert::is_truthy(heap, reads[4].as_tagged(heap)),
-                Convert::is_truthy(heap, reads[5].as_tagged(heap)),
+                reads[3].as_tagged(heap).is_truthy(heap),
+                reads[4].as_tagged(heap).is_truthy(heap),
+                reads[5].as_tagged(heap).is_truthy(heap),
             ];
             (present, truthy)
         };
@@ -581,7 +579,7 @@ impl Lookup<'_> {
         if get.is_some() || set.is_some() {
             for half in [get, set] {
                 if let Some(h) = half
-                    && !Object::is_callable(heap, h.as_tagged(heap))
+                    && !h.as_tagged(heap).is_callable(heap)
                 {
                     return Err(VmError::Type);
                 }
@@ -669,7 +667,7 @@ impl<'s, T> Handle<'s, T> {
 
 impl Map {
     pub fn lookup<'a>(
-        &'a self,
+        &self,
         heap: &'a Heap,
         receiver: Tagged<'a, Object>,
         name: Tagged<'a, SlotName>,
@@ -714,12 +712,12 @@ impl Map {
                 i += 2;
             }
         }
-        Lookup::lookup_in_parents(heap, proto, name)
+        proto.lookup_in_parents(heap, name)
     }
 }
 
 impl Object {
-    pub fn lookup<'a>(&'a self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
+    pub fn lookup<'a>(&self, heap: &'a Heap, name: Tagged<'a, SlotName>) -> Lookup<'a> {
         let receiver = Tagged::<Object>::anchored(heap, self);
         // accessor entries in a sparse receiver act like accessor
         // descriptors for the named walk
@@ -740,7 +738,7 @@ impl Object {
     /// The `AccessorPair` of a sparse accessor entry at `index`, when
     /// this object is a dictionary-mode array holding one.
     pub fn dictionary_accessor<'a>(
-        &'a self,
+        &self,
         heap: &'a Heap,
         index: Option<usize>,
     ) -> Option<Tagged<'a, AccessorPair>> {

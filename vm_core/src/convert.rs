@@ -20,71 +20,113 @@ pub enum Coercion<'a> {
 
 pub struct Convert;
 
-impl Convert {
+/// No-GC coercions: methods on the value itself. Functions that can
+/// allocate (and thus GC) stay in the `Convert` namespace above and
+/// take `heap` first.
+impl<'a> Tagged<'a, Value> {
     /// The numeric value of a value that already IS a number
     #[inline]
-    pub fn as_number(heap: &Heap, v: Tagged<'_, Value>) -> Option<f64> {
-        if let Some(i) = v.to_i64() {
+    pub fn as_number(self, heap: &Heap) -> Option<f64> {
+        if let Some(i) = self.to_i64() {
             return Some(i as f64);
         }
-        v.get_as::<Float>(heap).map(|f| f.value.get())
+        self.get_as::<Float>(heap).map(|f| f.value.get())
     }
 
     /// ES ToBoolean. Falsey: `false`, `undefined`, `null`, the hole, 0, -0, NaN,
     /// everything else is truthy.
     #[inline]
-    pub fn is_truthy(heap: &Heap, v: Tagged<'_, Value>) -> bool {
+    pub fn is_truthy(self, heap: &Heap) -> bool {
         let known = heap.known();
-        if let Some(i) = v.to_i64() {
+        if let Some(i) = self.to_i64() {
             return i != 0;
         }
-        if v == known.false_object.as_tagged(heap)
-            || v == known.undefined.as_tagged(heap)
-            || v == known.null.as_tagged(heap)
-            || v == known.the_hole.as_tagged(heap)
+        if self == known.false_object.as_tagged(heap)
+            || self == known.undefined.as_tagged(heap)
+            || self == known.null.as_tagged(heap)
+            || self == known.the_hole.as_tagged(heap)
         {
             return false;
         }
-        if v == known.true_object.as_tagged(heap) {
+        if self == known.true_object.as_tagged(heap) {
             return true;
         }
-        if let Some(f) = v.get_as::<Float>(heap) {
+        if let Some(f) = self.get_as::<Float>(heap) {
             let x = f.value.get();
             // -0.0 compares equal to 0.0; NaN compares unequal to everything
             return x != 0.0 && !x.is_nan();
         }
-        if let Some(s) = v.get_as::<DenseString>(heap) {
+        if let Some(s) = self.get_as::<DenseString>(heap) {
             return !s.is_empty();
         }
         true
     }
 
-    pub fn to_number(heap: &Heap, v: Tagged<'_, Value>) -> Result<f64, VmError> {
+    pub fn to_number(self, heap: &Heap) -> Result<f64, VmError> {
         let known = heap.known();
-        if let Some(i) = v.to_i64() {
+        if let Some(i) = self.to_i64() {
             return Ok(i as f64);
         }
-        if v == known.undefined.as_tagged(heap) || v == known.the_hole.as_tagged(heap) {
+        if self == known.undefined.as_tagged(heap) || self == known.the_hole.as_tagged(heap) {
             return Ok(f64::NAN);
         }
-        if v == known.null.as_tagged(heap) {
+        if self == known.null.as_tagged(heap) {
             return Ok(0.0);
         }
-        if v == known.false_object.as_tagged(heap) {
+        if self == known.false_object.as_tagged(heap) {
             return Ok(0.0);
         }
-        if v == known.true_object.as_tagged(heap) {
+        if self == known.true_object.as_tagged(heap) {
             return Ok(1.0);
         }
-        if let Some(f) = v.get_as::<Float>(heap) {
+        if let Some(f) = self.get_as::<Float>(heap) {
             return Ok(f.value.get());
         }
-        if let Some(s) = v.get_as::<DenseString>(heap) {
-            return Ok(Self::string_to_number(s.data(heap)).unwrap_or(f64::NAN));
+        if let Some(s) = self.get_as::<DenseString>(heap) {
+            return Ok(Convert::string_to_number(s.data(heap)).unwrap_or(f64::NAN));
         }
         Err(VmError::Type)
     }
 
+    /// ES Type check: numbers, strings, symbols, booleans, null, undefined
+    /// are primitives; everything else is an object.
+    #[inline]
+    pub fn is_primitive(self, heap: &Heap) -> bool {
+        let known = heap.known();
+        if self.is_smi() {
+            return true;
+        }
+        self == known.undefined.as_tagged(heap)
+            || self == known.null.as_tagged(heap)
+            || self == known.true_object.as_tagged(heap)
+            || self == known.false_object.as_tagged(heap)
+            || self.get_as::<Float>(heap).is_some()
+            || self.get_as::<DenseString>(heap).is_some()
+            || self.get_as::<Symbol>(heap).is_some()
+    }
+
+    /// ES 7.1.13 ToObject for the primitive kinds that expose a distinct
+    /// prototype: the prototype of a number/string/boolean primitive is the
+    /// matching builtin prototype (symbols have no exposed prototype in this
+    /// VM). `None` for objects and for the no-prototype primitives.
+    #[inline]
+    pub fn primitive_prototype(self, heap: &'a Heap) -> Option<Tagged<'a, Value>> {
+        let known = heap.known();
+        if self.is_smi() || self.get_as::<Float>(heap).is_some() {
+            Some(known.number_prototype.as_tagged(heap).erase())
+        } else if self.get_as::<DenseString>(heap).is_some() {
+            Some(known.string_prototype.as_tagged(heap).erase())
+        } else if self == known.true_object.as_tagged(heap)
+            || self == known.false_object.as_tagged(heap)
+        {
+            Some(known.boolean_prototype.as_tagged(heap).erase())
+        } else {
+            None
+        }
+    }
+}
+
+impl Convert {
     /// ES 7.1.6 ToInt32 applied to a number: truncate, reduce mod 2^32,
     /// map the upper half to negatives. NaN and ±∞ are +0.
     pub fn number_to_int32(n: f64) -> i32 {

@@ -55,11 +55,11 @@ pub fn add<'a>(ctx: &Ctx<'a>, lhs: Tagged<'_, Value>, rhs: Tagged<'_, Value>) ->
                 .as_tagged(heap)
                 .erase()
         } else {
-            let a = match Convert::to_number(heap, lhs.as_tagged(heap)) {
+            let a = match lhs.as_tagged(heap).to_number(heap) {
                 Ok(v) => v,
                 Err(e) => return ctx.raise_tag(e),
             };
-            let b = match Convert::to_number(heap, rhs.as_tagged(heap)) {
+            let b = match rhs.as_tagged(heap).to_number(heap) {
                 Ok(v) => v,
                 Err(e) => return ctx.raise_tag(e),
             };
@@ -243,7 +243,10 @@ pub fn named_load<'a>(
                 Err(e) => ctx.raise_tag(e),
             };
         }
-        let out = match Lookup::load_outcome(heap, recv.as_tagged(heap), name.as_tagged(heap)) {
+        let out = match recv
+            .as_tagged(heap)
+            .load_outcome(heap, name.as_tagged(heap))
+        {
             Ok(LoadOutcome::Value(v)) => {
                 let v = scope.handle(v);
                 InlineCache::update_load(
@@ -301,7 +304,7 @@ pub fn keyed_load<'a>(
                 Err(e) => ctx.raise_tag(e),
             };
         }
-        let element_index = match Lookup::classify_key(heap, key.as_tagged(heap).erase()) {
+        let element_index = match key.as_tagged(heap).erase().classify_key(heap) {
             Ok(Key::Element(i)) => Some(i),
             _ => None,
         };
@@ -320,7 +323,9 @@ pub fn keyed_load<'a>(
                 return scope.handle(unit).as_tagged(heap).erase();
             }
         }
-        let out = match Lookup::load_outcome_keyed(heap, recv.as_tagged(heap), key.as_tagged(heap))
+        let out = match recv
+            .as_tagged(heap)
+            .load_outcome_keyed(heap, key.as_tagged(heap))
         {
             Ok(LoadOutcome::Value(v)) => scope.handle(v),
             Ok(LoadOutcome::Getter(getter)) => {
@@ -373,7 +378,9 @@ pub fn keyed_load_imm<'a>(
                 Err(e) => ctx.raise_tag(e),
             };
         }
-        let out = match Lookup::load_outcome_keyed(heap, recv.as_tagged(heap), key.as_tagged(heap))
+        let out = match recv
+            .as_tagged(heap)
+            .load_outcome_keyed(heap, key.as_tagged(heap))
         {
             Ok(LoadOutcome::Value(v)) => scope.handle(v),
             Ok(LoadOutcome::Getter(getter)) => {
@@ -417,59 +424,81 @@ pub fn keyed_store<'a>(
             Ok(None) => return ctx.exception_word(),
             Err(e) => return ctx.raise_tag(e),
         };
-        let name: Handle<'_, SlotName> =
-            match Lookup::classify_key(heap, key.as_tagged(heap).erase()) {
-                Ok(Key::Element(i)) => {
-                    // sparse arrays: the stored entry's details dispatch
-                    // (accessors call setters, read-only data ignores)
-                    let dict_mode = recv
-                        .as_tagged(heap)
-                        .as_heap_object()
-                        .is_some_and(|h| h.as_ref().element_dictionary(heap).is_some());
-                    let dict_fallthrough: Option<Handle<'_, SlotName>> = if dict_mode {
-                        let entry_class = {
+        let name: Handle<'_, SlotName> = match key.as_tagged(heap).erase().classify_key(heap) {
+            Ok(Key::Element(i)) => {
+                // sparse arrays: the stored entry's details dispatch
+                // (accessors call setters, read-only data ignores)
+                let dict_mode = recv
+                    .as_tagged(heap)
+                    .as_heap_object()
+                    .is_some_and(|h| h.as_ref().element_dictionary(heap).is_some());
+                let dict_fallthrough: Option<Handle<'_, SlotName>> = if dict_mode {
+                    let entry_class = {
+                        let heap_ref: &Heap = heap;
+                        recv.as_tagged(heap_ref)
+                            .as_heap_object()
+                            .and_then(|h| h.as_ref().element_dictionary(heap_ref))
+                            .map(|d| d.as_ref().classify(heap_ref, i))
+                    };
+                    match entry_class {
+                        Some(EntryClass::Accessor) => {
                             let heap_ref: &Heap = heap;
-                            recv.as_tagged(heap_ref)
+                            let pair = recv
+                                .as_tagged(heap_ref)
                                 .as_heap_object()
                                 .and_then(|h| h.as_ref().element_dictionary(heap_ref))
-                                .map(|d| d.as_ref().classify(heap_ref, i))
-                        };
-                        match entry_class {
-                            Some(EntryClass::Accessor) => {
-                                let heap_ref: &Heap = heap;
-                                let pair = recv
-                                    .as_tagged(heap_ref)
-                                    .as_heap_object()
-                                    .and_then(|h| h.as_ref().element_dictionary(heap_ref))
-                                    .and_then(|d| {
-                                        d.as_ref()
-                                            .find(heap_ref, i)
-                                            .map(|e| d.as_ref().value_at(heap_ref, e))
-                                    })
-                                    .and_then(|v| v.get_as::<AccessorPair>(heap_ref));
-                                let Some(pair) = pair else {
-                                    return ctx.exception_word();
-                                };
-                                let setter = pair.as_ref().set.get(heap);
-                                if setter == heap.known().undefined.as_tagged(heap) {
-                                    return value.as_tagged(heap).erase();
-                                }
-                                let setter = scope.handle(setter);
-                                return match apply_store_outcome(
-                                    ctx,
-                                    recv,
-                                    StoreOutcome::CallSetter { setter },
-                                    value,
-                                ) {
-                                    Ok(()) => value.as_tagged(heap).erase(),
-                                    Err(()) => ctx.exception_word(),
-                                };
-                            }
-                            Some(EntryClass::ReadOnly) => {
-                                // sloppy-mode assignment silently ignores
+                                .and_then(|d| {
+                                    d.as_ref()
+                                        .find(heap_ref, i)
+                                        .map(|e| d.as_ref().value_at(heap_ref, e))
+                                })
+                                .and_then(|v| v.get_as::<AccessorPair>(heap_ref));
+                            let Some(pair) = pair else {
+                                return ctx.exception_word();
+                            };
+                            let setter = pair.as_ref().set.get(heap);
+                            if setter == heap.known().undefined.as_tagged(heap) {
                                 return value.as_tagged(heap).erase();
                             }
-                            Some(EntryClass::Data) => {
+                            let setter = scope.handle(setter);
+                            return match apply_store_outcome(
+                                ctx,
+                                recv,
+                                StoreOutcome::CallSetter { setter },
+                                value,
+                            ) {
+                                Ok(()) => value.as_tagged(heap).erase(),
+                                Err(()) => ctx.exception_word(),
+                            };
+                        }
+                        Some(EntryClass::ReadOnly) => {
+                            // sloppy-mode assignment silently ignores
+                            return value.as_tagged(heap).erase();
+                        }
+                        Some(EntryClass::Data) => {
+                            let obj = scope
+                                .cast::<Object>(heap, recv.as_tagged(heap))
+                                .expect("array receiver is an object");
+                            if let Err(e) =
+                                Object::store_array_element(heap, &scope, &obj, i, &value)
+                            {
+                                return ctx.raise_tag(e);
+                            }
+                            return value.as_tagged(heap).erase();
+                        }
+                        _ => {
+                            // absent: creating a property consults the
+                            // chain (prototype setters); clean chains
+                            // store directly, dirty ones take the
+                            // ordinary named path below
+                            let map = {
+                                let heap_ref: &Heap = heap;
+                                let Some(h) = recv.as_tagged(heap_ref).as_heap_object() else {
+                                    unreachable!("classified above");
+                                };
+                                scope.handle(h.map(heap_ref))
+                            };
+                            if Prototype::indexed_store_chain_ok(heap, &scope, &recv, &map, i) {
                                 let obj = scope
                                     .cast::<Object>(heap, recv.as_tagged(heap))
                                     .expect("array receiver is an object");
@@ -480,94 +509,67 @@ pub fn keyed_store<'a>(
                                 }
                                 return value.as_tagged(heap).erase();
                             }
-                            _ => {
-                                // absent: creating a property consults the
-                                // chain (prototype setters); clean chains
-                                // store directly, dirty ones take the
-                                // ordinary named path below
-                                let map = {
-                                    let heap_ref: &Heap = heap;
-                                    let Some(h) = recv.as_tagged(heap_ref).as_heap_object() else {
-                                        unreachable!("classified above");
-                                    };
-                                    scope.handle(h.map_ref(heap_ref))
-                                };
-                                if Prototype::indexed_store_chain_ok(heap, &scope, &recv, &map, i) {
-                                    let obj = scope
-                                        .cast::<Object>(heap, recv.as_tagged(heap))
-                                        .expect("array receiver is an object");
-                                    if let Err(e) =
-                                        Object::store_array_element(heap, &scope, &obj, i, &value)
-                                    {
-                                        return ctx.raise_tag(e);
-                                    }
-                                    return value.as_tagged(heap).erase();
-                                }
-                                Some(scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64))))
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if let Some(dict_name) = dict_fallthrough {
-                        dict_name
-                    } else {
-                        let mut direct = false;
-                        if let Some(hobj) = recv.as_tagged(heap).as_heap_object()
-                            && hobj.as_ref().is_array(heap)
-                        {
-                            let map = hobj.as_ref().map_ref(heap);
-                            if map
-                                .as_ref()
-                                .published_validity_cell(heap)
-                                .is_some_and(|cell| cell.as_ref().is_valid(heap))
-                            {
-                                direct = true;
-                            } else {
-                                let map = scope.handle(map);
-                                direct =
-                                    Prototype::indexed_store_chain_ok(heap, &scope, &recv, &map, i)
-                                        || {
-                                            // uncacheably dirty chains still store
-                                            // directly when THIS index is unintercepted
-                                            let heap_ref: &Heap = heap;
-                                            !Lookup::chain_holds_index_name(
-                                                heap_ref,
-                                                recv.as_tagged(heap_ref),
-                                                i,
-                                            )
-                                        };
-                            }
-                        }
-                        if !direct {
-                            scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
-                        } else {
-                            let obj = scope
-                                .cast::<Object>(heap, recv.as_tagged(heap))
-                                .expect("array receiver is an object");
-                            let grew = i >= obj.as_tagged(heap).as_ref().length();
-                            if let Err(e) =
-                                Object::store_array_element(heap, &scope, &obj, i, &value)
-                            {
-                                return ctx.raise_tag(e);
-                            }
-                            if let Some(fb) = fb_slot {
-                                InlineCache::update_store_element(
-                                    heap,
-                                    &scope,
-                                    ctx.feedback_ref(heap).map(|v| scope.handle(v)),
-                                    fb,
-                                    Some(recv),
-                                    grew,
-                                );
-                            }
-                            return value.as_tagged(heap).erase();
+                            Some(scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64))))
                         }
                     }
+                } else {
+                    None
+                };
+                if let Some(dict_name) = dict_fallthrough {
+                    dict_name
+                } else {
+                    let mut direct = false;
+                    if let Some(hobj) = recv.as_tagged(heap).as_heap_object()
+                        && hobj.as_ref().is_array(heap)
+                    {
+                        let map = hobj.as_ref().map(heap);
+                        if map
+                            .as_ref()
+                            .published_validity_cell(heap)
+                            .is_some_and(|cell| cell.as_ref().is_valid(heap))
+                        {
+                            direct = true;
+                        } else {
+                            let map = scope.handle(map);
+                            direct =
+                                Prototype::indexed_store_chain_ok(heap, &scope, &recv, &map, i)
+                                    || {
+                                        // uncacheably dirty chains still store
+                                        // directly when THIS index is unintercepted
+                                        let heap_ref: &Heap = heap;
+                                        !recv
+                                            .as_tagged(heap_ref)
+                                            .chain_holds_index_name(heap_ref, i)
+                                    };
+                        }
+                    }
+                    if !direct {
+                        scope.handle(Tagged::<SlotName>::from(Smi::new(i as i64)))
+                    } else {
+                        let obj = scope
+                            .cast::<Object>(heap, recv.as_tagged(heap))
+                            .expect("array receiver is an object");
+                        let grew = i >= obj.as_tagged(heap).length();
+                        if let Err(e) = Object::store_array_element(heap, &scope, &obj, i, &value) {
+                            return ctx.raise_tag(e);
+                        }
+                        if let Some(fb) = fb_slot {
+                            InlineCache::update_store_element(
+                                heap,
+                                &scope,
+                                ctx.feedback_ref(heap).map(|v| scope.handle(v)),
+                                fb,
+                                Some(recv),
+                                grew,
+                            );
+                        }
+                        return value.as_tagged(heap).erase();
+                    }
                 }
-                Ok(Key::Name(key)) => scope.handle(key),
-                Err(e) => return ctx.raise_tag(e),
-            };
+            }
+            Ok(Key::Name(key)) => scope.handle(key),
+            Err(e) => return ctx.raise_tag(e),
+        };
         let outcome = match recv.as_tagged(heap).erase().store_lookup(
             heap,
             &scope,
@@ -783,7 +785,7 @@ fn store_named_tail_scoped<'a>(
     let prev = recv
         .as_tagged(heap)
         .as_heap_object()
-        .map(|o| scope.handle(o.as_ref().map_ref(heap)));
+        .map(|o| scope.handle(o.as_ref().map(heap)));
     let outcome = match recv.as_tagged(heap).erase().store_lookup(
         heap,
         &scope,
@@ -885,7 +887,7 @@ pub fn construct<'a>(
         let Some(obj) = callee.as_tagged(heap).as_heap_object() else {
             return ctx.raise_tag(VmError::Type);
         };
-        if !obj.as_ref().header.map.get(heap).kind().is_constructor() {
+        if !obj.as_ref().map(heap).kind().is_constructor() {
             return ctx.raise_tag(VmError::Type);
         }
         let args = ctx.stack().args(ctx.frame_base(), args_base, count);
@@ -940,7 +942,7 @@ pub fn construct<'a>(
         if result.as_tagged(heap) == ctx.exception_word() {
             return ctx.exception_word();
         }
-        if Convert::is_primitive(heap, result.as_tagged(heap)) {
+        if result.as_tagged(heap).is_primitive(heap) {
             if derived {
                 // a derived constructor returned a primitive (ES 9.2.2.1)
                 return ctx.raise_tag(VmError::Type);

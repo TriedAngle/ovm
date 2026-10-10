@@ -1,8 +1,8 @@
 use core::{alloc::Layout, cell::UnsafeCell, cmp::Ordering};
 
 use crate::{
-    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, Key, Lookup, Map,
-    MapKind, ObjectKind, PropertyDescriptor, SlotName, Smi, Tagged, Value, Visitor,
+    EdgeVisitable, GcSlot, Handle, HandleScope, Header, Heap, HeapObject, Key, Map, MapKind,
+    ObjectKind, PropertyDescriptor, SlotName, Smi, Tagged, Value, Visitor,
 };
 
 /// A String exotic own key (ES 10.4.3.4 StringGetOwnProperty): `length` or
@@ -164,7 +164,7 @@ impl DenseString {
         receiver: Tagged<'a, Value>,
     ) -> Option<Tagged<'a, DenseString>> {
         let obj = receiver.as_heap_object()?;
-        let kind = obj.as_ref().header.map.get(heap).kind();
+        let kind = obj.as_ref().map(heap).kind();
         if kind.contains(MapKind::PRIMITIVE_WRAPPER) {
             return obj
                 .as_ref()
@@ -191,7 +191,7 @@ impl DenseString {
         {
             return Some(StringOwn::Length(self.len()));
         }
-        match Lookup::classify_key(heap, name.erase()) {
+        match name.erase().classify_key(heap) {
             Ok(Key::Element(i)) if i < self.len() => Some(StringOwn::Index(i)),
             _ => None,
         }
@@ -236,7 +236,7 @@ impl DenseString {
         receiver: Handle<'_, Value>,
         key: Handle<'_, SlotName>,
     ) -> Option<Tagged<'a, Value>> {
-        let Ok(Key::Element(i)) = Lookup::classify_key(heap, key.as_tagged(heap).erase()) else {
+        let Ok(Key::Element(i)) = key.as_tagged(heap).erase().classify_key(heap) else {
             return None;
         };
         let s = Self::from_receiver(heap, receiver.as_tagged(heap))?;

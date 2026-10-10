@@ -50,13 +50,9 @@ pub fn string_value_of<'a>(
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
-    match Object::wrapper_value(
-        heap,
-        // Safety: fresh rooted-slot word, no allocation since the read.
-        unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
-        WrapperKind::String,
-    )
-    .map(|v| v.raw())
+    match unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) }
+        .wrapper_value(heap, WrapperKind::String)
+        .map(|v| v.raw())
     {
         Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
         Err(err) => return raise_runtime(vm, heap, state, err),
@@ -72,13 +68,9 @@ pub fn string_to_string<'a>(
         vm, heap, state, ..
     } = nctx;
     let arg = args.get(heap, 0);
-    match Object::wrapper_value(
-        heap,
-        // Safety: fresh rooted-slot word, no allocation since the read.
-        unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) },
-        WrapperKind::String,
-    )
-    .map(|v| v.raw())
+    match unsafe { Tagged::<Value>::from_value_unchecked(arg.raw()) }
+        .wrapper_value(heap, WrapperKind::String)
+        .map(|v| v.raw())
     {
         Ok(v) => unsafe { Tagged::<Value>::from_value_unchecked(v) },
         Err(err) => return raise_runtime(vm, heap, state, err),

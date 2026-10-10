@@ -272,10 +272,10 @@ impl NumberDictionary {
         scope: &'s HandleScope<'_>,
         dict: &Handle<'s, NumberDictionary>,
     ) -> Handle<'s, NumberDictionary> {
-        if dict.as_tagged(heap).as_ref().has_sufficient_capacity(1) {
+        if dict.as_tagged(heap).has_sufficient_capacity(1) {
             return *dict;
         }
-        let nof = dict.as_tagged(heap).as_ref().nof();
+        let nof = dict.as_tagged(heap).nof();
         let fresh = NumberDictionary::new(heap, scope, nof + 1);
         dict.as_tagged(heap)
             .as_ref()
@@ -318,7 +318,7 @@ impl NumberDictionary {
                 t.nod.set(heap, host, Smi::new((t.nod() - 1) as i64));
             }
         }
-        table.as_tagged(heap).as_ref().note_index(heap, index);
+        table.as_tagged(heap).note_index(heap, index);
         table
     }
 
@@ -349,7 +349,7 @@ impl NumberDictionary {
     /// Iterate live entries in slot order (NOT index order — callers
     /// that need ascending indices must sort).
     pub fn for_each_entry<'a>(
-        &'a self,
+        &self,
         heap: &'a Heap,
         mut f: impl FnMut(usize, Tagged<'a, Value>, i64),
     ) {

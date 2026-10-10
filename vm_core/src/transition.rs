@@ -171,7 +171,7 @@ impl<'a> Tagged<'a, Value> {
         );
         if !self
             .as_heap_object()
-            .is_some_and(|obj| Object::matches_kind(obj.map_ref(heap).kind().kind()))
+            .is_some_and(|obj| Object::matches_kind(obj.map(heap).kind().kind()))
         {
             return Ok(true);
         }
@@ -467,7 +467,7 @@ impl Transition {
         // absorb the write in place.
         let (offset, parent_count, old_len) = {
             let receiver_ref = receiver.as_tagged(heap);
-            let parent = receiver_ref.map_ref(heap);
+            let parent = receiver_ref.map(heap);
             let target = parent
                 .find_transition(heap, name.as_tagged(heap), flags, None)
                 .expect("transition recorded above");
@@ -480,21 +480,21 @@ impl Transition {
             (
                 target.as_ref().descriptor(index).offset(),
                 parent.value_slot_count(),
-                receiver_ref.slots.get(heap).as_slice().len(),
+                receiver_ref.slots(heap).as_slice().len(),
             )
         };
 
         if offset < old_len {
             let receiver_ref = receiver.as_tagged(heap);
             let target = receiver_ref
-                .map_ref(heap)
+                .map(heap)
                 .find_transition(heap, name.as_tagged(heap), flags, None)
                 .expect("transition recorded above");
             let host = receiver_ref.erase();
             receiver_ref
                 .slot(heap, offset)
                 .set(heap, host, value.as_tagged(heap));
-            Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
+            Prototype::shape_changed(heap, receiver_ref.map(heap));
             receiver_ref.header.map.set(heap, host, target);
             return;
         }
@@ -507,11 +507,11 @@ impl Transition {
         let slots = heap.allocate_hole_array(capacity).as_handle(scope);
         let receiver_ref = receiver.as_tagged(heap);
         let target = receiver_ref
-            .map_ref(heap)
+            .map(heap)
             .find_transition(heap, name.as_tagged(heap), flags, None)
             .expect("transition recorded above");
         {
-            let old = receiver_ref.slots.get(heap);
+            let old = receiver_ref.slots(heap);
             let new = slots.as_tagged(heap);
             for k in 0..old_len {
                 new.as_ref().set(heap, k, old.at(heap, k));
@@ -520,7 +520,7 @@ impl Transition {
         }
         let host = receiver_ref.erase();
         receiver_ref.slots.set(heap, host, slots.as_tagged(heap));
-        Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
+        Prototype::shape_changed(heap, receiver_ref.map(heap));
         receiver_ref.header.map.set(heap, host, target);
     }
 
@@ -534,10 +534,10 @@ impl Transition {
         let receiver_ref = receiver.as_tagged(heap);
         let pair_values = pair.map(|(get, set)| (get.as_tagged(heap), set.as_tagged(heap)));
         let target = receiver_ref
-            .map_ref(heap)
+            .map(heap)
             .find_transition(heap, name.as_tagged(heap), flags, pair_values)
             .expect("transition recorded above");
-        Prototype::shape_changed(heap, receiver_ref.map_ref(heap));
+        Prototype::shape_changed(heap, receiver_ref.map(heap));
         receiver_ref
             .header
             .map
@@ -550,7 +550,7 @@ impl Transition {
         index: usize,
         value: Handle<'_, Value>,
     ) {
-        let offset = receiver.as_tagged(heap).map_ref(heap).descriptors()[index].offset();
+        let offset = receiver.as_tagged(heap).map(heap).descriptors()[index].offset();
         receiver.as_tagged(heap).slot(heap, offset).set(
             heap,
             receiver.as_tagged(heap).erase(),
@@ -567,7 +567,7 @@ impl Transition {
         let (kind, prototype, surviving, values) = {
             let name_word = name.as_tagged(heap);
             let obj = receiver.as_tagged(heap);
-            let parent = obj.map_ref(heap);
+            let parent = obj.map(heap);
             let descriptors = parent.descriptors();
             let index = descriptors
                 .iter()
@@ -586,7 +586,7 @@ impl Transition {
             // closures: a Tagged cannot escape this non-allocating region
             let mut surviving: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> =
                 Vec::with_capacity(descriptors.len() - 1);
-            let mut values: Vec<Handle<'_, Value>> = obj.slots.get(heap).as_slice()[..base]
+            let mut values: Vec<Handle<'_, Value>> = obj.slots(heap).as_slice()[..base]
                 .iter()
                 .map(|slot| scope.handle(slot.get(heap)))
                 .collect();
@@ -628,7 +628,7 @@ impl Transition {
             // lost publication race)
             let existing = receiver
                 .as_tagged(heap)
-                .map_ref(heap)
+                .map(heap)
                 .find_remove_transition(heap, name.as_tagged(heap))
                 .map(|m| m.as_handle(scope));
             if let Some(existing) = existing {
@@ -645,7 +645,7 @@ impl Transition {
                         let slots = token.allocate::<FixedArray>(values);
                         let host = receiver.as_tagged(heap).erase();
                         obj.slots.set(heap, host, slots);
-                        Prototype::shape_changed(heap, obj.map_ref(heap));
+                        Prototype::shape_changed(heap, obj.map(heap));
                         obj.header.map.set(heap, host, existing.as_tagged(heap));
                     },
                 );
@@ -654,7 +654,7 @@ impl Transition {
 
             let pairs_len = receiver
                 .as_tagged(heap)
-                .map_ref(heap)
+                .map(heap)
                 .transitions
                 .load(heap)
                 .map_or(0, |a| a.len());
@@ -670,7 +670,7 @@ impl Transition {
             };
             let published = heap.allocate_token_enter_heap(total, |token, heap| {
                 let obj = receiver.as_tagged(heap);
-                let parent = obj.map_ref(heap);
+                let parent = obj.map(heap);
                 // re-derive the publication after the reservation; see
                 // Transition::target for the same-length invariant
                 let word = parent.transitions.load_word(heap);
@@ -706,7 +706,7 @@ impl Transition {
                     Ok(()) => {
                         let host = receiver.as_tagged(heap).erase();
                         obj.slots.set(heap, host, slots);
-                        Prototype::shape_changed(heap, obj.map_ref(heap));
+                        Prototype::shape_changed(heap, obj.map(heap));
                         obj.header.map.set(heap, host, child);
                         Some(())
                     }
@@ -734,16 +734,15 @@ impl Transition {
             PropertyDescriptor::Data { value, .. } => {
                 let grow = match change {
                     Change::Append => true,
-                    Change::Replace { index } => {
-                        receiver.as_tagged(heap).map_ref(heap).descriptors()[index]
-                            .flags()
-                            .is_accessor()
-                    }
+                    Change::Replace { index } => receiver.as_tagged(heap).map(heap).descriptors()
+                        [index]
+                        .flags()
+                        .is_accessor(),
                 };
                 Self::target(
                     heap,
                     scope,
-                    |heap| receiver.as_tagged(heap).map_ref(heap),
+                    |heap| receiver.as_tagged(heap).map(heap),
                     name,
                     flags,
                     None,
@@ -763,7 +762,7 @@ impl Transition {
                 Self::target(
                     heap,
                     scope,
-                    |heap| receiver.as_tagged(heap).map_ref(heap),
+                    |heap| receiver.as_tagged(heap).map(heap),
                     name,
                     flags,
                     Some((get, set)),
@@ -792,7 +791,7 @@ impl Transition {
             // non-object home: no parent chain, define on the receiver
             return super_store_on_receiver(heap, scope, recv, name, value);
         };
-        match Lookup::lookup_in_parents(heap, proto, name) {
+        match proto.lookup_in_parents(heap, name) {
             Lookup::Data {
                 slot,
                 holder,
@@ -994,7 +993,7 @@ impl Object {
         debug_assert!(
             !receiver
                 .as_tagged(heap)
-                .map_ref(heap)
+                .map(heap)
                 .descriptors()
                 .iter()
                 .any(|d| d.name(heap).ptr_eq(name.as_tagged(heap))),
@@ -1005,9 +1004,7 @@ impl Object {
             return Ok(false);
         }
         // an integer-named own property can shadow an element hole
-        if name.as_tagged(heap).to_i64().is_some()
-            && receiver.as_tagged(heap).as_ref().is_array(heap)
-        {
+        if name.as_tagged(heap).to_i64().is_some() && receiver.as_tagged(heap).is_array(heap) {
             Object::promote_holey(heap, scope, &receiver);
         }
         Transition::define(heap, scope, receiver, name, desc, Change::Append);
@@ -1026,7 +1023,7 @@ impl Object {
         }
         let mut pairs: Vec<Handle<'_, Value>> = Vec::new();
         {
-            let base = receiver.as_tagged(heap).map_ref(heap).prototype.get(heap);
+            let base = receiver.as_tagged(heap).prototype(heap);
             if let Some(existing) = base.get_as::<FixedArray>(heap) {
                 for i in 0..existing.len() {
                     pairs.push(scope.handle(existing.at(heap, i)));
@@ -1049,7 +1046,7 @@ impl Object {
     ) -> Result<bool, VmError> {
         let current = receiver
             .as_tagged(heap)
-            .map_ref(heap)
+            .map(heap)
             .descriptors()
             .iter()
             .enumerate()
@@ -1071,9 +1068,7 @@ impl Object {
             return Ok(false);
         };
         // an integer-named own property can shadow an element hole
-        if name.as_tagged(heap).to_i64().is_some()
-            && receiver.as_tagged(heap).as_ref().is_array(heap)
-        {
+        if name.as_tagged(heap).to_i64().is_some() && receiver.as_tagged(heap).is_array(heap) {
             Object::promote_holey(heap, scope, &receiver);
         }
         Self::apply_define(heap, scope, receiver, name, index, action);
@@ -1087,7 +1082,7 @@ impl Object {
         key: Handle<'_, Value>,
     ) -> Result<bool, VmError> {
         let name = 'name: {
-            let key = match Lookup::classify_key(heap, key.as_tagged(heap)) {
+            let key = match key.as_tagged(heap).classify_key(heap) {
                 Ok(key) => key,
                 Err(err) => return Err(err),
             };
@@ -1102,12 +1097,7 @@ impl Object {
                         }
                         // indices at/past `length` were never own properties
                         if i < obj.as_ref().length()
-                            && obj
-                                .as_ref()
-                                .map_ref(heap)
-                                .as_ref()
-                                .kind()
-                                .is_dense_elements()
+                            && obj.as_ref().map(heap).as_ref().kind().is_dense_elements()
                             && let Some(elements) = obj.as_ref().elements_array(heap)
                             && i < elements.len()
                         {
@@ -1138,7 +1128,7 @@ impl Object {
     ) -> Result<bool, VmError> {
         let configurable = receiver
             .as_tagged(heap)
-            .map_ref(heap)
+            .map(heap)
             .descriptors()
             .iter()
             .find(|d| d.name(heap).ptr_eq(name.as_tagged(heap)))
@@ -1193,7 +1183,7 @@ impl Object {
         {
             let cond_9 = receiver
                 .as_tagged(heap)
-                .map_ref(heap)
+                .map(heap)
                 .prototype
                 .get(heap)
                 .ptr_eq(proto.as_tagged(heap));
@@ -1202,11 +1192,7 @@ impl Object {
             }
         }
         {
-            let cond_10 = receiver
-                .as_tagged(heap)
-                .map_ref(heap)
-                .kind()
-                .is_extendable();
+            let cond_10 = receiver.as_tagged(heap).map(heap).kind().is_extendable();
             if !cond_10 {
                 return Err(VmError::NotExtensible);
             }
@@ -1229,7 +1215,7 @@ impl Object {
                     let Some(o) = p.as_heap_object() else {
                         break;
                     };
-                    p = o.as_ref().map_ref(heap).prototype.get(heap);
+                    p = o.as_ref().prototype(heap);
                 }
                 Ok(())
             }
@@ -1248,11 +1234,11 @@ impl Object {
         let target = Transition::sibling_target(
             heap,
             scope,
-            |heap| receiver.as_tagged(heap).map_ref(heap),
+            |heap| receiver.as_tagged(heap).map(heap),
             SiblingChange::Prototype(proto),
         );
         let host = receiver.as_tagged(heap).erase();
-        Prototype::shape_changed(heap, receiver.as_tagged(heap).map_ref(heap));
+        Prototype::shape_changed(heap, receiver.as_tagged(heap).map(heap));
         receiver
             .as_tagged(heap)
             .header

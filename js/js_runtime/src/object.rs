@@ -8,7 +8,7 @@ use vm_core::proxy::Proxy;
 
 use vm_core::{
     Args, Convert, DenseString, Handle, HandleScope, HandleSlice, Heap, Object, PropertyDescriptor,
-    SlotName, Smi, StringOwn, Tagged, ThreadState, VM, Value, VmError,
+    Prototype, SlotName, Smi, StringOwn, Tagged, ThreadState, VM, Value, VmError,
 };
 use vm_core::{raise_runtime, rt_try};
 
@@ -41,7 +41,7 @@ pub fn object_constructor<'a>(
     } = nctx;
     let arg = args.get_handle(heap, 1);
     if is_construct {
-        if !Convert::is_primitive(heap, arg.as_tagged(heap)) {
+        if !arg.as_tagged(heap).is_primitive(heap) {
             // `new Object(obj)` returns it unchanged (ES 20.1.1.1 step 3)
             return arg.as_tagged(heap);
         }
@@ -51,7 +51,7 @@ pub fn object_constructor<'a>(
                 .erase()
         });
     }
-    if Convert::is_primitive(heap, arg.as_tagged(heap)) {
+    if arg.as_tagged(heap).is_primitive(heap) {
         // TODO: box primitives (String/Symbol wrappers)
         return raise_runtime(vm, heap, state, VmError::Type);
     }
@@ -73,7 +73,7 @@ pub fn object_get_prototype_of<'a>(
         let rooted = scope.handle(args.get(heap, 1));
         // Safety: rooted in `scope`, no allocation/GC since the read.
         let value = unsafe { Tagged::<Value>::from_value_unchecked(rooted.raw()) };
-        if let Some(proto) = Convert::primitive_prototype(heap, value) {
+        if let Some(proto) = value.primitive_prototype(heap) {
             // Safety: builtin prototype handle, rooted for the heap's life.
             return unsafe { Tagged::from_value_unchecked(proto.raw()) };
         }
@@ -81,7 +81,7 @@ pub fn object_get_prototype_of<'a>(
             // null / undefined: ToObject throws
             return raise_runtime(vm, heap, state, VmError::Type);
         };
-        obj.as_ref().header.map.get(heap).prototype.get(heap)
+        obj.as_ref().prototype(heap)
     })
 }
 
@@ -102,8 +102,8 @@ pub fn object_create<'a>(
         let proto = scope.handle(proto_arg);
         // If Type(O) is neither Object nor Null, throw a TypeError
         let null = heap.known().null.as_tagged(heap).raw();
-        let proto_ok = proto.as_tagged(heap).raw() == null
-            || !Convert::is_primitive(heap, proto.as_tagged(heap));
+        let proto_ok =
+            proto.as_tagged(heap).raw() == null || !proto.as_tagged(heap).is_primitive(heap);
         if !proto_ok {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
@@ -165,7 +165,7 @@ pub fn own_property_keys(heap: &Heap, target: Tagged<'_, Value>) -> Vec<Value> {
             }
         }
     }
-    for d in obj.as_ref().header.map.get(heap).descriptors() {
+    for d in obj.as_ref().map(heap).descriptors() {
         keys.push(d.name(heap).raw());
     }
     keys
@@ -203,8 +203,7 @@ pub fn object_has_own_property<'a>(
             if let Some(s) = DenseString::from_receiver(heap, receiver.as_tagged(heap)) {
                 break 'has s.as_ref().own_key(heap, key).is_some();
             }
-            if let Key::Element(i) =
-                Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
+            if let Key::Element(i) = key.erase().classify_key(heap).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -255,8 +254,7 @@ pub fn object_property_is_enumerable<'a>(
                     Some(StringOwn::Index(_))
                 );
             }
-            if let Key::Element(i) =
-                Lookup::classify_key(heap, key.erase()).unwrap_or(Key::Name(key))
+            if let Key::Element(i) = key.erase().classify_key(heap).unwrap_or(Key::Name(key))
                 && let Some(obj) = receiver.as_tagged(heap).as_heap_object()
                 && obj.as_ref().element_value(heap, i).is_some()
             {
@@ -328,7 +326,7 @@ pub fn plain_object<'a>(
 }
 
 /// `Object.getOwnPropertyDescriptor(O, P)` (ES 20.1.2.5): the shared
-/// raw descriptor reader (`Lookup::ordinary_own_descriptor`) converted
+/// raw descriptor reader (`ordinary_own_descriptor`) converted
 /// to a descriptor object via FromPropertyDescriptor semantics.
 pub fn object_get_own_property_descriptor<'a>(
     nctx: HostCtx<'a>,
@@ -363,7 +361,7 @@ pub fn object_get_own_property_descriptor<'a>(
             // String exotic: ToObject exposes `length` and index own props
             DenseString::own_descriptor(heap, &scope, target_v, key_v)
         } else {
-            Lookup::ordinary_own_descriptor(heap, &scope, target_v, key_v)
+            target_v.ordinary_own_descriptor(heap, &scope, key_v)
         };
         // root the oddball singletons once for the descriptor fields
         let true_v = scope.handle(heap.known().true_object.as_tagged(heap).erase());
@@ -490,9 +488,8 @@ pub fn object_set_prototype_of<'a>(
             let undefined = heap.known().undefined.as_tagged(heap).raw();
             (
                 target.as_tagged(heap).raw() == null || target.as_tagged(heap).raw() == undefined,
-                !Convert::is_primitive(heap, target.as_tagged(heap)),
-                proto.as_tagged(heap).raw() == null
-                    || !Convert::is_primitive(heap, proto.as_tagged(heap)),
+                !target.as_tagged(heap).is_primitive(heap),
+                proto.as_tagged(heap).raw() == null || !proto.as_tagged(heap).is_primitive(heap),
             )
         };
         // RequireObjectCoercible(O) (ES 20.1.2.20 step 1)
@@ -560,7 +557,7 @@ pub fn object_prevent_extensions<'a>(
             return heap.known().exception.as_tagged(heap).erase();
         };
         let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw) });
-        let cond_39 = Convert::is_truthy(heap, v.as_tagged(heap));
+        let cond_39 = v.as_tagged(heap).is_truthy(heap);
         if !cond_39 {
             raise_runtime(vm, heap, state, VmError::NotExtensible)
         } else {
@@ -617,7 +614,7 @@ pub fn set_integrity_flags(
 ) {
     use vm_core::{Map, MapInit, MapKind, SlotFlags};
     let (kind, descriptor_count, already) = {
-        let map = obj.as_tagged(heap).map_ref(heap);
+        let map = obj.as_tagged(heap).map(heap);
         (
             map.kind(),
             map.descriptors().len(),
@@ -638,7 +635,7 @@ pub fn set_integrity_flags(
     // anchored across the (allocating) map build
     heap.allocate_token_enter_heap(Map::layout_for(descriptor_count), |token, heap| {
         let obj_ref = obj.as_tagged(heap);
-        let map = obj_ref.map_ref(heap);
+        let map = obj_ref.map(heap);
         // Safety: fresh map-slot word, rooted below before the allocation.
         let prototype = scope.handle(map.prototype.get(heap));
         let descriptors: Vec<(Handle<'_, SlotName>, SlotFlags, Handle<'_, Value>)> = map
@@ -663,7 +660,7 @@ pub fn set_integrity_flags(
             descriptors: &descriptors,
             prototype,
         });
-        vm_core::Prototype::shape_changed(heap, obj_ref.map_ref(heap));
+        Prototype::shape_changed(heap, obj_ref.map(heap));
         obj_ref
             .header
             .map
@@ -711,7 +708,7 @@ pub fn object_seal<'a>(
             return heap.known().exception.as_tagged(heap).erase();
         };
         let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw) });
-        let cond_42 = Convert::is_truthy(heap, v.as_tagged(heap));
+        let cond_42 = v.as_tagged(heap).is_truthy(heap);
         if !cond_42 {
             return raise_runtime(vm, heap, state, VmError::NotExtensible);
         }
@@ -769,7 +766,7 @@ pub fn object_freeze<'a>(
             return heap.known().exception.as_tagged(heap).erase();
         };
         let v = scope.handle(unsafe { Tagged::<Value>::from_value_unchecked(raw) });
-        let cond_45 = Convert::is_truthy(heap, v.as_tagged(heap));
+        let cond_45 = v.as_tagged(heap).is_truthy(heap);
         if !cond_45 {
             return raise_runtime(vm, heap, state, VmError::NotExtensible);
         }

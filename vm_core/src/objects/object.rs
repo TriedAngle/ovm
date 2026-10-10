@@ -32,17 +32,17 @@ impl Object {
         Layout::new::<Self>()
     }
 
-    pub fn callable_info<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, CallableInfoObject>> {
-        if !self.header.map.get(heap).kind().is_callable() {
+    pub fn callable_info<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, CallableInfoObject>> {
+        if !self.map(heap).kind().is_callable() {
             return None;
         }
-        let info = self.slots.get(heap).at(heap, 0);
+        let info = self.slots(heap).at(heap, 0);
         // the callable map's slot 0 is always its CallableInfoObject
         Some(unsafe { info.cast() })
     }
 
-    pub fn closure_context<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, ContextObject>> {
-        if !self.header.map.get(heap).kind().is_callable() {
+    pub fn closure_context<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, ContextObject>> {
+        if !self.map(heap).kind().is_callable() {
             return None;
         }
         self.slots
@@ -52,35 +52,35 @@ impl Object {
     }
 
     /// The `idx`-th entry of the callable's constant pool, as a slot name.
-    pub fn constant_slot_name<'a>(&'a self, heap: &'a Heap, idx: usize) -> Tagged<'a, SlotName> {
+    pub fn constant_slot_name<'a>(&self, heap: &'a Heap, idx: usize) -> Tagged<'a, SlotName> {
         self.callable_info(heap)
             .expect("callable must have callable info")
             .constant_slot_name(heap, idx)
     }
 
     #[inline]
-    pub fn runtime_index<'a>(&'a self, heap: &'a Heap) -> Option<usize> {
-        if !self.header.map.get(heap).kind().is_native() {
+    pub fn runtime_index<'a>(&self, heap: &'a Heap) -> Option<usize> {
+        if !self.map(heap).kind().is_native() {
             return None;
         }
-        let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
+        let idx = Smi::decode(self.slots(heap).at(heap, 0).raw())?.value();
         usize::try_from(idx).ok()
     }
 
     /// The NATIVE-kind slot-0 Smi decoded to a call target half: the
     /// value is the callee's registry runtime index.
     #[inline]
-    pub fn runtime_call_target<'a>(&'a self, heap: &'a Heap) -> Option<CallTarget<'a>> {
-        if !self.header.map.get(heap).kind().is_native() {
+    pub fn runtime_call_target<'a>(&self, heap: &'a Heap) -> Option<CallTarget<'a>> {
+        if !self.map(heap).kind().is_native() {
             return None;
         }
-        let idx = Smi::decode(self.slots.get(heap).at(heap, 0).raw())?.value();
+        let idx = Smi::decode(self.slots(heap).at(heap, 0).raw())?.value();
         Some(CallTarget::Native(NativeIndex(usize::try_from(idx).ok()?)))
     }
 
     #[inline(always)]
-    pub fn is_array<'a>(&'a self, heap: &'a Heap) -> bool {
-        self.header.map.get(heap).kind().is_array()
+    pub fn is_array<'a>(&self, heap: &'a Heap) -> bool {
+        self.map(heap).kind().is_array()
     }
 
     /// The JSArray `length` internal slot, when `self` is an array named
@@ -88,7 +88,7 @@ impl Object {
     /// must consult this first. `None` for any other name or non-array.
     #[inline]
     pub fn array_length<'a>(
-        &'a self,
+        &self,
         heap: &'a Heap,
         name: Tagged<'a, SlotName>,
     ) -> Option<Tagged<'a, Value>> {
@@ -100,39 +100,39 @@ impl Object {
             .then(|| self.length.get(heap).erase())
     }
 
-    /// ES 7.3.26 PrivateElementFind restricted to fields: an own data
-    /// descriptor matching the private Symbol key (no prototype walk — private
-    /// elements live only on the instance itself).
-    pub fn private_find<'a>(
-        heap: &'a Heap,
-        obj: Tagged<'a, Value>,
-        key: Tagged<'a, Value>,
-    ) -> Option<&'a GcSlot> {
-        let o = obj.as_heap_object()?;
-        let map = o.as_ref().header.map.get(heap);
-        for d in map.descriptors() {
-            if d.name(heap).ptr_eq(key.as_name()) && !d.flags().is_accessor() {
-                return Some(o.as_ref().slot(heap, d.offset()));
-            }
-        }
-        None
+    /// The object's map (shape).
+    #[inline(always)]
+    pub fn map<'a>(&self, heap: &'a Heap) -> Tagged<'a, Map> {
+        self.header.map.get(heap)
     }
 
-    /// The object's map (shape).
-    #[inline]
-    pub fn map_ref<'a>(&self, heap: &'a Heap) -> Tagged<'a, Map> {
-        self.header.map.get(heap)
+    /// The map's prototype link.
+    #[inline(always)]
+    pub fn prototype<'a>(&self, heap: &'a Heap) -> Tagged<'a, Value> {
+        self.map(heap).prototype.get(heap)
+    }
+
+    /// The object's slots backing store.
+    #[inline(always)]
+    pub fn slots<'a>(&self, heap: &'a Heap) -> Tagged<'a, FixedArray> {
+        self.slots.get(heap)
+    }
+
+    /// The object's elements backing store word.
+    #[inline(always)]
+    pub fn elements<'a>(&self, heap: &'a Heap) -> Tagged<'a, FixedArray> {
+        self.elements.get(heap)
     }
 
     /// Whether the object's map allows adding new properties.
     pub fn is_extendable(&self, heap: &Heap) -> bool {
-        self.map_ref(heap).kind().is_extendable()
+        self.map(heap).kind().is_extendable()
     }
 
     /// The slot holding the value of the data slot at `offset`.
     #[inline]
     pub fn slot<'a>(&self, heap: &'a Heap, offset: usize) -> &'a GcSlot {
-        self.slots.get(heap).as_ref().element_slot(offset)
+        self.slots(heap).as_ref().element_slot(offset)
     }
 
     #[inline(always)]
@@ -141,28 +141,25 @@ impl Object {
     }
 
     #[inline(always)]
-    pub fn elements_array<'a>(&'a self, heap: &'a Heap) -> Option<Tagged<'a, FixedArray>> {
-        let kind = self.header.map.get(heap).as_ref().kind();
+    pub fn elements_array<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, FixedArray>> {
+        let kind = self.map(heap).kind();
         if kind.is_array() && !kind.is_dense_elements() {
             // dictionary-backed: not a FixedArray
             return None;
         }
-        let elements = self.elements.get(heap);
+        let elements = self.elements(heap);
         elements.is_strong_ptr().then_some(elements)
     }
 
     /// The sparse-elements backing store, when this array is in
     /// dictionary mode.
     #[inline]
-    pub fn element_dictionary<'a>(
-        &'a self,
-        heap: &'a Heap,
-    ) -> Option<Tagged<'a, NumberDictionary>> {
-        let kind = self.header.map.get(heap).as_ref().kind();
+    pub fn element_dictionary<'a>(&self, heap: &'a Heap) -> Option<Tagged<'a, NumberDictionary>> {
+        let kind = self.map(heap).kind();
         if !kind.is_array() || !kind.is_dictionary_elements() {
             return None;
         }
-        let elements = self.elements.get(heap);
+        let elements = self.elements(heap);
         if !elements.is_strong_ptr() {
             return None;
         }
@@ -172,7 +169,7 @@ impl Object {
     pub fn promote_holey(heap: &mut Heap, scope: &HandleScope<'_>, receiver: &Handle<'_, Object>) {
         let map = {
             let obj = receiver.as_tagged(heap);
-            let map = obj.as_ref().map_ref(heap);
+            let map = obj.as_ref().map(heap);
             // one-way lattice: only packed maps promote; holey and
             // dictionary maps are already past this rung
             if map.as_ref().kind().elements() != ElementsKind::Packed {
@@ -193,16 +190,12 @@ impl Object {
     }
 
     #[inline(always)]
-    pub fn element_value_dense<'a>(
-        &'a self,
-        heap: &'a Heap,
-        i: usize,
-    ) -> Option<Tagged<'a, Value>> {
-        let kind = self.header.map.get(heap).as_ref().kind();
+    pub fn element_value_dense<'a>(&self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
+        let kind = self.map(heap).kind();
         if !kind.is_array() || !kind.is_dense_elements() || i >= self.length() {
             return None;
         }
-        let elements = self.elements.get(heap);
+        let elements = self.elements(heap);
         if kind.is_holey() {
             // `length` can exceed the backing store: those indices are holes
             if i >= elements.as_ref().len() {
@@ -220,12 +213,12 @@ impl Object {
     }
 
     #[inline]
-    pub fn element_value<'a>(&'a self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
+    pub fn element_value<'a>(&self, heap: &'a Heap, i: usize) -> Option<Tagged<'a, Value>> {
         if let Some(v) = self.element_value_dense(heap, i) {
             return Some(v);
         }
 
-        let kind = self.header.map.get(heap).as_ref().kind();
+        let kind = self.map(heap).kind();
         if !kind.is_array() || i >= self.length() {
             return None;
         }
@@ -250,11 +243,61 @@ pub enum CallTarget<'a> {
     Proxy(Tagged<'a, Object>),
 }
 
-impl Object {
+impl<'a> Tagged<'a, Value> {
+    pub fn is_callable(self, heap: &Heap) -> bool {
+        let Some(obj) = self.as_heap_object() else {
+            return false;
+        };
+        obj.as_ref().map(heap).kind().is_callable()
+    }
+
+    /// ES 7.3.26 PrivateElementFind restricted to fields: an own data
+    /// descriptor matching the private Symbol key (no prototype walk — private
+    /// elements live only on the instance itself).
+    pub fn private_find(self, heap: &'a Heap, key: Tagged<'a, Value>) -> Option<&'a GcSlot> {
+        let o = self.as_heap_object()?;
+        let map = o.as_ref().map(heap);
+        for d in map.descriptors() {
+            if d.name(heap).ptr_eq(key.as_name()) && !d.flags().is_accessor() {
+                return Some(o.as_ref().slot(heap, d.offset()));
+            }
+        }
+        None
+    }
+
+    /// Write an existing element slot in place: never allocates, never
+    /// grows, no handle scope required — takes anchored `Tagged` words
+    /// under a single shared heap borrow (safe for fast paths).
+    #[inline]
+    pub fn store_array_element_in_place(
+        self,
+        heap: &Heap,
+        i: usize,
+        value: Tagged<'_, Value>,
+    ) -> Result<(), VmError> {
+        let Some(obj) = self.as_heap_object() else {
+            return Err(VmError::Type);
+        };
+        let kind = obj.as_ref().map(heap).kind();
+        if !kind.is_array() || !kind.is_dense_elements() || i >= obj.as_ref().length() {
+            return Err(VmError::OutOfBounds);
+        }
+        let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
+        if i >= elements.len() {
+            return Err(VmError::OutOfBounds);
+        }
+        if kind.is_holey() && elements.at(heap, i) == heap.known().the_hole.as_tagged(heap) {
+            return Err(VmError::OutOfBounds);
+        }
+        elements.set(heap, i, value);
+        Prototype::element_mutated_kind(heap, obj, kind);
+        Ok(())
+    }
+
     #[inline(always)]
-    pub fn call_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
-        let obj = f.as_heap_object()?;
-        let kind = obj.as_ref().header.map.get(heap).kind();
+    pub fn call_target(self, heap: &'a Heap) -> Option<CallTarget<'a>> {
+        let obj = self.as_heap_object()?;
+        let kind = obj.as_ref().map(heap).kind();
         if kind.is_proxy() {
             return Some(CallTarget::Proxy(obj));
         }
@@ -266,7 +309,7 @@ impl Object {
         }
         // every non-runtime callable object is laid out with
         // `[callable info, context]` in its first two slots
-        let slots = obj.as_ref().slots.get(heap);
+        let slots = obj.as_ref().slots(heap);
         let info = unsafe { slots.at(heap, 0).cast::<CallableInfoObject>() };
         let context = unsafe { slots.at(heap, 1).cast::<ContextObject>() };
         let descriptor = info.descriptor.to_smi_unchecked().value() as u64;
@@ -288,9 +331,9 @@ impl Object {
     }
 
     #[inline]
-    pub fn bytecode_target<'a>(heap: &'a Heap, f: Tagged<'a, Value>) -> Option<CallTarget<'a>> {
-        let obj = f.as_heap_object()?;
-        let slots = obj.as_ref().slots.get(heap);
+    pub fn bytecode_target(self, heap: &'a Heap) -> Option<CallTarget<'a>> {
+        let obj = self.as_heap_object()?;
+        let slots = obj.as_ref().slots(heap);
         let info = unsafe { slots.at(heap, 0).cast::<CallableInfoObject>() };
         let context = unsafe { slots.at(heap, 1).cast::<ContextObject>() };
         let descriptor = info.descriptor.to_smi_unchecked().value() as u64;
@@ -301,7 +344,9 @@ impl Object {
             kind: FunctionKind::decode(((descriptor >> 32) & 0xf) as i64),
         })
     }
+}
 
+impl Object {
     pub fn store_array_element(
         heap: &mut Heap,
         scope: &HandleScope<'_>,
@@ -414,17 +459,14 @@ impl Object {
             let dict = obj.as_ref().element_dictionary(heap).ok_or(VmError::Type)?;
             (scope.handle(dict), obj.as_ref().length())
         };
-        match dict.as_tagged(heap).as_ref().classify(heap, i) {
+        match dict.as_tagged(heap).classify(heap, i) {
             EntryClass::ReadOnly | EntryClass::Accessor => return Ok(()),
             EntryClass::Data | EntryClass::Absent => {}
         }
-        if matches!(
-            dict.as_tagged(heap).as_ref().classify(heap, i),
-            EntryClass::Absent
-        ) {
-            let cap_words = dict.as_tagged(heap).as_ref().capacity() * NumberDictionary::ENTRY_SIZE;
+        if matches!(dict.as_tagged(heap).classify(heap, i), EntryClass::Absent) {
+            let cap_words = dict.as_tagged(heap).capacity() * NumberDictionary::ENTRY_SIZE;
             let needed = new_len.max(length);
-            if !dict.as_tagged(heap).as_ref().requires_slow_elements()
+            if !dict.as_tagged(heap).requires_slow_elements()
                 && needed <= cap_words * 2
                 && needed < (1 << 26)
             {
@@ -461,7 +503,7 @@ impl Object {
     ) {
         let map = {
             let obj = receiver.as_tagged(heap);
-            let map = obj.as_ref().map_ref(heap);
+            let map = obj.as_ref().map(heap);
             if map.as_ref().kind().is_dictionary_elements() {
                 return;
             }
@@ -517,7 +559,7 @@ impl Object {
     ) {
         let map = {
             let obj = receiver.as_tagged(heap);
-            let map = obj.as_ref().map_ref(heap);
+            let map = obj.as_ref().map(heap);
             if !map.as_ref().kind().is_dictionary_elements() {
                 return;
             }
@@ -551,35 +593,6 @@ impl Object {
             .header
             .map
             .set(heap, obj.erase(), target.as_tagged(heap));
-    }
-
-    /// Write an existing element slot in place: never allocates, never
-    /// grows, no handle scope required — takes anchored `Tagged` words
-    /// under a single shared heap borrow (safe for fast paths).
-    #[inline]
-    pub fn store_array_element_in_place(
-        heap: &Heap,
-        receiver: Tagged<'_, Value>,
-        i: usize,
-        value: Tagged<'_, Value>,
-    ) -> Result<(), VmError> {
-        let Some(obj) = receiver.as_heap_object() else {
-            return Err(VmError::Type);
-        };
-        let kind = obj.as_ref().header.map.get(heap).as_ref().kind();
-        if !kind.is_array() || !kind.is_dense_elements() || i >= obj.as_ref().length() {
-            return Err(VmError::OutOfBounds);
-        }
-        let elements = obj.as_ref().elements_array(heap).ok_or(VmError::Type)?;
-        if i >= elements.len() {
-            return Err(VmError::OutOfBounds);
-        }
-        if kind.is_holey() && elements.at(heap, i) == heap.known().the_hole.as_tagged(heap) {
-            return Err(VmError::OutOfBounds);
-        }
-        elements.set(heap, i, value);
-        Prototype::element_mutated_kind(heap, obj, kind);
-        Ok(())
     }
 }
 
@@ -756,7 +769,7 @@ impl Object {
         value: Handle<'_, Value>,
         hint: Hint,
     ) -> Result<Coercion<'a>, VmError> {
-        if Convert::is_primitive(heap, value.as_tagged(heap)) {
+        if value.as_tagged(heap).is_primitive(heap) {
             return Ok(Coercion::Value(value.as_tagged(heap)));
         }
         HostCtx::new(vm, heap, state).handle_scope(|vm, heap, state, scope| {
@@ -775,7 +788,7 @@ impl Object {
             if exotic.as_tagged(heap) != heap.known().undefined.as_tagged(heap)
                 && exotic.as_tagged(heap) != heap.known().null.as_tagged(heap)
             {
-                if !Self::is_callable(heap, exotic.as_tagged(heap)) {
+                if !exotic.as_tagged(heap).is_callable(heap) {
                     // GetMethod: a non-callable, non-nullish method is a TypeError
                     return Err(VmError::Type);
                 }
@@ -793,7 +806,7 @@ impl Object {
                 if result.as_tagged(heap) == heap.known().exception.as_tagged(heap) {
                     return Ok(Coercion::Threw);
                 }
-                return if Convert::is_primitive(heap, result.as_tagged(heap)) {
+                return if result.as_tagged(heap).is_primitive(heap) {
                     Ok(Coercion::Value(result.as_tagged(heap)))
                 } else {
                     Err(VmError::Type)
@@ -814,7 +827,7 @@ impl Object {
                     Coercion::Threw => return Ok(Coercion::Threw),
                     Coercion::Value(v) => scope.handle(v),
                 };
-                if !Self::is_callable(heap, method.as_tagged(heap)) {
+                if !method.as_tagged(heap).is_callable(heap) {
                     continue;
                 }
                 let args = scope.stage(&[value.as_tagged(heap)]);
@@ -823,7 +836,7 @@ impl Object {
                 if result.as_tagged(heap) == heap.known().exception.as_tagged(heap) {
                     return Ok(Coercion::Threw);
                 }
-                if Convert::is_primitive(heap, result.as_tagged(heap)) {
+                if result.as_tagged(heap).is_primitive(heap) {
                     return Ok(Coercion::Value(result.as_tagged(heap)));
                 }
                 // object result: try the next method name
@@ -844,7 +857,7 @@ impl Object {
                 // root the anchored result to release the heap borrow
                 Coercion::Value(v) => {
                     let v = scope.handle(v);
-                    Ok(Some(Convert::to_number(heap, v.as_tagged(heap))?))
+                    Ok(Some(v.as_tagged(heap).to_number(heap)?))
                 }
             }
         })
@@ -857,7 +870,7 @@ impl Object {
         value: Handle<'_, Value>,
     ) -> Result<Option<Tagged<'a, Value>>, VmError> {
         state.handle_scope(|scope| {
-            let primitive = if Convert::is_primitive(heap, value.as_tagged(heap)) {
+            let primitive = if value.as_tagged(heap).is_primitive(heap) {
                 value
             } else {
                 match Self::to_primitive(vm, heap, state, value, Hint::String)? {
@@ -887,13 +900,6 @@ impl Object {
             return Ok(None);
         };
         Ok(Some(heap.new_number(op(a, b))))
-    }
-
-    pub fn is_callable<'a>(heap: &'a Heap, v: Tagged<'a, Value>) -> bool {
-        let Some(obj) = v.as_heap_object() else {
-            return false;
-        };
-        obj.as_ref().header.map.get(heap).kind().is_callable()
     }
 
     pub fn to_property_key<'a>(
@@ -936,7 +942,7 @@ impl Object {
             // canonical index strings name the same property as their
             // numeric form (ES 6.1.7): canonicalize to the Smi spelling
             // exactly once here, so every downstream bits-compare is sound
-            if let Some(i) = Lookup::canonical_index(word.as_ref().data(heap))
+            if let Some(i) = word.as_ref().data(heap).canonical_index()
                 && i < u32::MAX as usize
             {
                 return Ok(Some(Tagged::from(Smi::new(i as i64))));
@@ -962,7 +968,7 @@ impl Object {
             s.string
         } else if v.get_as::<Symbol>(heap).is_some() {
             s.symbol
-        } else if Self::is_callable(heap, v) {
+        } else if v.is_callable(heap) {
             s.function
         } else {
             s.object
@@ -977,7 +983,7 @@ impl Object {
         object: Handle<'_, Value>,
         callable: Handle<'_, Value>,
     ) -> Result<Option<bool>, VmError> {
-        if !Self::is_callable(heap, callable.as_tagged(heap)) {
+        if !callable.as_tagged(heap).is_callable(heap) {
             return Err(VmError::Type);
         }
         // 4. P = Get(C, "prototype") — full [[Get]]; a getter may run user
@@ -995,7 +1001,7 @@ impl Object {
                 Coercion::Value(v) => scope.handle(v),
             };
             // 5. P must be an object
-            if Convert::is_primitive(heap, proto.as_tagged(heap)) {
+            if proto.as_tagged(heap).is_primitive(heap) {
                 return Err(VmError::Type);
             }
             Ok(Some(Self::has_proto_in_chain(
@@ -1014,7 +1020,7 @@ impl Object {
         let Some(obj) = object.as_heap_object() else {
             return false;
         };
-        let proto = obj.as_ref().header.map.get(heap).prototype.get(heap);
+        let proto = obj.as_ref().prototype(heap);
         if proto.ptr_eq(target) {
             return true;
         }

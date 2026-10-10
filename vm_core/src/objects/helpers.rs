@@ -214,29 +214,31 @@ impl Object {
         )?;
         Ok(())
     }
+}
 
+impl<'a> Tagged<'a, Value> {
     /// Read slots[0] of a `PRIMITIVE_WRAPPER` receiver — or the receiver
     /// itself when it is the matching unboxed primitive: builtin `this`-values
     /// are never auto-boxed (ES 5.2.3), so `Number.prototype.toString` and
     /// friends must accept raw Smi/Float/string/boolean receivers. A receiver
     /// of the wrong primitive type (and any symbol/null/undefined) is a
     /// TypeError.
-    pub fn wrapper_value<'a>(
+    pub fn wrapper_value(
+        self,
         heap: &'a Heap,
-        receiver: Tagged<'a, Value>,
         kind: WrapperKind,
     ) -> Result<Tagged<'a, Value>, VmError> {
-        if kind.matches(heap, receiver) {
-            return Ok(receiver);
+        if kind.matches(heap, self) {
+            return Ok(self);
         }
-        let Some(obj) = receiver.as_heap_object() else {
+        let Some(obj) = self.as_heap_object() else {
             return Err(VmError::Type);
         };
-        let map = obj.as_ref().header.map.get(heap);
+        let map = obj.as_ref().map(heap);
         if !map.kind().contains(MapKind::PRIMITIVE_WRAPPER) {
             return Err(VmError::Type);
         }
-        let value = obj.as_ref().slots.get(heap).at(heap, 0);
+        let value = obj.as_ref().slots(heap).at(heap, 0);
         if kind.matches(heap, value) {
             Ok(value)
         } else {

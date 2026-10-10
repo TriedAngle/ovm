@@ -181,7 +181,7 @@ pub fn array_pop<'a>(
         let Some(obj) = scope.cast::<Object>(heap, receiver.as_tagged(heap)) else {
             return raise_runtime(vm, heap, state, VmError::Type);
         };
-        let is_array = obj.as_tagged(heap).as_ref().is_array(heap);
+        let is_array = obj.as_tagged(heap).is_array(heap);
         if !is_array {
             return raise_runtime(vm, heap, state, VmError::Type);
         }
@@ -198,7 +198,7 @@ pub fn array_pop<'a>(
         if let Some(dict) = this.as_ref().element_dictionary(heap) {
             dict.as_ref().delete(heap, last);
         } else {
-            let elements = this.as_ref().elements.get(heap);
+            let elements = this.as_ref().elements(heap);
             if elements.is_strong_ptr() && last < elements.as_ref().len() {
                 elements
                     .as_ref()
@@ -263,7 +263,7 @@ pub fn array_iterator_next<'a>(
             let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
                 return raise_runtime(vm, heap, state, VmError::Type);
             };
-            let slots = obj.as_ref().slots.get(heap);
+            let slots = obj.as_ref().slots(heap);
             if slots.len() < 2 {
                 return raise_runtime(vm, heap, state, VmError::Type);
             }
@@ -304,7 +304,7 @@ pub fn array_iterator_next<'a>(
             let Some(obj) = receiver.as_tagged(heap).as_heap_object() else {
                 return raise_runtime(vm, heap, state, VmError::Type);
             };
-            let slots = obj.as_ref().slots.get(heap);
+            let slots = obj.as_ref().slots(heap);
             slots.set(heap, 1, Smi::new(index.value() + 1).into_tagged());
         };
         let map = heap.known().iterator_result_map;
@@ -519,15 +519,15 @@ pub fn array_length_set<'a>(
             && obj
                 .as_tagged(heap)
                 .as_ref()
-                .map_ref(heap)
+                .map(heap)
                 .as_ref()
                 .kind()
                 .is_dense_elements()
         {
             Object::normalize_elements(heap, &scope, &obj);
         }
-        if let Some(dict) = obj.as_tagged(heap).as_ref().element_dictionary(heap) {
-            let old_len = obj.as_tagged(heap).as_ref().length();
+        if let Some(dict) = obj.as_tagged(heap).element_dictionary(heap) {
+            let old_len = obj.as_tagged(heap).length();
             if new_len < old_len {
                 // non-configurable entries clamp the shrink
                 let mut effective = new_len;
@@ -559,10 +559,10 @@ pub fn array_length_set<'a>(
                 .set(heap, obj_t.erase(), Smi::new(new_len as i64));
             return heap.known().undefined.as_tagged(heap).erase();
         }
-        let old_len = obj.as_tagged(heap).as_ref().length();
+        let old_len = obj.as_tagged(heap).length();
         if new_len < old_len {
             let hole = heap.known().the_hole.as_tagged(heap).erase();
-            if let Some(elements) = obj.as_tagged(heap).as_ref().elements_array(heap) {
+            if let Some(elements) = obj.as_tagged(heap).elements_array(heap) {
                 for i in new_len..old_len.min(elements.len()) {
                     elements.as_ref().set(heap, i, hole);
                 }
@@ -631,7 +631,7 @@ pub fn array_slice<'a>(
             return raise_runtime(vm, heap, state, VmError::Type);
         }
         let obj = scope.handle(obj);
-        let len = obj.as_tagged(heap).as_ref().length() as f64;
+        let len = obj.as_tagged(heap).length() as f64;
 
         let start = match slice_bound(
             vm,
@@ -673,7 +673,7 @@ pub fn array_slice<'a>(
         let mut values: Vec<Tagged<'_, Value>> = Vec::with_capacity(count);
         let mut has_hole = false;
         for i in start..start + count {
-            match obj.as_tagged(heap).as_ref().element_value(heap, i) {
+            match obj.as_tagged(heap).element_value(heap, i) {
                 Some(v) => values.push(v),
                 None => {
                     // Safety: old-gen singleton word.
@@ -716,7 +716,7 @@ pub fn array_sort<'a>(
         let cmpfn = if args.len() > 1 {
             let c = args.get(heap, 1);
             if c != heap.known().undefined.as_tagged(heap) {
-                if !Object::is_callable(heap, c) {
+                if !c.is_callable(heap) {
                     return raise_runtime(vm, heap, state, VmError::Type);
                 }
                 Some(scope.handle(c))
@@ -728,7 +728,7 @@ pub fn array_sort<'a>(
         };
         let undefined = heap.known().undefined.as_tagged(heap).erase().raw();
         let exception = heap.known().exception.as_tagged(heap).erase().raw();
-        let len = obj.as_tagged(heap).as_ref().length();
+        let len = obj.as_tagged(heap).length();
 
         // Root every element up front. The sort can allocate (`ToString`
         // for the default keys, user code for a comparator); a collection
@@ -737,7 +737,7 @@ pub fn array_sort<'a>(
         let mut elems: Vec<Handle<'_, Value>> = Vec::new();
         let mut undefined_count = 0usize;
         for i in 0..len {
-            match obj.as_tagged(heap).as_ref().element_value(heap, i) {
+            match obj.as_tagged(heap).element_value(heap, i) {
                 None => {}
                 Some(v) if v.raw() == undefined => undefined_count += 1,
                 Some(v) => elems.push(scope.handle(v)),
@@ -875,7 +875,7 @@ pub fn array_sort<'a>(
         }
         // the remainder become holes (or removed dictionary entries)
         if total < len {
-            if let Some(dict) = obj.as_tagged(heap).as_ref().element_dictionary(heap) {
+            if let Some(dict) = obj.as_tagged(heap).element_dictionary(heap) {
                 let mut doomed: Vec<usize> = Vec::new();
                 dict.as_ref().for_each_entry(heap, |k, _, _| {
                     if k >= total {
@@ -887,7 +887,7 @@ pub fn array_sort<'a>(
                 }
             } else {
                 let hole = heap.known().the_hole.as_tagged(heap).erase().raw();
-                if let Some(elements) = obj.as_tagged(heap).as_ref().elements_array(heap) {
+                if let Some(elements) = obj.as_tagged(heap).elements_array(heap) {
                     for j in total..len.min(elements.len()) {
                         // Safety: old-gen singleton word.
                         elements.as_ref().set(heap, j, unsafe {

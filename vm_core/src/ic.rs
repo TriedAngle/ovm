@@ -211,7 +211,7 @@ fn decode_handler_smi<T>(word: Tagged<'_, T>) -> Option<(i64, i64)> {
 #[inline(always)]
 fn ic_receiver<'a>(receiver: Tagged<'a, Value>, heap: &'a Heap) -> Option<Tagged<'a, Object>> {
     let obj = receiver.as_heap_object()?;
-    let kind = obj.map_ref(heap).kind();
+    let kind = obj.map(heap).kind();
     if !kind.is_js_receiver() || kind.is_proxy() {
         return None;
     }
@@ -256,7 +256,7 @@ fn probe_element_smi<'a>(
 ) -> Option<(Tagged<'a, Object>, Tagged<'a, Map>, i64, i64)> {
     let vector = vector?;
     let obj = receiver.as_heap_object()?;
-    let map = obj.map_ref(heap);
+    let map = obj.map(heap);
     let handler = probe(heap, vector, slot, map)?;
     if handler.is_ptr() {
         return None;
@@ -317,7 +317,7 @@ fn walk<'s>(
     obj: Tagged<'_, Object>,
     name: Tagged<'_, SlotName>,
 ) -> Option<Found<'s>> {
-    let map = obj.map_ref(heap);
+    let map = obj.map(heap);
     // accessor entries in a sparse hop act like accessor descriptors
     if let Some(pair) = obj.as_ref().dictionary_accessor(heap, name.as_index()) {
         return Some(Found::Accessor {
@@ -376,7 +376,7 @@ fn walk<'s>(
     let Some(proto_obj) = proto.as_heap_object() else {
         return Some(Found::Uncacheable);
     };
-    if !proto_obj.map_ref(heap).kind().kind().is_js_receiver() {
+    if !proto_obj.map(heap).kind().kind().is_js_receiver() {
         return Some(Found::Uncacheable);
     }
     walk(heap, scope, proto_obj, name)
@@ -445,7 +445,7 @@ fn chain_object_elements_clean(heap: &Heap, word: Tagged<'_, Value>) -> bool {
     let Some(obj) = word.get_as::<Object>(heap) else {
         return false;
     };
-    let map = obj.as_ref().map_ref(heap);
+    let map = obj.as_ref().map(heap);
     let kind = map.as_ref().kind();
     if kind.is_proxy() || !matches!(kind.kind(), ObjectKind::Object | ObjectKind::Array) {
         return false;
@@ -460,7 +460,7 @@ fn chain_object_elements_clean(heap: &Heap, word: Tagged<'_, Value>) -> bool {
             // a dictionary-backed hop may hold elements
             return false;
         }
-        let elements = obj.as_ref().elements.get(heap);
+        let elements = obj.as_ref().elements(heap);
         if elements.is_strong_ptr() {
             let hole = heap.known().the_hole.as_tagged(heap);
             let elements = elements.as_ref();
@@ -501,7 +501,7 @@ fn chain_elements_clean(heap: &Heap, map: Tagged<'_, Map>) -> bool {
         let Some(obj) = proto.get_as::<Object>(heap) else {
             return false;
         };
-        current = obj.as_ref().map_ref(heap);
+        current = obj.as_ref().map(heap);
     }
 }
 
@@ -562,7 +562,7 @@ fn analyze_load<'s>(
     receiver: Tagged<'_, Object>,
     name: Tagged<'_, SlotName>,
 ) -> Plan<'s> {
-    let receiver_map = scope.handle(receiver.map_ref(heap));
+    let receiver_map = scope.handle(receiver.map(heap));
     let mk = |kind, offset, pair, holder, own| Plan {
         kind,
         offset,
@@ -634,7 +634,7 @@ fn apply_parent_handler<'a>(
 ) -> Option<Hit<'a>> {
     let holder = handler_holder(heap, handler)?;
     let pairs = holder
-        .map_ref(heap)
+        .map(heap)
         .prototype
         .get(heap)
         .get_as::<FixedArray>(heap)?;
@@ -736,7 +736,7 @@ fn apply_element_load<'a>(
     if index >= len {
         return oob(heap);
     }
-    let elements = obj.elements.get(heap);
+    let elements = obj.elements(heap);
     if holey {
         // `length` can exceed the backing store: those indices are holes
         if index >= elements.as_ref().len() {
@@ -765,7 +765,7 @@ fn apply_indexed_string<'a>(
         if payload & ELEMENT_ALLOW_OOB != 0
             && receiver
                 .as_heap_object()
-                .is_some_and(|h| map_chain_cell_valid(heap, h.as_ref().map_ref(heap)))
+                .is_some_and(|h| map_chain_cell_valid(heap, h.as_ref().map(heap)))
         {
             return Some(ElementHit::Value(
                 heap.known().undefined.as_tagged(heap).erase(),
@@ -788,7 +788,7 @@ fn analyze_store<'s>(
         field: None,
         setter: None,
         setter_own: false,
-        receiver_map: scope.handle(receiver.map_ref(heap)),
+        receiver_map: scope.handle(receiver.map(heap)),
     };
     match walk(heap, scope, receiver, name) {
         Some(Found::Data { offset, holder }) if holder.as_tagged(heap).ptr_eq(receiver) => {
@@ -863,7 +863,7 @@ impl InlineCache {
         let Some(obj) = receiver.as_heap_object() else {
             return MonoProbe::NotReceiver;
         };
-        let map = obj.map_ref(heap);
+        let map = obj.map(heap);
         let (state_slot, handler_slot) = vector.site_unchecked(slot);
         let state = state_slot.get(heap);
 
@@ -940,7 +940,7 @@ impl InlineCache {
         let vector = vector?;
         let obj = ic_receiver(receiver, heap)?;
         vector.site(slot)?;
-        let map = obj.map_ref(heap);
+        let map = obj.map(heap);
         let handler = probe(heap, vector, slot, map)?;
         apply_load_handler(heap, obj, handler)
     }
@@ -967,7 +967,7 @@ impl InlineCache {
         if plan.non_existent() && !cache_non_existent {
             return;
         }
-        let map = scope.handle(recv.map_ref(heap));
+        let map = scope.handle(recv.map(heap));
         let handler = plan.into_handler(heap, scope);
         update_site(heap, scope, vector, slot, &map, &handler);
     }
@@ -1006,7 +1006,7 @@ impl InlineCache {
         if index > obj.length() || (append && payload & STORE_GROW == 0) {
             return None;
         }
-        let elements = obj.elements.get(heap);
+        let elements = obj.elements(heap);
         let clean = payload & STORE_CHAIN_CLEAN != 0;
         if holey && !append {
             if index >= elements.as_ref().len() {
@@ -1060,20 +1060,20 @@ impl InlineCache {
         let Some(obj) = recv.as_heap_object() else {
             return;
         };
-        let map = scope.handle(obj.map_ref(heap));
+        let map = scope.handle(obj.map(heap));
         let handler = if let Some(s) = recv.get_as::<DenseString>(heap) {
             if index < s.len() && s.code_unit(heap, index) > 0xFF {
                 return;
             }
             let string_prototype = heap.known().string_prototype.as_tagged(heap);
-            let proto_map = scope.handle(string_prototype.as_ref().map_ref(heap));
+            let proto_map = scope.handle(string_prototype.as_ref().map(heap));
             let clean = chain_elements_clean(heap, proto_map.as_tagged(heap));
             if index >= s.len() && !clean {
                 return;
             }
             let mut payload = 0;
             if clean {
-                proto_map.as_tagged(heap).as_ref().mark_prototype(heap);
+                proto_map.as_tagged(heap).mark_prototype(heap);
                 if let Some(cell) =
                     Prototype::get_or_create_prototype_chain_validity_cell(heap, scope, proto_map)
                 {
@@ -1099,7 +1099,7 @@ impl InlineCache {
             // covers them); hole/OOB misses add the guarded OOB bit
             let len = obj.as_ref().length();
             let hole_miss = payload & ELEMENT_HOLEY != 0 && {
-                let elements = obj.as_ref().elements.get(heap);
+                let elements = obj.as_ref().elements(heap);
                 index < elements.as_ref().len()
                     && elements.as_ref().at(heap, index) == heap.known().the_hole.as_tagged(heap)
             };
@@ -1136,7 +1136,7 @@ impl InlineCache {
         if !obj.is_array(heap) {
             return;
         }
-        let map = scope.handle(obj.map_ref(heap));
+        let map = scope.handle(obj.map(heap));
         // element store handlers are dense-only
         if !map.as_tagged(heap).kind().is_dense_elements() {
             return;
@@ -1173,7 +1173,7 @@ impl InlineCache {
         if vector.site(slot).is_none() {
             return false;
         }
-        let map = recv.map_ref(heap);
+        let map = recv.map(heap);
         let Some(handler) = probe(heap, vector, slot, map) else {
             return false;
         };
@@ -1206,13 +1206,13 @@ impl InlineCache {
                 return false;
             };
             let offset = row.offset();
-            let old_len = recv.slots.get(heap).as_slice().len();
+            let old_len = recv.slots(heap).as_slice().len();
             if offset >= old_len {
                 return false;
             }
             let host = recv.erase();
             recv.slot(heap, offset).set(heap, host, value);
-            Prototype::shape_changed(heap, recv.map_ref(heap));
+            Prototype::shape_changed(heap, recv.map(heap));
             recv.header.map.set(heap, host, target);
             return true;
         }
@@ -1231,7 +1231,7 @@ impl InlineCache {
         let vector = vector?;
         let recv = ic_receiver(receiver.as_tagged(heap).erase(), heap)?;
         vector.as_tagged(heap).site(slot)?;
-        let map = scope.handle(recv.map_ref(heap));
+        let map = scope.handle(recv.map(heap));
         let action = {
             let handler = probe(heap, vector.as_tagged(heap), slot, map.as_tagged(heap))?;
             if !handler.is_ptr() {
@@ -1305,7 +1305,7 @@ impl InlineCache {
             return;
         };
         let target =
-            (outcome == StoreOutcomeKind::Transition).then(|| scope.handle(recv.map_ref(heap)));
+            (outcome == StoreOutcomeKind::Transition).then(|| scope.handle(recv.map(heap)));
         let plan = analyze_store(heap, scope, recv, name.as_tagged(heap));
         let handler = store_handler(heap, scope, target, plan);
         update_site(heap, scope, vector, slot, &prev_map, &handler);
@@ -1338,7 +1338,7 @@ fn apply_transition(
         return false;
     }
     let offset = row.offset();
-    let old_len = recv.slots.get(heap).as_slice().len();
+    let old_len = recv.slots(heap).as_slice().len();
     let new_len = target_ref.value_slot_count();
 
     if offset < old_len {
@@ -1347,7 +1347,7 @@ fn apply_transition(
         let host = recv.erase();
         recv.slot(heap, offset)
             .set(heap, host, value.as_tagged(heap));
-        Prototype::shape_changed(heap, recv.map_ref(heap));
+        Prototype::shape_changed(heap, recv.map(heap));
         recv.header.map.set(heap, host, target.as_tagged(heap));
         return true;
     }
@@ -1364,7 +1364,7 @@ fn apply_transition(
             .as_tagged(heap)
             .as_heap_object()
             .expect("gated receiver");
-        let old = recv.slots.get(heap);
+        let old = recv.slots(heap);
         let new = slots.as_tagged(heap);
         for k in 0..old_len {
             new.set(heap, k, old.at(heap, k));
@@ -1372,7 +1372,7 @@ fn apply_transition(
         new.set(heap, offset, value.as_tagged(heap));
         let host = recv.erase();
         recv.slots.set(heap, host, new);
-        Prototype::shape_changed(heap, recv.map_ref(heap));
+        Prototype::shape_changed(heap, recv.map(heap));
         recv.header.map.set(heap, host, target.as_tagged(heap));
     }
     true
@@ -1527,7 +1527,7 @@ fn decode_runtime_payload(raw: i64) -> Option<NativeIndex> {
 
 #[inline]
 fn call_probe_strong<'a>(heap: &'a Heap, callee: Tagged<'a, Value>) -> CallProbe<'a> {
-    match Object::call_target(heap, callee) {
+    match callee.call_target(heap) {
         Some(CallTarget::Native(rt)) => CallProbe::Native(rt),
         Some(CallTarget::Bytecode {
             target,
