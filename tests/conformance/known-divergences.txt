@@ -1,0 +1,10 @@
+# Tests whose ovm behavior currently diverges from the reference engine.
+# Format: <filename> <issue URL>
+# Remove an entry once its issue is fixed (the runner then reports XPASS).
+array_midchain_length.js https://github.com/TriedAngle/ovm/issues/1
+property_key_spelling.js https://github.com/TriedAngle/ovm/issues/2
+string_wrapper_midchain_length.js https://github.com/TriedAngle/ovm/issues/3
+literal_proto.js https://github.com/TriedAngle/ovm/issues/7
+proto_setter.js https://github.com/TriedAngle/ovm/issues/8
+object_create_wrapper.js https://github.com/TriedAngle/ovm/issues/9
+midchain_proxy.js https://github.com/TriedAngle/ovm/issues/10
